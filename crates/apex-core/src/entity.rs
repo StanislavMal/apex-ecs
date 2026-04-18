@@ -109,6 +109,16 @@ impl EntityAllocator {
         // живые = все записи минус свободные
         self.records.len() - self.free_list.len()
     }
+
+    /// Получить живой Entity по индексу (для восстановления из relation_id)
+    pub fn get_by_index(&self, index: u32) -> Option<Entity> {
+        let record = self.records.get(index as usize)?;
+        if record.location.is_some() {
+            Some(Entity { index, generation: record.generation })
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for EntityAllocator {

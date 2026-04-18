@@ -7,7 +7,7 @@ use crate::{
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{EntityAllocator, EntityLocation, Entity},
     query::{QueryBuilder, WorldQuery},
-    relations::RelationRegistry,
+    relations::{IdIndex, RelationRegistry},
 };
 
 // ── QueryCache ─────────────────────────────────────────────────
@@ -82,6 +82,9 @@ pub struct World {
     pub(crate) current_tick: Tick,
     pub(crate) query_cache: QueryCache,
     pub(crate) relations: RelationRegistry,
+    /// Обратный индекс ComponentId → Vec<ArchetypeId>.
+    /// Ключевая структура из Flecs — делает query_relation O(1).
+    pub(crate) id_index: IdIndex,
 }
 
 impl World {
@@ -94,6 +97,7 @@ impl World {
             current_tick: Tick(1),
             query_cache: QueryCache::new(),
             relations: RelationRegistry::new(),
+            id_index: IdIndex::default(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
@@ -297,7 +301,12 @@ impl World {
             .iter()
             .filter_map(|&cid| self.registry.get_info(cid))
             .collect();
-        self.archetypes.push(Archetype::new(id, components.iter().copied().collect(), &infos));
+        let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
+        // Регистрируем все компоненты нового архетипа в IdIndex
+        for &cid in &arch.component_ids {
+            self.id_index.register_archetype(cid, id);
+        }
+        self.archetypes.push(arch);
         self.archetype_index.insert(components, id);
         self.query_cache.invalidate();
         id

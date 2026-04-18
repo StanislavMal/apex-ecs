@@ -27,3 +27,8 @@ desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Прочее
+
+*.txt
+*.bat
