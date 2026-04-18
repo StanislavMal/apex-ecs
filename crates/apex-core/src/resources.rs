@@ -16,14 +16,24 @@ use rustc_hash::FxHashMap;
 
 // ── Внутренний trait объект ────────────────────────────────────
 
-trait ResourceStorage: Any + Send + Sync {
+trait ResourceStorage: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
 }
 
-impl<T: Any + Send + Sync> ResourceStorage for T {
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+struct ResourceStorageImpl(Box<dyn Any + Send + Sync>);
+
+impl ResourceStorage for ResourceStorageImpl {
+    fn as_any(&self) -> &dyn Any {
+        &*self.0
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut *self.0
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
+        self.0
+    }
 }
 
 // ── ResourceMap ────────────────────────────────────────────────
@@ -39,7 +49,7 @@ impl ResourceMap {
 
     /// Вставить ресурс (перезаписывает если уже есть).
     pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.data.insert(TypeId::of::<T>(), Box::new(value));
+        self.data.insert(TypeId::of::<T>(), Box::new(ResourceStorageImpl(Box::new(value))));
     }
 
     /// Получить ссылку на ресурс. Паникует если ресурс не зарегистрирован.
@@ -83,12 +93,7 @@ impl ResourceMap {
         self.data
             .remove(&TypeId::of::<T>())
             .and_then(|b| {
-                // Downcasting из Box<dyn Trait> требует промежуточного шага
-                let raw: Box<dyn Any + Send + Sync> = unsafe {
-                    // SAFETY: ResourceStorage реализован для T: Any + Send + Sync,
-                    // и мы знаем что TypeId совпадает.
-                    std::mem::transmute(b)
-                };
+                let raw = b.into_any();
                 raw.downcast::<T>().ok().map(|b| *b)
             })
     }
