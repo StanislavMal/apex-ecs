@@ -5,6 +5,21 @@ use rustc_hash::FxHashMap;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ComponentId(pub(crate) u32);
 
+/// Тик мира — монотонно растущий счётчик, инкрементируется каждый раз
+/// когда World::tick() вызывается (обычно раз в кадр).
+/// Используется для change detection.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub struct Tick(pub u32);
+
+impl Tick {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub fn is_newer_than(self, last_run: Tick) -> bool {
+        self.0 > last_run.0
+    }
+}
+
 /// Метаданные компонента
 pub struct ComponentInfo {
     pub id: ComponentId,
@@ -12,14 +27,12 @@ pub struct ComponentInfo {
     pub type_id: TypeId,
     pub size: usize,
     pub align: usize,
-    /// Функция удаления (вызывается при drop)
     pub drop_fn: unsafe fn(*mut u8),
 }
 
 /// Трейт для всех компонентов
 pub trait Component: Send + Sync + 'static {}
 
-/// Автоматическая реализация для всех подходящих типов
 impl<T: Send + Sync + 'static> Component for T {}
 
 unsafe fn drop_ptr<T>(ptr: *mut u8) {
@@ -40,14 +53,11 @@ impl ComponentRegistry {
         }
     }
 
-    /// Зарегистрировать тип как компонент и получить его ID
     pub fn register<T: Component>(&mut self) -> ComponentId {
         let type_id = TypeId::of::<T>();
-
         if let Some(&id) = self.type_to_id.get(&type_id) {
             return id;
         }
-
         let id = ComponentId(self.components.len() as u32);
         self.components.push(ComponentInfo {
             id,
@@ -61,12 +71,10 @@ impl ComponentRegistry {
         id
     }
 
-    /// Получить ID уже зарегистрированного типа
     pub fn get_id<T: Component>(&self) -> Option<ComponentId> {
         self.type_to_id.get(&TypeId::of::<T>()).copied()
     }
 
-    /// Получить ID или зарегистрировать
     pub fn get_or_register<T: Component>(&mut self) -> ComponentId {
         self.register::<T>()
     }
@@ -81,7 +89,5 @@ impl ComponentRegistry {
 }
 
 impl Default for ComponentRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }

@@ -1,30 +1,25 @@
 use crate::{
     archetype::Archetype,
-    component::{Component, ComponentId},
+    component::{Component, ComponentId, Tick},
     entity::Entity,
     world::World,
 };
 
 // ── WorldQuery ─────────────────────────────────────────────────
-//
-// Единый trait для всего что можно запросить.
-// Компилятор полностью инлайнит fetch_item — никаких виртуальных вызовов.
 
 pub trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
 
-    /// Сколько ComponentId этот запрос занимает в плоском массиве
     fn component_count() -> usize;
-    /// Заполнить ids начиная с offset
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>);
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
-    /// Safety: архетип содержит все нужные компоненты, ids корректны
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId]) -> Self::State;
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State;
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
-    /// Safety: row < arch.len()
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Self::Item<'w>;
+    /// true если этот тип является фильтром (With/Without/Changed) — не даёт данных
+    fn is_filter() -> bool { false }
 }
 
 // ── Read<T> ────────────────────────────────────────────────────
@@ -45,14 +40,14 @@ impl<T: Component> WorldQuery for Read<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId]) -> Self::State {
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _last_run: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         arch.columns[col_idx].data as *const T
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
-        &*state.add(row)
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        Some(&*state.add(row))
     }
 }
 
@@ -74,14 +69,125 @@ impl<T: Component> WorldQuery for Write<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId]) -> Self::State {
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _last_run: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         arch.columns[col_idx].data as *mut T
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
-        &mut *state.add(row)
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        Some(&mut *state.add(row))
+    }
+}
+
+// ── With<T> — фильтр присутствия ──────────────────────────────
+
+/// Фильтр: entity должен иметь компонент T (но T не возвращается).
+pub struct With<T: Component>(std::marker::PhantomData<T>);
+
+impl<T: Component> WorldQuery for With<T> {
+    type Item<'w> = ();
+    type State = ();
+
+    #[inline] fn component_count() -> usize { 1 }
+    #[inline] fn is_filter() -> bool { true }
+
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        !ids.is_empty() && arch.has_component(ids[0])
+    }
+
+    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {}
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> {
+        Some(())
+    }
+}
+
+// ── Without<T> — фильтр отсутствия ────────────────────────────
+
+/// Фильтр: entity НЕ должен иметь компонент T.
+pub struct Without<T: Component>(std::marker::PhantomData<T>);
+
+impl<T: Component> WorldQuery for Without<T> {
+    type Item<'w> = ();
+    type State = ();
+
+    #[inline] fn component_count() -> usize { 1 }
+    #[inline] fn is_filter() -> bool { true }
+
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+
+    /// Архетип подходит если компонент ОТСУТСТВУЕТ
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        ids.is_empty() || !arch.has_component(ids[0])
+    }
+
+    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {}
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> {
+        Some(())
+    }
+}
+
+// ── Changed<T> — change detection ─────────────────────────────
+
+/// Фильтр: компонент T был изменён после last_run тика.
+/// Возвращает &T только для изменённых entity.
+pub struct Changed<T: Component>(std::marker::PhantomData<T>);
+
+#[derive(Clone, Copy)]
+pub struct ChangedState {
+    data: *const u8,
+    ticks: *const Tick,
+    last_run: Tick,
+    item_size: usize,
+}
+
+unsafe impl Send for ChangedState {}
+unsafe impl Sync for ChangedState {}
+
+impl<T: Component> WorldQuery for Changed<T> {
+    type Item<'w> = &'w T;
+    type State = ChangedState;
+
+    #[inline] fn component_count() -> usize { 1 }
+
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        !ids.is_empty() && arch.has_component(ids[0])
+    }
+
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
+        let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
+        let col = &arch.columns[col_idx];
+        ChangedState {
+            data: col.data,
+            ticks: col.ticks_ptr(),
+            last_run,
+            item_size: col.item_size,
+        }
+    }
+
+    /// Возвращает Some только если тик изменения > last_run
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        let tick = *state.ticks.add(row);
+        if tick.is_newer_than(state.last_run) {
+            Some(&*(state.data.add(row * state.item_size) as *const T))
+        } else {
+            None
+        }
     }
 }
 
@@ -104,32 +210,31 @@ macro_rules! impl_world_query_tuple {
 
             fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
                 let mut offset = 0;
-                #[allow(unused_assignments)]
                 $(
                     let n = $Q::component_count();
                     if !$Q::matches_archetype(arch, &ids[offset..offset + n]) { return false; }
-                    offset += n;
+                    #[allow(unused_assignments)]
+                    { offset += n; }
                 )+
-                let _ = offset;
                 true
             }
 
-            unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId]) -> Self::State {
+            unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
                 let mut offset = 0;
-                #[allow(unused_assignments)]
                 ($(
                     {
                         let n = $Q::component_count();
-                        let s = $Q::fetch_state(arch, &ids[offset..offset + n]);
-                        offset += n;
+                        let s = $Q::fetch_state(arch, &ids[offset..offset + n], last_run);
+                        #[allow(unused_assignments)]
+                        { offset += n; }
                         s
                     },
                 )+)
             }
 
             #[inline(always)]
-            unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
-                ( $( $Q::fetch_item(state.$idx, row), )+ )
+            unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+                Some(( $( $Q::fetch_item(state.$idx, row)?, )+ ))
             }
         }
     };
@@ -143,41 +248,40 @@ impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6), (H, 7));
 
+// ── ArchState ──────────────────────────────────────────────────
+
+pub(crate) struct ArchState<S> {
+    pub arch_idx: usize,
+    pub state: S,
+    pub len: usize,
+}
+
 // ── Query<Q> ──────────────────────────────────────────────────
 
-/// Zero-cost typed query. Итерация компилируется в прямой доступ к указателям.
-///
-/// ```ignore
-/// for (entity, (pos, vel)) in Query::<(Read<Position>, Write<Velocity>)>::new(&world).iter() {
-///     vel.x += pos.x;
-/// }
-/// ```
 pub struct Query<'w, Q: WorldQuery> {
     world: &'w World,
     archetypes: Vec<ArchState<Q::State>>,
-}
-
-struct ArchState<S> {
-    arch_idx: usize,
-    state: S,
-    len: usize,
+    #[allow(dead_code)]
+    last_run: Tick,
 }
 
 impl<'w, Q: WorldQuery> Query<'w, Q> {
     pub fn new(world: &'w World) -> Self {
+        Self::new_with_tick(world, Tick::ZERO)
+    }
+
+    pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
 
-        // ids могут быть не найдены если компонент не зарегистрирован
         let all_found = ids.len() == Q::component_count();
-
         let archetypes = if all_found {
             world.archetypes
                 .iter()
                 .enumerate()
                 .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
                 .map(|(arch_idx, arch)| {
-                    let state = unsafe { Q::fetch_state(arch, &ids) };
+                    let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
                     ArchState { arch_idx, state, len: arch.len() }
                 })
                 .collect()
@@ -185,50 +289,77 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             Vec::new()
         };
 
-        Self { world, archetypes }
+        Self { world, archetypes, last_run }
     }
 
-    /// Итерация с entity
     #[inline]
     pub fn iter(&self) -> QueryIter<'_, Q> {
-        QueryIter {
-            archetypes: &self.archetypes,
-            world: self.world,
-            arch_cursor: 0,
-            row_cursor: 0,
-        }
+        QueryIter { archetypes: &self.archetypes, world: self.world, arch_cursor: 0, row_cursor: 0 }
     }
 
-    /// Итерация без entity — чуть быстрее
     #[inline]
     pub fn iter_components(&self) -> QueryComponentIter<'_, Q> {
-        QueryComponentIter {
-            archetypes: &self.archetypes,
-            arch_cursor: 0,
-            row_cursor: 0,
-        }
+        QueryComponentIter { archetypes: &self.archetypes, arch_cursor: 0, row_cursor: 0 }
     }
 
-    /// for_each — лучший вариант для горячих путей, компилятор инлайнит замыкание
+    /// Последовательный for_each — лучший вариант для горячих путей
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         for a in &self.archetypes {
             let entities = &self.world.archetypes[a.arch_idx].entities;
             for row in 0..a.len {
-                let item = unsafe { Q::fetch_item(a.state, row) };
-                f(entities[row], item);
+                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                    f(entities[row], item);
+                }
             }
         }
     }
 
-    /// for_each без entity
     #[inline]
     pub fn for_each_component<F: FnMut(Q::Item<'_>)>(&self, mut f: F) {
         for a in &self.archetypes {
             for row in 0..a.len {
-                f(unsafe { Q::fetch_item(a.state, row) });
+                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                    f(item);
+                }
             }
         }
+    }
+
+    /// Параллельный for_each через rayon.
+    /// Каждый архетип обрабатывается как отдельный chunk — нет false sharing.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each<F>(&self, f: F)
+    where
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+        Q::Item<'_>: Send,
+    {
+        use rayon::prelude::*;
+        self.archetypes.par_iter().for_each(|a| {
+            let entities = &self.world.archetypes[a.arch_idx].entities;
+            for row in 0..a.len {
+                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                    f(entities[row], item);
+                }
+            }
+        });
+    }
+
+    /// Параллельный for_each без entity
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each_component<F>(&self, f: F)
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+        Q::Item<'_>: Send,
+    {
+        use rayon::prelude::*;
+        self.archetypes.par_iter().for_each(|a| {
+            for row in 0..a.len {
+                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                    f(item);
+                }
+            }
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -263,9 +394,11 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
             }
             let row = self.row_cursor;
             self.row_cursor += 1;
-            let entity = self.world.archetypes[a.arch_idx].entities[row];
-            let item = unsafe { Q::fetch_item(a.state, row) };
-            return Some((entity, item));
+            // Changed<T> может вернуть None — пропускаем строку
+            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                let entity = self.world.archetypes[a.arch_idx].entities[row];
+                return Some((entity, item));
+            }
         }
     }
 
@@ -276,7 +409,7 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
             .enumerate()
             .map(|(i, a)| if i == 0 { a.len.saturating_sub(self.row_cursor) } else { a.len })
             .sum();
-        (n, Some(n))
+        (0, Some(n))
     }
 }
 
@@ -300,7 +433,9 @@ impl<'q, Q: WorldQuery> Iterator for QueryComponentIter<'q, Q> {
             }
             let row = self.row_cursor;
             self.row_cursor += 1;
-            return Some(unsafe { Q::fetch_item(a.state, row) });
+            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                return Some(item);
+            }
         }
     }
 }
@@ -342,7 +477,7 @@ impl<'w> QueryBuilder<'w> {
     }
 
     #[inline]
-    fn matches_arch(&self, arch: &crate::archetype::Archetype) -> bool {
+    fn matches_arch(&self, arch: &Archetype) -> bool {
         self.reads.iter().all(|id| arch.has_component(*id))
             && self.writes.iter().all(|id| arch.has_component(*id))
             && self.excludes.iter().all(|id| !arch.has_component(*id))

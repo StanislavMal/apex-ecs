@@ -3,6 +3,10 @@ name = "apex-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+parallel = ["dep:rayon"]
+
 [dependencies]
 apex-graph = { path = "../apex-graph" }
 
@@ -12,3 +16,4 @@ thunderdome.workspace = true
 bitvec.workspace = true
 thiserror.workspace = true
 log.workspace = true
+rayon = { workspace = true, optional = true }

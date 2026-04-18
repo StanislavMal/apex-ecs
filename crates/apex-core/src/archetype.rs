@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{
-    component::{ComponentId, ComponentInfo},
+    component::{ComponentId, ComponentInfo, Tick},
     entity::Entity,
 };
 
@@ -22,6 +22,8 @@ pub(crate) struct Column {
     drop_fn: unsafe fn(*mut u8),
     pub(crate) len: usize,
     pub(crate) capacity: usize,
+    /// Per-row тик последнего изменения (для change detection)
+    pub(crate) change_ticks: Vec<Tick>,
 }
 
 unsafe impl Send for Column {}
@@ -37,6 +39,7 @@ impl Column {
             drop_fn: info.drop_fn,
             len: 0,
             capacity: 0,
+            change_ticks: Vec::new(),
         }
     }
 
@@ -46,13 +49,6 @@ impl Column {
         } else {
             Layout::from_size_align(self.item_size * capacity, self.item_align).unwrap()
         }
-    }
-
-    /// Сырой указатель на начало данных колонки.
-    /// Используется в zero-cost query для прямого доступа к слайсу.
-    #[inline]
-    pub fn data_ptr(&self) -> *mut u8 {
-        self.data
     }
 
     #[inline]
@@ -74,7 +70,8 @@ impl Column {
         &mut *(self.get_ptr(row) as *mut T)
     }
 
-    pub unsafe fn push(&mut self, src: *const u8) {
+    /// Записать новый элемент в конец, проставить тик изменения
+    pub unsafe fn push(&mut self, src: *const u8, tick: Tick) {
         if self.len >= self.capacity {
             self.grow();
         }
@@ -82,7 +79,18 @@ impl Column {
             let dst = self.data.add(self.len * self.item_size);
             std::ptr::copy_nonoverlapping(src, dst, self.item_size);
         }
+        self.change_ticks.push(tick);
         self.len += 1;
+    }
+
+    /// Записать элемент в уже существующую строку, обновить тик
+    pub unsafe fn write_at(&mut self, row: usize, src: *const u8, tick: Tick) {
+        if self.item_size > 0 {
+            std::ptr::copy_nonoverlapping(src, self.get_ptr(row), self.item_size);
+        }
+        if row < self.change_ticks.len() {
+            self.change_ticks[row] = tick;
+        }
     }
 
     pub unsafe fn swap_remove_and_drop(&mut self, row: usize) -> bool {
@@ -94,10 +102,13 @@ impl Column {
             if self.item_size > 0 {
                 std::ptr::copy_nonoverlapping(self.get_ptr(last), remove_ptr, self.item_size);
             }
+            self.change_ticks.swap(row, last);
+            self.change_ticks.pop();
             self.len -= 1;
             true
         } else {
             (self.drop_fn)(self.get_ptr(row));
+            self.change_ticks.pop();
             self.len -= 1;
             false
         }
@@ -110,6 +121,10 @@ impl Column {
             let remove_ptr = self.get_ptr(row);
             std::ptr::copy_nonoverlapping(self.get_ptr(last), remove_ptr, self.item_size);
         }
+        if row != last {
+            self.change_ticks.swap(row, last);
+        }
+        self.change_ticks.pop();
         self.len -= 1;
         row != last
     }
@@ -138,6 +153,18 @@ impl Column {
     #[inline]
     #[allow(dead_code)]
     pub fn len(&self) -> usize { self.len }
+
+    /// Тик изменения для строки row
+    #[inline]
+    pub fn get_tick(&self, row: usize) -> Tick {
+        self.change_ticks.get(row).copied().unwrap_or(Tick::ZERO)
+    }
+
+    /// Указатель на массив тиков — для zero-cost Changed<T> query
+    #[inline]
+    pub fn ticks_ptr(&self) -> *const Tick {
+        self.change_ticks.as_ptr()
+    }
 }
 
 impl Drop for Column {
@@ -213,13 +240,13 @@ impl Archetype {
         row
     }
 
-    pub unsafe fn write_component(&mut self, row: usize, component_id: ComponentId, src: *const u8) {
+    pub unsafe fn write_component(&mut self, row: usize, component_id: ComponentId, src: *const u8, tick: Tick) {
         if let Some(col_idx) = self.column_index(component_id) {
             let col = &mut self.columns[col_idx];
             if row >= col.len {
-                col.push(src);
-            } else if col.item_size > 0 {
-                std::ptr::copy_nonoverlapping(src, col.get_ptr(row), col.item_size);
+                col.push(src, tick);
+            } else {
+                col.write_at(row, src, tick);
             }
         }
     }

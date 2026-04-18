@@ -9,6 +9,7 @@ dependencies = [
  "apex-graph",
  "bitvec",
  "log",
+ "rayon",
  "rustc-hash",
  "smallvec",
  "thiserror",
