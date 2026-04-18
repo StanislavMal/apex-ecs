@@ -6,8 +6,10 @@ use crate::{
     archetype::{Archetype, ArchetypeId},
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{EntityAllocator, EntityLocation, Entity},
+    events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
+    resources::ResourceMap,
 };
 
 // ── QueryCache ─────────────────────────────────────────────────
@@ -76,6 +78,10 @@ pub struct World {
     pub(crate) id_index: IdIndex,
     /// Быстрый entity-level индекс relations — ключ к O(1) has_relation
     pub(crate) subject_index: SubjectIndex,
+    /// Глобальные ресурсы-синглтоны
+    pub(crate) resources: ResourceMap,
+    /// Шина событий
+    pub(crate) events: EventRegistry,
 }
 
 impl World {
@@ -90,20 +96,98 @@ impl World {
             relations: RelationRegistry::new(),
             id_index: IdIndex::default(),
             subject_index: SubjectIndex::new(),
+            resources: ResourceMap::new(),
+            events: EventRegistry::new(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
         world
     }
 
+    /// Advance the world tick and flush event double-buffers.
     pub fn tick(&mut self) {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
+        self.events.update_all();
     }
 
     pub fn current_tick(&self) -> Tick { self.current_tick }
 
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
         self.registry.register::<T>()
+    }
+
+    // ── Resources ──────────────────────────────────────────────
+
+    /// Вставить глобальный ресурс (перезаписывает если уже существует).
+    pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.resources.insert(value);
+    }
+
+    /// Получить иммутабельную ссылку на ресурс.
+    /// # Panics
+    /// Паникует если ресурс не был вставлен через `insert_resource`.
+    #[track_caller]
+    pub fn resource<T: Send + Sync + 'static>(&self) -> &T {
+        self.resources.get::<T>()
+    }
+
+    /// Получить мутабельную ссылку на ресурс.
+    /// # Panics
+    /// Паникует если ресурс не был вставлен через `insert_resource`.
+    #[track_caller]
+    pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
+        self.resources.get_mut::<T>()
+    }
+
+    /// Попытаться получить ресурс — None если не существует.
+    pub fn try_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.resources.try_get::<T>()
+    }
+
+    /// Попытаться получить мутабельный ресурс — None если не существует.
+    pub fn try_resource_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
+        self.resources.try_get_mut::<T>()
+    }
+
+    /// Удалить ресурс. Возвращает Some(T) если ресурс существовал.
+    pub fn remove_resource<T: Send + Sync + 'static>(&mut self) -> Option<T> {
+        self.resources.remove::<T>()
+    }
+
+    /// Проверить наличие ресурса.
+    pub fn has_resource<T: Send + Sync + 'static>(&self) -> bool {
+        self.resources.contains::<T>()
+    }
+
+    // ── Events ─────────────────────────────────────────────────
+
+    /// Зарегистрировать тип события. Идемпотентно.
+    pub fn add_event<T: Send + Sync + 'static>(&mut self) {
+        self.events.register::<T>();
+    }
+
+    /// Получить иммутабельную очередь событий.
+    /// # Panics
+    /// Паникует если событие не было зарегистрировано через `add_event`.
+    #[track_caller]
+    pub fn events<T: Send + Sync + 'static>(&self) -> &crate::events::EventQueue<T> {
+        self.events.get::<T>()
+    }
+
+    /// Получить мутабельную очередь событий для отправки.
+    /// # Panics
+    /// Паникует если событие не было зарегистрировано через `add_event`.
+    #[track_caller]
+    pub fn events_mut<T: Send + Sync + 'static>(&mut self) -> &mut crate::events::EventQueue<T> {
+        self.events.get_mut::<T>()
+    }
+
+    /// Отправить событие (короткий хелпер).
+    /// # Panics
+    /// Паникует если событие не было зарегистрировано через `add_event`.
+    #[track_caller]
+    pub fn send_event<T: Send + Sync + 'static>(&mut self, event: T) {
+        self.events.get_mut::<T>().send(event);
     }
 
     // ── Spawn ──────────────────────────────────────────────────
@@ -446,30 +530,6 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                     f(item);
                 }
             }
-        }
-    }
-
-    #[cfg(feature = "parallel")]
-    pub fn par_for_each<F>(&self, chunk_size: usize, f: F)
-    where
-        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
-        for<'a> Q::Item<'a>: Send,
-    {
-        use rayon::prelude::*;
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
-        for &arch_idx in self.arch_indices {
-            let arch = &self.world.archetypes[arch_idx];
-            if arch.is_empty() { continue; }
-            let state = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
-            let len = arch.len();
-            (0..len).into_par_iter().chunks(chunk_size).for_each(|chunk| {
-                for row in chunk {
-                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                        f(arch.entities[row], item);
-                    }
-                }
-            });
         }
     }
 
