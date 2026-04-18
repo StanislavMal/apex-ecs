@@ -79,7 +79,7 @@ pub struct World {
     /// Быстрый entity-level индекс relations — ключ к O(1) has_relation
     pub(crate) subject_index: SubjectIndex,
     /// Глобальные ресурсы-синглтоны
-    pub(crate) resources: ResourceMap,
+    pub resources: ResourceMap,
     /// Шина событий
     pub(crate) events: EventRegistry,
 }
