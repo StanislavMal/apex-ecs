@@ -4,7 +4,6 @@ use crate::{
     world::World,
 };
 
-/// Строитель запроса
 pub struct QueryBuilder<'w> {
     world: &'w World,
     reads: Vec<ComponentId>,
@@ -14,12 +13,7 @@ pub struct QueryBuilder<'w> {
 
 impl<'w> QueryBuilder<'w> {
     pub fn new(world: &'w World) -> Self {
-        Self {
-            world,
-            reads: Vec::new(),
-            writes: Vec::new(),
-            excludes: Vec::new(),
-        }
+        Self { world, reads: Vec::new(), writes: Vec::new(), excludes: Vec::new() }
     }
 
     pub fn read<T: Component>(mut self) -> Self {
@@ -43,24 +37,25 @@ impl<'w> QueryBuilder<'w> {
         self
     }
 
-    /// Найти все подходящие архетипы
+    /// Индексы архетипов, удовлетворяющих всем фильтрам
     pub fn matching_archetype_ids(&self) -> Vec<usize> {
         self.world
             .archetypes
             .iter()
             .enumerate()
-            .filter(|(_, arch)| {
-                let has_reads = self.reads.iter().all(|id| arch.has_component(*id));
-                let has_writes = self.writes.iter().all(|id| arch.has_component(*id));
-                let no_excludes = self.excludes.iter().all(|id| !arch.has_component(*id));
-                has_reads && has_writes && no_excludes
-            })
+            .filter(|(_, arch)| self.matches_arch(arch))
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Итерация по одному компоненту (read-only)
-    /// Возвращает боксированный итератор чтобы избежать проблем с разными типами
+    #[inline]
+    fn matches_arch(&self, arch: &crate::archetype::Archetype) -> bool {
+        self.reads.iter().all(|id| arch.has_component(*id))
+            && self.writes.iter().all(|id| arch.has_component(*id))
+            && self.excludes.iter().all(|id| !arch.has_component(*id))
+    }
+
+    /// Итерация по компоненту T с учётом всех фильтров builder'а
     pub fn iter_one<T: Component>(
         &'w self,
     ) -> Box<dyn Iterator<Item = (Entity, &'w T)> + 'w> {
@@ -69,13 +64,13 @@ impl<'w> QueryBuilder<'w> {
             None => return Box::new(std::iter::empty()),
         };
 
-        // Фильтруем только архетипы у которых есть этот компонент
+        // Архетипы должны иметь T И удовлетворять всем фильтрам
         let arch_indices: Vec<usize> = self
             .world
             .archetypes
             .iter()
             .enumerate()
-            .filter(|(_, arch)| arch.has_component(comp_id))
+            .filter(|(_, arch)| arch.has_component(comp_id) && self.matches_arch(arch))
             .map(|(i, _)| i)
             .collect();
 
@@ -90,7 +85,6 @@ impl<'w> QueryBuilder<'w> {
     }
 }
 
-/// Итератор по одному компоненту через все архетипы
 struct SingleComponentIter<'w, T> {
     world: &'w World,
     arch_indices: Vec<usize>,
@@ -105,12 +99,10 @@ impl<'w, T: Component> Iterator for SingleComponentIter<'w, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Берём текущий архетип
             let arch_idx = *self.arch_indices.get(self.arch_cursor)?;
             let arch = &self.world.archetypes[arch_idx];
 
             if self.row_cursor >= arch.len() {
-                // Переходим к следующему архетипу
                 self.arch_cursor += 1;
                 self.row_cursor = 0;
                 continue;
@@ -120,10 +112,7 @@ impl<'w, T: Component> Iterator for SingleComponentIter<'w, T> {
             let row = self.row_cursor;
             self.row_cursor += 1;
 
-            let component = unsafe {
-                arch.get_component::<T>(row, self.comp_id)?
-            };
-
+            let component = unsafe { arch.get_component::<T>(row, self.comp_id)? };
             return Some((entity, component));
         }
     }

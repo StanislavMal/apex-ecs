@@ -7,12 +7,11 @@ pub mod world;
 
 pub use component::Component;
 pub use entity::Entity;
-pub use world::World;
+pub use world::{World, Bundle};
 
-/// Prelude — удобный импорт
 pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::Entity;
-    pub use crate::world::World;
+    pub use crate::world::{World, Bundle};
     pub use crate::query::QueryBuilder;
 }
