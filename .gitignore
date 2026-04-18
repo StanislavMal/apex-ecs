@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock — не коммитим для библиотечных крейтов
+# Если добавишь бинарный крейт — убери эту строку
+Cargo.lock
+
+# Benchmark/profiling output
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+*.profdata
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.bak

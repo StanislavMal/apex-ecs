@@ -16,6 +16,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-examples"
+version = "0.1.0"
+dependencies = [
+ "apex-core",
+ "apex-graph",
+ "apex-scheduler",
+]
+
+[[package]]
 name = "apex-graph"
 version = "0.1.0"
 dependencies = [
@@ -37,6 +46,7 @@ dependencies = [
  "rustc-hash",
  "smallvec",
  "thiserror",
+ "thunderdome",
 ]
 
 [[package]]

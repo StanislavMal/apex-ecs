@@ -7,6 +7,7 @@ edition.workspace = true
 apex-core = { path = "../apex-core" }
 apex-graph = { path = "../apex-graph" }
 
+thunderdome.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true

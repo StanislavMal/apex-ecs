@@ -58,7 +58,7 @@ fn main() {
         .id();
 
     println!("Created {} entities", world.entity_count());
-    println!("Archetypes: {}\n", world.archetypes.len());
+    println!("Archetypes: {}\n", world.archetype_count());
 
     // Читаем компоненты напрямую
     let pos = world.get::<Position>(player).unwrap();

@@ -1,0 +1,9 @@
+[package]
+name = "apex-examples"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core = { path = "../apex-core" }
+apex-graph = { path = "../apex-graph" }
+apex-scheduler = { path = "../apex-scheduler" }

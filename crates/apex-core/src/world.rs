@@ -212,6 +212,10 @@ impl World {
         self.entity_locations.len()
     }
 
+    pub fn archetype_count(&self) -> usize {
+        self.archetypes.len()
+    }
+
     // ── Внутренние методы ──────────────────────────────────────
 
     fn find_or_create_archetype_with(
