@@ -1,0 +1,11 @@
+[package]
+name = "apex-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+smallvec.workspace = true
+thunderdome.workspace = true
+thiserror.workspace = true
+log.workspace = true

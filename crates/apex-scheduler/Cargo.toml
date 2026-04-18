@@ -1,0 +1,14 @@
+[package]
+name = "apex-scheduler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core = { path = "../apex-core" }
+apex-graph = { path = "../apex-graph" }
+
+rustc-hash.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+log.workspace = true

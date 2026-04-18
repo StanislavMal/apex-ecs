@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apex-core",
+    "crates/apex-graph",
+    "crates/apex-scheduler",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["You"]
+license = "MIT"
+
+[workspace.dependencies]
+# Хэширование - быстрее std HashMap
+rustc-hash = "1.1"
+
+# Маленькие vec на стеке (до N элементов без heap)
+smallvec = { version = "1.11", features = ["union"] }
+
+# Arena allocation - быстрое выделение памяти
+thunderdome = "0.6"
+
+# Битовые множества - для масок компонентов
+bitvec = "1.0"
+
+# Параллелизм
+rayon = "1.8"
+
+# Логирование
+log = "0.4"
+
+# Ошибки
+thiserror = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1  # немного оптимизаций даже в dev

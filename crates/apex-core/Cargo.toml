@@ -1,0 +1,14 @@
+[package]
+name = "apex-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-graph = { path = "../apex-graph" }
+
+rustc-hash.workspace = true
+smallvec.workspace = true
+thunderdome.workspace = true
+bitvec.workspace = true
+thiserror.workspace = true
+log.workspace = true
