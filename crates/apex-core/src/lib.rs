@@ -1,4 +1,5 @@
 pub mod archetype;
+pub mod commands;
 pub mod component;
 pub mod entity;
 pub mod query;
@@ -8,10 +9,13 @@ pub mod world;
 pub use component::Component;
 pub use entity::Entity;
 pub use world::{World, Bundle};
+pub use query::{Query, Read, Write, WorldQuery};
+pub use commands::Commands;
 
 pub mod prelude {
     pub use crate::component::Component;
     pub use crate::entity::Entity;
     pub use crate::world::{World, Bundle};
-    pub use crate::query::QueryBuilder;
+    pub use crate::query::{Query, Read, Write, QueryBuilder, WorldQuery};
+    pub use crate::commands::Commands;
 }

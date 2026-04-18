@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{
@@ -24,7 +24,6 @@ impl World {
             archetypes: Vec::new(),
             archetype_index: FxHashMap::default(),
         };
-        // Пустой архетип (entity без компонентов)
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
         world
@@ -36,7 +35,6 @@ impl World {
 
     // ── Spawn ──────────────────────────────────────────────────
 
-    /// Создать entity без компонентов, вернуть builder
     pub fn spawn(&mut self) -> EntityBuilder<'_> {
         let entity = self.entities.allocate();
         let row = unsafe { self.archetypes[0].allocate_row(entity) };
@@ -47,31 +45,18 @@ impl World {
         EntityBuilder { world: self, entity }
     }
 
-    /// Создать entity из Bundle — один архетипный переход, без промежуточных архетипов
+    /// Создать entity из Bundle — один архетипный переход, без промежуточных архетипов.
+    /// Данные пишутся напрямую в колонки без двойного прохода.
     pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
         let ids = bundle.component_ids(&mut self.registry);
-        let archetype_id = self.get_or_create_archetype(ids.clone());
-
+        let archetype_id = self.get_or_create_archetype(ids);
         let entity = self.entities.allocate();
+
+        // Резервируем строку и пишем данные за один проход внутри Bundle::write
         let row = self.archetypes[archetype_id.0 as usize].entities.len();
         self.archetypes[archetype_id.0 as usize].entities.push(entity);
 
-        // Выделяем место в колонках
-        for &cid in &ids {
-            let col_idx = self.archetypes[archetype_id.0 as usize].column_index(cid).unwrap();
-            let col = &mut self.archetypes[archetype_id.0 as usize].columns[col_idx];
-            if col.len >= col.capacity {
-                col.grow();
-            }
-            if col.item_size > 0 {
-                col.len += 1; // место зарезервировано, данные запишет bundle
-            } else {
-                col.len += 1;
-            }
-        }
-
-        // Записываем данные компонентов
-        bundle.write_components(self, archetype_id, row);
+        bundle.write_into(self, archetype_id, row);
 
         self.entities.set_location(entity, EntityLocation { archetype_id, row });
         entity
@@ -81,15 +66,6 @@ impl World {
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
         let component_id = self.registry.get_or_register::<T>();
-        self.insert_erased(entity, component_id, component);
-    }
-
-    fn insert_erased<T: Component>(
-        &mut self,
-        entity: Entity,
-        component_id: ComponentId,
-        component: T,
-    ) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
             None => return,
@@ -97,7 +73,6 @@ impl World {
 
         let current_idx = location.archetype_id.0 as usize;
 
-        // Уже есть — просто обновляем значение
         if self.archetypes[current_idx].has_component(component_id) {
             unsafe {
                 if let Some(dst) = self.archetypes[current_idx]
@@ -113,9 +88,8 @@ impl World {
         let new_row = self.move_entity(entity, location, new_archetype_id);
 
         unsafe {
-            let src = &component as *const T as *const u8;
             self.archetypes[new_archetype_id.0 as usize]
-                .write_component(new_row, component_id, src);
+                .write_component(new_row, component_id, &component as *const T as *const u8);
         }
         std::mem::forget(component);
 
@@ -211,11 +185,7 @@ impl World {
 
     // ── Внутренние методы ──────────────────────────────────────
 
-    fn find_or_create_archetype_with(
-        &mut self,
-        current: ArchetypeId,
-        add: ComponentId,
-    ) -> ArchetypeId {
+    fn find_or_create_archetype_with(&mut self, current: ArchetypeId, add: ComponentId) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].add_edges.get(&add) {
             return id;
         }
@@ -230,11 +200,7 @@ impl World {
         new_id
     }
 
-    fn find_or_create_archetype_without(
-        &mut self,
-        current: ArchetypeId,
-        remove: ComponentId,
-    ) -> ArchetypeId {
+    fn find_or_create_archetype_without(&mut self, current: ArchetypeId, remove: ComponentId) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].remove_edges.get(&remove) {
             return id;
         }
@@ -261,7 +227,9 @@ impl World {
         id
     }
 
-    /// Переместить entity из одного архетипа в другой, вернуть новый row.
+    /// Переместить entity из одного архетипа в другой.
+    /// Использует SmallVec<[u8; 32]> на стеке — нет heap-аллокации в hot path
+    /// для типичного случая ≤32 компонентов.
     fn move_entity(
         &mut self,
         entity: Entity,
@@ -272,30 +240,33 @@ impl World {
         let to_idx = to_archetype_id.0 as usize;
         let from_row = from_location.row;
 
-        // Общие компоненты — O(n) один раз, результат в HashSet для O(1) lookup ниже
-        let common: FxHashSet<ComponentId> = self.archetypes[from_idx]
-            .component_ids.iter()
-            .filter(|id| self.archetypes[to_idx].has_component(**id))
-            .copied()
-            .collect();
+        // Битовая маска общих компонентов на стеке (индекс колонки from → bool)
+        // SmallVec<[u8; 32]> = 32 компонента без аллокации
+        let from_len = self.archetypes[from_idx].columns.len();
+        let mut is_common: SmallVec<[bool; 32]> = SmallVec::from_elem(false, from_len);
+        for i in 0..from_len {
+            let cid = self.archetypes[from_idx].columns[i].component_id;
+            is_common[i] = self.archetypes[to_idx].has_component(cid);
+        }
 
         let to_row = self.archetypes[to_idx].entities.len();
         self.archetypes[to_idx].entities.push(entity);
 
         // Копируем общие компоненты from → to
-        for &comp_id in &common {
-            let from_col = self.archetypes[from_idx].column_index(comp_id).unwrap();
-            let to_col = self.archetypes[to_idx].column_index(comp_id).unwrap();
+        for i in 0..from_len {
+            if !is_common[i] { continue; }
+            let cid = self.archetypes[from_idx].columns[i].component_id;
+            let to_col = self.archetypes[to_idx].column_index(cid).unwrap();
 
             unsafe {
-                let item_size = self.archetypes[from_idx].columns[from_col].item_size;
+                let item_size = self.archetypes[from_idx].columns[i].item_size;
                 if item_size > 0 {
                     if self.archetypes[to_idx].columns[to_col].len
                         >= self.archetypes[to_idx].columns[to_col].capacity
                     {
                         self.archetypes[to_idx].columns[to_col].grow();
                     }
-                    let src = self.archetypes[from_idx].columns[from_col].get_ptr(from_row);
+                    let src = self.archetypes[from_idx].columns[i].get_ptr(from_row);
                     let dst = self.archetypes[to_idx].columns[to_col].get_ptr(to_row);
                     std::ptr::copy_nonoverlapping(src, dst, item_size);
                 }
@@ -307,8 +278,8 @@ impl World {
         unsafe {
             let from_last = self.archetypes[from_idx].entities.len() - 1;
 
-            for col in &mut self.archetypes[from_idx].columns {
-                if common.contains(&col.component_id) {
+            for (i, col) in self.archetypes[from_idx].columns.iter_mut().enumerate() {
+                if is_common[i] {
                     col.swap_remove_no_drop(from_row);
                 } else {
                     col.swap_remove_and_drop(from_row);
@@ -338,12 +309,11 @@ impl Default for World {
 
 // ── Bundle ─────────────────────────────────────────────────────
 
-/// Набор компонентов для атомарного spawn без промежуточных архетипов.
-///
-/// Реализован вручную для кортежей. Макрос расширяет до (A,), (A,B), ..., (A,B,C,D,E,F,G,H).
 pub trait Bundle: Sized {
-    fn component_ids(self: &Self, registry: &mut ComponentRegistry) -> Vec<ComponentId>;
-    fn write_components(self, world: &mut World, archetype_id: ArchetypeId, row: usize);
+    fn component_ids(&self, registry: &mut ComponentRegistry) -> Vec<ComponentId>;
+    /// Записать данные компонентов напрямую в колонки архетипа.
+    /// row уже добавлен в entities, колонки ещё не заполнены.
+    fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize);
 }
 
 macro_rules! impl_bundle {
@@ -356,17 +326,16 @@ macro_rules! impl_bundle {
                 ids
             }
 
-            fn write_components(self, world: &mut World, archetype_id: ArchetypeId, row: usize) {
+            fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize) {
                 let ($($T,)+) = self;
                 $(
                     {
                         let cid = world.registry.get_or_register::<$T>();
-                        unsafe {
-                            let arch = &mut world.archetypes[archetype_id.0 as usize];
-                            if let Some(col_idx) = arch.column_index(cid) {
-                                let col = &mut arch.columns[col_idx];
-                                // row уже зарезервирован в spawn_bundle, перезаписываем
+                        if let Some(col_idx) = world.archetypes[archetype_id.0 as usize].column_index(cid) {
+                            unsafe {
+                                let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
                                 if col.item_size > 0 {
+                                    if col.len >= col.capacity { col.grow(); }
                                     let dst = col.get_ptr(row);
                                     std::ptr::copy_nonoverlapping(
                                         &$T as *const $T as *const u8,
@@ -374,6 +343,7 @@ macro_rules! impl_bundle {
                                         col.item_size,
                                     );
                                 }
+                                col.len += 1;
                             }
                         }
                         std::mem::forget($T);

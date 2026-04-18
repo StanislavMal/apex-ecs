@@ -16,7 +16,7 @@ impl ArchetypeId {
 
 pub(crate) struct Column {
     pub(crate) component_id: ComponentId,
-    data: *mut u8,
+    pub(crate) data: *mut u8,
     pub(crate) item_size: usize,
     item_align: usize,
     drop_fn: unsafe fn(*mut u8),
@@ -46,6 +46,13 @@ impl Column {
         } else {
             Layout::from_size_align(self.item_size * capacity, self.item_align).unwrap()
         }
+    }
+
+    /// Сырой указатель на начало данных колонки.
+    /// Используется в zero-cost query для прямого доступа к слайсу.
+    #[inline]
+    pub fn data_ptr(&self) -> *mut u8 {
+        self.data
     }
 
     #[inline]
@@ -78,8 +85,6 @@ impl Column {
         self.len += 1;
     }
 
-    /// Swap-remove с вызовом drop на удаляемый элемент.
-    /// Возвращает true если был произведён swap (displaced элемент).
     pub unsafe fn swap_remove_and_drop(&mut self, row: usize) -> bool {
         debug_assert!(row < self.len);
         let last = self.len - 1;
@@ -98,7 +103,6 @@ impl Column {
         }
     }
 
-    /// Swap-remove без drop (данные переехали в другой архетип).
     pub unsafe fn swap_remove_no_drop(&mut self, row: usize) -> bool {
         debug_assert!(row < self.len);
         let last = self.len - 1;
@@ -111,7 +115,7 @@ impl Column {
     }
 
     pub(crate) fn grow(&mut self) {
-        let new_cap = if self.capacity == 0 { 4 } else { self.capacity * 2 };
+        let new_cap = if self.capacity == 0 { 16 } else { self.capacity * 2 };
         if self.item_size == 0 {
             self.capacity = new_cap;
             return;
@@ -152,7 +156,6 @@ pub struct Archetype {
     pub component_ids: SmallVec<[ComponentId; 8]>,
     pub(crate) columns: Vec<Column>,
     pub(crate) entities: Vec<Entity>,
-    /// O(1) lookup: ComponentId → column index
     column_map: FxHashMap<ComponentId, usize>,
     pub add_edges: FxHashMap<ComponentId, ArchetypeId>,
     pub remove_edges: FxHashMap<ComponentId, ArchetypeId>,
@@ -181,11 +184,8 @@ impl Archetype {
         }
     }
 
-    #[inline]
-    pub fn len(&self) -> usize { self.entities.len() }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool { self.entities.is_empty() }
+    #[inline] pub fn len(&self) -> usize { self.entities.len() }
+    #[inline] pub fn is_empty(&self) -> bool { self.entities.is_empty() }
 
     #[inline]
     pub fn column_index(&self, component_id: ComponentId) -> Option<usize> {
@@ -197,20 +197,12 @@ impl Archetype {
         self.column_map.contains_key(&component_id)
     }
 
-    pub unsafe fn get_component<T>(
-        &self,
-        row: usize,
-        component_id: ComponentId,
-    ) -> Option<&T> {
+    pub unsafe fn get_component<T>(&self, row: usize, component_id: ComponentId) -> Option<&T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get::<T>(row))
     }
 
-    pub unsafe fn get_component_mut<T>(
-        &mut self,
-        row: usize,
-        component_id: ComponentId,
-    ) -> Option<&mut T> {
+    pub unsafe fn get_component_mut<T>(&mut self, row: usize, component_id: ComponentId) -> Option<&mut T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get_mut::<T>(row))
     }
@@ -221,12 +213,7 @@ impl Archetype {
         row
     }
 
-    pub unsafe fn write_component(
-        &mut self,
-        row: usize,
-        component_id: ComponentId,
-        src: *const u8,
-    ) {
+    pub unsafe fn write_component(&mut self, row: usize, component_id: ComponentId, src: *const u8) {
         if let Some(col_idx) = self.column_index(component_id) {
             let col = &mut self.columns[col_idx];
             if row >= col.len {
@@ -237,7 +224,6 @@ impl Archetype {
         }
     }
 
-    /// Удалить строку, вернуть displaced entity (если был swap).
     pub unsafe fn remove_row(&mut self, row: usize) -> Option<Entity> {
         let last = self.entities.len() - 1;
         for col in &mut self.columns {
