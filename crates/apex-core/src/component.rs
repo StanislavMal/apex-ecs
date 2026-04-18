@@ -1,13 +1,9 @@
 use std::any::TypeId;
 use rustc_hash::FxHashMap;
 
-/// Уникальный ID компонента
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ComponentId(pub(crate) u32);
 
-/// Тик мира — монотонно растущий счётчик, инкрементируется каждый раз
-/// когда World::tick() вызывается (обычно раз в кадр).
-/// Используется для change detection.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Tick(pub u32);
 
@@ -20,7 +16,6 @@ impl Tick {
     }
 }
 
-/// Метаданные компонента
 pub struct ComponentInfo {
     pub id: ComponentId,
     pub name: &'static str,
@@ -30,26 +25,27 @@ pub struct ComponentInfo {
     pub drop_fn: unsafe fn(*mut u8),
 }
 
-/// Трейт для всех компонентов
 pub trait Component: Send + Sync + 'static {}
-
 impl<T: Send + Sync + 'static> Component for T {}
 
-unsafe fn drop_ptr<T>(ptr: *mut u8) {
+pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
     ptr.cast::<T>().drop_in_place();
 }
 
-/// Глобальный реестр компонентов
 pub struct ComponentRegistry {
     type_to_id: FxHashMap<TypeId, ComponentId>,
-    components: Vec<ComponentInfo>,
+    /// Индексированы по ComponentId.0 — но для relation ID могут быть разреженными.
+    /// Используем HashMap вместо Vec для поддержки произвольных ID.
+    by_id: FxHashMap<u32, ComponentInfo>,
+    next_id: u32,
 }
 
 impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
             type_to_id: FxHashMap::default(),
-            components: Vec::new(),
+            by_id: FxHashMap::default(),
+            next_id: 0,
         }
     }
 
@@ -58,8 +54,9 @@ impl ComponentRegistry {
         if let Some(&id) = self.type_to_id.get(&type_id) {
             return id;
         }
-        let id = ComponentId(self.components.len() as u32);
-        self.components.push(ComponentInfo {
+        let id = ComponentId(self.next_id);
+        self.next_id += 1;
+        self.by_id.insert(id.0, ComponentInfo {
             id,
             name: std::any::type_name::<T>(),
             type_id,
@@ -71,6 +68,12 @@ impl ComponentRegistry {
         id
     }
 
+    /// Зарегистрировать компонент с заранее известным ID (для relations).
+    /// Если ID уже зарегистрирован — ничего не делает.
+    pub fn register_raw(&mut self, id: ComponentId, info: ComponentInfo) {
+        self.by_id.entry(id.0).or_insert(info);
+    }
+
     pub fn get_id<T: Component>(&self) -> Option<ComponentId> {
         self.type_to_id.get(&TypeId::of::<T>()).copied()
     }
@@ -80,11 +83,11 @@ impl ComponentRegistry {
     }
 
     pub fn get_info(&self, id: ComponentId) -> Option<&ComponentInfo> {
-        self.components.get(id.0 as usize)
+        self.by_id.get(&id.0)
     }
 
     pub fn len(&self) -> usize {
-        self.components.len()
+        self.by_id.len()
     }
 }
 

@@ -1,18 +1,15 @@
 /// Apex ECS — Performance Benchmark
-///
 /// cargo run -p apex-examples --example perf --release
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
 
-#[derive(Clone, Copy)] struct Position  { x: f32, y: f32, z: f32 }
-#[derive(Clone, Copy)] struct Velocity  { x: f32, y: f32, z: f32 }
-#[derive(Clone, Copy)] struct Health    { current: f32, max: f32  }
+#[derive(Clone, Copy)] struct Position { x: f32, y: f32, z: f32 }
+#[derive(Clone, Copy)] struct Velocity { x: f32, y: f32, z: f32 }
+#[derive(Clone, Copy)] struct Health   { current: f32, max: f32  }
 #[derive(Clone, Copy)] struct Mass(f32);
 #[derive(Clone, Copy)] struct Player;
 #[derive(Clone, Copy)] struct Enemy;
-
-// ── Утилиты ────────────────────────────────────────────────────
 
 fn bench<F: FnMut() -> u64>(label: &str, mut f: F) {
     f();
@@ -25,14 +22,10 @@ fn bench<F: FnMut() -> u64>(label: &str, mut f: F) {
     }
     times.sort_by_key(|(d, _)| *d);
     let (med, n) = times[RUNS as usize / 2];
-    print_result(label, med, n);
-}
-
-fn print_result(label: &str, d: Duration, n: u64) {
-    let ns = d.as_nanos() as f64;
+    let ns = med.as_nanos() as f64;
     let ns_op = if n > 0 { ns / n as f64 } else { ns };
-    let mops = if d.as_secs_f64() > 0.0 { n as f64 / d.as_secs_f64() / 1e6 } else { f64::INFINITY };
-    println!("  {:<50} {:>7.2} ns/op  {:>8.2} M ops/s", label, ns_op, mops);
+    let mops = if med.as_secs_f64() > 0.0 { n as f64 / med.as_secs_f64() / 1e6 } else { f64::INFINITY };
+    println!("  {:<52} {:>7.2} ns/op  {:>8.2} M ops/s", label, ns_op, mops);
 }
 
 fn make_world(n: usize) -> (World, Vec<Entity>) {
@@ -73,63 +66,50 @@ fn bench_spawn(n: usize) {
         }
         (n * 1000) as u64
     });
-    bench(&format!("spawn builder chain ({n}k)"), || {
-        let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Velocity>();
-        world.register_component::<Health>();
-        for i in 0..n * 1000 {
-            let f = i as f32;
-            world.spawn()
-                .insert(Position { x: f, y: f * 0.5, z: 0.0 })
-                .insert(Velocity { x: 1.0, y: 0.0, z: 0.0 })
-                .insert(Health { current: 100.0, max: 100.0 })
-                .id();
-        }
-        (n * 1000) as u64
-    });
 }
 
-// ── Query read / write ─────────────────────────────────────────
+// ── Query vs CachedQuery ───────────────────────────────────────
 
-fn bench_query(n: usize) {
-    println!("\n── Query read/write ──────────────────────────────────────────────────────────");
+fn bench_query_vs_cached(n: usize) {
+    println!("\n── Query vs CachedQuery ──────────────────────────────────────────────────────");
     let (world, _) = make_world(n * 1000);
 
-    bench(&format!("Query<Read<Pos>> for_each ({n}k)"), || {
+    bench(&format!("Query::new + for_each ({n}k)  [no cache]"), || {
         let mut sum = 0.0f32;
-        Query::<Read<Position>>::new(&world).for_each_component(|pos| { sum += pos.x + pos.y; });
+        Query::<Read<Position>>::new(&world).for_each_component(|pos| { sum += pos.x; });
         std::hint::black_box(sum);
         (n * 1000) as u64
     });
 
-    bench(&format!("Query<(Read<Pos>, Read<Vel>)> for_each ({n}k)"), || {
+    bench(&format!("CachedQuery::new + for_each ({n}k)  [cached]"), || {
         let mut sum = 0.0f32;
-        Query::<(Read<Position>, Read<Velocity>)>::new(&world)
-            .for_each_component(|(pos, vel)| { sum += pos.x + vel.x; });
+        world.query_typed::<Read<Position>>().for_each_component(|pos| { sum += pos.x; });
         std::hint::black_box(sum);
         (n * 1000) as u64
     });
 
-    bench(&format!("Query<(Read<Vel>, Write<Pos>)> for_each ({n}k)"), || {
+    bench(&format!("Query<(Read<Vel>, Write<Pos>)> ({n}k)"), || {
         Query::<(Read<Velocity>, Write<Position>)>::new(&world)
+            .for_each_component(|(vel, pos)| { pos.x += vel.x; pos.y += vel.y; });
+        (n * 1000) as u64
+    });
+
+    bench(&format!("CachedQuery<(Read<Vel>, Write<Pos>)> ({n}k)"), || {
+        world.query_typed::<(Read<Velocity>, Write<Position>)>()
             .for_each_component(|(vel, pos)| { pos.x += vel.x; pos.y += vel.y; });
         (n * 1000) as u64
     });
 }
 
-// ── With / Without фильтры ─────────────────────────────────────
+// ── Filters ────────────────────────────────────────────────────
 
 fn bench_filters(n: usize) {
     println!("\n── Filters: With / Without ───────────────────────────────────────────────────");
-
-    // Мир: половина entity — Player, половина — Enemy
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
     world.register_component::<Player>();
     world.register_component::<Enemy>();
-
     for i in 0..n * 1000 {
         let f = i as f32;
         if i % 2 == 0 {
@@ -138,100 +118,151 @@ fn bench_filters(n: usize) {
             world.spawn_bundle((Position { x: f, y: 0.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, Enemy));
         }
     }
+    println!("  {} archetypes (Player + Enemy)", world.archetype_count());
 
-    println!("  World: {}k entities, {} archetypes (Player arch + Enemy arch)",
-        n, world.archetype_count());
-
-    // Без фильтра — все entity
-    bench(&format!("Query<Read<Pos>> no filter ({n}k)"), || {
-        let mut sum = 0.0f32;
-        Query::<Read<Position>>::new(&world).for_each_component(|pos| { sum += pos.x; });
-        std::hint::black_box(sum);
-        (n * 1000) as u64
+    bench(&format!("Query<Read<Pos>> all ({n}k)"), || {
+        let mut s = 0.0f32;
+        Query::<Read<Position>>::new(&world).for_each_component(|p| { s += p.x; });
+        std::hint::black_box(s); (n * 1000) as u64
     });
-
-    // With<Player> — только половина
     bench(&format!("Query<(Read<Pos>, With<Player>)> ({}k)", n/2), || {
-        let mut sum = 0.0f32;
+        let mut s = 0.0f32;
         Query::<(Read<Position>, With<Player>)>::new(&world)
-            .for_each_component(|(pos, _)| { sum += pos.x; });
-        std::hint::black_box(sum);
-        (n * 500) as u64
+            .for_each_component(|(p, _)| { s += p.x; });
+        std::hint::black_box(s); (n * 500) as u64
     });
-
-    // Without<Enemy> — только Player entity
     bench(&format!("Query<(Read<Pos>, Without<Enemy>)> ({}k)", n/2), || {
-        let mut sum = 0.0f32;
+        let mut s = 0.0f32;
         Query::<(Read<Position>, Without<Enemy>)>::new(&world)
-            .for_each_component(|(pos, _)| { sum += pos.x; });
-        std::hint::black_box(sum);
-        (n * 500) as u64
-    });
-
-    // With<Player> + Without<Enemy> — комбинированный фильтр
-    bench(&format!("Query<(Read<Pos>, With<Player>, Without<Enemy>)> ({}k)", n/2), || {
-        let mut sum = 0.0f32;
-        Query::<(Read<Position>, With<Player>, Without<Enemy>)>::new(&world)
-            .for_each_component(|(pos, _, _)| { sum += pos.x; });
-        std::hint::black_box(sum);
-        (n * 500) as u64
+            .for_each_component(|(p, _)| { s += p.x; });
+        std::hint::black_box(s); (n * 500) as u64
     });
 }
 
 // ── Change detection ───────────────────────────────────────────
 
 fn bench_change_detection(n: usize) {
-    println!("\n── Change detection: Changed<T> ──────────────────────────────────────────────");
-
+    println!("\n── Change detection ──────────────────────────────────────────────────────────");
     let (mut world, entities) = make_world(n * 1000);
-
-    // Тик 1: spawn (все компоненты помечены как changed)
-    let tick_after_spawn = world.current_tick();
-
-    // Тик 2: изменяем только 10% entity
+    let tick_spawn = world.current_tick();
     world.tick();
-    let changed_count = n * 100; // 10%
-    for &e in entities.iter().take(changed_count) {
-        if let Some(pos) = world.get_mut::<Position>(e) {
-            pos.x += 1.0;
+    for &e in entities.iter().take(n * 100) {
+        if let Some(p) = world.get_mut::<Position>(e) { p.x += 1.0; }
+    }
+
+    bench(&format!("Changed<Pos> all {n}k changed (baseline)"), || {
+        let mut c = 0u64;
+        Query::<Changed<Position>>::new_with_tick(&world, Tick::ZERO)
+            .for_each_component(|_| { c += 1; });
+        c
+    });
+    bench(&format!("Changed<Pos> 10% changed ({} entities)", n * 100), || {
+        let mut c = 0u64;
+        Query::<Changed<Position>>::new_with_tick(&world, tick_spawn)
+            .for_each_component(|_| { c += 1; });
+        c
+    });
+    bench(&format!("Read<Pos> baseline ({n}k)"), || {
+        let mut s = 0.0f32;
+        Query::<Read<Position>>::new(&world).for_each_component(|p| { s += p.x; });
+        std::hint::black_box(s); (n * 1000) as u64
+    });
+}
+
+// ── Relations ──────────────────────────────────────────────────
+
+fn bench_relations(n: usize) {
+    println!("\n── Relations ─────────────────────────────────────────────────────────────────");
+
+    // Сценарий: N родителей, каждый с 10 детьми
+    let children_per_parent = 10usize;
+    let parent_count = n * 100; // 10k родителей при n=100
+    let total = parent_count * (1 + children_per_parent);
+
+    bench(&format!("add_relation ChildOf ({total} entities, {parent_count} parents)"), || {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parents: Vec<Entity> = (0..parent_count)
+            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
+            .collect();
+        for &parent in &parents {
+            for j in 0..children_per_parent {
+                let child = world.spawn_bundle((Position { x: j as f32, y: 0.0, z: 0.0 },));
+                world.add_relation(child, ChildOf, parent);
+            }
+        }
+        total as u64
+    });
+
+    // Бенчмарк query_relation для конкретного родителя
+    let mut world = World::new();
+    world.register_component::<Position>();
+    let parents: Vec<Entity> = (0..parent_count)
+        .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
+        .collect();
+    for &parent in &parents {
+        for j in 0..children_per_parent {
+            let child = world.spawn_bundle((Position { x: j as f32, y: 0.0, z: 0.0 },));
+            world.add_relation(child, ChildOf, parent);
         }
     }
-    let tick_after_partial_update = world.current_tick();
+    let test_parent = parents[0];
+    println!("  Archetypes after relation setup: {}", world.archetype_count());
 
-    // Changed<Pos> после spawn — все entity changed
-    bench(&format!("Changed<Pos> after spawn — all {n}k changed"), || {
+    bench(&format!("query_relation<ChildOf>(parent) — {children_per_parent} children"), || {
+        let mut s = 0.0f32;
+        for (_, pos) in world.query_relation::<ChildOf, Read<Position>>(ChildOf, test_parent) {
+            s += pos.x;
+        }
+        std::hint::black_box(s);
+        children_per_parent as u64
+    });
+
+    bench(&format!("children_of<ChildOf>(parent) — {children_per_parent} children"), || {
         let mut count = 0u64;
-        Query::<Changed<Position>>::new_with_tick(&world, Tick::ZERO)
-            .for_each_component(|_pos| { count += 1; });
+        for _ in world.children_of(ChildOf, test_parent) { count += 1; }
         count
     });
 
-    // Changed<Pos> после частичного обновления — только 10%
-    bench(&format!("Changed<Pos> after 10% update — {changed_count} changed"), || {
+    bench(&format!("has_relation check ({}k)", n), || {
         let mut count = 0u64;
-        Query::<Changed<Position>>::new_with_tick(&world, tick_after_spawn)
-            .for_each_component(|_pos| { count += 1; });
-        count
+        for &parent in parents.iter().take(n * 1000 / children_per_parent) {
+            if world.has_relation(parents[0], ChildOf, parent) { count += 1; }
+        }
+        count.max(1)
     });
+}
 
-    // Для сравнения: Read<Pos> без фильтра
-    bench(&format!("Read<Pos> no filter (baseline {n}k)"), || {
-        let mut sum = 0.0f32;
-        Query::<Read<Position>>::new(&world).for_each_component(|pos| { sum += pos.x; });
-        std::hint::black_box(sum);
+// ── Commands ───────────────────────────────────────────────────
+
+fn bench_commands(n: usize) {
+    println!("\n── Commands (typed enum, no Box alloc for Despawn) ───────────────────────────");
+    bench(&format!("Commands::despawn + apply ({n}k)"), || {
+        let (mut world, _) = make_world(n * 1000);
+        let mut cmds = Commands::with_capacity(n * 1000);
+        Query::<Read<Health>>::new(&world).for_each(|e, _| { cmds.despawn(e); });
+        cmds.apply(&mut world);
         (n * 1000) as u64
     });
-
-    println!("  Verified: {} entities changed in tick {:?}",
-        Query::<Changed<Position>>::new_with_tick(&world, tick_after_spawn).len(),
-        tick_after_partial_update);
+    bench(&format!("Commands::insert + apply ({n}k)"), || {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Mass>();
+        let entities: Vec<Entity> = (0..n * 1000)
+            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
+            .collect();
+        let mut cmds = Commands::with_capacity(n * 1000);
+        for &e in &entities { cmds.insert(e, Mass(1.0)); }
+        cmds.apply(&mut world);
+        (n * 1000) as u64
+    });
 }
 
 // ── Structural changes ─────────────────────────────────────────
 
 fn bench_structural(n: usize) {
     println!("\n── Structural changes ────────────────────────────────────────────────────────");
-    bench(&format!("insert new component ({n}k)"), || {
+    bench(&format!("insert component ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
@@ -260,55 +291,24 @@ fn bench_structural(n: usize) {
     });
 }
 
-// ── Commands ───────────────────────────────────────────────────
-
-fn bench_commands(n: usize) {
-    println!("\n── Commands ──────────────────────────────────────────────────────────────────");
-    bench(&format!("Commands::despawn + apply ({n}k)"), || {
-        let (mut world, _) = make_world(n * 1000);
-        let mut cmds = Commands::with_capacity(n * 1000);
-        Query::<Read<Health>>::new(&world).for_each(|entity, _| { cmds.despawn(entity); });
-        cmds.apply(&mut world);
-        (n * 1000) as u64
-    });
-    bench(&format!("Commands::insert + apply ({n}k)"), || {
-        let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Mass>();
-        let entities: Vec<Entity> = (0..n * 1000)
-            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
-            .collect();
-        let mut cmds = Commands::with_capacity(n * 1000);
-        for &e in &entities { cmds.insert(e, Mass(1.0)); }
-        cmds.apply(&mut world);
-        (n * 1000) as u64
-    });
-}
-
-// ── Summary ────────────────────────────────────────────────────
-
-fn print_summary(n: usize) {
-    println!("\n── Summary ───────────────────────────────────────────────────────────────────");
-    let (world, _) = make_world(n * 1000);
-    println!("  {}k entities, {} archetypes", n, world.archetype_count());
-    println!("  Query<Read<Pos>>                  len = {}", Query::<Read<Position>>::new(&world).len());
-    println!("  Query<(Read<Pos>, With<Player>)>  len = {} (Player not registered → 0 expected)",
-        Query::<(Read<Position>, With<Player>)>::new(&world).len());
-    println!("  current_tick = {:?}", world.current_tick());
-}
-
 fn main() {
     println!("=== Apex ECS — Performance Benchmark ===");
-    println!("Build: {}", if cfg!(debug_assertions) { "DEBUG ⚠ запусти с --release!" } else { "RELEASE ✓" });
+    println!("Build: {}", if cfg!(debug_assertions) { "DEBUG ⚠" } else { "RELEASE ✓" });
     println!();
 
     const N: usize = 100;
 
     bench_spawn(N);
-    bench_query(N);
+    bench_query_vs_cached(N);
     bench_filters(N);
     bench_change_detection(N);
-    bench_structural(N);
+    bench_relations(N);
     bench_commands(N);
-    print_summary(N);
+    bench_structural(N);
+
+    println!("\n── Summary ───────────────────────────────────────────────────────────────────");
+    let (world, _) = make_world(N * 1000);
+    println!("  {}k entities, {} archetypes", N, world.archetype_count());
+    println!("  CachedQuery<Read<Pos>> len = {}", world.query_typed::<Read<Position>>().len());
+    println!("  current_tick = {:?}", world.current_tick());
 }
