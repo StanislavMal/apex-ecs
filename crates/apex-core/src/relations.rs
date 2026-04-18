@@ -1,21 +1,4 @@
 //! Relations — связи между entity, архитектура по образцу Flecs.
-//!
-//! ## Ключевые идеи из Flecs
-//!
-//! 1. **Id record (обратный индекс)** — каждый ComponentId (включая relation_id)
-//!    имеет запись `IdRecord { archetypes: Vec<ArchetypeId> }`. При создании
-//!    архетипа с relation_id он немедленно регистрируется в этом индексе.
-//!    Это делает `query_relation` O(1) вместо O(archetypes).
-//!
-//! 2. **Wildcard** — `query_wildcard::<ChildOf>()` находит все entity у которых
-//!    есть хоть какой-то ChildOf, независимо от target. Реализуется через
-//!    отдельный wildcard_id = `RELATION_FLAG | (kind_idx << 20) | WILDCARD_TARGET`.
-//!
-//! 3. **Каскадный despawn** — при `despawn(parent)` все entity с `ChildOf(parent)`
-//!    тоже despawn'ятся рекурсивно. Как `OnDeleteTarget::Delete` в Flecs.
-//!
-//! 4. **RelationData<R, D>** — relation может нести данные (не только ZST).
-//!    Например `Distance(f32)` между двумя entity.
 
 use std::any::TypeId;
 use rustc_hash::FxHashMap;
@@ -31,22 +14,16 @@ use crate::{
 
 // ── Константы кодирования ──────────────────────────────────────
 
-/// Старший бит = relation flag
 pub(crate) const RELATION_FLAG: u32 = 1 << 31;
+const WILDCARD_TARGET: u32 = (1 << 20) - 1;
 
-/// Зарезервированный target для wildcard запросов
-/// `query_wildcard::<ChildOf>()` → ищет ChildOf(*)
-const WILDCARD_TARGET: u32 = (1 << 20) - 1; // все биты target = 1
-
-/// Кодирует (kind_idx, target_entity_index) → ComponentId
 #[inline]
 pub(crate) fn encode_relation(kind_idx: u32, target_idx: u32) -> ComponentId {
-    debug_assert!(kind_idx < (1 << 11), "too many relation kinds (max 2048)");
-    debug_assert!(target_idx < WILDCARD_TARGET, "entity index too large for relation");
+    debug_assert!(kind_idx < (1 << 11), "too many relation kinds");
+    debug_assert!(target_idx < WILDCARD_TARGET, "entity index too large");
     ComponentId(RELATION_FLAG | (kind_idx << 20) | target_idx)
 }
 
-/// Wildcard ComponentId для данного kind — матчит любой target
 #[inline]
 pub(crate) fn wildcard_id(kind_idx: u32) -> ComponentId {
     ComponentId(RELATION_FLAG | (kind_idx << 20) | WILDCARD_TARGET)
@@ -72,25 +49,19 @@ fn is_wildcard(id: ComponentId) -> bool {
     decode_target(id) == WILDCARD_TARGET
 }
 
-// ── IdRecord — обратный индекс ─────────────────────────────────
+// ── IdRecord ───────────────────────────────────────────────────
 
-/// Запись для одного ComponentId: список архетипов которые его содержат.
-/// Это ключевая структура из Flecs — делает query O(1).
 #[derive(Default)]
 pub(crate) struct IdRecord {
-    /// Архетипы содержащие этот ComponentId (точный match)
     pub archetypes: SmallVec<[ArchetypeId; 4]>,
 }
 
-/// Глобальный обратный индекс: ComponentId → IdRecord
 #[derive(Default)]
 pub(crate) struct IdIndex {
     records: FxHashMap<u32, IdRecord>,
 }
 
 impl IdIndex {
-    /// Зарегистрировать архетип для данного ComponentId.
-    /// Вызывается при создании нового архетипа.
     pub fn register_archetype(&mut self, component_id: ComponentId, arch_id: ArchetypeId) {
         self.records
             .entry(component_id.0)
@@ -98,7 +69,6 @@ impl IdIndex {
             .archetypes
             .push(arch_id);
 
-        // Если это relation — также регистрируем в wildcard записи
         if is_relation_id(component_id) && !is_wildcard(component_id) {
             let wid = wildcard_id(decode_kind(component_id));
             self.records
@@ -109,7 +79,6 @@ impl IdIndex {
         }
     }
 
-    /// Получить список архетипов для ComponentId. O(1).
     #[inline]
     pub fn get(&self, component_id: ComponentId) -> &[ArchetypeId] {
         self.records
@@ -117,28 +86,88 @@ impl IdIndex {
             .map(|r| r.archetypes.as_slice())
             .unwrap_or(&[])
     }
+}
 
-    /// Удалить архетип из всех записей (при инвалидации — не используется,
-    /// архетипы никогда не удаляются, только растут).
-    #[allow(dead_code)]
-    pub fn remove_archetype(&mut self, component_id: ComponentId, arch_id: ArchetypeId) {
-        if let Some(record) = self.records.get_mut(&component_id.0) {
-            record.archetypes.retain(|id| *id != arch_id);
+// ── SubjectIndex — НОВЫЙ: entity-level обратный индекс ────────
+//
+// Проблема: has_relation делает get_location → archetype lookup.
+// При 10k архетипов это O(1) но с большим константным фактором
+// (FxHashMap lookup в column_map).
+//
+// Решение: храним для каждого entity множество его relation_id.
+// has_relation → SubjectIndex lookup → O(1) битовая проверка.
+//
+// subject_index[entity.index] = set of active relation ComponentIds
+
+pub(crate) struct SubjectIndex {
+    /// entity_index → список relation ComponentId которые есть у entity
+    /// SmallVec<[u32; 4]> — большинство entity имеют < 4 relations
+    relations: Vec<SmallVec<[u32; 4]>>,
+}
+
+impl SubjectIndex {
+    pub fn new() -> Self {
+        Self { relations: Vec::new() }
+    }
+
+    fn ensure(&mut self, entity_index: usize) {
+        if entity_index >= self.relations.len() {
+            self.relations.resize_with(entity_index + 1, SmallVec::new);
+        }
+    }
+
+    #[inline]
+    pub fn add(&mut self, entity_index: u32, relation_id: ComponentId) {
+        let idx = entity_index as usize;
+        self.ensure(idx);
+        let slot = &mut self.relations[idx];
+        if !slot.contains(&relation_id.0) {
+            slot.push(relation_id.0);
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, entity_index: u32, relation_id: ComponentId) {
+        let idx = entity_index as usize;
+        if idx < self.relations.len() {
+            self.relations[idx].retain(|id| *id != relation_id.0);
+        }
+    }
+
+    /// O(N) где N = кол-во relations у entity (обычно < 4) → фактически O(1)
+    #[inline]
+    pub fn has(&self, entity_index: u32, relation_id: ComponentId) -> bool {
+        let idx = entity_index as usize;
+        idx < self.relations.len()
+            && self.relations[idx].contains(&relation_id.0)
+    }
+
+    // Получить все relation_id для entity (для get_relation_target)
+    #[inline]
+    pub fn get_all(&self, entity_index: u32) -> &[u32] {
+        let idx = entity_index as usize;
+        if idx < self.relations.len() {
+            &self.relations[idx]
+        } else {
+            &[]
+        }
+    }
+
+    pub fn clear_entity(&mut self, entity_index: u32) {
+        let idx = entity_index as usize;
+        if idx < self.relations.len() {
+            self.relations[idx].clear();
         }
     }
 }
 
-// ── RelationKind trait ─────────────────────────────────────────
+impl Default for SubjectIndex {
+    fn default() -> Self { Self::new() }
+}
 
-/// Маркер типа связи. Реализуется для unit-struct'ов.
-///
-/// ```ignore
-/// struct ChildOf;
-/// impl RelationKind for ChildOf {}
-/// ```
+// ── RelationKind ───────────────────────────────────────────────
+
 pub trait RelationKind: Copy + Send + Sync + 'static {
-    /// Если true — при despawn target каскадно despawn'ятся все subjects.
-    /// Аналог `OnDeleteTarget::Delete` в Flecs.
     fn cascade_delete_on_target_despawn() -> bool { false }
 }
 
@@ -146,7 +175,6 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
 
 pub struct RelationRegistry {
     type_to_idx: FxHashMap<TypeId, u32>,
-    /// Флаги каскадного удаления по kind_idx
     cascade_flags: Vec<bool>,
     next_idx: u32,
 }
@@ -176,6 +204,7 @@ impl RelationRegistry {
         self.type_to_idx.get(&TypeId::of::<R>()).copied()
     }
 
+    #[allow(dead_code)]
     pub fn is_cascade(&self, kind_idx: u32) -> bool {
         self.cascade_flags.get(kind_idx as usize).copied().unwrap_or(false)
     }
@@ -188,13 +217,15 @@ impl Default for RelationRegistry {
 // ── World extension ────────────────────────────────────────────
 
 impl World {
-    // ── Добавление / удаление ──────────────────────────────────
-
     /// Добавить relation `(R, target)` к entity `subject`.
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         let kind_idx = self.relations.get_or_register::<R>();
         let relation_id = encode_relation(kind_idx, target.index);
         self.ensure_relation_component(relation_id);
+
+        // Обновляем SubjectIndex ДО structural change
+        self.subject_index.add(subject.index, relation_id);
+
         self.insert_relation_component(subject, relation_id);
     }
 
@@ -205,28 +236,28 @@ impl World {
             None => return,
         };
         let relation_id = encode_relation(kind_idx, target.index);
+
+        // Убираем из SubjectIndex
+        self.subject_index.remove(subject.index, relation_id);
+
         self.remove_relation_component(subject, relation_id);
     }
 
-    /// Проверить наличие relation `(R, target)` у entity `subject`. O(1).
+    /// Проверить наличие relation `(R, target)` у entity `subject`.
+    /// O(1) через SubjectIndex — не зависит от числа архетипов.
     #[inline]
     pub fn has_relation<R: RelationKind>(&self, subject: Entity, _kind: R, target: Entity) -> bool {
+        if !self.entities.is_alive(subject) { return false; }
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
             None => return false,
         };
         let relation_id = encode_relation(kind_idx, target.index);
-        let location = match self.entities.get_location(subject) {
-            Some(loc) => loc,
-            None => return false,
-        };
-        self.archetypes[location.archetype_id.0 as usize].has_component(relation_id)
+        self.subject_index.has(subject.index, relation_id)
     }
 
     // ── Query по конкретному target ────────────────────────────
 
-    /// Итерация по всем entity у которых есть `(R, target)`.
-    /// O(1) lookup через IdIndex, затем итерация только по matching архетипам.
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -242,7 +273,6 @@ impl World {
         Q::fill_ids(self, &mut data_ids);
         let all_found = data_ids.len() == Q::component_count();
 
-        // O(1) — берём список архетипов из IdIndex
         let arch_ids = self.id_index.get(relation_id);
 
         let arch_states: Vec<RelationArchState<Q::State>> = if all_found {
@@ -264,7 +294,6 @@ impl World {
     }
 
     /// Wildcard query: все entity у которых есть хоть какой-то `R` relation.
-    /// O(1) lookup через wildcard IdRecord.
     pub fn query_wildcard<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -299,7 +328,7 @@ impl World {
         RelationIter { world: self, arch_states, arch_cursor: 0, row_cursor: 0 }
     }
 
-    /// Прямые дочерние entity (ChildOf relation). O(1) lookup.
+    /// Прямые дочерние entity. O(1) lookup через IdIndex.
     pub fn children_of<'w, R: RelationKind>(
         &'w self,
         _kind: R,
@@ -312,38 +341,32 @@ impl World {
             .map(|rid| self.id_index.get(rid))
             .unwrap_or(&[]);
 
-        // Собираем entity из всех matching архетипов
         arch_ids.iter()
             .flat_map(move |&arch_id| {
-                let arch = &self.archetypes[arch_id.0 as usize];
-                arch.entities.iter().copied()
+                self.archetypes[arch_id.0 as usize].entities.iter().copied()
             })
     }
 
-    /// Получить target entity для relation `(R, ?)` у subject. O(1).
-    /// Возвращает первый найденный target (обычно у entity один target на kind).
+    /// Получить target entity для relation `(R, ?)` у subject.
+    /// O(1) через SubjectIndex.
     pub fn get_relation_target<R: RelationKind>(
         &self,
         subject: Entity,
         _kind: R,
     ) -> Option<Entity> {
         let kind_idx = self.relations.get_idx::<R>()?;
-        let location = self.entities.get_location(subject)?;
-        let arch = &self.archetypes[location.archetype_id.0 as usize];
-
-        // Ищем первый relation_id с нужным kind в архетипе
-        for &cid in &arch.component_ids {
+        // Ищем в SubjectIndex — не трогаем архетипы вообще
+        for &raw_id in self.subject_index.get_all(subject.index) {
+            let cid = ComponentId(raw_id);
             if is_relation_id(cid) && decode_kind(cid) == kind_idx && !is_wildcard(cid) {
                 let target_idx = decode_target(cid);
-                // Восстанавливаем Entity — нужен обратный lookup generation
-                return self.entities_by_index(target_idx);
+                return self.entities.get_by_index(target_idx);
             }
         }
         None
     }
 
-    /// Каскадный despawn: уничтожить entity и всех его потомков
-    /// у которых есть cascade relation (например ChildOf).
+    /// Каскадный despawn рекурсивно.
     pub fn despawn_recursive<R: RelationKind + Copy>(&mut self, _kind: R, entity: Entity) {
         let children: Vec<Entity> = self.children_of(_kind, entity).collect();
         for child in children {
@@ -377,10 +400,12 @@ impl World {
         }
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, relation_id);
         let new_row = self.move_entity(entity, location, new_arch_id);
+        // ZST relation — только тик, данных нет
         let tick = self.current_tick;
         if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
-            self.archetypes[new_arch_id.0 as usize].columns[col_idx].change_ticks.push(tick);
-            self.archetypes[new_arch_id.0 as usize].columns[col_idx].len += 1;
+            let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
+            col.change_ticks.push(tick);
+            col.len += 1;
         }
         self.entities.set_location(entity, crate::entity::EntityLocation {
             archetype_id: new_arch_id,
@@ -402,11 +427,6 @@ impl World {
             archetype_id: new_arch_id,
             row: new_row,
         });
-    }
-
-    /// Найти Entity по индексу (O(1) через EntityAllocator).
-    fn entities_by_index(&self, index: u32) -> Option<Entity> {
-        self.entities.get_by_index(index)
     }
 }
 
@@ -455,19 +475,16 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
 
 // ── Встроенные relation kinds ──────────────────────────────────
 
-/// Иерархия сцены. Каскадный despawn при удалении родителя.
 #[derive(Clone, Copy)]
 pub struct ChildOf;
 impl RelationKind for ChildOf {
     fn cascade_delete_on_target_despawn() -> bool { true }
 }
 
-/// Владение item entity.
 #[derive(Clone, Copy)]
 pub struct Owns;
 impl RelationKind for Owns {}
 
-/// Произвольная направленная связь.
 #[derive(Clone, Copy)]
 pub struct Likes;
 impl RelationKind for Likes {}
@@ -544,7 +561,15 @@ mod tests {
         assert!(all_children.contains(&c1));
         assert!(all_children.contains(&c2));
         assert!(!all_children.contains(&standalone));
-    }
+/*************  ✨ Windsurf Command ⭐  *************/
+// Recursively despawns all entities that have a given relation (e.g. ChildOf)
+// with the given entity, and all their children, and so on.
+//
+// This is useful for cleaning up complex entity hierarchies.
+//
+// # Example
+//
+/*******  820ec2b9-4631-4537-b89a-c2ca812ae617  *******/    }
 
     #[test]
     fn children_of_o1() {
@@ -575,5 +600,44 @@ mod tests {
         assert_eq!(world.entity_count(), 3);
         world.despawn_recursive(ChildOf, root);
         assert_eq!(world.entity_count(), 0);
+    }
+
+    #[test]
+    fn has_relation_fast_path() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        let parents: Vec<Entity> = (0..100)
+            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0 },)))
+            .collect();
+
+        let children: Vec<Entity> = (0..100)
+            .map(|i| {
+                let c = world.spawn_bundle((Position { x: i as f32, y: 0.0 },));
+                world.add_relation(c, ChildOf, parents[i]);
+                c
+            })
+            .collect();
+
+        // has_relation через SubjectIndex — O(1)
+        for i in 0..100 {
+            assert!(world.has_relation(children[i], ChildOf, parents[i]));
+            // Неправильный parent — должно быть false
+            let other = (i + 1) % 100;
+            assert!(!world.has_relation(children[i], ChildOf, parents[other]));
+        }
+    }
+
+    #[test]
+    fn get_relation_target() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
+        let child  = world.spawn_bundle((Position { x: 1.0, y: 0.0 },));
+
+        world.add_relation(child, ChildOf, parent);
+
+        let target = world.get_relation_target(child, ChildOf);
+        assert_eq!(target, Some(parent));
     }
 }

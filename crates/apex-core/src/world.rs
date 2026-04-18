@@ -7,7 +7,7 @@ use crate::{
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{EntityAllocator, EntityLocation, Entity},
     query::{QueryBuilder, WorldQuery},
-    relations::{IdIndex, RelationRegistry},
+    relations::{IdIndex, RelationRegistry, SubjectIndex},
 };
 
 // ── QueryCache ─────────────────────────────────────────────────
@@ -17,18 +17,11 @@ struct CacheEntry {
     version: u32,
 }
 
-/// Кеш matching архетипов. Хранится в UnsafeCell чтобы мутировать
-/// через &World (Query::new принимает &World).
-///
-/// Safety: доступ только из однопоточного контекста Query::new.
-/// При параллельном использовании кеш отключается (каждый поток
-/// строит свой список архетипов).
 pub(crate) struct QueryCache {
     entries: UnsafeCell<FxHashMap<Vec<ComponentId>, CacheEntry>>,
     version: u32,
 }
 
-// Safety: QueryCache используется только из &World в однопоточном контексте
 unsafe impl Sync for QueryCache {}
 
 impl QueryCache {
@@ -39,8 +32,6 @@ impl QueryCache {
         }
     }
 
-    /// Получить или вычислить список matching архетипов.
-    /// Safety: вызывается только из однопоточного Query::new.
     pub unsafe fn get_or_compute(
         &self,
         key: &[ComponentId],
@@ -82,9 +73,9 @@ pub struct World {
     pub(crate) current_tick: Tick,
     pub(crate) query_cache: QueryCache,
     pub(crate) relations: RelationRegistry,
-    /// Обратный индекс ComponentId → Vec<ArchetypeId>.
-    /// Ключевая структура из Flecs — делает query_relation O(1).
     pub(crate) id_index: IdIndex,
+    /// Быстрый entity-level индекс relations — ключ к O(1) has_relation
+    pub(crate) subject_index: SubjectIndex,
 }
 
 impl World {
@@ -98,6 +89,7 @@ impl World {
             query_cache: QueryCache::new(),
             relations: RelationRegistry::new(),
             id_index: IdIndex::default(),
+            subject_index: SubjectIndex::new(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
@@ -201,6 +193,10 @@ impl World {
             Some(loc) => loc,
             None => return false,
         };
+
+        // Очищаем SubjectIndex для этого entity
+        self.subject_index.clear_entity(entity.index);
+
         let arch_idx = location.archetype_id.0 as usize;
         unsafe {
             if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row) {
@@ -246,17 +242,14 @@ impl World {
 
     // ── Query API ──────────────────────────────────────────────
 
-    /// Typed zero-cost query с QueryCache
     pub fn query_typed<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, Tick::ZERO)
     }
 
-    /// Typed query с change detection
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, last_run)
     }
 
-    /// Legacy QueryBuilder
     pub fn query(&self) -> QueryBuilder<'_> {
         QueryBuilder::new(self)
     }
@@ -266,7 +259,11 @@ impl World {
 
     // ── Внутренние методы ──────────────────────────────────────
 
-    pub(crate) fn find_or_create_archetype_with(&mut self, current: ArchetypeId, add: ComponentId) -> ArchetypeId {
+    pub(crate) fn find_or_create_archetype_with(
+        &mut self,
+        current: ArchetypeId,
+        add: ComponentId,
+    ) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].add_edges.get(&add) {
             return id;
         }
@@ -280,12 +277,18 @@ impl World {
         new_id
     }
 
-    pub(crate) fn find_or_create_archetype_without(&mut self, current: ArchetypeId, remove: ComponentId) -> ArchetypeId {
+    pub(crate) fn find_or_create_archetype_without(
+        &mut self,
+        current: ArchetypeId,
+        remove: ComponentId,
+    ) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].remove_edges.get(&remove) {
             return id;
         }
         let new_components: Vec<ComponentId> = self.archetypes[current.0 as usize]
-            .component_ids.iter().copied().filter(|&id| id != remove).collect();
+            .component_ids.iter().copied()
+            .filter(|&id| id != remove)
+            .collect();
         let new_id = self.get_or_create_archetype(new_components);
         self.archetypes[current.0 as usize].remove_edges.insert(remove, new_id);
         self.archetypes[new_id.0 as usize].add_edges.insert(remove, current);
@@ -302,7 +305,6 @@ impl World {
             .filter_map(|&cid| self.registry.get_info(cid))
             .collect();
         let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
-        // Регистрируем все компоненты нового архетипа в IdIndex
         for &cid in &arch.component_ids {
             self.id_index.register_archetype(cid, id);
         }
@@ -357,8 +359,11 @@ impl World {
         unsafe {
             let from_last = self.archetypes[from_idx].entities.len() - 1;
             for (i, col) in self.archetypes[from_idx].columns.iter_mut().enumerate() {
-                if is_common[i] { col.swap_remove_no_drop(from_row); }
-                else { col.swap_remove_and_drop(from_row); }
+                if is_common[i] {
+                    col.swap_remove_no_drop(from_row);
+                } else {
+                    col.swap_remove_and_drop(from_row);
+                }
             }
             if from_row != from_last {
                 let displaced = self.archetypes[from_idx].entities[from_last];
@@ -381,9 +386,6 @@ impl Default for World {
 }
 
 // ── CachedQuery ────────────────────────────────────────────────
-//
-// Обёртка над Query которая использует QueryCache для O(1) lookup
-// matching архетипов при повторных вызовах с теми же компонентами.
 
 pub struct CachedQuery<'w, Q: WorldQuery> {
     world: &'w World,
@@ -447,7 +449,6 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         }
     }
 
-    /// Параллельный for_each — параллелизм по строкам внутри каждого архетипа
     #[cfg(feature = "parallel")]
     pub fn par_for_each<F>(&self, chunk_size: usize, f: F)
     where
@@ -457,13 +458,11 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         use rayon::prelude::*;
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(self.world, &mut ids);
-
         for &arch_idx in self.arch_indices {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
             let state = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
             let len = arch.len();
-
             (0..len).into_par_iter().chunks(chunk_size).for_each(|chunk| {
                 for row in chunk {
                     if let Some(item) = unsafe { Q::fetch_item(state, row) } {
