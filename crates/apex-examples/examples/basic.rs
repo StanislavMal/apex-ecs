@@ -127,9 +127,9 @@ fn main() {
     // ── Scheduler ──────────────────────────────────────────────
     println!("\n=== Scheduler ===");
     let mut scheduler = Scheduler::new();
-    let movement_id = scheduler.add_system("movement",     |_| println!("  [movement] running..."));
-    let health_id   = scheduler.add_system("health_check", |_| println!("  [health_check] running..."));
-    let render_id   = scheduler.add_system("render",       |_| println!("  [render] running..."));
+    let movement_id = scheduler.add_system("movement",     |_| println!("  [movement] running...")).id();
+    let health_id   = scheduler.add_system("health_check", |_| println!("  [health_check] running...")).id();
+    let render_id   = scheduler.add_system("render",       |_| println!("  [render] running...")).id();
     scheduler.add_dependency(health_id, movement_id);
     scheduler.add_dependency(render_id, health_id);
     scheduler.compile().unwrap();

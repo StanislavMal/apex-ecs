@@ -332,10 +332,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     pub fn par_for_each<F>(&self, f: F)
     where
         F: Fn(Entity, Q::Item<'_>) + Send + Sync,
-        Q::Item<'_>: Send,
+        for<'a> Q::Item<'a>: Send,
+        Q::State: Send + Sync,
     {
         use rayon::prelude::*;
-        self.archetypes.par_iter().for_each(|a| {
+        self.archetypes.as_slice().par_iter().for_each(|a| {
             let entities = &self.world.archetypes[a.arch_idx].entities;
             for row in 0..a.len {
                 if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
@@ -350,10 +351,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     pub fn par_for_each_component<F>(&self, f: F)
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
-        Q::Item<'_>: Send,
+        for<'a> Q::Item<'a>: Send,
+        Q::State: Send + Sync,
     {
         use rayon::prelude::*;
-        self.archetypes.par_iter().for_each(|a| {
+        self.archetypes.as_slice().par_iter().for_each(|a| {
             for row in 0..a.len {
                 if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
                     f(item);
