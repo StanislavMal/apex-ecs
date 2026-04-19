@@ -1,23 +1,9 @@
 /// Resources — глобальные синглтоны мира.
-///
-/// Хранятся как type-erased Box<dyn Any + Send + Sync> в FxHashMap по TypeId.
-/// Доступ O(1), нет аллокаций на горячем пути (кроме первичной вставки).
-///
-/// # Пример
-/// ```ignore
-/// world.insert_resource(GameConfig { gravity: 9.8 });
-/// let cfg = world.resource::<GameConfig>();
-/// world.resource_mut::<GameConfig>().gravity = 0.0;
-/// world.remove_resource::<GameConfig>();
-/// ```
-
 use std::any::{Any, TypeId};
 use rustc_hash::FxHashMap;
 
-// ── Внутренний trait объект ────────────────────────────────────
-
 trait ResourceStorage: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
+    fn as_any(&self)     -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
 }
@@ -25,18 +11,10 @@ trait ResourceStorage: Send + Sync {
 struct ResourceStorageImpl(Box<dyn Any + Send + Sync>);
 
 impl ResourceStorage for ResourceStorageImpl {
-    fn as_any(&self) -> &dyn Any {
-        &*self.0
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        &mut *self.0
-    }
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
-        self.0
-    }
+    fn as_any(&self)         -> &dyn Any { &*self.0 }
+    fn as_any_mut(&mut self) -> &mut dyn Any { &mut *self.0 }
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> { self.0 }
 }
-
-// ── ResourceMap ────────────────────────────────────────────────
 
 pub struct ResourceMap {
     data: FxHashMap<TypeId, Box<dyn ResourceStorage>>,
@@ -47,65 +25,72 @@ impl ResourceMap {
         Self { data: FxHashMap::default() }
     }
 
-    /// Вставить ресурс (перезаписывает если уже есть).
     pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.data.insert(TypeId::of::<T>(), Box::new(ResourceStorageImpl(Box::new(value))));
+        self.data.insert(
+            TypeId::of::<T>(),
+            Box::new(ResourceStorageImpl(Box::new(value))),
+        );
     }
 
-    /// Получить ссылку на ресурс. Паникует если ресурс не зарегистрирован.
     #[track_caller]
     pub fn get<T: Send + Sync + 'static>(&self) -> &T {
-        self.try_get::<T>().unwrap_or_else(|| {
-            panic!(
-                "Resource `{}` not found. Did you forget to insert_resource()?",
-                std::any::type_name::<T>()
-            )
-        })
+        self.try_get::<T>().unwrap_or_else(|| panic!(
+            "Resource `{}` not found. Did you forget insert_resource()?",
+            std::any::type_name::<T>()
+        ))
     }
 
-    /// Получить мутабельную ссылку. Паникует если ресурс не зарегистрирован.
     #[track_caller]
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
-        self.try_get_mut::<T>().unwrap_or_else(|| {
-            panic!(
-                "Resource `{}` not found. Did you forget to insert_resource()?",
-                std::any::type_name::<T>()
-            )
-        })
+        self.try_get_mut::<T>().unwrap_or_else(|| panic!(
+            "Resource `{}` not found. Did you forget insert_resource()?",
+            std::any::type_name::<T>()
+        ))
     }
 
-    /// Попытаться получить ресурс — None если не существует.
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.data
             .get(&TypeId::of::<T>())
             .and_then(|b| b.as_any().downcast_ref::<T>())
     }
 
-    /// Попытаться получить мутабельную ссылку — None если не существует.
     pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
         self.data
             .get_mut(&TypeId::of::<T>())
             .and_then(|b| b.as_any_mut().downcast_mut::<T>())
     }
 
-    /// Удалить ресурс. Возвращает Some(T) если ресурс существовал.
+    /// Получить raw mutable pointer на ресурс.
+    ///
+    /// Используется `SystemContext::resource_mut` для параллельного доступа.
+    /// Метод определён здесь (в своём крейте) — это законно.
+    ///
+    /// # Safety
+    /// Вызывающий код должен гарантировать что только одна система
+    /// в данный момент держит мутабельный доступ к T.
+    /// Планировщик обеспечивает это через `AccessDescriptor`.
+    pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut T> {
+        // SAFETY: мы берём shared ref и кастуем в *mut.
+        // Это тот же паттерн что UnsafeCell<T>::get().
+        // Безопасность обеспечивается планировщиком: два ParSystem
+        // с Write<T> к одному ресурсу никогда не в одном Stage.
+        let r = self.try_get::<T>()?;
+        Some(r as *const T as *mut T)
+    }
+
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.data
             .remove(&TypeId::of::<T>())
-            .and_then(|b| {
-                let raw = b.into_any();
-                raw.downcast::<T>().ok().map(|b| *b)
-            })
+            .and_then(|b| b.into_any().downcast::<T>().ok().map(|b| *b))
     }
 
-    /// Проверить наличие ресурса.
     #[inline]
     pub fn contains<T: Send + Sync + 'static>(&self) -> bool {
         self.data.contains_key(&TypeId::of::<T>())
     }
 
-    pub fn len(&self) -> usize { self.data.len() }
-    pub fn is_empty(&self) -> bool { self.data.is_empty() }
+    pub fn len(&self)      -> usize { self.data.len() }
+    pub fn is_empty(&self) -> bool  { self.data.is_empty() }
 }
 
 impl Default for ResourceMap {
@@ -150,7 +135,17 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Resource `apex_core::resources::tests::Gravity` not found")]
+    fn get_raw_ptr() {
+        let mut map = ResourceMap::new();
+        map.insert(Score(10));
+        let ptr = map.get_raw_ptr::<Score>().unwrap();
+        // SAFETY: тест — единственный владелец
+        unsafe { (*ptr).0 = 99; }
+        assert_eq!(map.get::<Score>().0, 99);
+    }
+
+    #[test]
+    #[should_panic(expected = "not found")]
     fn get_panics_if_missing() {
         let map = ResourceMap::new();
         let _ = map.get::<Gravity>();

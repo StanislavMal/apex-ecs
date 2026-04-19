@@ -68,43 +68,43 @@ impl QueryCache {
 // ── World ──────────────────────────────────────────────────────
 
 pub struct World {
-    pub(crate) entities: EntityAllocator,
-    pub(crate) registry: ComponentRegistry,
-    pub(crate) archetypes: Vec<Archetype>,
+    pub(crate) entities:        EntityAllocator,
+    pub(crate) registry:        ComponentRegistry,
+    pub(crate) archetypes:      Vec<Archetype>,
     pub(crate) archetype_index: FxHashMap<Vec<ComponentId>, ArchetypeId>,
-    pub(crate) current_tick: Tick,
-    pub(crate) query_cache: QueryCache,
-    pub(crate) relations: RelationRegistry,
-    pub(crate) id_index: IdIndex,
-    /// Быстрый entity-level индекс relations — ключ к O(1) has_relation
-    pub(crate) subject_index: SubjectIndex,
-    /// Глобальные ресурсы-синглтоны
-    pub resources: ResourceMap,
-    /// Шина событий
-    pub(crate) events: EventRegistry,
+    pub(crate) current_tick:    Tick,
+    pub(crate) query_cache:     QueryCache,
+    pub(crate) relations:       RelationRegistry,
+    pub(crate) id_index:        IdIndex,
+    pub(crate) subject_index:   SubjectIndex,
+    pub resources:              ResourceMap,
+    pub(crate) events:          EventRegistry,
 }
 
 impl World {
     pub fn new() -> Self {
         let mut world = Self {
-            entities: EntityAllocator::new(),
-            registry: ComponentRegistry::new(),
-            archetypes: Vec::new(),
+            entities:        EntityAllocator::new(),
+            registry:        ComponentRegistry::new(),
+            archetypes:      Vec::new(),
             archetype_index: FxHashMap::default(),
-            current_tick: Tick(1),
-            query_cache: QueryCache::new(),
-            relations: RelationRegistry::new(),
-            id_index: IdIndex::default(),
-            subject_index: SubjectIndex::new(),
-            resources: ResourceMap::new(),
-            events: EventRegistry::new(),
+            current_tick:    Tick(1),
+            query_cache:     QueryCache::new(),
+            relations:       RelationRegistry::new(),
+            id_index:        IdIndex::default(),
+            subject_index:   SubjectIndex::new(),
+            resources:       ResourceMap::new(),
+            events:          EventRegistry::new(),
         };
-        world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
+        world.archetypes.push(Archetype::new(
+            ArchetypeId::EMPTY,
+            SmallVec::new(),
+            &[],
+        ));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
         world
     }
 
-    /// Advance the world tick and flush event double-buffers.
     pub fn tick(&mut self) {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
         self.events.update_all();
@@ -118,73 +118,54 @@ impl World {
 
     // ── Resources ──────────────────────────────────────────────
 
-    /// Вставить глобальный ресурс (перезаписывает если уже существует).
     pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {
         self.resources.insert(value);
     }
 
-    /// Получить иммутабельную ссылку на ресурс.
-    /// # Panics
-    /// Паникует если ресурс не был вставлен через `insert_resource`.
     #[track_caller]
     pub fn resource<T: Send + Sync + 'static>(&self) -> &T {
         self.resources.get::<T>()
     }
 
-    /// Получить мутабельную ссылку на ресурс.
-    /// # Panics
-    /// Паникует если ресурс не был вставлен через `insert_resource`.
     #[track_caller]
     pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
         self.resources.get_mut::<T>()
     }
 
-    /// Попытаться получить ресурс — None если не существует.
     pub fn try_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.resources.try_get::<T>()
     }
 
-    /// Попытаться получить мутабельный ресурс — None если не существует.
     pub fn try_resource_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
         self.resources.try_get_mut::<T>()
     }
 
-    /// Удалить ресурс. Возвращает Some(T) если ресурс существовал.
     pub fn remove_resource<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.resources.remove::<T>()
     }
 
-    /// Проверить наличие ресурса.
     pub fn has_resource<T: Send + Sync + 'static>(&self) -> bool {
         self.resources.contains::<T>()
     }
 
+    pub fn resource_count(&self) -> usize { self.resources.len() }
+
     // ── Events ─────────────────────────────────────────────────
 
-    /// Зарегистрировать тип события. Идемпотентно.
     pub fn add_event<T: Send + Sync + 'static>(&mut self) {
         self.events.register::<T>();
     }
 
-    /// Получить иммутабельную очередь событий.
-    /// # Panics
-    /// Паникует если событие не было зарегистрировано через `add_event`.
     #[track_caller]
     pub fn events<T: Send + Sync + 'static>(&self) -> &crate::events::EventQueue<T> {
         self.events.get::<T>()
     }
 
-    /// Получить мутабельную очередь событий для отправки.
-    /// # Panics
-    /// Паникует если событие не было зарегистрировано через `add_event`.
     #[track_caller]
     pub fn events_mut<T: Send + Sync + 'static>(&mut self) -> &mut crate::events::EventQueue<T> {
         self.events.get_mut::<T>()
     }
 
-    /// Отправить событие (короткий хелпер).
-    /// # Panics
-    /// Паникует если событие не было зарегистрировано через `add_event`.
     #[track_caller]
     pub fn send_event<T: Send + Sync + 'static>(&mut self, event: T) {
         self.events.get_mut::<T>().send(event);
@@ -212,6 +193,107 @@ impl World {
         bundle.write_into(self, archetype_id, row, tick);
         self.entities.set_location(entity, EntityLocation { archetype_id, row });
         entity
+    }
+
+    /// Batch spawn — N entity одного Bundle типа без повторного поиска архетипа.
+    ///
+    /// # Производительность
+    /// - Один `get_or_create_archetype` на весь batch (vs N при `spawn_bundle`)
+    /// - `Vec::reserve` для всех колонок заранее — нет realloc в цикле
+    /// - Tight loop без HashMap lookup на каждый entity
+    ///
+    /// # Пример
+    /// ```ignore
+    /// let entities = world.spawn_many(100_000, |i| (
+    ///     Position { x: i as f32, y: 0.0, z: 0.0 },
+    ///     Velocity { x: 1.0, y: 0.0, z: 0.0 },
+    ///     Health { current: 100.0, max: 100.0 },
+    /// ));
+    /// ```
+    pub fn spawn_many<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
+    where
+        B: Bundle,
+        F: FnMut(usize) -> B,
+    {
+        if count == 0 { return Vec::new(); }
+
+        // Один вызов make_bundle для определения archetype
+        let sample = make_bundle(0);
+        let ids = sample.component_ids(&mut self.registry);
+        let archetype_id = self.get_or_create_archetype(ids);
+
+        // Reserve памяти для всех колонок сразу
+        let arch_idx = archetype_id.0 as usize;
+        let start_row = self.archetypes[arch_idx].entities.len();
+        self.archetypes[arch_idx].entities.reserve(count);
+        for col in &mut self.archetypes[arch_idx].columns {
+            // Растим колонку если нужно
+            while col.capacity < start_row + count {
+                col.grow();
+            }
+        }
+
+        let mut entities = Vec::with_capacity(count);
+        let tick = self.current_tick;
+
+        // Записываем sample (i=0)
+        let e0 = self.entities.allocate();
+        self.archetypes[arch_idx].entities.push(e0);
+        sample.write_into(self, archetype_id, start_row, tick);
+        self.entities.set_location(e0, EntityLocation { archetype_id, row: start_row });
+        entities.push(e0);
+
+        // Tight loop для остальных — без повторного поиска архетипа
+        for i in 1..count {
+            let bundle = make_bundle(i);
+            let row = start_row + i;
+            let entity = self.entities.allocate();
+            self.archetypes[arch_idx].entities.push(entity);
+            bundle.write_into(self, archetype_id, row, tick);
+            self.entities.set_location(entity, EntityLocation { archetype_id, row });
+            entities.push(entity);
+        }
+
+        entities
+    }
+
+    /// Batch spawn без возврата Vec<Entity> — максимальная скорость.
+    /// Используй когда entity ID не нужны немедленно.
+    pub fn spawn_many_silent<B, F>(&mut self, count: usize, mut make_bundle: F)
+    where
+        B: Bundle,
+        F: FnMut(usize) -> B,
+    {
+        if count == 0 { return; }
+
+        let sample = make_bundle(0);
+        let ids = sample.component_ids(&mut self.registry);
+        let archetype_id = self.get_or_create_archetype(ids);
+
+        let arch_idx = archetype_id.0 as usize;
+        let start_row = self.archetypes[arch_idx].entities.len();
+        self.archetypes[arch_idx].entities.reserve(count);
+        for col in &mut self.archetypes[arch_idx].columns {
+            while col.capacity < start_row + count {
+                col.grow();
+            }
+        }
+
+        let tick = self.current_tick;
+
+        let e0 = self.entities.allocate();
+        self.archetypes[arch_idx].entities.push(e0);
+        sample.write_into(self, archetype_id, start_row, tick);
+        self.entities.set_location(e0, EntityLocation { archetype_id, row: start_row });
+
+        for i in 1..count {
+            let bundle = make_bundle(i);
+            let row = start_row + i;
+            let entity = self.entities.allocate();
+            self.archetypes[arch_idx].entities.push(entity);
+            bundle.write_into(self, archetype_id, row, tick);
+            self.entities.set_location(entity, EntityLocation { archetype_id, row });
+        }
     }
 
     // ── Component ops ──────────────────────────────────────────
@@ -278,7 +360,6 @@ impl World {
             None => return false,
         };
 
-        // Очищаем SubjectIndex для этого entity
         self.subject_index.clear_entity(entity.index);
 
         let arch_idx = location.archetype_id.0 as usize;
@@ -338,7 +419,7 @@ impl World {
         QueryBuilder::new(self)
     }
 
-    pub fn entity_count(&self) -> usize { self.entities.len() }
+    pub fn entity_count(&self) -> usize    { self.entities.len() }
     pub fn archetype_count(&self) -> usize { self.archetypes.len() }
 
     // ── Внутренние методы ──────────────────────────────────────
@@ -405,7 +486,7 @@ impl World {
         to_archetype_id: ArchetypeId,
     ) -> usize {
         let from_idx = from_location.archetype_id.0 as usize;
-        let to_idx = to_archetype_id.0 as usize;
+        let to_idx   = to_archetype_id.0 as usize;
         let from_row = from_location.row;
 
         let from_len = self.archetypes[from_idx].columns.len();
@@ -420,7 +501,7 @@ impl World {
 
         for i in 0..from_len {
             if !is_common[i] { continue; }
-            let cid = self.archetypes[from_idx].columns[i].component_id;
+            let cid    = self.archetypes[from_idx].columns[i].component_id;
             let to_col = self.archetypes[to_idx].column_index(cid).unwrap();
             unsafe {
                 let item_size = self.archetypes[from_idx].columns[i].item_size;
@@ -534,9 +615,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     }
 
     pub fn len(&self) -> usize {
-        self.arch_indices.iter()
-            .map(|&i| self.world.archetypes[i].len())
-            .sum()
+        self.arch_indices.iter().map(|&i| self.world.archetypes[i].len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
