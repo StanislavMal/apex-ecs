@@ -1,0 +1,29 @@
+[package]
+name = "apex-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
+
+[dependencies]
+apex-core = { path = "../apex-core" }
+apex-scheduler = { path = "../apex-scheduler" }
+ecs_bench_suite = { git = "https://github.com/rust-gamedev/ecs_bench_suite" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmark"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "specialized"
+harness = false

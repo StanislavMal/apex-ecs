@@ -5,6 +5,7 @@ members = [
     "crates/apex-graph",
     "crates/apex-scheduler",
     "crates/apex-examples",
+    "crates/apex-bench",
 ]
 
 [workspace.package]
