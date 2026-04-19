@@ -4,18 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
-# Включить параллельное выполнение систем через rayon.
-# Требует что apex-core скомпилирован с feature "parallel".
+default  = []
 parallel = ["dep:rayon", "apex-core/parallel"]
 
 [dependencies]
-apex-core = { path = "../apex-core" }
+apex-core  = { path = "../apex-core" }
 apex-graph = { path = "../apex-graph" }
 
 thunderdome.workspace = true
-rustc-hash.workspace = true
-smallvec.workspace = true
-thiserror.workspace = true
-log.workspace = true
+rustc-hash.workspace  = true
+smallvec.workspace    = true
+thiserror.workspace   = true
+log.workspace         = true
 rayon = { workspace = true, optional = true }

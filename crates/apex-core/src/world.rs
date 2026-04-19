@@ -16,7 +16,7 @@ use crate::{
 
 struct CacheEntry {
     arch_indices: Vec<usize>,
-    version: u32,
+    version:      u32,
 }
 
 pub(crate) struct QueryCache {
@@ -28,23 +28,20 @@ unsafe impl Sync for QueryCache {}
 
 impl QueryCache {
     pub fn new() -> Self {
-        Self {
-            entries: UnsafeCell::new(FxHashMap::default()),
-            version: 0,
-        }
+        Self { entries: UnsafeCell::new(FxHashMap::default()), version: 0 }
     }
 
     pub unsafe fn get_or_compute(
         &self,
-        key: &[ComponentId],
+        key:           &[ComponentId],
         world_version: u32,
-        archetypes: &[Archetype],
-        matches: impl Fn(&Archetype) -> bool,
+        archetypes:    &[Archetype],
+        matches:       impl Fn(&Archetype) -> bool,
     ) -> &[usize] {
-        let map = &mut *self.entries.get();
+        let map   = &mut *self.entries.get();
         let entry = map.entry(key.to_vec()).or_insert(CacheEntry {
             arch_indices: Vec::new(),
-            version: u32::MAX,
+            version:      u32::MAX,
         });
         if entry.version != world_version {
             entry.arch_indices = archetypes
@@ -58,10 +55,7 @@ impl QueryCache {
         &entry.arch_indices
     }
 
-    pub fn invalidate(&mut self) {
-        self.version = self.version.wrapping_add(1);
-    }
-
+    pub fn invalidate(&mut self) { self.version = self.version.wrapping_add(1); }
     pub fn version(&self) -> u32 { self.version }
 }
 
@@ -77,7 +71,7 @@ pub struct World {
     pub(crate) relations:       RelationRegistry,
     pub(crate) id_index:        IdIndex,
     pub(crate) subject_index:   SubjectIndex,
-    pub resources:              ResourceMap,
+    pub        resources:       ResourceMap,
     pub(crate) events:          EventRegistry,
 }
 
@@ -96,11 +90,7 @@ impl World {
             resources:       ResourceMap::new(),
             events:          EventRegistry::new(),
         };
-        world.archetypes.push(Archetype::new(
-            ArchetypeId::EMPTY,
-            SmallVec::new(),
-            &[],
-        ));
+        world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
         world
     }
@@ -110,7 +100,10 @@ impl World {
         self.events.update_all();
     }
 
-    pub fn current_tick(&self) -> Tick { self.current_tick }
+    pub fn current_tick(&self)    -> Tick  { self.current_tick }
+    pub fn entity_count(&self)    -> usize { self.entities.len() }
+    pub fn archetype_count(&self) -> usize { self.archetypes.len() }
+    pub fn resource_count(&self)  -> usize { self.resources.len() }
 
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
         self.registry.register::<T>()
@@ -148,8 +141,6 @@ impl World {
         self.resources.contains::<T>()
     }
 
-    pub fn resource_count(&self) -> usize { self.resources.len() }
-
     // ── Events ─────────────────────────────────────────────────
 
     pub fn add_event<T: Send + Sync + 'static>(&mut self) {
@@ -171,11 +162,22 @@ impl World {
         self.events.get_mut::<T>().send(event);
     }
 
+    /// Raw pointer на EventQueue — для EventWriter в SystemContext.
+    /// Публичный чтобы apex-scheduler мог использовать без доступа к приватному полю.
+    ///
+    /// # Safety
+    /// Вызывающий гарантирует уникальный доступ (через AccessDescriptor).
+    pub fn event_queue_ptr<T: Send + Sync + 'static>(
+        &self,
+    ) -> Option<*mut crate::events::EventQueue<T>> {
+        self.events.get_raw_ptr::<T>()
+    }
+
     // ── Spawn ──────────────────────────────────────────────────
 
     pub fn spawn(&mut self) -> EntityBuilder<'_> {
         let entity = self.entities.allocate();
-        let row = unsafe { self.archetypes[0].allocate_row(entity) };
+        let row    = unsafe { self.archetypes[0].allocate_row(entity) };
         self.entities.set_location(entity, EntityLocation {
             archetype_id: ArchetypeId::EMPTY,
             row,
@@ -184,32 +186,29 @@ impl World {
     }
 
     pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
-        let ids = bundle.component_ids(&mut self.registry);
+        let ids          = bundle.component_ids(&mut self.registry);
         let archetype_id = self.get_or_create_archetype(ids);
-        let entity = self.entities.allocate();
-        let row = self.archetypes[archetype_id.0 as usize].entities.len();
+        let entity       = self.entities.allocate();
+        let row          = self.archetypes[archetype_id.0 as usize].entities.len();
+        let tick         = self.current_tick;
         self.archetypes[archetype_id.0 as usize].entities.push(entity);
-        let tick = self.current_tick;
         bundle.write_into(self, archetype_id, row, tick);
         self.entities.set_location(entity, EntityLocation { archetype_id, row });
         entity
     }
 
-    /// Batch spawn — N entity одного Bundle типа без повторного поиска архетипа.
+    /// Batch spawn — N entity одного Bundle типа.
     ///
-    /// # Производительность
-    /// - Один `get_or_create_archetype` на весь batch (vs N при `spawn_bundle`)
-    /// - `Vec::reserve` для всех колонок заранее — нет realloc в цикле
-    /// - Tight loop без HashMap lookup на каждый entity
+    /// # Оптимизации vs spawn_bundle в цикле
+    /// - Один `get_or_create_archetype` на весь batch
+    /// - `reserve` памяти для всех колонок заранее
+    /// - `allocate_batch` — один `Vec::resize_with` вместо N push
+    /// - `set_locations_batch` — один проход без повторных bounds checks
     ///
-    /// # Пример
-    /// ```ignore
-    /// let entities = world.spawn_many(100_000, |i| (
-    ///     Position { x: i as f32, y: 0.0, z: 0.0 },
-    ///     Velocity { x: 1.0, y: 0.0, z: 0.0 },
-    ///     Health { current: 100.0, max: 100.0 },
-    /// ));
-    /// ```
+    /// # Важно
+    /// `make_bundle` вызывается для i=0..count включительно.
+    /// Для определения archetype вызывается `make_bundle(0)` отдельно,
+    /// затем весь диапазон i=0..count для записи данных.
     pub fn spawn_many<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
@@ -217,48 +216,43 @@ impl World {
     {
         if count == 0 { return Vec::new(); }
 
-        // Один вызов make_bundle для определения archetype
-        let sample = make_bundle(0);
-        let ids = sample.component_ids(&mut self.registry);
-        let archetype_id = self.get_or_create_archetype(ids);
+        // Шаг 1: определяем archetype по bundle(0) — отдельный вызов
+        // make_bundle(0) здесь используется ТОЛЬКО для component_ids
+        let probe        = make_bundle(0);
+        let ids          = probe.component_ids(&mut self.registry);
+        // probe потребляется (drop) — данные не записываем
+        drop(probe);
 
-        // Reserve памяти для всех колонок сразу
-        let arch_idx = archetype_id.0 as usize;
-        let start_row = self.archetypes[arch_idx].entities.len();
+        let archetype_id = self.get_or_create_archetype(ids);
+        let arch_idx     = archetype_id.0 as usize;
+        let start_row    = self.archetypes[arch_idx].entities.len();
+        let tick         = self.current_tick;
+
+        // Шаг 2: reserve памяти заранее
         self.archetypes[arch_idx].entities.reserve(count);
+        let target_cap = start_row + count;
         for col in &mut self.archetypes[arch_idx].columns {
-            // Растим колонку если нужно
-            while col.capacity < start_row + count {
-                col.grow();
-            }
+            while col.capacity < target_cap { col.grow(); }
         }
 
-        let mut entities = Vec::with_capacity(count);
-        let tick = self.current_tick;
+        // Шаг 3: batch allocate entity IDs
+        let entities = self.entities.allocate_batch(count);
 
-        // Записываем sample (i=0)
-        let e0 = self.entities.allocate();
-        self.archetypes[arch_idx].entities.push(e0);
-        sample.write_into(self, archetype_id, start_row, tick);
-        self.entities.set_location(e0, EntityLocation { archetype_id, row: start_row });
-        entities.push(e0);
-
-        // Tight loop для остальных — без повторного поиска архетипа
-        for i in 1..count {
-            let bundle = make_bundle(i);
-            let row = start_row + i;
-            let entity = self.entities.allocate();
+        // Шаг 4: записываем entity + данные (make_bundle вызывается для КАЖДОГО i)
+        for (i, &entity) in entities.iter().enumerate() {
+            let row    = start_row + i;
+            let bundle = make_bundle(i); // i=0 вызывается снова — корректно
             self.archetypes[arch_idx].entities.push(entity);
             bundle.write_into(self, archetype_id, row, tick);
-            self.entities.set_location(entity, EntityLocation { archetype_id, row });
-            entities.push(entity);
         }
+
+        // Шаг 5: batch set_location
+        self.entities.set_locations_batch(&entities, archetype_id, start_row);
 
         entities
     }
 
-    /// Batch spawn без возврата Vec<Entity> — максимальная скорость.
-    /// Используй когда entity ID не нужны немедленно.
+    /// Batch spawn без возврата entity IDs — максимальная скорость.
     pub fn spawn_many_silent<B, F>(&mut self, count: usize, mut make_bundle: F)
     where
         B: Bundle,
@@ -266,43 +260,40 @@ impl World {
     {
         if count == 0 { return; }
 
-        let sample = make_bundle(0);
-        let ids = sample.component_ids(&mut self.registry);
-        let archetype_id = self.get_or_create_archetype(ids);
+        let probe        = make_bundle(0);
+        let ids          = probe.component_ids(&mut self.registry);
+        drop(probe);
 
-        let arch_idx = archetype_id.0 as usize;
-        let start_row = self.archetypes[arch_idx].entities.len();
+        let archetype_id = self.get_or_create_archetype(ids);
+        let arch_idx     = archetype_id.0 as usize;
+        let start_row    = self.archetypes[arch_idx].entities.len();
+        let tick         = self.current_tick;
+
         self.archetypes[arch_idx].entities.reserve(count);
+        let target_cap = start_row + count;
         for col in &mut self.archetypes[arch_idx].columns {
-            while col.capacity < start_row + count {
-                col.grow();
-            }
+            while col.capacity < target_cap { col.grow(); }
         }
 
-        let tick = self.current_tick;
+        let entities = self.entities.allocate_batch(count);
 
-        let e0 = self.entities.allocate();
-        self.archetypes[arch_idx].entities.push(e0);
-        sample.write_into(self, archetype_id, start_row, tick);
-        self.entities.set_location(e0, EntityLocation { archetype_id, row: start_row });
-
-        for i in 1..count {
+        for (i, &entity) in entities.iter().enumerate() {
+            let row    = start_row + i;
             let bundle = make_bundle(i);
-            let row = start_row + i;
-            let entity = self.entities.allocate();
             self.archetypes[arch_idx].entities.push(entity);
             bundle.write_into(self, archetype_id, row, tick);
-            self.entities.set_location(entity, EntityLocation { archetype_id, row });
         }
+
+        self.entities.set_locations_batch(&entities, archetype_id, start_row);
     }
 
     // ── Component ops ──────────────────────────────────────────
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
         let component_id = self.registry.get_or_register::<T>();
-        let location = match self.entities.get_location(entity) {
+        let location     = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None      => return,
         };
         let current_idx = location.archetype_id.0 as usize;
 
@@ -319,8 +310,8 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
-        let new_row = self.move_entity(entity, location, new_arch_id);
-        let tick = self.current_tick;
+        let new_row     = self.move_entity(entity, location, new_arch_id);
+        let tick        = self.current_tick;
         unsafe {
             self.archetypes[new_arch_id.0 as usize]
                 .write_component(new_row, component_id, &component as *const T as *const u8, tick);
@@ -328,27 +319,30 @@ impl World {
         std::mem::forget(component);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row: new_row,
+            row:          new_row,
         });
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> bool {
         let component_id = match self.registry.get_id::<T>() {
             Some(id) => id,
-            None => return false,
+            None     => return false,
         };
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return false,
+            None      => return false,
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
             return false;
         }
-        let new_arch_id = self.find_or_create_archetype_without(location.archetype_id, component_id);
+        let new_arch_id = self.find_or_create_archetype_without(
+            location.archetype_id,
+            component_id,
+        );
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row: new_row,
+            row:          new_row,
         });
         true
     }
@@ -357,17 +351,15 @@ impl World {
         if !self.entities.is_alive(entity) { return false; }
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return false,
+            None      => return false,
         };
-
         self.subject_index.clear_entity(entity.index);
-
         let arch_idx = location.archetype_id.0 as usize;
         unsafe {
             if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row) {
                 self.entities.set_location(displaced, EntityLocation {
                     archetype_id: location.archetype_id,
-                    row: location.row,
+                    row:          location.row,
                 });
             }
         }
@@ -380,7 +372,7 @@ impl World {
     #[inline]
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
         let component_id = self.registry.get_id::<T>()?;
-        let location = self.entities.get_location(entity)?;
+        let location     = self.entities.get_location(entity)?;
         unsafe {
             self.archetypes[location.archetype_id.0 as usize]
                 .get_component::<T>(location.row, component_id)
@@ -390,10 +382,10 @@ impl World {
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         let component_id = self.registry.get_id::<T>()?;
-        let location = self.entities.get_location(entity)?;
-        let tick = self.current_tick;
-        let arch = &mut self.archetypes[location.archetype_id.0 as usize];
-        let col_idx = arch.column_index(component_id)?;
+        let location     = self.entities.get_location(entity)?;
+        let tick         = self.current_tick;
+        let arch         = &mut self.archetypes[location.archetype_id.0 as usize];
+        let col_idx      = arch.column_index(component_id)?;
         if location.row < arch.columns[col_idx].change_ticks.len() {
             arch.columns[col_idx].change_ticks[location.row] = tick;
         }
@@ -401,9 +393,7 @@ impl World {
     }
 
     #[inline]
-    pub fn is_alive(&self, entity: Entity) -> bool {
-        self.entities.is_alive(entity)
-    }
+    pub fn is_alive(&self, entity: Entity) -> bool { self.entities.is_alive(entity) }
 
     // ── Query API ──────────────────────────────────────────────
 
@@ -415,19 +405,14 @@ impl World {
         CachedQuery::new(self, last_run)
     }
 
-    pub fn query(&self) -> QueryBuilder<'_> {
-        QueryBuilder::new(self)
-    }
-
-    pub fn entity_count(&self) -> usize    { self.entities.len() }
-    pub fn archetype_count(&self) -> usize { self.archetypes.len() }
+    pub fn query(&self) -> QueryBuilder<'_> { QueryBuilder::new(self) }
 
     // ── Внутренние методы ──────────────────────────────────────
 
     pub(crate) fn find_or_create_archetype_with(
         &mut self,
         current: ArchetypeId,
-        add: ComponentId,
+        add:     ComponentId,
     ) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].add_edges.get(&add) {
             return id;
@@ -445,7 +430,7 @@ impl World {
     pub(crate) fn find_or_create_archetype_without(
         &mut self,
         current: ArchetypeId,
-        remove: ComponentId,
+        remove:  ComponentId,
     ) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].remove_edges.get(&remove) {
             return id;
@@ -460,19 +445,17 @@ impl World {
         new_id
     }
 
-    pub(crate) fn get_or_create_archetype(&mut self, components: Vec<ComponentId>) -> ArchetypeId {
-        if let Some(&id) = self.archetype_index.get(&components) {
-            return id;
-        }
-        let id = ArchetypeId(self.archetypes.len() as u32);
-        let infos: Vec<&ComponentInfo> = components
-            .iter()
+    pub(crate) fn get_or_create_archetype(
+        &mut self,
+        components: Vec<ComponentId>,
+    ) -> ArchetypeId {
+        if let Some(&id) = self.archetype_index.get(&components) { return id; }
+        let id    = ArchetypeId(self.archetypes.len() as u32);
+        let infos: Vec<&ComponentInfo> = components.iter()
             .filter_map(|&cid| self.registry.get_info(cid))
             .collect();
-        let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
-        for &cid in &arch.component_ids {
-            self.id_index.register_archetype(cid, id);
-        }
+        let arch  = Archetype::new(id, components.iter().copied().collect(), &infos);
+        for &cid in &arch.component_ids { self.id_index.register_archetype(cid, id); }
         self.archetypes.push(arch);
         self.archetype_index.insert(components, id);
         self.query_cache.invalidate();
@@ -481,8 +464,8 @@ impl World {
 
     pub(crate) fn move_entity(
         &mut self,
-        entity: Entity,
-        from_location: EntityLocation,
+        entity:          Entity,
+        from_location:   EntityLocation,
         to_archetype_id: ArchetypeId,
     ) -> usize {
         let from_idx = from_location.archetype_id.0 as usize;
@@ -492,7 +475,7 @@ impl World {
         let from_len = self.archetypes[from_idx].columns.len();
         let mut is_common: SmallVec<[bool; 32]> = SmallVec::from_elem(false, from_len);
         for i in 0..from_len {
-            let cid = self.archetypes[from_idx].columns[i].component_id;
+            let cid      = self.archetypes[from_idx].columns[i].component_id;
             is_common[i] = self.archetypes[to_idx].has_component(cid);
         }
 
@@ -524,11 +507,8 @@ impl World {
         unsafe {
             let from_last = self.archetypes[from_idx].entities.len() - 1;
             for (i, col) in self.archetypes[from_idx].columns.iter_mut().enumerate() {
-                if is_common[i] {
-                    col.swap_remove_no_drop(from_row);
-                } else {
-                    col.swap_remove_and_drop(from_row);
-                }
+                if is_common[i] { col.swap_remove_no_drop(from_row); }
+                else            { col.swap_remove_and_drop(from_row); }
             }
             if from_row != from_last {
                 let displaced = self.archetypes[from_idx].entities[from_last];
@@ -536,7 +516,7 @@ impl World {
                 self.archetypes[from_idx].entities.pop();
                 self.entities.set_location(displaced, EntityLocation {
                     archetype_id: from_location.archetype_id,
-                    row: from_row,
+                    row:          from_row,
                 });
             } else {
                 self.archetypes[from_idx].entities.pop();
@@ -546,17 +526,15 @@ impl World {
     }
 }
 
-impl Default for World {
-    fn default() -> Self { Self::new() }
-}
+impl Default for World { fn default() -> Self { Self::new() } }
 
 // ── CachedQuery ────────────────────────────────────────────────
 
 pub struct CachedQuery<'w, Q: WorldQuery> {
-    world: &'w World,
+    world:        &'w World,
     arch_indices: &'w [usize],
-    last_run: Tick,
-    _phantom: std::marker::PhantomData<Q>,
+    last_run:     Tick,
+    _phantom:     std::marker::PhantomData<Q>,
 }
 
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
@@ -564,13 +542,11 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
 
-        let version = world.query_cache.version();
-        let arch_indices: &[usize] = if ids.len() == Q::component_count() {
+        let version      = world.query_cache.version();
+        let arch_indices = if ids.len() == Q::component_count() {
             unsafe {
                 world.query_cache.get_or_compute(
-                    &ids,
-                    version,
-                    &world.archetypes,
+                    &ids, version, &world.archetypes,
                     |arch| Q::matches_archetype(arch, &ids),
                 )
             }
@@ -588,7 +564,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         for &arch_idx in self.arch_indices {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
-            let state = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
+            let state    = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
             let entities = &arch.entities;
             for row in 0..arch.len() {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
@@ -607,9 +583,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if arch.is_empty() { continue; }
             let state = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
             for row in 0..arch.len() {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(item);
-                }
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
             }
         }
     }
@@ -640,14 +614,23 @@ macro_rules! impl_bundle {
                 ids
             }
 
-            fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick) {
+            fn write_into(
+                self,
+                world:        &mut World,
+                archetype_id: ArchetypeId,
+                row:          usize,
+                tick:         Tick,
+            ) {
                 let ($($T,)+) = self;
                 $(
                     {
                         let cid = world.registry.get_or_register::<$T>();
-                        if let Some(col_idx) = world.archetypes[archetype_id.0 as usize].column_index(cid) {
+                        if let Some(col_idx) = world.archetypes[archetype_id.0 as usize]
+                            .column_index(cid)
+                        {
                             unsafe {
-                                let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
+                                let col = &mut world.archetypes[archetype_id.0 as usize]
+                                    .columns[col_idx];
                                 if col.item_size > 0 {
                                     if col.len >= col.capacity { col.grow(); }
                                     let dst = col.get_ptr(row);
@@ -681,7 +664,7 @@ impl_bundle!(A, B, C, D, E, F, G, H);
 // ── EntityBuilder ──────────────────────────────────────────────
 
 pub struct EntityBuilder<'w> {
-    world: &'w mut World,
+    world:  &'w mut World,
     entity: Entity,
 }
 

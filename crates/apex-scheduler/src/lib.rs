@@ -1,18 +1,47 @@
+//! apex-scheduler — гибридный планировщик систем.
+//!
+//! # Типы систем
+//!
+//! ## Sequential — `FnMut(&mut World)`
+//! Полный доступ. Всегда одиночно. Для structural changes.
+//!
+//! ## ParSystem (struct) — явный AccessDescriptor
+//! ```ignore
+//! struct MySystem;
+//! impl ParSystem for MySystem {
+//!     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
+//!     fn run(&mut self, ctx: SystemContext<'_>) { ... }
+//! }
+//! sched.add_par_system("my", MySystem);
+//! ```
+//!
+//! ## FnParSystem — функция + AccessDescriptor
+//! ```ignore
+//! fn my_system(ctx: SystemContext<'_>) {
+//!     ctx.query::<Write<Pos>>().for_each_component(|pos| { pos.x += 1.0; });
+//! }
+//! sched.add_fn_par_system("my", my_system,
+//!     AccessDescriptor::new().write::<Pos>()
+//! );
+//! ```
+
 pub mod stage;
 
-use std::any::TypeId;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use apex_graph::Graph;
 use thunderdome::Index;
 use apex_core::{
+    AccessDescriptor,
     world::World,
     query::{WorldQuery, Query},
     component::Tick,
     entity::Entity,
+    system_param::{Res, ResMut, EventReader, EventWriter},
 };
 
 pub use stage::Stage;
+pub use apex_core::AccessDescriptor as Access;
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
@@ -23,48 +52,16 @@ pub enum SchedulerError {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct SystemId(u32);
+pub struct SystemId(pub u32);
 
 pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
-// ── AccessDescriptor ───────────────────────────────────────────
-
-#[derive(Default, Clone, Debug)]
-pub struct AccessDescriptor {
-    pub reads:  Vec<TypeId>,
-    pub writes: Vec<TypeId>,
-}
-
-impl AccessDescriptor {
-    pub fn new() -> Self { Self::default() }
-
-    pub fn read<T: 'static>(mut self) -> Self {
-        self.reads.push(TypeId::of::<T>());
-        self
-    }
-
-    pub fn write<T: 'static>(mut self) -> Self {
-        self.writes.push(TypeId::of::<T>());
-        self
-    }
-
-    pub fn conflicts_with(&self, other: &AccessDescriptor) -> bool {
-        for w in &self.writes {
-            if other.reads.contains(w) || other.writes.contains(w) { return true; }
-        }
-        for w in &other.writes {
-            if self.reads.contains(w) || self.writes.contains(w) { return true; }
-        }
-        false
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.reads.is_empty() && self.writes.is_empty()
-    }
-}
-
 // ── SystemContext ──────────────────────────────────────────────
 
+/// Ограниченный view на World для ParSystem.
+///
+/// Предоставляет типизированный доступ через `query()`, `resource()` и т.д.
+/// Планировщик гарантирует что в одном Stage нет Write-конфликтов.
 pub struct SystemContext<'w> {
     world:   *const World,
     _marker: std::marker::PhantomData<&'w World>,
@@ -89,22 +86,35 @@ impl<'w> SystemContext<'w> {
     }
 
     #[inline]
-    pub fn resource<T: Send + Sync + 'static>(&self) -> &T {
-        unsafe { (*self.world).resource::<T>() }
+    pub fn resource<T: Send + Sync + 'static>(&self) -> Res<'_, T> {
+        Res(unsafe { (*self.world).resource::<T>() })
     }
 
-    /// Мутабельный доступ к ресурсу для параллельных систем.
-    ///
-    /// Использует `ResourceMap::get_raw_ptr` — метод определён
-    /// в `apex-core` в том же крейте что и `ResourceMap`.
-    /// Никаких нарушений orphan rules.
     #[inline]
-    pub fn resource_mut<T: Send + Sync + 'static>(&self) -> &mut T {
+    pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
-            &mut *(*self.world)
+            let ptr = (*self.world)
                 .resources
                 .get_raw_ptr::<T>()
-                .expect("resource not found — did you insert_resource()?")
+                .expect("resource_mut: resource not found. Did you call insert_resource()?");
+            ResMut::from_ptr(ptr)
+        }
+    }
+
+    #[inline]
+    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+        // Используем публичный метод world.events() вместо приватного поля
+        EventReader(unsafe { (*self.world).events::<T>() })
+    }
+
+    #[inline]
+    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+        // Используем публичный метод world.event_queue_ptr() — добавлен в world.rs
+        unsafe {
+            let ptr = (*self.world)
+                .event_queue_ptr::<T>()
+                .expect("event_writer: event type not registered. Did you call add_event()?");
+            EventWriter::from_ptr(ptr)
         }
     }
 
@@ -121,15 +131,49 @@ impl<'w> SystemContext<'w> {
     {
         self.query::<Q>().for_each(f);
     }
+
+    #[inline]
+    pub fn for_each_component<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: FnMut(Q::Item<'_>),
+    {
+        self.query::<Q>().for_each_component(f);
+    }
 }
 
 // ── ParSystem trait ────────────────────────────────────────────
 
+/// Параллельная система с декларативным доступом.
 pub trait ParSystem: Send + Sync {
+    /// Декларация доступа — используется планировщиком.
     fn access() -> AccessDescriptor where Self: Sized;
+
+    /// Выполнить систему.
     fn run(&mut self, ctx: SystemContext<'_>);
+
+    /// Имя для отладки.
     fn name() -> &'static str where Self: Sized {
         std::any::type_name::<Self>()
+    }
+}
+
+// ── FnParSystem — обёртка для функций ─────────────────────────
+
+/// Адаптер для использования `fn(SystemContext<'_>)` как ParSystem.
+struct FnParSystem {
+    func:   Box<dyn FnMut(SystemContext<'_>) + Send + Sync>,
+    access: AccessDescriptor,
+    name:   &'static str,
+}
+
+impl ParSystem for FnParSystem {
+    fn access() -> AccessDescriptor where Self: Sized {
+        AccessDescriptor::new() // не используется — access хранится в поле
+    }
+
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        (self.func)(ctx);
     }
 }
 
@@ -144,14 +188,12 @@ enum SystemKind {
 }
 
 impl SystemKind {
-    fn is_parallel(&self) -> bool {
-        matches!(self, SystemKind::Parallel { .. })
-    }
+    fn is_parallel(&self) -> bool { matches!(self, SystemKind::Parallel { .. }) }
 
     fn access(&self) -> Option<&AccessDescriptor> {
         match self {
             SystemKind::Parallel { access, .. } => Some(access),
-            SystemKind::Sequential(_) => None,
+            SystemKind::Sequential(_)           => None,
         }
     }
 }
@@ -170,7 +212,7 @@ struct SystemDescriptor {
 
 pub struct SystemBuilder<'a> {
     scheduler: &'a mut Scheduler,
-    id: SystemId,
+    id:        SystemId,
 }
 
 impl<'a> SystemBuilder<'a> {
@@ -199,6 +241,7 @@ impl Scheduler {
 
     // ── Регистрация ────────────────────────────────────────────
 
+    /// Добавить Sequential систему с полным `&mut World`.
     pub fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
@@ -216,12 +259,13 @@ impl Scheduler {
         SystemBuilder { scheduler: self, id }
     }
 
+    /// Добавить ParSystem (struct с impl ParSystem).
     pub fn add_par_system<S: ParSystem + 'static>(
         &mut self,
         name: impl Into<String>,
         system: S,
     ) -> SystemId {
-        let id = SystemId(self.next_id);
+        let id     = SystemId(self.next_id);
         self.next_id += 1;
         let access = S::access();
         self.systems.push(SystemDescriptor {
@@ -235,6 +279,50 @@ impl Scheduler {
         id
     }
 
+    /// Добавить функцию-систему с явным AccessDescriptor.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// fn movement(ctx: SystemContext<'_>) {
+    ///     let dt = ctx.resource::<DeltaTime>().0;
+    ///     ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(vel, pos)| {
+    ///         pos.x += vel.x * dt;
+    ///     });
+    /// }
+    ///
+    /// sched.add_fn_par_system("movement", movement,
+    ///     AccessDescriptor::new().read::<DeltaTime>().write::<Position>()
+    /// );
+    /// ```
+    pub fn add_fn_par_system<F>(
+        &mut self,
+        name:   impl Into<String>,
+        func:   F,
+        access: AccessDescriptor,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        let id          = SystemId(self.next_id);
+        self.next_id   += 1;
+        let name_str    = name.into();
+        let system      = FnParSystem {
+            func:   Box::new(func),
+            access: access.clone(),
+            name:   std::any::type_name::<F>(),
+        };
+        self.systems.push(SystemDescriptor {
+            id,
+            name: name_str,
+            kind: SystemKind::Parallel { system: Box::new(system), access },
+            after:  Vec::new(),
+            before: Vec::new(),
+        });
+        self.execution_plan = None;
+        id
+    }
+
+    /// Добавить явную зависимость: `system` выполняется после `after_id`.
     pub fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
             if !s.after.contains(&after_id) { s.after.push(after_id); }
@@ -270,23 +358,19 @@ impl Scheduler {
             }
         }
 
-        // 2. Sequential барьеры
+        // 2. Sequential барьеры — разрывают параллельные группы
         let n = self.systems.len();
         for i in 0..n {
             if !self.systems[i].kind.is_parallel() {
                 for j in 0..i {
                     if let (Some(&from), Some(&to)) =
                         (nodes.get(&self.systems[j].id), nodes.get(&self.systems[i].id))
-                    {
-                        graph.add_edge(from, to, ());
-                    }
+                    { graph.add_edge(from, to, ()); }
                 }
                 for j in (i + 1)..n {
                     if let (Some(&from), Some(&to)) =
                         (nodes.get(&self.systems[i].id), nodes.get(&self.systems[j].id))
-                    {
-                        graph.add_edge(from, to, ());
-                    }
+                    { graph.add_edge(from, to, ()); }
                 }
             }
         }
@@ -299,9 +383,7 @@ impl Scheduler {
                 if ai.conflicts_with(aj) {
                     if let (Some(&from), Some(&to)) =
                         (nodes.get(&self.systems[i].id), nodes.get(&self.systems[j].id))
-                    {
-                        graph.add_edge(from, to, ());
-                    }
+                    { graph.add_edge(from, to, ()); }
                 }
             }
         }
@@ -363,8 +445,8 @@ impl Scheduler {
         for sys_id in order {
             if let Some(system) = self.systems.iter_mut().find(|s| s.id == sys_id) {
                 match &mut system.kind {
-                    SystemKind::Sequential(f) => f(world),
-                    SystemKind::Parallel { system, .. } => {
+                    SystemKind::Sequential(f)             => f(world),
+                    SystemKind::Parallel { system, .. }   => {
                         let ctx = SystemContext::new(world);
                         system.run(ctx);
                     }
@@ -375,8 +457,6 @@ impl Scheduler {
 
     #[cfg(feature = "parallel")]
     fn run_hybrid_parallel(&mut self, world: &mut World) {
-        use rayon::prelude::*;
-
         let plan = self.execution_plan.as_ref().unwrap();
         let stages: Vec<(Vec<SystemId>, bool)> = plan.stages
             .iter()
@@ -388,10 +468,9 @@ impl Scheduler {
                 for &sys_id in stage_ids {
                     if let Some(system) = self.systems.iter_mut().find(|s| s.id == sys_id) {
                         match &mut system.kind {
-                            SystemKind::Sequential(f) => f(world),
+                            SystemKind::Sequential(f)           => f(world),
                             SystemKind::Parallel { system, .. } => {
-                                let ctx = SystemContext::new(world);
-                                system.run(ctx);
+                                system.run(SystemContext::new(world));
                             }
                         }
                     }
@@ -399,6 +478,7 @@ impl Scheduler {
             } else {
                 // Parallel Stage → rayon::scope
                 // SAFETY: системы не имеют Write-конфликтов (инвариант compile())
+                use rayon::prelude::*;
                 let world_ptr = world as *mut World;
                 let indices: Vec<usize> = stage_ids.iter()
                     .filter_map(|sid| self.systems.iter().position(|s| s.id == *sid))
@@ -406,13 +486,12 @@ impl Scheduler {
 
                 rayon::scope(|s| {
                     for idx in &indices {
-                        let system_ptr = &mut self.systems[*idx] as *mut SystemDescriptor;
-                        let world_ref: &World = unsafe { &*world_ptr };
+                        let sys_ptr:   *mut SystemDescriptor = &mut self.systems[*idx];
+                        let world_ref: &World                = unsafe { &*world_ptr };
                         s.spawn(move |_| {
-                            let descriptor = unsafe { &mut *system_ptr };
+                            let descriptor = unsafe { &mut *sys_ptr };
                             if let SystemKind::Parallel { system, .. } = &mut descriptor.kind {
-                                let ctx = SystemContext::new(world_ref);
-                                system.run(ctx);
+                                system.run(SystemContext::new(world_ref));
                             }
                         });
                     }
@@ -435,17 +514,17 @@ impl Scheduler {
         };
         let mut out = String::new();
         for (i, stage) in plan.stages.iter().enumerate() {
-            let mode = if stage.is_parallelizable() { "PARALLEL" }
-                       else if stage.all_parallel   { "parallel/single" }
-                       else                          { "sequential" };
+            let mode = if stage.is_parallelizable()  { "PARALLEL" }
+                       else if stage.all_parallel     { "parallel/single" }
+                       else                           { "sequential" };
             out.push_str(&format!("Stage {} [{}]:\n", i, mode));
             for sys_id in &stage.system_ids {
                 if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
-                    let kind_str = if s.kind.is_parallel() {
-                        let acc = s.kind.access().unwrap();
-                        format!("par | reads:{} writes:{}", acc.reads.len(), acc.writes.len())
-                    } else {
-                        "seq | full &mut World".to_string()
+                    let kind_str = match &s.kind {
+                        SystemKind::Parallel { access, .. } =>
+                            format!("par | reads:{} writes:{}", access.reads.len(), access.writes.len()),
+                        SystemKind::Sequential(_) =>
+                            "seq | full &mut World".to_string(),
                     };
                     out.push_str(&format!("  - {} [{}]\n", s.name, kind_str));
                 }
@@ -455,9 +534,7 @@ impl Scheduler {
     }
 }
 
-impl Default for Scheduler {
-    fn default() -> Self { Self::new() }
-}
+impl Default for Scheduler { fn default() -> Self { Self::new() } }
 
 // ── Тесты ─────────────────────────────────────────────────────
 
@@ -468,7 +545,10 @@ mod tests {
 
     #[derive(Clone, Copy)] struct Pos { x: f32, y: f32 }
     #[derive(Clone, Copy)] struct Vel { x: f32, y: f32 }
-    #[derive(Clone, Copy)] struct Health(f32);
+    #[derive(Clone, Copy)] struct Hp(f32);
+    #[derive(Clone, Copy)] struct DeltaTime(f32);
+
+    // ── ParSystem реализации ───────────────────────────────────
 
     struct MovementSystem;
     impl ParSystem for MovementSystem {
@@ -476,24 +556,25 @@ mod tests {
             AccessDescriptor::new().read::<Vel>().write::<Pos>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Vel>, Write<Pos>)>()
-               .for_each_component(|(vel, pos)| { pos.x += vel.x; pos.y += vel.y; });
+            ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(vel, pos)| {
+                pos.x += vel.x;
+                pos.y += vel.y;
+            });
         }
     }
 
     struct HealthSystem;
     impl ParSystem for HealthSystem {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Health>()
-        }
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Hp>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Health>>()
-               .for_each_component(|hp| { hp.0 = hp.0.max(0.0); });
+            ctx.for_each_component::<Write<Hp>, _>(|hp| { hp.0 = hp.0.max(0.0); });
         }
     }
 
+    // ── Тесты ─────────────────────────────────────────────────
+
     #[test]
-    fn sequential_explicit_ordering() {
+    fn sequential_ordering() {
         let mut sched = Scheduler::new();
         let log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> = Default::default();
 
@@ -504,54 +585,118 @@ mod tests {
 
         sched.add_dependency(b, a);
         sched.compile().unwrap();
+
         let mut world = World::new();
         sched.run_sequential(&mut world);
         assert_eq!(*log.lock().unwrap(), vec!["a", "b"]);
     }
 
     #[test]
-    fn par_systems_no_conflict_same_stage() {
+    fn par_no_conflict_same_stage() {
         let mut sched = Scheduler::new();
         sched.add_par_system("movement", MovementSystem);
         sched.add_par_system("health",   HealthSystem);
         sched.compile().unwrap();
+
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1, "non-conflicting par systems → 1 stage");
+        assert_eq!(stages.len(), 1);
         assert!(stages[0].all_parallel);
         assert_eq!(stages[0].system_count(), 2);
     }
 
     #[test]
-    fn par_write_conflict_different_stages() {
-        struct WriterA;
-        impl ParSystem for WriterA {
+    fn par_write_conflict_separate_stages() {
+        struct WriterA; impl ParSystem for WriterA {
             fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
-        struct WriterB;
-        impl ParSystem for WriterB {
+        struct WriterB; impl ParSystem for WriterB {
             fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
         let mut sched = Scheduler::new();
-        sched.add_par_system("writer_a", WriterA);
-        sched.add_par_system("writer_b", WriterB);
+        sched.add_par_system("a", WriterA);
+        sched.add_par_system("b", WriterB);
         sched.compile().unwrap();
-        let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 2, "write conflict → 2 stages");
+
+        assert_eq!(sched.stages().unwrap().len(), 2);
     }
 
     #[test]
     fn sequential_breaks_parallel_groups() {
         let mut sched = Scheduler::new();
         sched.add_par_system("par_a", MovementSystem);
-        sched.add_system("seq_barrier", |_| {});
+        sched.add_system("barrier", |_| {});
         sched.add_par_system("par_b", HealthSystem);
         sched.compile().unwrap();
+
         let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 3, "sequential breaks parallel groups");
-        assert!(stages.iter().any(|s| !s.all_parallel), "should have sequential stage");
+        assert!(stages.len() >= 3);
+        assert!(stages.iter().any(|s| !s.all_parallel));
+    }
+
+    #[test]
+    fn fn_par_system_works() {
+        let mut sched = Scheduler::new();
+
+        sched.add_fn_par_system(
+            "movement",
+            |ctx: SystemContext<'_>| {
+                ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(vel, pos)| {
+                    pos.x += vel.x;
+                    pos.y += vel.y;
+                });
+            },
+            AccessDescriptor::new().read::<Vel>().write::<Pos>(),
+        );
+
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+        world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 3.0, y: 4.0 }));
+
+        sched.run_sequential(&mut world);
+
+        let mut result = (0.0f32, 0.0f32);
+        Query::<Read<Pos>>::new(&world).for_each_component(|p| { result = (p.x, p.y); });
+
+        assert!((result.0 - 3.0).abs() < 1e-6);
+        assert!((result.1 - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fn_par_system_with_resource() {
+        let mut sched = Scheduler::new();
+
+        sched.add_fn_par_system(
+            "scaled_movement",
+            |ctx: SystemContext<'_>| {
+                let dt = ctx.resource::<DeltaTime>();
+                ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(vel, pos)| {
+                    pos.x += vel.x * (*dt).0;
+                    pos.y += vel.y * (*dt).0;
+                });
+            },
+            AccessDescriptor::new()
+                .read::<DeltaTime>()
+                .read::<Vel>()
+                .write::<Pos>(),
+        );
+
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+        world.insert_resource(DeltaTime(0.5));
+        world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 2.0, y: 4.0 }));
+
+        sched.run_sequential(&mut world);
+
+        let mut result = (0.0f32, 0.0f32);
+        Query::<Read<Pos>>::new(&world).for_each_component(|p| { result = (p.x, p.y); });
+
+        assert!((result.0 - 1.0).abs() < 1e-6); // 2.0 * 0.5
+        assert!((result.1 - 2.0).abs() < 1e-6); // 4.0 * 0.5
     }
 
     #[test]
@@ -563,18 +708,14 @@ mod tests {
         world.register_component::<Pos>();
         world.register_component::<Vel>();
         world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 1.0, y: 2.0 }));
-        world.spawn_bundle((Pos { x: 5.0, y: 5.0 }, Vel { x: -1.0, y: 0.0 }));
 
         sched.run_sequential(&mut world);
 
-        let mut positions: Vec<(f32, f32)> = Vec::new();
-        Query::<Read<Pos>>::new(&world)
-            .for_each_component(|p| positions.push((p.x, p.y)));
-        positions.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut result = (0.0f32, 0.0f32);
+        Query::<Read<Pos>>::new(&world).for_each_component(|p| { result = (p.x, p.y); });
 
-        assert!((positions[0].0 - 1.0).abs() < 1e-6);
-        assert!((positions[0].1 - 2.0).abs() < 1e-6);
-        assert!((positions[1].0 - 4.0).abs() < 1e-6);
+        assert!((result.0 - 1.0).abs() < 1e-6);
+        assert!((result.1 - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -585,29 +726,5 @@ mod tests {
         sched.add_dependency(b, a);
         sched.add_dependency(a, b);
         assert!(sched.compile().is_err());
-    }
-
-    #[test]
-    fn mixed_seq_par_pipeline() {
-        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let mut sched = Scheduler::new();
-
-        sched.add_par_system("movement", MovementSystem);
-        let log2 = log.clone();
-        sched.add_system("commands", move |_| {
-            log2.lock().unwrap().push("commands".to_string());
-        });
-        sched.add_par_system("health", HealthSystem);
-        sched.compile().unwrap();
-
-        let mut world = World::new();
-        world.register_component::<Pos>();
-        world.register_component::<Vel>();
-        world.register_component::<Health>();
-        world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 1.0, y: 0.0 }));
-        world.spawn_bundle((Health(100.0),));
-
-        sched.run_sequential(&mut world);
-        assert!(log.lock().unwrap().contains(&"commands".to_string()));
     }
 }

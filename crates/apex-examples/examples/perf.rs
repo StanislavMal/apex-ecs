@@ -3,7 +3,8 @@
 
 use std::time::Instant;
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, SystemContext, AccessDescriptor};
+use apex_scheduler::{Scheduler, ParSystem, SystemContext};
+use apex_core::access::AccessDescriptor;
 
 #[derive(Clone, Copy)] struct Position { x: f32, y: f32, z: f32 }
 #[derive(Clone, Copy)] struct Velocity { x: f32, y: f32, z: f32 }
@@ -14,7 +15,7 @@ use apex_scheduler::{Scheduler, ParSystem, SystemContext, AccessDescriptor};
 
 #[derive(Clone, Copy)] struct PhysicsConfig { gravity: f32, dt: f32 }
 #[derive(Clone, Copy, Default)] struct FrameCounter { count: u64 }
-#[derive(Clone, Copy)] struct DamageEvent { target_id: u32, amount: f32 }
+#[derive(Clone, Copy)] struct DamageEvent  { target_id: u32, amount: f32 }
 #[derive(Clone, Copy)] struct CollisionEvent { a: u32, b: u32 }
 
 // ── Bench harness ─────────────────────────────────────────────
@@ -36,7 +37,7 @@ fn bench<F: FnMut() -> u64>(label: &str, mut f: F) {
         n as f64 / med.as_secs_f64() / 1e6
     } else { f64::INFINITY };
     println!(
-        "  {:<62} {:>8.2} ns/op  {:>8.2} M ops/s",
+        "  {:<64} {:>8.2} ns/op  {:>8.2} M ops/s",
         label, ns_op, mops
     );
 }
@@ -60,99 +61,13 @@ fn make_world(n: usize) -> (World, Vec<Entity>) {
     (world, entities)
 }
 
-// ── has_relation benchmark ─────────────────────────────────────
+// ── Batch Allocator benchmark ──────────────────────────────────
 
-fn bench_has_relation(n: usize) {
-    println!("── has_relation (SubjectIndex fix) ────────────────────────────────────────────");
+fn bench_batch_allocator(n: usize) {
+    println!("── Batch Entity Allocator ──────────────────────────────────────────────────────");
 
-    let children_per_parent = 8usize;
-    let parent_count        = n * 100;
-
-    let mut world = World::new();
-    world.register_component::<Position>();
-
-    let parents: Vec<Entity> = (0..parent_count)
-        .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
-        .collect();
-
-    for &parent in &parents {
-        for j in 0..children_per_parent {
-            let child = world.spawn_bundle((Position { x: j as f32, y: 0.0, z: 0.0 },));
-            world.add_relation(child, ChildOf, parent);
-        }
-    }
-
-    // Собираем пары для теста
-    let pairs: Vec<(Entity, Entity)> = parents.iter()
-        .filter_map(|&parent| {
-            world.children_of(ChildOf, parent).next()
-                .map(|child| (child, parent))
-        })
-        .take(n * 1000)
-        .collect();
-
-    println!("  Setup: {} parents, {} children each, {} test pairs",
-        parent_count, children_per_parent, pairs.len()
-    );
-
-    // True path — kind_mask hit + binary_search
-    bench(
-        &format!("has_relation TRUE  ({} checks, kind_mask+bsearch)", pairs.len()),
-        || {
-            let mut found = 0u64;
-            for &(child, parent) in &pairs {
-                if world.has_relation(child, ChildOf, parent) { found += 1; }
-            }
-            found.max(1)
-        },
-    );
-
-    // False path — kind_mask early exit (наиболее частый в реальном коде)
-    bench(
-        &format!("has_relation FALSE ({} checks, early-exit)", pairs.len()),
-        || {
-            let mut found = 0u64;
-            for (i, &(child, _)) in pairs.iter().enumerate() {
-                let wrong = parents[(i + 1) % parents.len()];
-                if world.has_relation(child, ChildOf, wrong) { found += 1; }
-            }
-            (pairs.len() as u64 - found).max(1)
-        },
-    );
-
-    // Множественные kinds — проверка kind_mask с несколькими битами
-    // Добавляем второй RelationKind чтобы у entity было 2 relation kinds
-    #[derive(Clone, Copy)] struct Likes;
-    impl apex_core::relations::RelationKind for Likes {}
-
-    // Добавляем Likes relation к первым 100 children
-    let extra_pairs: Vec<(Entity, Entity)> = pairs.iter().take(100)
-        .map(|&(child, parent)| {
-            world.add_relation(child, Likes, parent);
-            (child, parent)
-        })
-        .collect();
-
-    bench(
-        &format!("has_relation multi-kind ({} checks, 2 kinds set)", extra_pairs.len()),
-        || {
-            let mut found = 0u64;
-            for &(child, parent) in &extra_pairs {
-                if world.has_relation(child, ChildOf, parent) { found += 1; }
-                if world.has_relation(child, Likes,   parent) { found += 1; }
-            }
-            found.max(1)
-        },
-    );
-}
-
-// ── Batch Spawn benchmark ──────────────────────────────────────
-
-fn bench_spawn_batch(n: usize) {
-    println!("\n── Batch Spawn vs spawn_bundle ────────────────────────────────────────────────");
-
-    // Baseline: spawn_bundle по одному
-    bench(&format!("spawn_bundle loop ({n}k)  [baseline]"), || {
+    // spawn_bundle по одному — baseline
+    bench(&format!("spawn_bundle loop      ({n}k)  [baseline]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
@@ -168,13 +83,13 @@ fn bench_spawn_batch(n: usize) {
         (n * 1000) as u64
     });
 
-    // spawn_many — с возвратом Vec<Entity>
-    bench(&format!("spawn_many         ({n}k)  [batch+collect]"), || {
+    // spawn_many с Vec<Entity>
+    bench(&format!("spawn_many             ({n}k)  [batch+collect]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
         world.register_component::<Health>();
-        let entities = world.spawn_many(n * 1000, |i| {
+        let v = world.spawn_many(n * 1000, |i| {
             let f = i as f32;
             (
                 Position { x: f, y: f * 0.5, z: 0.0 },
@@ -182,11 +97,11 @@ fn bench_spawn_batch(n: usize) {
                 Health   { current: 100.0, max: 100.0 },
             )
         });
-        entities.len() as u64
+        v.len() as u64
     });
 
     // spawn_many_silent — без Vec<Entity>
-    bench(&format!("spawn_many_silent  ({n}k)  [batch, no collect]"), || {
+    bench(&format!("spawn_many_silent      ({n}k)  [batch, no collect]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
@@ -202,8 +117,8 @@ fn bench_spawn_batch(n: usize) {
         (n * 1000) as u64
     });
 
-    // 1 компонент — минимальный overhead
-    bench(&format!("spawn_many 1 comp  ({n}k)"), || {
+    // 1 компонент
+    bench(&format!("spawn_many_silent 1comp ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.spawn_many_silent(n * 1000, |i| {
@@ -212,8 +127,8 @@ fn bench_spawn_batch(n: usize) {
         (n * 1000) as u64
     });
 
-    // 8 компонентов — максимальный bundle
-    bench(&format!("spawn_many 8 comp  ({n}k)"), || {
+    // 4 компонента
+    bench(&format!("spawn_many_silent 4comp ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
@@ -230,137 +145,210 @@ fn bench_spawn_batch(n: usize) {
         });
         (n * 1000) as u64
     });
+
+    // allocate_batch напрямую — изолируем overhead аллокатора
+    bench(&format!("EntityAllocator::allocate_batch ({n}k)"), || {
+        let mut world = World::new();
+        // Добираемся до аллокатора через spawn фиктивных entity
+        // Используем spawn_many_silent с ZST чтобы изолировать аллокатор
+        world.register_component::<Player>();
+        world.spawn_many_silent(n * 1000, |_| (Player,));
+        (n * 1000) as u64
+    });
 }
 
-// ── Parallel Scheduler benchmark ───────────────────────────────
+// ── has_relation benchmark ─────────────────────────────────────
+
+fn bench_has_relation(n: usize) {
+    println!("\n── has_relation (SubjectIndex) ─────────────────────────────────────────────────");
+
+    let parent_count = n * 100;
+    let children_per = 8usize;
+
+    let mut world = World::new();
+    world.register_component::<Position>();
+
+    let parents: Vec<Entity> = (0..parent_count)
+        .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
+        .collect();
+
+    for &parent in &parents {
+        for j in 0..children_per {
+            let child = world.spawn_bundle((Position { x: j as f32, y: 0.0, z: 0.0 },));
+            world.add_relation(child, ChildOf, parent);
+        }
+    }
+
+    let pairs: Vec<(Entity, Entity)> = parents.iter()
+        .filter_map(|&p| world.children_of(ChildOf, p).next().map(|c| (c, p)))
+        .take(n * 1000)
+        .collect();
+
+    bench(&format!("has_relation TRUE  ({} checks)", pairs.len()), || {
+        let mut found = 0u64;
+        for &(child, parent) in &pairs {
+            if world.has_relation(child, ChildOf, parent) { found += 1; }
+        }
+        found.max(1)
+    });
+
+    bench(&format!("has_relation FALSE ({} checks, early-exit)", pairs.len()), || {
+        let mut found = 0u64;
+        for (i, &(child, _)) in pairs.iter().enumerate() {
+            if world.has_relation(child, ChildOf, parents[(i + 1) % parents.len()]) {
+                found += 1;
+            }
+        }
+        (pairs.len() as u64 - found).max(1)
+    });
+}
+
+// ── Scheduler benchmark ────────────────────────────────────────
 
 fn bench_scheduler(n: usize) {
-    println!("\n── Hybrid Scheduler ───────────────────────────────────────────────────────────");
+    println!("\n── Hybrid Scheduler ────────────────────────────────────────────────────────────");
 
-    // ParSystem реализации для бенчмарка
-    struct MovementSys;
-    impl ParSystem for MovementSys {
+    struct MoveSys;
+    impl ParSystem for MoveSys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>()
-               .for_each_component(|(vel, pos)| {
-                   pos.x += vel.x;
-                   pos.y += vel.y;
-               });
+            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+                p.x += v.x; p.y += v.y;
+            });
         }
     }
 
-    struct HealthSys;
-    impl ParSystem for HealthSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Health>()
-        }
+    struct HpSys;
+    impl ParSystem for HpSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Health>>().for_each_component(|hp| {
+            ctx.for_each_component::<Write<Health>, _>(|hp| {
                 hp.current = hp.current.min(hp.max);
             });
         }
     }
 
-    // Одна ParSystem — baseline
+    // 1 ParSystem
     bench(&format!("1 ParSystem: movement ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
-        sched.add_par_system("movement", MovementSys);
+        sched.add_par_system("move", MoveSys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    // Две независимые ParSystem в одном Stage
-    bench(&format!("2 ParSystem parallel stage ({n}k, no conflict)"), || {
+    // 2 независимые ParSystem → 1 Stage
+    bench(&format!("2 ParSystem no-conflict ({n}k, 1 stage)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
-        sched.add_par_system("movement", MovementSys);
-        sched.add_par_system("health",   HealthSys);
+        sched.add_par_system("move", MoveSys);
+        sched.add_par_system("hp",   HpSys);
         sched.compile().unwrap();
-        // Проверяем что они в одном Stage
         debug_assert_eq!(sched.stages().unwrap().len(), 1);
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    // Sequential система — baseline
-    bench(&format!("1 Sequential system ({n}k)"), || {
+    // FnParSystem с ресурсом
+    bench(&format!("FnParSystem + resource ({n}k)"), || {
+        let (mut world, _) = make_world(n * 1000);
+        world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
+        let mut sched = Scheduler::new();
+        sched.add_fn_par_system(
+            "physics",
+            |ctx: SystemContext<'_>| {
+                let dt = ctx.resource::<PhysicsConfig>().dt;
+                ctx.for_each_component::<Write<Position>, _>(|pos| {
+                    pos.x += dt;
+                });
+            },
+            AccessDescriptor::new().read::<PhysicsConfig>().write::<Position>(),
+        );
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    // Sequential система — для сравнения
+    bench(&format!("1 Sequential system   ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
-        sched.add_system("movement", |world: &mut World| {
+        sched.add_system("move", |world: &mut World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(world)
-                .for_each_component(|(vel, pos)| {
-                    pos.x += vel.x;
-                    pos.y += vel.y;
-                });
+                .for_each_component(|(v, p)| { p.x += v.x; p.y += v.y; });
         });
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    // compile() overhead
-    bench("compile() overhead (10 systems)", || {
+    // compile overhead
+    bench("compile() 10 mixed systems", || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("s1", MovementSys);
-        sched.add_par_system("s2", HealthSys);
-        for i in 0..8 {
-            let name = format!("seq_{i}");
-            sched.add_system(name, |_| {});
+        sched.add_par_system("m1", MoveSys);
+        sched.add_par_system("m2", HpSys);
+        for i in 0..4 {
+            sched.add_system(format!("seq_{i}"), |_| {});
+        }
+        sched.add_par_system("m3", MoveSys);
+        sched.add_par_system("m4", HpSys);
+        for i in 0..2 {
+            sched.add_system(format!("seq2_{i}"), |_| {});
         }
         sched.compile().unwrap();
         1
     });
 
-    // Stage detection — сколько Stage генерируется
+    // Демо debug_plan
     {
         let mut sched = Scheduler::new();
-        sched.add_par_system("movement", MovementSys);
-        sched.add_par_system("health",   HealthSys);
+        sched.add_par_system("physics",  MoveSys);
+        sched.add_par_system("hp_clamp", HpSys);
         sched.add_system("commands", |_| {});
-        sched.add_par_system("movement2", MovementSys);
+        sched.add_par_system("ai", MoveSys);
         sched.compile().unwrap();
-        let stages = sched.stages().unwrap();
-        println!("  Mixed pipeline stages: {} (par+par | seq | par)",
-            stages.len()
-        );
-        println!("{}", sched.debug_plan());
+        println!("  Mixed pipeline plan:\n{}", sched.debug_plan());
     }
 }
 
 // ── Resources benchmark ────────────────────────────────────────
 
 fn bench_resources(n: usize) {
-    println!("\n── Resources ──────────────────────────────────────────────────────────────────");
+    println!("\n── Resources ───────────────────────────────────────────────────────────────────");
 
     let mut world = World::new();
     world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
     world.insert_resource(FrameCounter::default());
 
-    bench(&format!("resource::<T>() ({n}k)"), || {
+    bench(&format!("resource::<T>() read  ({n}k)"), || {
         let mut sum = 0.0f32;
         for _ in 0..n * 1000 { sum += world.resource::<PhysicsConfig>().gravity; }
         std::hint::black_box(sum);
         (n * 1000) as u64
     });
 
-    bench(&format!("resource_mut::<T>() ({n}k)"), || {
-        for i in 0..n * 1000 {
-            world.resource_mut::<FrameCounter>().count = i as u64;
-        }
+    bench(&format!("resource_mut::<T>() write ({n}k)"), || {
+        for i in 0..n * 1000 { world.resource_mut::<FrameCounter>().count = i as u64; }
         std::hint::black_box(world.resource::<FrameCounter>().count);
         (n * 1000) as u64
+    });
+
+    bench(&format!("has_resource::<T>() ({n}k)"), || {
+        let mut found = 0u64;
+        for _ in 0..n * 1000 {
+            if world.has_resource::<PhysicsConfig>() { found += 1; }
+        }
+        found
     });
 }
 
 // ── Events benchmark ───────────────────────────────────────────
 
 fn bench_events(n: usize) {
-    println!("\n── Events ─────────────────────────────────────────────────────────────────────");
+    println!("\n── Events ──────────────────────────────────────────────────────────────────────");
 
     bench(&format!("send + iter_current ({n}k)"), || {
         let mut world = World::new();
@@ -400,7 +388,7 @@ fn bench_events(n: usize) {
 // ── Query benchmark ────────────────────────────────────────────
 
 fn bench_query(n: usize) {
-    println!("\n── Query ──────────────────────────────────────────────────────────────────────");
+    println!("\n── Query ───────────────────────────────────────────────────────────────────────");
     let (world, _) = make_world(n * 1000);
 
     bench(&format!("Query::new + for_each ({n}k)"), || {
@@ -419,15 +407,22 @@ fn bench_query(n: usize) {
 
     bench(&format!("Query<(Read<Vel>, Write<Pos>)> ({n}k)"), || {
         Query::<(Read<Velocity>, Write<Position>)>::new(&world)
-            .for_each_component(|(vel, pos)| { pos.x += vel.x; pos.y += vel.y; });
+            .for_each_component(|(v, p)| { p.x += v.x; p.y += v.y; });
         (n * 1000) as u64
+    });
+
+    bench(&format!("Query<(Read<Pos>, With<Player>)> (0 results)"), || {
+        let mut c = 0u64;
+        Query::<(Read<Position>, With<Player>)>::new(&world)
+            .for_each_component(|_| { c += 1; });
+        c.max(1)
     });
 }
 
 // ── Structural changes ─────────────────────────────────────────
 
 fn bench_structural(n: usize) {
-    println!("\n── Structural changes ─────────────────────────────────────────────────────────");
+    println!("\n── Structural changes ──────────────────────────────────────────────────────────");
 
     bench(&format!("insert component ({n}k)"), || {
         let mut world = World::new();
@@ -449,6 +444,14 @@ fn bench_structural(n: usize) {
         for e in entities { world.despawn(e); }
         (n * 1000) as u64
     });
+
+    bench(&format!("Commands::despawn + apply ({n}k)"), || {
+        let (mut world, _) = make_world(n * 1000);
+        let mut cmds = Commands::with_capacity(n * 1000);
+        Query::<Read<Health>>::new(&world).for_each(|e, _| { cmds.despawn(e); });
+        cmds.apply(&mut world);
+        (n * 1000) as u64
+    });
 }
 
 fn main() {
@@ -458,20 +461,20 @@ fn main() {
 
     const N: usize = 100;
 
+    bench_batch_allocator(N);
     bench_has_relation(N);
-    bench_spawn_batch(N);
     bench_scheduler(N);
     bench_resources(N);
     bench_events(N);
     bench_query(N);
     bench_structural(N);
 
-    println!("\n── Summary ────────────────────────────────────────────────────────────────────");
+    println!("\n── Summary ─────────────────────────────────────────────────────────────────────");
     let (mut world, _) = make_world(N * 1000);
     world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
     world.add_event::<DamageEvent>();
     println!("  {}k entities, {} archetypes", N, world.archetype_count());
-    println!("  resources: {}", world.resource_count());
-    println!("  CachedQuery<Read<Pos>> = {}", world.query_typed::<Read<Position>>().len());
-    println!("  current_tick = {:?}", world.current_tick());
+    println!("  resources:              {}", world.resource_count());
+    println!("  CachedQuery<Pos> len:   {}", world.query_typed::<Read<Position>>().len());
+    println!("  current_tick:           {:?}", world.current_tick());
 }

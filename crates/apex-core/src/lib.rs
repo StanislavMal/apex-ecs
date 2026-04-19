@@ -1,3 +1,4 @@
+pub mod access;
 pub mod archetype;
 pub mod commands;
 pub mod component;
@@ -7,8 +8,10 @@ pub mod query;
 pub mod relations;
 pub mod resources;
 pub mod storage;
+pub mod system_param;
 pub mod world;
 
+pub use access::AccessDescriptor;
 pub use component::{Component, Tick};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
@@ -17,8 +20,13 @@ pub use world::{World, Bundle, CachedQuery};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns, Likes};
+pub use system_param::{
+    Res, ResMut, EventReader, EventWriter,
+    WorldQuerySystemAccess,
+};
 
 pub mod prelude {
+    pub use crate::access::AccessDescriptor;
     pub use crate::component::{Component, Tick};
     pub use crate::entity::Entity;
     pub use crate::events::EventQueue;
@@ -27,4 +35,8 @@ pub mod prelude {
     pub use crate::query::{Query, Read, Write, With, Without, Changed, QueryBuilder, WorldQuery};
     pub use crate::commands::Commands;
     pub use crate::relations::{RelationKind, ChildOf, Owns, Likes};
+    pub use crate::system_param::{
+        Res, ResMut, EventReader, EventWriter,
+        WorldQuerySystemAccess,
+    };
 }

@@ -4,16 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default  = []
 parallel = ["dep:rayon"]
 
 [dependencies]
 apex-graph = { path = "../apex-graph" }
 
 rustc-hash.workspace = true
-smallvec.workspace = true
+smallvec.workspace  = true
 thunderdome.workspace = true
-bitvec.workspace = true
+bitvec.workspace    = true
 thiserror.workspace = true
-log.workspace = true
+log.workspace       = true
 rayon = { workspace = true, optional = true }
