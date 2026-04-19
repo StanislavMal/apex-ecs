@@ -11,10 +11,12 @@ parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 [dependencies]
 apex-core = { path = "../apex-core" }
 apex-scheduler = { path = "../apex-scheduler" }
+apex-graph = { path = "../apex-graph" }
 ecs_bench_suite = { git = "https://github.com/rust-gamedev/ecs_bench_suite" }
 
 [dev-dependencies]
 criterion = "0.5"
+petgraph = "0.6"
 
 [[bench]]
 name = "benchmark"
@@ -26,4 +28,8 @@ harness = false
 
 [[bench]]
 name = "specialized"
+harness = false
+
+[[bench]]
+name = "graph_bench"
 harness = false
