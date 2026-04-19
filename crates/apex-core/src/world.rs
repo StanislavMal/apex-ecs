@@ -109,6 +109,36 @@ impl World {
         self.registry.register::<T>()
     }
 
+    // ── Параллельный доступ ────────────────────────────────────
+
+    /// Создаёт `ParallelWorld` — маркер для безопасной передачи
+    /// неизменяемого указателя на World в параллельные системы.
+    ///
+    /// # Safety
+    /// Вызывающий обязан гарантировать:
+    /// 1. Все системы, работающие параллельно, задекларировали
+    ///    неконфликтующий доступ через `AccessDescriptor`.
+    /// 2. Во время действия `ParallelWorld` никакие structural changes
+    ///    (spawn/despawn/insert_component) не производятся.
+    /// 3. `ParallelWorld` не переживает `&self`.
+    pub unsafe fn as_parallel_world(&self) -> ParallelWorld<'_> {
+        ParallelWorld { world: self as *const World, _marker: std::marker::PhantomData }
+    }
+
+    /// Raw mutable pointer на архетип по индексу.
+    ///
+    /// Используется `ParallelWorld` для получения `&mut Archetype`
+    /// в параллельных системах. Безопасность гарантируется тем, что
+    /// два потока никогда не обращаются к одному архетипу с Write-доступом
+    /// к одному компоненту (инвариант `compile()`).
+    ///
+    /// # Safety
+    /// - `idx` должен быть валидным индексом в `self.archetypes`
+    /// - Вызывающий гарантирует отсутствие aliasing mutable references
+    pub(crate) unsafe fn archetype_ptr(&self, idx: usize) -> *mut Archetype {
+        &self.archetypes[idx] as *const Archetype as *mut Archetype
+    }
+
     // ── Resources ──────────────────────────────────────────────
 
     pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {
@@ -163,10 +193,6 @@ impl World {
     }
 
     /// Raw pointer на EventQueue — для EventWriter в SystemContext.
-    /// Публичный чтобы apex-scheduler мог использовать без доступа к приватному полю.
-    ///
-    /// # Safety
-    /// Вызывающий гарантирует уникальный доступ (через AccessDescriptor).
     pub fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
     ) -> Option<*mut crate::events::EventQueue<T>> {
@@ -198,17 +224,6 @@ impl World {
     }
 
     /// Batch spawn — N entity одного Bundle типа.
-    ///
-    /// # Оптимизации vs spawn_bundle в цикле
-    /// - Один `get_or_create_archetype` на весь batch
-    /// - `reserve` памяти для всех колонок заранее
-    /// - `allocate_batch` — один `Vec::resize_with` вместо N push
-    /// - `set_locations_batch` — один проход без повторных bounds checks
-    ///
-    /// # Важно
-    /// `make_bundle` вызывается для i=0..count включительно.
-    /// Для определения archetype вызывается `make_bundle(0)` отдельно,
-    /// затем весь диапазон i=0..count для записи данных.
     pub fn spawn_many<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
@@ -216,11 +231,8 @@ impl World {
     {
         if count == 0 { return Vec::new(); }
 
-        // Шаг 1: определяем archetype по bundle(0) — отдельный вызов
-        // make_bundle(0) здесь используется ТОЛЬКО для component_ids
         let probe        = make_bundle(0);
         let ids          = probe.component_ids(&mut self.registry);
-        // probe потребляется (drop) — данные не записываем
         drop(probe);
 
         let archetype_id = self.get_or_create_archetype(ids);
@@ -228,31 +240,26 @@ impl World {
         let start_row    = self.archetypes[arch_idx].entities.len();
         let tick         = self.current_tick;
 
-        // Шаг 2: reserve памяти заранее
         self.archetypes[arch_idx].entities.reserve(count);
         let target_cap = start_row + count;
         for col in &mut self.archetypes[arch_idx].columns {
             while col.capacity < target_cap { col.grow(); }
         }
 
-        // Шаг 3: batch allocate entity IDs
         let entities = self.entities.allocate_batch(count);
 
-        // Шаг 4: записываем entity + данные (make_bundle вызывается для КАЖДОГО i)
         for (i, &entity) in entities.iter().enumerate() {
             let row    = start_row + i;
-            let bundle = make_bundle(i); // i=0 вызывается снова — корректно
+            let bundle = make_bundle(i);
             self.archetypes[arch_idx].entities.push(entity);
             bundle.write_into(self, archetype_id, row, tick);
         }
 
-        // Шаг 5: batch set_location
         self.entities.set_locations_batch(&entities, archetype_id, start_row);
-
         entities
     }
 
-    /// Batch spawn без возврата entity IDs — максимальная скорость.
+    /// Batch spawn без возврата entity IDs.
     pub fn spawn_many_silent<B, F>(&mut self, count: usize, mut make_bundle: F)
     where
         B: Bundle,
@@ -524,9 +531,53 @@ impl World {
         }
         to_row
     }
+
+    // ── Relations ──────────────────────────────────────────────
+    // Реализация методов отношений находится в relations.rs
 }
 
 impl Default for World { fn default() -> Self { Self::new() } }
+
+// ── ParallelWorld ──────────────────────────────────────────────
+//
+// Тонкий токен, разрешающий передачу *const World в потоки Rayon.
+//
+// # Инварианты (поддерживаются планировщиком)
+//
+// 1. Все системы, работающие в одном Stage, прошли проверку
+//    `AccessDescriptor::conflicts_with` — Write-пересечений нет.
+//
+// 2. Каждая Column хранит данные как `*mut u8` (raw heap buffer).
+//    Разные Column — разные выделения памяти → нет aliasing.
+//
+// 3. Structural changes (spawn/despawn) запрещены во время
+//    параллельного Stage — `archetypes` Vec не изменяется,
+//    указатели остаются валидными.
+//
+// 4. `ParallelWorld` не переживает `&World` (lifetime `'w`).
+//    `rayon::scope` гарантирует join потоков до выхода из блока,
+//    поэтому dangling pointer невозможен.
+pub struct ParallelWorld<'w> {
+    pub(crate) world:   *const World,
+    pub(crate) _marker: std::marker::PhantomData<&'w World>,
+}
+
+// SAFETY: World содержит только Send+Sync данные.
+// Параллельный доступ безопасен при соблюдении инвариантов выше.
+unsafe impl Send for ParallelWorld<'_> {}
+unsafe impl Sync for ParallelWorld<'_> {}
+
+impl<'w> ParallelWorld<'w> {
+    /// Получить shared reference на World.
+    ///
+    /// # Safety
+    /// Вызывающий гарантирует что в этот момент нет конфликтующих
+    /// мутабельных доступов к тем же данным из других потоков.
+    #[inline]
+    pub unsafe fn get(&self) -> &'w World {
+        &*self.world
+    }
+}
 
 // ── CachedQuery ────────────────────────────────────────────────
 

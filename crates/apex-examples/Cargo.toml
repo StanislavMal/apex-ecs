@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-apex-core = { path = "../apex-core" }
-apex-graph = { path = "../apex-graph" }
+apex-core      = { path = "../apex-core" }
+apex-graph     = { path = "../apex-graph" }
 apex-scheduler = { path = "../apex-scheduler" }
+rayon = { workspace = true, optional = true }
+
+[features]
+default  = []
+parallel = ["dep:rayon", "apex-core/parallel", "apex-scheduler/parallel"]

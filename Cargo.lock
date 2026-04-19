@@ -23,6 +23,7 @@ dependencies = [
  "apex-core",
  "apex-graph",
  "apex-scheduler",
+ "rayon",
 ]
 
 [[package]]

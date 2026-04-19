@@ -16,7 +16,7 @@ pub use component::{Component, Tick};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
-pub use world::{World, Bundle, CachedQuery};
+pub use world::{World, Bundle, CachedQuery, ParallelWorld};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns, Likes};

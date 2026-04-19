@@ -1,5 +1,7 @@
 /// Apex ECS — Performance Benchmark
 /// cargo run -p apex-examples --example perf --release
+/// Параллельный режим:
+/// cargo run -p apex-examples --example perf --release --features parallel
 
 use std::time::Instant;
 use apex_core::prelude::*;
@@ -12,6 +14,9 @@ use apex_core::access::AccessDescriptor;
 #[derive(Clone, Copy)] struct Mass(f32);
 #[derive(Clone, Copy)] struct Player;
 #[derive(Clone, Copy)] struct Enemy;
+// Дополнительные компоненты для демонстрации параллелизма без конфликтов
+#[derive(Clone, Copy)] struct Temperature(f32);
+#[derive(Clone, Copy)] struct Mana       { current: f32, max: f32 }
 
 #[derive(Clone, Copy)] struct PhysicsConfig { gravity: f32, dt: f32 }
 #[derive(Clone, Copy, Default)] struct FrameCounter { count: u64 }
@@ -59,6 +64,28 @@ fn make_world(n: usize) -> (World, Vec<Entity>) {
         ))
     }).collect();
     (world, entities)
+}
+
+/// Создаёт World с 4 независимыми компонентами — для демонстрации
+/// параллелизма без каких-либо Write-конфликтов между системами.
+fn make_world_4comp(n: usize) -> World {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    world.register_component::<Velocity>();
+    world.register_component::<Health>();
+    world.register_component::<Temperature>();
+    world.register_component::<Mana>();
+    world.spawn_many_silent(n, |i| {
+        let f = i as f32;
+        (
+            Position    { x: f, y: f * 0.5, z: 0.0 },
+            Velocity    { x: 1.0, y: 0.5, z: 0.0 },
+            Health      { current: 100.0, max: 100.0 },
+            Temperature(20.0 + f * 0.001),
+            Mana        { current: 50.0, max: 100.0 },
+        )
+    });
+    world
 }
 
 // ── Batch Allocator benchmark ──────────────────────────────────
@@ -149,8 +176,6 @@ fn bench_batch_allocator(n: usize) {
     // allocate_batch напрямую — изолируем overhead аллокатора
     bench(&format!("EntityAllocator::allocate_batch ({n}k)"), || {
         let mut world = World::new();
-        // Добираемся до аллокатора через spawn фиктивных entity
-        // Используем spawn_many_silent с ZST чтобы изолировать аллокатор
         world.register_component::<Player>();
         world.spawn_many_silent(n * 1000, |_| (Player,));
         (n * 1000) as u64
@@ -314,6 +339,200 @@ fn bench_scheduler(n: usize) {
     }
 }
 
+// ── Параллельный планировщик ───────────────────────────────────
+
+/// Бенчмарк реального параллелизма через rayon.
+///
+/// Сравниваем sequential vs parallel выполнение одного и того же
+/// Stage из N независимых систем. Каждая система выполняет тяжёлую
+/// операцию (sin/cos) чтобы параллельный выигрыш был виден.
+///
+/// Ожидаемый результат на 2+ ядрах: speedup ~1.5–2x для 2 систем,
+/// ~2–4x для 4 систем (ограничен Rayon thread-pool overhead).
+#[cfg(feature = "parallel")]
+fn bench_parallel_scheduler(n: usize) {
+    println!("\n── Parallel Scheduler (rayon) ──────────────────────────────────────────────────");
+    println!("  rayon threads: {}", rayon::current_num_threads());
+
+    // Четыре системы без конфликтов — каждая пишет в свой компонент.
+    // Используем тяжёлую математику чтобы thread-spawn overhead был мал
+    // по сравнению с полезной работой.
+
+    struct PhysSys;
+    impl ParSystem for PhysSys {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Velocity>().write::<Position>()
+        }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+                // Очень тяжёлая операция - итеративный расчёт
+                let mut x = p.x + v.x;
+                let mut y = p.y + v.y;
+                for _ in 0..50 {
+                    x = x.sin().cos().exp().sqrt();
+                    y = y.cos().sin().ln_1p().abs();
+                }
+                p.x = x;
+                p.y = y;
+                p.z = x * y;
+            });
+        }
+    }
+
+    struct HpSys;
+    impl ParSystem for HpSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Write<Health>, _>(|hp| {
+                // Тяжёлые вычисления с health
+                let mut val = hp.current;
+                for i in 0..30 {
+                    val = (val * 0.9999_f32).max(0.0).min(hp.max);
+                    val = val.sqrt().sin().cos().exp();
+                    if i % 5 == 0 {
+                        val = val.ln_1p().abs();
+                    }
+                }
+                hp.current = val;
+            });
+        }
+    }
+
+    struct TempSys;
+    impl ParSystem for TempSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Write<Temperature>, _>(|t| {
+                // Много итераций уравнения охлаждения
+                let mut temp = t.0;
+                for _ in 0..40 {
+                    temp = temp + (20.0 - temp) * 0.001;
+                    temp = temp.sin().cos().exp().sqrt();
+                }
+                t.0 = temp;
+            });
+        }
+    }
+
+    struct ManaSys;
+    impl ParSystem for ManaSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Write<Mana>, _>(|m| {
+                // Сложные вычисления с манной
+                let mut mana = m.current;
+                for i in 0..35 {
+                    mana = (mana + 0.1).min(m.max);
+                    mana = mana.ln_1p().sin().cos().exp();
+                    if i % 7 == 0 {
+                        mana = mana.sqrt().abs();
+                    }
+                }
+                m.current = mana;
+            });
+        }
+    }
+
+    // ── 2 системы: Sequential vs Parallel ─────────────────────
+
+    bench(&format!("2 systems SEQUENTIAL  ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.compile().unwrap();
+        assert!(sched.stages().unwrap()[0].is_parallelizable());
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("2 systems PARALLEL    ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.compile().unwrap();
+        sched.run(&mut world); // run() выбирает parallel путь при feature = "parallel"
+        (n * 1000) as u64
+    });
+
+    // ── 4 системы: Sequential vs Parallel ─────────────────────
+
+    bench(&format!("4 systems SEQUENTIAL  ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.add_par_system("temp", TempSys);
+        sched.add_par_system("mana", ManaSys);
+        sched.compile().unwrap();
+        assert_eq!(sched.stages().unwrap().len(), 1,
+            "все 4 системы должны быть в одном Stage");
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("4 systems PARALLEL    ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.add_par_system("temp", TempSys);
+        sched.add_par_system("mana", ManaSys);
+        sched.compile().unwrap();
+        sched.run(&mut world);
+        (n * 1000) as u64
+    });
+
+    // ── Mixed pipeline: 4 par → seq → 2 par ───────────────────
+
+    bench(&format!("mixed pipeline SEQ    ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.add_par_system("temp", TempSys);
+        sched.add_par_system("mana", ManaSys);
+        sched.add_system("barrier", |_world: &mut World| {
+            // Structural: в реале — apply commands
+        });
+        sched.add_par_system("phys2", PhysSys);
+        sched.add_par_system("hp2",   HpSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("mixed pipeline PAR    ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.add_par_system("temp", TempSys);
+        sched.add_par_system("mana", ManaSys);
+        sched.add_system("barrier", |_world: &mut World| {});
+        sched.add_par_system("phys2", PhysSys);
+        sched.add_par_system("hp2",   HpSys);
+        sched.compile().unwrap();
+        sched.run(&mut world);
+        (n * 1000) as u64
+    });
+
+    // ── Показываем план ───────────────────────────────────────
+    {
+        let mut sched = Scheduler::new();
+        sched.add_par_system("phys", PhysSys);
+        sched.add_par_system("hp",   HpSys);
+        sched.add_par_system("temp", TempSys);
+        sched.add_par_system("mana", ManaSys);
+        sched.add_system("commands", |_| {});
+        sched.add_par_system("phys2", PhysSys);
+        sched.add_par_system("hp2",   HpSys);
+        sched.compile().unwrap();
+        println!("  Pipeline plan (parallel):\n{}", sched.debug_plan());
+    }
+}
+
 // ── Resources benchmark ────────────────────────────────────────
 
 fn bench_resources(n: usize) {
@@ -457,9 +676,13 @@ fn bench_structural(n: usize) {
 fn main() {
     println!("=== Apex ECS — Performance Benchmark ===");
     println!("Build: {}", if cfg!(debug_assertions) { "DEBUG ⚠" } else { "RELEASE ✓" });
+    #[cfg(feature = "parallel")]
+    println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
+    #[cfg(not(feature = "parallel"))]
+    println!("Mode:  sequential (compile with --features parallel for rayon)");
     println!();
 
-    const N: usize = 100;
+    const N: usize = 1000; // 1M сущностей (1000 * 1000)
 
     bench_batch_allocator(N);
     bench_has_relation(N);
@@ -468,6 +691,9 @@ fn main() {
     bench_events(N);
     bench_query(N);
     bench_structural(N);
+
+    #[cfg(feature = "parallel")]
+    bench_parallel_scheduler(N);
 
     println!("\n── Summary ─────────────────────────────────────────────────────────────────────");
     let (mut world, _) = make_world(N * 1000);
