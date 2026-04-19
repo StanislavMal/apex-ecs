@@ -15,7 +15,11 @@ fn bench_topological_sort(c: &mut Criterion) {
             for i in 0..size-1 {
                 graph.add_edge(nodes[i], nodes[i+1], ());
             }
-            b.iter(|| graph.topological_sort())
+            b.iter(|| {
+                // Используем compute_topological_sort чтобы избежать проблем с borrow checker
+                let result = graph.compute_topological_sort();
+                criterion::black_box(result)
+            })
         });
         
         // Benchmark petgraph для сравнения
@@ -58,7 +62,10 @@ fn bench_parallel_levels(c: &mut Criterion) {
                 }
             }
             
-            b.iter(|| graph.parallel_levels())
+            b.iter(|| {
+                let result = graph.parallel_levels();
+                criterion::black_box(result)
+            })
         });
     }
     

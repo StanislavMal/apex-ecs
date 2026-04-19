@@ -682,7 +682,7 @@ fn main() {
     println!("Mode:  sequential (compile with --features parallel for rayon)");
     println!();
 
-    const N: usize = 1000; // 1M сущностей (1000 * 1000)
+    const N: usize = 1000; // 100K сущностей (100 * 100)
 
     bench_batch_allocator(N);
     bench_has_relation(N);
