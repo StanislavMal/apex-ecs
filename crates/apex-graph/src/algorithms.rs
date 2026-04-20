@@ -1,186 +1,248 @@
-use std::collections::VecDeque;
 use rustc_hash::FxHashSet;
 use thunderdome::Index;
 
 use crate::{Graph, GraphError};
 
-impl<N, E> Graph<N, E> {
-    /// Топологическая сортировка (алгоритм Кана) с кэшированием
-    /// Возвращает узлы в порядке зависимостей
-    /// Используется для порядка выполнения систем
+impl<N, W> Graph<N, W> {
+    /// Топологическая сортировка (алгоритм Кана) с кэшированием.
+    ///
+    /// Возвращает узлы в порядке зависимостей.
+    /// Корректна при удалениях (дырки в slot-space).
     pub fn topological_sort(&mut self) -> Result<&[Index], GraphError> {
-        // Проверяем кэш
         if self.dirty || self.cached_topological.is_none() {
-            // Вычисляем заново
             let result = self.compute_topological_sort()?;
             self.cached_topological = Some(result);
             self.dirty = false;
         }
-        
         Ok(self.cached_topological.as_ref().unwrap())
     }
-    
-    /// Внутренняя реализация топологической сортировки (без кэширования)
-    /// Публичная для бенчмарков и тестов
+
+    /// Внутренняя реализация топологической сортировки (без кэширования).
+    ///
+    /// Оптимизация: in_degree берётся из adjacency_in[slot].len(),
+    /// т.е. без сканирования всех рёбер.
     pub fn compute_topological_sort(&self) -> Result<Vec<Index>, GraphError> {
-        // Используем Vec вместо HashMap так как индексы плотные
-        let node_count = self.nodes.len();
-        let mut in_degree: Vec<usize> = vec![0; node_count];
-        
-        // Заполняем in_degree: для каждого ребра увеличиваем степень целевого узла
-        for (_, edge) in self.edges.iter() {
-            let to_slot = edge.to.slot() as usize;
-            if to_slot < node_count {
-                in_degree[to_slot] += 1;
+        let live_nodes = self.nodes.len();
+        if live_nodes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let slot_cap = self.slot_capacity();
+        let mut in_degree: Vec<usize> = vec![0; slot_cap];
+
+        // Заполняем indegree по входящим спискам.
+        // Важно: берём только живые узлы (iter по Arena).
+        for (node, _) in self.nodes.iter() {
+            let slot = node.slot() as usize;
+            let deg = self
+                .adjacency_in
+                .get(slot)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            in_degree[slot] = deg;
+        }
+
+        // Очередь узлов без входящих рёбер: Vec + head быстрее VecDeque.
+        let mut queue: Vec<Index> = Vec::with_capacity(live_nodes);
+        for (node, _) in self.nodes.iter() {
+            let slot = node.slot() as usize;
+            if in_degree[slot] == 0 {
+                queue.push(node);
             }
         }
 
-        // Очередь узлов без входящих рёбер
-        let mut queue: VecDeque<Index> = VecDeque::new();
-        
-        // Собираем узлы с нулевой степенью
-        for (idx, _) in self.nodes.iter() {
-            let slot = idx.slot() as usize;
-            if slot < node_count && in_degree[slot] == 0 {
-                queue.push_back(idx);
-            }
-        }
+        let mut result: Vec<Index> = Vec::with_capacity(live_nodes);
+        let mut head = 0usize;
 
-        let mut result = Vec::with_capacity(node_count);
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
 
-        while let Some(node) = queue.pop_front() {
             result.push(node);
-            let node_slot = node.slot() as usize;
 
-            // Обновляем степени соседей
-            if node_slot < self.adjacency_out.len() {
-                if let Some(edges) = self.adjacency_out.get(node_slot) {
-                    for &edge_idx in edges {
-                        if let Some(edge) = self.edges.get(edge_idx) {
-                            let to_slot = edge.to.slot() as usize;
-                            if to_slot < node_count {
-                                in_degree[to_slot] -= 1;
-                                if in_degree[to_slot] == 0 {
-                                    queue.push_back(edge.to);
-                                }
-                            }
-                        }
+            let node_slot = node.slot() as usize;
+            if let Some(edges) = self.adjacency_out.get(node_slot) {
+                for &edge_idx in edges {
+                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+
+                    let to = edge.to;
+                    // На всякий: если пользователь как-то оставил ребро на несуществующий узел.
+                    if self.nodes.get(to).is_none() {
+                        continue;
+                    }
+
+                    let to_slot = to.slot() as usize;
+
+                    // indegree должен быть > 0, но защищаемся от underflow.
+                    let deg = &mut in_degree[to_slot];
+                    if *deg == 0 {
+                        continue;
+                    }
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push(to);
                     }
                 }
             }
         }
 
-        if result.len() == node_count {
+        if result.len() == live_nodes {
             Ok(result)
         } else {
             Err(GraphError::CycleDetected)
         }
     }
 
-    /// BFS обход с заданного узла
+    /// BFS обход с заданного узла.
+    ///
+    /// Оптимизация: visited = Vec<bool> по slot-space (быстрее HashSet).
     pub fn bfs(&self, start: Index) -> Vec<Index> {
-        let mut visited = FxHashSet::default();
-        let mut queue = VecDeque::new();
+        if self.nodes.get(start).is_none() {
+            return Vec::new();
+        }
+
+        let slot_cap = self.slot_capacity();
+        let mut visited = vec![false; slot_cap];
+
+        let mut queue: Vec<Index> = Vec::new();
+        let mut head = 0usize;
+
+        let start_slot = start.slot() as usize;
+        visited[start_slot] = true;
+        queue.push(start);
+
         let mut result = Vec::new();
 
-        queue.push_back(start);
-        visited.insert(start);
-
-        while let Some(node) = queue.pop_front() {
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
             result.push(node);
 
-            for successor in self.successors(node) {
-                if !visited.contains(&successor) {
-                    visited.insert(successor);
-                    queue.push_back(successor);
-                }
-            }
-        }
-
-        result
-    }
-
-    /// DFS обход с заданного узла
-    pub fn dfs(&self, start: Index) -> Vec<Index> {
-        let mut visited = FxHashSet::default();
-        let mut result = Vec::new();
-        self.dfs_recursive(start, &mut visited, &mut result);
-        result
-    }
-
-    fn dfs_recursive(
-        &self,
-        node: Index,
-        visited: &mut FxHashSet<Index>,
-        result: &mut Vec<Index>,
-    ) {
-        if !visited.insert(node) {
-            return;
-        }
-        result.push(node);
-
-        for successor in self.successors(node) {
-            self.dfs_recursive(successor, visited, result);
-        }
-    }
-
-    /// Параллельные уровни — группы узлов которые можно выполнять одновременно
-    /// Возвращает Vec<Vec<Index>> где каждый Vec — независимый уровень
-    pub fn parallel_levels(&mut self) -> Result<Vec<Vec<Index>>, GraphError> {
-        // Получаем sorted как Vec чтобы освободить borrow
-        let sorted_vec = self.compute_topological_sort()?;
-        let node_count = self.nodes.len();
-
-        // level[node_slot] = на каком уровне находится узел
-        let mut level: Vec<usize> = vec![0; node_count];
-
-        for &node in &sorted_vec {
             let node_slot = node.slot() as usize;
-            
-            // Уровень = max(уровни предшественников) + 1
-            let mut max_pred_level = 0;
-            let slot = node_slot;
-            if slot < self.adjacency_in.len() {
-                if let Some(edges) = self.adjacency_in.get(slot) {
-                    for &edge_idx in edges {
-                        if let Some(edge) = self.edges.get(edge_idx) {
-                            let pred_slot = edge.from.slot() as usize;
-                            if pred_slot < node_count {
-                                max_pred_level = max_pred_level.max(level[pred_slot]);
-                            }
-                        }
+            if let Some(edges) = self.adjacency_out.get(node_slot) {
+                for &edge_idx in edges {
+                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let succ = edge.to;
+                    if self.nodes.get(succ).is_none() {
+                        continue;
+                    }
+                    let succ_slot = succ.slot() as usize;
+                    if succ_slot >= visited.len() {
+                        continue;
+                    }
+                    if !visited[succ_slot] {
+                        visited[succ_slot] = true;
+                        queue.push(succ);
                     }
                 }
             }
-            
-            level[node_slot] = max_pred_level + 1;
         }
 
-        // Группируем по уровням
-        let max_level = *level.iter().max().unwrap_or(&0);
-        let mut levels: Vec<Vec<Index>> = vec![Vec::new(); max_level];
+        result
+    }
 
-        // Собираем индексы по уровням
-        for (idx, _) in self.nodes.iter() {
-            let slot = idx.slot() as usize;
-            if slot < node_count {
-                let lvl = level[slot];
-                if lvl > 0 {
-                    // Уровни 1-based, но в Vec 0-based
-                    levels[lvl - 1].push(idx);
+    /// DFS обход с заданного узла (итеративный, без рекурсии).
+    pub fn dfs(&self, start: Index) -> Vec<Index> {
+        if self.nodes.get(start).is_none() {
+            return Vec::new();
+        }
+
+        let slot_cap = self.slot_capacity();
+        let mut visited = vec![false; slot_cap];
+        let mut stack: Vec<Index> = Vec::new();
+        stack.push(start);
+
+        let mut result = Vec::new();
+
+        while let Some(node) = stack.pop() {
+            let slot = node.slot() as usize;
+            if slot >= visited.len() || visited[slot] {
+                continue;
+            }
+            visited[slot] = true;
+            result.push(node);
+
+            // Чтобы порядок был ближе к рекурсивному DFS,
+            // добавляем successors в обратном порядке.
+            if let Some(edges) = self.adjacency_out.get(slot) {
+                for &edge_idx in edges.iter().rev() {
+                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let succ = edge.to;
+                    if self.nodes.get(succ).is_none() {
+                        continue;
+                    }
+                    let succ_slot = succ.slot() as usize;
+                    if succ_slot < visited.len() && !visited[succ_slot] {
+                        stack.push(succ);
+                    }
                 }
             }
         }
 
-        Ok(levels)
+        result
     }
 
-    /// Проверка наличия цикла
+    /// Параллельные уровни — группы узлов которые можно выполнять одновременно.
+    ///
+    /// Использует кэшированную топологическую сортировку (через topological_sort()).
+    pub fn parallel_levels(&mut self) -> Result<Vec<Vec<Index>>, GraphError> {
+        // Клонируем срез в Vec<Index>, чтобы разорвать borrow
+        let sorted = self.topological_sort()?.to_vec(); // Vec<Index>
+
+        let slot_cap = self.slot_capacity();
+        let mut level: Vec<usize> = vec![0; slot_cap];
+
+        for &node in &sorted {
+            let node_slot = node.slot() as usize;
+
+            let mut max_pred_level = 0usize;
+
+            if let Some(edges) = self.adjacency_in.get(node_slot) {
+                for &edge_idx in edges {
+                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let pred = edge.from;
+                    if self.nodes.get(pred).is_none() {
+                        continue;
+                    }
+                    let pred_slot = pred.slot() as usize;
+                    if pred_slot < level.len() {
+                        max_pred_level = max_pred_level.max(level[pred_slot]);
+                    }
+                }
+            }
+
+            level[node_slot] = max_pred_level + 1;
+        }
+
+        let mut max_level = 0usize;
+        for &node in &sorted {
+            let slot = node.slot() as usize;
+            max_level = max_level.max(level.get(slot).copied().unwrap_or(0));
+        }
+
+        let mut levels: Vec<Vec<Index>> = vec![Vec::new(); max_level.max(1)];
+        for &node in &sorted {
+            let slot = node.slot() as usize;
+            let lvl = level[slot];
+            if lvl > 0 {
+                levels[lvl - 1].push(node);
+            }
+        }
+
+        // Если граф пустой (sorted пуст), вернём пустой Vec
+        if sorted.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(levels)
+        }
+    }
+
+    /// Проверка наличия цикла.
     pub fn has_cycle(&mut self) -> bool {
         self.topological_sort().is_err()
     }
 
-    /// Все узлы достижимые из start
+    /// Все узлы достижимые из start.
     pub fn reachable_from(&self, start: Index) -> FxHashSet<Index> {
         self.bfs(start).into_iter().collect()
     }
@@ -192,7 +254,7 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     #[test]
-    fn test_topological_sort() {
+    fn test_topological_sort_chain() {
         let mut g: Graph<&str, ()> = Graph::new();
         let a = g.add_node("A");
         let b = g.add_node("B");
@@ -203,7 +265,6 @@ mod tests {
         g.add_edge(b, c, ());
 
         let sorted = g.topological_sort().unwrap();
-        // A должен быть раньше B, B раньше C
         let pos: FxHashMap<Index, usize> = sorted
             .iter()
             .enumerate()
@@ -221,7 +282,7 @@ mod tests {
         let b = g.add_node("B");
 
         g.add_edge(a, b, ());
-        g.add_edge(b, a, ()); // Цикл!
+        g.add_edge(b, a, ()); // цикл
 
         assert!(g.has_cycle());
     }
@@ -242,12 +303,28 @@ mod tests {
         g.add_edge(c, d, ());
 
         let levels = g.parallel_levels().unwrap();
-        // Уровень 0: A, B (независимы)
-        // Уровень 1: C
-        // Уровень 2: D
         assert_eq!(levels.len(), 3);
-        assert_eq!(levels[0].len(), 2); // A и B параллельно
+        assert_eq!(levels[0].len(), 2); // A,B
         assert_eq!(levels[1].len(), 1); // C
         assert_eq!(levels[2].len(), 1); // D
+    }
+
+    #[test]
+    fn toposort_after_node_removal_is_correct() {
+        let mut g: Graph<&str, ()> = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+
+        g.add_edge(a, b, ());
+        g.add_edge(b, c, ());
+
+        // Удаляем B: должны исчезнуть оба ребра, останутся A и C без связей
+        assert!(g.remove_node(b).is_some());
+
+        let sorted = g.compute_topological_sort().unwrap();
+        assert_eq!(sorted.len(), 2);
+        assert!(sorted.contains(&a));
+        assert!(sorted.contains(&c));
     }
 }
