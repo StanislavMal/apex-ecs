@@ -130,7 +130,7 @@ impl Column {
     }
 
     pub(crate) fn grow(&mut self) {
-        let new_cap = if self.capacity == 0 { 16 } else { self.capacity * 2 };
+        let new_cap = if self.capacity == 0 { 64 } else { self.capacity * 2 };
         if self.item_size == 0 {
             self.capacity = new_cap;
             return;
@@ -164,6 +164,12 @@ impl Column {
     #[inline]
     pub fn ticks_ptr(&self) -> *const Tick {
         self.change_ticks.as_ptr()
+    }
+
+    /// Сырой указатель на данные — для chunk-level параллелизма
+    #[inline]
+    pub fn data_ptr(&self) -> *mut u8 {
+        self.data
     }
 }
 
@@ -265,4 +271,36 @@ impl Archetype {
             None
         }
     }
+}
+
+/// Описание одного чанка архетипа для chunk-level параллелизма.
+///
+/// Содержит сырые указатели на срезы данных [start, start+len).
+/// SAFETY: используется только внутри Rayon scope пока архетип жив
+/// и не происходит structural changes.
+pub struct ArchetypeChunk<'a> {
+    pub entities: &'a [Entity],
+    pub arch_id:  ArchetypeId,
+    /// Индекс строки start внутри архетипа (для column_index lookup)
+    pub start_row: usize,
+    pub len:       usize,
+}
+
+/// Разбить архетип на чанки фиксированного размера.
+///
+/// Возвращает срезы `entities` длиной `chunk_size` (последний может быть меньше).
+/// Используется `par_for_each_component` для параллельной итерации внутри одного архетипа.
+pub fn archetype_chunks(arch: &Archetype, chunk_size: usize) -> impl Iterator<Item = ArchetypeChunk<'_>> {
+    let total = arch.entities.len();
+    let num_chunks = (total + chunk_size - 1) / chunk_size;
+    (0..num_chunks).map(move |i| {
+        let start = i * chunk_size;
+        let end = (start + chunk_size).min(total);
+        ArchetypeChunk {
+            entities:  &arch.entities[start..end],
+            arch_id:   arch.id,
+            start_row: start,
+            len:       end - start,
+        }
+    })
 }

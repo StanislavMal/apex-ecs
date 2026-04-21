@@ -60,6 +60,81 @@ impl QueryCache {
     pub fn version(&self) -> u32 { self.version }
 }
 
+// ── DeferredCommand (deferred structural changes) ──────────────
+
+/// Отложенные structural changes — накапливаются во время итерации,
+/// применяются batch'ем после завершения системы.
+///
+/// Это устраняет необходимость прерывать итерацию для каждого insert/remove.
+enum DeferredCommand {
+    Despawn(Entity),
+    InsertRaw {
+        entity:       Entity,
+        component_id: ComponentId,
+        data:         Vec<u8>,
+        tick:         Tick,
+    },
+    RemoveRaw {
+        entity:       Entity,
+        component_id: ComponentId,
+    },
+}
+
+/// Очередь отложенных команд.
+///
+/// Используется когда нужно избежать borrow conflicts во время итерации.
+/// `apply` выполняет все команды за один проход.
+pub struct DeferredQueue {
+    commands: Vec<DeferredCommand>,
+}
+
+impl DeferredQueue {
+    pub fn new() -> Self { Self { commands: Vec::new() } }
+    pub fn with_capacity(cap: usize) -> Self { Self { commands: Vec::with_capacity(cap) } }
+
+    pub fn despawn(&mut self, entity: Entity) {
+        self.commands.push(DeferredCommand::Despawn(entity));
+    }
+
+    pub fn insert_raw(
+        &mut self,
+        entity:       Entity,
+        component_id: ComponentId,
+        data:         Vec<u8>,
+        tick:         Tick,
+    ) {
+        self.commands.push(DeferredCommand::InsertRaw { entity, component_id, data, tick });
+    }
+
+    pub fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
+        self.commands.push(DeferredCommand::RemoveRaw { entity, component_id });
+    }
+
+    pub fn len(&self) -> usize { self.commands.len() }
+    pub fn is_empty(&self) -> bool { self.commands.is_empty() }
+
+    /// Применить все отложенные команды к миру за один проход.
+    pub fn apply(&mut self, world: &mut World) {
+        for cmd in self.commands.drain(..) {
+            match cmd {
+                DeferredCommand::Despawn(e) => { world.despawn(e); }
+                DeferredCommand::InsertRaw { entity, component_id, data, tick } => {
+                    world.insert_raw(entity, component_id, data, tick);
+                }
+                DeferredCommand::RemoveRaw { entity, component_id } => {
+                    world.remove_raw(entity, component_id);
+                }
+            }
+        }
+    }
+
+    pub fn clear(&mut self) { self.commands.clear(); }
+}
+
+impl Default for DeferredQueue {
+    fn default() -> Self { Self::new() }
+}
+
 // ── World ──────────────────────────────────────────────────────
 
 pub struct World {
@@ -314,6 +389,66 @@ impl World {
         });
     }
 
+    /// Вставить компонент по raw данным — используется DeferredQueue.
+    pub(crate) fn insert_raw(
+        &mut self,
+        entity:       Entity,
+        component_id: ComponentId,
+        data:         Vec<u8>,
+        tick:         Tick,
+    ) {
+        let location = match self.entities.get_location(entity) {
+            Some(loc) => loc,
+            None      => return,
+        };
+        let current_idx = location.archetype_id.0 as usize;
+
+        if self.archetypes[current_idx].has_component(component_id) {
+            if !data.is_empty() {
+                unsafe {
+                    if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
+                        let col = &mut self.archetypes[current_idx].columns[col_idx];
+                        col.write_at(location.row, data.as_ptr(), tick);
+                    }
+                }
+            }
+            return;
+        }
+
+        let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
+        let new_row     = self.move_entity(entity, location, new_arch_id);
+        if !data.is_empty() {
+            unsafe {
+                self.archetypes[new_arch_id.0 as usize]
+                    .write_component(new_row, component_id, data.as_ptr(), tick);
+            }
+        }
+        self.entities.set_location(entity, EntityLocation {
+            archetype_id: new_arch_id,
+            row:          new_row,
+        });
+    }
+
+    /// Удалить компонент по raw ComponentId — используется DeferredQueue.
+    pub(crate) fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
+        let location = match self.entities.get_location(entity) {
+            Some(loc) => loc,
+            None      => return,
+        };
+        if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
+            return;
+        }
+        let new_arch_id = self.find_or_create_archetype_without(
+            location.archetype_id,
+            component_id,
+        );
+        let new_row = self.move_entity(entity, location, new_arch_id);
+        self.entities.set_location(entity, EntityLocation {
+            archetype_id: new_arch_id,
+            row:          new_row,
+        });
+    }
+
     pub fn remove<T: Component>(&mut self, entity: Entity) -> bool {
         let component_id = match self.registry.get_id::<T>() {
             Some(id) => id,
@@ -521,6 +656,15 @@ impl Default for World { fn default() -> Self { Self::new() } }
 
 // ── SystemContext ──────────────────────────────────────────────
 
+/// Размер чанка для par_for_each_component.
+///
+/// Разбивает архетип на блоки по N entity для параллельной обработки.
+/// Слишком маленький → overhead rayon съедает выигрыш.
+/// Слишком большой → мало задач, плохой load balancing.
+///
+/// 4096 — эмпирически оптимально для большинства компонентов.
+pub const PAR_CHUNK_SIZE: usize = 4096;
+
 pub struct SystemContext<'w> {
     pub(crate) world:   *const World,
     pub(crate) _marker: std::marker::PhantomData<&'w World>,
@@ -598,19 +742,18 @@ impl<'w> SystemContext<'w> {
         self.query::<Q>().for_each_component(f);
     }
 
-    /// Параллельная итерация по компонентам внутри одной системы.
+    /// Параллельная итерация по компонентам с chunk-level параллелизмом.
     ///
-    /// Всегда использует `rayon::par_iter` по архетипам.
-    /// Вложенный параллелизм (когда вызывается из `rayon::scope`
-    /// планировщика) безопасен: Rayon work-stealing корректно
-    /// обрабатывает вложенные задачи без deadlock.
+    /// **Ключевое улучшение**: разбивает каждый архетип на чанки по `PAR_CHUNK_SIZE`
+    /// entities и раздаёт их в Rayon work-stealing pool.
+    ///
+    /// Это даёт реальный speedup даже когда все entity в одном архетипе,
+    /// в отличие от предыдущей версии которая параллелила только по архетипам.
     ///
     /// Реальный выигрыш когда:
-    /// - Несколько архетипов (>2) с большим числом entity
-    /// - Тяжёлые вычисления на entity (трансцендентные функции)
-    ///
-    /// При лёгких операциях (простая арифметика) overhead Rayon
-    /// нивелирует выигрыш — используй `for_each_component`.
+    /// - Архетип содержит > PAR_CHUNK_SIZE entities
+    /// - Вычисления CPU-bound (не memory-bandwidth bound)
+    /// - Нет false sharing между чанками (каждый чанк = независимый диапазон строк)
     #[cfg(feature = "parallel")]
     pub fn par_for_each_component<Q, F>(&self, f: F)
     where
@@ -625,26 +768,40 @@ impl<'w> SystemContext<'w> {
 
         if ids.len() != Q::component_count() { return; }
 
+        // Собираем все подходящие архетипы и разбиваем их на чанки.
+        // Каждый чанк — независимый диапазон строк без aliasing.
+        //
         // SAFETY:
-        // - Каждый архетип — отдельный набор Column-буферов в памяти
-        // - Разные архетипы никогда не имеют aliasing данных
-        // - AccessDescriptor проверен compile() — нет Write-конфликтов
-        //   между системами в одном Stage
+        // - Каждый чанк обращается к непересекающемуся диапазону строк [start, end)
+        // - Разные архетипы — разные буферы Column
+        // - AccessDescriptor проверен compile() — нет Write-конфликтов между системами
         // - Structural changes запрещены во время выполнения систем
-        // - Rayon work-stealing корректен при вложенных scope:
-        //   если вызывается из rayon worker, задачи по архетипам
-        //   добавляются в локальную очередь и выполняются эффективно
-        world.archetypes
-            .par_iter()
-            .filter(|arch| !arch.is_empty() && Q::matches_archetype(arch, &ids))
-            .for_each(|arch| {
-                let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
-                for row in 0..arch.len() {
-                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                        f(item);
-                    }
+        // - Rayon work-stealing корректен при вложенных scope
+
+        // Все чанки всех архетипов в одном flat Vec — лучший load balancing
+        let chunks: Vec<(usize, usize, usize)> = world.archetypes
+            .iter()
+            .enumerate()
+            .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+            .flat_map(|(arch_idx, arch)| {
+                let total = arch.len();
+                (0..(total + PAR_CHUNK_SIZE - 1) / PAR_CHUNK_SIZE).map(move |chunk_i| {
+                    let start = chunk_i * PAR_CHUNK_SIZE;
+                    let end   = (start + PAR_CHUNK_SIZE).min(total);
+                    (arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch  = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    f(item);
                 }
-            });
+            }
+        });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -671,18 +828,30 @@ impl<'w> SystemContext<'w> {
 
         if ids.len() != Q::component_count() { return; }
 
-        world.archetypes
-            .par_iter()
-            .filter(|arch| !arch.is_empty() && Q::matches_archetype(arch, &ids))
-            .for_each(|arch| {
-                let state    = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
-                let entities = &arch.entities;
-                for row in 0..arch.len() {
-                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                        f(entities[row], item);
-                    }
+        let chunks: Vec<(usize, usize, usize)> = world.archetypes
+            .iter()
+            .enumerate()
+            .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+            .flat_map(|(arch_idx, arch)| {
+                let total = arch.len();
+                (0..(total + PAR_CHUNK_SIZE - 1) / PAR_CHUNK_SIZE).map(move |chunk_i| {
+                    let start = chunk_i * PAR_CHUNK_SIZE;
+                    let end   = (start + PAR_CHUNK_SIZE).min(total);
+                    (arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch     = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let state    = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            let entities = &arch.entities;
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    f(entities[row], item);
                 }
-            });
+            }
+        });
     }
 
     #[cfg(not(feature = "parallel"))]

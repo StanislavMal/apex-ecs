@@ -16,7 +16,7 @@ pub use component::{Component, Tick};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
-pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext};
+pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext, DeferredQueue};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns, Likes};
@@ -31,7 +31,7 @@ pub mod prelude {
     pub use crate::entity::Entity;
     pub use crate::events::EventQueue;
     pub use crate::resources::ResourceMap;
-    pub use crate::world::{World, Bundle, CachedQuery, SystemContext};
+    pub use crate::world::{World, Bundle, CachedQuery, SystemContext, DeferredQueue};
     pub use crate::query::{Query, Read, Write, With, Without, Changed, QueryBuilder, WorldQuery};
     pub use crate::commands::Commands;
     pub use crate::relations::{RelationKind, ChildOf, Owns, Likes};
