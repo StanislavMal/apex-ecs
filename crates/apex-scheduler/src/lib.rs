@@ -59,10 +59,7 @@ use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
     world::{World, ParallelWorld, SystemContext},
-    query::{WorldQuery, Query},
-    component::Tick,
-    entity::Entity,
-    system_param::{Res, ResMut, EventReader, EventWriter, AutoSystem, WorldQuerySystemAccess},
+    system_param::{AutoSystem, WorldQuerySystemAccess},
 };
 
 pub use stage::Stage;
@@ -264,8 +261,15 @@ struct GraphEdgeInfo {
 /// при следующем compile добавляются только новые узлы/рёбра.
 pub struct Scheduler {
     systems:         Vec<SystemDescriptor>,
+    /// Быстрый поиск системы по SystemId: O(1) вместо O(n)
+    system_indices:  FxHashMap<SystemId, usize>,
     next_id:         u32,
     execution_plan:  Option<ExecutionPlan>,
+
+    // ── Конфигурация параллелизма ───────────────────────────────
+    /// Минимальное количество систем в Stage для параллельного выполнения
+    /// Если систем меньше этого значения — выполняется последовательно
+    parallel_threshold: usize,
 
     // ── Инкрементальный граф ────────────────────────────────────
     /// Граф зависимостей: узлы = SystemId, рёбра = ConflictKind.
@@ -283,8 +287,10 @@ impl Scheduler {
     pub fn new() -> Self {
         Self {
             systems:          Vec::new(),
+            system_indices:   FxHashMap::default(),
             next_id:          0,
             execution_plan:   None,
+            parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             dependency_graph: Graph::new(),
             graph_nodes:      FxHashMap::default(),
             edge_info:        Vec::new(),
@@ -301,6 +307,7 @@ impl Scheduler {
     {
         let id = SystemId(self.next_id);
         self.next_id += 1;
+        let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
@@ -308,6 +315,7 @@ impl Scheduler {
             after:  Vec::new(),
             before: Vec::new(),
         });
+        self.system_indices.insert(id, index);
         self.invalidate_plan();
         SystemBuilder { scheduler: self, id }
     }
@@ -323,6 +331,7 @@ impl Scheduler {
         self.next_id += 1;
         let access = S::Query::system_access();
         let adapter = AutoSystemAdapter { inner: system };
+        let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
@@ -330,6 +339,7 @@ impl Scheduler {
             after:  Vec::new(),
             before: Vec::new(),
         });
+        self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
     }
@@ -343,6 +353,7 @@ impl Scheduler {
         let id     = SystemId(self.next_id);
         self.next_id += 1;
         let access = S::access();
+        let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
@@ -350,6 +361,7 @@ impl Scheduler {
             after:  Vec::new(),
             before: Vec::new(),
         });
+        self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
     }
@@ -367,6 +379,7 @@ impl Scheduler {
         let id       = SystemId(self.next_id);
         self.next_id += 1;
         let system   = FnParSystem { func: Box::new(func), access: access.clone() };
+        let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
@@ -374,6 +387,7 @@ impl Scheduler {
             after:  Vec::new(),
             before: Vec::new(),
         });
+        self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
     }
@@ -400,7 +414,8 @@ impl Scheduler {
     /// топосорт (добавленные узлы уже в графе).
     pub fn compile(&mut self) -> Result<(), SchedulerError> {
         if self.graph_dirty {
-            self.rebuild_graph()?;
+            // Инкрементальное обновление: добавляем только новые узлы и рёбра
+            self.add_new_nodes_and_edges()?;
             self.graph_dirty = false;
         }
 
@@ -526,21 +541,224 @@ impl Scheduler {
                 let ai = match self.systems[i].kind.access() { Some(a) => a, None => continue };
                 let aj = match self.systems[j].kind.access() { Some(a) => a, None => continue };
 
-                if let Some(conflict_kind) = detect_conflict_kind(
+                if let Some((conflict_kind, direction)) = detect_conflict_kind(
                     ai, aj,
                     self.systems[i].id,
                     self.systems[j].id,
                 ) {
+                    // direction = true означает i→j
+                    if direction {
+                        if let (Some(&from), Some(&to)) =
+                            (self.graph_nodes.get(&self.systems[i].id),
+                             self.graph_nodes.get(&self.systems[j].id))
+                        {
+                            self.dependency_graph.add_edge(from, to, conflict_kind.clone());
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: self.systems[i].id,
+                                to_id:   self.systems[j].id,
+                                kind:    conflict_kind,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Проверяет, существует ли ребро между двумя узлами.
+    fn has_edge_between(&self, from: Index, to: Index) -> bool {
+        // Проверяем все исходящие рёбра из from
+        self.dependency_graph.successors(from).any(|succ| succ == to)
+    }
+
+    /// Инкрементальное добавление новых узлов и рёбер в граф.
+    ///
+    /// Добавляет только системы, которых ещё нет в `graph_nodes`,
+    /// и рёбра для новых/изменённых систем.
+    fn add_new_nodes_and_edges(&mut self) -> Result<(), SchedulerError> {
+        let n = self.systems.len();
+        
+        // ── 1. Добавляем новые узлы (системы) ──────────────────
+        let mut new_system_indices = Vec::new();
+        for (idx, system) in self.systems.iter().enumerate() {
+            if !self.graph_nodes.contains_key(&system.id) {
+                let node = self.dependency_graph.add_node(system.id);
+                self.graph_nodes.insert(system.id, node);
+                new_system_indices.push(idx);
+            }
+        }
+
+        // Если нет новых систем, но граф помечен как dirty (например, изменились зависимости)
+        // нужно пересчитать рёбра для существующих систем
+        let systems_to_process = if new_system_indices.is_empty() {
+            // Обрабатываем все системы (зависимости могли измениться)
+            (0..n).collect::<Vec<_>>()
+        } else {
+            // Обрабатываем только новые системы и их связи с существующими
+            new_system_indices
+        };
+
+        // ── 2. Явные зависимости для новых/изменённых систем ──
+        for &idx in &systems_to_process {
+            let system = &self.systems[idx];
+            
+            // После кого выполняется
+            for &after_id in &system.after {
+                if let (Some(&from), Some(&to)) =
+                    (self.graph_nodes.get(&after_id), self.graph_nodes.get(&system.id))
+                {
+                    // Проверяем, нет ли уже такого ребра
+                    if !self.has_edge_between(from, to) {
+                        self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.edge_info.push(GraphEdgeInfo {
+                            from_id: after_id,
+                            to_id:   system.id,
+                            kind:    ConflictKind::Explicit,
+                        });
+                    }
+                }
+            }
+            
+            // Перед кем выполняется
+            for &before_id in &system.before {
+                if let (Some(&from), Some(&to)) =
+                    (self.graph_nodes.get(&system.id), self.graph_nodes.get(&before_id))
+                {
+                    if !self.has_edge_between(from, to) {
+                        self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.edge_info.push(GraphEdgeInfo {
+                            from_id: system.id,
+                            to_id:   before_id,
+                            kind:    ConflictKind::Explicit,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── 3. Sequential барьеры для новых/изменённых систем ─
+        for &idx in &systems_to_process {
+            let system = &self.systems[idx];
+            
+            if !system.kind.is_parallel() {
+                // Sequential система: все предыдущие → текущая
+                for j in 0..idx {
                     if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&self.systems[i].id),
+                        (self.graph_nodes.get(&self.systems[j].id),
+                         self.graph_nodes.get(&system.id))
+                    {
+                        if !self.has_edge_between(from, to) {
+                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: self.systems[j].id,
+                                to_id:   system.id,
+                                kind:    ConflictKind::SequentialBarrier,
+                            });
+                        }
+                    }
+                }
+                
+                // Sequential система: текущая → все последующие
+                for j in (idx + 1)..n {
+                    if let (Some(&from), Some(&to)) =
+                        (self.graph_nodes.get(&system.id),
                          self.graph_nodes.get(&self.systems[j].id))
                     {
-                        self.dependency_graph.add_edge(from, to, conflict_kind.clone());
-                        self.edge_info.push(GraphEdgeInfo {
-                            from_id: self.systems[i].id,
-                            to_id:   self.systems[j].id,
-                            kind:    conflict_kind,
-                        });
+                        if !self.has_edge_between(from, to) {
+                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: system.id,
+                                to_id:   self.systems[j].id,
+                                kind:    ConflictKind::SequentialBarrier,
+                            });
+                        }
+                    }
+                }
+            } else {
+                // Параллельная система: проверяем sequential барьеры от других систем
+                for j in 0..n {
+                    if j == idx { continue; }
+                    
+                    if !self.systems[j].kind.is_parallel() {
+                        // Если другая система sequential, добавляем барьер
+                        if j < idx {
+                            // sequential → текущая
+                            if let (Some(&from), Some(&to)) =
+                                (self.graph_nodes.get(&self.systems[j].id),
+                                 self.graph_nodes.get(&system.id))
+                            {
+                                if !self.has_edge_between(from, to) {
+                                    self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_info.push(GraphEdgeInfo {
+                                        from_id: self.systems[j].id,
+                                        to_id:   system.id,
+                                        kind:    ConflictKind::SequentialBarrier,
+                                    });
+                                }
+                            }
+                        } else {
+                            // текущая → sequential
+                            if let (Some(&from), Some(&to)) =
+                                (self.graph_nodes.get(&system.id),
+                                 self.graph_nodes.get(&self.systems[j].id))
+                            {
+                                if !self.has_edge_between(from, to) {
+                                    self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_info.push(GraphEdgeInfo {
+                                        from_id: system.id,
+                                        to_id:   self.systems[j].id,
+                                        kind:    ConflictKind::SequentialBarrier,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── 4. Write/Read конфликты для новых/изменённых систем ─
+        for &idx in &systems_to_process {
+            let system_i = &self.systems[idx];
+            let ai = match system_i.kind.access() { Some(a) => a, None => continue };
+            
+            // Проверяем конфликты со всеми другими системами
+            // Для Write+Write конфликтов добавляем ребро только если idx < j
+            // чтобы избежать дублирования
+            for j in 0..n {
+                if j == idx { continue; }
+                
+                let system_j = &self.systems[j];
+                let aj = match system_j.kind.access() { Some(a) => a, None => continue };
+                
+                if let Some((conflict_kind, direction)) = detect_conflict_kind(
+                    ai, aj,
+                    system_i.id,
+                    system_j.id,
+                ) {
+                    // direction = true означает i→j
+                    if direction {
+                        // Для Write+Write конфликтов добавляем ребро только если idx < j
+                        // чтобы избежать дублирования (j→i уже обработается когда j будет в systems_to_process)
+                        if matches!(conflict_kind, ConflictKind::WriteWrite { .. }) && idx > j {
+                            continue;
+                        }
+                        
+                        if let (Some(&from), Some(&to)) =
+                            (self.graph_nodes.get(&system_i.id),
+                             self.graph_nodes.get(&system_j.id))
+                        {
+                            if !self.has_edge_between(from, to) {
+                                self.dependency_graph.add_edge(from, to, conflict_kind.clone());
+                                self.edge_info.push(GraphEdgeInfo {
+                                    from_id: system_i.id,
+                                    to_id:   system_j.id,
+                                    kind:    conflict_kind,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -603,7 +821,8 @@ impl Scheduler {
             .as_ref().unwrap().flat_order.clone();
 
         for sys_id in order {
-            if let Some(system) = self.systems.iter_mut().find(|s| s.id == sys_id) {
+            if let Some(index) = self.system_indices.get(&sys_id) {
+                let system = &mut self.systems[*index];
                 match &mut system.kind {
                     SystemKind::Sequential(f)             => f(world),
                     SystemKind::Parallel { system, .. }   => {
@@ -627,9 +846,11 @@ impl Scheduler {
             .collect();
 
         for (stage_ids, all_parallel) in &stages {
-            if !all_parallel || stage_ids.len() <= 1 {
+            // Проверяем threshold для параллельного выполнения
+            if !all_parallel || stage_ids.len() < self.parallel_threshold {
                 for &sys_id in stage_ids {
-                    if let Some(system) = self.systems.iter_mut().find(|s| s.id == sys_id) {
+                    if let Some(index) = self.system_indices.get(&sys_id) {
+                        let system = &mut self.systems[*index];
                         match &mut system.kind {
                             SystemKind::Sequential(f)           => f(world),
                             SystemKind::Parallel { system, .. } => {
@@ -649,7 +870,8 @@ impl Scheduler {
 
             let indices: Vec<usize> = stage_ids
                 .iter()
-                .filter_map(|sid| self.systems.iter().position(|s| s.id == *sid))
+                .filter_map(|sid| self.system_indices.get(sid))
+                .copied()
                 .collect();
 
             // SAFETY: indices уникальны → каждый SendPtr<SystemDescriptor>
@@ -820,40 +1042,45 @@ impl Default for Scheduler { fn default() -> Self { Self::new() } }
 
 /// Определить тип конфликта между двумя AccessDescriptor.
 ///
-/// Возвращает первый найденный конфликт с именем компонента.
+/// Возвращает (ConflictKind, направление) где направление true означает i→j.
 /// Если конфликтов нет — None.
 fn detect_conflict_kind(
     ai: &AccessDescriptor,
     aj: &AccessDescriptor,
     id_i: SystemId,
     id_j: SystemId,
-) -> Option<ConflictKind> {
+) -> Option<(ConflictKind, bool)> {
     // Write+Write: оба пишут в один компонент
+    // Добавляем ребро только если i < j чтобы избежать дублирования
     for w in &ai.writes {
         if aj.writes.contains(w) {
-            return Some(ConflictKind::WriteWrite {
+            // Для Write+Write направление не важно, но нужно избежать дублирования
+            // Возвращаем true только если i < j (чтобы избежать обратного ребра)
+            // Но мы не знаем здесь i < j, поэтому всегда возвращаем true
+            // Вызывающий код должен фильтровать дубликаты
+            return Some((ConflictKind::WriteWrite {
                 component_name: component_type_name(*w),
-            });
+            }, true)); // i→j
         }
     }
     // Write(i)+Read(j): i пишет то что j читает
     for w in &ai.writes {
         if aj.reads.contains(w) {
-            return Some(ConflictKind::WriteRead {
+            return Some((ConflictKind::WriteRead {
                 component_name: component_type_name(*w),
                 writer_id: id_i.0,
                 reader_id: id_j.0,
-            });
+            }, true)); // i→j (писатель → читатель)
         }
     }
     // Write(j)+Read(i): j пишет то что i читает
     for w in &aj.writes {
         if ai.reads.contains(w) {
-            return Some(ConflictKind::WriteRead {
+            return Some((ConflictKind::WriteRead {
                 component_name: component_type_name(*w),
                 writer_id: id_j.0,
                 reader_id: id_i.0,
-            });
+            }, false)); // j→i, но мы в цикле i→j, поэтому пропускаем
         }
     }
     None
@@ -877,7 +1104,7 @@ fn component_type_name(type_id: std::any::TypeId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::{prelude::*, world::World};
+    use apex_core::{prelude::*, world::World, query::Query};
 
     #[derive(Clone, Copy)] struct Pos { x: f32, y: f32 }
     #[derive(Clone, Copy)] struct Vel { x: f32, y: f32 }
