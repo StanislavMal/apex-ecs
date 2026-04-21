@@ -8,7 +8,7 @@
 //! - Commands
 
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, SystemContext};
+use apex_scheduler::{Scheduler, ParSystem};
 use apex_core::access::AccessDescriptor;
 
 // ── Компоненты ────────────────────────────────────────────────
@@ -89,6 +89,23 @@ impl ParSystem for HealthClampSystem {
             if (hp.current - prev).abs() > f32::EPSILON { clamped += 1; }
         });
         println!("  [HealthClampSystem] clamped={}", clamped);
+    }
+}
+
+// ── AutoSystem: Movement (новый типобезопасный API) ───────────
+
+struct MovementSystem;
+
+impl AutoSystem for MovementSystem {
+    type Query = (Read<Velocity>, Write<Position>);
+
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        let count = ctx.query::<Self::Query>().len();
+        ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
+            pos.x += vel.x * 0.016;
+            pos.y += vel.y * 0.016;
+        });
+        println!("  [MovementSystem (AutoSystem)] updated {} entities", count);
     }
 }
 
@@ -243,6 +260,10 @@ fn main() {
     // Stage 0: Physics + HealthClamp — параллельны (нет конфликтов)
     sched.add_par_system("physics",      PhysicsSystem);
     sched.add_par_system("health_clamp", HealthClampSystem);
+    
+    // AutoSystem: новый типобезопасный API (автовывод AccessDescriptor)
+    let movement_id = sched.add_auto_system("movement", MovementSystem);
+    println!("  [Demo] AutoSystem 'movement' зарегистрирован без явного AccessDescriptor");
 
     // Stage 1: damage_apply (Sequential барьер)
     let damage_id = sched.add_system("damage_apply", damage_apply).id();
@@ -282,6 +303,7 @@ fn main() {
     sched.compile().unwrap();
 
     println!("Compiled plan:\n{}", sched.debug_plan());
+    println!("\nVerbose diagnostics:\n{}", sched.debug_plan_verbose());
     println!("--- Running tick 1 ---\n");
     sched.run(&mut world);
 

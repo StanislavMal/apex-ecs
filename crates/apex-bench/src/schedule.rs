@@ -1,5 +1,6 @@
 use crate::{Position, Velocity};
-use apex_scheduler::{Scheduler, ParSystem, SystemContext};
+use apex_scheduler::{Scheduler, ParSystem};
+use apex_core::world::SystemContext;
 use apex_core::access::AccessDescriptor;
 
 pub struct Benchmark;

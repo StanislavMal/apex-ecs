@@ -10,6 +10,7 @@ use crate::{
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
     resources::ResourceMap,
+    system_param::{Res, ResMut, EventReader, EventWriter, WorldQuerySystemAccess},
 };
 
 // ── QueryCache ─────────────────────────────────────────────────
@@ -116,25 +117,13 @@ impl World {
     ///
     /// # Safety
     /// Вызывающий обязан гарантировать:
-    /// 1. Все системы, работающие параллельно, задекларировали
-    ///    неконфликтующий доступ через `AccessDescriptor`.
-    /// 2. Во время действия `ParallelWorld` никакие structural changes
-    ///    (spawn/despawn/insert_component) не производятся.
+    /// 1. Все системы задекларировали неконфликтующий доступ.
+    /// 2. Во время действия `ParallelWorld` нет structural changes.
     /// 3. `ParallelWorld` не переживает `&self`.
     pub unsafe fn as_parallel_world(&self) -> ParallelWorld<'_> {
         ParallelWorld { world: self as *const World, _marker: std::marker::PhantomData }
     }
 
-    /// Raw mutable pointer на архетип по индексу.
-    ///
-    /// Используется `ParallelWorld` для получения `&mut Archetype`
-    /// в параллельных системах. Безопасность гарантируется тем, что
-    /// два потока никогда не обращаются к одному архетипу с Write-доступом
-    /// к одному компоненту (инвариант `compile()`).
-    ///
-    /// # Safety
-    /// - `idx` должен быть валидным индексом в `self.archetypes`
-    /// - Вызывающий гарантирует отсутствие aliasing mutable references
     pub(crate) unsafe fn archetype_ptr(&self, idx: usize) -> *mut Archetype {
         &self.archetypes[idx] as *const Archetype as *mut Archetype
     }
@@ -192,7 +181,6 @@ impl World {
         self.events.get_mut::<T>().send(event);
     }
 
-    /// Raw pointer на EventQueue — для EventWriter в SystemContext.
     pub fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
     ) -> Option<*mut crate::events::EventQueue<T>> {
@@ -223,7 +211,6 @@ impl World {
         entity
     }
 
-    /// Batch spawn — N entity одного Bundle типа.
     pub fn spawn_many<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
@@ -259,7 +246,6 @@ impl World {
         entities
     }
 
-    /// Batch spawn без возврата entity IDs.
     pub fn spawn_many_silent<B, F>(&mut self, count: usize, mut make_bundle: F)
     where
         B: Bundle,
@@ -531,48 +517,220 @@ impl World {
         }
         to_row
     }
-
-    // ── Relations ──────────────────────────────────────────────
-    // Реализация методов отношений находится в relations.rs
 }
 
 impl Default for World { fn default() -> Self { Self::new() } }
 
-// ── ParallelWorld ──────────────────────────────────────────────
+// ── SystemContext ──────────────────────────────────────────────
 //
-// Тонкий токен, разрешающий передачу *const World в потоки Rayon.
+// Ограниченный view на World для ParSystem / AutoSystem.
 //
-// # Инварианты (поддерживаются планировщиком)
+// Живёт здесь (в apex-core) чтобы избежать циклической зависимости:
+//   apex-scheduler -> apex-core (ok)
+//   apex-core -> apex-scheduler (нельзя)
 //
-// 1. Все системы, работающие в одном Stage, прошли проверку
-//    `AccessDescriptor::conflicts_with` — Write-пересечений нет.
-//
-// 2. Каждая Column хранит данные как `*mut u8` (raw heap buffer).
-//    Разные Column — разные выделения памяти → нет aliasing.
-//
-// 3. Structural changes (spawn/despawn) запрещены во время
-//    параллельного Stage — `archetypes` Vec не изменяется,
-//    указатели остаются валидными.
-//
-// 4. `ParallelWorld` не переживает `&World` (lifetime `'w`).
-//    `rayon::scope` гарантирует join потоков до выхода из блока,
-//    поэтому dangling pointer невозможен.
-pub struct ParallelWorld<'w> {
+// SystemContext не содержит &mut World — только *const World.
+// Мутация компонентов происходит через Column::data (*mut u8),
+// безопасность гарантируется AccessDescriptor + compile().
+
+pub struct SystemContext<'w> {
     pub(crate) world:   *const World,
     pub(crate) _marker: std::marker::PhantomData<&'w World>,
 }
 
 // SAFETY: World содержит только Send+Sync данные.
-// Параллельный доступ безопасен при соблюдении инвариантов выше.
+// Параллельный доступ безопасен при соблюдении инвариантов AccessDescriptor.
+unsafe impl Send for SystemContext<'_> {}
+unsafe impl Sync for SystemContext<'_> {}
+
+impl<'w> SystemContext<'w> {
+    pub fn new(world: &'w World) -> Self {
+        Self { world: world as *const World, _marker: std::marker::PhantomData }
+    }
+
+    #[inline]
+    pub fn query<Q: WorldQuery>(&self) -> crate::query::Query<'_, Q> {
+        unsafe { crate::query::Query::new(&*self.world) }
+    }
+
+    #[inline]
+    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> crate::query::Query<'_, Q> {
+        unsafe { crate::query::Query::new_with_tick(&*self.world, last_run) }
+    }
+
+    #[inline]
+    pub fn resource<T: Send + Sync + 'static>(&self) -> Res<'_, T> {
+        Res(unsafe { (*self.world).resource::<T>() })
+    }
+
+    #[inline]
+    pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
+        unsafe {
+            let ptr = (*self.world)
+                .resources
+                .get_raw_ptr::<T>()
+                .expect("resource_mut: resource not found");
+            ResMut::from_ptr(ptr)
+        }
+    }
+
+    #[inline]
+    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+        EventReader(unsafe { (*self.world).events::<T>() })
+    }
+
+    #[inline]
+    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+        unsafe {
+            let ptr = (*self.world)
+                .event_queue_ptr::<T>()
+                .expect("event_writer: event type not registered");
+            EventWriter::from_ptr(ptr)
+        }
+    }
+
+    #[inline]
+    pub fn entity_count(&self) -> usize {
+        unsafe { (*self.world).entity_count() }
+    }
+
+    #[inline]
+    pub fn for_each<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: FnMut(Entity, Q::Item<'_>),
+    {
+        self.query::<Q>().for_each(f);
+    }
+
+    #[inline]
+    pub fn for_each_component<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: FnMut(Q::Item<'_>),
+    {
+        self.query::<Q>().for_each_component(f);
+    }
+
+    /// Параллельная итерация по компонентам внутри одной системы.
+    ///
+    /// Распараллеливает работу по архетипам — каждый архетип независим
+    /// (отдельный Column-буфер в памяти), поэтому параллелизм безопасен
+    /// без дополнительной синхронизации.
+    ///
+    /// # Когда использовать
+    /// - Много entity (>10к) в одном архетипе
+    /// - Тяжёлые вычисления на entity (физика, AI pathfinding)
+    /// - Система уже объявила корректный AccessDescriptor
+    ///
+    /// # Когда НЕ использовать
+    /// - Мало entity (<1к) — overhead Rayon превысит выигрыш
+    /// - Лёгкие операции (простая арифметика) — cache miss перевесит
+    /// - Нужен порядок обработки entity
+    ///
+    /// # Safety
+    /// Безопасность гарантируется двумя инвариантами:
+    /// 1. `AccessDescriptor` системы задекларировал все Write-компоненты
+    ///    (проверено `compile()` — нет конфликтующих систем в одном Stage)
+    /// 2. Разные архетипы = разные Column-буферы = нет aliasing
+    ///
+    /// При использовании `AutoSystem` инвариант 1 гарантирован статически.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each_component<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery + Send,
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let world = unsafe { &*self.world };
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(world, &mut ids);
+
+        if ids.len() != Q::component_count() { return; }
+
+        // SAFETY:
+        // - Каждый архетип — отдельный набор Column-буферов в памяти
+        // - Разные архетипы никогда не имеют aliasing данных
+        // - AccessDescriptor проверен compile() — нет Write-конфликтов
+        //   между системами в одном Stage
+        // - Structural changes (spawn/despawn) запрещены во время Stage
+        //   поэтому archetypes.len() и Column::data стабильны
+        world.archetypes
+            .par_iter()
+            .filter(|arch| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+            .for_each(|arch| {
+                let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+                for row in 0..arch.len() {
+                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                        f(item);
+                    }
+                }
+            });
+    }
+
+    /// Fallback для non-parallel builds — обычная итерация.
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each_component<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: Fn(Q::Item<'_>),
+    {
+        self.for_each_component::<Q, _>(f);
+    }
+
+    /// Параллельная итерация с Entity.
+    ///
+    /// Аналог `par_for_each_component` но передаёт `(Entity, Q::Item)`.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery + Send,
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let world = unsafe { &*self.world };
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(world, &mut ids);
+
+        if ids.len() != Q::component_count() { return; }
+
+        world.archetypes
+            .par_iter()
+            .filter(|arch| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+            .for_each(|arch| {
+                let state    = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+                let entities = &arch.entities;
+                for row in 0..arch.len() {
+                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                        f(entities[row], item);
+                    }
+                }
+            });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each<Q, F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: Fn(Entity, Q::Item<'_>),
+    {
+        self.for_each::<Q, _>(f);
+    }
+}
+
+// ── ParallelWorld ──────────────────────────────────────────────
+
+pub struct ParallelWorld<'w> {
+    pub(crate) world:   *const World,
+    pub(crate) _marker: std::marker::PhantomData<&'w World>,
+}
+
 unsafe impl Send for ParallelWorld<'_> {}
 unsafe impl Sync for ParallelWorld<'_> {}
 
 impl<'w> ParallelWorld<'w> {
-    /// Получить shared reference на World.
-    ///
-    /// # Safety
-    /// Вызывающий гарантирует что в этот момент нет конфликтующих
-    /// мутабельных доступов к тем же данным из других потоков.
     #[inline]
     pub unsafe fn get(&self) -> &'w World {
         &*self.world

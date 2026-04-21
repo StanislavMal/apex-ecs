@@ -16,13 +16,13 @@ pub use component::{Component, Tick};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
-pub use world::{World, Bundle, CachedQuery, ParallelWorld};
+pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns, Likes};
 pub use system_param::{
     Res, ResMut, EventReader, EventWriter,
-    WorldQuerySystemAccess,
+    WorldQuerySystemAccess, AutoSystem,
 };
 
 pub mod prelude {
@@ -31,12 +31,12 @@ pub mod prelude {
     pub use crate::entity::Entity;
     pub use crate::events::EventQueue;
     pub use crate::resources::ResourceMap;
-    pub use crate::world::{World, Bundle, CachedQuery};
+    pub use crate::world::{World, Bundle, CachedQuery, SystemContext};
     pub use crate::query::{Query, Read, Write, With, Without, Changed, QueryBuilder, WorldQuery};
     pub use crate::commands::Commands;
     pub use crate::relations::{RelationKind, ChildOf, Owns, Likes};
     pub use crate::system_param::{
         Res, ResMut, EventReader, EventWriter,
-        WorldQuerySystemAccess,
+        WorldQuerySystemAccess, AutoSystem,
     };
 }

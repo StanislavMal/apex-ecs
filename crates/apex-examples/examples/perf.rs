@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, SystemContext};
+use apex_scheduler::{Scheduler, ParSystem};
 use apex_core::access::AccessDescriptor;
 
 #[derive(Clone, Copy)] struct Position { x: f32, y: f32, z: f32 }
@@ -255,6 +255,18 @@ fn bench_scheduler(n: usize) {
         }
     }
 
+    // AutoSystem для сравнения производительности
+    struct AutoMoveSys;
+    impl AutoSystem for AutoMoveSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Self::Query, _>(|(v, p)| {
+                p.x += v.x; p.y += v.y;
+            });
+        }
+    }
+
     // 1 ParSystem
     bench(&format!("1 ParSystem: movement ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
@@ -325,6 +337,27 @@ fn bench_scheduler(n: usize) {
         }
         sched.compile().unwrap();
         1
+    });
+
+    // AutoSystem бенчмарк
+    bench(&format!("1 AutoSystem ({n}k)"), || {
+        let (mut world, _) = make_world(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("auto_move", AutoMoveSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    // Сравнение ParSystem vs AutoSystem
+    bench(&format!("ParSystem vs AutoSystem ({n}k)"), || {
+        let (mut world, _) = make_world(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("par", MoveSys);
+        sched.add_auto_system("auto", AutoMoveSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
     });
 
     // Демо debug_plan
@@ -533,6 +566,128 @@ fn bench_parallel_scheduler(n: usize) {
     }
 }
 
+// ── Intra-system parallelism (par_for_each_component) ──────────
+
+#[cfg(feature = "parallel")]
+fn bench_intra_system_parallel(n: usize) {
+    println!("\n── Intra-system Parallelism (par_for_each_component) ──────────────────────────────");
+    println!("  rayon threads: {}", rayon::current_num_threads());
+
+    // Создаём мир с большим количеством сущностей для демонстрации параллелизма
+    let mut world = World::new();
+    world.register_component::<Position>();
+    world.register_component::<Velocity>();
+    world.register_component::<Health>();
+    
+    // Создаём 100k сущностей для тестирования
+    world.spawn_many_silent(n * 100, |i| {
+        let f = i as f32;
+        (
+            Position { x: f, y: f * 0.5, z: 0.0 },
+            Velocity { x: 1.0, y: 0.5, z: 0.0 },
+            Health { current: 100.0, max: 100.0 },
+        )
+    });
+
+    // Система с обычным for_each_component (последовательная)
+    struct SequentialSys;
+    impl ParSystem for SequentialSys {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Velocity>().write::<Position>()
+        }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+                // Тяжёлые вычисления для демонстрации выигрыша
+                let mut x = p.x + v.x;
+                let mut y = p.y + v.y;
+                for _ in 0..30 {
+                    x = x.sin().cos().exp().sqrt();
+                    y = y.cos().sin().ln_1p().abs();
+                }
+                p.x = x;
+                p.y = y;
+            });
+        }
+    }
+
+    // Система с par_for_each_component (параллельная внутри системы)
+    struct ParallelSys;
+    impl ParSystem for ParallelSys {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Velocity>().write::<Position>()
+        }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.par_for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+                // Те же тяжёлые вычисления
+                let mut x = p.x + v.x;
+                let mut y = p.y + v.y;
+                for _ in 0..30 {
+                    x = x.sin().cos().exp().sqrt();
+                    y = y.cos().sin().ln_1p().abs();
+                }
+                p.x = x;
+                p.y = y;
+            });
+        }
+    }
+
+    // Бенчмарк последовательной версии
+    let total_entities = n * 100;
+    bench(&format!("Sequential for_each_component ({}k)", total_entities), || {
+        let mut sched = Scheduler::new();
+        sched.add_par_system("seq", SequentialSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        total_entities as u64
+    });
+
+    // Бенчмарк параллельной версии
+    bench(&format!("Parallel par_for_each_component ({}k)", total_entities), || {
+        let mut sched = Scheduler::new();
+        sched.add_par_system("par", ParallelSys);
+        sched.compile().unwrap();
+        sched.run(&mut world); // run() использует параллельное выполнение
+        total_entities as u64
+    });
+
+    // AutoSystem с par_for_each_component
+    struct AutoParallelSys;
+    impl AutoSystem for AutoParallelSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.par_for_each_component::<Self::Query, _>(|(v, p)| {
+                let mut x = p.x + v.x;
+                let mut y = p.y + v.y;
+                for _ in 0..20 {
+                    x = x.sin().cos();
+                    y = y.cos().sin();
+                }
+                p.x = x;
+                p.y = y;
+            });
+        }
+    }
+
+    bench(&format!("AutoSystem + par_for_each_component ({}k)", total_entities), || {
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("auto_par", AutoParallelSys);
+        sched.compile().unwrap();
+        sched.run(&mut world);
+        total_entities as u64
+    });
+
+    println!("  Note: par_for_each_component распараллеливает итерацию по архетипам");
+    println!("        внутри одной системы, когда много сущностей (>10k)");
+}
+
+// Fallback для non-parallel builds
+#[cfg(not(feature = "parallel"))]
+fn bench_intra_system_parallel(_n: usize) {
+    println!("\n── Intra-system Parallelism (par_for_each_component) ──────────────────────────────");
+    println!("  Feature 'parallel' not enabled - skipping intra-system parallelism benchmarks");
+}
+
 // ── Resources benchmark ────────────────────────────────────────
 
 fn bench_resources(n: usize) {
@@ -694,6 +849,9 @@ fn main() {
 
     #[cfg(feature = "parallel")]
     bench_parallel_scheduler(N);
+
+    #[cfg(feature = "parallel")]
+    bench_intra_system_parallel(N);
 
     println!("\n── Summary ─────────────────────────────────────────────────────────────────────");
     let (mut world, _) = make_world(N * 1000);
