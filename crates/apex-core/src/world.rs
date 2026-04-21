@@ -112,16 +112,14 @@ impl World {
 
     // ── Параллельный доступ ────────────────────────────────────
 
-    /// Создаёт `ParallelWorld` — маркер для безопасной передачи
-    /// неизменяемого указателя на World в параллельные системы.
-    ///
     /// # Safety
-    /// Вызывающий обязан гарантировать:
-    /// 1. Все системы задекларировали неконфликтующий доступ.
-    /// 2. Во время действия `ParallelWorld` нет structural changes.
-    /// 3. `ParallelWorld` не переживает `&self`.
+    /// Вызывающий гарантирует отсутствие structural changes
+    /// и корректность AccessDescriptor всех параллельных систем.
     pub unsafe fn as_parallel_world(&self) -> ParallelWorld<'_> {
-        ParallelWorld { world: self as *const World, _marker: std::marker::PhantomData }
+        ParallelWorld {
+            world:   self as *const World,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     pub(crate) unsafe fn archetype_ptr(&self, idx: usize) -> *mut Archetype {
@@ -522,24 +520,12 @@ impl World {
 impl Default for World { fn default() -> Self { Self::new() } }
 
 // ── SystemContext ──────────────────────────────────────────────
-//
-// Ограниченный view на World для ParSystem / AutoSystem.
-//
-// Живёт здесь (в apex-core) чтобы избежать циклической зависимости:
-//   apex-scheduler -> apex-core (ok)
-//   apex-core -> apex-scheduler (нельзя)
-//
-// SystemContext не содержит &mut World — только *const World.
-// Мутация компонентов происходит через Column::data (*mut u8),
-// безопасность гарантируется AccessDescriptor + compile().
 
 pub struct SystemContext<'w> {
     pub(crate) world:   *const World,
     pub(crate) _marker: std::marker::PhantomData<&'w World>,
 }
 
-// SAFETY: World содержит только Send+Sync данные.
-// Параллельный доступ безопасен при соблюдении инвариантов AccessDescriptor.
 unsafe impl Send for SystemContext<'_> {}
 unsafe impl Sync for SystemContext<'_> {}
 
@@ -614,27 +600,17 @@ impl<'w> SystemContext<'w> {
 
     /// Параллельная итерация по компонентам внутри одной системы.
     ///
-    /// Распараллеливает работу по архетипам — каждый архетип независим
-    /// (отдельный Column-буфер в памяти), поэтому параллелизм безопасен
-    /// без дополнительной синхронизации.
+    /// Всегда использует `rayon::par_iter` по архетипам.
+    /// Вложенный параллелизм (когда вызывается из `rayon::scope`
+    /// планировщика) безопасен: Rayon work-stealing корректно
+    /// обрабатывает вложенные задачи без deadlock.
     ///
-    /// # Когда использовать
-    /// - Много entity (>10к) в одном архетипе
-    /// - Тяжёлые вычисления на entity (физика, AI pathfinding)
-    /// - Система уже объявила корректный AccessDescriptor
+    /// Реальный выигрыш когда:
+    /// - Несколько архетипов (>2) с большим числом entity
+    /// - Тяжёлые вычисления на entity (трансцендентные функции)
     ///
-    /// # Когда НЕ использовать
-    /// - Мало entity (<1к) — overhead Rayon превысит выигрыш
-    /// - Лёгкие операции (простая арифметика) — cache miss перевесит
-    /// - Нужен порядок обработки entity
-    ///
-    /// # Safety
-    /// Безопасность гарантируется двумя инвариантами:
-    /// 1. `AccessDescriptor` системы задекларировал все Write-компоненты
-    ///    (проверено `compile()` — нет конфликтующих систем в одном Stage)
-    /// 2. Разные архетипы = разные Column-буферы = нет aliasing
-    ///
-    /// При использовании `AutoSystem` инвариант 1 гарантирован статически.
+    /// При лёгких операциях (простая арифметика) overhead Rayon
+    /// нивелирует выигрыш — используй `for_each_component`.
     #[cfg(feature = "parallel")]
     pub fn par_for_each_component<Q, F>(&self, f: F)
     where
@@ -654,8 +630,10 @@ impl<'w> SystemContext<'w> {
         // - Разные архетипы никогда не имеют aliasing данных
         // - AccessDescriptor проверен compile() — нет Write-конфликтов
         //   между системами в одном Stage
-        // - Structural changes (spawn/despawn) запрещены во время Stage
-        //   поэтому archetypes.len() и Column::data стабильны
+        // - Structural changes запрещены во время выполнения систем
+        // - Rayon work-stealing корректен при вложенных scope:
+        //   если вызывается из rayon worker, задачи по архетипам
+        //   добавляются в локальную очередь и выполняются эффективно
         world.archetypes
             .par_iter()
             .filter(|arch| !arch.is_empty() && Q::matches_archetype(arch, &ids))
@@ -669,7 +647,6 @@ impl<'w> SystemContext<'w> {
             });
     }
 
-    /// Fallback для non-parallel builds — обычная итерация.
     #[cfg(not(feature = "parallel"))]
     pub fn par_for_each_component<Q, F>(&self, f: F)
     where
@@ -680,8 +657,6 @@ impl<'w> SystemContext<'w> {
     }
 
     /// Параллельная итерация с Entity.
-    ///
-    /// Аналог `par_for_each_component` но передаёт `(Entity, Q::Item)`.
     #[cfg(feature = "parallel")]
     pub fn par_for_each<Q, F>(&self, f: F)
     where
@@ -732,9 +707,7 @@ unsafe impl Sync for ParallelWorld<'_> {}
 
 impl<'w> ParallelWorld<'w> {
     #[inline]
-    pub unsafe fn get(&self) -> &'w World {
-        &*self.world
-    }
+    pub unsafe fn get(&self) -> &'w World { &*self.world }
 }
 
 // ── CachedQuery ────────────────────────────────────────────────

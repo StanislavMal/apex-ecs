@@ -14,9 +14,8 @@ use apex_core::access::AccessDescriptor;
 #[derive(Clone, Copy)] struct Mass(f32);
 #[derive(Clone, Copy)] struct Player;
 #[derive(Clone, Copy)] struct Enemy;
-// Дополнительные компоненты для демонстрации параллелизма без конфликтов
 #[derive(Clone, Copy)] struct Temperature(f32);
-#[derive(Clone, Copy)] struct Mana       { current: f32, max: f32 }
+#[derive(Clone, Copy)] struct Mana { current: f32, max: f32 }
 
 #[derive(Clone, Copy)] struct PhysicsConfig { gravity: f32, dt: f32 }
 #[derive(Clone, Copy, Default)] struct FrameCounter { count: u64 }
@@ -66,8 +65,6 @@ fn make_world(n: usize) -> (World, Vec<Entity>) {
     (world, entities)
 }
 
-/// Создаёт World с 4 независимыми компонентами — для демонстрации
-/// параллелизма без каких-либо Write-конфликтов между системами.
 fn make_world_4comp(n: usize) -> World {
     let mut world = World::new();
     world.register_component::<Position>();
@@ -93,7 +90,6 @@ fn make_world_4comp(n: usize) -> World {
 fn bench_batch_allocator(n: usize) {
     println!("── Batch Entity Allocator ──────────────────────────────────────────────────────");
 
-    // spawn_bundle по одному — baseline
     bench(&format!("spawn_bundle loop      ({n}k)  [baseline]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
@@ -110,7 +106,6 @@ fn bench_batch_allocator(n: usize) {
         (n * 1000) as u64
     });
 
-    // spawn_many с Vec<Entity>
     bench(&format!("spawn_many             ({n}k)  [batch+collect]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
@@ -127,7 +122,6 @@ fn bench_batch_allocator(n: usize) {
         v.len() as u64
     });
 
-    // spawn_many_silent — без Vec<Entity>
     bench(&format!("spawn_many_silent      ({n}k)  [batch, no collect]"), || {
         let mut world = World::new();
         world.register_component::<Position>();
@@ -144,7 +138,6 @@ fn bench_batch_allocator(n: usize) {
         (n * 1000) as u64
     });
 
-    // 1 компонент
     bench(&format!("spawn_many_silent 1comp ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Position>();
@@ -154,7 +147,6 @@ fn bench_batch_allocator(n: usize) {
         (n * 1000) as u64
     });
 
-    // 4 компонента
     bench(&format!("spawn_many_silent 4comp ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Position>();
@@ -173,7 +165,6 @@ fn bench_batch_allocator(n: usize) {
         (n * 1000) as u64
     });
 
-    // allocate_batch напрямую — изолируем overhead аллокатора
     bench(&format!("EntityAllocator::allocate_batch ({n}k)"), || {
         let mut world = World::new();
         world.register_component::<Player>();
@@ -255,11 +246,9 @@ fn bench_scheduler(n: usize) {
         }
     }
 
-    // AutoSystem для сравнения производительности
     struct AutoMoveSys;
     impl AutoSystem for AutoMoveSys {
         type Query = (Read<Velocity>, Write<Position>);
-        
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<Self::Query, _>(|(v, p)| {
                 p.x += v.x; p.y += v.y;
@@ -267,7 +256,6 @@ fn bench_scheduler(n: usize) {
         }
     }
 
-    // 1 ParSystem
     bench(&format!("1 ParSystem: movement ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
@@ -277,7 +265,6 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // 2 независимые ParSystem → 1 Stage
     bench(&format!("2 ParSystem no-conflict ({n}k, 1 stage)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
@@ -289,7 +276,6 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // FnParSystem с ресурсом
     bench(&format!("FnParSystem + resource ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
@@ -309,7 +295,6 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // Sequential система — для сравнения
     bench(&format!("1 Sequential system   ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
@@ -322,14 +307,11 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // compile overhead - разные размеры графов
     bench("compile() 5 systems (2 par + 3 seq)", || {
         let mut sched = Scheduler::new();
         sched.add_par_system("m1", MoveSys);
         sched.add_par_system("m2", HpSys);
-        for i in 0..3 {
-            sched.add_system(format!("seq_{i}"), |_| {});
-        }
+        for i in 0..3 { sched.add_system(format!("seq_{i}"), |_| {}); }
         sched.compile().unwrap();
         1
     });
@@ -338,55 +320,44 @@ fn bench_scheduler(n: usize) {
         let mut sched = Scheduler::new();
         sched.add_par_system("m1", MoveSys);
         sched.add_par_system("m2", HpSys);
-        for i in 0..4 {
-            sched.add_system(format!("seq_{i}"), |_| {});
-        }
+        for i in 0..4 { sched.add_system(format!("seq_{i}"), |_| {}); }
         sched.add_par_system("m3", MoveSys);
         sched.add_par_system("m4", HpSys);
-        for i in 0..2 {
-            sched.add_system(format!("seq2_{i}"), |_| {});
-        }
+        for i in 0..2 { sched.add_system(format!("seq2_{i}"), |_| {}); }
         sched.compile().unwrap();
         1
     });
 
     bench("compile() 20 systems (complex graph)", || {
         let mut sched = Scheduler::new();
-        // Stage 0: 4 параллельные системы
-        for i in 0..4 {
-            sched.add_par_system(format!("par_a{i}"), MoveSys);
-        }
-        // Stage 1: 2 последовательные
-        for i in 0..2 {
-            sched.add_system(format!("seq_a{i}"), |_| {});
-        }
-        // Stage 2: 4 параллельные
-        for i in 0..4 {
-            sched.add_par_system(format!("par_b{i}"), HpSys);
-        }
-        // Stage 3: 4 последовательные
-        for i in 0..4 {
-            sched.add_system(format!("seq_b{i}"), |_| {});
-        }
-        // Stage 4: 6 параллельные
-        for i in 0..6 {
-            sched.add_par_system(format!("par_c{i}"), MoveSys);
-        }
+        for i in 0..4 { sched.add_par_system(format!("par_a{i}"), MoveSys); }
+        for i in 0..2 { sched.add_system(format!("seq_a{i}"), |_| {}); }
+        for i in 0..4 { sched.add_par_system(format!("par_b{i}"), HpSys); }
+        for i in 0..4 { sched.add_system(format!("seq_b{i}"), |_| {}); }
+        for i in 0..6 { sched.add_par_system(format!("par_c{i}"), MoveSys); }
         sched.compile().unwrap();
         1
     });
 
-    // Измерение overhead AutoSystem vs ParSystem при компиляции
     bench("compile() 10 AutoSystems", || {
         let mut sched = Scheduler::new();
-        for i in 0..10 {
-            sched.add_auto_system(format!("auto_{i}"), AutoMoveSys);
-        }
+        for i in 0..10 { sched.add_auto_system(format!("auto_{i}"), AutoMoveSys); }
         sched.compile().unwrap();
         1
     });
 
-    // AutoSystem бенчмарк
+    // Повторный compile() без изменений — проверка идемпотентности.
+    // graph_dirty = false → ранний выход, должно быть ~бесплатно.
+    bench("compile() repeat (no changes, early exit)", || {
+        let mut sched = Scheduler::new();
+        sched.add_par_system("m1", MoveSys);
+        sched.add_par_system("m2", HpSys);
+        sched.add_system("seq", |_| {});
+        sched.compile().unwrap(); // первый — строит граф
+        sched.compile().unwrap(); // второй — graph_dirty=false, ранний выход
+        1
+    });
+
     bench(&format!("1 AutoSystem ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
@@ -396,7 +367,6 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // Сравнение ParSystem vs AutoSystem
     bench(&format!("ParSystem vs AutoSystem ({n}k)"), || {
         let (mut world, _) = make_world(n * 1000);
         let mut sched = Scheduler::new();
@@ -407,7 +377,6 @@ fn bench_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // Демо debug_plan
     {
         let mut sched = Scheduler::new();
         sched.add_par_system("physics",  MoveSys);
@@ -419,24 +388,203 @@ fn bench_scheduler(n: usize) {
     }
 }
 
-// ── Параллельный планировщик ───────────────────────────────────
+// ── compile() overhead — полный корректный тест ───────────────
+//
+// Три сценария:
+//   1. Фиксированный N — честное O(N²) без накопления
+//   2. Инкрементальный — добавляем по 1 системе, каждый раз compile()
+//      Измеряем реальную стоимость "добавить систему и перекомпилировать"
+//   3. Идемпотентность и recompile после изменения
 
-/// Бенчмарк реального параллелизма через rayon.
-///
-/// Сравниваем sequential vs parallel выполнение одного и того же
-/// Stage из N независимых систем. Каждая система выполняет тяжёлую
-/// операцию (sin/cos) чтобы параллельный выигрыш был виден.
-///
-/// Ожидаемый результат на 2+ ядрах: speedup ~1.5–2x для 2 систем,
-/// ~2–4x для 4 систем (ограничен Rayon thread-pool overhead).
+fn bench_compile_overhead() {
+    println!("\n── Scheduler compile() overhead ────────────────────────────────────────────────");
+    println!("  Каждый тест создаёт новый Scheduler если не указано иное.");
+    println!("  Сложность rebuild_graph: O(N²) по числу пар систем.");
+
+    struct SimpleSys;
+    impl ParSystem for SimpleSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Position>() }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct OtherSys;
+    impl ParSystem for OtherSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Velocity>() }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    // ── 1. Фиксированный N — базовый O(N²) ───────────────────
+    println!("\n  --- Фиксированный N (новый Scheduler каждый раз) ---");
+
+    for &n_sys in &[1usize, 5, 10, 20, 50] {
+        bench(&format!("compile() {n_sys:>2} par systems (no conflicts)"), || {
+            let mut sched = Scheduler::new();
+            for i in 0..n_sys {
+                if i % 2 == 0 {
+                    sched.add_par_system(format!("sys_{i}"), SimpleSys);
+                } else {
+                    sched.add_par_system(format!("sys_{i}"), OtherSys);
+                }
+            }
+            sched.compile().unwrap();
+            1
+        });
+    }
+
+    println!();
+
+    for &n_sys in &[2usize, 5, 10, 20] {
+        bench(
+            &format!("compile() {n_sys:>2} par systems (all Write<Pos> — max conflicts)"),
+            || {
+                let mut sched = Scheduler::new();
+                for i in 0..n_sys {
+                    sched.add_par_system(format!("sys_{i}"), SimpleSys);
+                }
+                sched.compile().unwrap();
+                debug_assert_eq!(sched.stages().unwrap().len(), n_sys);
+                1
+            },
+        );
+    }
+
+    println!();
+
+    bench("compile() 10 sys: 5 par + 5 seq (max barriers)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..5 { sched.add_par_system(format!("par_{i}"), OtherSys); }
+        for i in 0..5 { sched.add_system(format!("seq_{i}"), |_| {}); }
+        sched.compile().unwrap();
+        1
+    });
+
+    // ── 2. Инкрементальный — добавляем 1 систему за раз ──────
+    //
+    // Реальный сценарий: игра в процессе разработки добавляет
+    // системы одну за другой. Каждый add_*_system инвалидирует план,
+    // следующий compile() делает полный rebuild_graph для текущего N.
+    //
+    // Что измеряем: суммарная стоимость N compile() при росте
+    // числа систем от 1 до N. Честно показывает что каждый compile()
+    // стоит O(k²) для k систем.
+    println!("\n  --- Инкрементальный: добавляем по 1 системе, каждый раз compile() ---");
+    println!("  Измеряется суммарная стоимость: compile(1) + compile(2) + ... + compile(N)");
+
+    bench("инкрементальный: 1 система  (1 compile)", || {
+        let mut sched = Scheduler::new();
+        sched.add_par_system("sys_0", OtherSys);
+        sched.compile().unwrap(); // compile для N=1
+        1
+    });
+
+    bench("инкрементальный: 5 систем  (5 compile)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..5 {
+            sched.add_par_system(format!("sys_{i}"), OtherSys);
+            sched.compile().unwrap(); // compile для N=1,2,3,4,5
+        }
+        1
+    });
+
+    bench("инкрементальный: 10 систем (10 compile)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..10 {
+            sched.add_par_system(format!("sys_{i}"), OtherSys);
+            sched.compile().unwrap(); // compile для N=1..10
+        }
+        1
+    });
+
+    bench("инкрементальный: 20 систем (20 compile)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..20 {
+            sched.add_par_system(format!("sys_{i}"), OtherSys);
+            sched.compile().unwrap(); // compile для N=1..20
+        }
+        1
+    });
+
+    // Для сравнения: один compile() для того же N
+    println!("\n  --- Сравнение: N инкрементальных compile() vs 1 compile() для N систем ---");
+
+    bench("1 compile() для 10 систем (baseline)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..10 { sched.add_par_system(format!("sys_{i}"), OtherSys); }
+        sched.compile().unwrap();
+        1
+    });
+
+    bench("10 compile() (инкрементально, N=1..10)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..10 {
+            sched.add_par_system(format!("sys_{i}"), OtherSys);
+            sched.compile().unwrap();
+        }
+        1
+    });
+
+    // Ожидаемое соотношение: 10 инкрементальных ≈ 5-6x дороже 1 compile(10)
+    // Потому что: sum(k² for k=1..10) ≈ 385, vs 10² = 100 для одного compile
+
+    bench("1 compile() для 20 систем (baseline)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..20 { sched.add_par_system(format!("sys_{i}"), OtherSys); }
+        sched.compile().unwrap();
+        1
+    });
+
+    bench("20 compile() (инкрементально, N=1..20)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..20 {
+            sched.add_par_system(format!("sys_{i}"), OtherSys);
+            sched.compile().unwrap();
+        }
+        1
+    });
+
+    // ── 3. Идемпотентность и recompile ────────────────────────
+    println!("\n  --- Идемпотентность и recompile после изменений ---");
+
+    // Повторный compile() без изменений — graph_dirty=false → ранний выход
+    bench("compile() repeat без изменений (graph_dirty=false)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..10 { sched.add_par_system(format!("sys_{i}"), OtherSys); }
+        sched.compile().unwrap(); // первый — строит граф
+        sched.compile().unwrap(); // второй — ранний выход, ~бесплатно
+        1
+    });
+
+    // Добавление 1 системы после compile() → инвалидация → recompile
+    bench("add 1 system after compile(10) → recompile(11)", || {
+        let mut sched = Scheduler::new();
+        for i in 0..10 { sched.add_par_system(format!("sys_{i}"), OtherSys); }
+        sched.compile().unwrap();         // compile для 10 систем
+        sched.add_par_system("sys_10", OtherSys); // инвалидирует план
+        sched.compile().unwrap();         // полный rebuild для 11 систем
+        1
+    });
+
+    // Добавление зависимости после compile() → recompile
+    bench("add_dependency after compile() → recompile", || {
+        let mut sched = Scheduler::new();
+        for i in 0..5 { sched.add_par_system(format!("sys_{i}"), OtherSys); }
+        sched.compile().unwrap();
+        let a_id = apex_scheduler::SystemId(0);
+        let b_id = apex_scheduler::SystemId(1);
+        sched.add_dependency(b_id, a_id); // инвалидирует план
+        sched.compile().unwrap();         // rebuild с явной зависимостью
+        1
+    });
+}
+
+// ── Parallel Scheduler ────────────────────────────────────────
+
 #[cfg(feature = "parallel")]
 fn bench_parallel_scheduler(n: usize) {
     println!("\n── Parallel Scheduler (rayon) ──────────────────────────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
-
-    // Четыре системы без конфликтов — каждая пишет в свой компонент.
-    // Используем тяжёлую математику чтобы thread-spawn overhead был мал
-    // по сравнению с полезной работой.
+    println!("  Workload: лёгкие операции (memory-bandwidth bound)");
+    println!("  Ожидание: SEQ ≈ PAR (шина памяти — узкое место, не CPU)");
 
     struct PhysSys;
     impl ParSystem for PhysSys {
@@ -445,17 +593,10 @@ fn bench_parallel_scheduler(n: usize) {
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<(Write<Velocity>, Write<Position>), _>(|(v, p)| {
-                // Реалистичные вычисления: движение с ускорением и трением
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 p.z += v.z * 0.016;
-                
-                // Небольшое трение
                 v.x *= 0.99;
-                v.y *= 0.99;
-                v.z *= 0.99;
-                
-                // Гравитация
                 v.y -= 9.8 * 0.016;
             });
         }
@@ -466,7 +607,6 @@ fn bench_parallel_scheduler(n: usize) {
         fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<Write<Health>, _>(|hp| {
-                // Реалистичное обновление здоровья: регенерация и clamp
                 hp.current = (hp.current + 0.1).min(hp.max).max(0.0);
             });
         }
@@ -477,7 +617,6 @@ fn bench_parallel_scheduler(n: usize) {
         fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<Write<Temperature>, _>(|t| {
-                // Реалистичное уравнение охлаждения
                 t.0 += (20.0 - t.0) * 0.001;
             });
         }
@@ -488,38 +627,36 @@ fn bench_parallel_scheduler(n: usize) {
         fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<Write<Mana>, _>(|m| {
-                // Реалистичная регенерация маны
                 m.current = (m.current + 0.2).min(m.max);
             });
         }
     }
 
-    // ── 2 системы: Sequential vs Parallel ─────────────────────
+    // ── Лёгкая нагрузка (memory-bound) ────────────────────────
 
-    bench(&format!("2 systems SEQUENTIAL  ({n}k entities)"), || {
+    println!("\n  --- Лёгкая нагрузка (memory-bound, SEQ ≈ PAR ожидается) ---");
+
+    bench(&format!("2 systems SEQ  ({n}k entities)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
         sched.add_par_system("hp",   HpSys);
         sched.compile().unwrap();
-        assert!(sched.stages().unwrap()[0].is_parallelizable());
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    bench(&format!("2 systems PARALLEL    ({n}k entities)"), || {
+    bench(&format!("2 systems PAR  ({n}k entities)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
         sched.add_par_system("hp",   HpSys);
         sched.compile().unwrap();
-        sched.run(&mut world); // run() выбирает parallel путь при feature = "parallel"
+        sched.run(&mut world);
         (n * 1000) as u64
     });
 
-    // ── 4 системы: Sequential vs Parallel ─────────────────────
-
-    bench(&format!("4 systems SEQUENTIAL  ({n}k entities)"), || {
+    bench(&format!("4 systems SEQ  ({n}k entities)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
@@ -527,13 +664,12 @@ fn bench_parallel_scheduler(n: usize) {
         sched.add_par_system("temp", TempSys);
         sched.add_par_system("mana", ManaSys);
         sched.compile().unwrap();
-        assert_eq!(sched.stages().unwrap().len(), 1,
-            "все 4 системы должны быть в одном Stage");
+        assert_eq!(sched.stages().unwrap().len(), 1);
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    bench(&format!("4 systems PARALLEL    ({n}k entities)"), || {
+    bench(&format!("4 systems PAR  ({n}k entities)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
@@ -545,18 +681,128 @@ fn bench_parallel_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // ── Mixed pipeline: 4 par → seq → 2 par ───────────────────
+    // ── Тяжёлая нагрузка (CPU-bound) ──────────────────────────
+    //
+    // Трансцендентные функции (atan2, tanh, sqrt, powi) — реально
+    // CPU-bound, не vectorizable компилятором. Speedup должен быть виден.
 
-    bench(&format!("mixed pipeline SEQ    ({n}k entities)"), || {
+    println!("\n  --- Тяжёлая нагрузка (CPU-bound via transcendental, speedup ожидается) ---");
+
+    struct HeavyPhysSys;
+    impl ParSystem for HeavyPhysSys {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write::<Velocity>().write::<Position>()
+        }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<(Write<Velocity>, Write<Position>), _>(|(v, p)| {
+                let dt    = 0.016f32;
+                let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+                let angle = speed.atan2(1.0);
+                let drag  = angle.cos() * 0.99;
+                v.x = v.x * drag + angle.sin() * 0.001;
+                v.y = v.y * drag - 9.8 * dt;
+                v.z = v.z * drag;
+                p.x += v.x * dt;
+                p.y += v.y * dt;
+                p.z += v.z * dt;
+                if p.y < 0.0 { p.y = 0.0; v.y = v.y.abs() * 0.8; }
+            });
+        }
+    }
+
+    struct HeavyTempSys;
+    impl ParSystem for HeavyTempSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Write<Temperature>, _>(|t| {
+                let ambient = 20.0f32;
+                let diff    = t.0 - ambient;
+                let rate    = (diff * 0.1).tanh() * 0.05;
+                t.0        -= rate;
+                t.0         = t.0.clamp(
+                    ambient - diff.abs().sqrt(),
+                    ambient + diff.abs().sqrt(),
+                );
+            });
+        }
+    }
+
+    struct HeavyManaSys;
+    impl ParSystem for HeavyManaSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.for_each_component::<Write<Mana>, _>(|m| {
+                let ratio = m.current / m.max;
+                let regen = (1.0 - ratio).sqrt() * 0.5;
+                m.current = (m.current + regen).min(m.max);
+                if ratio > 0.9 {
+                    m.current *= 1.0 - (ratio - 0.9).powi(2) * 0.01;
+                }
+            });
+        }
+    }
+
+    bench(&format!("1 system HEAVY SEQ ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("heavy_phys", HeavyPhysSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("2 systems HEAVY SEQ ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("heavy_phys", HeavyPhysSys);
+        sched.add_par_system("heavy_temp", HeavyTempSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("2 systems HEAVY PAR ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("heavy_phys", HeavyPhysSys);
+        sched.add_par_system("heavy_temp", HeavyTempSys);
+        sched.compile().unwrap();
+        sched.run(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("3 systems HEAVY SEQ ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("heavy_phys", HeavyPhysSys);
+        sched.add_par_system("heavy_temp", HeavyTempSys);
+        sched.add_par_system("heavy_mana", HeavyManaSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        (n * 1000) as u64
+    });
+
+    bench(&format!("3 systems HEAVY PAR ({n}k entities)"), || {
+        let mut world = make_world_4comp(n * 1000);
+        let mut sched = Scheduler::new();
+        sched.add_par_system("heavy_phys", HeavyPhysSys);
+        sched.add_par_system("heavy_temp", HeavyTempSys);
+        sched.add_par_system("heavy_mana", HeavyManaSys);
+        sched.compile().unwrap();
+        sched.run(&mut world);
+        (n * 1000) as u64
+    });
+
+    println!("\n  --- Speedup summary (PAR / SEQ) ---");
+    println!("  Note: лёгкая нагрузка → speedup ~1.0x (memory-bound, ожидаемо)");
+    println!("  Note: тяжёлая нагрузка → speedup > 1.5x на 12 ядрах (CPU-bound)");
+
+    bench(&format!("mixed pipeline SEQ ({n}k)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
         sched.add_par_system("hp",   HpSys);
-        sched.add_par_system("temp", TempSys);
-        sched.add_par_system("mana", ManaSys);
-        sched.add_system("barrier", |_world: &mut World| {
-            // Structural: в реале — apply commands
-        });
+        sched.add_system("barrier", |_: &mut World| {});
         sched.add_par_system("phys2", PhysSys);
         sched.add_par_system("hp2",   HpSys);
         sched.compile().unwrap();
@@ -564,14 +810,12 @@ fn bench_parallel_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    bench(&format!("mixed pipeline PAR    ({n}k entities)"), || {
+    bench(&format!("mixed pipeline PAR ({n}k)"), || {
         let mut world = make_world_4comp(n * 1000);
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
         sched.add_par_system("hp",   HpSys);
-        sched.add_par_system("temp", TempSys);
-        sched.add_par_system("mana", ManaSys);
-        sched.add_system("barrier", |_world: &mut World| {});
+        sched.add_system("barrier", |_: &mut World| {});
         sched.add_par_system("phys2", PhysSys);
         sched.add_par_system("hp2",   HpSys);
         sched.compile().unwrap();
@@ -579,7 +823,6 @@ fn bench_parallel_scheduler(n: usize) {
         (n * 1000) as u64
     });
 
-    // ── Показываем план ───────────────────────────────────────
     {
         let mut sched = Scheduler::new();
         sched.add_par_system("phys", PhysSys);
@@ -592,700 +835,21 @@ fn bench_parallel_scheduler(n: usize) {
         sched.compile().unwrap();
         println!("  Pipeline plan (parallel):\n{}", sched.debug_plan());
     }
-
-    // ── Тест "тяжёлой нагрузки" для Parallel Scheduler ─────────────
-    println!("\n── Heavy Workload Parallel Scheduler (AAA игры) ──────────────────────────────");
-    println!("  rayon threads: {}", rayon::current_num_threads());
-    println!("  Workload: 50-100 операций на сущность (физика + AI + рендеринг + логика)");
-
-    // Система с тяжёлыми вычислениями (имитация AAA игры)
-    struct HeavyPhysicsSys;
-    impl ParSystem for HeavyPhysicsSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Velocity>().write::<Position>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Write<Velocity>, Write<Position>), _>(|(v, p)| {
-                // Тяжёлые вычисления: физика с коллизиями, трением, гравитацией
-                // ~20-30 операций на сущность
-                let dt = 0.016;
-                
-                // Движение
-                p.x += v.x * dt;
-                p.y += v.y * dt;
-                p.z += v.z * dt;
-                
-                // Трение (сложная модель)
-                let speed_sq = v.x * v.x + v.y * v.y + v.z * v.z;
-                if speed_sq > 0.001 {
-                    let speed = speed_sq.sqrt();
-                    let friction = 0.99 - 0.01 * speed;
-                    v.x *= friction;
-                    v.y *= friction;
-                    v.z *= friction;
-                }
-                
-                // Гравитация с сопротивлением воздуха
-                v.y -= 9.8 * dt;
-                v.y *= 0.999;
-                
-                // Ограничение скорости
-                let max_speed = 100.0;
-                if speed_sq > max_speed * max_speed {
-                    let scale = max_speed / speed_sq.sqrt();
-                    v.x *= scale;
-                    v.y *= scale;
-                    v.z *= scale;
-                }
-                
-                // Простая коллизия с землёй
-                if p.y < 0.0 {
-                    p.y = 0.0;
-                    v.y = -v.y * 0.8; // Отскок
-                }
-                
-                // Дополнительные вычисления для нагрузки
-                let distance = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
-                let angle = (p.y / distance.max(1.0)).asin();
-                let _ = angle; // Используем чтобы компилятор не оптимизировал
-            });
-        }
-    }
-
-    struct HeavyAISys;
-    impl ParSystem for HeavyAISys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Position>().write::<Velocity>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Position>, Write<Velocity>), _>(|(p, v)| {
-                // Тяжёлый AI: поиск пути, принятие решений
-                // ~15-20 операций на сущность
-                
-                // Искусственный интеллект: движение к цели
-                let target_x = 1000.0;
-                let target_y = 500.0;
-                let target_z = 0.0;
-                
-                let dx = target_x - p.x;
-                let dy = target_y - p.y;
-                let dz = target_z - p.z;
-                
-                let distance = (dx * dx + dy * dy + dz * dz).sqrt();
-                if distance > 1.0 {
-                    let speed = 10.0;
-                    v.x += (dx / distance) * speed * 0.016;
-                    v.y += (dy / distance) * speed * 0.016;
-                    v.z += (dz / distance) * speed * 0.016;
-                }
-                
-                // Избегание препятствий
-                let obstacle_distance = (p.x * p.x + p.z * p.z).sqrt();
-                if obstacle_distance < 50.0 {
-                    let avoid_strength = 5.0;
-                    v.x -= p.x * avoid_strength * 0.016;
-                    v.z -= p.z * avoid_strength * 0.016;
-                }
-                
-                // Ограничение ускорения
-                let accel_sq = v.x * v.x + v.y * v.y + v.z * v.z;
-                let max_accel = 20.0;
-                if accel_sq > max_accel * max_accel {
-                    let scale = max_accel / accel_sq.sqrt();
-                    v.x *= scale;
-                    v.y *= scale;
-                    v.z *= scale;
-                }
-                
-                // Дополнительные вычисления
-                let _decision_value = (p.x * 0.1).sin() + (p.y * 0.05).cos();
-            });
-        }
-    }
-
-    struct HeavyRenderSys;
-    impl ParSystem for HeavyRenderSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Position>().read::<Velocity>().write::<Health>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Position>, Read<Velocity>, Write<Health>), _>(|(p, v, h)| {
-                // Тяжёлые вычисления для рендеринга: LOD, culling, подготовка данных
-                // ~10-15 операций на сущность
-                
-                // Вычисление расстояния до камеры
-                let camera_x = 0.0;
-                let camera_y = 0.0;
-                let camera_z = -100.0;
-                
-                let dx = p.x - camera_x;
-                let dy = p.y - camera_y;
-                let dz = p.z - camera_z;
-                let distance_to_camera = (dx * dx + dy * dy + dz * dz).sqrt();
-                
-                // LOD (Level of Detail) на основе расстояния
-                let lod_level = if distance_to_camera < 100.0 {
-                    3 // Высокий детализация
-                } else if distance_to_camera < 500.0 {
-                    2 // Средняя детализация
-                } else {
-                    1 // Низкая детализация
-                };
-                
-                // Frustum culling (упрощённый)
-                let in_frustum = distance_to_camera < 1000.0 && p.y > -100.0;
-                
-                // Подготовка данных для рендеринга
-                if in_frustum {
-                    // Вычисление нормали для освещения
-                    let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
-                    let normal_x = if speed > 0.0 { v.x / speed } else { 0.0 };
-                    let normal_y = if speed > 0.0 { v.y / speed } else { 1.0 };
-                    let normal_z = if speed > 0.0 { v.z / speed } else { 0.0 };
-                    
-                    // Освещение (заглушка)
-                    let light_intensity = (normal_y * 0.5 + 0.5).max(0.0).min(1.0);
-                    
-                    // Влияние на здоровье (для демонстрации)
-                    if lod_level == 3 {
-                        // Высокая детализация → больше вычислений → "стоимость" здоровья
-                        h.current = (h.current - 0.001).max(0.0);
-                    }
-                    
-                    let _render_data = (lod_level, light_intensity, distance_to_camera);
-                }
-            });
-        }
-    }
-
-    // ── Тестирование с разным количеством систем ───────────────
-    
-    // 1 система тяжёлой нагрузки
-    bench(&format!("1 system HEAVY workload ({n}k entities)"), || {
-        let mut world = make_world_4comp(n * 1000);
-        let mut sched = Scheduler::new();
-        sched.add_par_system("heavy_physics", HeavyPhysicsSys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        (n * 1000) as u64
-    });
-
-    // 2 системы тяжёлой нагрузки (параллельные)
-    bench(&format!("2 systems HEAVY PARALLEL ({n}k entities)"), || {
-        let mut world = make_world_4comp(n * 1000);
-        let mut sched = Scheduler::new();
-        sched.add_par_system("heavy_physics", HeavyPhysicsSys);
-        sched.add_par_system("heavy_ai", HeavyAISys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        (n * 1000) as u64
-    });
-
-    // 3 системы тяжёлой нагрузки (параллельные)
-    bench(&format!("3 systems HEAVY PARALLEL ({n}k entities)"), || {
-        let mut world = make_world_4comp(n * 1000);
-        let mut sched = Scheduler::new();
-        sched.add_par_system("heavy_physics", HeavyPhysicsSys);
-        sched.add_par_system("heavy_ai", HeavyAISys);
-        sched.add_par_system("heavy_render", HeavyRenderSys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        (n * 1000) as u64
-    });
-
-    // Mixed pipeline с тяжёлой нагрузкой
-    bench(&format!("Mixed pipeline HEAVY ({n}k entities)"), || {
-        let mut world = make_world_4comp(n * 1000);
-        let mut sched = Scheduler::new();
-        sched.add_par_system("physics1", HeavyPhysicsSys);
-        sched.add_par_system("ai1", HeavyAISys);
-        sched.add_system("barrier", |_world: &mut World| {
-            // Structural changes
-        });
-        sched.add_par_system("physics2", HeavyPhysicsSys);
-        sched.add_par_system("render", HeavyRenderSys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        (n * 1000) as u64
-    });
-
-    println!("  Note: Тяжёлая нагрузка = 50-100 операций на сущность");
-    println!("        Ожидаемый speedup на 12 ядрах: 4-8x для 3+ систем");
 }
 
-// ── Инкрементальный граф (ленивый топосорт) ─────────────────────
-
-#[cfg(feature = "parallel")]
-fn bench_incremental_graph(n: usize) {
-    println!("\n── Incremental Graph (Lazy Toposort) ──────────────────────────────────────────────");
-    println!("  Тестирование ленивого обновления графа зависимостей");
-    println!("  Добавление систем без полного пересчёта графа");
-
-    struct SimpleSys;
-    impl ParSystem for SimpleSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Position>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Write<Position>, _>(|p| {
-                p.x += 1.0;
-            });
-        }
-    }
-
-    // Тест 1: Добавление систем по одной и измерение времени компиляции
-    println!("  --- Добавление систем по одной ---");
-    
-    bench(&format!("compile() после 1 системы"), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("sys1", SimpleSys);
-        sched.compile().unwrap();
-        1
-    });
-
-    bench(&format!("compile() после 5 систем"), || {
-        let mut sched = Scheduler::new();
-        for i in 0..5 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        1
-    });
-
-    bench(&format!("compile() после 10 систем"), || {
-        let mut sched = Scheduler::new();
-        for i in 0..10 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        1
-    });
-
-    bench(&format!("compile() после 20 систем"), || {
-        let mut sched = Scheduler::new();
-        for i in 0..20 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        1
-    });
-
-    // Тест 2: Инкрементальное добавление систем
-    println!("  --- Инкрементальное добавление ---");
-    
-    bench(&format!("инкрементальное: 1→5→10→20 систем"), || {
-        let mut sched = Scheduler::new();
-        
-        // Добавляем 1 систему и компилируем
-        sched.add_par_system("sys0", SimpleSys);
-        sched.compile().unwrap();
-        
-        // Добавляем ещё 4 системы (всего 5)
-        for i in 1..5 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        
-        // Добавляем ещё 5 систем (всего 10)
-        for i in 5..10 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        
-        // Добавляем ещё 10 систем (всего 20)
-        for i in 10..20 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        
-        1
-    });
-
-    // Тест 3: Добавление зависимостей
-    println!("  --- Добавление зависимостей ---");
-    
-    bench(&format!("добавление 10 зависимостей"), || {
-        let mut sched = Scheduler::new();
-        
-        // Создаём 5 систем
-        let mut system_ids = Vec::new();
-        for i in 0..5 {
-            let id = sched.add_par_system(format!("sys{}", i), SimpleSys);
-            system_ids.push(id);
-        }
-        
-        // Добавляем зависимости: каждая система зависит от предыдущей
-        for i in 1..5 {
-            sched.add_dependency(system_ids[i], system_ids[i-1]);
-        }
-        
-        sched.compile().unwrap();
-        1
-    });
-
-    // Тест 4: Сравнение полной перестройки vs инкрементального обновления
-    println!("  --- Сравнение полной vs инкрементальной компиляции ---");
-    
-    // Полная перестройка каждый раз
-    bench(&format!("полная перестройка графа 10 раз"), || {
-        for _ in 0..10 {
-            let mut sched = Scheduler::new();
-            for i in 0..10 {
-                sched.add_par_system(format!("sys{}", i), SimpleSys);
-            }
-            sched.compile().unwrap();
-        }
-        1
-    });
-
-    // Инкрементальное обновление
-    bench(&format!("инкрементальное обновление 10 раз"), || {
-        let mut sched = Scheduler::new();
-        
-        // Первая компиляция
-        for i in 0..10 {
-            sched.add_par_system(format!("sys{}", i), SimpleSys);
-        }
-        sched.compile().unwrap();
-        
-        // 9 раз добавляем по одной системе и компилируем
-        for batch in 0..9 {
-            for i in 0..10 {
-                sched.add_par_system(format!("sys_batch{}_{}", batch, i), SimpleSys);
-            }
-            sched.compile().unwrap();
-        }
-        
-        1
-    });
-
-    // Тест 5: Граф с конфликтами
-    println!("  --- Граф с Write-конфликтами ---");
-    
-    struct WritePosSys;
-    impl ParSystem for WritePosSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Position>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Write<Position>, _>(|p| {
-                p.x += 1.0;
-            });
-        }
-    }
-
-    struct WriteVelSys;
-    impl ParSystem for WriteVelSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Velocity>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Write<Velocity>, _>(|v| {
-                v.x += 1.0;
-            });
-        }
-    }
-
-    bench(&format!("граф с 5 Write-конфликтами"), || {
-        let mut sched = Scheduler::new();
-        
-        // Создаём 5 систем пишущих в Position (конфликты)
-        for i in 0..5 {
-            sched.add_par_system(format!("pos_sys{}", i), WritePosSys);
-        }
-        
-        // Создаём 5 систем пишущих в Velocity (нет конфликтов с Position)
-        for i in 0..5 {
-            sched.add_par_system(format!("vel_sys{}", i), WriteVelSys);
-        }
-        
-        sched.compile().unwrap();
-        
-        // Проверяем что системы с конфликтами в разных Stage
-        let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 2, "Write-конфликты должны создавать разные Stage");
-        
-        1
-    });
-
-    println!("  Note: Инкрементальный граф хранит зависимости между compile()");
-    println!("        Добавление систем обновляет только новые узлы/рёбра");
-    println!("        Полный пересчёт только при graph_dirty = true");
+#[cfg(not(feature = "parallel"))]
+fn bench_parallel_scheduler(_n: usize) {
+    println!("\n── Parallel Scheduler: feature 'parallel' not enabled ──────────────────────────");
 }
 
-// ── Специализированные Query с WorldQuerySystemAccess ──────────
-
-#[cfg(feature = "parallel")]
-fn bench_specialized_queries(n: usize) {
-    println!("\n── Specialized Queries (WorldQuerySystemAccess) ──────────────────────────────────");
-    println!("  Тестирование производительности специализированных Query");
-    println!("  Сравнение AutoSystem vs ParSystem vs специализированных Query");
-
-    // Создаём мир с разными архетипами
-    let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world.register_component::<Mass>();
-    world.register_component::<Player>();
-    world.register_component::<Enemy>();
-    
-    // Создаём 100k сущностей в 3 разных архетипах
-    let total = n * 100;
-    let third = total / 3;
-    
-    // Архетип 1: Position + Velocity + Health
-    world.spawn_many_silent(third, |i| {
-        let f = i as f32;
-        (
-            Position { x: f, y: f * 0.5, z: 0.0 },
-            Velocity { x: 1.0, y: 0.5, z: 0.0 },
-            Health { current: 100.0, max: 100.0 },
-        )
-    });
-    
-    // Архетип 2: Position + Velocity + Mass
-    world.spawn_many_silent(third, |i| {
-        let f = i as f32;
-        (
-            Position { x: f + 1000.0, y: f * 0.3, z: 0.0 },
-            Velocity { x: 0.5, y: 1.0, z: 0.0 },
-            Mass(1.0 + (i % 10) as f32 * 0.1),
-        )
-    });
-    
-    // Архетип 3: Position + Velocity + Player
-    world.spawn_many_silent(third, |i| {
-        let f = i as f32;
-        (
-            Position { x: f * 2.0, y: f * 0.7, z: 0.0 },
-            Velocity { x: 0.3, y: 0.8, z: 0.0 },
-            Player,
-        )
-    });
-
-    // Тест 1: Обычный AutoSystem
-    struct AutoMovementSys;
-    impl AutoSystem for AutoMovementSys {
-        type Query = (Read<Velocity>, Write<Position>);
-        
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Self::Query, _>(|(v, p)| {
-                p.x += v.x * 0.016;
-                p.y += v.y * 0.016;
-                p.z += v.z * 0.016;
-            });
-        }
-    }
-
-    // Тест 2: ParSystem с явным AccessDescriptor
-    struct ParMovementSys;
-    impl ParSystem for ParMovementSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
-                p.x += v.x * 0.016;
-                p.y += v.y * 0.016;
-                p.z += v.z * 0.016;
-            });
-        }
-    }
-
-    // Тест 3: Специализированный Query с фильтрацией
-    struct SpecializedQuerySys;
-    impl ParSystem for SpecializedQuerySys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>().read::<Health>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            // Специализированный Query: только сущности с Health > 50
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>, Read<Health>), _>(|(v, p, h)| {
-                if h.current > 50.0 {
-                    p.x += v.x * 0.016 * 2.0; // Быстрее если здоровье высокое
-                    p.y += v.y * 0.016 * 2.0;
-                    p.z += v.z * 0.016 * 2.0;
-                } else {
-                    p.x += v.x * 0.016 * 0.5; // Медленнее если здоровье низкое
-                    p.y += v.y * 0.016 * 0.5;
-                    p.z += v.z * 0.016 * 0.5;
-                }
-            });
-        }
-    }
-
-    // Тест 4: Query с With<Player> фильтром
-    struct PlayerOnlySys;
-    impl ParSystem for PlayerOnlySys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>().read::<Player>()
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            // Только игроки
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>, Read<Player>), _>(|(v, p, _)| {
-                p.x += v.x * 0.016 * 1.5; // Игроки двигаются быстрее
-                p.y += v.y * 0.016 * 1.5;
-                p.z += v.z * 0.016 * 1.5;
-            });
-        }
-    }
-
-    // Тест 5: Сложный Query с ветвлением по Health (используем архетип 1: Position + Velocity + Health)
-    struct ComplexQuerySys;
-    impl ParSystem for ComplexQuerySys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new()
-                .read::<Velocity>()
-                .write::<Position>()
-                .read::<Health>()  // Только архетип 1 имеет Health
-        }
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            // Сложный Query: сущности с разным уровнем здоровья (только архетип 1)
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>, Read<Health>), _>(|(v, p, h)| {
-                if h.current > 70.0 {
-                    // Высокое здоровье: быстрее
-                    p.x += v.x * 0.016 * 1.2;
-                    p.y += v.y * 0.016 * 1.2;
-                    p.z += v.z * 0.016 * 1.2;
-                } else if h.current > 40.0 {
-                    // Среднее здоровье: нормальная скорость
-                    p.x += v.x * 0.016;
-                    p.y += v.y * 0.016;
-                    p.z += v.z * 0.016;
-                } else {
-                    // Низкое здоровье: медленнее
-                    p.x += v.x * 0.016 * 0.7;
-                    p.y += v.y * 0.016 * 0.7;
-                    p.z += v.z * 0.016 * 0.7;
-                }
-            });
-        }
-    }
-
-    println!("  --- Сравнение разных типов Query ---");
-    
-    let total_entities = n * 100;
-    
-    // AutoSystem
-    bench(&format!("AutoSystem (базовый) ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_auto_system("auto", AutoMovementSys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    // ParSystem
-    bench(&format!("ParSystem (явный access) ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("par", ParMovementSys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    // Специализированный Query с Health фильтром
-    bench(&format!("Специализированный Query (Health filter) ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("specialized", SpecializedQuerySys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    // Query с With<Player> фильтром
-    bench(&format!("Query с With<Player> фильтром ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("player_only", PlayerOnlySys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    // Сложный Query с ветвлением по Health
-    bench(&format!("Сложный Query (Health ветвление) ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("complex", ComplexQuerySys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    println!("  --- Параллельное выполнение специализированных Query ---");
-    
-    // Параллельное выполнение нескольких специализированных систем
-    bench(&format!("3 специализированные системы PARALLEL ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("auto", ParMovementSys);
-        sched.add_par_system("specialized", SpecializedQuerySys);
-        sched.add_par_system("player_only", PlayerOnlySys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        total_entities as u64
-    });
-
-    // Сравнение sequential vs parallel для сложного Query
-    bench(&format!("Сложный Query SEQUENTIAL ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("complex", ComplexQuerySys);
-        sched.compile().unwrap();
-        sched.run_sequential(&mut world);
-        total_entities as u64
-    });
-
-    bench(&format!("Сложный Query PARALLEL ({}k)", total_entities), || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("complex", ComplexQuerySys);
-        sched.compile().unwrap();
-        sched.run(&mut world);
-        total_entities as u64
-    });
-
-    println!("  --- Измерение overhead компиляции специализированных Query ---");
-    
-    bench("compile() 5 специализированных систем", || {
-        let mut sched = Scheduler::new();
-        sched.add_par_system("sys1", ParMovementSys);
-        sched.add_par_system("sys2", SpecializedQuerySys);
-        sched.add_par_system("sys3", PlayerOnlySys);
-        sched.add_par_system("sys4", ComplexQuerySys);
-        sched.add_par_system("sys5", ParMovementSys);
-        sched.compile().unwrap();
-        1
-    });
-
-    bench("compile() 10 смешанных систем (Auto + Par + специализированные)", || {
-        let mut sched = Scheduler::new();
-        for i in 0..3 {
-            sched.add_auto_system(format!("auto_{}", i), AutoMovementSys);
-        }
-        for i in 0..3 {
-            sched.add_par_system(format!("par_{}", i), ParMovementSys);
-        }
-        for i in 0..2 {
-            sched.add_par_system(format!("special_{}", i), SpecializedQuerySys);
-        }
-        sched.add_par_system("player", PlayerOnlySys);
-        sched.add_par_system("complex", ComplexQuerySys);
-        sched.compile().unwrap();
-        1
-    });
-
-    println!("  Note: Специализированные Query используют WorldQuerySystemAccess");
-    println!("        для статической проверки доступа к компонентам");
-    println!("        With<T> фильтры исключают сущности без компонента T");
-    println!("        Сложные Query с несколькими фильтрами могут быть дороже");
-}
-
-// ── Intra-system parallelism (par_for_each_component) ──────────
+// ── Intra-system parallelism ───────────────────────────────────
 
 #[cfg(feature = "parallel")]
 fn bench_intra_system_parallel(n: usize) {
     println!("\n── Intra-system Parallelism (par_for_each_component) ──────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
+    println!("  Тест: одна система, несколько архетипов → параллелизм по архетипам");
 
-    // Создаём мир с несколькими архетипами для демонстрации параллелизма
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
@@ -1293,383 +857,278 @@ fn bench_intra_system_parallel(n: usize) {
     world.register_component::<Mass>();
     world.register_component::<Player>();
     world.register_component::<Enemy>();
-    
-    // Создаём 100k сущностей в 4 разных архетипах
-    let total = n * 100;
-    let quarter = total / 4;
-    
-    // Архетип 1: Position + Velocity + Health
+
+    let total    = n * 100;
+    let quarter  = total / 4;
+
     world.spawn_many_silent(quarter, |i| {
         let f = i as f32;
-        (
-            Position { x: f, y: f * 0.5, z: 0.0 },
-            Velocity { x: 1.0, y: 0.5, z: 0.0 },
-            Health { current: 100.0, max: 100.0 },
-        )
+        (Position { x: f, y: f * 0.5, z: 0.0 },
+         Velocity { x: 1.0, y: 0.5, z: 0.0 },
+         Health { current: 100.0, max: 100.0 })
     });
-    
-    // Архетип 2: Position + Velocity + Mass
     world.spawn_many_silent(quarter, |i| {
         let f = i as f32;
-        (
-            Position { x: f + 1000.0, y: f * 0.3, z: 0.0 },
-            Velocity { x: 0.5, y: 1.0, z: 0.0 },
-            Mass(1.0 + (i % 10) as f32 * 0.1),
-        )
+        (Position { x: f + 1000.0, y: f * 0.3, z: 0.0 },
+         Velocity { x: 0.5, y: 1.0, z: 0.0 },
+         Mass(1.0 + (i % 10) as f32 * 0.1))
     });
-    
-    // Архетип 3: Position + Velocity + Player
     world.spawn_many_silent(quarter, |i| {
         let f = i as f32;
-        (
-            Position { x: f * 2.0, y: f * 0.7, z: 0.0 },
-            Velocity { x: 0.3, y: 0.8, z: 0.0 },
-            Player,
-        )
+        (Position { x: f * 2.0, y: f * 0.7, z: 0.0 },
+         Velocity { x: 0.3, y: 0.8, z: 0.0 },
+         Player)
     });
-    
-    // Архетип 4: Position + Velocity + Enemy
     world.spawn_many_silent(quarter, |i| {
         let f = i as f32;
-        (
-            Position { x: f * 1.5, y: f * 0.2, z: 0.0 },
-            Velocity { x: 0.8, y: 0.2, z: 0.0 },
-            Enemy,
-        )
+        (Position { x: f * 1.5, y: f * 0.2, z: 0.0 },
+         Velocity { x: 0.8, y: 0.2, z: 0.0 },
+         Enemy)
     });
 
-    // Система с обычным for_each_component (последовательная)
-    struct SequentialSys;
-    impl ParSystem for SequentialSys {
+    let total_entities = n * 100;
+
+    struct SeqSys;
+    impl ParSystem for SeqSys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
-                // Реалистичные вычисления: движение с небольшими дополнительными операциями
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 p.z += v.z * 0.016;
-                
-                // Небольшое дополнительное вычисление для демонстрации
                 let len = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
-                if len > 1000.0 {
-                    p.x /= len * 0.001;
-                    p.y /= len * 0.001;
-                    p.z /= len * 0.001;
-                }
+                if len > 10000.0 { p.x /= len; p.y /= len; p.z /= len; }
             });
         }
     }
 
-    // Система с par_for_each_component (параллельная внутри системы)
-    struct ParallelSys;
-    impl ParSystem for ParallelSys {
+    struct ParSys;
+    impl ParSystem for ParSys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.par_for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
-                // Те же реалистичные вычисления
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 p.z += v.z * 0.016;
-                
                 let len = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
-                if len > 1000.0 {
-                    p.x /= len * 0.001;
-                    p.y /= len * 0.001;
-                    p.z /= len * 0.001;
-                }
+                if len > 10000.0 { p.x /= len; p.y /= len; p.z /= len; }
             });
         }
     }
 
-    // Бенчмарк последовательной версии
-    let total_entities = n * 100;
-    bench(&format!("Sequential for_each_component ({}k)", total_entities), || {
+    struct AutoParSys;
+    impl AutoSystem for AutoParSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.par_for_each_component::<Self::Query, _>(|(v, p)| {
+                p.x += v.x * 0.016;
+                p.y += v.y * 0.016;
+                p.z += v.z * 0.016;
+                let len = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+                if len > 10000.0 { p.x /= len; p.y /= len; p.z /= len; }
+            });
+        }
+    }
+
+    bench(&format!("Sequential for_each ({total_entities}k, 4 archetypes)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("seq", SequentialSys);
+        sched.add_par_system("seq", SeqSys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         total_entities as u64
     });
 
-    // Бенчмарк параллельной версии
-    bench(&format!("Parallel par_for_each_component ({}k)", total_entities), || {
+    bench(&format!("par_for_each SEQ context ({total_entities}k, 4 archetypes)"), || {
+        // run_sequential → main thread → par_iter реально параллелит
         let mut sched = Scheduler::new();
-        sched.add_par_system("par", ParallelSys);
+        sched.add_par_system("par", ParSys);
         sched.compile().unwrap();
-        sched.run(&mut world); // run() использует параллельное выполнение
+        sched.run_sequential(&mut world);
         total_entities as u64
     });
 
-    // AutoSystem с par_for_each_component (идентичные вычисления)
-    struct AutoParallelSys;
-    impl AutoSystem for AutoParallelSys {
-        type Query = (Read<Velocity>, Write<Position>);
-        
-        fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.par_for_each_component::<Self::Query, _>(|(v, p)| {
-                // Те же вычисления, что и в обычном тесте
-                p.x += v.x * 0.016;
-                p.y += v.y * 0.016;
-                p.z += v.z * 0.016;
-                
-                let len = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
-                if len > 1000.0 {
-                    p.x /= len * 0.001;
-                    p.y /= len * 0.001;
-                    p.z /= len * 0.001;
-                }
-            });
-        }
-    }
-
-    bench(&format!("AutoSystem + par_for_each_component ({}k)", total_entities), || {
+    bench(&format!("par_for_each PAR context ({total_entities}k, 4 archetypes)"), || {
+        // run() → rayon::scope → par_for_each тоже параллелит (вложенный scope)
         let mut sched = Scheduler::new();
-        sched.add_auto_system("auto_par", AutoParallelSys);
+        sched.add_par_system("par", ParSys);
         sched.compile().unwrap();
         sched.run(&mut world);
         total_entities as u64
     });
 
-    println!("  Note: par_for_each_component распараллеливает итерацию по архетипам");
-    println!("        внутри одной системы, когда много сущностей (>10k)");
+    bench(&format!("AutoSystem + par_for_each ({total_entities}k)"), || {
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("auto_par", AutoParSys);
+        sched.compile().unwrap();
+        sched.run_sequential(&mut world);
+        total_entities as u64
+    });
+
+    println!("  Note: par_for_each параллелит по архетипам в обоих контекстах");
+    println!("        Rayon work-stealing корректен при вложенных scope");
 }
 
-// ── Medium workload parallel scheduler (реальная игровая нагрузка) ──────────
+#[cfg(not(feature = "parallel"))]
+fn bench_intra_system_parallel(_n: usize) {
+    println!("\n── Intra-system Parallelism: feature 'parallel' not enabled ────────────────────");
+}
+
+// ── Medium workload ────────────────────────────────────────────
 
 #[cfg(feature = "parallel")]
-fn bench_medium_workload_parallel(n: usize) {
-    println!("\n── Medium Workload Parallel Scheduler (реальная игровая нагрузка) ────────────────");
+fn bench_medium_workload(n: usize) {
+    println!("\n── Medium Workload (реалистичная игровая нагрузка) ─────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
-    println!("  Workload: 15-20 операций на сущность (физика + AI + логика)");
+    println!("  Workload: 15-25 операций/entity, часть CPU-bound (sqrt, ветвление)");
 
-    // Система с средней нагрузкой (как в реальных играх)
-    struct PhysicsMediumSys;
-    impl ParSystem for PhysicsMediumSys {
+    struct PhysicsSys;
+    impl ParSystem for PhysicsSys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().write::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<(Write<Velocity>, Write<Position>), _>(|(v, p)| {
-                // Реалистичная физика: 8 операций
-                let dt = 0.016;
-                
-                // Гравитация + трение
+                let dt = 0.016f32;
                 v.y -= 9.8 * dt;
-                v.x *= 0.99;
-                v.y *= 0.99;
-                v.z *= 0.99;
-                
-                // Движение
-                p.x += v.x * dt;
-                p.y += v.y * dt;
-                p.z += v.z * dt;
-                
-                // Коллизия с полом
-                if p.y < 0.0 {
-                    p.y = 0.0;
-                    v.y = -v.y * 0.8;
-                }
-                
-                // Нормализация (если слишком быстро)
+                v.x *= 0.99; v.y *= 0.99; v.z *= 0.99;
+                p.x += v.x * dt; p.y += v.y * dt; p.z += v.z * dt;
+                if p.y < 0.0 { p.y = 0.0; v.y = v.y.abs() * 0.8; }
                 let speed_sq = v.x * v.x + v.y * v.y + v.z * v.z;
                 if speed_sq > 100.0 {
-                    let inv_speed = 10.0 / speed_sq.sqrt();
-                    v.x *= inv_speed;
-                    v.y *= inv_speed;
-                    v.z *= inv_speed;
+                    let s = 10.0 / speed_sq.sqrt();
+                    v.x *= s; v.y *= s; v.z *= s;
                 }
             });
         }
     }
 
-    struct AIMediumSys;
-    impl ParSystem for AIMediumSys {
+    struct AISys;
+    impl ParSystem for AISys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().read::<Position>().write::<Velocity>().write::<Health>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Position>, Write<Velocity>, Write<Health>), _>(|(p, v, hp)| {
-                // Реалистичный AI: 7 операций
-                let target_x = 100.0;
-                let target_y = 50.0;
-                
-                // Вектор к цели
-                let dx = target_x - p.x;
-                let dy = target_y - p.y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                
-                if dist > 1.0 {
-                    // Движение к цели
+            ctx.for_each_component::<(Read<Position>, Write<Velocity>, Write<Health>), _>(
+                |(p, v, hp)| {
+                    let dx   = 100.0 - p.x;
+                    let dy   = 50.0  - p.y;
+                    let dist = (dx * dx + dy * dy).sqrt().max(1.0);
                     v.x += dx / dist * 0.1;
                     v.y += dy / dist * 0.1;
-                    
-                    // Ограничение скорости
-                    let speed_sq = v.x * v.x + v.y * v.y;
-                    if speed_sq > 25.0 {
-                        let inv_speed = 5.0 / speed_sq.sqrt();
-                        v.x *= inv_speed;
-                        v.y *= inv_speed;
-                    }
-                }
-                
-                // Регенерация здоровья
-                hp.current = (hp.current + 0.05).min(hp.max);
-                
-                // Если здоровье низкое - убегаем
-                if hp.current < 30.0 {
-                    v.x *= 1.2;
-                    v.y *= 1.2;
-                }
-            });
+                    let sq = v.x * v.x + v.y * v.y;
+                    if sq > 25.0 { let s = 5.0 / sq.sqrt(); v.x *= s; v.y *= s; }
+                    hp.current = (hp.current + 0.05).min(hp.max);
+                    if hp.current < 30.0 { v.x *= 1.2; v.y *= 1.2; }
+                },
+            );
         }
     }
 
-    struct LogicMediumSys;
-    impl ParSystem for LogicMediumSys {
+    struct LogicSys;
+    impl ParSystem for LogicSys {
         fn access() -> AccessDescriptor {
             AccessDescriptor::new().write::<Temperature>().write::<Mana>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.for_each_component::<(Write<Temperature>, Write<Mana>), _>(|(temp, mana)| {
-                // Реалистичная логика: 6 операций
-                // Температура стремится к 20°C
                 temp.0 += (20.0 - temp.0) * 0.01;
-                
-                // Если температура высокая, мана тратится быстрее
-                let mana_cost = if temp.0 > 30.0 { 0.02 } else { 0.01 };
-                mana.current = (mana.current - mana_cost).max(0.0);
-                
-                // Регенерация маны если температура нормальная
-                if temp.0 < 25.0 {
-                    mana.current = (mana.current + 0.03).min(mana.max);
-                }
-                
-                // Эффект от маны на температуру
-                if mana.current < 20.0 {
-                    temp.0 += 0.5; // Низкая мана → перегрев
-                }
+                let cost = if temp.0 > 30.0 { 0.02 } else { 0.01 };
+                mana.current = (mana.current - cost).max(0.0);
+                if temp.0 < 25.0 { mana.current = (mana.current + 0.03).min(mana.max); }
+                if mana.current < 20.0 { temp.0 += 0.5; }
             });
         }
     }
 
-    // Создаём мир для теста средней нагрузки
     let mut world = make_world_4comp(n * 1000);
-    
-    // Добавляем недостающие компоненты
     world.register_component::<Temperature>();
     world.register_component::<Mana>();
-    
-    // Обновляем сущности чтобы у всех были все компоненты
     let mut entities = Vec::new();
-    world.query_typed::<Read<Position>>().for_each(|e, _| {
-        entities.push(e);
-    });
+    world.query_typed::<Read<Position>>().for_each(|e, _| entities.push(e));
     for &e in &entities {
         world.insert(e, Temperature(20.0));
         world.insert(e, Mana { current: 50.0, max: 100.0 });
     }
 
-    // Тестируем scaling с разным количеством систем
-    println!("  --- Scaling с количеством систем ---");
-    
-    // 1 система
-    bench(&format!("1 system MEDIUM workload ({n}k entities)"), || {
+    bench(&format!("1 system MEDIUM SEQ ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics", PhysicsMediumSys);
+        sched.add_par_system("physics", PhysicsSys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    // 2 системы
-    bench(&format!("2 systems MEDIUM workload ({n}k entities)"), || {
+    bench(&format!("2 systems MEDIUM SEQ ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics", PhysicsMediumSys);
-        sched.add_par_system("ai", AIMediumSys);
+        sched.add_par_system("physics", PhysicsSys);
+        sched.add_par_system("ai",      AISys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    bench(&format!("2 systems MEDIUM PARALLEL ({n}k entities)"), || {
+    bench(&format!("2 systems MEDIUM PAR ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics", PhysicsMediumSys);
-        sched.add_par_system("ai", AIMediumSys);
+        sched.add_par_system("physics", PhysicsSys);
+        sched.add_par_system("ai",      AISys);
         sched.compile().unwrap();
         sched.run(&mut world);
         (n * 1000) as u64
     });
 
-    // 3 системы
-    bench(&format!("3 systems MEDIUM workload ({n}k entities)"), || {
+    bench(&format!("3 systems MEDIUM SEQ ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics", PhysicsMediumSys);
-        sched.add_par_system("ai", AIMediumSys);
-        sched.add_par_system("logic", LogicMediumSys);
+        sched.add_par_system("physics", PhysicsSys);
+        sched.add_par_system("ai",      AISys);
+        sched.add_par_system("logic",   LogicSys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    bench(&format!("3 systems MEDIUM PARALLEL ({n}k entities)"), || {
+    bench(&format!("3 systems MEDIUM PAR ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics", PhysicsMediumSys);
-        sched.add_par_system("ai", AIMediumSys);
-        sched.add_par_system("logic", LogicMediumSys);
+        sched.add_par_system("physics", PhysicsSys);
+        sched.add_par_system("ai",      AISys);
+        sched.add_par_system("logic",   LogicSys);
         sched.compile().unwrap();
         sched.run(&mut world);
         (n * 1000) as u64
     });
 
-    println!("  --- Mixed pipeline (реальный сценарий) ---");
-    
-    // Mixed pipeline: 2 par → seq → 2 par
-    bench(&format!("Mixed pipeline MEDIUM SEQ ({n}k entities)"), || {
+    bench(&format!("mixed pipeline MEDIUM SEQ ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics1", PhysicsMediumSys);
-        sched.add_par_system("ai1", AIMediumSys);
-        sched.add_system("barrier", |_world: &mut World| {
-            // Команды, события и т.д.
-        });
-        sched.add_par_system("physics2", PhysicsMediumSys);
-        sched.add_par_system("logic", LogicMediumSys);
+        sched.add_par_system("physics1", PhysicsSys);
+        sched.add_par_system("ai1",      AISys);
+        sched.add_system("barrier", |_: &mut World| {});
+        sched.add_par_system("physics2", PhysicsSys);
+        sched.add_par_system("logic",    LogicSys);
         sched.compile().unwrap();
         sched.run_sequential(&mut world);
         (n * 1000) as u64
     });
 
-    bench(&format!("Mixed pipeline MEDIUM PAR ({n}k entities)"), || {
+    bench(&format!("mixed pipeline MEDIUM PAR ({n}k)"), || {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics1", PhysicsMediumSys);
-        sched.add_par_system("ai1", AIMediumSys);
-        sched.add_system("barrier", |_world: &mut World| {});
-        sched.add_par_system("physics2", PhysicsMediumSys);
-        sched.add_par_system("logic", LogicMediumSys);
+        sched.add_par_system("physics1", PhysicsSys);
+        sched.add_par_system("ai1",      AISys);
+        sched.add_system("barrier", |_: &mut World| {});
+        sched.add_par_system("physics2", PhysicsSys);
+        sched.add_par_system("logic",    LogicSys);
         sched.compile().unwrap();
         sched.run(&mut world);
         (n * 1000) as u64
     });
 
-    println!("  Note: Средняя нагрузка = 15-20 операций на сущность");
-    println!("        Ожидаемый speedup на 12 ядрах: 3-6x для 3+ систем");
+    println!("  Note: speedup виден при 3+ системах и достаточной вычислительной нагрузке");
 }
 
 #[cfg(not(feature = "parallel"))]
-fn bench_medium_workload_parallel(_n: usize) {
-    println!("\n── Medium Workload Parallel Scheduler ────────────────────────────────────────────");
-    println!("  Feature 'parallel' not enabled - skipping medium workload benchmarks");
-}
-
-// Fallback для non-parallel builds
-#[cfg(not(feature = "parallel"))]
-fn bench_intra_system_parallel(_n: usize) {
-    println!("\n── Intra-system Parallelism (par_for_each_component) ──────────────────────────────");
-    println!("  Feature 'parallel' not enabled - skipping intra-system parallelism benchmarks");
-}
+fn bench_medium_workload(_n: usize) {}
 
 // ── Resources benchmark ────────────────────────────────────────
 
@@ -1820,11 +1279,12 @@ fn main() {
     println!("Mode:  sequential (compile with --features parallel for rayon)");
     println!();
 
-    const N: usize = 1000; // 100K сущностей (100 * 100)
+    const N: usize = 1000; // базовый масштаб: 1M entities
 
     bench_batch_allocator(N);
     bench_has_relation(N);
     bench_scheduler(N);
+    bench_compile_overhead();
     bench_resources(N);
     bench_events(N);
     bench_query(N);
@@ -1837,13 +1297,7 @@ fn main() {
     bench_intra_system_parallel(N);
 
     #[cfg(feature = "parallel")]
-    bench_medium_workload_parallel(N);
-
-    #[cfg(feature = "parallel")]
-    bench_incremental_graph(N);
-
-    #[cfg(feature = "parallel")]
-    bench_specialized_queries(N);
+    bench_medium_workload(N);
 
     println!("\n── Summary ─────────────────────────────────────────────────────────────────────");
     let (mut world, _) = make_world(N * 1000);
