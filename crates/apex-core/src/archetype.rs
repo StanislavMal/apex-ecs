@@ -29,6 +29,16 @@ pub(crate) struct Column {
 unsafe impl Send for Column {}
 unsafe impl Sync for Column {}
 
+/// Публичное представление колонки для внешних крейтов.
+pub struct ColumnView<'a> {
+    col: &'a Column,
+}
+
+impl<'a> ColumnView<'a> {
+    pub fn id(&self) -> ComponentId { self.col.component_id }
+    pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 { self.col.get_ptr(row) }
+}
+
 impl Column {
     pub fn new(info: &ComponentInfo) -> Self {
         Self {
@@ -42,6 +52,10 @@ impl Column {
             change_ticks: Vec::new(),
         }
     }
+
+    /// Публичный accessor для component_id колонки.
+    #[inline]
+    pub fn id(&self) -> ComponentId { self.component_id }
 
     fn layout_for(&self, capacity: usize) -> Layout {
         if self.item_size == 0 {
@@ -58,6 +72,11 @@ impl Column {
         } else {
             self.data.add(row * self.item_size)
         }
+    }
+
+    #[inline]
+    pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 {
+        self.get_ptr(row)
     }
 
     #[inline]
@@ -271,6 +290,11 @@ impl Archetype {
             None
         }
     }
+
+    pub fn columns(&self) -> impl Iterator<Item = ColumnView<'_>> {
+        self.columns.iter().map(|col| ColumnView { col })
+    }
+    pub fn entities(&self) -> &[Entity] { &self.entities }
 }
 
 /// Описание одного чанка архетипа для chunk-level параллелизма.

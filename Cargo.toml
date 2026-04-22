@@ -4,6 +4,8 @@ members = [
     "crates/apex-core",
     "crates/apex-graph",
     "crates/apex-scheduler",
+    "crates/apex-serialization",
+    "crates/apex-hot-reload",
     "crates/apex-examples",
     "crates/apex-bench",
 ]
@@ -15,16 +17,16 @@ authors = ["You"]
 license = "MIT"
 
 [workspace.dependencies]
-# Хэширование - быстрее std HashMap
+# Хэширование
 rustc-hash = "1.1"
 
-# Маленькие vec на стеке (до N элементов без heap)
+# Маленькие vec на стеке
 smallvec = { version = "1.11", features = ["union"] }
 
-# Arena allocation - быстрое выделение памяти
+# Arena allocation
 thunderdome = "0.6"
 
-# Битовые множества - для масок компонентов
+# Битовые множества
 bitvec = "1.0"
 
 # Параллелизм
@@ -36,10 +38,14 @@ log = "0.4"
 # Ошибки
 thiserror = "1.0"
 
+# Сериализация (новое)
+serde     = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 
 [profile.dev]
-opt-level = 1  # немного оптимизаций даже в dev
+opt-level = 1

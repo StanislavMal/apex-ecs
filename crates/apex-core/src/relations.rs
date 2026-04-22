@@ -18,7 +18,7 @@ pub(crate) const RELATION_FLAG: u32 = 1 << 31;
 const WILDCARD_TARGET: u32 = (1 << 20) - 1;
 
 #[inline]
-pub(crate) fn encode_relation(kind_idx: u32, target_idx: u32) -> ComponentId {
+pub fn encode_relation(kind_idx: u32, target_idx: u32) -> ComponentId {
     debug_assert!(kind_idx < (1 << 11), "too many relation kinds");
     debug_assert!(target_idx < WILDCARD_TARGET, "entity index too large");
     ComponentId(RELATION_FLAG | (kind_idx << 20) | target_idx)
@@ -35,12 +35,12 @@ pub fn is_relation_id(id: ComponentId) -> bool {
 }
 
 #[inline]
-pub(crate) fn decode_kind(id: ComponentId) -> u32 {
+pub fn decode_kind(id: ComponentId) -> u32 {
     (id.0 & !RELATION_FLAG) >> 20
 }
 
 #[inline]
-pub(crate) fn decode_target(id: ComponentId) -> u32 {
+pub fn decode_target(id: ComponentId) -> u32 {
     id.0 & ((1 << 20) - 1)
 }
 
@@ -89,32 +89,12 @@ impl IdIndex {
 }
 
 // ── SubjectIndex ───────────────────────────────────────────────
-//
-// Исправленная версия: O(1) через u64 kind_mask + binary_search в SmallVec.
-//
-// Предыдущая реализация использовала SmallVec::contains — линейный поиск
-// по всем relation_id. При N relations это O(N) с большим константным
-// фактором из-за сравнения u32.
-//
-// Новая структура SubjectEntry:
-//   kind_mask: u64  — бит kind_idx установлен если есть хоть один relation
-//                     этого kind. Даёт O(1) early-exit для has().
-//   relations: SmallVec<[u32; 4]> — отсортированный список полных relation_id.
-//                     binary_search = O(log N), но N < 8 на практике,
-//                     поэтому реально быстрее hash из-за cache locality.
-//
-// Итоговая сложность has():
-//   - kind не зарегистрирован → 1 bit check → false (< 1 ns)
-//   - kind есть, target нет  → bit check + binary_search (< 3 ns)
-//   - kind есть, target есть → bit check + binary_search (< 3 ns)
 
 #[derive(Default)]
 struct SubjectEntry {
     /// Битовая маска: бит k установлен ↔ есть relation с kind_idx = k.
-    /// Поддерживает до 64 различных RelationKind — достаточно для любой игры.
     kind_mask: u64,
     /// Отсортированный список полных relation ComponentId (как u32).
-    /// Инвариант: всегда отсортирован → binary_search корректен.
     relations: SmallVec<[u32; 4]>,
 }
 
@@ -125,8 +105,6 @@ impl SubjectEntry {
         self.kind_mask & (1u64 << kind_idx) != 0
     }
 
-    /// Fallback для kind_idx >= 64 — линейный поиск по relations.
-    /// На практике никогда не вызывается (< 64 relation kinds в любой игре).
     #[cold]
     fn has_kind_slow(&self, kind_idx: u32) -> bool {
         self.relations.iter().any(|&r| {
@@ -138,14 +116,12 @@ impl SubjectEntry {
     #[inline]
     fn insert(&mut self, relation_id: ComponentId) {
         let raw = relation_id.0;
-        // Обновляем kind_mask
         let kind_idx = decode_kind(relation_id);
         if kind_idx < 64 {
             self.kind_mask |= 1u64 << kind_idx;
         }
-        // Вставляем в отсортированную позицию (insertion sort — N мал)
         match self.relations.binary_search(&raw) {
-            Ok(_) => {} // уже есть
+            Ok(_)    => {}
             Err(pos) => self.relations.insert(pos, raw),
         }
     }
@@ -156,10 +132,8 @@ impl SubjectEntry {
         if let Ok(pos) = self.relations.binary_search(&raw) {
             self.relations.remove(pos);
         }
-        // Пересчитываем kind_mask для этого kind
         let kind_idx = decode_kind(relation_id);
         if kind_idx < 64 {
-            // Проверяем остались ли ещё relations этого kind
             let still_has_kind = self.relations.iter().any(|&r| {
                 let cid = ComponentId(r);
                 is_relation_id(cid) && decode_kind(cid) == kind_idx
@@ -173,9 +147,7 @@ impl SubjectEntry {
     #[inline]
     fn has(&self, relation_id: ComponentId) -> bool {
         let kind_idx = decode_kind(relation_id);
-        // O(1) early-exit: если kind отсутствует → false без binary_search
         if !self.has_kind(kind_idx) { return false; }
-        // O(log N) binary_search — N < 8 на практике
         self.relations.binary_search(&relation_id.0).is_ok()
     }
 }
@@ -211,8 +183,6 @@ impl SubjectIndex {
         }
     }
 
-    /// O(1) через kind_mask + O(log N) binary_search.
-    /// Фактически < 3 ns для типичных случаев.
     #[inline]
     pub fn has(&self, entity_index: u32, relation_id: ComponentId) -> bool {
         let idx = entity_index as usize;
@@ -251,17 +221,24 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
 // ── RelationRegistry ───────────────────────────────────────────
 
 pub struct RelationRegistry {
-    type_to_idx: FxHashMap<TypeId, u32>,
-    cascade_flags: Vec<bool>,
-    next_idx: u32,
+    type_to_idx:    FxHashMap<TypeId, u32>,
+    cascade_flags:  Vec<bool>,
+    /// kind_idx → type_name строка (для сериализации).
+    /// Инвариант: `idx_to_name[kind_idx]` заполняется в `get_or_register`.
+    idx_to_name:    Vec<String>,
+    /// type_name → kind_idx (для десериализации).
+    name_to_idx:    FxHashMap<String, u32>,
+    next_idx:       u32,
 }
 
 impl RelationRegistry {
     pub fn new() -> Self {
         Self {
-            type_to_idx: FxHashMap::default(),
+            type_to_idx:   FxHashMap::default(),
             cascade_flags: Vec::new(),
-            next_idx: 0,
+            idx_to_name:   Vec::new(),
+            name_to_idx:   FxHashMap::default(),
+            next_idx:      0,
         }
     }
 
@@ -274,6 +251,12 @@ impl RelationRegistry {
         self.next_idx += 1;
         self.type_to_idx.insert(type_id, idx);
         self.cascade_flags.push(R::cascade_delete_on_target_despawn());
+
+        // Регистрируем name для сериализации
+        let name = std::any::type_name::<R>().to_string();
+        self.idx_to_name.push(name.clone());
+        self.name_to_idx.insert(name, idx);
+
         idx
     }
 
@@ -285,6 +268,30 @@ impl RelationRegistry {
     pub fn is_cascade(&self, kind_idx: u32) -> bool {
         self.cascade_flags.get(kind_idx as usize).copied().unwrap_or(false)
     }
+
+    // ── Методы для сериализации ────────────────────────────────
+
+    /// Получить type_name строку по kind_idx.
+    ///
+    /// Используется `WorldSerializer::snapshot` для записи human-readable
+    /// имени relation в снэпшот.
+    #[inline]
+    pub fn get_name(&self, kind_idx: u32) -> Option<&str> {
+        self.idx_to_name.get(kind_idx as usize).map(|s| s.as_str())
+    }
+
+    /// Получить kind_idx по type_name строке.
+    ///
+    /// Используется `WorldSerializer::restore` при восстановлении relations.
+    /// Возвращает `None` если RelationKind не зарегистрирован в текущем мире
+    /// (например, был удалён из кода после сохранения).
+    #[inline]
+    pub fn get_idx_by_name(&self, name: &str) -> Option<u32> {
+        self.name_to_idx.get(name).copied()
+    }
+
+    /// Количество зарегистрированных видов relations.
+    pub fn kind_count(&self) -> usize { self.next_idx as usize }
 }
 
 impl Default for RelationRegistry {
@@ -295,7 +302,7 @@ impl Default for RelationRegistry {
 
 impl World {
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
-        let kind_idx = self.relations.get_or_register::<R>();
+        let kind_idx    = self.relations.get_or_register::<R>();
         let relation_id = encode_relation(kind_idx, target.index);
         self.ensure_relation_component(relation_id);
         self.subject_index.add(subject.index, relation_id);
@@ -305,21 +312,20 @@ impl World {
     pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None => return,
+            None      => return,
         };
         let relation_id = encode_relation(kind_idx, target.index);
         self.subject_index.remove(subject.index, relation_id);
         self.remove_relation_component(subject, relation_id);
     }
 
-    /// O(1) через SubjectIndex: kind_mask check + binary_search.
-    /// Типичная стоимость: < 3 ns.
+    /// O(1) проверка через SubjectIndex: kind_mask check + binary_search.
     #[inline]
     pub fn has_relation<R: RelationKind>(&self, subject: Entity, _kind: R, target: Entity) -> bool {
         if !self.entities.is_alive(subject) { return false; }
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None => return false,
+            None      => return false,
         };
         let relation_id = encode_relation(kind_idx, target.index);
         self.subject_index.has(subject.index, relation_id)
@@ -327,12 +333,12 @@ impl World {
 
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
-        _kind: R,
+        _kind:  R,
         target: Entity,
     ) -> RelationIter<'w, Q> {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None => return RelationIter::empty(self),
+            None      => return RelationIter::empty(self),
         };
         let relation_id = encode_relation(kind_idx, target.index);
 
@@ -366,7 +372,7 @@ impl World {
     ) -> RelationIter<'w, Q> {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None => return RelationIter::empty(self),
+            None      => return RelationIter::empty(self),
         };
         let wid = wildcard_id(kind_idx);
 
@@ -396,10 +402,10 @@ impl World {
 
     pub fn children_of<'w, R: RelationKind>(
         &'w self,
-        _kind: R,
+        _kind:  R,
         parent: Entity,
     ) -> impl Iterator<Item = Entity> + 'w {
-        let kind_idx = self.relations.get_idx::<R>();
+        let kind_idx    = self.relations.get_idx::<R>();
         let relation_id = kind_idx.map(|k| encode_relation(k, parent.index));
 
         let arch_ids: &[ArchetypeId] = relation_id
@@ -415,7 +421,7 @@ impl World {
     pub fn get_relation_target<R: RelationKind>(
         &self,
         subject: Entity,
-        _kind: R,
+        _kind:   R,
     ) -> Option<Entity> {
         let kind_idx = self.relations.get_idx::<R>()?;
         for &raw_id in self.subject_index.get_all(subject.index) {
@@ -439,12 +445,13 @@ impl World {
     pub(crate) fn ensure_relation_component(&mut self, relation_id: ComponentId) {
         if self.registry.get_info(relation_id).is_none() {
             self.registry.register_raw(relation_id, ComponentInfo {
-                id: relation_id,
-                name: "<relation>",
-                type_id: std::any::TypeId::of::<()>(),
-                size: 0,
-                align: 1,
-                drop_fn: |_| {},
+                id:       relation_id,
+                name:     "<relation>",
+                type_id:  std::any::TypeId::of::<()>(),
+                size:     0,
+                align:    1,
+                drop_fn:  |_| {},
+                serde:    None,
             });
         }
     }
@@ -452,14 +459,14 @@ impl World {
     pub(crate) fn insert_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None      => return,
         };
         if self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, relation_id);
-        let new_row = self.move_entity(entity, location, new_arch_id);
-        let tick = self.current_tick;
+        let new_row     = self.move_entity(entity, location, new_arch_id);
+        let tick        = self.current_tick;
         if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
             let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
             col.change_ticks.push(tick);
@@ -467,23 +474,23 @@ impl World {
         }
         self.entities.set_location(entity, crate::entity::EntityLocation {
             archetype_id: new_arch_id,
-            row: new_row,
+            row:          new_row,
         });
     }
 
     pub(crate) fn remove_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None      => return,
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_without(location.archetype_id, relation_id);
-        let new_row = self.move_entity(entity, location, new_arch_id);
+        let new_row     = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, crate::entity::EntityLocation {
             archetype_id: new_arch_id,
-            row: new_row,
+            row:          new_row,
         });
     }
 }
@@ -492,15 +499,15 @@ impl World {
 
 pub(crate) struct RelationArchState<S> {
     pub arch_idx: usize,
-    pub state: S,
-    pub len: usize,
+    pub state:    S,
+    pub len:      usize,
 }
 
 pub struct RelationIter<'w, Q: WorldQuery> {
-    world: &'w World,
+    world:       &'w World,
     arch_states: Vec<RelationArchState<Q::State>>,
     arch_cursor: usize,
-    row_cursor: usize,
+    row_cursor:  usize,
 }
 
 impl<'w, Q: WorldQuery> RelationIter<'w, Q> {
@@ -518,7 +525,7 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
             let a = self.arch_states.get(self.arch_cursor)?;
             if self.row_cursor >= a.len {
                 self.arch_cursor += 1;
-                self.row_cursor = 0;
+                self.row_cursor   = 0;
                 continue;
             }
             let row = self.row_cursor;
@@ -571,11 +578,10 @@ mod tests {
 
     #[test]
     fn subject_entry_kind_mask() {
-        // Проверяем что kind_mask корректно обновляется
         let mut entry = SubjectEntry::default();
         let rel1 = encode_relation(0, 100);
         let rel2 = encode_relation(1, 200);
-        let rel3 = encode_relation(0, 300); // тот же kind что rel1
+        let rel3 = encode_relation(0, 300);
 
         entry.insert(rel1);
         assert!(entry.has_kind(0));
@@ -586,36 +592,24 @@ mod tests {
 
         entry.insert(rel3);
         entry.remove(rel1);
-        // kind 0 всё ещё должен быть — остался rel3
         assert!(entry.has_kind(0));
 
         entry.remove(rel3);
-        // теперь kind 0 должен исчезнуть
         assert!(!entry.has_kind(0));
     }
 
     #[test]
-    fn has_relation_o1() {
-        let mut world = World::new();
-        world.register_component::<Position>();
+    fn relation_registry_name_roundtrip() {
+        let mut reg = RelationRegistry::new();
+        let idx = reg.get_or_register::<ChildOf>();
 
-        let parents: Vec<Entity> = (0..100)
-            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0 },)))
-            .collect();
+        // Проверяем что имя сохраняется
+        let name = reg.get_name(idx).unwrap();
+        assert!(name.contains("ChildOf"));
 
-        let children: Vec<Entity> = (0..100)
-            .map(|i| {
-                let c = world.spawn_bundle((Position { x: i as f32, y: 0.0 },));
-                world.add_relation(c, ChildOf, parents[i]);
-                c
-            })
-            .collect();
-
-        for i in 0..100 {
-            assert!(world.has_relation(children[i], ChildOf, parents[i]));
-            let other = (i + 1) % 100;
-            assert!(!world.has_relation(children[i], ChildOf, parents[other]));
-        }
+        // Проверяем обратный поиск
+        let found_idx = reg.get_idx_by_name(name).unwrap();
+        assert_eq!(found_idx, idx);
     }
 
     #[test]

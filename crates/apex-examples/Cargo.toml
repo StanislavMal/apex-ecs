@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-apex-core      = { path = "../apex-core" }
-apex-graph     = { path = "../apex-graph" }
-apex-scheduler = { path = "../apex-scheduler" }
+apex-core          = { path = "../apex-core" }
+apex-graph         = { path = "../apex-graph" }
+apex-scheduler     = { path = "../apex-scheduler" }
+apex-serialization = { path = "../apex-serialization" }
+apex-hot-reload    = { path = "../apex-hot-reload" }
+serde              = { version = "1.0", features = ["derive"] }
+serde_json         = "1.0"
 rayon = { workspace = true, optional = true }
 
 [features]

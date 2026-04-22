@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 
 use crate::{
     archetype::{Archetype, ArchetypeId},
-    component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
+    component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick, Serializable},
     entity::{EntityAllocator, EntityLocation, Entity},
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
@@ -183,6 +183,53 @@ impl World {
 
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
         self.registry.register::<T>()
+    }
+
+    pub fn register_component_serde<T: crate::component::Serializable>(&mut self) -> ComponentId {
+        self.registry.register_serde::<T>()
+    }
+
+    pub fn registry(&self) -> &ComponentRegistry { &self.registry }
+
+    pub fn archetypes(&self) -> &[Archetype] { &self.archetypes }
+
+    pub fn relation_registry(&self) -> &RelationRegistry { &self.relations }
+
+    pub fn relation_registry_mut(&mut self) -> &mut RelationRegistry { &mut self.relations }
+
+    pub fn subject_index_raw(&self, entity_index: u32) -> &[u32] {
+        self.subject_index.get_all(entity_index)
+    }
+
+    pub fn spawn_empty(&mut self) -> Entity {
+        let entity = self.entities.allocate();
+        let row    = unsafe { self.archetypes[0].allocate_row(entity) };
+        self.entities.set_location(entity, EntityLocation {
+            archetype_id: ArchetypeId::EMPTY,
+            row,
+        });
+        entity
+    }
+
+    pub fn insert_relation_raw(&mut self, subject: Entity, relation_id: ComponentId, _target: Entity) {
+        self.ensure_relation_component(relation_id);
+        self.subject_index.add(subject.index, relation_id);
+        self.insert_relation_component(subject, relation_id);
+    }
+
+    /// Публичная обёртка над pub(crate) insert_raw — для apex-serialization.
+    ///
+    /// Вставить raw байты компонента в entity. Используется при restore
+    /// когда тип компонента неизвестен статически.
+    #[inline]
+    pub fn insert_raw_pub(
+        &mut self,
+        entity:       Entity,
+        component_id: ComponentId,
+        data:         Vec<u8>,
+        tick:         Tick,
+    ) {
+        self.insert_raw(entity, component_id, data, tick);
     }
 
     // ── Параллельный доступ ────────────────────────────────────

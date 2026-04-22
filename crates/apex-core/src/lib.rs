@@ -12,7 +12,7 @@ pub mod system_param;
 pub mod world;
 
 pub use access::AccessDescriptor;
-pub use component::{Component, Tick};
+pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde_fns};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
@@ -27,7 +27,7 @@ pub use system_param::{
 
 pub mod prelude {
     pub use crate::access::AccessDescriptor;
-    pub use crate::component::{Component, Tick};
+    pub use crate::component::{Component, Tick, Serializable};
     pub use crate::entity::Entity;
     pub use crate::events::EventQueue;
     pub use crate::resources::ResourceMap;

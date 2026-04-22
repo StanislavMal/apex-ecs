@@ -10,10 +10,14 @@ parallel = ["dep:rayon"]
 [dependencies]
 apex-graph = { path = "../apex-graph" }
 
-rustc-hash.workspace = true
-smallvec.workspace  = true
+rustc-hash.workspace  = true
+smallvec.workspace    = true
 thunderdome.workspace = true
-bitvec.workspace    = true
-thiserror.workspace = true
-log.workspace       = true
+bitvec.workspace      = true
+thiserror.workspace   = true
+log.workspace         = true
 rayon = { workspace = true, optional = true }
+
+# Сериализация — нужна для Serializable трейта и make_serde_fns
+serde     = { workspace = true }
+serde_json = { workspace = true }

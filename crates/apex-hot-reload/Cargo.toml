@@ -1,0 +1,22 @@
+[package]
+name = "apex-hot-reload"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core          = { path = "../apex-core" }
+apex-serialization = { path = "../apex-serialization" }
+
+# File watcher — cross-platform.
+# notify 6.x автоматически выбирает OS-бэкенд через cfg:
+#   Windows → ReadDirectoryChangesWatcher
+#   Linux   → INotifyWatcher
+#   macOS   → KqueueWatcher / FSEventsWatcher
+# Никаких дополнительных feature флагов не нужно.
+notify = "6.1"
+
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rustc-hash.workspace = true
+thiserror.workspace  = true
+log.workspace        = true
