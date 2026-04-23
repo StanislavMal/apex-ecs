@@ -6,7 +6,7 @@
 //! - Hybrid Scheduler (ParSystem + FnParSystem + Sequential)
 //! - Relations (ChildOf иерархии)
 //! - Commands
-
+//! cargo run -p apex-examples --example basic --release --features parallel
 use apex_core::prelude::*;
 use apex_scheduler::{Scheduler, ParSystem};
 use apex_core::access::AccessDescriptor;
@@ -257,25 +257,13 @@ fn main() {
 
     let mut sched = Scheduler::new();
 
-    // Stage 0: Physics + HealthClamp — параллельны (нет конфликтов)
+    // Все Par-системы СНАЧАЛА (правило: Par до Sequential)
     sched.add_par_system("physics",      PhysicsSystem);
     sched.add_par_system("health_clamp", HealthClampSystem);
     
     // AutoSystem: новый типобезопасный API (автовывод AccessDescriptor)
     let movement_id = sched.add_auto_system("movement", MovementSystem);
     println!("  [Demo] AutoSystem 'movement' зарегистрирован без явного AccessDescriptor");
-
-    // Stage 1: damage_apply (Sequential барьер)
-    let damage_id = sched.add_system("damage_apply", damage_apply).id();
-
-    // Stage 2: despawn_dead (Sequential)
-    let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
-
-    // Stage 3: stats (Sequential)
-    let stats_id = sched.add_system("stats_update", stats_update).id();
-
-    sched.add_dependency(despawn_id, damage_id);
-    sched.add_dependency(stats_id,   despawn_id);
 
     // FnParSystem: velocity reset для Enemy — демо нового API
     let reset_id = sched.add_fn_par_system(
@@ -295,10 +283,13 @@ fn main() {
             .write::<Velocity>(),
     );
 
-    // enemy_ai после physics (physics тоже пишет Velocity — конфликт → auto-ordered)
-    sched.add_dependency(reset_id, sched.stages().map(|_| apex_scheduler::SystemId(0)).unwrap_or(apex_scheduler::SystemId(0)));
-    // Просто добавляем после damage для порядка
-    sched.add_dependency(reset_id, damage_id);
+    // Sequential ПОСЛЕ всех Par
+    let damage_id = sched.add_system("damage_apply", damage_apply).id();
+    let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
+    let stats_id = sched.add_system("stats_update", stats_update).id();
+
+    sched.add_dependency(despawn_id, damage_id);
+    sched.add_dependency(stats_id,   despawn_id);
 
     sched.compile().unwrap();
 
