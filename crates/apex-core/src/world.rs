@@ -1082,47 +1082,12 @@ impl<'w> EntityBuilder<'w> {
 // не внутренняя логика мира.
  
 impl World {
-    /// Срез всех архетипов мира — для итерации в query.
-    ///
-    /// Используется `RhaiQueryIter` для обхода компонентов.
-    /// Вызывающий не должен мутировать архетипы напрямую.
-    #[inline]
-    pub fn archetypes(&self) -> &[crate::archetype::Archetype] {
-        &self.archetypes
-    }
- 
-    /// Доступ к реестру компонентов — для поиска ComponentId по типу.
-    ///
-    /// Используется `ScriptEngine::register_component::<T>()`.
-    #[inline]
-    pub fn registry(&self) -> &crate::component::ComponentRegistry {
-        &self.registry
-    }
- 
     /// Доступ к аллокатору entity — для получения Entity по index.
     ///
     /// Используется `despawn()` из Rhai-скриптов.
     #[inline]
     pub fn entity_allocator(&self) -> &crate::entity::EntityAllocator {
         &self.entities
-    }
- 
-    /// Вставить компонент по сырым байтам и ComponentId.
-    ///
-    /// Используется `WorldSerializer::restore` и `apply_deferred_spawns`.
-    /// Метод уже существует как `pub(crate)` — делаем его `pub`.
-    ///
-    /// # Safety
-    /// `component_bytes` должны содержать корректно выровненный T,
-    /// соответствующий `component_id`.
-    pub fn insert_raw_pub(
-        &mut self,
-        entity:         crate::entity::Entity,
-        component_id:   crate::component::ComponentId,
-        component_bytes: Vec<u8>,
-        tick:           crate::component::Tick,
-    ) {
-        self.insert_raw(entity, component_id, component_bytes, tick);
     }
  
     /// Получить ComponentId по строковому имени типа.

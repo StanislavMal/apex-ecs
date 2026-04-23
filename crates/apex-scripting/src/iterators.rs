@@ -85,6 +85,7 @@ fn parse_one_desc(s: &str) -> Option<QueryDesc> {
 // ── ArchState ──────────────────────────────────────────────────
 
 /// Состояние одного архетипа в query-итераторе.
+#[derive(Clone)]
 struct ArchState {
     /// Индекс архетипа в `world.archetypes`
     arch_idx: usize,
@@ -95,6 +96,7 @@ struct ArchState {
     components: Vec<ComponentState>,
 }
 
+#[derive(Clone)]
 struct ComponentState {
     col_idx:   usize,
     type_name: String,
@@ -107,6 +109,7 @@ struct ComponentState {
 /// Rhai-совместимый итератор результатов `query()`.
 ///
 /// Регистрируется через `engine.register_iterator::<RhaiQueryIter>()`.
+#[derive(Clone)]
 pub struct RhaiQueryIter {
     ctx:             Rc<RefCell<ScriptContext>>,
     arch_states:     Vec<ArchState>,
@@ -149,8 +152,8 @@ impl RhaiQueryIter {
         let ctx_ref = self.ctx.borrow();
         // SAFETY: итератор завершён (flush_writes вызывается в Drop или
         // после исчерпания итератора), никаких shared borrow на Column нет.
-        let world_ptr = ctx_ref.world_ptr
-            .expect("flush_writes вызван вне run()");
+        let world_ref = ctx_ref.world_ref();
+        let world_ptr = world_ref as *const World;
 
         for (arch_idx, row, type_name, dynamic) in self.pending_writes.drain(..) {
             let binding = match ctx_ref.binding(&type_name) {
@@ -160,11 +163,11 @@ impl RhaiQueryIter {
 
             // SAFETY: arch_idx и row валидны — получены из того же world.
             unsafe {
-                let world = world_ptr.as_ptr();
-                let arch  = &(*world).archetypes()[arch_idx];
+                let world = world_ptr.as_ref().unwrap_unchecked();
+                let arch  = &world.archetypes()[arch_idx];
                 if let Some(col_idx) = arch.column_index(binding.id) {
                     // Получаем указатель на данные в колонке
-                    let col = &(*world).archetypes()[arch_idx].columns()[col_idx];
+                    let col = &world.archetypes()[arch_idx].columns_raw()[col_idx];
                     let ptr = col.get_raw_ptr(row) as *mut u8;
                     (binding.write)(ptr, &dynamic);
                 }
@@ -186,19 +189,23 @@ impl Iterator for RhaiQueryIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            // Клонируем arch_state чтобы избежать borrow conflict
+            // между immutable borrow (arch_state) и mutable borrow (self.build_item)
             let arch_state = self.arch_states.get(self.arch_cursor)?;
+            let arch_idx   = arch_state.arch_idx;
+            let len        = arch_state.len;
+            let components = arch_state.components.clone();
 
-            if self.row_cursor >= arch_state.len {
+            if self.row_cursor >= len {
                 self.arch_cursor += 1;
                 self.row_cursor  = 0;
                 continue;
             }
 
-            let row      = self.row_cursor;
-            let arch_idx = arch_state.arch_idx;
+            let row = self.row_cursor;
             self.row_cursor += 1;
 
-            let item = self.build_item(arch_idx, arch_state, row);
+            let item = self.build_item(arch_idx, &components, row);
             return Some(item);
         }
     }
@@ -207,7 +214,7 @@ impl Iterator for RhaiQueryIter {
 // ── Построение элементов ───────────────────────────────────────
 
 impl RhaiQueryIter {
-    fn build_item(&mut self, arch_idx: usize, arch_state: &ArchState, row: usize) -> Dynamic {
+    fn build_item(&mut self, arch_idx: usize, components: &[ComponentState], row: usize) -> Dynamic {
         let ctx_ref  = self.ctx.borrow();
         let world    = ctx_ref.world_ref();
         let arch     = &world.archetypes()[arch_idx];
@@ -218,7 +225,7 @@ impl RhaiQueryIter {
         let entity: Entity = arch.entities()[row];
         map.insert("entity".into(), Dynamic::from_int(entity.index() as rhai::INT));
 
-        for comp in &arch_state.components {
+        for comp in components {
             let binding = match ctx_ref.binding(&comp.type_name) {
                 Some(b) => b,
                 None    => continue,

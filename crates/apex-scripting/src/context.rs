@@ -75,6 +75,11 @@ pub struct ScriptContext {
     /// Применяется после завершения скрипта через `apply_deferred()`.
     pub(crate) deferred: RefCell<Commands>,
 
+    /// Буфер запросов spawn из скриптов (SpawnRequest содержит rhai::Dynamic,
+    /// который не Send, поэтому не может идти через Commands::add).
+    /// Применяется в apply_deferred_requests после завершения скрипта.
+    pub(crate) deferred_spawns: RefCell<Vec<SpawnRequest>>,
+
     /// Реестр компонентов доступных из скриптов: name → binding
     pub(crate) bindings: HashMap<&'static str, ComponentBinding>,
 
@@ -88,6 +93,7 @@ impl ScriptContext {
             delta_time:          0.0,
             world_ptr:           None,
             deferred:            RefCell::new(Commands::new()),
+            deferred_spawns:     RefCell::new(Vec::new()),
             bindings:            HashMap::new(),
             entity_count_cache:  0,
         }
@@ -146,15 +152,10 @@ impl ScriptContext {
 
     /// Поставить в очередь запрос на создание entity.
     pub fn queue_spawn(&self, request: SpawnRequest) {
-        let mut deferred = self.deferred.borrow_mut();
-        // SpawnRequest → Command::Apply замыкание
-        // Мы не можем передать request напрямую в Commands::spawn_bundle
-        // т.к. не знаем типы статически. Используем raw-insert через binding.
-        // Это будет разрешено в apply_deferred с доступом к world и bindings.
-        deferred.add(move |_world: &mut World| {
-            // Placeholder — реальная логика в apply_deferred_requests
-            let _ = &request;
-        });
+        // Сохраняем запрос в отдельный буфер — Commands::add требует Send,
+        // а SpawnRequest содержит Rc (из rhai::Dynamic). Применение будет
+        // выполнено в apply_deferred_requests.
+        self.deferred_spawns.borrow_mut().push(request);
     }
 
     /// Поставить в очередь уничтожение entity.
@@ -166,10 +167,14 @@ impl ScriptContext {
     ///
     /// Вызывается `ScriptEngine::run()` после завершения скрипта.
     pub(crate) fn apply_deferred(&mut self) {
+        // Извлекаем deferred ДО вызова world_mut, чтобы избежать borrow conflict
+        let mut deferred = std::mem::take(&mut *self.deferred.borrow_mut());
         // SAFETY: apply_deferred вызывается только после того как скрипт
         // завершился и никаких borrow на world_ref больше нет.
         let world = unsafe { self.world_mut() };
-        self.deferred.borrow_mut().apply(world);
+        deferred.apply(world);
+        // Возвращаем очищенный Commands обратно (уже пустой после apply)
+        *self.deferred.borrow_mut() = deferred;
     }
 
     // ── Регистрация компонентов ────────────────────────────────

@@ -363,19 +363,25 @@ impl ScriptEngine {
 
         // Выполняем скрипт
         let result = if let Some(script) = self.scripts.get(&self.active_script) {
-            // Вызываем fn run() если она есть, иначе выполняем весь скрипт
-            let has_run_fn = script.ast.iter_fn_def().any(|f| f.name == "run");
-
-            if has_run_fn {
-                self.engine.call_fn::<()>(
-                    &mut rhai::Scope::new(),
-                    &script.ast,
-                    "run",
-                    (),
-                ).map_err(|e| ScriptError::runtime(&self.active_script, e))
-            } else {
-                self.engine.eval_ast::<()>(&script.ast)
-                    .map_err(|e| ScriptError::runtime(&self.active_script, e))
+            // Пытаемся вызвать fn run(). Если её нет — выполняем весь скрипт.
+            // iter_fn_def приватный, поэтому используем call_fn и проверяем ошибку.
+            let call_result = self.engine.call_fn::<()>(
+                &mut rhai::Scope::new(),
+                &script.ast,
+                "run",
+                (),
+            );
+            match call_result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Если функция не найдена — выполняем весь AST
+                    if matches!(e.as_ref(), rhai::EvalAltResult::ErrorFunctionNotFound(fn_name, _) if fn_name == "run") {
+                        self.engine.eval_ast::<()>(&script.ast)
+                            .map_err(|e| ScriptError::runtime(&self.active_script, e))
+                    } else {
+                        Err(ScriptError::runtime(&self.active_script, e))
+                    }
+                }
             }
         } else {
             log::warn!("ScriptEngine::run: активный скрипт '{}' не найден", self.active_script);
@@ -386,13 +392,21 @@ impl ScriptEngine {
             log::error!("ScriptEngine: ошибка выполнения: {}", e);
         }
 
-        // Сбрасываем world_ptr ДО apply — это важно для безопасности
-        // (clear_world_ptr делает его None, apply_deferred снова берёт &mut)
-        self.ctx.borrow_mut().clear_world_ptr();
-
         // Применяем отложенные despawn-команды
         // (spawn-запросы обрабатываются отдельно через apply_spawn_queue)
+        // ВАЖНО: apply_deferred вызывается ДО clear_world_ptr, т.к. внутри
+        // использует world_mut() который требует world_ptr.
         self.ctx.borrow_mut().apply_deferred();
+
+        // Сбрасываем world_ptr после применения всех deferred-команд
+        self.ctx.borrow_mut().clear_world_ptr();
+
+        // Перемещаем spawn-запросы из ScriptContext.deferred_spawns в self.spawn_queue
+        {
+            let ctx = self.ctx.borrow_mut();
+            let spawns = std::mem::take(&mut *ctx.deferred_spawns.borrow_mut());
+            self.spawn_queue.extend(spawns);
+        }
 
         // Применяем накопленные spawn-запросы
         // (извлекаем из ctx чтобы не держать borrow во время apply)

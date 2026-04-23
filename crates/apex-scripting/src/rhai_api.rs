@@ -38,6 +38,7 @@ pub fn register_globals(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
     register_despawn(engine, Rc::clone(&ctx));
 
     // Регистрируем итератор чтобы Rhai знал как итерировать RhaiQueryIter
+    // Примечание: register_iterator требует Clone + 'static для типа итератора.
     engine.register_iterator::<RhaiQueryIter>();
 }
 
@@ -63,9 +64,12 @@ fn register_entity_count(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
 // Возвращает RhaiQueryIter — итератор по entity с запрошенными компонентами.
 
 fn register_query(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
-    engine.register_fn("query", move |descs: rhai::Array| -> RhaiQueryIter {
+    // Используем register_fn с возвратом Dynamic, оборачивая RhaiQueryIter
+    // в Rc<RefCell<>> для удовлетворения требований RhaiNativeFunc.
+    engine.register_fn("query", move |descs: rhai::Array| -> Dynamic {
         let parsed = parse_query_descs(&descs);
-        RhaiQueryIter::new(Rc::clone(&ctx), parsed)
+        let iter = RhaiQueryIter::new(Rc::clone(&ctx), parsed);
+        Dynamic::from(iter)
     });
 }
 
@@ -75,9 +79,9 @@ fn register_query(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
 // Ставит в очередь SpawnRequest, применяется после скрипта.
 
 fn register_spawn(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
-    // Версия с Map компонентов: spawn(#{ position: Position(0.0, 0.0) })
+    // Версия с Map компонентов: spawn_entity(#{ position: Position(0.0, 0.0) })
     let ctx_map = Rc::clone(&ctx);
-    engine.register_fn("spawn", move |components: rhai::Map| -> Dynamic {
+    engine.register_fn("spawn_entity", move |components: rhai::Map| -> Dynamic {
         let request = crate::context::SpawnRequest {
             components: components
                 .into_iter()

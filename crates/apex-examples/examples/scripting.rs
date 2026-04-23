@@ -48,7 +48,7 @@ fn run() {
 
     // Спавн если мало entity
     if entity_count() < 5 {
-        spawn(#{
+        spawn_entity(#{
             position: Position(0.0, 0.0),
             velocity: Velocity(1.0, 0.5),
             health:   Health(100.0, 100.0),

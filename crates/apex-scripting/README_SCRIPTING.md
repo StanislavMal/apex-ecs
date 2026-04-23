@@ -70,7 +70,7 @@ fn run() {
 
     // Спавн новых entity
     if entity_count() < 100 {
-        spawn(#{
+        spawn_entity(#{
             position: Position(0.0, 0.0),
             velocity: Velocity(1.0, 0.5),
         });
@@ -107,9 +107,9 @@ fn run() {
 | Функция | Описание |
 |---|---|
 | `delta_time() → float` | Delta time текущего кадра |
-| `entity_count() → int` | Число живых entity |
+| `entity_count() → int` | Число живых entity (кешировано на момент `run()`) |
 | `query(descs) → iter` | Итератор entity с компонентами |
-| `spawn(map)` | Создать entity (отложено) |
+| `spawn_entity(map)` | Создать entity с компонентами (отложено) |
 | `spawn_empty()` | Создать пустую entity (отложено) |
 | `despawn(entity_idx)` | Уничтожить entity (отложено) |
 | `log(msg)` | Вывести в лог движка |
@@ -149,31 +149,31 @@ for entity in query(["Read:Position", "Write:Velocity"]) {
 
 При ошибке компиляции — старый скрипт продолжает работать, ошибка логируется.
 
-## Изменения в `apex-core`
+## Публичное API `apex-core`, используемое скриптингом
 
-Необходимо применить патчи:
+Скриптинг полагается на следующие публичные методы `apex-core`:
 
-### `world.rs` — добавить в конец
+### `World` (world.rs)
 
-```rust
-impl World {
-    pub fn archetypes(&self) -> &[Archetype] { &self.archetypes }
-    pub fn registry(&self) -> &ComponentRegistry { &self.registry }
-    pub fn entity_allocator(&self) -> &EntityAllocator { &self.entities }
-    pub fn component_id_by_name(&self, name: &str) -> Option<ComponentId> { ... }
-    pub fn insert_raw_pub(&mut self, entity, component_id, bytes, tick) { ... }
-}
-```
+| Метод | Описание |
+|---|---|
+| `archetypes() → &[Archetype]` | Доступ к архетипам для итерации |
+| `registry() → &ComponentRegistry` | Реестр компонентов для поиска по имени |
+| `entity_allocator() → &EntityAllocator` | Аллокатор entity для проверки живости |
+| `component_id_by_name(name) → Option<ComponentId>` | Поиск ComponentId по строковому имени |
+| `insert_raw_pub(entity, component_id, bytes, tick)` | Вставка компонента по сырым данным |
 
-### `archetype.rs` — добавить в `impl Archetype`
+### `Archetype` (archetype.rs)
 
-```rust
-pub fn columns_raw(&self) -> &[Column] { &self.columns }
-```
+| Метод | Описание |
+|---|---|
+| `columns_raw() → &[Column]` | Доступ к колонкам компонентов для чтения/записи |
+| `entity(row) → Entity` | Entity по индексу строки |
+| `len() → usize` | Количество живых entity в архетипе |
 
-Полные патчи в файлах:
-- `PATCH_apex-core_world.rs`
-- `PATCH_apex-core_archetype.rs`
+### `Column` (archetype.rs)
+
+`pub struct Column` — публичный тип, доступный из внешних крейтов.
 
 ## Архитектурные решения
 
@@ -189,10 +189,12 @@ Rhai без фичи `"sync"` — однопоточный. `Rc<RefCell<>>` до
 - `None` вне `run()` — любое обращение к world безопасно завершается ошибкой
 - `NonNull` внутри `run()` — явный `unsafe` при разыменовании сигнализирует о намерении
 
-### `Commands` для отложенных изменений
+### Два буфера для отложенных изменений
 
 Spawn/despawn из скрипта нельзя применять во время итерации по архетипам.
-Команды накапливаются в `Commands` и применяются после `engine.run()`.
+
+- **Despawn** — накапливается в `Commands` (требует `Send`), применяется через `apply_deferred()` после скрипта
+- **Spawn** — накапливается в `deferred_spawns: RefCell<Vec<SpawnRequest>>` (содержит `rhai::Dynamic` с `Rc`, не `Send`), перемещается в `ScriptEngine.spawn_queue` и применяется через `apply_spawn_queue()`
 
 ### `ScriptableField` для примитивов, `ScriptableRegistrar` для структур
 

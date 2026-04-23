@@ -14,7 +14,7 @@ impl ArchetypeId {
     pub const EMPTY: Self = Self(0);
 }
 
-pub(crate) struct Column {
+pub struct Column {
     pub(crate) component_id: ComponentId,
     pub(crate) data: *mut u8,
     pub(crate) item_size: usize,
