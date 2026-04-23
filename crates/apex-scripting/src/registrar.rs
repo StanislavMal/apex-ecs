@@ -3,6 +3,8 @@
 //! Обеспечивает двустороннее преобразование компонента в/из `rhai::Dynamic`
 //! и регистрацию конструктора в Rhai Engine.
 //!
+//! Также содержит `ResourceBinding` — для доступа к глобальным ресурсам из скриптов.
+//!
 //! # Ручная реализация
 //!
 //! ```ignore
@@ -69,4 +71,31 @@ pub trait ScriptableRegistrar: Sized + 'static {
     ///
     /// Вызывается один раз при `ScriptEngine::register_component::<T>()`.
     fn register_rhai_type(engine: &mut Engine);
+}
+
+// ── ResourceBinding ─────────────────────────────────────────────
+
+/// Информация о ресурсе, зарегистрированном для доступа из Rhai-скриптов.
+///
+/// Аналогичен `ComponentBinding`, но для глобальных ресурсов (`World.resources`).
+pub struct ResourceBinding {
+    /// Строковое имя типа ресурса.
+    pub name: &'static str,
+    /// Прочитать ресурс из `&World` → Dynamic.
+    /// Возвращает `None` если ресурс не найден.
+    pub read:   fn(&apex_core::World) -> Option<Dynamic>,
+    /// Записать ресурс в `&mut World` из Dynamic.
+    /// Возвращает `false` если тип неверен.
+    pub write:  fn(&mut apex_core::World, &Dynamic) -> bool,
+}
+
+// ── EventBinding ────────────────────────────────────────────────
+
+/// Информация о событии, зарегистрированном для отправки из Rhai-скриптов.
+pub struct EventBinding {
+    /// Строковое имя типа события.
+    pub name: &'static str,
+    /// Отправить событие в `&mut World` (принимает Dynamic, конвертирует в T).
+    /// Возвращает `false` если событие не зарегистрировано или тип неверен.
+    pub emit: fn(&mut apex_core::World, &Dynamic) -> bool,
 }

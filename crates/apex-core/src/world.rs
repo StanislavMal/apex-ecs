@@ -301,6 +301,17 @@ impl World {
         self.events.get_mut::<T>().send(event);
     }
 
+    /// Безопасная версия `send_event` — возвращает `false` если событие
+    /// не зарегистрировано (не вызван `add_event::<T>()`), вместо паники.
+    pub fn try_send_event<T: Send + Sync + 'static>(&mut self, event: T) -> bool {
+        if let Some(queue) = self.events.try_get_mut::<T>() {
+            queue.send(event);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
     ) -> Option<*mut crate::events::EventQueue<T>> {

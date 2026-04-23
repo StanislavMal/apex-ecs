@@ -438,6 +438,116 @@ fn run() {
     println!();
 
     // ═══════════════════════════════════════════════════════
+    // ТЕСТ 9: read_resource + write_resource
+    // ═══════════════════════════════════════════════════════
+
+    println!("─── Тест 9: read_resource + write_resource ───");
+
+    // Используем struct с именованными полями для Scriptable
+    #[derive(Clone, Debug, PartialEq, Scriptable)]
+    struct Gravity { value: f32 }
+
+    #[derive(Clone, Debug, PartialEq, Scriptable)]
+    struct Score { value: i64 }
+
+    let mut world = World::new();
+    world.resources.insert(Gravity { value: 9.8 });
+    world.resources.insert(Score { value: 0 });
+
+    let mut engine = ScriptEngine::new();
+    engine.register_resource::<Gravity>();
+    engine.register_resource::<Score>();
+
+    // Читаем ресурс через скрипт и проверяем что значение корректно
+    engine.load_script_str("read_res", r#"
+fn run() {
+    let g = read_resource("Gravity");
+    log(`Gravity = ${g}`);
+    // Проверяем что g — это Map и содержит поле value
+    // Если g — Map, то g.value вернёт значение, иначе ()
+    let val = g.value;
+    log(`val type = ${type_of(val)}`);
+    // Конвертируем val в целое число для записи в Score
+    // val — это f64 (9.8), конвертируем в i64 через to_int()
+    let score_val = val.to_int();
+    write_resource("Score", #{ value: score_val });
+}
+"#).expect("загрузка read_res");
+    engine.set_active("read_res").expect("set_active read_res");
+    engine.run(0.016, &mut world);
+    world.tick();
+
+    // Проверяем что read_resource вернул правильное значение Gravity (9.8)
+    let score = world.resources.get::<Score>();
+    // 9.8.to_int() = 9 (округление вниз)
+    if score.value == 9 {
+        println!("  ✅ read_resource: Gravity прочитан, value = 9.8 → Score = {}", score.value);
+    } else {
+        println!("  ❌ read_resource: Score = {}, ожидалось 9 (Gravity прочитан неверно)", score.value);
+        all_ok = false;
+    }
+
+    // Пишем ресурс через скрипт
+    engine.load_script_str("write_res", r#"
+fn run() {
+    write_resource("Score", #{ value: 100 });
+}
+"#).expect("загрузка write_res");
+    engine.set_active("write_res").expect("set_active write_res");
+    engine.run(0.016, &mut world);
+    world.tick();
+
+    // Проверяем что Score изменился
+    let score = world.resources.get::<Score>();
+    if score.value == 100 {
+        println!("  ✅ write_resource: Score изменён на 100");
+    } else {
+        println!("  ❌ write_resource: Score = {}, ожидалось 100", score.value);
+        all_ok = false;
+    }
+    println!();
+
+    // ═══════════════════════════════════════════════════════
+    // ТЕСТ 10: emit_event
+    // ═══════════════════════════════════════════════════════
+
+    println!("─── Тест 10: emit_event ───");
+
+    #[derive(Clone, Debug, PartialEq, Scriptable)]
+    struct PlayerDied { x: f32, y: f32 }
+
+    let mut world = World::new();
+    world.add_event::<PlayerDied>();
+
+    let mut engine = ScriptEngine::new();
+    engine.register_event::<PlayerDied>();
+
+    engine.load_script_str("emit", r#"
+fn run() {
+    emit_event("PlayerDied", #{ x: 10.0, y: 20.0 });
+}
+"#).expect("загрузка emit");
+    engine.set_active("emit").expect("set_active emit");
+    engine.run(0.016, &mut world);
+
+    // Проверяем что событие дошло (ДО tick, т.к. tick перемещает current→previous)
+    let count = world.events::<PlayerDied>().iter_current().count();
+    if count == 1 {
+        let event = world.events::<PlayerDied>().iter_current().next().unwrap();
+        if (event.x - 10.0).abs() < 0.001 && (event.y - 20.0).abs() < 0.001 {
+            println!("  ✅ emit_event: событие PlayerDied отправлено и получено");
+        } else {
+            println!("  ❌ emit_event: данные события неверны: ({}, {})", event.x, event.y);
+            all_ok = false;
+        }
+    } else {
+        println!("  ❌ emit_event: получено {} событий (ожидалось 1)", count);
+        all_ok = false;
+    }
+    world.tick();
+    println!();
+
+    // ═══════════════════════════════════════════════════════
     // ИТОГ
     // ═══════════════════════════════════════════════════════
 

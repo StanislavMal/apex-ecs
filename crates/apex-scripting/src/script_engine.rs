@@ -40,7 +40,7 @@ use std::{
 };
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use rhai::{Engine, AST};
+use rhai::{Dynamic, Engine, AST};
 
 use apex_core::{
     component::ComponentId,
@@ -50,7 +50,7 @@ use apex_core::{
 use crate::{
     context::{ComponentBinding, ScriptContext, SpawnRequest},
     error::ScriptError,
-    registrar::ScriptableRegistrar,
+    registrar::{EventBinding, ResourceBinding, ScriptableRegistrar},
     rhai_api,
 };
 
@@ -254,6 +254,91 @@ impl ScriptEngine {
         log::debug!("ScriptEngine: зарегистрирован компонент '{}'", T::type_name_str());
     }
 
+    // ── Регистрация ресурсов ───────────────────────────────────
+
+    /// Зарегистрировать ресурс T для доступа из скриптов.
+    ///
+    /// После регистрации:
+    /// - `read_resource("TypeName")` возвращает Dynamic Map с полями
+    /// - `write_resource("TypeName", value)` записывает ресурс
+    ///
+    /// # Пример
+    ///
+    /// ```ignore
+    /// world.resources.insert(Gravity(9.8));
+    /// engine.register_resource::<Gravity>();
+    /// ```
+    pub fn register_resource<T>(&mut self)
+    where
+        T: ScriptableRegistrar + Send + Sync,
+    {
+        let binding = ResourceBinding {
+            name: T::type_name_str(),
+            read: |world: &World| -> Option<Dynamic> {
+                let res = world.resources.try_get::<T>()?;
+                Some(res.to_dynamic())
+            },
+            write: |world: &mut World, value: &Dynamic| -> bool {
+                if let Some(new_val) = T::from_dynamic(value) {
+                    world.resources.insert(new_val);
+                    true
+                } else {
+                    log::warn!(
+                        "write_resource: не удалось конвертировать Dynamic в {}",
+                        T::type_name_str()
+                    );
+                    false
+                }
+            },
+        };
+        self.ctx.borrow_mut().add_resource_binding(binding);
+        log::debug!("ScriptEngine: зарегистрирован ресурс '{}'", T::type_name_str());
+    }
+
+    // ── Регистрация событий ────────────────────────────────────
+
+    /// Зарегистрировать событие T для отправки из скриптов.
+    ///
+    /// После регистрации:
+    /// - `emit_event("TypeName", value)` отправляет событие
+    ///
+    /// # Пример
+    ///
+    /// ```ignore
+    /// world.add_event::<PlayerDied>();
+    /// engine.register_event::<PlayerDied>();
+    /// ```
+    pub fn register_event<T>(&mut self)
+    where
+        T: ScriptableRegistrar + Send + Sync,
+    {
+        let binding = EventBinding {
+            name: T::type_name_str(),
+            emit: |world: &mut World, value: &Dynamic| -> bool {
+                if let Some(event) = T::from_dynamic(value) {
+                    if world.try_send_event(event) {
+                        true
+                    } else {
+                        log::warn!(
+                            "emit_event: событие '{}' не зарегистрировано в world (вызовите world.add_event::<{}>())",
+                            T::type_name_str(),
+                            T::type_name_str(),
+                        );
+                        false
+                    }
+                } else {
+                    log::warn!(
+                        "emit_event: не удалось конвертировать Dynamic в {}",
+                        T::type_name_str()
+                    );
+                    false
+                }
+            },
+        };
+        self.ctx.borrow_mut().add_event_binding(binding);
+        log::debug!("ScriptEngine: зарегистрировано событие '{}'", T::type_name_str());
+    }
+
     // ── Загрузка скриптов ──────────────────────────────────────
 
     /// Загрузить и скомпилировать все `.rhai` файлы из директории скриптов.
@@ -397,6 +482,11 @@ impl ScriptEngine {
         // ВАЖНО: apply_deferred вызывается ДО clear_world_ptr, т.к. внутри
         // использует world_mut() который требует world_ptr.
         self.ctx.borrow_mut().apply_deferred();
+
+        // Применяем отложенные записи ресурсов и отправки событий
+        // (буферизированы чтобы избежать RefCell double-borrow при вызове
+        // write_resource/emit_event внутри query()-итерации)
+        self.ctx.borrow_mut().apply_deferred_resources_and_events();
 
         // Сбрасываем world_ptr после применения всех deferred-команд
         self.ctx.borrow_mut().clear_world_ptr();

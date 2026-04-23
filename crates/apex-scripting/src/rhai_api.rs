@@ -1,5 +1,5 @@
 //! Регистрация глобальных Rhai-функций: `delta_time`, `entity_count`,
-//! `query`, `spawn`, `despawn`.
+//! `query`, `spawn`, `despawn`, `read_resource`, `write_resource`, `emit_event`.
 //!
 //! Все функции захватывают `Rc<RefCell<ScriptContext>>` и работают
 //! с миром через него в пределах вызова `ScriptEngine::run()`.
@@ -36,6 +36,8 @@ pub fn register_globals(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
     register_query(engine, Rc::clone(&ctx));
     register_spawn(engine, Rc::clone(&ctx));
     register_despawn(engine, Rc::clone(&ctx));
+    register_resource_api(engine, Rc::clone(&ctx));
+    register_event_api(engine, Rc::clone(&ctx));
 
     // Регистрируем итератор чтобы Rhai знал как итерировать RhaiQueryIter
     // Примечание: register_iterator требует Clone + 'static для типа итератора.
@@ -130,5 +132,38 @@ pub fn register_log(engine: &mut Engine) {
     engine.on_print(|msg| log::info!("[script] {}", msg));
     engine.on_debug(|msg, src, pos| {
         log::debug!("[script] {}:{} — {}", src.unwrap_or("?"), pos, msg);
+    });
+}
+
+// ── read_resource(name) / write_resource(name, value) ──────────
+
+/// Зарегистрировать `read_resource(type_name)` и `write_resource(type_name, value)`.
+fn register_resource_api(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
+    let ctx_read = Rc::clone(&ctx);
+    engine.register_fn("read_resource", move |type_name: rhai::ImmutableString| -> Dynamic {
+        let ctx = ctx_read.borrow();
+        match ctx.read_resource(type_name.as_str()) {
+            Some(val) => val,
+            None => {
+                log::warn!("read_resource: ресурс '{}' не найден", type_name);
+                Dynamic::UNIT
+            }
+        }
+    });
+
+    let ctx_write = Rc::clone(&ctx);
+    engine.register_fn("write_resource", move |type_name: rhai::ImmutableString, value: Dynamic| {
+        let ctx = ctx_write.borrow();
+        ctx.write_resource(type_name.as_str(), &value);
+    });
+}
+
+// ── emit_event(name, value) ────────────────────────────────────
+
+/// Зарегистрировать `emit_event(type_name, value)`.
+fn register_event_api(engine: &mut Engine, ctx: Rc<RefCell<ScriptContext>>) {
+    engine.register_fn("emit_event", move |type_name: rhai::ImmutableString, value: Dynamic| {
+        let ctx = ctx.borrow();
+        ctx.emit_event(type_name.as_str(), &value);
     });
 }
