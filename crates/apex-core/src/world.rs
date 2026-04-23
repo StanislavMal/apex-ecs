@@ -1074,3 +1074,63 @@ impl<'w> EntityBuilder<'w> {
 
     pub fn id(self) -> Entity { self.entity }
 }
+
+// ── Scripting API ──────────────────────────────────────────────────────────
+//
+// Публичные accessor'ы для apex-scripting.
+// Отделены от основного impl World чтобы было ясно: это внешний API,
+// не внутренняя логика мира.
+ 
+impl World {
+    /// Срез всех архетипов мира — для итерации в query.
+    ///
+    /// Используется `RhaiQueryIter` для обхода компонентов.
+    /// Вызывающий не должен мутировать архетипы напрямую.
+    #[inline]
+    pub fn archetypes(&self) -> &[crate::archetype::Archetype] {
+        &self.archetypes
+    }
+ 
+    /// Доступ к реестру компонентов — для поиска ComponentId по типу.
+    ///
+    /// Используется `ScriptEngine::register_component::<T>()`.
+    #[inline]
+    pub fn registry(&self) -> &crate::component::ComponentRegistry {
+        &self.registry
+    }
+ 
+    /// Доступ к аллокатору entity — для получения Entity по index.
+    ///
+    /// Используется `despawn()` из Rhai-скриптов.
+    #[inline]
+    pub fn entity_allocator(&self) -> &crate::entity::EntityAllocator {
+        &self.entities
+    }
+ 
+    /// Вставить компонент по сырым байтам и ComponentId.
+    ///
+    /// Используется `WorldSerializer::restore` и `apply_deferred_spawns`.
+    /// Метод уже существует как `pub(crate)` — делаем его `pub`.
+    ///
+    /// # Safety
+    /// `component_bytes` должны содержать корректно выровненный T,
+    /// соответствующий `component_id`.
+    pub fn insert_raw_pub(
+        &mut self,
+        entity:         crate::entity::Entity,
+        component_id:   crate::component::ComponentId,
+        component_bytes: Vec<u8>,
+        tick:           crate::component::Tick,
+    ) {
+        self.insert_raw(entity, component_id, component_bytes, tick);
+    }
+ 
+    /// Получить ComponentId по строковому имени типа.
+    ///
+    /// Используется `apex-scripting` для разрешения имён из скриптов.
+    /// Поиск линейный (O(N) по числу зарегистрированных компонентов),
+    /// но вызывается только при инициализации движка — не в hot path.
+    pub fn component_id_by_name(&self, name: &str) -> Option<crate::component::ComponentId> {
+        self.registry.iter().find(|info| info.name == name).map(|i| i.id)
+    }
+}

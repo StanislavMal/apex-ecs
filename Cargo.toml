@@ -8,6 +8,8 @@ members = [
     "crates/apex-hot-reload",
     "crates/apex-examples",
     "crates/apex-bench",
+    "crates/apex-macros",
+    "crates/apex-scripting",
 ]
 
 [workspace.package]
@@ -38,9 +40,12 @@ log = "0.4"
 # Ошибки
 thiserror = "1.0"
 
-# Сериализация (новое)
+# Сериализация
 serde     = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Скриптинг — однопоточный Rhai (без "sync" feature, используем Rc<RefCell>)
+rhai = { version = "1.19", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

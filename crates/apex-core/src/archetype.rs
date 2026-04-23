@@ -291,9 +291,24 @@ impl Archetype {
         }
     }
 
+    /// Публичный итератор колонок через ColumnView (безопасный, без raw).
     pub fn columns(&self) -> impl Iterator<Item = ColumnView<'_>> {
         self.columns.iter().map(|col| ColumnView { col })
     }
+
+    /// Сырой срез колонок — для apex-scripting query-итератора.
+    ///
+    /// # Safety
+    /// Вызывающий должен гарантировать что:
+    /// - Нет concurrent structural changes во время итерации
+    /// - Индексы row не выходят за пределы col.len
+    ///
+    /// Используется только `RhaiQueryIter` в однопоточном контексте.
+    #[inline]
+    pub fn columns_raw(&self) -> &[Column] {
+        &self.columns
+    }
+
     pub fn entities(&self) -> &[Entity] { &self.entities }
 }
 
