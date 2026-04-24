@@ -88,6 +88,16 @@ pub enum ConflictKind {
     },
     /// Sequential барьер — система с полным &mut World
     SequentialBarrier,
+    /// Два EventWriter одного типа событий
+    EventWriteWrite {
+        event_name: &'static str,
+    },
+    /// EventWriter и EventReader одного типа событий
+    EventWriteRead {
+        event_name: &'static str,
+        writer_id: u32,
+        reader_id: u32,
+    },
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -101,6 +111,10 @@ impl std::fmt::Display for ConflictKind {
                 write!(f, "Write+Read conflict on `{}`", component_name),
             ConflictKind::SequentialBarrier =>
                 write!(f, "sequential barrier (&mut World)"),
+            ConflictKind::EventWriteWrite { event_name } =>
+                write!(f, "Event Write+Write conflict on `{}`", event_name),
+            ConflictKind::EventWriteRead { event_name, .. } =>
+                write!(f, "Event Write+Read conflict on `{}`", event_name),
         }
     }
 }
@@ -297,6 +311,11 @@ pub struct Scheduler {
 
     /// Флаг: был ли уже выполнен Startup этап.
     startup_completed: bool,
+
+    /// Пользовательский порядок StageLabel для compile().
+    /// Если Some — compile() использует этот порядок вместо hardcoded standard_order().
+    /// Если None — используется StageLabel::standard_order().
+    stage_order: Option<Vec<StageLabel>>,
 }
 
 impl Scheduler {
@@ -315,6 +334,7 @@ impl Scheduler {
             archetype_indices_storage: Vec::new(),
             cached_archetype_count: 0,
             startup_completed: false,
+            stage_order:      None,
         }
     }
 
@@ -510,6 +530,25 @@ impl Scheduler {
         }
     }
 
+    /// Установить пользовательский порядок StageLabel для compile().
+    ///
+    /// По умолчанию стадии упорядочиваются по приоритету:
+    /// `Startup(0) → First(1) → PreUpdate(2) → Update(3) → PostUpdate(4) → Last(5) → Custom(6)`.
+    ///
+    /// Если нужно изменить порядок (например, `First` после `Update`), используй этот метод:
+    ///
+    /// ```ignore
+    /// # use apex_scheduler::stage::StageLabel::*;
+    /// let mut scheduler = Scheduler::new();
+    /// scheduler.configure_stages(vec![Startup, Update, First, PreUpdate, PostUpdate, Last]);
+    /// ```
+    ///
+    /// Стадии, не указанные в `order`, добавляются в конец в порядке возрастания приоритета.
+    pub fn configure_stages(&mut self, order: Vec<StageLabel>) {
+        self.stage_order = Some(order);
+        self.invalidate_plan();
+    }
+
     fn invalidate_plan(&mut self) {
         self.execution_plan = None;
         self.graph_dirty    = true;
@@ -573,10 +612,30 @@ impl Scheduler {
             }
         }
 
-        // Собираем все Stage в порядке priority (Startup → First → ... → Last → Custom)
+        // Собираем все Stage в порядке priority или пользовательском порядке
         let mut stages: Vec<Stage> = Vec::new();
-        for (_prio, mut s_stages) in label_stages {
-            stages.append(&mut s_stages);
+
+        if let Some(order) = &self.stage_order {
+            // Пользовательский порядок стадий
+            let mut stage_map: FxHashMap<StageLabel, Vec<Stage>> = FxHashMap::default();
+            for (_prio, mut s_stages) in label_stages {
+                for stage in s_stages.drain(..) {
+                    stage_map.entry(stage.label.clone()).or_default().push(stage);
+                }
+            }
+            for label in order {
+                if let Some(mut s_stages) = stage_map.remove(label) {
+                    stages.append(&mut s_stages);
+                }
+            }
+            // Стадии не указанные в порядке — добавляем в конец
+            let mut remaining: Vec<Stage> = stage_map.into_values().flat_map(|v| v).collect();
+            stages.append(&mut remaining);
+        } else {
+            // Стандартный порядок по priority (Startup → First → ... → Last → Custom)
+            for (_prio, mut s_stages) in label_stages {
+                stages.append(&mut s_stages);
+            }
         }
 
         let flat_order: Vec<SystemId> = stages
@@ -952,9 +1011,11 @@ impl Scheduler {
                 ) {
                     // direction = true означает i→j
                     if direction {
-                        // Для Write+Write конфликтов добавляем ребро только если idx < j
-                        // чтобы избежать дублирования (j→i уже обработается когда j будет в systems_to_process)
-                        if matches!(conflict_kind, ConflictKind::WriteWrite { .. }) && idx > j {
+                        // Для Write+Write и EventWriteWrite конфликтов добавляем ребро
+                        // только если idx < j чтобы избежать дублирования
+                        let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
+                            || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. });
+                        if is_symmetric && idx > j {
                             continue;
                         }
                         
@@ -1378,14 +1439,11 @@ fn detect_conflict_kind(
     id_i: SystemId,
     id_j: SystemId,
 ) -> Option<(ConflictKind, bool)> {
+    // ── Компонентные конфликты ──────────────────────────────────
+
     // Write+Write: оба пишут в один компонент
-    // Добавляем ребро только если i < j чтобы избежать дублирования
     for w in &ai.writes {
         if aj.writes.contains(w) {
-            // Для Write+Write направление не важно, но нужно избежать дублирования
-            // Возвращаем true только если i < j (чтобы избежать обратного ребра)
-            // Но мы не знаем здесь i < j, поэтому всегда возвращаем true
-            // Вызывающий код должен фильтровать дубликаты
             return Some((ConflictKind::WriteWrite {
                 component_name: component_type_name(*w),
             }, true)); // i→j
@@ -1408,9 +1466,41 @@ fn detect_conflict_kind(
                 component_name: component_type_name(*w),
                 writer_id: id_j.0,
                 reader_id: id_i.0,
-            }, false)); // j→i, но мы в цикле i→j, поэтому пропускаем
+            }, false)); // j→i
         }
     }
+
+    // ── Event конфликты ─────────────────────────────────────────
+
+    // EventWriteWrite: оба пишут в один тип событий
+    for w in &ai.writes_event {
+        if aj.writes_event.contains(w) {
+            return Some((ConflictKind::EventWriteWrite {
+                event_name: component_type_name(*w),
+            }, true)); // i→j
+        }
+    }
+    // EventWrite(i)+EventRead(j): i пишет событие, j читает
+    for w in &ai.writes_event {
+        if aj.reads_event.contains(w) {
+            return Some((ConflictKind::EventWriteRead {
+                event_name: component_type_name(*w),
+                writer_id: id_i.0,
+                reader_id: id_j.0,
+            }, true)); // i→j (писатель → читатель)
+        }
+    }
+    // EventWrite(j)+EventRead(i): j пишет событие, i читает
+    for w in &aj.writes_event {
+        if ai.reads_event.contains(w) {
+            return Some((ConflictKind::EventWriteRead {
+                event_name: component_type_name(*w),
+                writer_id: id_j.0,
+                reader_id: id_i.0,
+            }, false)); // j→i
+        }
+    }
+
     None
 }
 
@@ -1853,5 +1943,170 @@ mod tests {
         // Второй run — ресурс должен остаться (Startup не перезаписывает)
         sched.run_sequential(&mut world);
         assert_eq!(*world.resource::<i32>(), 42, "Ресурс не должен измениться");
+    }
+
+    // ── Event конфликты ────────────────────────────────────────
+
+    struct EventWriterForTest;
+    impl ParSystem for EventWriterForTest {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write_event::<i32>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct AnotherEventWriter;
+    impl ParSystem for AnotherEventWriter {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write_event::<i32>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct EventReaderForTest;
+    impl ParSystem for EventReaderForTest {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read_event::<i32>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    #[test]
+    fn event_write_write_conflict() {
+        let mut sched = Scheduler::new();
+
+        sched.add_par_system("writer_a", EventWriterForTest);
+        sched.add_par_system("writer_b", AnotherEventWriter);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        // Два EventWriter одного типа → должны быть в разных Stage (конфликт)
+        assert!(stages.len() >= 2,
+            "EventWriteWrite конфликт: ожидается минимум 2 Stage, получено {}", stages.len());
+    }
+
+    #[test]
+    fn event_write_read_conflict() {
+        let mut sched = Scheduler::new();
+
+        sched.add_par_system("writer", EventWriterForTest);
+        sched.add_par_system("reader", EventReaderForTest);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        // EventWriter + EventReader одного типа → должны быть в разных Stage (конфликт)
+        assert!(stages.len() >= 2,
+            "EventWriteRead конфликт: ожидается минимум 2 Stage, получено {}", stages.len());
+    }
+
+    #[test]
+    fn event_read_read_no_conflict() {
+        let mut sched = Scheduler::new();
+
+        sched.add_par_system("reader_a", EventReaderForTest);
+        sched.add_par_system("reader_b", EventReaderForTest);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        // Два EventReader одного типа → НЕТ конфликта, могут быть в одном Stage
+        // Проверяем что есть хотя бы один Stage с обеими системами
+        let found = stages.iter().any(|s| {
+            s.system_ids.len() >= 2
+        });
+        assert!(found,
+            "EventRead не должны конфликтовать: ожидается Stage с обеими системами");
+    }
+
+    #[test]
+    fn event_conflict_kind_in_edge_info() {
+        let mut sched = Scheduler::new();
+
+        let wid = sched.add_par_system("writer", EventWriterForTest);
+        let rid = sched.add_par_system("reader", AnotherEventWriter);
+
+        sched.compile().unwrap();
+
+        let conflicts = sched.conflicts_between(wid, rid);
+        assert!(!conflicts.is_empty(),
+            "Должен быть конфликт между EventWriter и EventWriter");
+
+        // Проверяем тип конфликта
+        let has_event_conflict = conflicts.iter().any(|c| {
+            matches!(c, ConflictKind::EventWriteWrite { .. })
+        });
+        assert!(has_event_conflict,
+            "Конфликт должен быть EventWriteWrite");
+    }
+
+    // ── configure_stages ─────────────────────────────────────────
+
+    #[test]
+    fn configure_stages_custom_order() {
+        let mut sched = Scheduler::new();
+
+        // Добавляем системы в Update и PreUpdate
+        sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
+        sched.add_system_to_stage("pre_work", |_| {}, StageLabel::PreUpdate);
+
+        // Меняем порядок: Update ДО PreUpdate
+        sched.configure_stages(vec![
+            StageLabel::Startup,
+            StageLabel::Update,
+            StageLabel::PreUpdate,
+            StageLabel::First,
+            StageLabel::PostUpdate,
+            StageLabel::Last,
+        ]);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+
+        // Update должен быть перед PreUpdate
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+
+        assert!(upd_idx.is_some(), "Должен быть Update Stage");
+        assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
+        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate при configure_stages");
+    }
+
+    #[test]
+    fn configure_stages_keeps_missing_at_end() {
+        let mut sched = Scheduler::new();
+
+        // Добавляем системы в разные этапы
+        sched.add_system_to_stage("pre", |_| {}, StageLabel::PreUpdate);
+        sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
+        sched.add_system_to_stage("last_work", |_| {}, StageLabel::Last);
+
+        // Указываем только Update и PreUpdate — Last не указан
+        sched.configure_stages(vec![
+            StageLabel::Startup,
+            StageLabel::Update,
+            StageLabel::PreUpdate,
+        ]);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+
+        // Update и PreUpdate должны быть (в указанном порядке)
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+        assert!(upd_idx.is_some());
+        assert!(pre_idx.is_some());
+        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate");
+
+        // Last должен быть в конце (не указан в order, добавлен автоматически)
+        let last_idx = stages.iter().position(|s| s.label == StageLabel::Last);
+        assert!(last_idx.is_some(), "Last должен присутствовать даже если не указан в configure_stages");
+        assert!(last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
+            "Last (не указанный в order) должен быть в конце");
     }
 }

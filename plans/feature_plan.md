@@ -70,9 +70,14 @@ graph TB
 - `EventRegistry::update_all()` — процессинг задержанных (перенос в current buffer при наступлении tick)
 - `flush_delayed()` — интеграция с `Tick`
 
-#### Шаг 1.4: Подписки на типы событий с контролем порядка ❌
+#### Шаг 1.4: Event конфликты через AccessDescriptor ✅
 
-> **Не реализовано.** Пункт описывал интеграцию с Scheduler через `AccessDescriptor` (система декларирует `reads_events::<MyEvent>()`, планировщик строит граф зависимостей между читателями). Отложено до необходимости.
+- В [`AccessDescriptor`](crates/apex-core/src/access.rs:160-163) добавлены поля `reads_event: Vec<TypeId>` и `writes_event: Vec<TypeId>`
+- Методы [`read_event<T>()`](crates/apex-core/src/access.rs:188) и [`write_event<T>()`](crates/apex-core/src/access.rs:195) — декларация доступа к событиям
+- В [`ConflictKind`](crates/apex-scheduler/src/lib.rs:92-100) добавлены варианты `EventWriteWrite` и `EventWriteRead`
+- [`detect_conflict_kind()`](crates/apex-scheduler/src/lib.rs:1437-1463) проверяет event-конфликты наравне с компонентными
+- Правила: два EventWriter → конфликт (WriteWrite), EventWriter + EventReader → конфликт (WriteRead), два EventReader → нет конфликта
+- 4 теста: `event_write_write_conflict`, `event_write_read_conflict`, `event_read_read_no_conflict`, `event_conflict_kind_in_edge_info`
 
 ### Тесты для фичи 1
 
@@ -162,10 +167,13 @@ graph TB
 - Системы регистрируются с меткой этапа: `sched.add_system_to_stage(StageLabel::Update, "move", move_system)`
 - Каждый этап может содержать несколько систем, выполняющихся параллельно
 
-#### Шаг 3.2: `StageConfig` — конфигурация этапов ⚠️ ЧАСТИЧНО
+#### Шаг 3.2: `configure_stages()` — пользовательский порядок StageLabel ✅
 
-- ✅ Добавлен `StageLabel::Custom(&'static str)` для кастомных этапов
-- ❌ `configure_stages()` для переопределения порядка не реализован — порядок фиксирован в `StageLabel::standard_order()`
+- В [`Scheduler`](crates/apex-scheduler/src/lib.rs:314) добавлено поле `stage_order: Option<Vec<StageLabel>>`
+- Метод [`configure_stages(order: Vec<StageLabel>)`](crates/apex-scheduler/src/lib.rs:535) — переопределение порядка этапов
+- [`compile()`](crates/apex-scheduler/src/lib.rs:548) использует `stage_order` если задан, иначе `StageLabel::standard_order()` (как было)
+- Стадии, не указанные в `order`, добавляются в конец автоматически
+- 2 теста: `configure_stages_custom_order`, `configure_stages_keeps_missing_at_end`
 
 #### Шаг 3.3: Startup-этап ✅
 

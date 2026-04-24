@@ -140,17 +140,27 @@ impl ArchetypeMask {
 /// Декларация Read/Write доступа системы к данным мира.
 ///
 /// Использует два уровня представления:
-/// - `TypeId` вектора — для регистрации компонентов (до первого compile)
+/// - `TypeId` вектора — для регистрации компонентов/событий (до первого compile)
 /// - `ComponentMask` — для O(1) проверки конфликтов после назначения индексов
 ///
 /// Правила конфликтов — аналог Rust borrow checker:
 /// - Write + Read  → конфликт
 /// - Write + Write → конфликт
 /// - Read  + Read  → нет конфликта (параллельны)
+///
+/// Также поддерживает декларацию доступа к событиям (events):
+/// - `read_event<T>()` / `write_event<T>()` — декларация чтения/записи событий
+/// - Два писателя одного типа событий конфликтуют (WriteWrite)
+/// - Писатель и читатель одного типа событий конфликтуют (WriteRead)
+/// - Два читателя одного типа событий — НЕ конфликтуют
 #[derive(Default, Clone, Debug)]
 pub struct AccessDescriptor {
     pub reads:  Vec<TypeId>,
     pub writes: Vec<TypeId>,
+    /// Типы событий, которые система читает.
+    pub reads_event:  Vec<TypeId>,
+    /// Типы событий, которые система пишет.
+    pub writes_event: Vec<TypeId>,
     /// Битовые маски — заполняются планировщиком через `assign_masks`.
     pub read_mask:  ComponentMask,
     pub write_mask: ComponentMask,
@@ -174,9 +184,25 @@ impl AccessDescriptor {
         self
     }
 
+    /// Декларировать чтение событий типа T.
+    pub fn read_event<T: 'static>(mut self) -> Self {
+        let tid = TypeId::of::<T>();
+        if !self.reads_event.contains(&tid) { self.reads_event.push(tid); }
+        self
+    }
+
+    /// Декларировать запись событий типа T.
+    pub fn write_event<T: 'static>(mut self) -> Self {
+        let tid = TypeId::of::<T>();
+        if !self.writes_event.contains(&tid) { self.writes_event.push(tid); }
+        self
+    }
+
     pub fn merge(mut self, other: &AccessDescriptor) -> Self {
         for &tid in &other.reads  { if !self.reads.contains(&tid)  { self.reads.push(tid);  } }
         for &tid in &other.writes { if !self.writes.contains(&tid) { self.writes.push(tid); } }
+        for &tid in &other.reads_event  { if !self.reads_event.contains(&tid)  { self.reads_event.push(tid);  } }
+        for &tid in &other.writes_event { if !self.writes_event.contains(&tid) { self.writes_event.push(tid); } }
         // Маски сливаем битовым OR
         self.read_mask  = self.read_mask.or(&other.read_mask);
         self.write_mask = self.write_mask.or(&other.write_mask);
@@ -228,5 +254,6 @@ impl AccessDescriptor {
 
     pub fn is_empty(&self) -> bool {
         self.reads.is_empty() && self.writes.is_empty()
+            && self.reads_event.is_empty() && self.writes_event.is_empty()
     }
 }
