@@ -35,9 +35,10 @@
 - **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon
 - **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>` работают без overhead
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи закодированы как компоненты
-- **Сериализация мира** — снэпшот/восстановление состояния через JSON
+- **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
 - **Batch API** — `spawn_many` создаёт тысячи entity за один проход
+> **Версия 0.1.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
 ### 1.2 Структура крейтов
 
 | Крейт | Назначение |
@@ -53,7 +54,9 @@
 
 ### 1.3 Установка
 
-Добавьте зависимости в `Cargo.toml` вашего проекта:
+Крейты **ещё не опубликованы на crates.io** (версия 0.1.0). Используйте один из способов ниже.
+
+**Вариант A — локальный путь (разработка):**
 
 ```toml
 [dependencies]
@@ -69,6 +72,24 @@ apex-isolated      = { path = "path/to/apex-ecs/crates/apex-isolated" }
 [features]
 parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 ```
+
+**Вариант B — git-зависимость (потребитель):**
+
+```toml
+[dependencies]
+apex-core          = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-scheduler     = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-serialization = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-hot-reload    = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-macros        = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-scripting     = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-isolated      = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+
+[features]
+parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
+```
+
+> **Минимальная версия Rust:** 2021 Edition. Функция `parallel` требует включения соответствующего feature-флага — без неё планировщик работает в последовательном режиме.
 
 ---
 
@@ -201,6 +222,33 @@ Archetype [Position, Velocity, Health]
 ### 3.2 Граф переходов архетипов
 
 Каждый архетип хранит карту переходов: при добавлении компонента A — в какой архетип перейти, при удалении A — в какой вернуться.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "empty" as empty
+    state "[Position]" as p
+    state "[Position, Velocity]" as pv
+    state "[Position, Health]" as ph
+    state "[Position, Velocity, Health]" as pvh
+
+    empty --> p : add Position
+    p --> empty : remove Position
+    p --> pv : add Velocity
+    pv --> p : remove Velocity
+    p --> ph : add Health
+    ph --> p : remove Health
+    pv --> pvh : add Health
+    pvh --> pv : remove Health
+    ph --> pvh : add Velocity
+    pvh --> ph : remove Velocity
+
+    note right of p
+        add_edges / remove_edges кеш
+        обеспечивает O(1) поиск
+        целевого архетипа
+    end note
+```
 
 ```rust
 // Внутренняя логика (для понимания):
@@ -600,6 +648,8 @@ cmds.add(|world: &mut World| { /* произвольная команда */ });
 
 > **Совет:** `Commands::with_capacity(n)` — предаллоцирует буфер для `n` команд. Используйте, когда заранее знаете примерное количество команд.
 
+> **Параллелизм:** В параллельных системах (см. [раздел 13](#13-параллелизм)) каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. Два `despawn()` одного entity — второй вызов будет no-op. `Commands` не должен пересекать границу параллельного вызова — применяйте `cmds.apply()` после завершения параллельного блока.
+
 ### 7.2 DeferredQueue
 
 `DeferredQueue` работает с raw `ComponentId` — используется в системах, где тип компонента неизвестен статически.
@@ -831,12 +881,43 @@ println!("entities: {}", snapshot.entities.len());
 println!("relations: {}", snapshot.relations.len());
 ```
 
+#### 10.2.1 Бинарный формат (bincode)
+
+Помимо JSON, снэпшоты поддерживают бинарную сериализацию через `bincode`. Бинарный формат компактнее и быстрее — используйте его для production save/load:
+
+```rust
+// Сериализовать в bincode:
+let binary = snapshot.to_binary().expect("bincode failed");
+std::fs::write("savegame.bin", &binary).unwrap();
+
+// Загрузить из bincode:
+let data = std::fs::read("savegame.bin").unwrap();
+let restored = WorldSnapshot::from_binary(&data).expect("invalid binary save");
+```
+
+Также доступен универсальный метод `WorldSerializer::write_to_file()`, который определяет формат по расширению:
+
+```rust
+// Сохранение — явное указание формата:
+WorldSerializer::write_to_file("savegame.json", &snapshot, apex_serialization::snapshot::SaveFormat::Json).unwrap();
+WorldSerializer::write_to_file("savegame.bin", &snapshot, apex_serialization::snapshot::SaveFormat::Bincode).unwrap();
+
+// Загрузка — авто-определение по расширению:
+let loaded = WorldSerializer::read_from_file("savegame.json").unwrap();
+```
+
+> **Сравнение размеров** (на тестовом датасете): JSON ~1.8 MB, bincode ~1.2 MB. Разница особенно заметна при большом количестве entity.
+
 ### 10.3 Загрузка
 
 ```rust
-// Прочитать с диска:
+// Прочитать с диска (JSON):
 let json = std::fs::read("savegame.json").unwrap();
 let snapshot = WorldSnapshot::from_json(&json).unwrap();
+
+// Или из bincode:
+let binary = std::fs::read("savegame.bin").unwrap();
+let snapshot = WorldSnapshot::from_binary(&binary).unwrap();
 
 // Подготовить новый мир (зарегистрировать те же типы):
 let mut world = World::new();
@@ -1147,12 +1228,60 @@ sched.add_system("sync_bridge", |world: &mut World| {
 - `WorldBridge::send_event()` принимает только `Serialize + Send + Sync + 'static` типы (сериализация в `bincode`)
 - `WorldBridge::send_action_event()` принимает любые `Send + Sync + 'static` (без сериализации)
 - `IsolatedWorld` использует собственный `Scheduler` — зависимости между мирами не отслеживаются
+- Канал `WorldBridge` гарантирует FIFO-порядок событий
+
+### 12.5 Полный пример: два мира на двух потоках
+
+```rust
+use apex_isolated::{IsolatedWorld, WorldBridge};
+use std::thread;
+use std::sync::mpsc;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
+struct DamageEvent { amount: f32 };
+
+// Основной мир
+let mut world = /* ... */;
+
+// Создать пару мостов
+let (main_bridge, sub_bridge) = WorldBridge::new();
+world.insert_resource(sub_bridge);  // в изолированном мире
+
+// Изолированный мир
+let mut sub = IsolatedWorld::new();
+sub.world.register_component::<Health>();
+sub.world.insert_resource(main_bridge);
+
+sub.scheduler.add_system("damage", |w: &mut World| {
+    // Применить входящие события
+    if let Some(bridge) = w.try_resource::<WorldBridge>() {
+        bridge.apply_incoming(w);
+    }
+});
+sub.scheduler.compile().unwrap();
+
+// Запуск изолированного мира в отдельном потоке
+let handle = thread::spawn(move || {
+    for _ in 0..60 {
+        sub.tick();  // scheduler.run() + world.tick()
+        thread::sleep(std::time::Duration::from_millis(16));
+    }
+});
+
+// Отправка события из основного мира
+let bridge = world.resource::<WorldBridge>();
+bridge.send_event(&DamageEvent { amount: 10.0 });
+
+handle.join().unwrap();
+```
+
+> **Примечание:** Для синхронизации между потоками используется канал `mpsc` внутри `WorldBridge`. `IsolatedWorld` не требует `Sync` — каждый мир работает в своём потоке. Мосты являются `Send`, но не `Sync`.
 
 ---
 
 ## 13. Параллелизм
 
-### 11.1 Параллельный запуск систем
+### 13.1 Параллельный запуск систем
 
 Планировщик автоматически группирует совместимые Par-системы в одну Stage и запускает их параллельно через Rayon.
 
@@ -1177,7 +1306,15 @@ cargo run --features parallel
 
 **Пример:** `PhysicsSystem` (write `Velocity`, write `Position`, read `Mass`) и `HealthClampSystem` (write `Health`) не имеют общих Write → выполняются в одном Stage параллельно.
 
-### 11.2 Параллельная итерация внутри системы
+#### Как это работает (безопасность)
+
+Параллелизм безопасен благодаря трём архитектурным решениям:
+
+1. **Archetype-level sharing.** Параллельные системы получают `SubWorld` — shared borrow на уровне архетипов. Rayon гарантирует, что два `SubWorld` не перекрываются по конфликтующим архетипам (аналог borrow checker, но на stage-уровне).
+2. **Deferred structural changes.** `Commands::apply()` и `DeferredQueue::apply()` вызываются вне параллельного контекста. Это значит, что insert/remove не может произойти одновременно с параллельным чтением.
+3. **Per-system Commands.** Каждая параллельная система получает собственный экземпляр `Commands` (не `Sync`) — conflicts нет по определению.
+
+### 13.2 Параллельная итерация внутри системы
 
 `par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks по `PAR_CHUNK_SIZE` (4096) entity, каждый chunk обрабатывается независимо в Rayon thread pool.
 
@@ -1200,6 +1337,41 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 ```
 
 > **Примечание:** `par_for_each` даёт реальный выигрыш когда архетип содержит **> 4096 entity** И вычисления CPU-bound (не memory-bandwidth bound). Для маленьких датасетов overhead Rayon превысит выигрыш.
+
+### 13.3 Ограничения параллелизма
+
+#### Nested `par_for_each`
+
+Вызов `par_for_each` или `par_for_each_component` внутри callback'а другого `par_for_each` **запаникует** — Rayon не поддерживает вложенные вызовы `scope()` в одном thread pool. Используйте последовательную итерацию (`for_each`) внутри параллельного блока.
+
+#### Structural changes внутри `par_for_each`
+
+Прямой вызов `world.insert()` / `world.remove()` / `world.despawn()` внутри `par_for_each` — **UB** (меняет мапу архетипов во время итерации). Используйте `Commands` для буферизации:
+```rust
+ctx.query::<Read<Health>>()
+    .par_for_each(|entity, hp| {
+        // ✅ Безопасно: Commands буферизует изменения
+        if hp.current <= 0.0 { cmds.despawn(entity); }
+    });
+// Применение вне параллельного контекста:
+cmds.apply(world);
+```
+Подробнее о `Commands` — в [разделе 7](#7-commands-и-deferredqueue).
+
+#### Rhai-скриптинг
+
+`ScriptEngine` использует `Rc<RefCell<>>` и **не поддерживает** многопоточность. Вызов `engine.run()` внутри `ParSystem` или `par_for_each` приведёт к логической ошибке и потенциальному data corruption.
+
+```rust
+// ❌ НЕПРАВИЛЬНО: Rhai однопоточен
+impl ParSystem for ScriptedMovement {
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        self.engine.run(0.016, ctx.world_mut()); // compile error или UB
+    }
+}
+```
+
+Используйте Rhai-скриптинг только в последовательных системах (`add_system`). Подробнее — в [разделе 17](#17-rhai-scripting).
 
 ---
 
@@ -1729,6 +1901,40 @@ emit_event("CollisionEvent", #{ entity: entity_id });
 // при вызове внутри query()-итерации.
 ```
 
+### 17.5.1 Обработка ошибок
+
+`ScriptEngine::run()` логирует ошибки выполнения через `log::error!()`, но **не паникует** —
+игра продолжает работать даже при падении скрипта:
+
+```rust
+engine.run(0.016, &mut world);
+// При ошибке скрипта: ошибка в логе, мир не повреждён
+```
+
+Типы ошибок (`apex_scripting::ScriptError`):
+
+| Вариант | Описание |
+|---|---|
+| `ScriptError::Compile` | Ошибка компиляции — синтаксис, неверные типы, неизвестные функции |
+| `ScriptError::Runtime` | Ошибка выполнения — деление на ноль, неверный тип Dynamic, паника в кастомной функции |
+| `ScriptError::NotFound` | Скрипт с указанным именем не найден |
+| `ScriptError::Io` | Ошибка чтения .rhai-файла с диска |
+| `ScriptError::Watcher` | Ошибка файлового наблюдателя (hot-reload) |
+| `ScriptError::NoScriptDir` | Директория скриптов не задана |
+
+`load_script_str()` и `load_scripts()` возвращают `Result<(), ScriptError>` — ошибки компиляции
+должны обрабатываться явно:
+
+```rust
+match engine.load_script_str("game", code) {
+    Ok(()) => log::info!("Скрипт скомпилирован"),
+    Err(e) => log::error!("Ошибка компиляции: {}", e),
+}
+```
+
+При хот-релоаде неудачная перекомпиляция **не заменяет** старый AST —
+предыдущая рабочая версия скрипта продолжает использоваться.
+
 ### 17.6 Хот-релоад скриптов
 
 `ScriptEngine` поддерживает горячую перезагрузку `.rhai`-файлов из директории:
@@ -1761,6 +1967,64 @@ loop {
 | `(A, B)` | `[a, b]` (массив из 2 элементов) |
 | `(A, B, C)` | `[a, b, c]` (массив из 3 элементов) |
 | `Option<T>` | `null` или значение типа `T` |
+| `HashMap<K, V>` | ❌ не поддерживается напрямую (используйте отдельные компоненты) |
+| `Vec<T>` | ❌ не поддерживается напрямую (используйте фиксированные поля или несколько entity) |
+| `enum` | ❌ не поддерживается напрямую (используйте компоненты-маркеры) |
+
+> **Однопоточность:** `ScriptEngine` использует `Rc<RefCell<>>` (не `Arc<Mutex<>>`),
+> потому что Rhai без фичи `"sync"` — однопоточный. **Не используйте `ScriptEngine`
+> в `ParSystem` или в параллельных потоках** — это приведёт к панике при попытке
+> клонирования `Rc`. Скриптинг предназначен только для однопоточного
+> последовательного выполнения в главном цикле.
+
+### 17.7.1 Ручная реализация `ScriptableRegistrar`
+
+`#[derive(Scriptable)]` генерирует реализацию `ScriptableRegistrar` для структур с
+поддерживаемыми типами полей (см. таблицу 17.7). Если ваш компонент содержит
+нестандартные типы, требующие специальной логики конвертации, реализуйте трейт
+вручную:
+
+```rust
+use rhai::{Dynamic, Engine, Map};
+use apex_scripting::ScriptableRegistrar;
+
+struct Health { current: f32, max: f32 }
+
+impl ScriptableRegistrar for Health {
+    fn type_name_str() -> &'static str { "Health" }
+
+    fn field_names() -> &'static [&'static str] { &["current", "max"] }
+
+    fn to_dynamic(&self) -> Dynamic {
+        let mut map = Map::new();
+        map.insert("current".into(), Dynamic::from_float(self.current as f64));
+        map.insert("max".into(),     Dynamic::from_float(self.max as f64));
+        Dynamic::from_map(map)
+    }
+
+    fn from_dynamic(d: &Dynamic) -> Option<Self> {
+        let map = d.read_lock::<Map>()?;
+        Some(Self {
+            current: map.get("current")?.as_float().ok()? as f32,
+            max:     map.get("max")?.as_float().ok()? as f32,
+        })
+    }
+
+    fn register_rhai_type(engine: &mut Engine) {
+        engine.register_fn("Health", |current: f64, max: f64| -> Dynamic {
+            let mut map = Map::new();
+            map.insert("current".into(), Dynamic::from_float(current));
+            map.insert("max".into(),     Dynamic::from_float(max));
+            Dynamic::from_map(map)
+        });
+    }
+}
+```
+
+**Когда нужна ручная реализация:**
+- Компонент содержит `HashMap<K, V>`, `Vec<T>` или `enum` (макрос их не поддерживает)
+- Нужна кастомная валидация при конвертации `Dynamic → T`
+- Тип имеет внешние зависимости, не реализующие `ScriptableRegistrar`
 
 ### 17.8 Публичное API apex-core для скриптинга
 
