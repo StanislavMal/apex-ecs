@@ -189,11 +189,21 @@ pub fn propagate_transforms(world: &mut World) {
         }
     }
 
-    // 3. Sequential обработка от корней к листьям
-    for entity in ordered {
+    // 3. Sequential обработка от корней к листьям с каскадированием dirty на детей
+    //    Используем while i < ordered.len(), т.к. ordered динамически растёт
+    //    при добавлении детей dirty-родителя.
+    let mut i = 0;
+    while i < ordered.len() {
+        let entity = ordered[i];
+
+        if !world.is_alive(entity) {
+            i += 1;
+            continue;
+        }
+
         let local = match world.get::<LocalTransform>(entity) {
             Some(l) => *l,
-            None => continue,
+            None => { i += 1; continue; }
         };
 
         let parent = world.get_relation_target(entity, ChildOf);
@@ -207,11 +217,31 @@ pub fn propagate_transforms(world: &mut World) {
             local.to_matrix()
         };
 
+        // Записываем новый GlobalTransform
         if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
             gt.0 = global_matrix;
         }
 
+        // Снимаем TransformDirty
         world.remove::<TransformDirty>(entity);
+
+        // ── Каскадирование TransformDirty на детей ─────────────────
+        // Если у этой entity есть дети (ChildOf), помечаем их как dirty,
+        // чтобы их GlobalTransform тоже пересчитался.
+        // Это решает проблему "пользователь пометил только родителя" (Feature 2, issue #2).
+        let children: Vec<Entity> = world.children_of(ChildOf, entity).collect();
+        for child in children {
+            if !world.is_alive(child) {
+                continue;
+            }
+            if world.get::<TransformDirty>(child).is_none() {
+                world.insert(child, TransformDirty);
+                // Добавляем в ordered-список для обработки в этом же проходе
+                ordered.push(child);
+            }
+        }
+
+        i += 1;
     }
 }
 
@@ -234,6 +264,15 @@ pub fn propagate_transforms(world: &mut World) {
 ///     StageLabel::PostUpdate,
 /// );
 /// ```
+/// Функция-хук: автоматически вставляет TransformDirty при изменении LocalTransform.
+///
+/// Вызывается из `World::get_mut::<LocalTransform>()` после обновления tick изменения.
+fn mark_local_transform_dirty(entity: Entity, world: &mut World) {
+    // Вставляем TransformDirty, если ещё нет (insert дедуплицируется).
+    // Если entity уже имеет TransformDirty, это no-op (просто обновит tick).
+    world.insert(entity, TransformDirty);
+}
+
 pub struct TransformPlugin;
 
 impl TransformPlugin {
@@ -242,6 +281,11 @@ impl TransformPlugin {
         world.register_component::<LocalTransform>();
         world.register_component::<GlobalTransform>();
         world.register_component::<TransformDirty>();
+
+        // Регистрируем write_hook для автоматической пометки TransformDirty
+        // при любом вызове get_mut::<LocalTransform>().
+        // Это решает проблему "забыл пометить Dirty" (Feature 2, issue #1).
+        world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
     }
 }
 

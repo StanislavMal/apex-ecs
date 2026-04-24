@@ -74,13 +74,9 @@ fn main() {
         Some(parent),
     );
 
-    // ── 4. Устанавливаем GlobalTransform для корня (grandparent) ─
-    // Корень не имеет TransformDirty, но его GlobalTransform нужно
-    // инициализировать вручную (или через propagate_transforms).
-    let gp_local = *world.get::<LocalTransform>(grandparent).unwrap();
-    if let Some(gt) = world.get_mut::<GlobalTransform>(grandparent) {
-        gt.0 = gp_local.to_matrix();
-    }
+    // ── 4. Grandparent уже имеет TransformDirty (вставлен при spawn) ─
+    //     propagate_transforms сам вычислит GlobalTransform = LocalTransform
+    //     для корневого entity (без родителя).
 
     print_entity(&world, grandparent, "Grandparent (before)");
     print_entity(&world, parent,     "Parent (before)");
@@ -121,22 +117,23 @@ fn main() {
     println!("✅ Все проверки пройдены!\n");
 
     // ── 7. Демонстрация: изменение LocalTransform у родителя ─────
-    //     propagate_transforms использует top-down DFS, поэтому
-    //     Parent и Child можно оба пометить dirty — порядок
-    //     обработки будет корректным (сначала предки, потом потомки).
+    //     Теперь TransformDirty вставляется АВТОМАТИЧЕСКИ:
+    //     1) get_mut::<LocalTransform>() обновляет change_tick
+    //        и вызывает write_hook, который вставляет TransformDirty
+    //     2) propagate_transforms каскадирует dirty на всех детей
+    //        (через ChildOf), так что Child тоже пересчитывается.
     println!("--- Изменение LocalTransform у Parent ---\n");
 
     // Меняем локальную позицию Parent
+    // → get_mut автоматически вставит TransformDirty (через write_hook)
     if let Some(lt) = world.get_mut::<LocalTransform>(parent) {
         lt.translation = Vec3::new(100.0, 0.0, 0.0);
     }
 
-    // Помечаем и Parent, и Child как dirty
-    world.insert(parent, TransformDirty);
-    world.insert(child, TransformDirty);
-
-    // Запускаем propagate_transforms напрямую (не через Scheduler)
-    println!("  Parent и Child помечены dirty, запуск propagate_transforms...\n");
+    // propagate_transforms сам найдёт всех детей через ChildOf
+    // и вставит им TransformDirty перед пересчётом.
+    println!("  Parent помечен dirty автоматически, запуск propagate_transforms...\n");
+    println!("  (Child получит TransformDirty автоматически через каскадирование)\n");
     world.tick();
     transform::propagate_transforms(&mut world);
 

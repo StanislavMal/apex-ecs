@@ -149,6 +149,10 @@ pub struct World {
     pub(crate) subject_index:   SubjectIndex,
     pub        resources:       ResourceMap,
     pub(crate) events:          EventRegistry,
+    /// Коллбэки, вызываемые при записи компонента (вызове get_mut).
+    /// Функция-указатель (Copy), чтобы избежать borrow conflict с self.
+    /// Ключ — ComponentId.
+    pub(crate) write_hooks:     FxHashMap<ComponentId, fn(Entity, &mut World)>,
 }
 
 impl World {
@@ -165,6 +169,7 @@ impl World {
             subject_index:   SubjectIndex::new(),
             resources:       ResourceMap::new(),
             events:          EventRegistry::new(),
+            write_hooks:     FxHashMap::default(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
@@ -568,12 +573,44 @@ impl World {
         let component_id = self.registry.get_id::<T>()?;
         let location     = self.entities.get_location(entity)?;
         let tick         = self.current_tick;
-        let arch         = &mut self.archetypes[location.archetype_id.0 as usize];
-        let col_idx      = arch.column_index(component_id)?;
-        if location.row < arch.columns[col_idx].change_ticks.len() {
-            arch.columns[col_idx].change_ticks[location.row] = tick;
+
+        // 1. Обновляем tick изменения (change detection)
+        {
+            let arch = &mut self.archetypes[location.archetype_id.0 as usize];
+            if let Some(col_idx) = arch.column_index(component_id) {
+                if location.row < arch.columns[col_idx].change_ticks.len() {
+                    arch.columns[col_idx].change_ticks[location.row] = tick;
+                }
+            }
         }
-        unsafe { Some(arch.columns[col_idx].get_mut::<T>(location.row)) }
+
+        // 2. Вызываем write_hook, если зарегистрирован.
+        //    Хук может переместить entity в другой archetype (например, insert TransformDirty).
+        //    fn pointer — Copy, поэтому копируем и отпускаем borrow на self.write_hooks.
+        let hook_fn: Option<fn(Entity, &mut World)> = self.write_hooks.get(&component_id).copied();
+        if let Some(hook) = hook_fn {
+            hook(entity, self);
+        }
+
+        // 3. Перепроверяем location (хук мог изменить archetype) и получаем ссылку
+        let location2 = self.entities.get_location(entity)?;
+        let arch      = &mut self.archetypes[location2.archetype_id.0 as usize];
+        let col_idx   = arch.column_index(component_id)?;
+        unsafe { Some(arch.columns[col_idx].get_mut::<T>(location2.row)) }
+    }
+
+    /// Зарегистрировать write_hook для компонента T.
+    /// Хук вызывается при каждом вызове `get_mut::<T>()` ПОСЛЕ обновления tick'а изменения.
+    ///
+    /// Используется, например, для автоматической пометки TransformDirty
+    /// при изменении LocalTransform.
+    pub fn register_write_hook<T: Component>(
+        &mut self,
+        hook: fn(Entity, &mut World),
+    ) {
+        if let Some(cid) = self.registry.get_id::<T>() {
+            self.write_hooks.insert(cid, hook);
+        }
     }
 
     #[inline]
