@@ -91,7 +91,7 @@ where
     { let mut w = setup(); run_seq(&mut w); }
     { let mut w = setup(); run_par(&mut w); }
 
-    let collect_times = |mut run: &mut dyn FnMut(&mut World),
+    let collect_times = |run: &mut dyn FnMut(&mut World),
                          setup:  &mut dyn FnMut() -> World| -> Vec<Duration> {
         let mut v = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
@@ -141,7 +141,7 @@ fn make_world_3comp(n: usize) -> World {
 /// Возвращает (World, Vec<Entity>) — Vec нужен для тестов structural changes.
 /// Vec строится через query после spawn, чтобы не платить за него в spawn-тестах.
 fn make_world_3comp_with_entities(n: usize) -> (World, Vec<Entity>) {
-    let mut world = make_world_3comp(n);
+    let world = make_world_3comp(n);
     let mut entities = Vec::with_capacity(n);
     world.query_typed::<Read<Position>>().for_each(|e, _| entities.push(e));
     (world, entities)
@@ -876,7 +876,7 @@ fn bench_events(n: usize) {
             world.events_mut::<CollisionEvent>().send_batch(
                 (0..n * 1000).map(|i| CollisionEvent { a: i as u32, b: (i + 1) as u32 })
             );
-            let len = world.events::<CollisionEvent>().len_current();
+            let len = world.events::<CollisionEvent>().len_pending();
             std::hint::black_box(len);
             len as u64
         },

@@ -43,7 +43,7 @@ impl<T: Component> WorldQuery for Read<T> {
 
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
-        arch.columns[col_idx].data as *const T
+        arch.columns[col_idx].get_ptr(0) as *const T
     }
 
     #[inline(always)]
@@ -78,7 +78,7 @@ impl<T: Component> WorldQuery for Write<T> {
 
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
-        arch.columns[col_idx].data as *mut T
+        arch.columns[col_idx].get_ptr(0) as *mut T
     }
 
     #[inline(always)]

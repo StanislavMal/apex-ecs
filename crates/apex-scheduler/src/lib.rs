@@ -62,7 +62,7 @@ use apex_core::{
     system_param::{AutoSystem, WorldQuerySystemAccess},
 };
 
-pub use stage::Stage;
+pub use stage::{Stage, StageLabel};
 pub use apex_core::AccessDescriptor as Access;
 
 // ── ConflictKind ───────────────────────────────────────────────
@@ -212,6 +212,8 @@ struct SystemDescriptor {
     kind:   SystemKind,
     after:  Vec<SystemId>,
     before: Vec<SystemId>,
+    /// Этап выполнения (по умолчанию Update).
+    stage_label: StageLabel,
 }
 
 // ── SystemBuilder ──────────────────────────────────────────────
@@ -292,6 +294,9 @@ pub struct Scheduler {
     /// Количество архетипов в World на момент последнего compute_archetype_indices().
     /// Используется для кеширования — пересчёт только при изменении.
     cached_archetype_count: usize,
+
+    /// Флаг: был ли уже выполнен Startup этап.
+    startup_completed: bool,
 }
 
 impl Scheduler {
@@ -309,13 +314,27 @@ impl Scheduler {
             system_archetype_indices: FxHashMap::default(),
             archetype_indices_storage: Vec::new(),
             cached_archetype_count: 0,
+            startup_completed: false,
         }
     }
 
     // ── Регистрация ────────────────────────────────────────────
 
-    /// Регистрировать Sequential систему (полный &mut World).
+    /// Регистрировать Sequential систему (полный &mut World) в указанном этапе.
     pub fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    where
+        F: FnMut(&mut World) + Send + 'static,
+    {
+        self.add_system_to_stage(name, func, StageLabel::Update)
+    }
+
+    /// Регистрировать Sequential систему в указанном этапе.
+    pub fn add_system_to_stage<F>(
+        &mut self,
+        name: impl Into<String>,
+        func: F,
+        stage_label: StageLabel,
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -328,16 +347,36 @@ impl Scheduler {
             kind: SystemKind::Sequential(Box::new(func)),
             after:  Vec::new(),
             before: Vec::new(),
+            stage_label,
         });
         self.system_indices.insert(id, index);
         self.invalidate_plan();
         SystemBuilder { scheduler: self, id }
     }
 
-    /// Регистрировать AutoSystem — access выводится из типа Query.
-    ///
-    /// Рекомендуемый метод: невозможно забыть задекларировать компонент.
+    /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
+    pub fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    where
+        F: FnMut(&mut World) + Send + 'static,
+    {
+        self.add_system_to_stage(name, func, StageLabel::Startup)
+    }
+
+    /// Регистрировать AutoSystem в этапе Update (по умолчанию).
     pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemId
+    where
+        S: AutoSystem + 'static,
+    {
+        self.add_auto_system_to_stage(name, system, StageLabel::Update)
+    }
+
+    /// Регистрировать AutoSystem в указанном этапе.
+    pub fn add_auto_system_to_stage<S>(
+        &mut self,
+        name: impl Into<String>,
+        system: S,
+        stage_label: StageLabel,
+    ) -> SystemId
     where
         S: AutoSystem + 'static,
     {
@@ -352,17 +391,36 @@ impl Scheduler {
             kind: SystemKind::Parallel { system: Box::new(adapter), access },
             after:  Vec::new(),
             before: Vec::new(),
+            stage_label,
         });
         self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
     }
 
-    /// Регистрировать ParSystem с явным AccessDescriptor.
+    /// Регистрировать AutoSystem в Startup этапе.
+    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemId
+    where
+        S: AutoSystem + 'static,
+    {
+        self.add_auto_system_to_stage(name, system, StageLabel::Startup)
+    }
+
+    /// Регистрировать ParSystem в этапе Update (по умолчанию).
     pub fn add_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
         system: S,
+    ) -> SystemId {
+        self.add_par_system_to_stage(name, system, StageLabel::Update)
+    }
+
+    /// Регистрировать ParSystem в указанном этапе.
+    pub fn add_par_system_to_stage<S: ParSystem + 'static>(
+        &mut self,
+        name:   impl Into<String>,
+        system: S,
+        stage_label: StageLabel,
     ) -> SystemId {
         let id     = SystemId(self.next_id);
         self.next_id += 1;
@@ -374,18 +432,42 @@ impl Scheduler {
             kind: SystemKind::Parallel { system: Box::new(system), access },
             after:  Vec::new(),
             before: Vec::new(),
+            stage_label,
         });
         self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
     }
 
-    /// Регистрировать FnParSystem — замыкание с явным access.
+    /// Регистрировать ParSystem в Startup этапе.
+    pub fn add_startup_par_system<S: ParSystem + 'static>(
+        &mut self,
+        name:   impl Into<String>,
+        system: S,
+    ) -> SystemId {
+        self.add_par_system_to_stage(name, system, StageLabel::Startup)
+    }
+
+    /// Регистрировать FnParSystem в этапе Update (по умолчанию).
     pub fn add_fn_par_system<F>(
         &mut self,
         name:   impl Into<String>,
         func:   F,
         access: AccessDescriptor,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_fn_par_system_to_stage(name, func, access, StageLabel::Update)
+    }
+
+    /// Регистрировать FnParSystem в указанном этапе.
+    pub fn add_fn_par_system_to_stage<F>(
+        &mut self,
+        name:   impl Into<String>,
+        func:   F,
+        access: AccessDescriptor,
+        stage_label: StageLabel,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
@@ -400,10 +482,24 @@ impl Scheduler {
             kind: SystemKind::Parallel { system: Box::new(system), access },
             after:  Vec::new(),
             before: Vec::new(),
+            stage_label,
         });
         self.system_indices.insert(id, index);
         self.invalidate_plan();
         id
+    }
+
+    /// Регистрировать FnParSystem в Startup этапе.
+    pub fn add_startup_fn_par_system<F>(
+        &mut self,
+        name:   impl Into<String>,
+        func:   F,
+        access: AccessDescriptor,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_fn_par_system_to_stage(name, func, access, StageLabel::Startup)
     }
 
     /// Добавить явную зависимость: `system` выполняется после `after_id`.
@@ -436,31 +532,52 @@ impl Scheduler {
             self.graph_dirty = false;
         }
 
+        // Топологическая сортировка всех систем → уровни параллелизма
         let levels = self.dependency_graph
             .parallel_levels()
             .map_err(|_| {
-                // Попытка найти участников цикла для информативного сообщения
                 let cycle_info = self.find_cycle_description();
                 SchedulerError::CircularDependency { cycle_info }
             })?;
 
-        let stages: Vec<Stage> = levels
-            .into_iter()
-            .map(|level| {
-                let system_ids: Vec<SystemId> = level
-                    .iter()
-                    .filter_map(|&node| self.dependency_graph.node_data(node))
-                    .copied()
-                    .collect();
-                let all_parallel = system_ids.iter().all(|sid| {
+        // Для каждого уровня топосорта разделяем system_ids по stage_label.
+        // Затем объединяем результаты по label в порядке приоритета.
+        use std::collections::BTreeMap;
+        use rustc_hash::FxHashMap;
+        let mut label_stages: BTreeMap<u8, Vec<Stage>> = BTreeMap::new();
+
+        for level in &levels {
+            let mut level_by_label: FxHashMap<StageLabel, Vec<SystemId>> = FxHashMap::default();
+            for &node in level {
+                if let Some(&sys_id) = self.dependency_graph.node_data(node) {
+                    if let Some(system) = self.systems.iter().find(|s| s.id == sys_id) {
+                        level_by_label
+                            .entry(system.stage_label.clone())
+                            .or_default()
+                            .push(sys_id);
+                    }
+                }
+            }
+            for (label, ids) in level_by_label {
+                let all_parallel = ids.iter().all(|sid| {
                     self.systems.iter()
                         .find(|s| s.id == *sid)
                         .map(|s| s.kind.is_parallel())
                         .unwrap_or(false)
                 });
-                Stage::new(system_ids, all_parallel)
-            })
-            .collect();
+                let prio = label.priority();
+                label_stages
+                    .entry(prio)
+                    .or_default()
+                    .push(Stage::new(label, ids, all_parallel));
+            }
+        }
+
+        // Собираем все Stage в порядке priority (Startup → First → ... → Last → Custom)
+        let mut stages: Vec<Stage> = Vec::new();
+        for (_prio, mut s_stages) in label_stages {
+            stages.append(&mut s_stages);
+        }
 
         let flat_order: Vec<SystemId> = stages
             .iter()
@@ -722,53 +839,67 @@ impl Scheduler {
             let system = &self.systems[idx];
             
             if !system.kind.is_parallel() {
-                // Sequential система: все предыдущие → текущая
-                for j in 0..idx {
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&self.systems[j].id),
-                         self.graph_nodes.get(&system.id))
-                    {
-                        if !self.has_edge_between(from, to) {
-                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                            self.edge_info.push(GraphEdgeInfo {
-                                from_id: self.systems[j].id,
-                                to_id:   system.id,
-                                kind:    ConflictKind::SequentialBarrier,
-                            });
-                        }
-                    }
-                }
-                
-                // Sequential система: текущая → все последующие
-                for j in (idx + 1)..n {
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&system.id),
-                         self.graph_nodes.get(&self.systems[j].id))
-                    {
-                        if !self.has_edge_between(from, to) {
-                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                            self.edge_info.push(GraphEdgeInfo {
-                                from_id: system.id,
-                                to_id:   self.systems[j].id,
-                                kind:    ConflictKind::SequentialBarrier,
-                            });
-                        }
-                    }
-                }
-            } else {
-                // Параллельная система: проверяем sequential барьеры от других систем
+                // Sequential система: sequential → par и par → sequential
                 for j in 0..n {
                     if j == idx { continue; }
-                    
-                    if !self.systems[j].kind.is_parallel() {
-                        // Если другая система sequential, добавляем барьер
+                    if self.systems[j].kind.is_parallel() {
+                        // par → sequential (если par раньше)
                         if j < idx {
-                            // sequential → текущая
                             if let (Some(&from), Some(&to)) =
                                 (self.graph_nodes.get(&self.systems[j].id),
                                  self.graph_nodes.get(&system.id))
                             {
-                                if !self.has_edge_between(from, to) {
+                                if !self.has_edge_between(from, to)
+                                    && !self.dependency_graph.has_path(to, from)
+                                {
+                                    self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_info.push(GraphEdgeInfo {
+                                        from_id: self.systems[j].id,
+                                        to_id:   system.id,
+                                        kind:    ConflictKind::SequentialBarrier,
+                                    });
+                                }
+                            }
+                        }
+                        // sequential → par (если par позже)
+                        if j > idx {
+                            if let (Some(&from), Some(&to)) =
+                                (self.graph_nodes.get(&system.id),
+                                 self.graph_nodes.get(&self.systems[j].id))
+                            {
+                                if !self.has_edge_between(from, to)
+                                    && !self.dependency_graph.has_path(to, from)
+                                {
+                                    self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_info.push(GraphEdgeInfo {
+                                        from_id: system.id,
+                                        to_id:   self.systems[j].id,
+                                        kind:    ConflictKind::SequentialBarrier,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // Sequential ↔ Sequential: НЕ добавляем барьер,
+                    // чтобы не конфликтовать с explicit dependencies.
+                    // Внутри Stage они выполняются последовательно по порядку system_ids.
+                }
+            } else {
+                // Параллельная система: проверяем sequential барьеры от sequential систем
+                for j in 0..n {
+                    if j == idx { continue; }
+                    
+                    if !self.systems[j].kind.is_parallel() {
+                        // sequential → par или par → sequential
+                        if j < idx {
+                            // sequential → par
+                            if let (Some(&from), Some(&to)) =
+                                (self.graph_nodes.get(&self.systems[j].id),
+                                 self.graph_nodes.get(&system.id))
+                            {
+                                if !self.has_edge_between(from, to)
+                                    && !self.dependency_graph.has_path(to, from)
+                                {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: self.systems[j].id,
@@ -778,12 +909,14 @@ impl Scheduler {
                                 }
                             }
                         } else {
-                            // текущая → sequential
+                            // par → sequential
                             if let (Some(&from), Some(&to)) =
                                 (self.graph_nodes.get(&system.id),
                                  self.graph_nodes.get(&self.systems[j].id))
                             {
-                                if !self.has_edge_between(from, to) {
+                                if !self.has_edge_between(from, to)
+                                    && !self.dependency_graph.has_path(to, from)
+                                {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: system.id,
@@ -829,7 +962,9 @@ impl Scheduler {
                             (self.graph_nodes.get(&system_i.id),
                              self.graph_nodes.get(&system_j.id))
                         {
-                            if !self.has_edge_between(from, to) {
+                            if !self.has_edge_between(from, to)
+                                && !self.dependency_graph.has_path(to, from)
+                            {
                                 self.dependency_graph.add_edge(from, to, conflict_kind.clone());
                                 self.edge_info.push(GraphEdgeInfo {
                                     from_id: system_i.id,
@@ -878,14 +1013,14 @@ impl Scheduler {
 
     /// Запустить одну итерацию планировщика.
     /// С feature = "parallel" — параллельный путь через Rayon.
+    ///
+    /// Startup этап выполняется только при первом вызове `run()`.
     pub fn run(&mut self, world: &mut World) {
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
 
         // Вычисляем маппинг систем → архетипы для SubWorld.
-        // Это нужно делать перед каждым запуском, так как World мог измениться
-        // (добавились/удалились архетипы через spawn/despawn).
         self.compute_archetype_indices(world);
 
         #[cfg(feature = "parallel")]
@@ -893,6 +1028,9 @@ impl Scheduler {
 
         #[cfg(not(feature = "parallel"))]
         self.run_sequential(world);
+
+        // После первого run() Startup больше не выполняется
+        self.startup_completed = true;
     }
 
     /// Последовательное выполнение — для тестов и non-parallel builds.
@@ -901,14 +1039,22 @@ impl Scheduler {
             self.compile().expect("Failed to compile schedule");
         }
 
-        let order: Vec<SystemId> = self.execution_plan
-            .as_ref().unwrap().flat_order.clone();
+        let plan = self.execution_plan.as_ref().unwrap();
+
+        // Фильтруем Startup системы если этап уже был выполнен
+        let order: Vec<SystemId> = plan.stages.iter()
+            .filter(|stage| {
+                if stage.label == StageLabel::Startup && self.startup_completed {
+                    return false; // пропускаем Startup
+                }
+                true
+            })
+            .flat_map(|s| s.system_ids.iter().copied())
+            .collect();
 
         // Sequential системы получают &mut World, параллельные — SubWorld
-        // Создаём SubWorld на все архетипы для параллельных систем
         let all_indices: Vec<usize> = (0..world.archetypes().len()).collect();
         let sub_world = apex_core::SubWorld::new(
-            // SAFETY: мы не используем sub_world одновременно с &mut world
             unsafe { &*(world as *mut World as *const World) },
             &all_indices,
         );
@@ -924,6 +1070,9 @@ impl Scheduler {
                 }
             }
         }
+
+        // После первого выполнения Startup больше не запускается
+        self.startup_completed = true;
     }
 
     /// Параллельное выполнение через Rayon scope + spawn.
@@ -937,8 +1086,15 @@ impl Scheduler {
     #[cfg(feature = "parallel")]
     fn run_hybrid_parallel(&mut self, world: &mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
+        // Фильтруем Startup если уже выполнен
         let stages: Vec<(Vec<SystemId>, bool)> = plan.stages
             .iter()
+            .filter(|stage| {
+                if stage.label == StageLabel::Startup && self.startup_completed {
+                    return false;
+                }
+                true
+            })
             .map(|s| (s.system_ids.clone(), s.all_parallel))
             .collect();
 
@@ -1067,7 +1223,7 @@ impl Scheduler {
             let mode = if stage.is_parallelizable()  { "PARALLEL" }
                        else if stage.all_parallel     { "parallel/single" }
                        else                           { "sequential" };
-            out.push_str(&format!("Stage {} [{}]:\n", i, mode));
+            out.push_str(&format!("Stage {} [{}] ({}) :\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
                 if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
                     let kind_str = match &s.kind {
@@ -1115,7 +1271,7 @@ impl Scheduler {
             let mode = if stage.is_parallelizable()  { "PARALLEL" }
                        else if stage.all_parallel     { "parallel/single" }
                        else                           { "sequential" };
-            out.push_str(&format!("Stage {} [{}]:\n", i, mode));
+            out.push_str(&format!("Stage {} [{}] ({}):\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
                 if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
                     match &s.kind {
@@ -1594,5 +1750,108 @@ mod tests {
         let mut hp_result = -1.0f32;
         Query::<Read<Hp>>::new(&world).for_each_component(|hp| { hp_result = hp.0; });
         assert!((hp_result - 0.0).abs() < 1e-6);
+    }
+
+    // ── StageLabel тесты ────────────────────────────────────────
+
+    #[test]
+    fn startup_system_runs_once() {
+        let mut sched = Scheduler::new();
+        let startup_count = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let counter = startup_count.clone();
+
+        sched.add_startup_system("init", move |_| {
+            *counter.lock().unwrap() += 1;
+        });
+
+        let mut world = World::new();
+
+        // Первый run() — Startup выполняется
+        sched.run_sequential(&mut world);
+        assert_eq!(*startup_count.lock().unwrap(), 1, "Startup должен выполниться 1 раз");
+
+        // Второй run() — Startup НЕ выполняется
+        sched.run_sequential(&mut world);
+        assert_eq!(*startup_count.lock().unwrap(), 1, "Startup НЕ должен выполниться повторно");
+    }
+
+    #[test]
+    fn stage_label_in_debug_plan() {
+        let mut sched = Scheduler::new();
+        sched.add_startup_system("init", |_| {});
+        sched.add_auto_system("movement", AutoMovement);
+        sched.compile().unwrap();
+
+        let plan = sched.debug_plan();
+        assert!(plan.contains("Startup"), "debug_plan должен содержать Startup label");
+        assert!(plan.contains("Update"),  "debug_plan должен содержать Update label");
+    }
+
+    #[test]
+    fn add_system_to_stage_custom_label() {
+        let mut sched = Scheduler::new();
+
+        // Добавляем системы в разные этапы
+        sched.add_system_to_stage("pre", |_| {}, StageLabel::PreUpdate);
+        sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        // Должно быть минимум 2 Stage: PreUpdate и Update
+        assert!(stages.len() >= 2, "Должно быть минимум 2 Stage, получено {}", stages.len());
+
+        // Проверяем что PreUpdate идут перед Update
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
+        assert!(upd_idx.is_some(), "Должен быть Update Stage");
+        assert!(pre_idx.unwrap() < upd_idx.unwrap(),
+            "PreUpdate должен быть перед Update");
+    }
+
+    #[test]
+    fn startup_auto_system() {
+        let mut sched = Scheduler::new();
+
+        // AutoSystem на Startup
+        sched.add_startup_auto_system("init_movement", AutoMovement);
+
+        // Обычная система на Update
+        sched.add_auto_system("update_health", AutoHealth);
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        assert!(stages.len() >= 2, "Должно быть минимум 2 Stage");
+
+        // Startup выполняется первым
+        assert_eq!(stages[0].label, StageLabel::Startup,
+            "Первый Stage должен быть Startup");
+        assert!(stages.iter().any(|s| s.label == StageLabel::Update),
+            "Должен быть Update Stage");
+    }
+
+    #[test]
+    fn startup_system_works_via_run() {
+        let mut sched = Scheduler::new();
+        let startup_val = std::sync::Arc::new(std::sync::Mutex::new(0i32));
+        let val = startup_val.clone();
+
+        sched.add_startup_system("init", move |world: &mut World| {
+            world.insert_resource(42i32);
+            *val.lock().unwrap() = 42;
+        });
+
+        let mut world = World::new();
+
+        // Первый run
+        sched.run_sequential(&mut world);
+        assert_eq!(*startup_val.lock().unwrap(), 42, "Startup система должна выполниться");
+        assert_eq!(*world.resource::<i32>(), 42, "Ресурс должен быть установлен");
+
+        // Второй run — ресурс должен остаться (Startup не перезаписывает)
+        sched.run_sequential(&mut world);
+        assert_eq!(*world.resource::<i32>(), 42, "Ресурс не должен измениться");
     }
 }

@@ -4,11 +4,12 @@
 //! - Resources, Events
 //! - spawn_many (batch API)
 //! - Hybrid Scheduler (ParSystem + FnParSystem + Sequential)
+//! - Bevy-подобные Stages (Startup, PreUpdate, Update, PostUpdate)
 //! - Relations (ChildOf иерархии)
 //! - Commands
 //! cargo run -p apex-examples --example basic --release --features parallel
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem};
+use apex_scheduler::{Scheduler, ParSystem, StageLabel};
 use apex_core::access::AccessDescriptor;
 
 // ── Компоненты ────────────────────────────────────────────────
@@ -154,10 +155,71 @@ fn stats_update(world: &mut World) {
     println!("  [stats_update] frame={} entities={}", stats.frame, entities);
 }
 
+// ── Startup-системы ──────────────────────────────────────────
+// Выполняются один раз при первом run().
+
+fn init_resources(world: &mut World) {
+    world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
+    world.insert_resource(DeltaTime(0.016));
+    world.insert_resource(FrameStats::default());
+
+    world.add_event::<DamageEvent>();
+    world.add_event::<DeathEvent>();
+
+    println!("  [Startup] init_resources: PhysicsConfig, DeltaTime, FrameStats, events");
+}
+
+fn spawn_player(world: &mut World) {
+    world.spawn_bundle((
+        Position { x: 0.0,  y: 10.0 },
+        Velocity { x: 1.0,  y: 0.0  },
+        Health   { current: 100.0, max: 100.0 },
+        Mass(80.0),
+        Player,
+        Name("Hero"),
+    ));
+
+    world.spawn_bundle((
+        Position { x: 20.0, y:  5.0 },
+        Velocity { x: -0.5, y:  0.0 },
+        Health   { current: 30.0, max: 30.0 },
+        Mass(60.0),
+        Name("Goblin"),
+    ));
+
+    world.spawn_bundle((
+        Position { x: -5.0, y: 3.0 },
+        Velocity { x:  0.3, y: 0.0 },
+        Health   { current: 75.0, max: 75.0 },
+        Mass(120.0),
+        Name("Orc"),
+    ));
+
+    // Batch spawn
+    world.spawn_many_silent(500, |i| (
+        Position { x: i as f32 * 0.5, y: 0.0 },
+        Velocity { x: 0.1, y: 0.0 },
+        Health   { current: 50.0, max: 50.0 },
+        Mass(70.0),
+        Enemy,
+    ));
+
+    world.spawn_many_silent(200, |i| (
+        Position { x: -(i as f32), y: 2.0 },
+        Velocity { x: 0.0, y: 0.0 },
+        Health   { current: 20.0, max: 20.0 },
+        Mass(30.0),
+        Enemy,
+    ));
+
+    println!("  [Startup] spawn_player: entities={}, archetypes={}",
+        world.entity_count(), world.archetype_count());
+}
+
 // ── main ──────────────────────────────────────────────────────
 
 fn main() {
-    println!("=== Apex ECS — Basic Example ===\n");
+    println!("=== Apex ECS — Basic Example (with Stages) ===\n");
 
     let mut world = World::new();
 
@@ -169,104 +231,29 @@ fn main() {
     world.register_component::<Enemy>();
     world.register_component::<Name>();
 
-    // ── Resources ─────────────────────────────────────────────
-    println!("=== Resources ===");
-
-    world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
-    world.insert_resource(DeltaTime(0.016));
-    world.insert_resource(FrameStats::default());
-
-    println!("PhysicsConfig: {:?}", world.resource::<PhysicsConfig>());
-    world.resource_mut::<PhysicsConfig>().gravity = 1.62;
-    println!("Moon gravity:  {:.2}", world.resource::<PhysicsConfig>().gravity);
-    world.resource_mut::<PhysicsConfig>().gravity = 9.8;
-
-    // ── Events ────────────────────────────────────────────────
-    println!("\n=== Events ===");
-
-    world.add_event::<DamageEvent>();
-    world.add_event::<DeathEvent>();
-
-    // ── Spawn ─────────────────────────────────────────────────
-    println!("\n=== Spawn ===");
-
-    let player = world.spawn_bundle((
-        Position { x: 0.0,  y: 10.0 },
-        Velocity { x: 1.0,  y: 0.0  },
-        Health   { current: 100.0, max: 100.0 },
-        Mass(80.0),
-        Player,
-        Name("Hero"),
-    ));
-
-    let goblin = world.spawn_bundle((
-        Position { x: 20.0, y:  5.0 },
-        Velocity { x: -0.5, y:  0.0 },
-        Health   { current: 30.0, max: 30.0 },
-        Mass(60.0),
-        Name("Goblin"),
-    ));
-
-    let _orc = world.spawn_bundle((
-        Position { x: -5.0, y: 3.0 },
-        Velocity { x:  0.3, y: 0.0 },
-        Health   { current: 75.0, max: 75.0 },
-        Mass(120.0),
-        Name("Orc"),
-    ));
-
-    println!("Spawned {} entities, {} archetypes", world.entity_count(), world.archetype_count());
-
-    // ── Batch Spawn ───────────────────────────────────────────
-    println!("\n=== Batch Spawn ===");
-
-    let soldiers = world.spawn_many(500, |i| (
-        Position { x: i as f32 * 0.5, y: 0.0 },
-        Velocity { x: 0.1, y: 0.0 },
-        Health   { current: 50.0, max: 50.0 },
-        Mass(70.0),
-        Enemy,
-    ));
-    println!("spawn_many(500 soldiers): {} entities created", soldiers.len());
-
-    world.spawn_many_silent(200, |i| (
-        Position { x: -(i as f32), y: 2.0 },
-        Velocity { x: 0.0, y: 0.0 },
-        Health   { current: 20.0, max: 20.0 },
-        Mass(30.0),
-        Enemy,
-    ));
-    println!("spawn_many_silent(200 archers)");
-    println!("Total entities: {}", world.entity_count());
-
-    // ── Events pipeline ───────────────────────────────────────
-    println!("\n=== Events Pipeline ===");
-
-    // Наносим урон: goblin получает 35 (умрёт, у него 30 HP)
-    world.send_event(DamageEvent { target: goblin, amount: 35.0 });
-    world.send_event(DamageEvent { target: player, amount: 10.0 });
-
-    println!("Sent 2 damage events (current tick)");
-    world.tick(); // damage → previous
-    println!("After tick: {} damage events in previous",
-        world.events::<DamageEvent>().len_previous()
-    );
-
-    // ── Hybrid Scheduler ──────────────────────────────────────
-    println!("\n=== Hybrid Scheduler ===\n");
+    // ── Scheduler with Stages ────────────────────────────────
+    println!("=== Scheduler with Stages ===\n");
 
     let mut sched = Scheduler::new();
 
-    // Все Par-системы СНАЧАЛА (правило: Par до Sequential)
-    sched.add_par_system("physics",      PhysicsSystem);
-    sched.add_par_system("health_clamp", HealthClampSystem);
-    
-    // AutoSystem: новый типобезопасный API (автовывод AccessDescriptor)
-    let movement_id = sched.add_auto_system("movement", MovementSystem);
-    println!("  [Demo] AutoSystem 'movement' зарегистрирован без явного AccessDescriptor");
+    // ╔══════════════════════════════════════════════════════════╗
+    // ║  Startup — выполняется один раз при первом run()       ║
+    // ╚══════════════════════════════════════════════════════════╝
+    sched.add_startup_system("init_resources", init_resources);
+    sched.add_startup_system("spawn_player",   spawn_player);
 
-    // FnParSystem: velocity reset для Enemy — демо нового API
-    let reset_id = sched.add_fn_par_system(
+    // ╔══════════════════════════════════════════════════════════╗
+    // ║  PreUpdate — AutoSystem (автовывод доступа)            ║
+    // ╚══════════════════════════════════════════════════════════╝
+    sched.add_auto_system_to_stage("movement", MovementSystem, StageLabel::PreUpdate);
+    println!("  [Stage:PreUpdate] MovementSystem зарегистрирован как AutoSystem");
+
+    // ╔══════════════════════════════════════════════════════════╗
+    // ║  Update — ParSystem + FnParSystem (параллельные)       ║
+    // ╚══════════════════════════════════════════════════════════╝
+    sched.add_par_system_to_stage("physics",      PhysicsSystem,      StageLabel::Update);
+    sched.add_par_system_to_stage("health_clamp", HealthClampSystem,  StageLabel::Update);
+    sched.add_fn_par_system_to_stage(
         "enemy_ai",
         |ctx: SystemContext<'_>| {
             let count = ctx.query::<(Read<Enemy>, Write<Velocity>)>().len();
@@ -281,34 +268,52 @@ fn main() {
         AccessDescriptor::new()
             .read::<Enemy>()
             .write::<Velocity>(),
+        StageLabel::Update,
     );
 
-    // Sequential ПОСЛЕ всех Par
-    let damage_id = sched.add_system("damage_apply", damage_apply).id();
-    let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
-    let stats_id = sched.add_system("stats_update", stats_update).id();
+    // ╔══════════════════════════════════════════════════════════╗
+    // ║  PostUpdate — Sequential системы                        ║
+    // ╚══════════════════════════════════════════════════════════╝
+    let damage_id  = sched.add_system_to_stage("damage_apply",  damage_apply,  StageLabel::PostUpdate).id();
+    let despawn_id = sched.add_system_to_stage("despawn_dead",  despawn_dead,  StageLabel::PostUpdate).id();
+    let stats_id   = sched.add_system_to_stage("stats_update",  stats_update,  StageLabel::PostUpdate).id();
 
     sched.add_dependency(despawn_id, damage_id);
     sched.add_dependency(stats_id,   despawn_id);
 
     sched.compile().unwrap();
 
-    println!("Compiled plan:\n{}", sched.debug_plan());
+    println!("\nCompiled plan:\n{}", sched.debug_plan());
     println!("\nVerbose diagnostics:\n{}", sched.debug_plan_verbose());
-    println!("--- Running tick 1 ---\n");
+
+    // ── Tick 1 (Startup + все стейджи) ───────────────────────
+    println!("\n--- Running tick 1 (Startup + PreUpdate + Update + PostUpdate) ---\n");
     sched.run(&mut world);
+
+    // Находим player и goblin через query (они созданы в startup)
+    let player = Query::<Read<Player>>::new(&world)
+        .iter().next().map(|(e, _)| e)
+        .expect("Player entity not found");
+    let goblin = Query::<Read<Name>>::new(&world)
+        .iter().find(|(_, n)| n.0 == "Goblin")
+        .map(|(e, _)| e)
+        .expect("Goblin entity not found");
 
     println!("\nAfter tick 1:");
     println!("  Entities:       {}", world.entity_count());
-    println!("  goblin alive:   {}", world.is_alive(goblin));
-    println!("  player alive:   {}", world.is_alive(player));
+    println!("  Resources:      PhysicsConfig={:?}", world.resource::<PhysicsConfig>());
     if let Some(hp) = world.get::<Health>(player) {
         println!("  player HP:      {}/{}", hp.current, hp.max);
     }
     println!("  FrameStats:     {:?}", world.resource::<FrameStats>());
 
-    // ── Tick 2 ────────────────────────────────────────────────
-    println!("\n--- Running tick 2 ---\n");
+    // ── Tick 2 (без Startup) ─────────────────────────────────
+    // Посылаем события через world.send_event ДО scheduler.run,
+    // чтобы они попали в previous buffer после tick()
+    world.send_event(DamageEvent { target: goblin, amount: 35.0 });
+    world.send_event(DamageEvent { target: player, amount: 10.0 });
+
+    println!("\n--- Running tick 2 (без Startup — выполняется только PreUpdate → Update → PostUpdate) ---\n");
     world.tick();
     sched.run(&mut world);
 
@@ -359,7 +364,7 @@ fn main() {
     cmds.apply(&mut world);
     println!("Entities: {} → {}", before, world.entity_count());
 
-    // ── Resource cleanup ──────────────────────────────────────
+    // ── Resource ops ──────────────────────────────────────────
     println!("\n=== Resource ops ===");
     let removed = world.remove_resource::<PhysicsConfig>();
     println!("remove_resource::<PhysicsConfig>: {}", removed.is_some());

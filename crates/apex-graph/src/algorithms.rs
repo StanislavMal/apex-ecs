@@ -4,6 +4,56 @@ use thunderdome::Index;
 use crate::{Graph, GraphError};
 
 impl<N, W> Graph<N, W> {
+    /// Проверяет, существует ли путь от `from` к `to` (BFS).
+    ///
+    /// Используется для предотвращения создания циклов при добавлении рёбер.
+    pub fn has_path(&self, from: Index, to: Index) -> bool {
+        if from == to {
+            return true;
+        }
+        if self.nodes.get(from).is_none() || self.nodes.get(to).is_none() {
+            return false;
+        }
+
+        let slot_cap = self.slot_capacity();
+        let mut visited = vec![false; slot_cap];
+
+        let mut queue: Vec<Index> = Vec::new();
+        let mut head = 0usize;
+
+        let start_slot = from.slot() as usize;
+        if start_slot < visited.len() {
+            visited[start_slot] = true;
+        }
+        queue.push(from);
+
+        while head < queue.len() {
+            let node = queue[head];
+            head += 1;
+
+            let node_slot = node.slot() as usize;
+            if let Some(edges) = self.adjacency_out.get(node_slot) {
+                for &edge_idx in edges {
+                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let succ = edge.to;
+                    if self.nodes.get(succ).is_none() {
+                        continue;
+                    }
+                    if succ == to {
+                        return true;
+                    }
+                    let succ_slot = succ.slot() as usize;
+                    if succ_slot < visited.len() && !visited[succ_slot] {
+                        visited[succ_slot] = true;
+                        queue.push(succ);
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     /// Топологическая сортировка (алгоритм Кана) с кэшированием.
     ///
     /// Возвращает узлы в порядке зависимостей.
@@ -252,6 +302,38 @@ impl<N, W> Graph<N, W> {
 mod tests {
     use super::*;
     use rustc_hash::FxHashMap;
+
+    #[test]
+    fn test_has_path_exists() {
+        let mut g: Graph<&str, ()> = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        let c = g.add_node("C");
+        g.add_edge(a, b, ());
+        g.add_edge(b, c, ());
+        assert!(g.has_path(a, c));
+        assert!(g.has_path(a, b));
+        assert!(!g.has_path(b, a));
+        assert!(!g.has_path(c, a));
+    }
+
+    #[test]
+    fn test_has_path_self_loop() {
+        let mut g: Graph<&str, ()> = Graph::new();
+        let a = g.add_node("A");
+        assert!(g.has_path(a, a));
+    }
+
+    #[test]
+    fn test_has_path_nonexistent_nodes() {
+        let mut g: Graph<&str, ()> = Graph::new();
+        let a = g.add_node("A");
+        let b = g.add_node("B");
+        // nodes exist but no edges
+        assert!(!g.has_path(a, b));
+        assert!(!g.has_path(b, a));
+    }
+
 
     #[test]
     fn test_topological_sort_chain() {
