@@ -206,6 +206,8 @@ for entity in query(["Read:Position", "Write:Velocity"]) {
 
 При ошибке компиляции — старый скрипт продолжает работать, ошибка логируется.
 
+> **Hot Reload префабов:** Файловые префабы (`.prefab`) также поддерживают горячую перезагрузку через `PrefabPlugin` из крейта `apex-hot-reload`. При изменении файла префаба все entity, созданные по этому префабу, автоматически пересоздаются через `reapply_asset()`/`reapply_all()`. Подробнее — в разделе [Hot Reload префабов (PrefabPlugin)](#11-hot-reload) руководства пользователя.
+
 ## Публичное API `apex-core`, используемое скриптингом
 
 Скриптинг полагается на следующие публичные методы `apex-core`:
@@ -236,6 +238,18 @@ for entity in query(["Read:Position", "Write:Velocity"]) {
 ### `Column` (archetype.rs)
 
 `pub struct Column` — публичный тип, доступный из внешних крейтов.
+
+### `EntityTemplate` + `TemplateRegistry` (template.rs)
+
+| Метод | Описание |
+|---|---|
+| `World::register_template(name, template)` | Регистрация именованного шаблона в мире |
+| `World::spawn_from_template(name, params) → Entity` | Создание entity по шаблону |
+| `World::has_template(name) → bool` | Проверка наличия шаблона |
+| `Commands::spawn_template(name)` | Отложенный спавн по шаблону (через Commands) |
+| `Commands::spawn_from_template(name, params)` | Отложенный спавн с параметрами |
+
+Эти методы используются скриптингом через `World::spawn_from_template()` при интеграции с `PrefabManifest` (который реализует `EntityTemplate`).
 
 ## Архитектурные решения
 

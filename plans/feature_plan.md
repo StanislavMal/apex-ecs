@@ -366,13 +366,13 @@ graph TB
 
 ---
 
-## Фича 5: Prefabs, EntityTemplate, Sub-worlds ⏳ ОЖИДАЕТ
+## Фича 5: Prefabs, EntityTemplate, IsolatedWorld ✅ РЕАЛИЗОВАНО
 
 ### Текущее состояние
 
-[`spawn_bundle`](crates/apex-core/src/world.rs), [`spawn_many`](crates/apex-core/src/world.rs). [`SubWorld`](crates/apex-core/src/sub_world.rs) — только для параллелизма. Нет шаблонов/префабов.
+[`EntityTemplate`](crates/apex-core/src/template.rs), [`PrefabManifest`](crates/apex-serialization/src/prefab.rs), [`IsolatedWorld`](crates/apex-isolated/src/lib.rs) — всё реализовано и протестировано.
 
-### Что нужно сделать
+### Что было сделано
 
 #### Шаг 5.1: `EntityTemplate` — параметризованный шаблон
 
@@ -461,8 +461,8 @@ graph LR
         B["2. TransformPropagation ✅"]
         D["4. Бинарная сериализация ✅"]
     end
-    subgraph "Фаза 3 (высокоуровневые)"
-        E["5. Prefabs + Sub-worlds"]
+    subgraph "✅ Фаза 3 — завершена"
+        E["5. Prefabs + IsolatedWorld ✅"]
     end
     
     A --> B
@@ -476,7 +476,7 @@ graph LR
 2. ✅ **Фича 3** (Stages) — улучшение планировщика
 3. ✅ **Фича 2** (TransformPropagation) — использует Stages (PostUpdate) и Relations (ChildOf)
 4. ✅ **Фича 4** (бинаризация) — независима, но полезна для Prefab
-5. ⏳ **Фича 5** (Prefabs + Sub-worlds) — венец, опирается на всё выше
+5. ✅ **Фича 5** (Prefabs + IsolatedWorld) — реализована, опирается на всё выше
 
 ---
 
@@ -488,4 +488,4 @@ graph LR
 | 2. TransformPropagation | ✅ Реализовано | 2-3 | 3-4 | Средняя |
 | 3. Stages | ✅ Реализовано | 1 | 3 | Средняя |
 | 4. Бинарная сериализация | ✅ Реализовано | 1-2 | 3-4 | Низкая-Средняя |
-| 5. Prefabs + Sub-worlds | ⏳ Ожидает | 3-4 | 4-5 | Высокая |
+| 5. Prefabs + EntityTemplate + IsolatedWorld | ✅ Реализовано | 4 | 10 | Высокая |
