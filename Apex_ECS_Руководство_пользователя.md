@@ -939,8 +939,29 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 - Регистрируйте все Par-системы **ДО** Sequential — это максимизирует размер параллельных Stage
 - Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
 - Чем больше Par-систем без конфликтов — тем лучше масштабируется на N ядер
+- `par_for_each_component` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 
-### 12.5 Релизная сборка
+### 12.5 Intra-system Parallelism
+
+`par_for_each_component` и `par_for_each` на `Query`/`CachedQuery` дают реальный прирост только когда:
+- **Количество entity >> PAR_CHUNK_SIZE (4096)** — иначе overhead Rayon превышает выигрыш
+- **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
+
+```rust
+// Хорошо: CPU-bound, много entity
+ctx.query::<(Read<Mass>, Write<Velocity>)>()
+    .par_for_each_component(|(mass, vel)| {
+        vel.y -= 9.8 * mass.0 * 0.016; // CPU-bound
+    });
+
+// Плохо: memory-bound, мало entity
+ctx.query::<Read<Position>>()
+    .par_for_each_component(|pos| {
+        let _ = pos.x.sqrt(); // memory-bound
+    });
+```
+
+### 12.6 Релизная сборка
 
 ```toml
 # В Cargo.toml (уже настроено):
@@ -954,6 +975,35 @@ codegen-units = 1
 # Запуск с параллелизмом:
 cargo run --release --features parallel
 ```
+
+### 12.7 Эталонные метрики производительности
+
+Измерения на **i5-12400F (6P+4E, 12 потоков)**, 1000k entities, release + LTO:
+
+| Операция | Throughput | Масштабирование |
+|----------|:----------:|:---------------:|
+| `spawn_many_silent` (1 comp) | **35.6 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (4 comp) | **15.6 M ops/s** | 🟢 O(N) |
+| `Query::for_each_component` | **143 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each_component` | **141.6 M ops/s** | 🟢 O(N) |
+| `Query<(Read, Write)>` | **127.6 M ops/s** | 🟢 O(N) |
+| insert component | **12.2 M ops/s** | 🟢 O(N) |
+| despawn | **47.5 M ops/s** | 🟢 O(N) |
+| resource read | **291 M ops/s** | 🟢 O(1) |
+| resource write | **396 M ops/s** | 🟢 O(1) |
+| event send + read | **152 M ops/s** | 🟢 O(N) |
+
+**Параллельное ускорение (speedup = seq/par, 12 потоков):**
+
+| Сценарий | 100k | 1000k | Комментарий |
+|----------|:----:|:-----:|-------------|
+| `par_for_each` CPU-bound (atan2+cos) | 1.56x | **3.98x** | 🟢 Растёт с N |
+| `par_for_each` memory-bound (sqrt) | 0.23x | 1.08x | 🟡 Memory bound |
+| Межсистемный, 2 CPU-bound | 1.07x | 1.07x | 🔴 Memory bound |
+| Solo 8 систем | 3.79x | **4.63x** | 🟢 Растёт с N |
+| Solo 12 систем | 4.02x | 4.65x | 🟡 Насыщение на 8 потоках |
+
+> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **3.98x ускорение**. Межсистемный параллелизм упирается в пропускную способность памяти (L3 кеш 18 MB) — это архитектурное ограничение CPU.
 
 ---
 
