@@ -137,7 +137,7 @@ pub struct TransformDirty;
 /// 2. Для каждой: вычислить GlobalTransform = parent.GlobalTransform * self.LocalTransform
 /// 3. Снять флаг TransformDirty
 pub fn propagate_transforms(world: &mut World) {
-    // Собираем dirty entity (через отдельный блок, чтобы отпустить borrow на world)
+    // 1. Собираем dirty entity
     let dirty_entities: Vec<Entity> = {
         let q = world.query_typed::<Read<TransformDirty>>();
         let mut entities = Vec::new();
@@ -149,35 +149,68 @@ pub fn propagate_transforms(world: &mut World) {
         return;
     }
 
-    // Для каждой dirty entity вычисляем GlobalTransform
-    for entity in dirty_entities {
+    // 2. Топологическая сортировка dirty entity (корни → листья)
+    //    Итеративный DFS: для каждого dirty entity поднимаемся по предкам
+    //    и добавляем их в порядке от корня к листьям.
+    use rustc_hash::FxHashSet;
+
+    let mut ordered = Vec::with_capacity(dirty_entities.len());
+    let mut seen = FxHashSet::default();
+
+    for &entity in &dirty_entities {
+        if !world.get::<TransformDirty>(entity).is_some() {
+            continue;
+        }
+
+        // Явный стек для итеративного DFS
+        let mut stack = vec![entity];
+
+        while let Some(top) = stack.last().copied() {
+            if seen.contains(&top.index) {
+                stack.pop();
+                continue;
+            }
+
+            // Есть ли dirty родитель, который ещё не в `seen`?
+            let parent = world.get_relation_target(top, ChildOf);
+            let need_parent = parent
+                .map(|p| {
+                    world.get::<TransformDirty>(p).is_some() && !seen.contains(&p.index)
+                })
+                .unwrap_or(false);
+
+            if need_parent {
+                stack.push(parent.unwrap());
+            } else {
+                seen.insert(top.index);
+                ordered.push(top);
+                stack.pop();
+            }
+        }
+    }
+
+    // 3. Sequential обработка от корней к листьям
+    for entity in ordered {
         let local = match world.get::<LocalTransform>(entity) {
             Some(l) => *l,
-            None => continue, // нет LocalTransform — нечего вычислять
+            None => continue,
         };
 
         let parent = world.get_relation_target(entity, ChildOf);
 
         let global_matrix = if let Some(parent_entity) = parent {
-            // Есть родитель: GlobalTransform = parent.Global * child.Local
             match world.get::<GlobalTransform>(parent_entity) {
-                Some(parent_global) => parent_global.0 * local.to_matrix(),
-                None => {
-                    // У родителя ещё нет GlobalTransform — fallback на local
-                    local.to_matrix()
-                }
+                Some(pg) => pg.0 * local.to_matrix(),
+                None => local.to_matrix(),
             }
         } else {
-            // Нет родителя: GlobalTransform = LocalTransform
             local.to_matrix()
         };
 
-        // Записываем GlobalTransform
         if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
             gt.0 = global_matrix;
         }
 
-        // Снимаем TransformDirty
         world.remove::<TransformDirty>(entity);
     }
 }

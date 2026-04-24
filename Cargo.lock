@@ -145,6 +145,7 @@ dependencies = [
  "apex-scripting",
  "apex-serialization",
  "env_logger",
+ "glam",
  "log",
  "rayon",
  "rhai",

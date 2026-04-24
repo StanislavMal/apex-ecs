@@ -652,6 +652,10 @@ impl World {
         from_location:   EntityLocation,
         to_archetype_id: ArchetypeId,
     ) -> usize {
+        // Любое перемещение entity между archetypes может изменить
+        // результаты запросов → сбрасываем кэш.
+        self.query_cache.invalidate();
+
         let from_idx = from_location.archetype_id.0 as usize;
         let to_idx   = to_archetype_id.0 as usize;
         let from_row = from_location.row;
