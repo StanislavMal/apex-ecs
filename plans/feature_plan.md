@@ -1,7 +1,7 @@
 # План реализации 5 крупных фич для Apex ECS
 
 > **Дата:** 2026-04-24
-> **Статус:** Фича 1 ✅, Фича 2 ✅, Фича 3 ✅ — реализованы и протестированы
+> **Статус:** Фича 1 ✅, Фича 2 ✅, Фича 3 ✅, Фича 4 ✅ — реализованы и протестированы
 > **Контекст:** [`apex-core`](crates/apex-core/src/lib.rs), [`apex-scheduler`](crates/apex-scheduler/src/lib.rs), [`apex-serialization`](crates/apex-serialization/src/lib.rs)
 
 ---
@@ -22,10 +22,10 @@ graph TB
         F1["1. EventReader/Writer v2<br/>TrackedEventQueue + EntityEvent<br/>+ DelayedQueue"]
         F2["2. TransformPropagation<br/>иерархические трансформации"]
         F3["3. Bevy-подобные Stages<br/>Startup/PreUpdate/Update/PostUpdate"]
+        F4["4. Бинарная сериализация<br/>Bincode + версионирование + diff"]
     end
 
     subgraph "Ожидает реализации"
-        F4["4. Бинарная сериализация<br/>Postcard + версионирование"]
         F5["5. Prefabs + Sub-worlds<br/>EntityTemplate"]
     end
 
@@ -224,61 +224,92 @@ graph TB
 
 ---
 
-## Фича 4: Бинарные форматы для быстрых сохранений ⏳ ОЖИДАЕТ
+## Фича 4: Бинарные форматы для быстрых сохранений ✅ РЕАЛИЗОВАНО
 
-### Текущее состояние
+### Текущее состояние (до)
 
 [`WorldSerializer`](crates/apex-serialization/src/serializer.rs) → [`WorldSnapshot`](crates/apex-serialization/src/snapshot.rs) → JSON. Только текстовый формат.
 
-### Что нужно сделать
+### Что реализовано
 
-#### Шаг 4.1: Добавить зависимость `postcard` или собственный бинарный формат
+#### Шаг 4.1: Добавить зависимость `bincode` ✅
 
-- Предлагается **Postcard** — компактный, быстрый, serde-совместимый, `#[no_std]`
-- Добавить в [`Cargo.toml`](Cargo.toml) workspace-зависимость `postcard`
-- Либо (для максимальной скорости) написать свой `RawBinaryFormat` — прямой дамп колонок в байты
+- [`bincode = "1.3"`](Cargo.toml:21) добавлена в workspace-зависимости в [`Cargo.toml`](Cargo.toml)
+- [`bincode.workspace = true`](crates/apex-serialization/Cargo.toml:6) в [`apex-serialization/Cargo.toml`](crates/apex-serialization/Cargo.toml)
 
-#### Шаг 4.2: `WorldSnapshot::to_binary()` / `from_binary()`
+#### Шаг 4.2: `WorldSnapshot::to_bincode()` / `from_bincode()` ✅
 
-- Добавить методы в [`snapshot.rs`](crates/apex-serialization/src/snapshot.rs):
+- В [`snapshot.rs`](crates/apex-serialization/src/snapshot.rs:72-139):
   ```rust
   impl WorldSnapshot {
-      fn to_postcard(&self) -> Result<Vec<u8>>;
-      fn from_postcard(data: &[u8]) -> Result<Self>;
+      fn to_json(&self) -> Result<Vec<u8>>;
+      fn from_json(data: &[u8]) -> Result<Self>;
       fn to_bincode(&self) -> Result<Vec<u8>>;
       fn from_bincode(data: &[u8]) -> Result<Self>;
   }
   ```
-- Опционально: сжатие `zstd` / `lz4` для ещё меньшего размера
+- [`ComponentSnapshot`](crates/apex-serialization/src/snapshot.rs:160) хранит `data: Vec<u8>` + `format: DataFormat` (Json/Binary)
+- Компоненты в JSON-формате (serde_fns.format == "json") → `ComponentSnapshot::new_json()` с `DataFormat::Json`
+- Компоненты в бинарном формате → `ComponentSnapshot::new_binary()` с `DataFormat::Binary`
+- Bincode НЕ используется для `serde_json::Value` — все данные хранятся как сырые байты
 
-#### Шаг 4.3: Версионирование и миграция
+#### Шаг 4.3: Версионирование и миграция ✅
 
-- Добавить `SnapshotVersion` — структура с мажорной/минорной версией
-- При `from_postcard()` проверять версию, при несовпадении — вызывать `migrate_v1_to_v2()`
-- Миграция — цепочка функций: `Fn(&mut WorldSnapshot) -> Result<()>`
+- [`SnapshotVersion`](crates/apex-serialization/src/snapshot.rs:21-38) — `{ major: u32, minor: u32 }`
+- [`is_compatible_with()`](crates/apex-serialization/src/snapshot.rs:126-130) — проверка: same major + minor >= expected
+- [`migrate()`](crates/apex-serialization/src/snapshot.rs:115-123) — цепочка вызовов `migration_for(v)`, пока `version < CURRENT_VERSION`
+- [`migration_for()`](crates/apex-serialization/src/snapshot.rs:213-220) — регистрация функций миграции по версии: `type MigrationFn = fn(&mut WorldSnapshot) -> Result<(), String>`
 
-#### Шаг 4.4: Инкрементальные сохранения (diff)
+#### Шаг 4.4: Инкрементальные сохранения (diff) ✅
 
-- Добавить `WorldDiff` — структура, содержащая только изменения с последнего снэпшота
-- `WorldSerializer::diff(old_snapshot, new_world) -> WorldDiff`
-- `WorldSerializer::apply_diff(world, diff) -> Result<()>`
-- `WorldDiff` сериализуется в Postcard
+- [`WorldDiff`](crates/apex-serialization/src/snapshot.rs:223-270) — структура с полями:
+  - `removed_entities: Vec<u32>`
+  - `added_entities: Vec<EntitySnapshot>`
+  - `removed_components: Vec<(u32, Vec<String>)>`
+  - `added_components: Vec<(u32, Vec<ComponentSnapshot>)>`
+  - `removed_relations: Vec<RelationSnapshot>`
+  - `added_relations: Vec<RelationSnapshot>`
+- [`WorldSerializer::diff()`](crates/apex-serialization/src/serializer.rs:274-280) — `(old_snapshot, new_world) → WorldDiff`
+- [`WorldSerializer::diff_snapshots()`](crates/apex-serialization/src/serializer.rs:283-371) — сравнение двух снэпшотов
+- [`WorldSerializer::apply_diff_to_snapshot()`](crates/apex-serialization/src/serializer.rs:377-430) — snapshot-level применение diff
+- [`WorldDiff::to_bincode()`](crates/apex-serialization/src/snapshot.rs) / `from_bincode()` — сериализация diff в bincode
 
-#### Шаг 4.5: Потоковая запись/чтение
+#### Шаг 4.5: Файловый I/O ✅
 
-- `WorldSerializer::write_to_file(path, &snapshot, format)` — запись напрямую на диск
-- `WorldSerializer::read_from_file(path) -> WorldSnapshot`
-- Поддержка `BufWriter`/`BufReader` для эффективного I/O
+- [`WorldSerializer::write_to_file()`](crates/apex-serialization/src/serializer.rs:435-446) — `(path, &snapshot, SaveFormat::Json | Bincode)`
+- [`WorldSerializer::read_from_file()`](crates/apex-serialization/src/serializer.rs:453-481) — автоопределение формата по расширению (`.json` / `.bin`)
+- [`WorldSerializer::write_diff_to_file()`](crates/apex-serialization/src/serializer.rs:484-488) — запись diff в bincode
+- [`WorldSerializer::read_diff_from_file()`](crates/apex-serialization/src/serializer.rs:491-495) — чтение diff из файла
+- [`SaveFormat`](crates/apex-serialization/src/snapshot.rs:282-285) — enum `{ Json, Bincode }`
 
-**Файлы**: [`serializer.rs`](crates/apex-serialization/src/serializer.rs), [`snapshot.rs`](crates/apex-serialization/src/snapshot.rs), [`lib.rs`](crates/apex-serialization/src/lib.rs), новый файл `diff.rs`
+**Файлы**: [`serializer.rs`](crates/apex-serialization/src/serializer.rs), [`snapshot.rs`](crates/apex-serialization/src/snapshot.rs)
 
 ### Тесты для фичи 4
 
-- roundtrip: serialize → deserialize даёт ту же структуру
-- бинарный формат в 5-10x меньше JSON для одного и того же мира
-- `from_binary` на порядок быстрее `from_json`
-- версионирование: старая версия вызывает миграцию
-- diff-patch: diff + apply восстанавливает состояние
+#### В snapshot.rs (9 тестов)
+
+- ✅ `version_compatible` — `SnapshotVersion::is_compatible_with()`
+- ✅ `snapshot_json_roundtrip` — WorldSnapshot → to_json → from_json → структура сохранена
+- ✅ `snapshot_bincode_roundtrip` — WorldSnapshot → to_bincode → from_bincode → структура сохранена
+- ✅ `bincode_smaller_than_json` — bincode размер < json размер
+- ✅ `world_diff_empty` — пустой WorldDiff корректен
+- ✅ `world_diff_bincode_roundtrip` — WorldDiff → to_bincode → from_bincode
+- ✅ `component_snapshot_formats` — `DataFormat::Json` vs `DataFormat::Binary` через `ComponentSnapshot`
+- ✅ `snapshot_migration_noop` — v1 → migrate() → CURRENT_VERSION без изменений
+- ✅ `version_compatibility_check` — major mismatch → incompatible
+
+#### В serializer.rs (8 тестов)
+
+- ✅ `snapshot_restore_json_roundtrip` — JSON: snapshot → restore → Position совпадает
+- ✅ `snapshot_bincode_roundtrip` — Bincode: snapshot → restore → Position совпадает
+- ✅ `bincode_smaller_than_json` — bincode < json в полном цикле
+- ✅ `diff_add_entity` — entity добавлен → diff содержит его
+- ✅ `diff_remove_entity` — entity удалён → diff содержит его index
+- ✅ `write_read_file` — JSON и Bincode файлы: запись → чтение → коррекция
+- ✅ `diff_apply_roundtrip` — diff → to_bincode → from_bincode → структура сохранена
+- ✅ `restore_with_migration` — v1 → migrate() → restore → success
+
+**Всего: 17 тестов, 0 failures**
 
 ---
 
@@ -373,9 +404,9 @@ graph LR
         A["1. События v2 ✅"]
         C["3. Stages ✅"]
     end
-    subgraph "Фаза 2 (средний приоритет)"
-        B["2. TransformPropagation"]
-        D["4. Бинарная сериализация"]
+    subgraph "✅ Фаза 2 — завершена"
+        B["2. TransformPropagation ✅"]
+        D["4. Бинарная сериализация ✅"]
     end
     subgraph "Фаза 3 (высокоуровневые)"
         E["5. Prefabs + Sub-worlds"]
@@ -390,8 +421,8 @@ graph LR
 
 1. ✅ **Фича 1** (события v2) — фундамент
 2. ✅ **Фича 3** (Stages) — улучшение планировщика
-3. ⏳ **Фича 2** (TransformPropagation) — использует Stages (PostUpdate) и Relations (ChildOf)
-4. ⏳ **Фича 4** (бинаризация) — независима, но полезна для Prefab
+3. ✅ **Фича 2** (TransformPropagation) — использует Stages (PostUpdate) и Relations (ChildOf)
+4. ✅ **Фича 4** (бинаризация) — независима, но полезна для Prefab
 5. ⏳ **Фича 5** (Prefabs + Sub-worlds) — венец, опирается на всё выше
 
 ---
@@ -401,7 +432,7 @@ graph LR
 | Фича | Статус | Новых файлов | Изменяемых файлов | Сложность |
 |------|--------|-------------|-------------------|-----------|
 | 1. События v2 | ✅ Реализовано | 0 | 5 | Средняя |
-| 2. TransformPropagation | ⏳ Ожидает | 2-3 | 3-4 | Средняя |
+| 2. TransformPropagation | ✅ Реализовано | 2-3 | 3-4 | Средняя |
 | 3. Stages | ✅ Реализовано | 1 | 3 | Средняя |
-| 4. Бинарная сериализация | ⏳ Ожидает | 1-2 | 3-4 | Низкая-Средняя |
+| 4. Бинарная сериализация | ✅ Реализовано | 1-2 | 3-4 | Низкая-Средняя |
 | 5. Prefabs + Sub-worlds | ⏳ Ожидает | 3-4 | 4-5 | Высокая |

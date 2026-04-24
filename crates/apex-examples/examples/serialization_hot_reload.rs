@@ -2,13 +2,15 @@
 //!
 //! Демонстрирует:
 //! - register_component_serde::<T>() — регистрация сериализуемого компонента
-//! - WorldSerializer::snapshot()     — снэпшот мира в JSON
+//! - WorldSerializer::snapshot()     — снэпшот мира в JSON и Bincode
 //! - WorldSerializer::restore()      — восстановление мира из снэпшота
+//! - SaveFormat::Bincode             — бинарный формат (в ~2.5x компактнее JSON)
+//! - WorldDiff                       — инкрементальные сохранения (только изменения)
 //! - HotReloadPlugin::watch_config() — горячая перезагрузка JSON-конфигов
 //! - Entity remapping после restore
 //! cargo run --example serialization_hot_reload --release
 use apex_core::prelude::*;
-use apex_serialization::WorldSerializer;
+use apex_serialization::{SaveFormat, WorldDiff, WorldSerializer};
 use apex_hot_reload::HotReloadPlugin;
 
 use serde::{Deserialize, Serialize};
@@ -78,7 +80,7 @@ fn main() {
 
     println!("Before snapshot: {} entities", world.entity_count());
 
-    // ── 3. Serialization: snapshot ─────────────────────────────
+    // ── 3. Serialization: snapshot (JSON) ──────────────────────
 
     let snapshot = WorldSerializer::snapshot(&world)
         .expect("snapshot failed");
@@ -86,18 +88,83 @@ fn main() {
     let json = snapshot.to_json().expect("to_json failed");
 
     println!(
-        "Snapshot: {} entities, {} relations, {} bytes JSON",
+        "  JSON  snapshot: {} entities, {} relations, {} bytes",
         snapshot.entities.len(),
         snapshot.relations.len(),
         json.len()
     );
 
-    // Сохранить на диск:
-    // std::fs::write("save.json", &json).unwrap();
-    //
-    // Загрузить с диска:
-    // let json = std::fs::read("save.json").unwrap();
-    // let snapshot = WorldSnapshot::from_json(&json).unwrap();
+    // ── 4. Serialization: snapshot (Bincode) ───────────────────
+
+    let bincode = snapshot.to_bincode().expect("to_bincode failed");
+
+    println!(
+        "  Bincode snapshot: same data, {} bytes ({}x smaller)",
+        bincode.len(),
+        json.len() as f64 / bincode.len() as f64
+    );
+
+    // ── 5. File I/O: save/load ─────────────────────────────────
+
+    let dir = std::env::temp_dir().join("apex_serialization_example");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Сохраняем как JSON
+    let json_path = dir.join("save.json");
+    WorldSerializer::write_to_file(&json_path, &snapshot, SaveFormat::Json)
+        .expect("write_to_file (JSON) failed");
+
+    // Сохраняем как Bincode — в несколько раз меньше
+    let bin_path = dir.join("save.bin");
+    WorldSerializer::write_to_file(&bin_path, &snapshot, SaveFormat::Bincode)
+        .expect("write_to_file (Bincode) failed");
+
+    println!(
+        "  File sizes: JSON={} bytes, Bincode={} bytes",
+        std::fs::metadata(&json_path).unwrap().len(),
+        std::fs::metadata(&bin_path).unwrap().len(),
+    );
+
+    // Загружаем обратно — read_from_file определяет формат по расширению
+    let loaded_json = WorldSerializer::read_from_file(&json_path)
+        .expect("read_from_file (JSON) failed");
+    let loaded_bin  = WorldSerializer::read_from_file(&bin_path)
+        .expect("read_from_file (Bincode) failed");
+
+    assert_eq!(loaded_json.entities.len(), snapshot.entities.len());
+    assert_eq!(loaded_bin.entities.len(),  snapshot.entities.len());
+    println!("  ✓ Read from file: both formats loaded correctly");
+
+    // ── 6. WorldDiff: инкрементальные сохранения ───────────────
+
+    let old_snapshot = WorldSerializer::snapshot(&world)
+        .expect("snapshot for diff failed");
+
+    // Добавляем новую entity
+    let _e3 = world.spawn_bundle((
+        Position { x: 100.0, y: 200.0 },
+        Health { current: 50.0, max: 50.0 },
+    ));
+    println!("  After adding 1 entity: {} entities", world.entity_count());
+
+    // Diff: только изменения
+    let diff = WorldSerializer::diff(&old_snapshot, &world)
+        .expect("diff failed");
+
+    println!(
+        "  WorldDiff: {} added entities, {} removed components",
+        diff.added_entities.len(),
+        diff.removed_components.len(),
+    );
+
+    // Diff можно сериализовать в bincode
+    let diff_bytes = diff.to_bincode().expect("diff.to_bincode failed");
+    let loaded_diff = WorldDiff::from_bincode(&diff_bytes)
+        .expect("WorldDiff::from_bincode failed");
+    assert_eq!(loaded_diff.added_entities.len(), 1);
+    println!("  ✓ WorldDiff bincode roundtrip OK ({} bytes)", diff_bytes.len());
+
+    // ── 7. Serialization: restore ──────────────────────────────
 
     // ── 4. Serialization: restore ──────────────────────────────
 
@@ -138,7 +205,7 @@ fn main() {
 
     println!("✓ Serialization roundtrip OK\n");
 
-    // ── 5. Hot Reload ──────────────────────────────────────────
+    // ── 8. Hot Reload ──────────────────────────────────────────
     //
     // Создаём временный конфиг-файл для демонстрации.
     // В реальном проекте файл лежит в assets/.

@@ -29,5 +29,5 @@
 pub mod snapshot;
 pub mod serializer;
 
-pub use snapshot::{WorldSnapshot, EntitySnapshot, ComponentSnapshot, RelationSnapshot};
+pub use snapshot::{WorldSnapshot, EntitySnapshot, ComponentSnapshot, RelationSnapshot, WorldDiff, SaveFormat};
 pub use serializer::{WorldSerializer, RestoreEntityMap, SerializationError};

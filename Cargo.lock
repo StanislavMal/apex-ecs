@@ -219,6 +219,7 @@ name = "apex-serialization"
 version = "0.1.0"
 dependencies = [
  "apex-core",
+ "bincode",
  "log",
  "rustc-hash",
  "serde",
