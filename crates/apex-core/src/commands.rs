@@ -78,6 +78,33 @@ impl Commands {
         self.queue.push(Command::Apply(Box::new(f)));
     }
 
+    /// Создать entity из зарегистрированного шаблона с параметрами.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// cmds.spawn_from_template("Monster", TemplateParams::new()
+    ///     .with("speed", 10.0f32));
+    /// ```
+    pub fn spawn_from_template(&mut self, name: &str, params: crate::template::TemplateParams) {
+        let name = name.to_string();
+        self.queue.push(Command::Apply(Box::new(move |world: &mut World| {
+            world.spawn_from_template(&name, &params);
+        })));
+    }
+
+    /// Создать entity из шаблона с параметрами по умолчанию.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// cmds.spawn_template("Monster");
+    /// ```
+    pub fn spawn_template(&mut self, name: &str) {
+        let name = name.to_string();
+        self.queue.push(Command::Apply(Box::new(move |world: &mut World| {
+            world.spawn_template(&name);
+        })));
+    }
+
     /// Применить все накопленные команды к миру
     pub fn apply(&mut self, world: &mut World) {
         for cmd in self.queue.drain(..) {

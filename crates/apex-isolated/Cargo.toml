@@ -1,0 +1,13 @@
+[package]
+name = "apex-isolated"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+apex-core      = { path = "../apex-core" }
+apex-scheduler = { path = "../apex-scheduler" }
+
+crossbeam-channel = { workspace = true }
+serde             = { workspace = true }
+bincode           = { workspace = true }
+log               = { workspace = true }

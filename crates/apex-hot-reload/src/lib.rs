@@ -39,7 +39,9 @@
 pub mod asset_registry;
 pub mod watcher;
 pub mod plugin;
+pub mod prefab_plugin;
 
 pub use asset_registry::{AssetId, AssetRegistry, AssetChange};
 pub use watcher::FileWatcher;
 pub use plugin::{HotReloadPlugin, HotReloadError, ConfigLoader};
+pub use prefab_plugin::{PrefabPlugin, PrefabAsset};

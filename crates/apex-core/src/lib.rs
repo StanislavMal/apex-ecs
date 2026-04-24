@@ -10,6 +10,7 @@ pub mod resources;
 pub mod storage;
 pub mod sub_world;
 pub mod system_param;
+pub mod template;
 pub mod transform;
 pub mod world;
 
@@ -42,4 +43,6 @@ pub mod prelude {
         Res, ResMut, EventReader, EventWriter,
         WorldQuerySystemAccess, AutoSystem,
     };
+    pub use crate::template::{TemplateParams, EntityTemplate};
+    pub use crate::impl_entity_template;
 }

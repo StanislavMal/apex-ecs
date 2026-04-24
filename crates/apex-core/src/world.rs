@@ -11,6 +11,7 @@ use crate::{
     relations::{IdIndex, RelationRegistry, SubjectIndex},
     resources::ResourceMap,
     system_param::{Res, ResMut, EventReader, EventWriter, WorldQuerySystemAccess},
+    template::TemplateRegistry,
 };
 
 // ── QueryCache ─────────────────────────────────────────────────
@@ -153,6 +154,8 @@ pub struct World {
     /// Функция-указатель (Copy), чтобы избежать borrow conflict с self.
     /// Ключ — ComponentId.
     pub(crate) write_hooks:     FxHashMap<ComponentId, fn(Entity, &mut World)>,
+    /// Реестр именованных шаблонов (EntityTemplate).
+    pub(crate) templates:       TemplateRegistry,
 }
 
 impl World {
@@ -170,6 +173,7 @@ impl World {
             resources:       ResourceMap::new(),
             events:          EventRegistry::new(),
             write_hooks:     FxHashMap::default(),
+            templates:       TemplateRegistry::new(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
@@ -480,11 +484,9 @@ impl World {
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
         let new_row     = self.move_entity(entity, location, new_arch_id);
-        if !data.is_empty() {
-            unsafe {
-                self.archetypes[new_arch_id.0 as usize]
-                    .write_component(new_row, component_id, data.as_ptr(), tick);
-            }
+        unsafe {
+            self.archetypes[new_arch_id.0 as usize]
+                .write_component(new_row, component_id, data.as_ptr(), tick);
         }
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
@@ -1155,7 +1157,7 @@ impl World {
     pub fn entity_allocator(&self) -> &crate::entity::EntityAllocator {
         &self.entities
     }
- 
+  
     /// Получить ComponentId по строковому имени типа.
     ///
     /// Используется `apex-scripting` для разрешения имён из скриптов.
@@ -1163,5 +1165,36 @@ impl World {
     /// но вызывается только при инициализации движка — не в hot path.
     pub fn component_id_by_name(&self, name: &str) -> Option<crate::component::ComponentId> {
         self.registry.iter().find(|info| info.name == name).map(|i| i.id)
+    }
+
+    // ── EntityTemplate API ────────────────────────────────────────
+
+    /// Зарегистрировать именованный шаблон сущности.
+    pub fn register_template(&mut self, name: &str, template: impl crate::template::EntityTemplate + 'static) {
+        self.templates.register(name, template);
+    }
+
+    /// Создать entity из зарегистрированного шаблона с параметрами.
+    pub fn spawn_from_template(
+        &mut self,
+        name: &str,
+        params: &crate::template::TemplateParams,
+    ) -> Option<crate::entity::Entity> {
+        // Используем raw pointer, чтобы избежать borrow conflict:
+        // `self.templates` (immut) и `self` (mut) одновременно.
+        let raw = self.templates.get_raw(name)?;
+        // SAFETY: шаблон жив, пока жив World (мы его не удаляем),
+        // и get_raw возвращает корректный указатель.
+        unsafe { Some((*raw).spawn(self, params)) }
+    }
+
+    /// Создать entity из шаблона с параметрами по умолчанию.
+    pub fn spawn_template(&mut self, name: &str) -> Option<crate::entity::Entity> {
+        self.spawn_from_template(name, &crate::template::TemplateParams::new())
+    }
+
+    /// Доступ к реестру шаблонов (только для чтения).
+    pub fn template_registry(&self) -> &crate::template::TemplateRegistry {
+        &self.templates
     }
 }

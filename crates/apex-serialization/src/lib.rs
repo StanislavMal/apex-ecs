@@ -26,8 +26,10 @@
 //! // entity_map: HashMap<old_index, new_Entity> — для патча внешних ссылок
 //! ```
 
+pub mod prefab;
 pub mod snapshot;
 pub mod serializer;
 
+pub use prefab::{PrefabManifest, PrefabComponent, PrefabChild, PrefabLoader, PrefabError};
 pub use snapshot::{WorldSnapshot, EntitySnapshot, ComponentSnapshot, RelationSnapshot, WorldDiff, SaveFormat};
 pub use serializer::{WorldSerializer, RestoreEntityMap, SerializationError};

@@ -9,8 +9,10 @@ apex-graph         = { path = "../apex-graph" }
 apex-scheduler     = { path = "../apex-scheduler" }
 apex-serialization = { path = "../apex-serialization" }
 apex-hot-reload    = { path = "../apex-hot-reload" }
+apex-isolated      = { path = "../apex-isolated" }
 apex-scripting     = { path = "../apex-scripting" }
 apex-macros        = { path = "../apex-macros" }
+crossbeam-channel  = { workspace = true }
 rhai               = { workspace = true }
 serde              = { version = "1.0", features = ["derive"] }
 serde_json         = "1.0"

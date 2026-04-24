@@ -6,6 +6,7 @@ members = [
     "crates/apex-scheduler",
     "crates/apex-serialization",
     "crates/apex-hot-reload",
+    "crates/apex-isolated",
     "crates/apex-examples",
     "crates/apex-bench",
     "crates/apex-macros",
@@ -47,6 +48,9 @@ bincode    = "1.3"
 
 # Математика для трансформаций
 glam = { version = "0.29", features = ["serde"] }
+
+# Каналы для WorldBridge
+crossbeam-channel = "0.5"
 
 # Скриптинг — однопоточный Rhai (без "sync" feature, используем Rc<RefCell>)
 rhai = { version = "1.19", features = ["serde"] }

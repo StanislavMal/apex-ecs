@@ -12,10 +12,11 @@ use std::path::Path;
 use apex_core::{
     component::{ComponentId, Tick},
     entity::Entity,
-    relations::{is_relation_id, decode_kind, decode_target, encode_relation},
+    relations::{is_relation_id, decode_kind, decode_target, encode_relation, ChildOf},
     world::World,
 };
 
+use crate::prefab::{PrefabChild, PrefabComponent, PrefabManifest};
 use crate::snapshot::{
     ComponentSnapshot, EntitySnapshot, RelationSnapshot, SaveFormat, WorldDiff,
     WorldSnapshot,
@@ -51,6 +52,9 @@ pub enum SerializationError {
 
     #[error("migration error: {0}")]
     Migration(String),
+
+    #[error("entity with index {index} not found in world")]
+    EntityNotFound { index: u32 },
 }
 
 // ── RestoreEntityMap ───────────────────────────────────────────
@@ -483,6 +487,94 @@ impl WorldSerializer {
         let data = std::fs::read(path)?;
         let diff = WorldDiff::from_bincode(&data)?;
         Ok(diff)
+    }
+
+    // ── Prefab export ─────────────────────────────────────────────
+
+    /// Создать [`PrefabManifest`] из одной entity.
+    ///
+    /// Сериализуются только компоненты, зарегистрированные через
+    /// `world.register_component_serde::<T>()`. Relation-компоненты
+    /// и ZST пропускаются.
+    pub fn entity_to_prefab(
+        world: &World,
+        entity: Entity,
+    ) -> Result<PrefabManifest, SerializationError> {
+        let location = world
+            .entity_allocator()
+            .get_location(entity)
+            .ok_or(SerializationError::EntityNotFound { index: entity.index() })?;
+
+        let arch = &world.archetypes()[location.archetype_id.as_usize()];
+        let mut components = Vec::new();
+
+        for col in arch.columns() {
+            let cid: apex_core::component::ComponentId = col.id();
+            let info = match world.registry().get_info(cid) {
+                Some(i) => i,
+                None => continue,
+            };
+
+            // Relation-компоненты пропускаем
+            if is_relation_id(info.id) {
+                continue;
+            }
+
+            // Компоненты без serde пропускаем
+            let serde_fns = match &info.serde {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // ZST — нечего сериализовать
+            if info.size == 0 {
+                continue;
+            }
+
+            // Сериализуем сырые данные компонента в байты
+            let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row)) }
+                .map_err(|e| SerializationError::SerializeFailed {
+                    type_name: info.name.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            // Парсим JSON-байты в serde_json::Value
+            let json_value: serde_json::Value = serde_json::from_slice(&raw_bytes)?;
+
+            components.push(PrefabComponent {
+                type_name: info.name.to_string(),
+                value: json_value,
+            });
+        }
+
+        Ok(PrefabManifest {
+            name: format!("entity_{}", entity.index()),
+            components,
+            children: Vec::new(),
+        })
+    }
+
+    /// Создать [`PrefabManifest`] из entity и всей её иерархии детей.
+    ///
+    /// Рекурсивно обходит детей через `ChildOf` relation, создавая
+    /// вложенные `PrefabChild` записи.
+    pub fn hierarchy_to_prefab(
+        world: &World,
+        root: Entity,
+    ) -> Result<PrefabManifest, SerializationError> {
+        let mut manifest = Self::entity_to_prefab(world, root)?;
+
+        // Рекурсивно собираем детей
+        let children: Vec<Entity> = world.children_of(ChildOf, root).collect();
+        for child in children {
+            let child_manifest = Self::hierarchy_to_prefab(world, child)?;
+            manifest.children.push(PrefabChild {
+                prefab: child_manifest.name.clone(),
+                overrides: Vec::new(),
+            });
+        }
+
+        Ok(manifest)
     }
 }
 

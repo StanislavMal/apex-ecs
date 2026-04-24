@@ -12,6 +12,11 @@ pub struct ArchetypeId(pub(crate) u32);
 
 impl ArchetypeId {
     pub const EMPTY: Self = Self(0);
+
+    /// Получить внутренний индекс (для доступа к `world.archetypes()`).
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
 }
 
 pub struct Column {

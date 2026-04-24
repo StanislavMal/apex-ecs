@@ -140,10 +140,12 @@ dependencies = [
  "apex-core",
  "apex-graph",
  "apex-hot-reload",
+ "apex-isolated",
  "apex-macros",
  "apex-scheduler",
  "apex-scripting",
  "apex-serialization",
+ "crossbeam-channel 0.5.15",
  "env_logger",
  "glam",
  "log",
@@ -176,6 +178,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "apex-isolated"
+version = "0.1.0"
+dependencies = [
+ "apex-core",
+ "apex-scheduler",
+ "bincode",
+ "crossbeam-channel 0.5.15",
+ "log",
+ "serde",
 ]
 
 [[package]]
