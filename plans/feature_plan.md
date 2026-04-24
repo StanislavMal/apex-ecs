@@ -1,7 +1,7 @@
 # План реализации 5 крупных фич для Apex ECS
 
 > **Дата:** 2026-04-24
-> **Статус:** Фича 1 ✅, Фича 3 ✅ — реализованы и протестированы
+> **Статус:** Фича 1 ✅, Фича 2 ✅, Фича 3 ✅ — реализованы и протестированы
 > **Контекст:** [`apex-core`](crates/apex-core/src/lib.rs), [`apex-scheduler`](crates/apex-scheduler/src/lib.rs), [`apex-serialization`](crates/apex-serialization/src/lib.rs)
 
 ---
@@ -20,11 +20,11 @@ graph TB
 
     subgraph "✅ Реализовано"
         F1["1. EventReader/Writer v2<br/>TrackedEventQueue + EntityEvent<br/>+ DelayedQueue"]
+        F2["2. TransformPropagation<br/>иерархические трансформации"]
         F3["3. Bevy-подобные Stages<br/>Startup/PreUpdate/Update/PostUpdate"]
     end
 
     subgraph "Ожидает реализации"
-        F2["2. TransformPropagation<br/>иерархические трансформации"]
         F4["4. Бинарная сериализация<br/>Postcard + версионирование"]
         F5["5. Prefabs + Sub-worlds<br/>EntityTemplate"]
     end
@@ -97,49 +97,59 @@ graph TB
 
 ---
 
-## Фича 2: Иерархические трансформации (TransformPropagation) ⏳ ОЖИДАЕТ
+## Фича 2: Иерархические трансформации (TransformPropagation) ✅ РЕАЛИЗОВАНО
 
-### Текущее состояние
+### Исходное состояние
 
-Есть [`ChildOf`](crates/apex-core/src/relations.rs:543) relation, [`children_of()`](crates/apex-core/src/relations.rs:407), [`despawn_recursive()`](crates/apex-core/src/relations.rs:437). Нет автоматического распространения трансформаций.
+Есть [`ChildOf`](crates/apex-core/src/relations.rs:543) relation, [`children_of()`](crates/apex-core/src/relations.rs:407), [`despawn_recursive()`](crates/apex-core/src/relations.rs:437). Нет компонентов трансформаций и автоматического распространения.
 
-### Что нужно сделать
+### Что реализовано
 
-#### Шаг 2.1: Компоненты `LocalTransform` и `GlobalTransform`
+#### Шаг 2.1: Компоненты `LocalTransform` и `GlobalTransform` ✅
 
-- Определить `LocalTransform` (положение, поворот, масштаб) как `Component`
-- Определить `GlobalTransform` (итоговая мировая матрица 4x4) как `Component`
-- `GlobalTransform` — не сериализуемый runtime-компонент, пересчитывается из `LocalTransform`
+- [`LocalTransform`](crates/apex-core/src/transform.rs:44-48) — `translation: Vec3`, `rotation: Quat`, `scale: Vec3`
+- [`GlobalTransform`](crates/apex-core/src/transform.rs:99-100) — обёртка над `Mat4`, пересчитывается из `LocalTransform`
+- `to_matrix()` — преобразует `LocalTransform` в аффинную матрицу 4x4
+- Конструкторы: `from_translation()`, `from_rotation()`, `from_scale()`, `IDENTITY`, `Default`
 
-#### Шаг 2.2: Dirty-флаг для инкрементального пересчёта
+#### Шаг 2.2: Dirty-флаг для инкрементального пересчёта ✅
 
-- Добавить `TransformDirty` — маркерный компонент (или битовый флаг на entity)
-- При изменении `LocalTransform` у родителя, все дети (рекурсивно) помечаются `TransformDirty`
-- Система `propagate_transforms` обрабатывает только `TransformDirty` сущности, снимает флаг после пересчёта
+- [`TransformDirty`](crates/apex-core/src/transform.rs:126-127) — маркерный компонент
+- [`propagate_transforms()`](crates/apex-core/src/transform.rs:139-191) — sequential система:
+  1. Собирает все entity с `TransformDirty` через `query_typed::<Read<TransformDirty>>()`
+  2. Для каждой dirty entity вычисляет `GlobalTransform = parent.Global * local.to_matrix()`
+  3. Если нет родителя — `GlobalTransform = LocalTransform`
+  4. Снимает `TransformDirty` после записи
 
-#### Шаг 2.3: Система `TransformPropagationSystem`
+#### Шаг 2.3: Зависимость `glam` (математическая библиотека) ✅
 
-- Sequential-система, выполняющаяся в `PostUpdate`
-- Алгоритм:
-  1. Собрать корневые entity (родители без ChildOf)
-  2. BFS/DFS обход: для каждой entity вычислить `GlobalTransform = parent.GlobalTransform * child.LocalTransform`
-  3. Параллельная обработка независимых поддеревьев через `rayon`
-- Добавить `PropagatedChildren` ресурс для кеширования топологически отсортированного порядка обхода
+- Добавлена `glam = "0.29"` в [`Cargo.toml`](Cargo.toml:48)
+- Используется: `Vec3`, `Quat`, `Mat4` (`from_scale_rotation_translation`, `transform_point3`)
 
-#### Шаг 2.4: Интеграция с Scheduler
+#### Шаг 2.4: `TransformPlugin` — регистрация компонентов ✅
 
-- Зарегистрировать `propagate_transforms` как встроенную систему
-- Плагин `TransformPlugin` — конфигурируемый: можно включить/выключить, задать порядок
+- [`TransformPlugin::register_components(world)`](crates/apex-core/src/transform.rs:213-218) — регистрирует `LocalTransform`, `GlobalTransform`, `TransformDirty`
+- Система `propagate_transforms` добавляется пользователем вручную:
+  ```rust
+  scheduler.add_system_to_stage(
+      "propagate_transforms",
+      apex_core::transform::propagate_transforms,
+      StageLabel::PostUpdate,
+  );
+  ```
+- Scheduler не импортируется (избегаем циклической зависимости apex-core ↔ apex-scheduler)
 
-**Файлы**: новый модуль [`crates/apex-core/src/transform.rs`], [`relations.rs`](crates/apex-core/src/relations.rs), [`world.rs`](crates/apex-core/src/world.rs), [`scheduler`](crates/apex-scheduler/src/lib.rs)
+**Файлы**: [`crates/apex-core/src/transform.rs`], [`Cargo.toml`](Cargo.toml), [`crates/apex-core/Cargo.toml`](crates/apex-core/Cargo.toml), [`crates/apex-core/src/lib.rs`](crates/apex-core/src/lib.rs:13)
 
 ### Тесты для фичи 2
 
-- одна entity без ChildOf: GlobalTransform == LocalTransform
-- цепочка parent→child→grandchild: перемножение корректно
-- изменение LocalTransform родителя → все дети пересчитаны
-- dirty-флаг снимается после пропагации
-- параллельный пересчёт независимых поддеревьев
+- ✅ `local_transform_default_is_identity` — IDENTITY значения по умолчанию
+- ✅ `local_transform_to_matrix` — `to_matrix()` корректно транслирует точку
+- ✅ `global_transform_default_is_identity` — `GlobalTransform::default()` == `Mat4::IDENTITY`
+- ✅ `propagate_single_entity_no_parent` — GlobalTransform == LocalTransform, TransformDirty снят
+- ✅ `propagate_parent_child_chain` — parent(100,0,0) + child(10,0,0) → child.Global = (110,0,0)
+- ✅ `propagate_deep_hierarchy` — grandparent(50) + parent(30) + child(20) → parent=80, child=100
+- ✅ `no_transform_dirty_skips_propagation` — без TransformDirty GlobalTransform не меняется
 
 ---
 

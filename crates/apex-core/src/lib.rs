@@ -10,6 +10,7 @@ pub mod resources;
 pub mod storage;
 pub mod sub_world;
 pub mod system_param;
+pub mod transform;
 pub mod world;
 
 pub use access::AccessDescriptor;

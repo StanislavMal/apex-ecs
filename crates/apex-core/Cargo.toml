@@ -21,3 +21,6 @@ rayon = { workspace = true, optional = true }
 # Сериализация — нужна для Serializable трейта и make_serde_fns
 serde     = { workspace = true }
 serde_json = { workspace = true }
+
+# Математика для трансформаций
+glam = { workspace = true }
