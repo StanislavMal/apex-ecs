@@ -4,6 +4,7 @@ pub mod commands;
 pub mod component;
 pub mod entity;
 pub mod events;
+pub mod par_utils;
 pub mod query;
 pub mod relations;
 pub mod resources;
@@ -23,7 +24,7 @@ pub use sub_world::SubWorld;
 pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext, DeferredQueue};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
-pub use relations::{RelationKind, ChildOf, Owns, Likes};
+pub use relations::{RelationKind, ChildOf, Owns};
 pub use system_param::{
     Res, ResMut, EventReader, EventWriter,
     WorldQuerySystemAccess, AutoSystem,
@@ -38,7 +39,7 @@ pub mod prelude {
     pub use crate::world::{World, Bundle, CachedQuery, SystemContext, DeferredQueue};
     pub use crate::query::{Query, Read, Write, With, Without, Changed, QueryBuilder, WorldQuery};
     pub use crate::commands::Commands;
-    pub use crate::relations::{RelationKind, ChildOf, Owns, Likes};
+    pub use crate::relations::{RelationKind, ChildOf, Owns};
     pub use crate::system_param::{
         Res, ResMut, EventReader, EventWriter,
         WorldQuerySystemAccess, AutoSystem,

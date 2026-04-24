@@ -52,12 +52,14 @@
 
 pub mod stage;
 
+use std::any::TypeId;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 use apex_graph::Graph;
 use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
+    component::ComponentRegistry,
     world::{World, ParallelWorld, SystemContext},
     system_param::{AutoSystem, WorldQuerySystemAccess},
 };
@@ -316,6 +318,12 @@ pub struct Scheduler {
     /// Если Some — compile() использует этот порядок вместо hardcoded standard_order().
     /// Если None — используется StageLabel::standard_order().
     stage_order: Option<Vec<StageLabel>>,
+
+    /// Реестр имён компонентов TypeId → &'static str.
+    /// Заполняется из ComponentRegistry перед compile() в run()/run_sequential().
+    /// Используется `component_type_name()` для отображения реальных имён компонентов
+    /// в ConflictKind (вместо заглушки "<component>").
+    type_names: FxHashMap<TypeId, &'static str>,
 }
 
 impl Scheduler {
@@ -335,6 +343,7 @@ impl Scheduler {
             cached_archetype_count: 0,
             startup_completed: false,
             stage_order:      None,
+            type_names:       FxHashMap::default(),
         }
     }
 
@@ -554,6 +563,21 @@ impl Scheduler {
         self.graph_dirty    = true;
     }
 
+    /// Заполнить `type_names` из ComponentRegistry World'а.
+    ///
+    /// После вызова этой функции `component_type_name()` будет возвращать
+    /// реальные имена компонентов вместо `"<component>"`.
+    ///
+    /// Вызывается автоматически в `run()` / `run_sequential()`.
+    /// Можно вызвать вручную перед `compile()`, если нужны реальные имена
+    /// в `debug_plan_verbose()`.
+    pub fn populate_type_names(&mut self, registry: &ComponentRegistry) {
+        self.type_names.clear();
+        for info in registry.iter() {
+            self.type_names.insert(info.type_id, info.name);
+        }
+    }
+
     // ── Компиляция ─────────────────────────────────────────────
 
     /// Скомпилировать расписание.
@@ -707,119 +731,6 @@ impl Scheduler {
         }
 
         self.cached_archetype_count = arch_count;
-    }
-
-    /// Полная перестройка графа зависимостей.
-    ///
-    /// Вызывается при `graph_dirty = true`. Добавляет все системы как узлы,
-    /// затем все рёбра (явные + sequential барьеры + Write/Read конфликты).
-    fn rebuild_graph(&mut self) -> Result<(), SchedulerError> {
-        // Очищаем граф и метаданные рёбер
-        self.dependency_graph = Graph::new();
-        self.graph_nodes.clear();
-        self.edge_info.clear();
-
-        // Добавляем все системы как узлы
-        for system in &self.systems {
-            let node = self.dependency_graph.add_node(system.id);
-            self.graph_nodes.insert(system.id, node);
-        }
-
-        let n = self.systems.len();
-
-        // ── 1. Явные зависимости ───────────────────────────────
-        for system in &self.systems {
-            for &after_id in &system.after {
-                if let (Some(&from), Some(&to)) =
-                    (self.graph_nodes.get(&after_id), self.graph_nodes.get(&system.id))
-                {
-                    self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
-                    self.edge_info.push(GraphEdgeInfo {
-                        from_id: after_id,
-                        to_id:   system.id,
-                        kind:    ConflictKind::Explicit,
-                    });
-                }
-            }
-            for &before_id in &system.before {
-                if let (Some(&from), Some(&to)) =
-                    (self.graph_nodes.get(&system.id), self.graph_nodes.get(&before_id))
-                {
-                    self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
-                    self.edge_info.push(GraphEdgeInfo {
-                        from_id: system.id,
-                        to_id:   before_id,
-                        kind:    ConflictKind::Explicit,
-                    });
-                }
-            }
-        }
-
-        // ── 2. Sequential барьеры ──────────────────────────────
-        for i in 0..n {
-            if !self.systems[i].kind.is_parallel() {
-                // Все предыдущие системы → sequential
-                for j in 0..i {
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&self.systems[j].id),
-                         self.graph_nodes.get(&self.systems[i].id))
-                    {
-                        self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                        self.edge_info.push(GraphEdgeInfo {
-                            from_id: self.systems[j].id,
-                            to_id:   self.systems[i].id,
-                            kind:    ConflictKind::SequentialBarrier,
-                        });
-                    }
-                }
-                // Sequential → все последующие
-                for j in (i + 1)..n {
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&self.systems[i].id),
-                         self.graph_nodes.get(&self.systems[j].id))
-                    {
-                        self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                        self.edge_info.push(GraphEdgeInfo {
-                            from_id: self.systems[i].id,
-                            to_id:   self.systems[j].id,
-                            kind:    ConflictKind::SequentialBarrier,
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── 3. Write/Read конфликты ────────────────────────────
-        // Определяем конфликт и его причину (первый конфликтующий компонент)
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let ai = match self.systems[i].kind.access() { Some(a) => a, None => continue };
-                let aj = match self.systems[j].kind.access() { Some(a) => a, None => continue };
-
-                if let Some((conflict_kind, direction)) = detect_conflict_kind(
-                    ai, aj,
-                    self.systems[i].id,
-                    self.systems[j].id,
-                ) {
-                    // direction = true означает i→j
-                    if direction {
-                        if let (Some(&from), Some(&to)) =
-                            (self.graph_nodes.get(&self.systems[i].id),
-                             self.graph_nodes.get(&self.systems[j].id))
-                        {
-                            self.dependency_graph.add_edge(from, to, conflict_kind.clone());
-                            self.edge_info.push(GraphEdgeInfo {
-                                from_id: self.systems[i].id,
-                                to_id:   self.systems[j].id,
-                                kind:    conflict_kind,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Проверяет, существует ли ребро между двумя узлами.
@@ -1008,6 +919,7 @@ impl Scheduler {
                     ai, aj,
                     system_i.id,
                     system_j.id,
+                    &self.type_names,
                 ) {
                     // direction = true означает i→j
                     if direction {
@@ -1077,6 +989,8 @@ impl Scheduler {
     ///
     /// Startup этап выполняется только при первом вызове `run()`.
     pub fn run(&mut self, world: &mut World) {
+        // Заполняем реестр имён компонентов для диагностики конфликтов
+        self.populate_type_names(world.registry());
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
@@ -1096,6 +1010,8 @@ impl Scheduler {
 
     /// Последовательное выполнение — для тестов и non-parallel builds.
     pub fn run_sequential(&mut self, world: &mut World) {
+        // Заполняем реестр имён компонентов для диагностики конфликтов
+        self.populate_type_names(world.registry());
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
@@ -1438,6 +1354,7 @@ fn detect_conflict_kind(
     aj: &AccessDescriptor,
     id_i: SystemId,
     id_j: SystemId,
+    type_names: &FxHashMap<TypeId, &'static str>,
 ) -> Option<(ConflictKind, bool)> {
     // ── Компонентные конфликты ──────────────────────────────────
 
@@ -1445,7 +1362,7 @@ fn detect_conflict_kind(
     for w in &ai.writes {
         if aj.writes.contains(w) {
             return Some((ConflictKind::WriteWrite {
-                component_name: component_type_name(*w),
+                component_name: component_type_name(*w, type_names),
             }, true)); // i→j
         }
     }
@@ -1453,7 +1370,7 @@ fn detect_conflict_kind(
     for w in &ai.writes {
         if aj.reads.contains(w) {
             return Some((ConflictKind::WriteRead {
-                component_name: component_type_name(*w),
+                component_name: component_type_name(*w, type_names),
                 writer_id: id_i.0,
                 reader_id: id_j.0,
             }, true)); // i→j (писатель → читатель)
@@ -1463,7 +1380,7 @@ fn detect_conflict_kind(
     for w in &aj.writes {
         if ai.reads.contains(w) {
             return Some((ConflictKind::WriteRead {
-                component_name: component_type_name(*w),
+                component_name: component_type_name(*w, type_names),
                 writer_id: id_j.0,
                 reader_id: id_i.0,
             }, false)); // j→i
@@ -1476,7 +1393,7 @@ fn detect_conflict_kind(
     for w in &ai.writes_event {
         if aj.writes_event.contains(w) {
             return Some((ConflictKind::EventWriteWrite {
-                event_name: component_type_name(*w),
+                event_name: component_type_name(*w, type_names),
             }, true)); // i→j
         }
     }
@@ -1484,7 +1401,7 @@ fn detect_conflict_kind(
     for w in &ai.writes_event {
         if aj.reads_event.contains(w) {
             return Some((ConflictKind::EventWriteRead {
-                event_name: component_type_name(*w),
+                event_name: component_type_name(*w, type_names),
                 writer_id: id_i.0,
                 reader_id: id_j.0,
             }, true)); // i→j (писатель → читатель)
@@ -1494,7 +1411,7 @@ fn detect_conflict_kind(
     for w in &aj.writes_event {
         if ai.reads_event.contains(w) {
             return Some((ConflictKind::EventWriteRead {
-                event_name: component_type_name(*w),
+                event_name: component_type_name(*w, type_names),
                 writer_id: id_j.0,
                 reader_id: id_i.0,
             }, false)); // j→i
@@ -1506,15 +1423,13 @@ fn detect_conflict_kind(
 
 /// Получить имя типа по TypeId.
 ///
-/// В release builds TypeId не содержит имя — возвращаем заглушку.
-/// В debug/dev — также заглушка, но ConflictKind::WriteWrite { component_name }
-/// всё равно содержит TypeId для сравнения.
-fn component_type_name(type_id: std::any::TypeId) -> &'static str {
-    // TypeId не даёт имя в stable Rust. Для диагностики достаточно
-    // знать что конфликт ЕСТЬ — имя TypeId видно в AccessDescriptor.reads/writes.
-    // В будущем можно добавить registry TypeId→&str в World.
-    let _ = type_id;
-    "<component>"
+/// Пытается найти имя в переданной `type_names` (заполняется из ComponentRegistry).
+/// Если не найдено — возвращает `"<component>"`.
+fn component_type_name(
+    type_id: TypeId,
+    type_names: &FxHashMap<TypeId, &'static str>,
+) -> &'static str {
+    type_names.get(&type_id).copied().unwrap_or("<component>")
 }
 
 // ── Тесты ─────────────────────────────────────────────────────

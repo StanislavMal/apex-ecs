@@ -30,5 +30,7 @@ desktop.ini
 
 # Прочее
 
-*.txt
-*.bat
+# Временные файлы (исключены явно, а не маской)
+cargo_error.txt
+bench_final.txt
+project_context*.txt

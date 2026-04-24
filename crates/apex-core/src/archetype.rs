@@ -66,7 +66,11 @@ impl Column {
         if self.item_size == 0 {
             Layout::from_size_align(0, 1).unwrap()
         } else {
-            Layout::from_size_align(self.item_size * capacity, self.item_align).unwrap()
+            let size = self
+                .item_size
+                .checked_mul(capacity)
+                .expect("overflow in layout_for: item_size * capacity");
+            Layout::from_size_align(size, self.item_align).unwrap()
         }
     }
 
@@ -117,7 +121,7 @@ impl Column {
         }
     }
 
-    pub unsafe fn swap_remove_and_drop(&mut self, row: usize) -> bool {
+    pub unsafe fn swap_remove_and_drop(&mut self, row: usize) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
         if row != last {
@@ -127,18 +131,14 @@ impl Column {
                 std::ptr::copy_nonoverlapping(self.get_ptr(last), remove_ptr, self.item_size);
             }
             self.change_ticks.swap(row, last);
-            self.change_ticks.pop();
-            self.len -= 1;
-            true
         } else {
             (self.drop_fn)(self.get_ptr(row));
-            self.change_ticks.pop();
-            self.len -= 1;
-            false
         }
+        self.change_ticks.pop();
+        self.len -= 1;
     }
 
-    pub unsafe fn swap_remove_no_drop(&mut self, row: usize) -> bool {
+    pub unsafe fn swap_remove_no_drop(&mut self, row: usize) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
         if row != last && self.item_size > 0 {
@@ -150,7 +150,6 @@ impl Column {
         }
         self.change_ticks.pop();
         self.len -= 1;
-        row != last
     }
 
     pub(crate) fn grow(&mut self) {
@@ -173,10 +172,6 @@ impl Column {
         self.data = new_data;
         self.capacity = new_cap;
     }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize { self.len }
 
     /// Тик изменения для строки row
     #[inline]

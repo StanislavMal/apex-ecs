@@ -26,6 +26,7 @@ use apex_core::{
     component::{ComponentId, Tick},
     entity::Entity,
     relations::ChildOf,
+    template::TemplateParams,
     world::World,
 };
 use rustc_hash::FxHashMap;
@@ -145,12 +146,15 @@ impl PrefabLoader {
     ///
     /// * `overrides` — переопределения компонентов корневой entity.
     /// * `parent` — если указан, entity становится ребёнком через `ChildOf`.
+    /// * `params` — параметры шаблона для проброса (могут быть использованы
+    ///   кастомными компонентами, реализующими `EntityTemplate`).
     pub fn instantiate(
         &self,
         world: &mut World,
         manifest: &PrefabManifest,
         overrides: &[PrefabComponent],
         parent: Option<Entity>,
+        params: Option<&TemplateParams>,
     ) -> Result<Entity, PrefabError> {
         let entity = self.spawn_entity(world, manifest, overrides)?;
 
@@ -165,7 +169,7 @@ impl PrefabLoader {
                 PrefabError::SubPrefabNotFound { name: child.prefab.clone() }
             })?;
 
-            self.instantiate(world, child_manifest, &child.overrides, Some(entity))?;
+            self.instantiate(world, child_manifest, &child.overrides, Some(entity), params)?;
         }
 
         Ok(entity)
@@ -187,10 +191,11 @@ impl PrefabLoader {
             .map(|c| (c.type_name.as_str(), &c.value))
             .collect();
 
-        // Объединяем: overrides заменяют компоненты из manifest
+        // Объединяем: overrides заменяют компоненты из manifest.
+        // Если в manifest есть дубликаты type_name — побеждает последний.
         let mut seen: HashMap<&str, &serde_json::Value> = HashMap::new();
         for comp in &manifest.components {
-            seen.entry(&comp.type_name).or_insert(&comp.value);
+            seen.insert(&comp.type_name, &comp.value);
         }
         // Overrides перезаписывают
         for (type_name, value) in &override_map {
@@ -244,8 +249,9 @@ impl apex_core::template::EntityTemplate for PrefabManifest {
         // Пытаемся преобразовать params в overrides
         let overrides: Vec<PrefabComponent> = Vec::new(); // params → overrides (сложно без type_id → name)
         // Поскольку мы не можем легко преобразовать TemplateParams в PrefabComponent
-        // (нужен обратный маппинг TypeId → имя), используем instantiate без overrides
-        loader.instantiate(world, self, &overrides, None)
+        // (нужен обратный маппинг TypeId → имя), используем instantiate без overrides,
+        // но передаём params для проброса в кастомные компоненты.
+        loader.instantiate(world, self, &overrides, None, Some(params))
             .expect("PrefabManifest::spawn failed")
     }
 }
@@ -318,7 +324,7 @@ mod tests {
         }"#;
 
         let manifest = loader.load_json(json).unwrap().clone();
-        let entity = loader.instantiate(&mut world, &manifest, &[], None).unwrap();
+        let entity = loader.instantiate(&mut world, &manifest, &[], None, None).unwrap();
 
         let health = world.get::<Health>(entity).unwrap();
         assert_eq!(health.current, 100.0);
@@ -353,7 +359,7 @@ mod tests {
         }"#).unwrap();
 
         let manifest = loader.get("Parent").unwrap();
-        let parent = loader.instantiate(&mut world, manifest, &[], None).unwrap();
+        let parent = loader.instantiate(&mut world, manifest, &[], None, None).unwrap();
 
         let parent_name = world.get::<Name>(parent).unwrap();
         assert_eq!(parent_name.0, "Parent");
@@ -387,7 +393,7 @@ mod tests {
             },
         ];
 
-        let entity = loader.instantiate(&mut world, manifest, &overrides, None).unwrap();
+        let entity = loader.instantiate(&mut world, manifest, &overrides, None, None).unwrap();
 
         let health = world.get::<Health>(entity).unwrap();
         assert_eq!(health.current, 200.0);  // override
@@ -410,7 +416,7 @@ mod tests {
         }"#;
 
         let manifest = loader.load_json(json).unwrap().clone();
-        let result = loader.instantiate(&mut world, &manifest, &[], None);
+        let result = loader.instantiate(&mut world, &manifest, &[], None, None);
 
         assert!(result.is_err());
         match result {
@@ -433,7 +439,7 @@ mod tests {
         }"#).unwrap();
 
         let manifest = loader.get("Parent").unwrap();
-        let result = loader.instantiate(&mut world, manifest, &[], None);
+        let result = loader.instantiate(&mut world, manifest, &[], None, None);
 
         assert!(result.is_err());
         match result {
@@ -469,7 +475,7 @@ mod tests {
         }"#).unwrap();
 
         let manifest = loader.get("Mover").unwrap();
-        let entity = loader.instantiate(&mut world, manifest, &[], None).unwrap();
+        let entity = loader.instantiate(&mut world, manifest, &[], None, None).unwrap();
 
         let pos = world.get::<Position>(entity).unwrap();
         assert_eq!(pos.x, 1.0);
@@ -509,7 +515,7 @@ mod tests {
         }"#).unwrap();
 
         let manifest = loader.get("Parent").unwrap();
-        let parent = loader.instantiate(&mut world, manifest, &[], None).unwrap();
+        let parent = loader.instantiate(&mut world, manifest, &[], None, None).unwrap();
 
         // Проверяем parent
         let parent_name = world.get::<Name>(parent).unwrap();

@@ -4,8 +4,11 @@ use crate::{
     component::{Component, ComponentId, Tick},
     entity::Entity,
     system_param::WorldQuerySystemAccess,
-    world::{adaptive_chunk_size, World},
+    world::World,
 };
+
+#[cfg(feature = "parallel")]
+use crate::par_utils::compute_par_chunks;
 
 // ── WorldQuery ─────────────────────────────────────────────────
 
@@ -376,18 +379,10 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             return;
         }
 
-        let chunks: Vec<(usize, usize, usize)> = self
-            .archetypes
-            .iter()
-            .flat_map(|a| {
-                let chunk_size = adaptive_chunk_size(a.len, num_threads);
-                (0..(a.len + chunk_size - 1) / chunk_size).map(move |chunk_i| {
-                    let start = chunk_i * chunk_size;
-                    let end = (start + chunk_size).min(a.len);
-                    (a.arch_idx, start, end)
-                })
-            })
-            .collect();
+        let chunks = compute_par_chunks(
+            self.archetypes.iter().map(|a| (a.arch_idx, a.len)),
+            num_threads,
+        );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
@@ -427,18 +422,10 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             return;
         }
 
-        let chunks: Vec<(usize, usize, usize)> = self
-            .archetypes
-            .iter()
-            .flat_map(|a| {
-                let chunk_size = adaptive_chunk_size(a.len, num_threads);
-                (0..(a.len + chunk_size - 1) / chunk_size).map(move |chunk_i| {
-                    let start = chunk_i * chunk_size;
-                    let end = (start + chunk_size).min(a.len);
-                    (a.arch_idx, start, end)
-                })
-            })
-            .collect();
+        let chunks = compute_par_chunks(
+            self.archetypes.iter().map(|a| (a.arch_idx, a.len)),
+            num_threads,
+        );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };

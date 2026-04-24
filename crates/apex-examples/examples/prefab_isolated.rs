@@ -145,7 +145,7 @@ fn main() {
 
     // Спавним игрока из префаба: instantiate(&self, world, manifest, overrides, parent)
     let player = loader
-        .instantiate(&mut world, &manifest, &[], None)
+        .instantiate(&mut world, &manifest, &[], None, None)
         .expect("failed to instantiate player prefab");
     println!("  Игрок создан: entity={}", player);
 

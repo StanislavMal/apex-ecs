@@ -105,13 +105,15 @@ impl<T> TrackedEventQueue<T> {
     ///
     /// Вызывается автоматически в `world.tick()`.
     /// Если все читатели прочитали предыдущие события, буфер `events`
-    /// очищается перед загрузкой нового.
+    /// очищается перед загрузкой нового. Если не все читатели догнали —
+    /// старые события дописываются в конец нового буфера, чтобы
+    /// отстающие читатели могли их догнать.
     pub fn update(&mut self) {
-        // GC: если все читатели прочитали все текущие события — очищаем
         let all_read = self.all_readers_caught_up();
+
         if all_read {
+            // Все читатели прочитали старые события — очищаем буфер и сбрасываем курсоры
             self.events.clear();
-            // Сбрасываем курсоры в 0
             for cursor in &mut self.cursors {
                 if let Some(pos) = cursor {
                     *pos = 0;
@@ -119,17 +121,27 @@ impl<T> TrackedEventQueue<T> {
             }
         }
 
-        // Меняем местами буферы
+        // Меняем местами буферы: events ← pending (новые события текущего тика)
         std::mem::swap(&mut self.events, &mut self.pending);
-        self.pending.clear();
 
-        // Сбрасываем курсоры на начало нового буфера events
-        // (но если читатель не успел прочитать старые, они потеряны —
-        //  это стандартное поведение double-buffer, как в Bevy)
-        for cursor in &mut self.cursors {
-            if let Some(pos) = cursor {
-                *pos = 0;
+        if all_read {
+            // Все читатели догнали — просто очищаем pending, курсоры уже в 0
+            self.pending.clear();
+        } else {
+            // Не все читатели догнали: старые события (теперь в pending) нужно
+            // дописать в конец events, чтобы отстающие читатели могли их догнать
+            let new_count = self.events.len() as u32;
+
+            // Сдвигаем курсоры на количество новых событий, которые встали перед старыми
+            for cursor in &mut self.cursors {
+                if let Some(pos) = cursor {
+                    *pos += new_count;
+                }
             }
+
+            // Переносим старые события в конец буфера чтения
+            self.events.append(&mut self.pending);
+            // self.pending теперь пуст — append переместил все элементы
         }
     }
 
@@ -149,13 +161,14 @@ impl<T> TrackedEventQueue<T> {
     }
 
     /// Продвинуть курсор читателя до конца буфера (отметить всё как прочитанное).
+    ///
+    /// **Внимание:** эта функция — заведомый no-op. Через `&self` невозможно
+    /// мутировать курсор, поэтому вызов ничего не делает.
+    /// Используйте [`advance_reader_mut`](TrackedEventQueue::advance_reader_mut).
+    #[deprecated(note = "Use advance_reader_mut instead — this function is a no-op")]
     #[inline]
     pub fn advance_reader(&self, reader_id: &EventCursor) {
-        let idx = reader_id.0 as usize;
-        if let Some(Some(pos)) = self.cursors.get(idx) {
-            let _ = pos; // мы не можем мутировать self через &self
-        }
-        // advance_reader требует &mut self, см. advance_reader_mut
+        let _ = reader_id;
     }
 
     /// Мутабельная версия продвижения курсора.

@@ -276,7 +276,7 @@ impl PrefabPlugin {
         })?;
 
         // Создаём новые entity
-        let new_entity = self.loader.instantiate(world, manifest, &[], None)
+        let new_entity = self.loader.instantiate(world, manifest, &[], None, None)
             .map_err(|e| HotReloadError::Deserialize {
                 path: "unknown".to_string(),
                 reason: e.to_string(),

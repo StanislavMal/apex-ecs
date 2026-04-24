@@ -351,7 +351,10 @@ impl World {
         entity
     }
 
-    pub fn spawn_many<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
+    /// Внутренний общий метод для `spawn_many` / `spawn_many_silent`.
+    /// Всегда возвращает `Vec<Entity>`, а публичные обёртки решают,
+    /// возвращать его или игнорировать.
+    fn spawn_many_inner<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
         F: FnMut(usize) -> B,
@@ -386,38 +389,20 @@ impl World {
         entities
     }
 
-    pub fn spawn_many_silent<B, F>(&mut self, count: usize, mut make_bundle: F)
+    pub fn spawn_many<B, F>(&mut self, count: usize, make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
         F: FnMut(usize) -> B,
     {
-        if count == 0 { return; }
+        self.spawn_many_inner(count, make_bundle)
+    }
 
-        let probe        = make_bundle(0);
-        let ids          = probe.component_ids(&mut self.registry);
-        drop(probe);
-
-        let archetype_id = self.get_or_create_archetype(ids);
-        let arch_idx     = archetype_id.0 as usize;
-        let start_row    = self.archetypes[arch_idx].entities.len();
-        let tick         = self.current_tick;
-
-        self.archetypes[arch_idx].entities.reserve(count);
-        let target_cap = start_row + count;
-        for col in &mut self.archetypes[arch_idx].columns {
-            while col.capacity < target_cap { col.grow(); }
-        }
-
-        let entities = self.entities.allocate_batch(count);
-
-        for (i, &entity) in entities.iter().enumerate() {
-            let row    = start_row + i;
-            let bundle = make_bundle(i);
-            self.archetypes[arch_idx].entities.push(entity);
-            bundle.write_into(self, archetype_id, row, tick);
-        }
-
-        self.entities.set_locations_batch(&entities, archetype_id, start_row);
+    pub fn spawn_many_silent<B, F>(&mut self, count: usize, make_bundle: F)
+    where
+        B: Bundle,
+        F: FnMut(usize) -> B,
+    {
+        self.spawn_many_inner(count, make_bundle);
     }
 
     // ── Component ops ──────────────────────────────────────────
@@ -966,6 +951,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
         use rayon::prelude::*;
+        use crate::par_utils::compute_par_chunks;
         let num_threads = rayon::current_num_threads();
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(self.world, &mut ids);
@@ -973,21 +959,14 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
         let world    = self.world;
         let last_run = self.last_run;
-        let chunks: Vec<(usize, usize, usize)> = self
-            .arch_indices
-            .iter()
-            .copied()
-            .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
-            .flat_map(|arch_idx| {
-                let arch       = &world.archetypes[arch_idx];
-                let chunk_size = adaptive_chunk_size(arch.len(), num_threads);
-                (0..(arch.len() + chunk_size - 1) / chunk_size).map(move |chunk_i| {
-                    let start = chunk_i * chunk_size;
-                    let end   = (start + chunk_size).min(arch.len());
-                    (arch_idx, start, end)
-                })
-            })
-            .collect();
+        let chunks = compute_par_chunks(
+            self.arch_indices
+                .iter()
+                .copied()
+                .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+                .map(|arch_idx| (arch_idx, world.archetypes[arch_idx].len())),
+            num_threads,
+        );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch  = &world.archetypes[arch_idx];
@@ -1013,6 +992,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         F: Fn(Entity, Q::Item<'_>) + Send + Sync,
     {
         use rayon::prelude::*;
+        use crate::par_utils::compute_par_chunks;
         let num_threads = rayon::current_num_threads();
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(self.world, &mut ids);
@@ -1020,21 +1000,14 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
         let world    = self.world;
         let last_run = self.last_run;
-        let chunks: Vec<(usize, usize, usize)> = self
-            .arch_indices
-            .iter()
-            .copied()
-            .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
-            .flat_map(|arch_idx| {
-                let arch       = &world.archetypes[arch_idx];
-                let chunk_size = adaptive_chunk_size(arch.len(), num_threads);
-                (0..(arch.len() + chunk_size - 1) / chunk_size).map(move |chunk_i| {
-                    let start = chunk_i * chunk_size;
-                    let end   = (start + chunk_size).min(arch.len());
-                    (arch_idx, start, end)
-                })
-            })
-            .collect();
+        let chunks = compute_par_chunks(
+            self.arch_indices
+                .iter()
+                .copied()
+                .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+                .map(|arch_idx| (arch_idx, world.archetypes[arch_idx].len())),
+            num_threads,
+        );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch     = &world.archetypes[arch_idx];

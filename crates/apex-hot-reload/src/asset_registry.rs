@@ -1,9 +1,6 @@
 //! AssetRegistry — маппинг путей к файлам на зарегистрированные ассеты.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use rustc_hash::FxHashMap;
 

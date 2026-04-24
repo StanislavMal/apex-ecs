@@ -36,7 +36,7 @@ impl<'w> SubWorld<'w> {
     pub fn entity_count(&self) -> usize {
         self.archetype_indices
             .iter()
-            .map(|&idx| unsafe { self.world.archetype_ptr(idx).as_ref().unwrap().len() })
+            .map(|&idx| unsafe { (&*self.world.archetype_ptr(idx)).len() })
             .sum()
     }
 

@@ -212,6 +212,7 @@ type MigrationFn = fn(&mut WorldSnapshot) -> Result<(), String>;
 
 fn migration_for(version: u32) -> Option<MigrationFn> {
     match version {
+        0 => Some(|_data| Ok(())), // no-op: формат данных не менялся между v0 и v1
         _ => None,
     }
 }

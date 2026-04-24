@@ -1,4 +1,5 @@
 use std::any::TypeId;
+use std::collections::HashSet;
 
 /// Битовая маска компонентов — до 128 компонентов (достаточно для любой игры).
 ///
@@ -199,10 +200,11 @@ impl AccessDescriptor {
     }
 
     pub fn merge(mut self, other: &AccessDescriptor) -> Self {
-        for &tid in &other.reads  { if !self.reads.contains(&tid)  { self.reads.push(tid);  } }
-        for &tid in &other.writes { if !self.writes.contains(&tid) { self.writes.push(tid); } }
-        for &tid in &other.reads_event  { if !self.reads_event.contains(&tid)  { self.reads_event.push(tid);  } }
-        for &tid in &other.writes_event { if !self.writes_event.contains(&tid) { self.writes_event.push(tid); } }
+        // O(N+M) дедупликация через HashSet вместо O(N²) contains+push
+        Self::dedup_push(&mut self.reads, &other.reads);
+        Self::dedup_push(&mut self.writes, &other.writes);
+        Self::dedup_push(&mut self.reads_event, &other.reads_event);
+        Self::dedup_push(&mut self.writes_event, &other.writes_event);
         // Маски сливаем битовым OR
         self.read_mask  = self.read_mask.or(&other.read_mask);
         self.write_mask = self.write_mask.or(&other.write_mask);
@@ -238,18 +240,35 @@ impl AccessDescriptor {
 
     /// Fallback O(N) проверка — используется если маски не назначены.
     pub fn conflicts_with(&self, other: &AccessDescriptor) -> bool {
-        // Быстрый путь через маски если они назначены
+        // Если маски не пусты — используем быстрый путь по битовым маскам
         if !self.write_mask.is_empty() || !other.write_mask.is_empty() {
             return self.conflicts_with_fast(other);
         }
-        // Fallback: linear scan
-        for w in &self.writes {
-            if other.reads.contains(w) || other.writes.contains(w) { return true; }
+        // Если маски пусты, но есть writes в векторах — значит assign_masks() не вызывался,
+        // используем fallback (linear scan)
+        if !self.writes.is_empty() || !other.writes.is_empty() {
+            for w in &self.writes {
+                if other.reads.contains(w) || other.writes.contains(w) { return true; }
+            }
+            for w in &other.writes {
+                if self.reads.contains(w) || self.writes.contains(w) { return true; }
+            }
         }
-        for w in &other.writes {
-            if self.reads.contains(w) || self.writes.contains(w) { return true; }
-        }
+        // Нет writes — нет конфликта
         false
+    }
+
+    /// O(N+M) дедупликация через HashSet — заменяет O(N²) contains+push в merge.
+    fn dedup_push(vec: &mut Vec<TypeId>, items: &[TypeId]) {
+        if items.is_empty() {
+            return;
+        }
+        let mut set: HashSet<TypeId> = vec.iter().cloned().collect();
+        for &item in items {
+            if set.insert(item) {
+                vec.push(item);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
