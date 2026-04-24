@@ -914,6 +914,103 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         }
     }
 
+    /// Параллельная итерация по компонентам (без Entity).
+    /// Работает только с `feature = "parallel"`.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each_component<F>(&self, f: F)
+    where
+        Q: Send,
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+        let num_threads = rayon::current_num_threads();
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(self.world, &mut ids);
+        if ids.len() != Q::component_count() { return; }
+
+        let world    = self.world;
+        let last_run = self.last_run;
+        let chunks: Vec<(usize, usize, usize)> = self
+            .arch_indices
+            .iter()
+            .copied()
+            .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+            .flat_map(|arch_idx| {
+                let arch       = &world.archetypes[arch_idx];
+                let chunk_size = adaptive_chunk_size(arch.len(), num_threads);
+                (0..(arch.len() + chunk_size - 1) / chunk_size).map(move |chunk_i| {
+                    let start = chunk_i * chunk_size;
+                    let end   = (start + chunk_size).min(arch.len());
+                    (arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch  = &world.archetypes[arch_idx];
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
+            }
+        });
+    }
+
+    /// Параллельная итерация по компонентам (без Entity) — fallback для sequential.
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each_component<F: FnMut(Q::Item<'_>)>(&self, f: F) {
+        self.for_each_component(f);
+    }
+
+    /// Параллельная итерация по (Entity, компонентам).
+    /// Работает только с `feature = "parallel"`.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each<F>(&self, f: F)
+    where
+        Q: Send,
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+        let num_threads = rayon::current_num_threads();
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(self.world, &mut ids);
+        if ids.len() != Q::component_count() { return; }
+
+        let world    = self.world;
+        let last_run = self.last_run;
+        let chunks: Vec<(usize, usize, usize)> = self
+            .arch_indices
+            .iter()
+            .copied()
+            .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+            .flat_map(|arch_idx| {
+                let arch       = &world.archetypes[arch_idx];
+                let chunk_size = adaptive_chunk_size(arch.len(), num_threads);
+                (0..(arch.len() + chunk_size - 1) / chunk_size).map(move |chunk_i| {
+                    let start = chunk_i * chunk_size;
+                    let end   = (start + chunk_size).min(arch.len());
+                    (arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch     = &world.archetypes[arch_idx];
+            let state    = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            let entities = &arch.entities;
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    f(entities[row], item);
+                }
+            }
+        });
+    }
+
+    /// Параллельная итерация по (Entity, компонентам) — fallback для sequential.
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, f: F) {
+        self.for_each(f);
+    }
+
     pub fn len(&self) -> usize {
         self.arch_indices.iter().map(|&i| self.world.archetypes[i].len()).sum()
     }

@@ -415,10 +415,11 @@ impl AutoSystem for MovementSystem {
     type Query = (Read<Velocity>, Write<Position>);
 
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
-            pos.x += vel.x * 0.016;
-            pos.y += vel.y * 0.016;
-        });
+        ctx.query::<Self::Query>()
+            .for_each_component(|(vel, pos)| {
+                pos.x += vel.x * 0.016;
+                pos.y += vel.y * 0.016;
+            });
     }
 }
 
@@ -447,13 +448,12 @@ impl ParSystem for PhysicsSystem {
         let dt = cfg.dt;
         let g = cfg.gravity;
 
-        ctx.for_each_component::<(Read<Mass>, Write<Velocity>, Write<Position>), _>(
-            |(mass, vel, pos)| {
+        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
+            .for_each_component(|(mass, vel, pos)| {
                 vel.y -= g * mass.0 * dt;
                 pos.x += vel.x * dt;
                 pos.y += vel.y * dt;
-            }
-        );
+            });
     }
 }
 
@@ -467,10 +467,11 @@ sched.add_par_system("physics", PhysicsSystem);
 sched.add_fn_par_system(
     "enemy_ai",
     |ctx: SystemContext<'_>| {
-        ctx.for_each_component::<(Read<Enemy>, Write<Velocity>), _>(|(_, vel)| {
-            vel.x *= 0.99;
-            vel.y *= 0.99;
-        });
+        ctx.query::<(Read<Enemy>, Write<Velocity>)>()
+            .for_each_component(|(_, vel)| {
+                vel.x *= 0.99;
+                vel.y *= 0.99;
+            });
     },
     AccessDescriptor::new()
         .read::<Enemy>()
@@ -537,12 +538,13 @@ sched.run(&mut world);
 
 ```rust
 fn run(&mut self, ctx: SystemContext<'_>) {
-    // Query:
-    let q = ctx.query::<(Read<Velocity>, Write<Position>)>();
-    q.for_each(|entity, (vel, pos)| { /* ... */ });
+    // Query — единственный способ итерации:
+    ctx.query::<(Read<Velocity>, Write<Position>)>()
+        .for_each(|entity, (vel, pos)| { /* ... */ });
 
-    // Сокращённая форма:
-    ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(v, p)| { /* ... */ });
+    // Без Entity (чуть быстрее):
+    ctx.query::<(Read<Vel>, Write<Pos>)>()
+        .for_each_component(|(v, p)| { /* ... */ });
 
     // Ресурсы:
     let cfg   = ctx.resource::<PhysicsConfig>();        // Res<T>
@@ -557,9 +559,10 @@ fn run(&mut self, ctx: SystemContext<'_>) {
     ctx.entity_count() // -> usize
 
     // Параллельная итерация (feature = "parallel"):
-    ctx.par_for_each_component::<(Read<Vel>, Write<Pos>), _>(|(v, p)| {
-        /* выполняется на нескольких потоках */
-    });
+    ctx.query::<(Read<Vel>, Write<Pos>)>()
+        .par_for_each_component(|(v, p)| {
+            /* выполняется на нескольких потоках */
+        });
 }
 ```
 
@@ -892,18 +895,17 @@ cargo run --features parallel
 ```rust
 impl ParSystem for PhysicsSystem {
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.par_for_each_component::<(Read<Mass>, Write<Velocity>, Write<Position>), _>(
-            |(mass, vel, pos)| {
+        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
+            .par_for_each_component(|(mass, vel, pos)| {
                 vel.y -= 9.8 * mass.0 * 0.016;
                 pos.x += vel.x * 0.016;
                 pos.y += vel.y * 0.016;
-            }
-        );
+            });
     }
 }
 
 // par_for_each — то же с Entity:
-ctx.par_for_each::<Read<Position>, _>(|entity, pos| {
+ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
     /* обрабатывается параллельно */
 });
 ```
@@ -924,7 +926,7 @@ ctx.par_for_each::<Read<Position>, _>(|entity, pos| {
 
 - `CachedQuery` (`world.query_typed<Q>()`) переиспользует список архетипов — дешевле `Query::new()` в hot path
 - Используйте `With<T>`/`Without<T>` для фильтрации вместо `if` внутри closure
-- `for_each_component()` быстрее `for_each()` — не загружает Entity для каждой строки
+- `for_each_component()` быстрее `for_each()` — не загружает Entity для каждой строки (доступно на `Query` и `CachedQuery`)
 
 ### 12.3 Structural changes
 
@@ -994,10 +996,11 @@ impl AutoSystem for MovementSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let dt = ctx.resource::<DeltaTime>().0;
-        ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
-            pos.x += vel.x * dt;
-            pos.y += vel.y * dt;
-        });
+        ctx.query::<Self::Query>()
+            .for_each_component(|(vel, pos)| {
+                pos.x += vel.x * dt;
+                pos.y += vel.y * dt;
+            });
     }
 }
 

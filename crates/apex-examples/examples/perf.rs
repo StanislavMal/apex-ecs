@@ -1706,7 +1706,7 @@ fn main() {
         apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed));
     println!();
 
-    const N: usize = 100; // → N*1000 entity в большинстве тестов
+    const N: usize = 1000; // → N*1000 entity в большинстве тестов
 
     bench_batch_allocator(N);
     bench_has_relation(N);
