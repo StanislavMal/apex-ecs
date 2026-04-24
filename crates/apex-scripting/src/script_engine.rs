@@ -522,8 +522,13 @@ impl ScriptEngine {
             let entity = world.spawn_empty();
             for (key, dynamic) in &req.components {
                 let key_lower = key.to_lowercase();
-                // Ищем обработчик сначала по lowercase, потом по оригинальному имени
+                // Также пробуем без подчёркиваний, чтобы tile_kind → tilekind → TileKind
+                let key_no_underscore: String = key_lower.chars()
+                    .filter(|c| *c != '_')
+                    .collect();
+                // Ищем обработчик: lower → no_underscore → оригинал → lower без underscore
                 let applier = self.spawn_appliers.get(&key_lower)
+                    .or_else(|| self.spawn_appliers.get(&key_no_underscore))
                     .or_else(|| self.spawn_appliers.get(key.as_str()));
 
                 if let Some(applier) = applier {

@@ -130,6 +130,13 @@ fn run() {
 | `(A, B)` | `Array [a, b]` |
 | `(A, B, C)` | `Array [a, b, c]` |
 | `Option<T>` | `()` или `T` |
+| `Vec<T>` | `Array` |
+| `HashMap<String, V>` | `Map` |
+| `enum` (C-like) | `i64` (через `#[derive(Scriptable)]`) |
+
+> **⚠️ C-like enum константы:** Константы C-like enum (`TileKind_Floor`, `TileKind_Wall`) регистрируются как **функции** Rhai. В скрипте обязательно используйте `TileKind_Floor()` **со скобками**. Без скобок Rhai выдаст ошибку `Variable not found`.
+
+> **💡 snake_case в spawn_entity:** Ключи в `spawn_entity(#{tile_kind: TileKind_Floor()})` могут быть как в snake_case (`tile_kind`), так и PascalCase (`TileKind`). Движок нормализует оба варианта.
 
 Для вложенных структур — реализуй `ScriptableRegistrar` вручную или добавь `#[derive(Scriptable)]`.
 

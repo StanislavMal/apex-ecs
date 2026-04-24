@@ -1,6 +1,6 @@
 //! `ScriptableField` — конвертация примитивных типов между Rust и Rhai Dynamic.
 //!
-//! Поддерживаемые типы: f32, i32, u32, bool, String.
+//! Поддерживаемые типы: f32, i32, u32, bool, String, Vec, HashMap.
 //! Для вложенных структур достаточно реализовать `ScriptableRegistrar`,
 //! который внутри тоже использует Dynamic Map.
 //!
@@ -18,6 +18,7 @@
 //! }
 //! ```
 
+use std::collections::HashMap;
 use rhai::Dynamic;
 
 /// Конвертация поля компонента в/из Rhai Dynamic.
@@ -239,5 +240,41 @@ impl<T: ScriptableField> ScriptableField for Option<T> {
         } else {
             Some(Some(T::from_dynamic(d)?))
         }
+    }
+}
+
+// ── Vec<T> ──────────────────────────────────────────────────────
+
+impl<T: ScriptableField> ScriptableField for Vec<T> {
+    fn to_dynamic(&self) -> Dynamic {
+        let arr: rhai::Array = self.iter().map(|v| v.to_dynamic()).collect();
+        Dynamic::from_array(arr)
+    }
+
+    fn from_dynamic(d: &Dynamic) -> Option<Self> {
+        let arr = d.read_lock::<rhai::Array>()?;
+        arr.iter().map(|v| T::from_dynamic(v)).collect()
+    }
+}
+
+// ── HashMap<String, V> ──────────────────────────────────────────
+
+impl<V: ScriptableField> ScriptableField for HashMap<String, V> {
+    fn to_dynamic(&self) -> Dynamic {
+        let mut map = rhai::Map::new();
+        for (k, v) in self.iter() {
+            map.insert(k.clone().into(), v.to_dynamic());
+        }
+        Dynamic::from_map(map)
+    }
+
+    fn from_dynamic(d: &Dynamic) -> Option<Self> {
+        let lock = d.read_lock::<rhai::Map>()?;
+        let mut out = HashMap::new();
+        for (k, v) in lock.iter() {
+            let val = V::from_dynamic(v)?;
+            out.insert(k.to_string(), val);
+        }
+        Some(out)
     }
 }
