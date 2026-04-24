@@ -115,11 +115,14 @@ graph TB
 #### Шаг 2.2: Dirty-флаг для инкрементального пересчёта ✅
 
 - [`TransformDirty`](crates/apex-core/src/transform.rs:126-127) — маркерный компонент
-- [`propagate_transforms()`](crates/apex-core/src/transform.rs:139-191) — sequential система:
+- [`propagate_transforms()`](crates/apex-core/src/transform.rs:139-246) — sequential система:
   1. Собирает все entity с `TransformDirty` через `query_typed::<Read<TransformDirty>>()`
-  2. Для каждой dirty entity вычисляет `GlobalTransform = parent.Global * local.to_matrix()`
-  3. Если нет родителя — `GlobalTransform = LocalTransform`
-  4. Снимает `TransformDirty` после записи
+  2. Топологическая сортировка dirty entity (DFS: корни → листья)
+  3. Для каждой dirty entity вычисляет `GlobalTransform = parent.Global * local.to_matrix()`
+  4. Если нет родителя — `GlobalTransform = LocalTransform`
+  5. Снимает `TransformDirty` после записи
+  6. **Каскадирование dirty на детей**: итерация по `world.children_of(ChildOf, entity)`, вставка `TransformDirty` всем детям, добавление их в ordered-список для обработки в том же проходе
+- Используется `while i < ordered.len()` вместо `for entity in ordered`, т.к. список динамически растёт при каскадировании
 
 #### Шаг 2.3: Зависимость `glam` (математическая библиотека) ✅
 
@@ -139,7 +142,47 @@ graph TB
   ```
 - Scheduler не импортируется (избегаем циклической зависимости apex-core ↔ apex-scheduler)
 
-**Файлы**: [`crates/apex-core/src/transform.rs`], [`Cargo.toml`](Cargo.toml), [`crates/apex-core/Cargo.toml`](crates/apex-core/Cargo.toml), [`crates/apex-core/src/lib.rs`](crates/apex-core/src/lib.rs:13)
+#### Шаг 2.5: `write_hooks` — автоматическая пометка TransformDirty при изменении LocalTransform ✅
+
+- [`write_hooks: FxHashMap<ComponentId, fn(Entity, &mut World)>`](crates/apex-core/src/world.rs:152-155) — новое поле в `World`, хранит коллбэки на запись
+- Использован `fn` pointer (Copy) вместо `Box<dyn Fn>`, чтобы избежать borrow conflict при вызове `hook(entity, self)`
+- [`get_mut::<T>()`](crates/apex-core/src/world.rs:571-600) модифицирован:
+  1. Обновляет `change_tick` (как и раньше)
+  2. Копирует hook из `write_hooks` (fn pointer — Copy) и отпускает borrow
+  3. Вызывает `hook(entity, self)`, если хук зарегистрирован
+  4. Перепроверяет location (хук мог изменить archetype через `insert`) и возвращает `&mut T`
+- [`register_write_hook::<T>()`](crates/apex-core/src/world.rs:602-614) — публичный метод для регистрации хука
+- [`mark_local_transform_dirty`](crates/apex-core/src/transform.rs:270-274) — функция-хук: вызывает `world.insert(entity, TransformDirty)`
+- Зарегистрирован в [`TransformPlugin::register_components()`](crates/apex-core/src/transform.rs:280-288):
+  ```rust
+  world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
+  ```
+- **Решает проблему Issue #1**: пользователь больше не должен вручную вставлять `TransformDirty` после `get_mut::<LocalTransform>()`
+
+#### Шаг 2.6: Каскадирование TransformDirty на детей ✅
+
+- В `propagate_transforms()`, после обработки dirty entity и снятия `TransformDirty`, выполняется каскадирование ([строки 228-242](crates/apex-core/src/transform.rs:228-242)):
+  ```rust
+  let children: Vec<Entity> = world.children_of(ChildOf, entity).collect();
+  for child in children {
+      if !world.is_alive(child) { continue; }
+      if world.get::<TransformDirty>(child).is_none() {
+          world.insert(child, TransformDirty);
+          ordered.push(child);
+      }
+  }
+  ```
+- **Решает проблему Issue #2**: если пользователь изменил LocalTransform родителя, дети автоматически получают `TransformDirty` и их `GlobalTransform` пересчитывается в том же проходе `propagate_transforms`
+- До исправления: пользователь должен был вручную пометить каждого ребёнка как dirty
+- После исправления: достаточно изменить `LocalTransform` родителя через `get_mut`, остальное делается автоматически
+
+**Файлы**: [`crates/apex-core/src/transform.rs`], [`crates/apex-core/src/world.rs`](crates/apex-core/src/world.rs), [`Cargo.toml`](Cargo.toml), [`crates/apex-core/Cargo.toml`](crates/apex-core/Cargo.toml), [`crates/apex-core/src/lib.rs`](crates/apex-core/src/lib.rs:13)
+
+### Дополнительно: Баги, исправленные в процессе
+
+- **Issue #1: Нет автоматической пометки TransformDirty** — добавлен механизм `write_hooks` в ядро `World`. При вызове `get_mut::<LocalTransform>()` хук `mark_local_transform_dirty` автоматически вставляет `TransformDirty`
+- **Issue #2: Нет каскадирования dirty от родителя к детям** — в `propagate_transforms()` добавлен проход по `world.children_of(ChildOf, entity)` после обработки dirty entity. Все дети помечаются dirty и добавляются в ordered-список
+- **Borrow checker conflict** — изначально использовался `Box<dyn Fn(Entity, &mut World)>`, но вызов `hook(entity, self)` конфликтовал с borrow `self.write_hooks.get()`. Решение: замена на `fn(Entity, &mut World)` (function pointer, Copy), копирование значения перед вызовом
 
 ### Тесты для фичи 2
 
@@ -150,6 +193,16 @@ graph TB
 - ✅ `propagate_parent_child_chain` — parent(100,0,0) + child(10,0,0) → child.Global = (110,0,0)
 - ✅ `propagate_deep_hierarchy` — grandparent(50) + parent(30) + child(20) → parent=80, child=100
 - ✅ `no_transform_dirty_skips_propagation` — без TransformDirty GlobalTransform не меняется
+
+### Примеры
+
+- [`transform_example.rs`](crates/apex-examples/examples/transform_example.rs) — полноценный пример:
+  - Создание иерархии Grandparent → Parent → Child
+  - `TransformDirty` вставляется автоматически при spawn (через `EntityBuilder`)
+  - Первый запуск `propagate_transforms` → все GlobalTransform корректны
+  - Изменение `LocalTransform` родителя через `get_mut` → **write_hook** автоматически вставляет `TransformDirty`
+  - Запуск `propagate_transforms` → **каскадирование** помечает Child dirty → Child.Global пересчитан
+  - Все assertions проходят без единой ручной вставки `TransformDirty`
 
 ---
 
