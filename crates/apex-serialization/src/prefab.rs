@@ -476,4 +476,58 @@ mod tests {
         assert_eq!(pos.y, 2.0);
         assert_eq!(pos.z, 3.0);
     }
+
+    #[test]
+    fn prefab_child_overrides() {
+        let mut world = setup_world();
+        let mut loader = PrefabLoader::new();
+
+        // Child prefab — будет переопределён
+        loader.load_json(r#"{
+            "name": "Child",
+            "components": [
+                { "type_name": "apex_serialization::prefab::tests::Health", "value": { "current": 10.0, "max": 10.0 } },
+                { "type_name": "apex_serialization::prefab::tests::Name", "value": "OriginalChild" }
+            ]
+        }"#).unwrap();
+
+        // Parent prefab с дочерним prefab + overrides
+        loader.load_json(r#"{
+            "name": "Parent",
+            "components": [
+                { "type_name": "apex_serialization::prefab::tests::Name", "value": "Parent" }
+            ],
+            "children": [
+                {
+                    "prefab": "Child",
+                    "overrides": [
+                        { "type_name": "apex_serialization::prefab::tests::Health", "value": { "current": 999.0, "max": 999.0 } },
+                        { "type_name": "apex_serialization::prefab::tests::Name", "value": "OverriddenChild" }
+                    ]
+                }
+            ]
+        }"#).unwrap();
+
+        let manifest = loader.get("Parent").unwrap();
+        let parent = loader.instantiate(&mut world, manifest, &[], None).unwrap();
+
+        // Проверяем parent
+        let parent_name = world.get::<Name>(parent).unwrap();
+        assert_eq!(parent_name.0, "Parent");
+
+        // Ищем ребёнка
+        use apex_core::relations::ChildOf;
+        let children: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        assert_eq!(children.len(), 1, "parent должен иметь ровно одного ребёнка");
+
+        let child = children[0];
+
+        // Проверяем, что overrides применились
+        let child_health = world.get::<Health>(child).unwrap();
+        assert_eq!(child_health.current, 999.0, "Health.current должен быть из overrides");
+        assert_eq!(child_health.max, 999.0, "Health.max должен быть из overrides");
+
+        let child_name = world.get::<Name>(child).unwrap();
+        assert_eq!(child_name.0, "OverriddenChild", "Name должен быть из overrides");
+    }
 }

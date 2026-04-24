@@ -38,6 +38,7 @@
 
 use crate::{
     entity::Entity,
+    relations::ChildOf,
     world::World,
 };
 use rustc_hash::FxHashMap;
@@ -105,6 +106,15 @@ pub trait EntityTemplate: Send + Sync {
     /// при вызове `spawn_from_template`. Если поле не переопределено —
     /// использовать значения по умолчанию из шаблона.
     fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity;
+
+    /// Опциональный родитель для создаваемой entity.
+    ///
+    /// Если вернуть `Some(parent_entity)`, то после спавна будет
+    /// автоматически установлено отношение `ChildOf(parent)`.
+    /// По умолчанию возвращает `None` (без родителя).
+    fn parent(&self) -> Option<Entity> {
+        None
+    }
 }
 
 // ── TemplateRegistry ─────────────────────────────────────────────
@@ -128,13 +138,22 @@ impl TemplateRegistry {
     }
 
     /// Создать entity из зарегистрированного шаблона.
+    ///
+    /// Если шаблон возвращает `Some(parent)` из [`EntityTemplate::parent()`],
+    /// то после спавна автоматически устанавливается `ChildOf(parent)`.
     pub fn spawn_from_template(
         &self,
         world: &mut World,
         name: &str,
         params: &TemplateParams,
     ) -> Option<Entity> {
-        self.templates.get(name).map(|t| t.spawn(world, params))
+        self.templates.get(name).map(|t| {
+            let entity = t.spawn(world, params);
+            if let Some(parent) = t.parent() {
+                world.add_relation(entity, ChildOf, parent);
+            }
+            entity
+        })
     }
 
     /// Получить raw pointer на шаблон по имени (для обхода borrow checker).
@@ -329,5 +348,69 @@ mod tests {
         ).unwrap();
         let v2 = world.get::<MyTemplate>(entity2).unwrap();
         assert_eq!(v2.value, 100);
+    }
+
+    #[test]
+    fn template_in_commands() {
+        use crate::query::Read;
+
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Label>();
+        world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
+
+        let mut commands = crate::commands::Commands::new();
+        commands.spawn_template("test");
+        commands.apply(&mut world);
+
+        // Должна быть ровно одна entity с Position
+        let query = world.query_typed::<Read<Position>>();
+        let mut count = 0;
+        query.for_each(|_, _| count += 1);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn template_parent_relation() {
+        use crate::relations::ChildOf;
+
+        struct ChildTemplate;
+
+        impl EntityTemplate for ChildTemplate {
+            fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
+                world.spawn().insert(Position { x: 1.0, y: 2.0 }).id()
+            }
+            fn parent(&self) -> Option<Entity> {
+                // Будет установлен внешним кодом через замыкание или хранение parent в структуре.
+                // В этом тесте мы проверяем механизм через регистрацию.
+                None
+            }
+        }
+
+        struct ParentBoundChild {
+            parent: Entity,
+        }
+
+        impl EntityTemplate for ParentBoundChild {
+            fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
+                world.spawn().insert(Label("child".to_string())).id()
+            }
+            fn parent(&self) -> Option<Entity> {
+                Some(self.parent)
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Label>();
+
+        let parent = world.spawn_empty();
+
+        world.register_template("child", ParentBoundChild { parent });
+
+        let child = world.spawn_template("child").unwrap();
+
+        // Проверяем, что child имеет отношение ChildOf(parent)
+        assert!(world.has_relation(child, ChildOf, parent));
     }
 }

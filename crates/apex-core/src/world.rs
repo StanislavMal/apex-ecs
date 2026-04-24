@@ -1175,6 +1175,9 @@ impl World {
     }
 
     /// Создать entity из зарегистрированного шаблона с параметрами.
+    ///
+    /// Если шаблон возвращает `Some(parent)` из [`EntityTemplate::parent()`],
+    /// то после спавна автоматически устанавливается `ChildOf(parent)`.
     pub fn spawn_from_template(
         &mut self,
         name: &str,
@@ -1185,7 +1188,14 @@ impl World {
         let raw = self.templates.get_raw(name)?;
         // SAFETY: шаблон жив, пока жив World (мы его не удаляем),
         // и get_raw возвращает корректный указатель.
-        unsafe { Some((*raw).spawn(self, params)) }
+        unsafe {
+            let template = &*raw;
+            let entity = template.spawn(self, params);
+            if let Some(parent) = template.parent() {
+                self.add_relation(entity, crate::relations::ChildOf, parent);
+            }
+            Some(entity)
+        }
     }
 
     /// Создать entity из шаблона с параметрами по умолчанию.

@@ -28,6 +28,7 @@ use std::{
 };
 
 use apex_core::entity::Entity;
+use apex_core::relations::ChildOf;
 use apex_core::world::World;
 use apex_serialization::prefab::{PrefabError, PrefabLoader, PrefabManifest};
 
@@ -165,8 +166,8 @@ impl PrefabPlugin {
     /// Перезагружает префаб в кеш `PrefabLoader`.
     /// Если префаб был загружен — обновляет манифест в `assets`.
     ///
-    /// **Не пересоздаёт entity** — это ответственность внешнего кода,
-    /// который может использовать [`PrefabAsset::spawned_entities`] для этого.
+    /// **Не пересоздаёт entity** — используйте [`reapply_asset`](PrefabPlugin::reapply_asset)
+    /// после вызова этого метода, если нужно пересоздать entity из обновлённого префаба.
     pub fn on_asset_changed(&mut self, change: &AssetChange) -> Result<(), HotReloadError> {
         let path = &change.path;
 
@@ -233,6 +234,78 @@ impl PrefabPlugin {
 
     pub fn is_empty(&self) -> bool {
         self.loader.is_empty()
+    }
+
+    /// Добавить entity в список отслеживаемых для указанного префаба.
+    ///
+    /// При вызове [`reapply_asset`](PrefabPlugin::reapply_asset) все отслеживаемые entity
+    /// будут деспавнены и созданы заново из обновлённого манифеста.
+    pub fn track_entity(&mut self, id: AssetId, entity: Entity) {
+        if let Some(asset) = self.assets.get_mut(&id.0) {
+            asset.spawned_entities.push(entity);
+        }
+    }
+
+    /// Пересоздать все entity из префаба по `AssetId`.
+    ///
+    /// 1. Деспавнит все ранее созданные entity (из `PrefabAsset::spawned_entities`)
+    /// 2. Загружает обновлённый манифест из кеша `PrefabLoader`
+    /// 3. Создаёт новые entity через `PrefabLoader::instantiate`
+    /// 4. Заменяет список отслеживаемых entity
+    pub fn reapply_asset(&mut self, world: &mut World, id: AssetId) -> Result<(), HotReloadError> {
+        let prefab_name = self.prefab_names.get(&id.0).ok_or_else(|| {
+            HotReloadError::Deserialize {
+                path: "unknown".to_string(),
+                reason: format!("prefab with AssetId={} not found", id.0),
+            }
+        })?;
+
+        // Деспавним старые entity (рекурсивно, вместе с детьми)
+        if let Some(asset) = self.assets.get(&id.0) {
+            for &entity in &asset.spawned_entities {
+                world.despawn_recursive(ChildOf, entity);
+            }
+        }
+
+        // Получаем обновлённый манифест из кеша
+        let manifest = self.loader.get(prefab_name).ok_or_else(|| {
+            HotReloadError::Deserialize {
+                path: "unknown".to_string(),
+                reason: format!("prefab `{}` not found in cache after reload", prefab_name),
+            }
+        })?;
+
+        // Создаём новые entity
+        let new_entity = self.loader.instantiate(world, manifest, &[], None)
+            .map_err(|e| HotReloadError::Deserialize {
+                path: "unknown".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Обновляем список отслеживаемых entity
+        if let Some(asset) = self.assets.get_mut(&id.0) {
+            asset.spawned_entities = vec![new_entity];
+        }
+
+        log::info!(
+            "[prefab] reapplied `{}` (AssetId={}) — respawned entity {:?}",
+            prefab_name,
+            id.0,
+            new_entity,
+        );
+
+        Ok(())
+    }
+
+    /// Пересоздать все entity из всех зарегистрированных префабов.
+    ///
+    /// Полезно для полного обновления сцены после массовых изменений.
+    pub fn reapply_all(&mut self, world: &mut World) -> Result<(), HotReloadError> {
+        let ids: Vec<AssetId> = self.prefab_names.keys().copied().map(AssetId).collect();
+        for id in ids {
+            self.reapply_asset(world, id)?;
+        }
+        Ok(())
     }
 }
 
