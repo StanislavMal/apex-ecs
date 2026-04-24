@@ -8,6 +8,7 @@ pub mod query;
 pub mod relations;
 pub mod resources;
 pub mod storage;
+pub mod sub_world;
 pub mod system_param;
 pub mod world;
 
@@ -16,6 +17,7 @@ pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
+pub use sub_world::SubWorld;
 pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext, DeferredQueue};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;

@@ -60,7 +60,7 @@ impl ParSystem for PhysicsSystem {
 
         let count = ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().len();
 
-        ctx.for_each_component::<(Read<Mass>, Write<Velocity>, Write<Position>), _>(
+        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().for_each_component(
             |(mass, vel, pos)| {
                 vel.y  -= g * mass.0 * dt;
                 pos.x  += vel.x * dt;
@@ -83,7 +83,7 @@ impl ParSystem for HealthClampSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let mut clamped = 0usize;
-        ctx.for_each_component::<Write<Health>, _>(|hp| {
+        ctx.query::<Write<Health>>().for_each_component(|hp| {
             let prev = hp.current;
             hp.current = hp.current.clamp(0.0, hp.max);
             if (hp.current - prev).abs() > f32::EPSILON { clamped += 1; }
@@ -101,7 +101,7 @@ impl AutoSystem for MovementSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let count = ctx.query::<Self::Query>().len();
-        ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
+        ctx.query::<Self::Query>().for_each_component(|(vel, pos)| {
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -270,7 +270,7 @@ fn main() {
         "enemy_ai",
         |ctx: SystemContext<'_>| {
             let count = ctx.query::<(Read<Enemy>, Write<Velocity>)>().len();
-            ctx.for_each_component::<(Read<Enemy>, Write<Velocity>), _>(|(_, vel)| {
+            ctx.query::<(Read<Enemy>, Write<Velocity>)>().for_each_component(|(_, vel)| {
                 vel.x *= 0.99; // трение
                 vel.y *= 0.99;
             });

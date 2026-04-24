@@ -204,6 +204,11 @@ impl ComponentRegistry {
         self.type_to_id.get(&TypeId::of::<T>()).copied()
     }
 
+    /// Получить ComponentId по TypeId (для динамических запросов).
+    pub fn get_id_by_type(&self, type_id: &TypeId) -> Option<ComponentId> {
+        self.type_to_id.get(type_id).copied()
+    }
+
     pub fn get_or_register<T: Component>(&mut self) -> ComponentId {
         self.register::<T>()
     }

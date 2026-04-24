@@ -281,6 +281,17 @@ pub struct Scheduler {
     edge_info:        Vec<GraphEdgeInfo>,
     /// True если после последнего compile() добавлялись системы/зависимости.
     graph_dirty:      bool,
+
+    // ── SubWorld маппинг ────────────────────────────────────────
+    /// Для каждой системы — индексы архетипов, которые ей нужны.
+    /// Заполняется в compile() и используется в run_hybrid_parallel().
+    system_archetype_indices: FxHashMap<SystemId, Vec<usize>>,
+    /// Owned storage для Vec<usize>, используемых SubWorld.
+    /// Позволяет избежать Box::leak — данные живут в Scheduler.
+    archetype_indices_storage: Vec<Vec<usize>>,
+    /// Количество архетипов в World на момент последнего compute_archetype_indices().
+    /// Используется для кеширования — пересчёт только при изменении.
+    cached_archetype_count: usize,
 }
 
 impl Scheduler {
@@ -295,6 +306,9 @@ impl Scheduler {
             graph_nodes:      FxHashMap::default(),
             edge_info:        Vec::new(),
             graph_dirty:      false,
+            system_archetype_indices: FxHashMap::default(),
+            archetype_indices_storage: Vec::new(),
+            cached_archetype_count: 0,
         }
     }
 
@@ -412,6 +426,9 @@ impl Scheduler {
     /// Строит/обновляет граф зависимостей, находит параллельные Stage.
     /// Если граф не изменился с прошлого compile — только пересчитывает
     /// топосорт (добавленные узлы уже в графе).
+    ///
+    /// Также вычисляет для каждой системы индексы архетипов, которые ей нужны
+    /// (для создания SubWorld в run_hybrid_parallel).
     pub fn compile(&mut self) -> Result<(), SchedulerError> {
         if self.graph_dirty {
             // Инкрементальное обновление: добавляем только новые узлы и рёбра
@@ -452,6 +469,68 @@ impl Scheduler {
 
         self.execution_plan = Some(ExecutionPlan { stages, flat_order });
         Ok(())
+    }
+
+    /// Вычислить для каждой системы индексы архетипов, которые ей нужны.
+    ///
+    /// Вызывается после compile() перед run(), когда World уже создан.
+    /// Использует AccessDescriptor.reads/writes (TypeId) для фильтрации.
+    pub fn compute_archetype_indices(&mut self, world: &apex_core::World) {
+        let archetypes = world.archetypes();
+        let arch_count = archetypes.len();
+
+        // Кеш: если количество архетипов не изменилось — пропускаем пересчёт
+        if arch_count == self.cached_archetype_count && !self.system_archetype_indices.is_empty() {
+            return;
+        }
+
+        self.system_archetype_indices.clear();
+        self.archetype_indices_storage.clear();
+
+        if arch_count == 0 {
+            self.cached_archetype_count = 0;
+            return;
+        }
+
+        // Для каждой системы находим подходящие архетипы
+        for system in &self.systems {
+            let access = match system.kind.access() {
+                Some(a) => a,
+                None => continue, // Sequential — не использует SubWorld
+            };
+
+            // Собираем все TypeId, которые система читает или пишет
+            let mut system_type_ids: Vec<std::any::TypeId> = Vec::new();
+            system_type_ids.extend(access.reads.iter().copied());
+            system_type_ids.extend(access.writes.iter().copied());
+
+            if system_type_ids.is_empty() {
+                // Система без компонентов (только ресурсы/события) — все архетипы
+                let all: Vec<usize> = (0..arch_count).collect();
+                self.system_archetype_indices.insert(system.id, all);
+                continue;
+            }
+
+            let mut indices = Vec::new();
+            for (arch_idx, arch) in archetypes.iter().enumerate() {
+                // Проверяем, есть ли у архетипа хотя бы один компонент из списка системы
+                let registry = world.registry();
+                let has_match = system_type_ids.iter().any(|tid| {
+                    if let Some(cid) = registry.get_id_by_type(tid) {
+                        arch.has_component(cid)
+                    } else {
+                        false
+                    }
+                });
+                if has_match {
+                    indices.push(arch_idx);
+                }
+            }
+
+            self.system_archetype_indices.insert(system.id, indices);
+        }
+
+        self.cached_archetype_count = arch_count;
     }
 
     /// Полная перестройка графа зависимостей.
@@ -804,6 +883,11 @@ impl Scheduler {
             self.compile().expect("Failed to compile schedule");
         }
 
+        // Вычисляем маппинг систем → архетипы для SubWorld.
+        // Это нужно делать перед каждым запуском, так как World мог измениться
+        // (добавились/удалились архетипы через spawn/despawn).
+        self.compute_archetype_indices(world);
+
         #[cfg(feature = "parallel")]
         self.run_hybrid_parallel(world);
 
@@ -820,23 +904,36 @@ impl Scheduler {
         let order: Vec<SystemId> = self.execution_plan
             .as_ref().unwrap().flat_order.clone();
 
+        // Sequential системы получают &mut World, параллельные — SubWorld
+        // Создаём SubWorld на все архетипы для параллельных систем
+        let all_indices: Vec<usize> = (0..world.archetypes().len()).collect();
+        let sub_world = apex_core::SubWorld::new(
+            // SAFETY: мы не используем sub_world одновременно с &mut world
+            unsafe { &*(world as *mut World as *const World) },
+            &all_indices,
+        );
+
         for sys_id in order {
             if let Some(index) = self.system_indices.get(&sys_id) {
                 let system = &mut self.systems[*index];
                 match &mut system.kind {
-                    SystemKind::Sequential(f)             => f(world),
-                    SystemKind::Parallel { system, .. }   => {
-                        system.run(SystemContext::new(world));
+                    SystemKind::Sequential(f) => f(world),
+                    SystemKind::Parallel { system, .. } => {
+                        system.run(SystemContext::from_sub_world(&sub_world));
                     }
                 }
             }
         }
     }
 
-    /// Параллельное выполнение через Rayon.
+    /// Параллельное выполнение через Rayon scope + spawn.
     ///
     /// Системы в одном Stage (все ParSystem, нет конфликтов) запускаются
-    /// через `rayon::scope` — параллельно в thread pool.
+    /// через `rayon::scope(|s| { for ... { s.spawn(...) } })` — каждая
+    /// система получает свой поток без оверхеда на split/steal от par_iter.
+    ///
+    /// Для stage с малым числом систем (< parallel_threshold) используется
+    /// последовательный запуск, чтобы избежать оверхеда rayon::scope.
     #[cfg(feature = "parallel")]
     fn run_hybrid_parallel(&mut self, world: &mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
@@ -845,16 +942,31 @@ impl Scheduler {
             .map(|s| (s.system_ids.clone(), s.all_parallel))
             .collect();
 
+        // Pre-вычисляем SubWorld storage для всех систем
+        // Это безопасно, потому что:
+        // - SubWorld не владеет данными, только ссылается
+        // - Мы не делаем structural changes во время выполнения
+        // - Разные SubWorld для разных систем не пересекаются по архетипам
+        let const_world: &World = unsafe { &*(world as *mut World as *const World) };
+        self.prepare_sub_worlds(const_world);
+
+        // Строим маппинг system_idx → storage_idx
+        // storage_idx = порядковый номер системы в self.systems
+        // (prepare_sub_worlds заполняет storage в том же порядке)
+        let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
+
         for (stage_ids, all_parallel) in &stages {
             // Проверяем threshold для параллельного выполнения
             if !all_parallel || stage_ids.len() < self.parallel_threshold {
                 for &sys_id in stage_ids {
-                    if let Some(index) = self.system_indices.get(&sys_id) {
-                        let system = &mut self.systems[*index];
+                    if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                        // SubWorld должен быть создан ДО mutable borrow self.systems
+                        let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
+                        let system = &mut self.systems[sys_idx];
                         match &mut system.kind {
                             SystemKind::Sequential(f)           => f(world),
                             SystemKind::Parallel { system, .. } => {
-                                system.run(SystemContext::new(world));
+                                system.run(SystemContext::from_sub_world(&sw));
                             }
                         }
                     }
@@ -862,39 +974,78 @@ impl Scheduler {
                 continue;
             }
 
-            // SAFETY: все системы этого Stage прошли compile():
-            // - нет Write-конфликтов между системами
-            // - каждая Column — отдельный буфер памяти
-            // - structural changes запрещены во время Stage
-            let par_world: ParallelWorld<'_> = unsafe { world.as_parallel_world() };
-
             let indices: Vec<usize> = stage_ids
                 .iter()
                 .filter_map(|sid| self.system_indices.get(sid))
                 .copied()
                 .collect();
 
-            // SAFETY: indices уникальны → каждый SendPtr<SystemDescriptor>
-            // указывает на отдельный элемент Vec → нет aliasing.
-            let ptrs: Vec<SendPtr<SystemDescriptor>> = indices
-                .iter()
-                .map(|&idx| SendPtr(&mut self.systems[idx] as *mut SystemDescriptor))
-                .collect();
+            // Создаём SubWorld для каждой системы ПЕРЕД scope
+            // (SubWorld содержит ссылки, поэтому должен быть создан до замыкания)
+            let sub_worlds: Vec<apex_core::SubWorld<'_>> = indices.iter().map(|&sys_idx| {
+                self.make_sub_world(system_to_storage[sys_idx], const_world)
+            }).collect();
 
-            rayon::scope(|scope| {
-                for ptr in &ptrs {
-                    let sys_ptr   = SendPtr(ptr.0);
-                    let world_ref = &par_world;
-
-                    scope.spawn(move |_| {
-                        let descriptor = unsafe { sys_ptr.as_mut() };
+            // Используем rayon::scope + spawn вместо par_iter().for_each(),
+            // чтобы избежать оверхеда на split/steal.
+            // Каждая система spawn-ится как отдельная задача в thread pool.
+            // Это эффективно для малого числа систем (≤ num_threads).
+            // SendPtr обеспечивает Send+Sync для сырых указателей.
+            // Используем into_iter() для потребления sub_worlds — каждая
+            // итерация забирает один элемент, избегая move всей Vec.
+            rayon::scope(|s| {
+                let mut sub_worlds_iter = sub_worlds.into_iter();
+                for &sys_idx in &indices {
+                    let ptr = SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor);
+                    let sw = sub_worlds_iter.next().unwrap();
+                    s.spawn(move |_| {
+                        let descriptor = unsafe { ptr.as_mut() };
                         if let SystemKind::Parallel { system, .. } = &mut descriptor.kind {
-                            let world = unsafe { world_ref.get() };
-                            system.run(SystemContext::new(world));
+                            system.run(SystemContext::from_sub_world(&sw));
                         }
                     });
                 }
             });
+        }
+    }
+
+    /// Создать SubWorld для системы на основе предвычисленных archetype_indices.
+    ///
+    /// Использует `archetype_indices_storage` для owned хранения данных,
+    /// что позволяет избежать `Box::leak`. Storage заполняется заранее
+    /// в `prepare_sub_worlds()`.
+    ///
+    /// # SAFETY
+    /// - `storage_idx` должен быть валидным индексом в `archetype_indices_storage`
+    /// - `archetype_indices_storage` не должен изменяться, пока SubWorld жив
+    fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
+        let arch_indices: &'w [usize] = unsafe {
+            let vec = &self.archetype_indices_storage[storage_idx];
+            std::slice::from_raw_parts(vec.as_ptr(), vec.len())
+        };
+        apex_core::SubWorld::new(world, arch_indices)
+    }
+
+    /// Подготовить storage для SubWorld — заполняет `archetype_indices_storage`
+    /// для всех систем. Вызывается перед `run_hybrid_parallel()`.
+    /// Позволяет избежать `Box::leak` в `make_sub_world`.
+    fn prepare_sub_worlds(&mut self, world: &World) {
+        self.archetype_indices_storage.clear();
+        let arch_count = world.archetypes().len();
+
+        for system in &self.systems {
+            let indices = self.system_archetype_indices.get(&system.id);
+            match indices {
+                Some(indices) if !indices.is_empty() => {
+                    self.archetype_indices_storage.push(indices.clone());
+                }
+                _ => {
+                    // fallback: все архетипы
+                    self.archetype_indices_storage.push(
+                        (0..arch_count).collect()
+                    );
+                }
+            }
         }
     }
 
@@ -991,6 +1142,27 @@ impl Scheduler {
                         SystemKind::Sequential(_) => {
                             out.push_str(&format!("  - {} [seq | full &mut World]\n", s.name));
                         }
+                    }
+                }
+            }
+        }
+
+        // ── SubWorld маппинг (архетипы для каждой системы) ────
+        if !self.system_archetype_indices.is_empty() {
+            out.push_str("\n  ── SubWorld archetype mapping ──\n");
+            for sys_id in plan.flat_order.iter() {
+                if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
+                    if let Some(indices) = self.system_archetype_indices.get(sys_id) {
+                        out.push_str(&format!(
+                            "  {}: {} archetypes [{}]\n",
+                            s.name,
+                            indices.len(),
+                            if indices.len() <= 10 {
+                                indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                            } else {
+                                format!("{}..{}", indices[0], indices[indices.len()-1])
+                            }
+                        ));
                     }
                 }
             }
@@ -1117,10 +1289,11 @@ mod tests {
     impl AutoSystem for AutoMovement {
         type Query = (Read<Vel>, Write<Pos>);
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
-                pos.x += vel.x;
-                pos.y += vel.y;
-            });
+            ctx.query::<Self::Query>()
+                .for_each_component(|(vel, pos)| {
+                    pos.x += vel.x;
+                    pos.y += vel.y;
+                });
         }
     }
 
@@ -1128,9 +1301,10 @@ mod tests {
     impl AutoSystem for AutoHealth {
         type Query = Write<Hp>;
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<Self::Query, _>(|hp| {
-                hp.0 = hp.0.max(0.0);
-            });
+            ctx.query::<Self::Query>()
+                .for_each_component(|hp| {
+                    hp.0 = hp.0.max(0.0);
+                });
         }
     }
 
@@ -1275,9 +1449,10 @@ mod tests {
         impl ParSystem for MovementSystem {
             fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
             fn run(&mut self, ctx: SystemContext<'_>) {
-                ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(vel, pos)| {
-                    pos.x += vel.x; pos.y += vel.y;
-                });
+                ctx.query::<(Read<Vel>, Write<Pos>)>()
+                    .for_each_component(|(vel, pos)| {
+                        pos.x += vel.x; pos.y += vel.y;
+                    });
             }
         }
 
@@ -1362,10 +1537,11 @@ mod tests {
             "scaled_movement",
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
-                ctx.for_each_component::<(Read<Vel>, Write<Pos>), _>(|(vel, pos)| {
-                    pos.x += vel.x * (*dt).0;
-                    pos.y += vel.y * (*dt).0;
-                });
+                ctx.query::<(Read<Vel>, Write<Pos>)>()
+                    .for_each_component(|(vel, pos)| {
+                        pos.x += vel.x * (*dt).0;
+                        pos.y += vel.y * (*dt).0;
+                    });
             },
             AccessDescriptor::new()
                 .read::<DeltaTime>()

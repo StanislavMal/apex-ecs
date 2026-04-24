@@ -175,7 +175,7 @@ impl ParSystem for MoveSys {
         AccessDescriptor::new().read::<Velocity>().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+        ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
             p.z += v.z * 0.016;
@@ -187,7 +187,7 @@ struct HpSys;
 impl ParSystem for HpSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Write<Health>, _>(|hp| {
+        ctx.query::<Write<Health>>().for_each_component(|hp| {
             hp.current = hp.current.min(hp.max).max(0.0);
         });
     }
@@ -197,7 +197,7 @@ struct TempSys;
 impl ParSystem for TempSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Write<Temperature>, _>(|t| {
+        ctx.query::<Write<Temperature>>().for_each_component(|t| {
             t.0 += (20.0 - t.0) * 0.001;
         });
     }
@@ -207,7 +207,7 @@ struct ManaSys;
 impl ParSystem for ManaSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Write<Mana>, _>(|m| {
+        ctx.query::<Write<Mana>>().for_each_component(|m| {
             m.current = (m.current + 0.2).min(m.max);
         });
     }
@@ -219,7 +219,7 @@ impl ParSystem for HeavyPhysSys {
         AccessDescriptor::new().write::<Velocity>().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<(Write<Velocity>, Write<Position>), _>(|(v, p)| {
+        ctx.query::<(Write<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
             let dt    = 0.016f32;
             let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
             let angle = speed.atan2(1.0);
@@ -239,7 +239,7 @@ struct HeavyTempSys;
 impl ParSystem for HeavyTempSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Write<Temperature>, _>(|t| {
+        ctx.query::<Write<Temperature>>().for_each_component(|t| {
             let ambient = 20.0f32;
             let diff    = t.0 - ambient;
             let rate    = (diff * 0.1).tanh() * 0.05;
@@ -256,7 +256,7 @@ struct HeavyManaSys;
 impl ParSystem for HeavyManaSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Write<Mana>, _>(|m| {
+        ctx.query::<Write<Mana>>().for_each_component(|m| {
             let ratio = m.current / m.max;
             let regen = (1.0 - ratio).sqrt() * 0.5;
             m.current = (m.current + regen).min(m.max);
@@ -271,7 +271,7 @@ struct AutoMoveSys;
 impl AutoSystem for AutoMoveSys {
     type Query = (Read<Velocity>, Write<Position>);
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<Self::Query, _>(|(v, p)| {
+        ctx.query::<Self::Query>().for_each_component(|(v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
         });
@@ -533,7 +533,7 @@ fn bench_scheduler_throughput(n: usize) {
             "physics",
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
-                ctx.for_each_component::<Write<Position>, _>(|pos| { pos.x += dt; });
+                ctx.query::<Write<Position>>().for_each_component(|pos| { pos.x += dt; });
             },
             AccessDescriptor::new().read::<PhysicsConfig>().write::<Position>(),
         );
@@ -1205,6 +1205,288 @@ fn bench_parallel_scheduler(n: usize) {
         );
     }
 
+    // ── Сравнение for_each_component vs par_for_each_component ──────────
+    //
+    // Ключевой тест: проверяем, даёт ли par_for_each_component (intra-system
+    // parallelism) прирост по сравнению с for_each_component (sequential)
+    // в межсистемном режиме.
+    //
+    // Системы: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
+    // vs HeavyPhysSys (for_each) + HeavyTempSys (for_each)
+    //
+    // Ожидание: par_for_each должен использовать все 12 ядер для каждой системы,
+    // в то время как for_each использует только 1 ядро на систему.
+
+    println!("\n  --- Сравнение for_each vs par_for_each (межсистемный) ---");
+    println!("  Ожидание: par_for_each даст speedup ≈ 2x–6x за счёт использования всех ядер");
+
+    struct HeavyPhysParSys;
+    impl ParSystem for HeavyPhysParSys {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write::<Velocity>().write::<Position>()
+        }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
+                let dt    = 0.016f32;
+                let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+                let angle = speed.atan2(1.0);
+                let drag  = angle.cos() * 0.99;
+                v.x = v.x * drag + angle.sin() * 0.001;
+                v.y = v.y * drag - 9.8 * dt;
+                v.z = v.z * drag;
+                p.x += v.x * dt;
+                p.y += v.y * dt;
+                p.z += v.z * dt;
+                if p.y < 0.0 { p.y = 0.0; v.y = v.y.abs() * 0.8; }
+            });
+        }
+    }
+
+    struct HeavyTempParSys;
+    impl ParSystem for HeavyTempParSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.query::<Write<Temperature>>().par_for_each_component(|t| {
+                let ambient = 20.0f32;
+                let diff    = t.0 - ambient;
+                let rate    = (diff * 0.1).tanh() * 0.05;
+                t.0        -= rate;
+                t.0         = t.0.clamp(
+                    ambient - diff.abs().sqrt(),
+                    ambient + diff.abs().sqrt(),
+                );
+            });
+        }
+    }
+
+    struct HeavyManaParSys;
+    impl ParSystem for HeavyManaParSys {
+        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+        fn run(&mut self, ctx: SystemContext<'_>) {
+            ctx.query::<Write<Mana>>().par_for_each_component(|m| {
+                let ratio = m.current / m.max;
+                let regen = (1.0 - ratio).sqrt() * 0.5;
+                m.current = (m.current + regen).min(m.max);
+                if ratio > 0.9 {
+                    m.current *= 1.0 - (ratio - 0.9).powi(2) * 0.01;
+                }
+            });
+        }
+    }
+
+    // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
+    {
+        let (seq_sched, par_sched) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys)
+        );
+        let (seq_par_sched, par_par_sched) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysParSys),
+            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempParSys)
+        );
+        bench_seq_par(
+            &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
+            || make_isolated_world(n * 1000),
+            { let mut s = seq_sched; move |w| s.run_sequential(w) },
+            { let mut s = par_sched; move |w| s.run(w) },
+        );
+        bench_seq_par(
+            &format!("[par_for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
+            || make_isolated_world(n * 1000),
+            { let mut s = seq_par_sched; move |w| s.run_sequential(w) },
+            { let mut s = par_par_sched; move |w| s.run(w) },
+        );
+    }
+
+    // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
+    {
+        let (seq_sched, par_sched) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys),
+            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaSys)
+        );
+        let (seq_par_sched, par_par_sched) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysParSys),
+            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempParSys),
+            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaParSys)
+        );
+        bench_seq_par(
+            &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
+            || make_isolated_world(n * 1000),
+            { let mut s = seq_sched; move |w| s.run_sequential(w) },
+            { let mut s = par_sched; move |w| s.run(w) },
+        );
+        bench_seq_par(
+            &format!("[par_for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
+            || make_isolated_world(n * 1000),
+            { let mut s = seq_par_sched; move |w| s.run_sequential(w) },
+            { let mut s = par_par_sched; move |w| s.run(w) },
+        );
+    }
+
+    // ── Максимальный межсистемный параллелизм: N систем = N ядер ──
+    //
+    // Ключевой тест: создаём 12 систем, каждая пишет в СВОЙ уникальный
+    // компонент. Каждая система работает со своим архетипом.
+    // Это позволяет измерить максимальный achievable speedup
+    // межсистемного параллелизма без конкуренции за данные.
+    //
+    // Ожидание: speedup ≈ 8x–10x (12 ядер, минимальные накладные расходы).
+    // Если speedup << 8x — проблема в планировщике (rayon::par_iter),
+    // а не в SubWorld или кеш-конкуренции.
+
+    println!("\n  --- Максимальный межсистемный параллелизм: 12 систем × 1 компонент ---");
+    println!("  Ожидание: speedup ≈ 8x–10x (12 ядер, без конкуренции за данные)");
+
+    // ── 12 уникальных компонентов ─────────────────────────────
+    struct C0(f32);
+    struct C1(f32);
+    struct C2(f32);
+    struct C3(f32);
+    struct C4(f32);
+    struct C5(f32);
+    struct C6(f32);
+    struct C7(f32);
+    struct C8(f32);
+    struct C9(f32);
+    struct C10(f32);
+    struct C11(f32);
+
+    // ── 12 систем, каждая пишет в свой компонент ──────────────
+    macro_rules! make_solo_sys {
+        ($name:ident, $comp:ty) => {
+            struct $name;
+            impl ParSystem for $name {
+                fn access() -> AccessDescriptor {
+                    AccessDescriptor::new().write::<$comp>()
+                }
+                fn run(&mut self, ctx: SystemContext<'_>) {
+                    ctx.query::<Write<$comp>>().for_each_component(|c| {
+                        c.0 = (c.0 * 1.01 + 0.5).sin();
+                    });
+                }
+            }
+        };
+    }
+
+    make_solo_sys!(SoloSys0, C0);
+    make_solo_sys!(SoloSys1, C1);
+    make_solo_sys!(SoloSys2, C2);
+    make_solo_sys!(SoloSys3, C3);
+    make_solo_sys!(SoloSys4, C4);
+    make_solo_sys!(SoloSys5, C5);
+    make_solo_sys!(SoloSys6, C6);
+    make_solo_sys!(SoloSys7, C7);
+    make_solo_sys!(SoloSys8, C8);
+    make_solo_sys!(SoloSys9, C9);
+    make_solo_sys!(SoloSys10, C10);
+    make_solo_sys!(SoloSys11, C11);
+
+    // ── Мир с 12 архетипами, по одному компоненту в каждом ────
+    let make_12arch_world = |n: usize| {
+        let mut world = World::new();
+        world.register_component::<C0>();
+        world.register_component::<C1>();
+        world.register_component::<C2>();
+        world.register_component::<C3>();
+        world.register_component::<C4>();
+        world.register_component::<C5>();
+        world.register_component::<C6>();
+        world.register_component::<C7>();
+        world.register_component::<C8>();
+        world.register_component::<C9>();
+        world.register_component::<C10>();
+        world.register_component::<C11>();
+
+        world.spawn_many_silent(n, |i| (C0(i as f32),));
+        world.spawn_many_silent(n, |i| (C1(i as f32),));
+        world.spawn_many_silent(n, |i| (C2(i as f32),));
+        world.spawn_many_silent(n, |i| (C3(i as f32),));
+        world.spawn_many_silent(n, |i| (C4(i as f32),));
+        world.spawn_many_silent(n, |i| (C5(i as f32),));
+        world.spawn_many_silent(n, |i| (C6(i as f32),));
+        world.spawn_many_silent(n, |i| (C7(i as f32),));
+        world.spawn_many_silent(n, |i| (C8(i as f32),));
+        world.spawn_many_silent(n, |i| (C9(i as f32),));
+        world.spawn_many_silent(n, |i| (C10(i as f32),));
+        world.spawn_many_silent(n, |i| (C11(i as f32),));
+        world
+    };
+
+    // ── Тест 1: 2 системы ─────────────────────────────────────
+    {
+        let (seq, par) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1)
+        );
+        bench_seq_par(
+            &format!("2 solo-системы, 2 архетипа ({n}k each)"),
+            || make_12arch_world(n * 1000),
+            { let mut s = seq; move |w| s.run_sequential(w) },
+            { let mut s = par; move |w| s.run(w) },
+        );
+    }
+
+    // ── Тест 2: 4 системы ─────────────────────────────────────
+    {
+        let (seq, par) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1),
+            |s: &mut Scheduler| s.add_par_system("s2", SoloSys2),
+            |s: &mut Scheduler| s.add_par_system("s3", SoloSys3)
+        );
+        bench_seq_par(
+            &format!("4 solo-системы, 4 архетипа ({n}k each)"),
+            || make_12arch_world(n * 1000),
+            { let mut s = seq; move |w| s.run_sequential(w) },
+            { let mut s = par; move |w| s.run(w) },
+        );
+    }
+
+    // ── Тест 3: 8 систем ─────────────────────────────────────
+    {
+        let (seq, par) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1),
+            |s: &mut Scheduler| s.add_par_system("s2", SoloSys2),
+            |s: &mut Scheduler| s.add_par_system("s3", SoloSys3),
+            |s: &mut Scheduler| s.add_par_system("s4", SoloSys4),
+            |s: &mut Scheduler| s.add_par_system("s5", SoloSys5),
+            |s: &mut Scheduler| s.add_par_system("s6", SoloSys6),
+            |s: &mut Scheduler| s.add_par_system("s7", SoloSys7)
+        );
+        bench_seq_par(
+            &format!("8 solo-систем, 8 архетипов ({n}k each)"),
+            || make_12arch_world(n * 1000),
+            { let mut s = seq; move |w| s.run_sequential(w) },
+            { let mut s = par; move |w| s.run(w) },
+        );
+    }
+
+    // ── Тест 4: 12 систем (полная загрузка всех ядер) ─────────
+    {
+        let (seq, par) = make_scheds!(
+            |s: &mut Scheduler| s.add_par_system("s0",  SoloSys0),
+            |s: &mut Scheduler| s.add_par_system("s1",  SoloSys1),
+            |s: &mut Scheduler| s.add_par_system("s2",  SoloSys2),
+            |s: &mut Scheduler| s.add_par_system("s3",  SoloSys3),
+            |s: &mut Scheduler| s.add_par_system("s4",  SoloSys4),
+            |s: &mut Scheduler| s.add_par_system("s5",  SoloSys5),
+            |s: &mut Scheduler| s.add_par_system("s6",  SoloSys6),
+            |s: &mut Scheduler| s.add_par_system("s7",  SoloSys7),
+            |s: &mut Scheduler| s.add_par_system("s8",  SoloSys8),
+            |s: &mut Scheduler| s.add_par_system("s9",  SoloSys9),
+            |s: &mut Scheduler| s.add_par_system("s10", SoloSys10),
+            |s: &mut Scheduler| s.add_par_system("s11", SoloSys11)
+        );
+        bench_seq_par(
+            &format!("12 solo-систем, 12 архетипов ({n}k each)"),
+            || make_12arch_world(n * 1000),
+            { let mut s = seq; move |w| s.run_sequential(w) },
+            { let mut s = par; move |w| s.run(w) },
+        );
+    }
+
     // ── Pipeline с барьером ───────────────────────────────────
     println!("\n  --- Pipeline с Sequential барьером ---");
 
@@ -1300,7 +1582,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1315,7 +1597,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.par_for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1330,7 +1612,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1348,7 +1630,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.par_for_each_component::<(Read<Velocity>, Write<Position>), _>(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1408,6 +1690,9 @@ fn bench_intra_system_parallel(_n: usize) {
 // ── main ───────────────────────────────────────────────────────
 
 fn main() {
+    // Инициализируем PAR_CHUNK_SIZE из переменной окружения (если задана)
+    apex_core::world::init_par_chunk_size_from_env();
+
     println!("=== Apex ECS — Performance Benchmark v2 ===");
     println!("Build: {}",
         if cfg!(debug_assertions) { "DEBUG ⚠  (запускайте с --release)" }
@@ -1417,6 +1702,8 @@ fn main() {
     println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
     #[cfg(not(feature = "parallel"))]
     println!("Mode:  sequential  (--features parallel для rayon)");
+    println!("PAR_CHUNK_SIZE: {} (установи APEX_PAR_CHUNK_SIZE для изменения)",
+        apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed));
     println!();
 
     const N: usize = 100; // → N*1000 entity в большинстве тестов

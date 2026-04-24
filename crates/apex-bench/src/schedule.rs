@@ -11,10 +11,11 @@ impl ParSystem for MoveSystem {
         AccessDescriptor::new().read::<Velocity>().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<(apex_core::query::Read<Velocity>, apex_core::query::Write<Position>), _>(|(v, p)| {
-            p.x += v.x;
-            p.y += v.y;
-        });
+        ctx.query::<(apex_core::query::Read<Velocity>, apex_core::query::Write<Position>)>()
+            .for_each_component(|(v, p)| {
+                p.x += v.x;
+                p.y += v.y;
+            });
     }
 }
 
@@ -24,9 +25,10 @@ impl ParSystem for GravitySystem {
         AccessDescriptor::new().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.for_each_component::<apex_core::query::Write<Position>, _>(|p| {
-            p.y -= 9.8 * 0.016;
-        });
+        ctx.query::<apex_core::query::Write<Position>>()
+            .for_each_component(|p| {
+                p.y -= 9.8 * 0.016;
+            });
     }
 }
 

@@ -55,6 +55,88 @@ impl ComponentMask {
     }
 }
 
+/// Битовая маска архетипов — до 1024 архетипов (16 × u64).
+///
+/// Позволяет O(1) проверять, какие архетипы соответствуют AccessDescriptor системы.
+/// Заполняется планировщиком в `compile()` после того, как все архетипы созданы.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ArchetypeMask {
+    bits: [u64; 16],
+}
+
+impl ArchetypeMask {
+    pub const EMPTY: Self = Self { bits: [0u64; 16] };
+
+    #[inline]
+    pub fn set(&mut self, idx: usize) {
+        if idx < 1024 {
+            self.bits[idx / 64] |= 1u64 << (idx % 64);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> bool {
+        if idx < 1024 {
+            self.bits[idx / 64] & (1u64 << (idx % 64)) != 0
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn and(&self, other: &Self) -> Self {
+        let mut bits = [0u64; 16];
+        for i in 0..16 {
+            bits[i] = self.bits[i] & other.bits[i];
+        }
+        Self { bits }
+    }
+
+    #[inline]
+    pub fn or(&self, other: &Self) -> Self {
+        let mut bits = [0u64; 16];
+        for i in 0..16 {
+            bits[i] = self.bits[i] | other.bits[i];
+        }
+        Self { bits }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&b| b == 0)
+    }
+
+    /// Пересекается ли маска с другой?
+    #[inline]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        for i in 0..16 {
+            if self.bits[i] & other.bits[i] != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Количество установленных битов.
+    #[inline]
+    pub fn count(&self) -> u32 {
+        self.bits.iter().map(|&b| b.count_ones()).sum()
+    }
+
+    /// Итерация по установленным индексам.
+    pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(chunk_i, &chunk)| {
+            (0..64).filter_map(move |bit| {
+                if chunk & (1u64 << bit) != 0 {
+                    Some(chunk_i * 64 + bit)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+}
+
 /// Декларация Read/Write доступа системы к данным мира.
 ///
 /// Использует два уровня представления:
@@ -72,6 +154,9 @@ pub struct AccessDescriptor {
     /// Битовые маски — заполняются планировщиком через `assign_masks`.
     pub read_mask:  ComponentMask,
     pub write_mask: ComponentMask,
+    /// Маска архетипов — заполняется планировщиком в compile().
+    /// Определяет, какие архетипы нужны этой системе.
+    pub archetype_mask: ArchetypeMask,
 }
 
 impl AccessDescriptor {

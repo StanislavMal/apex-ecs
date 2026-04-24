@@ -4,7 +4,7 @@ use crate::{
     component::{Component, ComponentId, Tick},
     entity::Entity,
     system_param::WorldQuerySystemAccess,
-    world::World,
+    world::{adaptive_chunk_size, World},
 };
 
 // ── WorldQuery ─────────────────────────────────────────────────
@@ -355,6 +355,110 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 }
             }
         }
+    }
+
+    /// Параллельная итерация по компонентам (chunk-level parallelism).
+    /// Автоматически использует `adaptive_chunk_size` для каждого архетипа.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each_component<F>(&self, f: F)
+    where
+        Q: Send,
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let num_threads = rayon::current_num_threads();
+
+        // Предварительно вычисляем ID компонентов (как в new_with_tick)
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(self.world, &mut ids);
+        if ids.len() != Q::component_count() {
+            return;
+        }
+
+        let chunks: Vec<(usize, usize, usize)> = self
+            .archetypes
+            .iter()
+            .flat_map(|a| {
+                let chunk_size = adaptive_chunk_size(a.len, num_threads);
+                (0..(a.len + chunk_size - 1) / chunk_size).map(move |chunk_i| {
+                    let start = chunk_i * chunk_size;
+                    let end = (start + chunk_size).min(a.len);
+                    (a.arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
+            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    f(item);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each_component<F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: FnMut(Q::Item<'_>),
+    {
+        self.for_each_component(f);
+    }
+
+    /// Параллельная итерация с Entity.
+    #[cfg(feature = "parallel")]
+    pub fn par_for_each<F>(&self, f: F)
+    where
+        Q: Send,
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let num_threads = rayon::current_num_threads();
+
+        // Предварительно вычисляем ID компонентов (как в new_with_tick)
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(self.world, &mut ids);
+        if ids.len() != Q::component_count() {
+            return;
+        }
+
+        let chunks: Vec<(usize, usize, usize)> = self
+            .archetypes
+            .iter()
+            .flat_map(|a| {
+                let chunk_size = adaptive_chunk_size(a.len, num_threads);
+                (0..(a.len + chunk_size - 1) / chunk_size).map(move |chunk_i| {
+                    let start = chunk_i * chunk_size;
+                    let end = (start + chunk_size).min(a.len);
+                    (a.arch_idx, start, end)
+                })
+            })
+            .collect();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
+            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            let entities = &arch.entities;
+            for row in start..end {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    f(entities[row], item);
+                }
+            }
+        });
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    pub fn par_for_each<F>(&self, f: F)
+    where
+        Q: WorldQuery,
+        F: FnMut(Entity, Q::Item<'_>),
+    {
+        self.for_each(f);
     }
 
     pub fn len(&self) -> usize {

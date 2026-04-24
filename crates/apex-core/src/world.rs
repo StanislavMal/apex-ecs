@@ -721,40 +721,93 @@ impl Default for World { fn default() -> Self { Self::new() } }
 /// Слишком большой → мало задач, плохой load balancing.
 ///
 /// 4096 — эмпирически оптимально для большинства компонентов.
-pub const PAR_CHUNK_SIZE: usize = 4096;
+///
+/// Можно переопределить через переменную окружения APEX_PAR_CHUNK_SIZE
+/// или через `set_par_chunk_size()` для экспериментов.
+pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4096);
+
+/// Минимальный размер чанка (предотвращает слишком мелкое дробление).
+pub const MIN_CHUNK_SIZE: usize = 4096;
+/// Максимальный размер чанка (предотвращает слишком крупные чанки).
+pub const MAX_CHUNK_SIZE: usize = 65536;
+
+/// Вычислить адаптивный размер чанка на основе количества entity.
+///
+/// Формула: `entity_count / num_threads` — 1 чанк на поток.
+/// Результат ограничен [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
+/// num_threads — количество потоков rayon (передаётся из вызывающего кода).
+///
+/// Для entity_count < MIN_CHUNK_SIZE * num_threads используется MIN_CHUNK_SIZE.
+/// Для entity_count > MAX_CHUNK_SIZE * num_threads используется MAX_CHUNK_SIZE.
+pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
+    let n = num_threads.max(1);
+    // Целевое количество чанков: n (1 чанк на поток)
+    let chunk = entity_count / n;
+    // Ограничиваем [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]
+    chunk.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+}
+
+/// Установить размер чанка для par_for_each_component.
+/// Используется для экспериментов — позволяет менять CHUNK_SIZE без перекомпиляции.
+pub fn set_par_chunk_size(chunk_size: usize) {
+    PAR_CHUNK_SIZE.store(chunk_size, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Инициализировать PAR_CHUNK_SIZE из переменной окружения (если задана).
+pub fn init_par_chunk_size_from_env() {
+    if let Ok(val) = std::env::var("APEX_PAR_CHUNK_SIZE") {
+        let trimmed = val.trim();
+        if let Ok(chunk_size) = trimmed.parse::<usize>() {
+            PAR_CHUNK_SIZE.store(chunk_size, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 pub struct SystemContext<'w> {
-    pub(crate) world:   *const World,
-    pub(crate) _marker: std::marker::PhantomData<&'w World>,
+    /// SubWorld'ы, которые видит эта система.
+    /// Обычно один SubWorld, но может быть несколько если система
+    /// работает с несколькими группами архетипов.
+    pub(crate) sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
 }
 
 unsafe impl Send for SystemContext<'_> {}
 unsafe impl Sync for SystemContext<'_> {}
 
 impl<'w> SystemContext<'w> {
-    pub fn new(world: &'w World) -> Self {
-        Self { world: world as *const World, _marker: std::marker::PhantomData }
+    pub fn new(sub_worlds: &'w [crate::sub_world::SubWorld<'w>]) -> Self {
+        Self { sub_worlds }
+    }
+
+    /// Создаёт SystemContext из одного SubWorld (наиболее частый случай).
+    pub fn from_sub_world(sub_world: &'w crate::sub_world::SubWorld<'w>) -> Self {
+        Self { sub_worlds: std::slice::from_ref(sub_world) }
+    }
+
+    /// Получить World (для обратной совместимости).
+    /// Используется для query, resource, event доступа.
+    fn world(&self) -> &'w World {
+        self.sub_worlds[0].world
     }
 
     #[inline]
     pub fn query<Q: WorldQuery>(&self) -> crate::query::Query<'_, Q> {
-        unsafe { crate::query::Query::new(&*self.world) }
+        crate::query::Query::new(self.world())
     }
 
     #[inline]
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> crate::query::Query<'_, Q> {
-        unsafe { crate::query::Query::new_with_tick(&*self.world, last_run) }
+        crate::query::Query::new_with_tick(self.world(), last_run)
     }
 
     #[inline]
     pub fn resource<T: Send + Sync + 'static>(&self) -> Res<'_, T> {
-        Res(unsafe { (*self.world).resource::<T>() })
+        Res(self.world().resource::<T>())
     }
 
     #[inline]
     pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
-            let ptr = (*self.world)
+            let ptr = self.world()
                 .resources
                 .get_raw_ptr::<T>()
                 .expect("resource_mut: resource not found");
@@ -764,13 +817,13 @@ impl<'w> SystemContext<'w> {
 
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
-        EventReader(unsafe { (*self.world).events::<T>() })
+        EventReader(unsafe { self.world().events::<T>() })
     }
 
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
-            let ptr = (*self.world)
+            let ptr = self.world()
                 .event_queue_ptr::<T>()
                 .expect("event_writer: event type not registered");
             EventWriter::from_ptr(ptr)
@@ -779,147 +832,11 @@ impl<'w> SystemContext<'w> {
 
     #[inline]
     pub fn entity_count(&self) -> usize {
-        unsafe { (*self.world).entity_count() }
+        self.world().entity_count()
     }
 
-    #[inline]
-    pub fn for_each<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: FnMut(Entity, Q::Item<'_>),
-    {
-        self.query::<Q>().for_each(f);
-    }
-
-    #[inline]
-    pub fn for_each_component<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: FnMut(Q::Item<'_>),
-    {
-        self.query::<Q>().for_each_component(f);
-    }
-
-    /// Параллельная итерация по компонентам с chunk-level параллелизмом.
-    ///
-    /// **Ключевое улучшение**: разбивает каждый архетип на чанки по `PAR_CHUNK_SIZE`
-    /// entities и раздаёт их в Rayon work-stealing pool.
-    ///
-    /// Это даёт реальный speedup даже когда все entity в одном архетипе,
-    /// в отличие от предыдущей версии которая параллелила только по архетипам.
-    ///
-    /// Реальный выигрыш когда:
-    /// - Архетип содержит > PAR_CHUNK_SIZE entities
-    /// - Вычисления CPU-bound (не memory-bandwidth bound)
-    /// - Нет false sharing между чанками (каждый чанк = независимый диапазон строк)
-    #[cfg(feature = "parallel")]
-    pub fn par_for_each_component<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery + Send,
-        F: Fn(Q::Item<'_>) + Send + Sync,
-    {
-        use rayon::prelude::*;
-
-        let world = unsafe { &*self.world };
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(world, &mut ids);
-
-        if ids.len() != Q::component_count() { return; }
-
-        // Собираем все подходящие архетипы и разбиваем их на чанки.
-        // Каждый чанк — независимый диапазон строк без aliasing.
-        //
-        // SAFETY:
-        // - Каждый чанк обращается к непересекающемуся диапазону строк [start, end)
-        // - Разные архетипы — разные буферы Column
-        // - AccessDescriptor проверен compile() — нет Write-конфликтов между системами
-        // - Structural changes запрещены во время выполнения систем
-        // - Rayon work-stealing корректен при вложенных scope
-
-        // Все чанки всех архетипов в одном flat Vec — лучший load balancing
-        let chunks: Vec<(usize, usize, usize)> = world.archetypes
-            .iter()
-            .enumerate()
-            .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
-            .flat_map(|(arch_idx, arch)| {
-                let total = arch.len();
-                (0..(total + PAR_CHUNK_SIZE - 1) / PAR_CHUNK_SIZE).map(move |chunk_i| {
-                    let start = chunk_i * PAR_CHUNK_SIZE;
-                    let end   = (start + PAR_CHUNK_SIZE).min(total);
-                    (arch_idx, start, end)
-                })
-            })
-            .collect();
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch  = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(item);
-                }
-            }
-        });
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each_component<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: Fn(Q::Item<'_>),
-    {
-        self.for_each_component::<Q, _>(f);
-    }
-
-    /// Параллельная итерация с Entity.
-    #[cfg(feature = "parallel")]
-    pub fn par_for_each<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery + Send,
-        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
-    {
-        use rayon::prelude::*;
-
-        let world = unsafe { &*self.world };
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(world, &mut ids);
-
-        if ids.len() != Q::component_count() { return; }
-
-        let chunks: Vec<(usize, usize, usize)> = world.archetypes
-            .iter()
-            .enumerate()
-            .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
-            .flat_map(|(arch_idx, arch)| {
-                let total = arch.len();
-                (0..(total + PAR_CHUNK_SIZE - 1) / PAR_CHUNK_SIZE).map(move |chunk_i| {
-                    let start = chunk_i * PAR_CHUNK_SIZE;
-                    let end   = (start + PAR_CHUNK_SIZE).min(total);
-                    (arch_idx, start, end)
-                })
-            })
-            .collect();
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch     = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state    = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
-            let entities = &arch.entities;
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(entities[row], item);
-                }
-            }
-        });
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each<Q, F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: Fn(Entity, Q::Item<'_>),
-    {
-        self.for_each::<Q, _>(f);
-    }
+    // Итерация только через ctx.query::<Q>().for_each(...)
+    // или ctx.query::<Q>().par_for_each(...)
 }
 
 // ── ParallelWorld ──────────────────────────────────────────────
