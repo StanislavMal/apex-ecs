@@ -27,6 +27,7 @@ use apex_core::{
     world::World,
 };
 
+use crate::iterators::{ArchState, QueryDesc};
 use crate::registrar::{ResourceBinding, EventBinding, ScriptableRegistrar};
 
 // ── ComponentBinding ───────────────────────────────────────────
@@ -101,6 +102,11 @@ pub struct ScriptContext {
 
     /// Счётчик entity — кешируется чтобы не вызывать world через ptr каждый раз
     entity_count_cache: usize,
+
+    /// Кэш результатов build_arch_states — избегает повторного сканирования
+    /// всех архетипов при повторных query() с теми же дескрипторами.
+    /// Инвалидируется при каждом новом запуске скрипта (в set_world_ptr).
+    pub(crate) query_cache: RefCell<HashMap<Vec<QueryDesc>, Vec<ArchState>>>,
 }
 
 impl ScriptContext {
@@ -116,6 +122,7 @@ impl ScriptContext {
             deferred_resource_writes: RefCell::new(Vec::new()),
             deferred_events:         RefCell::new(Vec::new()),
             entity_count_cache:      0,
+            query_cache:             RefCell::new(HashMap::new()),
         }
     }
 
@@ -132,6 +139,8 @@ impl ScriptContext {
         self.deferred.borrow_mut().clear();
         self.deferred_resource_writes.borrow_mut().clear();
         self.deferred_events.borrow_mut().clear();
+        // Инвалидируем кэш запросов — мир мог измениться между кадрами
+        self.query_cache.borrow_mut().clear();
     }
 
     /// Сбросить указатель на мир после завершения скрипта.

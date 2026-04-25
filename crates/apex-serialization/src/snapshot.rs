@@ -220,6 +220,12 @@ fn migration_for(version: u32) -> Option<MigrationFn> {
 // ── WorldDiff (инкрементальные изменения) ───────────────────────
 
 /// Разница между двумя снэпшотами для инкрементального сохранения.
+///
+/// # Byte-level delta (3.1)
+/// Компоненты, присутствующие в обоих снэпшотах с одинаковым `type_name`,
+/// сравниваются побайтово. Если данные совпадают — компонент не включается в diff.
+/// Если отличаются — компонент попадает в `modified_components`.
+/// Это сокращает размер diff при небольшой доле изменённых данных.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldDiff {
     pub version: u32,
@@ -231,6 +237,8 @@ pub struct WorldDiff {
     pub added_components: Vec<(u32, Vec<ComponentSnapshot>)>,
     /// Компоненты, удалённые у существующих entity.
     pub removed_components: Vec<(u32, Vec<String>)>,
+    /// Компоненты, изменённые у существующих entity (byte-level delta).
+    pub modified_components: Vec<(u32, Vec<ComponentSnapshot>)>,
     /// Добавленные relations.
     pub added_relations: Vec<RelationSnapshot>,
     /// Удалённые relations.
@@ -247,6 +255,7 @@ impl WorldDiff {
             removed_entities: Vec::new(),
             added_components: Vec::new(),
             removed_components: Vec::new(),
+            modified_components: Vec::new(),
             added_relations: Vec::new(),
             removed_relations: Vec::new(),
         }
@@ -265,6 +274,7 @@ impl WorldDiff {
             && self.removed_entities.is_empty()
             && self.added_components.is_empty()
             && self.removed_components.is_empty()
+            && self.modified_components.is_empty()
             && self.added_relations.is_empty()
             && self.removed_relations.is_empty()
     }

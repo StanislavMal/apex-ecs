@@ -33,7 +33,7 @@ use crate::context::ScriptContext;
 // ── QueryDesc ──────────────────────────────────────────────────
 
 /// Разобранный дескриптор одного компонента в запросе.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct QueryDesc {
     /// Имя типа компонента
     pub type_name: String,
@@ -85,7 +85,7 @@ fn parse_one_desc(s: &str) -> Option<QueryDesc> {
 
 /// Состояние одного архетипа в query-итераторе.
 #[derive(Clone)]
-struct ArchState {
+pub(crate) struct ArchState {
     /// Индекс архетипа в `world.archetypes`
     arch_idx: usize,
     /// Количество entity в архетипе
@@ -96,7 +96,7 @@ struct ArchState {
 }
 
 #[derive(Clone)]
-struct ComponentState {
+pub(crate) struct ComponentState {
     col_idx:   usize,
     type_name: String,
     write:     bool,
@@ -126,9 +126,18 @@ impl RhaiQueryIter {
     /// ВСЕ запрошенные компоненты.
     pub fn new(ctx: Rc<RefCell<ScriptContext>>, descs: Vec<QueryDesc>) -> Self {
         let arch_states = {
-            let ctx_ref   = ctx.borrow();
-            let world     = ctx_ref.world_ref();
-            build_arch_states(world, &ctx_ref, &descs)
+            let ctx_ref = ctx.borrow();
+            let world   = ctx_ref.world_ref();
+
+            // Проверяем кэш запросов в ScriptContext
+            let mut cache = ctx_ref.query_cache.borrow_mut();
+            if let Some(cached) = cache.get(&descs) {
+                cached.clone()
+            } else {
+                let states = build_arch_states(world, &ctx_ref, &descs);
+                cache.insert(descs, states.clone());
+                states
+            }
         };
 
         Self {

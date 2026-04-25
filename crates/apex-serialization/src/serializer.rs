@@ -307,7 +307,7 @@ impl WorldSerializer {
                     diff.added_entities.push(new_entity.clone());
                 }
                 Some(old_entity) => {
-                    // Существующая — сравниваем компоненты
+                    // Существующая — сравниваем компоненты с byte-level delta
                     let old_comps: HashMap<&str, &ComponentSnapshot> = old_entity.components
                         .iter()
                         .map(|c| (c.type_name.as_str(), c))
@@ -315,12 +315,17 @@ impl WorldSerializer {
 
                     let mut added = Vec::new();
                     let mut removed = Vec::new();
+                    let mut modified = Vec::new();
 
                     for new_comp in &new_entity.components {
                         match old_comps.get(new_comp.type_name.as_str()) {
                             None => added.push(new_comp.clone()),
-                            Some(_old) => {
-                                // В будущем: deep compare данных
+                            Some(old_comp) => {
+                                // Byte-level delta: сравниваем данные компонента
+                                if new_comp.data != old_comp.data {
+                                    modified.push(new_comp.clone());
+                                }
+                                // Если данные совпадают — не включаем в diff
                             }
                         }
                     }
@@ -336,6 +341,9 @@ impl WorldSerializer {
                     }
                     if !removed.is_empty() {
                         diff.removed_components.push((new_entity.original_index, removed));
+                    }
+                    if !modified.is_empty() {
+                        diff.modified_components.push((new_entity.original_index, modified));
                     }
                 }
             }
@@ -415,6 +423,18 @@ impl WorldSerializer {
         for (entity_idx, components) in &diff.added_components {
             if let Some(entity) = result.entities.iter_mut().find(|e| e.original_index == *entity_idx) {
                 entity.components.extend(components.clone());
+            }
+        }
+
+        // Применяем modified компоненты (byte-level delta) — заменяем старые версии новыми
+        for (entity_idx, components) in &diff.modified_components {
+            if let Some(entity) = result.entities.iter_mut().find(|e| e.original_index == *entity_idx) {
+                for new_comp in components {
+                    if let Some(old) = entity.components.iter_mut().find(|c| c.type_name == new_comp.type_name) {
+                        old.data = new_comp.data.clone();
+                        old.format = new_comp.format;
+                    }
+                }
             }
         }
 
@@ -767,6 +787,52 @@ mod tests {
         let diff_bytes = diff.to_bincode().unwrap();
         let loaded_diff = WorldDiff::from_bincode(&diff_bytes).unwrap();
         assert_eq!(loaded_diff.added_entities.len(), 1);
+    }
+
+    #[test]
+    fn diff_byte_level_delta_modified_component() {
+        use apex_core::component::ComponentId;
+
+        let mut world = setup_world();
+        let old_snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Находим entity с Health через итерацию по архетипам
+        let health_id = world.registry().get_id::<Health>().unwrap();
+        let e1 = *world.archetypes().iter()
+            .filter(|a| a.column_index(health_id).is_some())
+            .flat_map(|a| a.entities().iter())
+            .next()
+            .unwrap();
+        *world.get_mut::<Health>(e1).unwrap() = Health { current: 50.0, max: 100.0 };
+
+        // Diff — компонент должен попасть в modified_components, а НЕ в added_components
+        let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
+        assert!(diff.added_entities.is_empty(), "нет новых entity");
+        assert!(diff.added_components.is_empty(), "нет добавленных компонентов");
+        assert_eq!(diff.modified_components.len(), 1, "один entity с изменённым компонентом");
+        assert_eq!(diff.modified_components[0].1.len(), 1, "один изменённый компонент");
+        assert_eq!(diff.modified_components[0].1[0].type_name, "apex_serialization::serializer::tests::Health");
+
+        // Применяем diff к base snapshot — данные должны обновиться
+        let new_snap = WorldSerializer::apply_diff_to_snapshot(&old_snap, &diff).unwrap();
+        let health_snap = new_snap.entities.iter()
+            .find(|e| e.original_index == diff.modified_components[0].0)
+            .and_then(|e| e.components.iter().find(|c| c.type_name == "apex_serialization::serializer::tests::Health"))
+            .unwrap();
+        // Проверяем что данные изменились: старые данные (100.0) → новые (50.0)
+        let health_str = String::from_utf8_lossy(&health_snap.data);
+        assert!(health_str.contains("50.0"), "Health.current должен быть 50.0, получено: {health_str}");
+    }
+
+    #[test]
+    fn diff_unchanged_component_excluded() {
+        let mut world = setup_world();
+        let old_snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Ничего не меняем — diff должен быть пустым (все компоненты совпадают)
+        let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
+        assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
+        assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
     }
 
     #[test]
