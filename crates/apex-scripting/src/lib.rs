@@ -18,16 +18,25 @@
 //! # Использование
 //!
 //! ```ignore
+//! use std::path::Path;
+//! use apex_scripting::{ScriptEngine, Scriptable};
+//!
 //! // Регистрация компонентов как Scriptable
 //! #[derive(Clone, Copy, Scriptable)]
 //! struct Position { x: f32, y: f32 }
 //!
-//! // Создание движка
-//! let mut engine = ScriptEngine::new(Path::new("scripts/"));
+//! #[derive(Clone, Copy, Scriptable)]
+//! struct Velocity { x: f32, y: f32 }
 //!
-//! // Регистрация API: компоненты + глобальные функции
-//! engine.register_component::<Position>(&mut world);
-//! engine.build_api(&world);
+//! // Создание движка с директорией скриптов
+//! let mut engine = ScriptEngine::with_dir(Path::new("scripts/"));
+//!
+//! // Регистрация компонентов для доступа из скриптов
+//! engine.register_component::<Position>(&world);
+//! engine.register_component::<Velocity>(&world);
+//!
+//! // Загрузка .rhai файлов
+//! engine.load_scripts().expect("ошибка загрузки скриптов");
 //!
 //! // Game loop
 //! loop {
@@ -40,7 +49,7 @@
 //! # Пример скрипта (scripts/game.rhai)
 //!
 //! ```rhai
-//! fn run(ctx) {
+//! fn run() {
 //!     let dt = delta_time();
 //!
 //!     for entity in query(["Read:Position", "Write:Velocity"]) {
@@ -51,7 +60,7 @@
 //!     }
 //!
 //!     if entity_count() < 10 {
-//!         spawn(#{ position: Position(0.0, 0.0), velocity: Velocity(1.0, 0.5) });
+//!         spawn_entity(#{ position: Position(0.0, 0.0), velocity: Velocity(1.0, 0.5) });
 //!     }
 //! }
 //! ```

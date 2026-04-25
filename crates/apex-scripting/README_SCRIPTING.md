@@ -127,12 +127,22 @@ fn run() {
 | `u32`, `u64` | `INT` (i64, lossy для u64) |
 | `bool` | `bool` |
 | `String` | `ImmutableString` |
+| `&'static str` | `ImmutableString` |
 | `(A, B)` | `Array [a, b]` |
 | `(A, B, C)` | `Array [a, b, c]` |
 | `Option<T>` | `()` или `T` |
 | `Vec<T>` | `Array` |
 | `HashMap<String, V>` | `Map` |
 | `enum` (C-like) | `i64` (через `#[derive(Scriptable)]`) |
+
+### Zero-copy path для примитивных типов
+
+Компоненты-обёртки над одним примитивным полем (например, `Health(f32)`) автоматически
+используют **zero-copy** путь: данные читаются/записываются напрямую из Column без создания
+промежуточного Dynamic Map. Это даёт ускорение ~2× на чтение/запись примитивных полей.
+
+`#[derive(Scriptable)]` определяет `primitive_info()` для таких типов автоматически.
+Для ручной реализации — переопредели [`ScriptableRegistrar::primitive_info()`](src/registrar.rs:77-85).
 
 > **⚠️ C-like enum константы:** Константы C-like enum (`TileKind_Floor`, `TileKind_Wall`) регистрируются как **функции** Rhai. В скрипте обязательно используйте `TileKind_Floor()` **со скобками**. Без скобок Rhai выдаст ошибку `Variable not found`.
 
@@ -299,6 +309,25 @@ Spawn/despawn из скрипта нельзя применять во врем�
 - **Чтение ресурсов** (`read_resource`) — использует shared borrow (`world_ref()`), безопасно во время выполнения скрипта
 - **Запись ресурсов** (`write_resource`) и **отправка событий** (`emit_event`) — буферизируются в `deferred_resource_writes` / `deferred_events` (RefCell<Vec<(String, Dynamic)>>) во время выполнения скрипта
 - **Применение** — после завершения скрипта вызывается `apply_deferred_resources_and_events()`, которая извлекает буферы и применяет их через `world_mut()`, что гарантирует отсутствие RefCell double-borrow при вызове внутри query()-итерации
+
+### Change ticks при записи из Rhai
+
+При модификации компонентов через Write-доступ в query-итераторе (`flush_writes()`) **автоматически обновляются change ticks**. Это означает, что `Changed<T>` query корректно видит изменения, сделанные из Rhai-скриптов.
+
+Без этого изменения системы с фильтром `Changed<T>` не реагировали бы на модификации из скриптов.
+
+### Кэширование query-запросов
+
+`ScriptContext` содержит `query_cache: HashMap<Vec<QueryDesc>, Vec<ArchState>>`, который:
+- Кэширует результат сканирования архетипов при повторных вызовах `query()` с теми же дескрипторами
+- Инвалидируется при каждом новом запуске скрипта (в `set_world_ptr`)
+- Ускоряет частые query из Rhai-скриптов в 2-5× за счёт устранения повторного полного сканирования мира
+
+### Zero-copy path для примитивных полей
+
+Компоненты-обёртки над одним примитивным полем используют `PrimitiveInfo` для прямого чтения/записи данных из Column, минуя создание Dynamic Map. Это даёт ~2× ускорение на чтение примитивных полей.
+
+`#[derive(Scriptable)]` автоматически определяет `primitive_info()` для таких типов.
 
 ### `ScriptableField` для примитивов, `ScriptableRegistrar` для структур
 
