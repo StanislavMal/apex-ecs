@@ -935,6 +935,28 @@ let new_player_entity = entity_map[&old_player_index];
 
 > **Примечание:** Relations восстанавливаются автоматически на шаге 2 `restore` — после того как все entity уже созданы. Если тип `RelationKind` не зарегистрирован в мире — relation пропускается с предупреждением в лог.
 
+### 10.3.1 WorldDiff и дельта-сериализация
+
+`WorldDiff` — структура, представляющая разницу между двумя состояниями мира. Используется для инкрементальных сохранений — вместо полного snapshot сохраняются только изменённые компоненты.
+
+```rust
+use apex_serialization::snapshot::{WorldDiff, diff_snapshots};
+
+// Создать два snapshot:
+let snap1 = WorldSerializer::snapshot(&world).unwrap();
+// ... изменения в мире ...
+let snap2 = WorldSerializer::snapshot(&world).unwrap();
+
+// Вычислить diff (byte-level сравнение компонентов):
+let diff = diff_snapshots(&snap1, &snap2).unwrap();
+
+// diff.modified_components — только изменённые данные
+// Неизменённые компоненты исключены из диффа
+println!("modified components: {}", diff.modified_components.len());
+```
+
+> **Преимущество:** При частичных изменениях (например, изменилось 10% entity) размер диффа в ~10× меньше полного snapshot. Поле `modified_components` содержит только побайтово изменённые компоненты.
+
 ### 10.4 Prefabs (файловые префабы)
 
 Prefabs — это JSON-формат для описания и переиспользования entity и их иерархий. В отличие от `EntityTemplate`, префабы загружаются из файлов и могут изменяться без перекомпиляции.
@@ -1338,7 +1360,35 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 
 > **Примечание:** `par_for_each` даёт реальный выигрыш когда архетип содержит **> 4096 entity** И вычисления CPU-bound (не memory-bandwidth bound). Для маленьких датасетов overhead Rayon превысит выигрыш.
 
-### 13.3 Ограничения параллелизма
+### 13.3 Row-level параллельный SubWorld
+
+Начиная с v0.1.0, [`SubWorld`](crates/apex-core/src/sub_world.rs:94) поддерживает row-level итерацию — параллельную обработку entity внутри одного архетипа.
+
+```rust
+// Последовательная итерация по entity в SubWorld:
+sub_world.for_each_entity(|entity| {
+    println!("entity: {:?}", entity);
+});
+
+// Последовательная итерация по строкам (без Entity, чуть быстрее):
+sub_world.for_each_row(|_row| {
+    // доступ к компонентам через SubWorld
+});
+
+// Параллельная итерация (feature = "parallel"):
+sub_world.par_for_each_entity(|entity| {
+    /* выполняется на нескольких потоках */
+});
+
+// Параллельная итерация по строкам:
+sub_world.par_for_each_row(|_row| {
+    /* выполняется на нескольких потоках */
+});
+```
+
+> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют `compute_par_chunks` — архетип разбивается на чанки по `PAR_CHUNK_SIZE` (4096) entity. Дают выигрыш при CPU-bound нагрузках с >4096 entity в одном архетипе.
+
+### 13.4 Ограничения параллелизма
 
 #### Nested `par_for_each`
 
@@ -1907,7 +1957,35 @@ emit_event("CollisionEvent", #{ entity: entity_id });
 // при вызове внутри query()-итерации.
 ```
 
-### 17.5.1 Обработка ошибок
+### 17.5.1 Кэширование запросов в Rhai
+
+Начиная с v0.1.0, повторные вызовы `query()` из Rhai-скрипта с теми же дескрипторами автоматически кэшируются. Это устраняет повторное сканирование всех архетипов при каждом кадре.
+
+```rust
+// Первый вызов — полное сканирование архетипов:
+let entities = query([Read(Velocity), Write(Position)]);
+// Второй вызов с теми же дескрипторами — из кэша (значительно быстрее):
+let entities = query([Read(Velocity), Write(Position)]);
+```
+
+> **Как это работает:** `ScriptContext` хранит `query_cache: HashMap<Vec<QueryDesc>, Vec<ArchState>>`. Кэш инвалидируется при каждом новом запуске скрипта. Если состав архетипов не менялся между кадрами — повторный `query()` возвращает закэшированный результат без сканирования мира.
+
+### 17.5.2 Change Detection после записи компонентов
+
+При модификации компонентов из Rhai-скриптов (через `Write<T>` в query) change ticks корректно обновляются. Это значит, что `Changed<T>` в последующих Rust-системах видит изменения, сделанные скриптами.
+
+```rust
+// Rhai-скрипт изменяет компонент:
+for entity in query([Write(Position)]) {
+    entity.pos.x += 1.0;
+}
+
+// После engine.run(), Rust-система с Changed<Position> увидит это изменение
+```
+
+> **Внутреннее устройство:** В `flush_writes()` при записи компонента вызывается `arch.set_change_tick(row, component_id, world.current_tick())`. Без этого изменения из скриптов не триггерили бы `Changed<T>`.
+
+### 17.5.3 Обработка ошибок
 
 `ScriptEngine::run()` логирует ошибки выполнения через `log::error!()`, но **не паникует** —
 игра продолжает работать даже при падении скрипта:

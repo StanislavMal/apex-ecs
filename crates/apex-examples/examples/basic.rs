@@ -8,6 +8,8 @@
 //! - Relations (ChildOf иерархии)
 //! - Commands
 //! cargo run -p apex-examples --example basic --release --features parallel
+//! cargo test --workspace
+
 use apex_core::prelude::*;
 use apex_scheduler::{Scheduler, ParSystem, StageLabel};
 use apex_core::access::AccessDescriptor;
