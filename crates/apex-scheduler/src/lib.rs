@@ -60,12 +60,14 @@ use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
     component::ComponentRegistry,
-    world::{World, ParallelWorld, SystemContext},
-    system_param::{AutoSystem, WorldQuerySystemAccess},
+    world::{World, ParallelWorld},
+    system_param::WorldQuerySystemAccess,
 };
 
 pub use stage::{Stage, StageLabel};
 pub use apex_core::AccessDescriptor as Access;
+pub use apex_core::system_param::AutoSystem;
+pub use apex_core::world::SystemContext;
 
 // ── ConflictKind ───────────────────────────────────────────────
 

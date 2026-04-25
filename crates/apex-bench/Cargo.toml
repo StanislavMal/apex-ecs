@@ -1,35 +1,29 @@
 [package]
 name = "apex-bench"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
 
 [features]
-default = []
-parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
+default = ["apex"]
+apex = []
+bevy = ["dep:bevy_ecs"]
+legion = ["dep:legion"]
 
 [dependencies]
+cgmath = "0.18"
+rayon = "1.4"
+
+# Apex ECS
 apex-core = { path = "../apex-core" }
 apex-scheduler = { path = "../apex-scheduler" }
-apex-graph = { path = "../apex-graph" }
-ecs_bench_suite = { git = "https://github.com/rust-gamedev/ecs_bench_suite" }
+
+# ECS under test
+bevy_ecs = { version = "0.1", optional = true }
+legion = { version = "0.3", optional = true }
 
 [dev-dependencies]
-criterion = "0.5"
-petgraph = "0.6"
+criterion = "0.3"
 
 [[bench]]
-name = "benchmark"
-harness = false
-
-[[bench]]
-name = "comparison"
-harness = false
-
-[[bench]]
-name = "specialized"
-harness = false
-
-[[bench]]
-name = "graph_bench"
+name = "benchmarks"
 harness = false
