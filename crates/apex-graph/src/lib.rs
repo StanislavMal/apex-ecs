@@ -26,6 +26,12 @@ pub struct Graph<N, W> {
     pub(crate) cached_topological: Option<Vec<Index>>,
     /// Флаг изменения графа.
     pub(crate) dirty: bool,
+
+    // ── Переиспользуемые буферы для BFS/DFS ──────────────────────
+    /// Буфер visited для has_path/bfs — избегает аллокации на каждый вызов.
+    pub(crate) bfs_visited: Vec<bool>,
+    /// Буфер очереди для has_path/bfs — избегает аллокации на каждый вызов.
+    pub(crate) bfs_queue: Vec<Index>,
 }
 
 /// Данные ребра.
@@ -61,6 +67,8 @@ impl<N, W> Graph<N, W> {
             adjacency_in: Vec::new(),
             cached_topological: None,
             dirty: false,
+            bfs_visited: Vec::new(),
+            bfs_queue: Vec::new(),
         }
     }
 

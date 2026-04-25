@@ -807,15 +807,14 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
         MIN_CHUNK_SIZE
     };
     // Целевое количество чанков: n (1 чанк на поток)
-    let chunk = entity_count / n;
-    // Если target chunk size меньше dynamic_min — оставляем как есть,
-    // чтобы обеспечить параллелизм для малых наборов entity.
-    // Иначе ограничиваем [dynamic_min, MAX_CHUNK_SIZE].
+    let mut chunk = entity_count / n;
+    // Нижняя граница: dynamic_min предотвращает создание микро-чанков
+    // для малых наборов entity (overhead rayon > выгода параллелизма).
     if chunk < dynamic_min {
-        chunk.max(1)
-    } else {
-        chunk.min(MAX_CHUNK_SIZE)
+        chunk = dynamic_min;
     }
+    // Верхняя граница: MAX_CHUNK_SIZE
+    chunk.min(MAX_CHUNK_SIZE)
 }
 
 /// Установить размер чанка для par_for_each_component.
@@ -1280,5 +1279,70 @@ impl World {
     /// Доступ к реестру шаблонов (только для чтения).
     pub fn template_registry(&self) -> &crate::template::TemplateRegistry {
         &self.templates
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_chunk_size_small_world() {
+        // < 100 entities: dynamic_min = 128 → chunk = 128, даже при 8 threads
+        assert_eq!(adaptive_chunk_size(50, 8), 128);
+        assert_eq!(adaptive_chunk_size(50, 4), 128);
+        assert_eq!(adaptive_chunk_size(1, 8), 128);
+        assert_eq!(adaptive_chunk_size(99, 8), 128);
+    }
+
+    #[test]
+    fn adaptive_chunk_size_medium_world() {
+        // 100..1000 entities: dynamic_min = 32
+        // 200 / 8 = 25 < 32 → chunk = 32
+        assert_eq!(adaptive_chunk_size(200, 8), 32);
+        // 500 / 8 = 62 >= 32 → chunk = 62
+        assert_eq!(adaptive_chunk_size(500, 8), 62);
+        // 100 / 8 = 12 < 32 → chunk = 32
+        assert_eq!(adaptive_chunk_size(100, 8), 32);
+    }
+
+    #[test]
+    fn adaptive_chunk_size_large_world() {
+        // >= 1000 entities: dynamic_min = MIN_CHUNK_SIZE (64)
+        // 1000 / 8 = 125 >= 64 → chunk = 125
+        assert_eq!(adaptive_chunk_size(1000, 8), 125);
+        // 10000 / 8 = 1250 < MAX_CHUNK_SIZE → chunk = 1250
+        assert_eq!(adaptive_chunk_size(10000, 8), 1250);
+    }
+
+    #[test]
+    fn adaptive_chunk_size_single_thread() {
+        // num_threads = 1 → chunk = entity_count
+        assert_eq!(adaptive_chunk_size(50, 1), 128); // 50 < 128 → 128
+        assert_eq!(adaptive_chunk_size(200, 1), 200); // 200 >= 32 → 200
+        assert_eq!(adaptive_chunk_size(1000, 1), 1000); // 1000 >= 64 → 1000
+    }
+
+    #[test]
+    fn adaptive_chunk_size_max_cap() {
+        // chunk не превышает MAX_CHUNK_SIZE
+        // 1 thread: entity_count / 1 = 131072 > MAX_CHUNK_SIZE → cap
+        assert_eq!(adaptive_chunk_size(MAX_CHUNK_SIZE * 2, 1), MAX_CHUNK_SIZE);
+        // 8 threads: entity_count / 8 = 16384 < MAX_CHUNK_SIZE → 16384
+        assert_eq!(adaptive_chunk_size(MAX_CHUNK_SIZE * 2, 8), 16384);
+    }
+
+    #[test]
+    fn adaptive_chunk_size_transition_points() {
+        // Точки перехода между диапазонами
+        // entity_count=99 → dynamic_min=128
+        // entity_count=100 → dynamic_min=32
+        assert_eq!(adaptive_chunk_size(99, 8), 128);
+        assert_eq!(adaptive_chunk_size(100, 8), 32);
+
+        // entity_count=999 → dynamic_min=32
+        // entity_count=1000 → dynamic_min=64
+        assert_eq!(adaptive_chunk_size(999, 8), 124); // 999/8=124 >= 32 → 124
+        assert_eq!(adaptive_chunk_size(1000, 8), 125); // 1000/8=125 >= 64 → 125
     }
 }

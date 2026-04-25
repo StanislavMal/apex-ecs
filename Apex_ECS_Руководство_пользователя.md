@@ -1338,7 +1338,7 @@ cargo run --features parallel
 
 ### 13.2 Параллельная итерация внутри системы
 
-`par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks по `PAR_CHUNK_SIZE` (4096) entity, каждый chunk обрабатывается независимо в Rayon thread pool.
+`par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128 для <100 entities, 32 для 100–1000, 64 для ≥1000).
 
 ```rust
 impl ParSystem for PhysicsSystem {
@@ -1358,7 +1358,7 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 });
 ```
 
-> **Примечание:** `par_for_each` даёт реальный выигрыш когда архетип содержит **> 4096 entity** И вычисления CPU-bound (не memory-bandwidth bound). Для маленьких датасетов overhead Rayon превысит выигрыш.
+> **Примечание:** После фазы 5 размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798). Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
 
 ### 13.3 Row-level параллельный SubWorld
 
@@ -1386,7 +1386,7 @@ sub_world.par_for_each_row(|_row| {
 });
 ```
 
-> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют `compute_par_chunks` — архетип разбивается на чанки по `PAR_CHUNK_SIZE` (4096) entity. Дают выигрыш при CPU-bound нагрузках с >4096 entity в одном архетипе.
+> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют [`compute_par_chunks`](crates/apex-core/src/par_utils.rs:14) — размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128 для <100 entities, 32 для 100–1000, 64 для ≥1000). Дают выигрыш при CPU-bound нагрузках, когда chunk-size достаточно велик для амортизации overhead Rayon.
 
 ### 13.4 Ограничения параллелизма
 
@@ -1455,7 +1455,7 @@ impl ParSystem for ScriptedMovement {
 ### 14.5 Intra-system Parallelism
 
 `par_for_each_component` и `par_for_each` на `Query`/`CachedQuery` дают реальный прирост только когда:
-- **Количество entity >> PAR_CHUNK_SIZE (4096)** — иначе overhead Rayon превышает выигрыш
+- **Размер чанка** — вычисляется динамически [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128/32/64) и верхним лимитом [`MAX_CHUNK_SIZE`](crates/apex-core/src/world.rs:797) (65536). Убедитесь, что chunk-size достаточен для амортизации overhead Rayon.
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
 
 ```rust

@@ -765,6 +765,12 @@ impl Scheduler {
     ///
     /// Добавляет только системы, которых ещё нет в `graph_nodes`,
     /// и рёбра для новых/изменённых систем.
+    ///
+    /// ## Оптимизация
+    /// - При первом compile (граф пуст) — проверки `has_path()` не нужны,
+    ///   т.к. циклов в пустом графе быть не может. Это убирает O(N²) BFS-ов.
+    /// - `has_path()` использует переиспользуемые буферы Graph.bfs_visited/bfs_queue
+    ///   вместо аллокации на каждый вызов.
     fn add_new_nodes_and_edges(&mut self) -> Result<(), SchedulerError> {
         let n = self.systems.len();
         
@@ -787,6 +793,10 @@ impl Scheduler {
             // Обрабатываем только новые системы и их связи с существующими
             new_system_indices
         };
+
+        // Оптимизация 🅱️: при первом compile() граф ещё пуст — has_path() всегда false.
+        // Пропускаем O(N²) BFS-ов, т.к. циклов в пустом графе быть не может.
+        let has_existing_edges = !self.edge_set.is_empty();
 
         // ── 2. Явные зависимости для новых/изменённых систем ──
         for &idx in &systems_to_process {
@@ -844,7 +854,8 @@ impl Scheduler {
                                  self.graph_nodes.get(&system.id))
                             {
                                 if !self.has_edge_between(from, to)
-                                    && !self.dependency_graph.has_path(to, from)
+                                    && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                        || !has_existing_edges)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_set.insert((from, to));
@@ -863,7 +874,8 @@ impl Scheduler {
                                  self.graph_nodes.get(&self.systems[j].id))
                             {
                                 if !self.has_edge_between(from, to)
-                                    && !self.dependency_graph.has_path(to, from)
+                                    && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                        || !has_existing_edges)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_set.insert((from, to));
@@ -894,7 +906,8 @@ impl Scheduler {
                                  self.graph_nodes.get(&system.id))
                             {
                                 if !self.has_edge_between(from, to)
-                                    && !self.dependency_graph.has_path(to, from)
+                                    && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                        || !has_existing_edges)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_set.insert((from, to));
@@ -912,7 +925,8 @@ impl Scheduler {
                                  self.graph_nodes.get(&self.systems[j].id))
                             {
                                 if !self.has_edge_between(from, to)
-                                    && !self.dependency_graph.has_path(to, from)
+                                    && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                        || !has_existing_edges)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
                                     self.edge_set.insert((from, to));
@@ -964,7 +978,8 @@ impl Scheduler {
                              self.graph_nodes.get(&system_j.id))
                         {
                             if !self.has_edge_between(from, to)
-                                && !self.dependency_graph.has_path(to, from)
+                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                    || !has_existing_edges)
                             {
                                 self.dependency_graph.add_edge(from, to, conflict_kind.clone());
                                 self.edge_set.insert((from, to));
@@ -1240,26 +1255,26 @@ impl Scheduler {
         }
 
         // ── 2. Row-level split (5.7) ─────────────────────────────
-        // Группируем системы по одинаковым наборам индексов архетипов.
+        // Группируем системы по одинаковым наборам индексов архетипов
+        // через Hash & Eq по содержимому &[usize] (без клонирования Vec).
         // Если в группе 2+ системы, распределяем строки архетипов между ними.
         let num_threads = rayon::current_num_threads();
-        let mut sig_to_systems: FxHashMap<Vec<usize>, Vec<usize>> = FxHashMap::default();
+        let mut groups: FxHashMap<&[usize], Vec<usize>> = FxHashMap::default();
 
         for (sys_idx, storage) in self.archetype_indices_storage.iter().enumerate() {
             if storage.len() >= 2 {
-                sig_to_systems.entry(storage.clone()).or_default().push(sys_idx);
+                groups.entry(storage.as_slice()).or_default().push(sys_idx);
             }
         }
 
         // Инициализируем пустыми Vec для всех систем
         let mut row_ranges: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); self.systems.len()];
 
-        for (_sig, sys_indices) in &sig_to_systems {
-            if sys_indices.len() < 2 {
+        for (_sig, sys_indices) in &groups {
+            let group_size = sys_indices.len().min(num_threads);
+            if group_size < 2 {
                 continue; // Только группы с реальным conflict (2+ системы)
             }
-
-            let group_size = sys_indices.len().min(num_threads);
 
             for &arch_idx in _sig.iter() {
                 if arch_idx >= arch_count {

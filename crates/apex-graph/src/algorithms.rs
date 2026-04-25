@@ -7,7 +7,12 @@ impl<N, W> Graph<N, W> {
     /// Проверяет, существует ли путь от `from` к `to` (BFS).
     ///
     /// Используется для предотвращения создания циклов при добавлении рёбер.
-    pub fn has_path(&self, from: Index, to: Index) -> bool {
+    /// Проверяет, существует ли путь от `from` к `to` (BFS).
+    ///
+    /// Используется для предотвращения создания циклов при добавлении рёбер.
+    /// Оптимизация: переиспользует буферы `bfs_visited` и `bfs_queue` из Graph
+    /// вместо аллокации на каждый вызов.
+    pub fn has_path(&mut self, from: Index, to: Index) -> bool {
         if from == to {
             return true;
         }
@@ -16,19 +21,22 @@ impl<N, W> Graph<N, W> {
         }
 
         let slot_cap = self.slot_capacity();
-        let mut visited = vec![false; slot_cap];
 
-        let mut queue: Vec<Index> = Vec::new();
+        // Переиспользуем буферы: resize вместо vec![] — избегаем аллокации
+        self.bfs_visited.clear();
+        self.bfs_visited.resize(slot_cap, false);
+
+        self.bfs_queue.clear();
         let mut head = 0usize;
 
         let start_slot = from.slot() as usize;
-        if start_slot < visited.len() {
-            visited[start_slot] = true;
+        if start_slot < self.bfs_visited.len() {
+            self.bfs_visited[start_slot] = true;
         }
-        queue.push(from);
+        self.bfs_queue.push(from);
 
-        while head < queue.len() {
-            let node = queue[head];
+        while head < self.bfs_queue.len() {
+            let node = self.bfs_queue[head];
             head += 1;
 
             let node_slot = node.slot() as usize;
@@ -43,9 +51,9 @@ impl<N, W> Graph<N, W> {
                         return true;
                     }
                     let succ_slot = succ.slot() as usize;
-                    if succ_slot < visited.len() && !visited[succ_slot] {
-                        visited[succ_slot] = true;
-                        queue.push(succ);
+                    if succ_slot < self.bfs_visited.len() && !self.bfs_visited[succ_slot] {
+                        self.bfs_visited[succ_slot] = true;
+                        self.bfs_queue.push(succ);
                     }
                 }
             }
