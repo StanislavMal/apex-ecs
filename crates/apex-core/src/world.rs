@@ -365,7 +365,7 @@ impl World {
         let ids          = probe.component_ids(&mut self.registry);
         drop(probe);
 
-        let archetype_id = self.get_or_create_archetype(ids);
+        let archetype_id = self.get_or_create_archetype(ids.clone());
         let arch_idx     = archetype_id.0 as usize;
         let start_row    = self.archetypes[arch_idx].entities.len();
         let tick         = self.current_tick;
@@ -378,11 +378,20 @@ impl World {
 
         let entities = self.entities.allocate_batch(count);
 
+        // Предвычисляем column indices для всех компонентов бандла,
+        // чтобы избежать повторных вызовов get_or_register и column_index
+        // в write_into для каждой entity (экономит ~40k HashMap lookup'ов при 10k entity).
+        let col_indices: Vec<(ComponentId, usize)> = ids.iter()
+            .filter_map(|&id| {
+                self.archetypes[arch_idx].column_index(id).map(|col_idx| (id, col_idx))
+            })
+            .collect();
+
         for (i, &entity) in entities.iter().enumerate() {
             let row    = start_row + i;
             let bundle = make_bundle(i);
             self.archetypes[arch_idx].entities.push(entity);
-            bundle.write_into(self, archetype_id, row, tick);
+            bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
         }
 
         self.entities.set_locations_batch(&entities, archetype_id, start_row);
@@ -748,14 +757,17 @@ impl Default for World { fn default() -> Self { Self::new() } }
 /// Слишком маленький → overhead rayon съедает выигрыш.
 /// Слишком большой → мало задач, плохой load balancing.
 ///
-/// 4096 — эмпирически оптимально для большинства компонентов.
+/// 64 — оптимально для малых наборов entity (обеспечивает параллелизм);
+/// для больших наборов размер чанка адаптивно увеличивается.
 ///
 /// Можно переопределить через переменную окружения APEX_PAR_CHUNK_SIZE
 /// или через `set_par_chunk_size()` для экспериментов.
-pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(4096);
+pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
-/// Минимальный размер чанка (предотвращает слишком мелкое дробление).
-pub const MIN_CHUNK_SIZE: usize = 4096;
+/// Минимальный размер чанка.
+/// Для малых наборов entity размер чанка может быть меньше MIN_CHUNK_SIZE,
+/// чтобы обеспечить параллелизм (см. adaptive_chunk_size).
+pub const MIN_CHUNK_SIZE: usize = 64;
 /// Максимальный размер чанка (предотвращает слишком крупные чанки).
 pub const MAX_CHUNK_SIZE: usize = 65536;
 
@@ -765,14 +777,21 @@ pub const MAX_CHUNK_SIZE: usize = 65536;
 /// Результат ограничен [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
 /// num_threads — количество потоков rayon (передаётся из вызывающего кода).
 ///
-/// Для entity_count < MIN_CHUNK_SIZE * num_threads используется MIN_CHUNK_SIZE.
+/// Для entity_count < MIN_CHUNK_SIZE * num_threads размер чанка динамически
+/// уменьшается до `entity_count / n`, гарантируя n параллельных задач.
 /// Для entity_count > MAX_CHUNK_SIZE * num_threads используется MAX_CHUNK_SIZE.
 pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
     let n = num_threads.max(1);
     // Целевое количество чанков: n (1 чанк на поток)
     let chunk = entity_count / n;
-    // Ограничиваем [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE]
-    chunk.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+    // Если target chunk size меньше MIN_CHUNK_SIZE — оставляем как есть,
+    // чтобы обеспечить параллелизм для малых наборов entity.
+    // Иначе ограничиваем [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
+    if chunk < MIN_CHUNK_SIZE {
+        chunk.max(1)
+    } else {
+        chunk.min(MAX_CHUNK_SIZE)
+    }
 }
 
 /// Установить размер чанка для par_for_each_component.
@@ -1041,6 +1060,22 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 pub trait Bundle: Sized {
     fn component_ids(&self, registry: &mut ComponentRegistry) -> Vec<ComponentId>;
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
+
+    /// Пакетная запись компонентов с предвычисленными column indices.
+    ///
+    /// По умолчанию вызывает `write_into`. Переопределяется в макросе `impl_bundle`
+    /// для оптимизации: использует переданные `col_indices` вместо повторного
+    /// вызова `get_or_register` и `column_index` для каждой entity.
+    fn write_into_batch(
+        self,
+        world: &mut World,
+        archetype_id: ArchetypeId,
+        row: usize,
+        tick: Tick,
+        _col_indices: &[(ComponentId, usize)],
+    ) {
+        self.write_into(world, archetype_id, row, tick);
+    }
 }
 
 macro_rules! impl_bundle {
@@ -1081,6 +1116,43 @@ macro_rules! impl_bundle {
                                 }
                                 col.change_ticks.push(tick);
                                 col.len += 1;
+                            }
+                        }
+                        std::mem::forget($T);
+                    }
+                )+
+            }
+
+            fn write_into_batch(
+                self,
+                world:        &mut World,
+                archetype_id: ArchetypeId,
+                row:          usize,
+                tick:         Tick,
+                col_indices:  &[(ComponentId, usize)],
+            ) {
+                let ($($T,)+) = self;
+                $(
+                    {
+                        // Используем get_id (без регистрации) — компонент уже зарегистрирован
+                        if let Some(cid) = world.registry.get_id::<$T>() {
+                            // Линейный поиск по предвычисленному списку col_indices
+                            if let Some(&(_cid, col_idx)) = col_indices.iter().find(|&&(id, _)| id == cid) {
+                                unsafe {
+                                    let col = &mut world.archetypes[archetype_id.0 as usize]
+                                        .columns[col_idx];
+                                    if col.item_size > 0 {
+                                        if col.len >= col.capacity { col.grow(); }
+                                        let dst = col.get_ptr(row);
+                                        std::ptr::copy_nonoverlapping(
+                                            &$T as *const $T as *const u8,
+                                            dst,
+                                            col.item_size,
+                                        );
+                                    }
+                                    col.change_ticks.push(tick);
+                                    col.len += 1;
+                                }
                             }
                         }
                         std::mem::forget($T);

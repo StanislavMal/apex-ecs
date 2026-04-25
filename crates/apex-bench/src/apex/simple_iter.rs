@@ -2,22 +2,17 @@ use apex_core::prelude::*;
 use crate::{Transform, Position, Rotation, Velocity};
 use cgmath::{Matrix4, Vector3};
 
+// SimpleIter — итерация по 10K сущностей, Position += Velocity
+// World хранится как owned, query_typed() создаётся на каждой итерации
 pub struct SimpleIter {
-    // Только для удержания памяти, query использует внутреннюю мутабельность
-    _world: &'static World,
-    query: CachedQuery<'static, (Read<Velocity>, Write<Position>)>,
+    world: World,
 }
 
 impl SimpleIter {
     pub fn new() -> Self {
-        let mut world = Box::new(World::new());
+        let mut world = World::new();
 
-        // Обязательная регистрация компонентов
-        world.register_component::<Transform>();
-        world.register_component::<Position>();
-        world.register_component::<Rotation>();
-        world.register_component::<Velocity>();
-
+        // Регистрация компонентов происходит автоматически через spawn_many
         world.spawn_many(10_000, |_| (
             Transform(Matrix4::from_scale(1.0)),
             Position(Vector3::new(0.0, 0.0, 0.0)),
@@ -25,16 +20,13 @@ impl SimpleIter {
             Velocity(Vector3::new(1.0, 0.0, 0.0)),
         ));
 
-        // Безопасное получение 'static времени жизни
-        let world = Box::leak(world);
-        let query = CachedQuery::<(Read<Velocity>, Write<Position>)>::new(world, Tick::ZERO);
-
-        Self { _world: world, query }
+        Self { world }
     }
 
     pub fn run(&self) {
-        self.query.for_each_component(|(vel, pos)| {
-            pos.0 += vel.0;
-        });
+        self.world.query_typed::<(Read<Velocity>, Write<Position>)>()
+            .for_each_component(|(vel, pos)| {
+                pos.0 += vel.0;
+            });
     }
 }

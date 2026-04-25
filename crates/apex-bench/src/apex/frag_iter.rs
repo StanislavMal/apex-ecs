@@ -15,18 +15,16 @@ declare_markers!(
 
 pub struct Data(pub f32);
 
+// FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом
+// World хранится как owned, query_typed() создаётся на каждой итерации
 pub struct FragIter {
-    // Иммутабельная ссылка, только для хранения (чтобы мир не был удалён)
-    #[allow(dead_code)]
-    world: &'static World,
-    query: CachedQuery<'static, Write<Data>>,
+    world: World,
 }
 
 impl FragIter {
     pub fn new() -> Self {
-        let mut world = Box::new(World::new());
+        let mut world = World::new();
 
-        // ... спавн сущностей (без изменений) ...
         for i in 0..26 {
             for _ in 0..20 {
                 let val = i as f32;
@@ -62,14 +60,13 @@ impl FragIter {
             }
         }
 
-        let world = Box::leak(world); // &'static mut World преобразуется в &'static World
-        let query = CachedQuery::<Write<Data>>::new(world, Tick::ZERO);
-        Self { world, query }
+        Self { world }
     }
 
-    pub fn run(&mut self) {
-        self.query.for_each_component(|data| {
-            data.0 *= 2.0;
-        });
+    pub fn run(&self) {
+        self.world.query_typed::<Write<Data>>()
+            .for_each_component(|data| {
+                data.0 *= 2.0;
+            });
     }
 }

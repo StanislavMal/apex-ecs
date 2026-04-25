@@ -20,7 +20,7 @@ struct SysCE;
 impl AutoSystem for SysAB {
     type Query = (Write<A>, Write<B>);
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each_component(|(mut a, mut b)| {
+        ctx.query::<Self::Query>().for_each_component(|(a, b)| {
             std::mem::swap(&mut a.0, &mut b.0);
         });
     }
@@ -29,7 +29,7 @@ impl AutoSystem for SysAB {
 impl AutoSystem for SysCD {
     type Query = (Write<C>, Write<D>);
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each_component(|(mut c, mut d)| {
+        ctx.query::<Self::Query>().for_each_component(|(c, d)| {
             std::mem::swap(&mut c.0, &mut d.0);
         });
     }
@@ -38,7 +38,7 @@ impl AutoSystem for SysCD {
 impl AutoSystem for SysCE {
     type Query = (Write<C>, Write<E>);
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each_component(|(mut c, mut e)| {
+        ctx.query::<Self::Query>().for_each_component(|(c, e)| {
             std::mem::swap(&mut c.0, &mut e.0);
         });
     }
