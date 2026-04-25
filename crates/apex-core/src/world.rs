@@ -393,11 +393,46 @@ impl World {
             })
             .collect();
 
-        for (i, &entity) in entities.iter().enumerate() {
-            let row    = start_row + i as usize;
-            let bundle = make_bundle(i);
-            self.archetypes[arch_idx].entities.push(entity);
-            bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
+        // Порог: для 1 компонента per-entity loop быстрее, чем bulk copy.
+        // Для 2+ компонентов bulk copy из первой строки выигрывает за счёт
+        // устранения 10,000 вызовов make_bundle и 40,000 поисков в col_indices.
+        if col_indices.len() <= 1 {
+            // Per-entity loop — старый подход, быстрее для малого числа компонентов.
+            for (i, &entity) in entities.iter().enumerate() {
+                let row    = start_row + i;
+                let bundle = make_bundle(i);
+                self.archetypes[arch_idx].entities.push(entity);
+                bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
+            }
+        } else {
+            // Первая entity — пишем через штатный write_into_batch (создаёт "шаблон" строки).
+            // Для Copy-компонентов это позволяет нам затем bulk-копировать данные из первой
+            // строки во все последующие, избегая 10,000 вызовов make_bundle и 40,000 поисков
+            // в col_indices.iter().find() (как в Legion SOA подходе).
+            let first_entity  = entities[0];
+            let first_bundle  = make_bundle(0);
+            self.archetypes[arch_idx].entities.push(first_entity);
+            first_bundle.write_into_batch(self, archetype_id, start_row, tick, &col_indices);
+
+            // Остальные count-1 entity — bulk copy из первой строки во все последующие.
+            // Безопасность: данные уже записаны в первую строку через write_into_batch,
+            // память зарезервирована через reserve(count), change_ticks также зарезервированы.
+            for (i, &entity) in entities[1..].iter().enumerate() {
+                let row = start_row + 1 + i;
+                self.archetypes[arch_idx].entities.push(entity);
+                for &(_cid, col_idx) in &col_indices {
+                    unsafe {
+                        let col = &mut self.archetypes[arch_idx].columns[col_idx];
+                        if col.item_size > 0 {
+                            let src = col.get_ptr(start_row);
+                            let dst = col.get_ptr(row);
+                            std::ptr::copy_nonoverlapping(src, dst, col.item_size);
+                        }
+                        col.change_ticks.push(tick);
+                        col.len += 1;
+                    }
+                }
+            }
         }
 
         self.entities.set_locations_batch(&entities, archetype_id, start_row as u32);

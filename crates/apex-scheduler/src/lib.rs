@@ -977,9 +977,14 @@ impl Scheduler {
                             (self.graph_nodes.get(&system_i.id),
                              self.graph_nodes.get(&system_j.id))
                         {
+                            // Всегда проверяем has_path(to, from) для конфликтов,
+                            // т.к. detect_conflict_kind может найти разные конфликты
+                            // для пар (i,j) и (j,i) (например WriteWrite + WriteRead),
+                            // что создаёт цикл. has_existing_edges не применяем,
+                            // т.к. detect_conflict_kind не является основной причиной
+                            // регрессии compile() (основная причина — sequential barriers).
                             if !self.has_edge_between(from, to)
-                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                    || !has_existing_edges)
+                                && !self.dependency_graph.has_path(to, from)
                             {
                                 self.dependency_graph.add_edge(from, to, conflict_kind.clone());
                                 self.edge_set.insert((from, to));
