@@ -384,9 +384,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             num_threads,
         );
 
+        let last_run = self.last_run;
+
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
             for row in start..end {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
                     f(item);
@@ -427,9 +429,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             num_threads,
         );
 
+        let last_run = self.last_run;
+
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, Tick::ZERO) };
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
             let entities = &arch.entities;
             for row in start..end {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {

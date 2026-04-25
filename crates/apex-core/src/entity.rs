@@ -19,7 +19,7 @@ impl std::fmt::Display for Entity {
 #[derive(Clone, Copy, Debug)]
 pub struct EntityLocation {
     pub archetype_id: crate::archetype::ArchetypeId,
-    pub row:          usize,
+    pub row:          u32,
 }
 
 struct EntityRecord {
@@ -95,7 +95,7 @@ impl EntityAllocator {
         &mut self,
         entities:     &[Entity],
         archetype_id: crate::archetype::ArchetypeId,
-        start_row:    usize,
+        start_row:    u32,
     ) {
         for (i, entity) in entities.iter().enumerate() {
             let record = &mut self.records[entity.index as usize];
@@ -103,7 +103,7 @@ impl EntityAllocator {
             debug_assert_eq!(record.generation, entity.generation);
             record.location = Some(EntityLocation {
                 archetype_id,
-                row: start_row + i,
+                row: start_row + i as u32,
             });
         }
     }
@@ -238,7 +238,7 @@ mod tests {
         for (i, entity) in entities.iter().enumerate() {
             let loc = alloc.get_location(*entity).unwrap();
             assert_eq!(loc.archetype_id.0, 42);
-            assert_eq!(loc.row, i);
+            assert_eq!(loc.row as usize, i);
         }
     }
 }

@@ -39,6 +39,8 @@ pub struct TrackedEventQueue<T> {
     cursors: Vec<Option<u32>>,
     /// Счётчик для генерации ID новых читателей.
     next_cursor_id: u32,
+    /// Список освобождённых EventCursor ID для O(1) переиспользования.
+    free_list: Vec<EventCursor>,
 }
 
 impl<T> TrackedEventQueue<T> {
@@ -48,6 +50,7 @@ impl<T> TrackedEventQueue<T> {
             pending: Vec::new(),
             cursors: Vec::new(),
             next_cursor_id: 0,
+            free_list: Vec::new(),
         }
     }
 
@@ -70,13 +73,15 @@ impl<T> TrackedEventQueue<T> {
         let id = self.next_cursor_id;
         self.next_cursor_id += 1;
 
-        // Находим свободный слот или добавляем новый
-        for slot in &mut self.cursors {
-            if slot.is_none() {
-                *slot = Some(0);
-                return EventCursor(id);
+        // O(1): переиспользуем освобождённый слот из free_list
+        if let Some(cursor) = self.free_list.pop() {
+            let idx = cursor.0 as usize;
+            if idx < self.cursors.len() {
+                self.cursors[idx] = Some(0);
             }
+            return cursor;
         }
+
         self.cursors.push(Some(0));
         EventCursor(id)
     }
@@ -89,10 +94,14 @@ impl<T> TrackedEventQueue<T> {
         let idx = reader_id.0 as usize;
         if idx < self.cursors.len() {
             self.cursors[idx] = None;
+            // O(1): сохраняем освобождённый ID для переиспользования
+            self.free_list.push(reader_id);
         }
-        // Сжимаем хвост из None
-        while self.cursors.last().copied() == Some(None) {
-            self.cursors.pop();
+        // Сжимаем хвост из None (только если free_list пуст, иначе слот может понадобиться)
+        if self.free_list.is_empty() {
+            while self.cursors.last().copied() == Some(None) {
+                self.cursors.pop();
+            }
         }
     }
 
@@ -224,6 +233,7 @@ impl<T> TrackedEventQueue<T> {
     pub fn clear(&mut self) {
         self.events.clear();
         self.pending.clear();
+        self.free_list.clear();
         for cursor in &mut self.cursors {
             if let Some(pos) = cursor {
                 *pos = 0;

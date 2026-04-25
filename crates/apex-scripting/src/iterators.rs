@@ -22,7 +22,6 @@
 use std::{cell::RefCell, rc::Rc};
 
 use apex_core::{
-    archetype::Archetype,
     component::ComponentId,
     entity::Entity,
     world::World,
@@ -170,6 +169,8 @@ impl RhaiQueryIter {
                     let col = &world.archetypes()[arch_idx].columns_raw()[col_idx];
                     let ptr = col.get_raw_ptr(row) as *mut u8;
                     (binding.write)(ptr, &dynamic);
+                    // Обновляем change tick для корректной работы change detection
+                    arch.set_change_tick(row, binding.id, world.current_tick());
                 }
             }
         }

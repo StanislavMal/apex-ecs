@@ -53,7 +53,7 @@
 pub mod stage;
 
 use std::any::TypeId;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 use apex_graph::Graph;
 use thunderdome::Index;
@@ -297,6 +297,8 @@ pub struct Scheduler {
     dependency_graph: Graph<SystemId, ConflictKind>,
     /// Map SystemId → Index в dependency_graph (для быстрого lookup).
     graph_nodes:      FxHashMap<SystemId, Index>,
+    /// O(1) lookup рёбер: (from, to) → exists. Синхронизирован с dependency_graph.
+    edge_set:         FxHashSet<(Index, Index)>,
     /// Рёбра с полными метаданными — для verbose диагностики.
     edge_info:        Vec<GraphEdgeInfo>,
     /// True если после последнего compile() добавлялись системы/зависимости.
@@ -312,6 +314,9 @@ pub struct Scheduler {
     /// Количество архетипов в World на момент последнего compute_archetype_indices().
     /// Используется для кеширования — пересчёт только при изменении.
     cached_archetype_count: usize,
+    /// Флаг: изменились ли archetype indices после последнего prepare_sub_worlds().
+    /// Позволяет избежать клонирования storage каждый кадр.
+    sub_worlds_dirty: bool,
 
     /// Флаг: был ли уже выполнен Startup этап.
     startup_completed: bool,
@@ -338,11 +343,13 @@ impl Scheduler {
             parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             dependency_graph: Graph::new(),
             graph_nodes:      FxHashMap::default(),
+            edge_set:         FxHashSet::default(),
             edge_info:        Vec::new(),
             graph_dirty:      false,
             system_archetype_indices: FxHashMap::default(),
             archetype_indices_storage: Vec::new(),
             cached_archetype_count: 0,
+            sub_worlds_dirty: true,
             startup_completed: false,
             stage_order:      None,
             type_names:       FxHashMap::default(),
@@ -689,6 +696,9 @@ impl Scheduler {
         self.system_archetype_indices.clear();
         self.archetype_indices_storage.clear();
 
+        // Данные изменились — prepare_sub_worlds нужно пересоздать storage
+        self.sub_worlds_dirty = true;
+
         if arch_count == 0 {
             self.cached_archetype_count = 0;
             return;
@@ -737,8 +747,8 @@ impl Scheduler {
 
     /// Проверяет, существует ли ребро между двумя узлами.
     fn has_edge_between(&self, from: Index, to: Index) -> bool {
-        // Проверяем все исходящие рёбра из from
-        self.dependency_graph.successors(from).any(|succ| succ == to)
+        // O(1) проверка через edge_set вместо O(N) successors()
+        self.edge_set.contains(&(from, to))
     }
 
     /// Инкрементальное добавление новых узлов и рёбер в граф.
@@ -780,6 +790,7 @@ impl Scheduler {
                     // Проверяем, нет ли уже такого ребра
                     if !self.has_edge_between(from, to) {
                         self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.edge_set.insert((from, to));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: after_id,
                             to_id:   system.id,
@@ -796,6 +807,7 @@ impl Scheduler {
                 {
                     if !self.has_edge_between(from, to) {
                         self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.edge_set.insert((from, to));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: system.id,
                             to_id:   before_id,
@@ -825,6 +837,7 @@ impl Scheduler {
                                     && !self.dependency_graph.has_path(to, from)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_set.insert((from, to));
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: self.systems[j].id,
                                         to_id:   system.id,
@@ -843,6 +856,7 @@ impl Scheduler {
                                     && !self.dependency_graph.has_path(to, from)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_set.insert((from, to));
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: system.id,
                                         to_id:   self.systems[j].id,
@@ -873,6 +887,7 @@ impl Scheduler {
                                     && !self.dependency_graph.has_path(to, from)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_set.insert((from, to));
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: self.systems[j].id,
                                         to_id:   system.id,
@@ -890,6 +905,7 @@ impl Scheduler {
                                     && !self.dependency_graph.has_path(to, from)
                                 {
                                     self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                                    self.edge_set.insert((from, to));
                                     self.edge_info.push(GraphEdgeInfo {
                                         from_id: system.id,
                                         to_id:   self.systems[j].id,
@@ -941,6 +957,7 @@ impl Scheduler {
                                 && !self.dependency_graph.has_path(to, from)
                             {
                                 self.dependency_graph.add_edge(from, to, conflict_kind.clone());
+                                self.edge_set.insert((from, to));
                                 self.edge_info.push(GraphEdgeInfo {
                                     from_id: system_i.id,
                                     to_id:   system_j.id,
@@ -1164,7 +1181,15 @@ impl Scheduler {
     /// Подготовить storage для SubWorld — заполняет `archetype_indices_storage`
     /// для всех систем. Вызывается перед `run_hybrid_parallel()`.
     /// Позволяет избежать `Box::leak` в `make_sub_world`.
+    ///
+    /// Использует `sub_worlds_dirty` для кеширования: если данные не изменились
+    /// с прошлого вызова, пересоздание storage пропускается.
     fn prepare_sub_worlds(&mut self, world: &World) {
+        // Если данные не изменились — пропускаем клонирование
+        if !self.sub_worlds_dirty {
+            return;
+        }
+
         self.archetype_indices_storage.clear();
         let arch_count = world.archetypes().len();
 
@@ -1182,6 +1207,9 @@ impl Scheduler {
                 }
             }
         }
+
+        // Storage актуален до следующего изменения archetype indices
+        self.sub_worlds_dirty = false;
     }
 
     // ── Инспекция ──────────────────────────────────────────────

@@ -75,6 +75,12 @@ impl Column {
     }
 
     #[inline]
+    pub unsafe fn set_change_tick(&self, row: usize, tick: Tick) {
+        debug_assert!(row < self.len);
+        let ptr = self.change_ticks.as_ptr() as *mut Tick;
+        *ptr.add(row) = tick;
+    }
+
     pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
         if self.item_size == 0 {
             self.item_align as *mut u8
@@ -173,6 +179,36 @@ impl Column {
         self.capacity = new_cap;
     }
 
+    /// Предварительное выделение памяти под `additional` элементов.
+    /// Позволяет избежать множественных grow() при массовых spawn'ах.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let needed = self.len + additional;
+        if needed <= self.capacity {
+            self.change_ticks.reserve(additional);
+            return;
+        }
+        let new_cap = needed.next_power_of_two().max(64);
+        if self.item_size == 0 {
+            self.capacity = new_cap;
+            self.change_ticks.reserve(additional);
+            return;
+        }
+        let new_layout = self.layout_for(new_cap);
+        let new_data = unsafe { alloc(new_layout) };
+        assert!(!new_data.is_null(), "allocation failed");
+        if self.len > 0 && !self.data.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data, new_data, self.len * self.item_size);
+            }
+        }
+        if self.capacity > 0 && !self.data.is_null() {
+            unsafe { dealloc(self.data, self.layout_for(self.capacity)); }
+        }
+        self.data = new_data;
+        self.capacity = new_cap;
+        self.change_ticks.reserve(additional);
+    }
+
     /// Тик изменения для строки row
     #[inline]
     pub fn get_tick(&self, row: usize) -> Tick {
@@ -257,6 +293,20 @@ impl Archetype {
     pub unsafe fn get_component_mut<T>(&mut self, row: usize, component_id: ComponentId) -> Option<&mut T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get_mut::<T>(row))
+    }
+
+    /// Обновить change tick для компонента в указанной строке.
+    ///
+    /// Использует сырые указатели для interior mutation через `&self`,
+    /// что позволяет обновлять tick без `&mut self`.
+    ///
+    /// # Safety
+    /// - `row` должен быть < len колонки
+    /// - Никакая другая mutable ссылка на колонку не должна существовать
+    pub unsafe fn set_change_tick(&self, row: usize, component_id: ComponentId, tick: Tick) {
+        if let Some(col_idx) = self.column_index(component_id) {
+            self.columns[col_idx].set_change_tick(row, tick);
+        }
     }
 
     pub unsafe fn allocate_row(&mut self, entity: Entity) -> usize {

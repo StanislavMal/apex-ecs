@@ -1,7 +1,7 @@
 use std::any::TypeId;
 use std::collections::HashSet;
 
-/// Битовая маска компонентов — до 128 компонентов (достаточно для любой игры).
+/// Битовая маска компонентов — до 256 компонентов.
 ///
 /// Заменяет `Vec<TypeId>` в AccessDescriptor для O(1) операций:
 /// - `contains` → бит-проверка vs O(N) linear scan
@@ -9,50 +9,70 @@ use std::collections::HashSet;
 /// - `merge` → битовый OR vs dedup loop
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ComponentMask {
-    lo: u64, // компоненты 0..63
-    hi: u64, // компоненты 64..127
+    bits: [u64; 4], // 4 × 64 = 256 бит
 }
 
 impl ComponentMask {
-    pub const EMPTY: Self = Self { lo: 0, hi: 0 };
+    pub const EMPTY: Self = Self { bits: [0u64; 4] };
+
+    const MASK_64: u64 = 0x3F; // маска для idx % 64
+
+    #[inline]
+    fn word_idx(idx: u8) -> usize {
+        (idx >> 6) as usize // idx / 64
+    }
+
+    #[inline]
+    fn bit_idx(idx: u8) -> u64 {
+        1u64 << (idx as u64 & Self::MASK_64)
+    }
 
     #[inline]
     pub fn set(&mut self, idx: u8) {
-        if idx < 64 {
-            self.lo |= 1u64 << idx;
-        } else {
-            self.hi |= 1u64 << (idx - 64);
-        }
+        self.bits[Self::word_idx(idx)] |= Self::bit_idx(idx);
     }
 
     #[inline]
     pub fn get(&self, idx: u8) -> bool {
-        if idx < 64 {
-            self.lo & (1u64 << idx) != 0
-        } else {
-            self.hi & (1u64 << (idx - 64)) != 0
-        }
+        self.bits[Self::word_idx(idx)] & Self::bit_idx(idx) != 0
     }
 
     #[inline]
     pub fn and(&self, other: &Self) -> Self {
-        Self { lo: self.lo & other.lo, hi: self.hi & other.hi }
+        Self {
+            bits: [
+                self.bits[0] & other.bits[0],
+                self.bits[1] & other.bits[1],
+                self.bits[2] & other.bits[2],
+                self.bits[3] & other.bits[3],
+            ],
+        }
     }
 
     #[inline]
     pub fn or(&self, other: &Self) -> Self {
-        Self { lo: self.lo | other.lo, hi: self.hi | other.hi }
+        Self {
+            bits: [
+                self.bits[0] | other.bits[0],
+                self.bits[1] | other.bits[1],
+                self.bits[2] | other.bits[2],
+                self.bits[3] | other.bits[3],
+            ],
+        }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.lo == 0 && self.hi == 0
+        self.bits[0] == 0 && self.bits[1] == 0 && self.bits[2] == 0 && self.bits[3] == 0
     }
 
     /// Пересекается ли маска с другой?
     #[inline]
     pub fn overlaps(&self, other: &Self) -> bool {
-        !self.and(other).is_empty()
+        (self.bits[0] & other.bits[0]) != 0
+            || (self.bits[1] & other.bits[1]) != 0
+            || (self.bits[2] & other.bits[2]) != 0
+            || (self.bits[3] & other.bits[3]) != 0
     }
 }
 

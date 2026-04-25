@@ -212,7 +212,7 @@ impl World {
 
     pub fn spawn_empty(&mut self) -> Entity {
         let entity = self.entities.allocate();
-        let row    = unsafe { self.archetypes[0].allocate_row(entity) };
+        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
         self.entities.set_location(entity, EntityLocation {
             archetype_id: ArchetypeId::EMPTY,
             row,
@@ -331,7 +331,7 @@ impl World {
 
     pub fn spawn(&mut self) -> EntityBuilder<'_> {
         let entity = self.entities.allocate();
-        let row    = unsafe { self.archetypes[0].allocate_row(entity) };
+        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
         self.entities.set_location(entity, EntityLocation {
             archetype_id: ArchetypeId::EMPTY,
             row,
@@ -341,13 +341,13 @@ impl World {
 
     pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
         let ids          = bundle.component_ids(&mut self.registry);
-        let archetype_id = self.get_or_create_archetype(ids);
+        let archetype_id = self.get_or_create_archetype(&ids);
         let entity       = self.entities.allocate();
         let row          = self.archetypes[archetype_id.0 as usize].entities.len();
         let tick         = self.current_tick;
         self.archetypes[archetype_id.0 as usize].entities.push(entity);
         bundle.write_into(self, archetype_id, row, tick);
-        self.entities.set_location(entity, EntityLocation { archetype_id, row });
+        self.entities.set_location(entity, EntityLocation { archetype_id, row: row as u32 });
         entity
     }
 
@@ -365,15 +365,14 @@ impl World {
         let ids          = probe.component_ids(&mut self.registry);
         drop(probe);
 
-        let archetype_id = self.get_or_create_archetype(ids.clone());
+        let archetype_id = self.get_or_create_archetype(&ids);
         let arch_idx     = archetype_id.0 as usize;
         let start_row    = self.archetypes[arch_idx].entities.len();
         let tick         = self.current_tick;
 
         self.archetypes[arch_idx].entities.reserve(count);
-        let target_cap = start_row + count;
         for col in &mut self.archetypes[arch_idx].columns {
-            while col.capacity < target_cap { col.grow(); }
+            col.reserve(count);
         }
 
         let entities = self.entities.allocate_batch(count);
@@ -388,13 +387,13 @@ impl World {
             .collect();
 
         for (i, &entity) in entities.iter().enumerate() {
-            let row    = start_row + i;
+            let row    = start_row + i as usize;
             let bundle = make_bundle(i);
             self.archetypes[arch_idx].entities.push(entity);
             bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
         }
 
-        self.entities.set_locations_batch(&entities, archetype_id, start_row);
+        self.entities.set_locations_batch(&entities, archetype_id, start_row as u32);
         entities
     }
 
@@ -429,7 +428,7 @@ impl World {
             unsafe {
                 if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                     let col = &mut self.archetypes[current_idx].columns[col_idx];
-                    col.write_at(location.row, &component as *const T as *const u8, tick);
+                    col.write_at(location.row as usize, &component as *const T as *const u8, tick);
                 }
             }
             std::mem::forget(component);
@@ -441,12 +440,12 @@ impl World {
         let tick        = self.current_tick;
         unsafe {
             self.archetypes[new_arch_id.0 as usize]
-                .write_component(new_row, component_id, &component as *const T as *const u8, tick);
+                .write_component(new_row as usize, component_id, &component as *const T as *const u8, tick);
         }
         std::mem::forget(component);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row:          new_row,
+            row:          new_row as u32,
         });
     }
 
@@ -469,7 +468,7 @@ impl World {
                 unsafe {
                     if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                         let col = &mut self.archetypes[current_idx].columns[col_idx];
-                        col.write_at(location.row, data.as_ptr(), tick);
+                        col.write_at(location.row as usize, data.as_ptr(), tick);
                     }
                 }
             }
@@ -480,11 +479,11 @@ impl World {
         let new_row     = self.move_entity(entity, location, new_arch_id);
         unsafe {
             self.archetypes[new_arch_id.0 as usize]
-                .write_component(new_row, component_id, data.as_ptr(), tick);
+                .write_component(new_row as usize, component_id, data.as_ptr(), tick);
         }
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row:          new_row,
+            row:          new_row as u32,
         });
     }
 
@@ -504,7 +503,7 @@ impl World {
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row:          new_row,
+            row:          new_row as u32,
         });
     }
 
@@ -527,7 +526,7 @@ impl World {
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
-            row:          new_row,
+            row:          new_row as u32,
         });
         true
     }
@@ -541,7 +540,7 @@ impl World {
         self.subject_index.clear_entity(entity.index);
         let arch_idx = location.archetype_id.0 as usize;
         unsafe {
-            if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row) {
+            if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row as usize) {
                 self.entities.set_location(displaced, EntityLocation {
                     archetype_id: location.archetype_id,
                     row:          location.row,
@@ -560,7 +559,7 @@ impl World {
         let location     = self.entities.get_location(entity)?;
         unsafe {
             self.archetypes[location.archetype_id.0 as usize]
-                .get_component::<T>(location.row, component_id)
+                .get_component::<T>(location.row as usize, component_id)
         }
     }
 
@@ -574,8 +573,8 @@ impl World {
         {
             let arch = &mut self.archetypes[location.archetype_id.0 as usize];
             if let Some(col_idx) = arch.column_index(component_id) {
-                if location.row < arch.columns[col_idx].change_ticks.len() {
-                    arch.columns[col_idx].change_ticks[location.row] = tick;
+                if (location.row as usize) < arch.columns[col_idx].change_ticks.len() {
+                    arch.columns[col_idx].change_ticks[location.row as usize] = tick;
                 }
             }
         }
@@ -592,7 +591,7 @@ impl World {
         let location2 = self.entities.get_location(entity)?;
         let arch      = &mut self.archetypes[location2.archetype_id.0 as usize];
         let col_idx   = arch.column_index(component_id)?;
-        unsafe { Some(arch.columns[col_idx].get_mut::<T>(location2.row)) }
+        unsafe { Some(arch.columns[col_idx].get_mut::<T>(location2.row as usize)) }
     }
 
     /// Зарегистрировать write_hook для компонента T.
@@ -638,7 +637,7 @@ impl World {
             .component_ids.iter().copied().collect();
         new_components.push(add);
         new_components.sort_unstable();
-        let new_id = self.get_or_create_archetype(new_components);
+        let new_id = self.get_or_create_archetype(&new_components);
         self.archetypes[current.0 as usize].add_edges.insert(add, new_id);
         self.archetypes[new_id.0 as usize].remove_edges.insert(add, current);
         new_id
@@ -656,17 +655,18 @@ impl World {
             .component_ids.iter().copied()
             .filter(|&id| id != remove)
             .collect();
-        let new_id = self.get_or_create_archetype(new_components);
+        let new_id = self.get_or_create_archetype(&new_components);
         self.archetypes[current.0 as usize].remove_edges.insert(remove, new_id);
         self.archetypes[new_id.0 as usize].add_edges.insert(remove, current);
         new_id
     }
 
+    #[inline(never)]
     pub(crate) fn get_or_create_archetype(
         &mut self,
-        components: Vec<ComponentId>,
+        components: &[ComponentId],
     ) -> ArchetypeId {
-        if let Some(&id) = self.archetype_index.get(&components) { return id; }
+        if let Some(&id) = self.archetype_index.get(components) { return id; }
         let id    = ArchetypeId(self.archetypes.len() as u32);
         let infos: Vec<&ComponentInfo> = components.iter()
             .filter_map(|&cid| self.registry.get_info(cid))
@@ -674,7 +674,7 @@ impl World {
         let arch  = Archetype::new(id, components.iter().copied().collect(), &infos);
         for &cid in &arch.component_ids { self.id_index.register_archetype(cid, id); }
         self.archetypes.push(arch);
-        self.archetype_index.insert(components, id);
+        self.archetype_index.insert(components.to_vec(), id);
         self.query_cache.invalidate();
         id
     }
@@ -684,7 +684,7 @@ impl World {
         entity:          Entity,
         from_location:   EntityLocation,
         to_archetype_id: ArchetypeId,
-    ) -> usize {
+    ) -> u32 {
         // Любое перемещение entity между archetypes может изменить
         // результаты запросов → сбрасываем кэш.
         self.query_cache.invalidate();
@@ -715,11 +715,11 @@ impl World {
                     {
                         self.archetypes[to_idx].columns[to_col].grow();
                     }
-                    let src = self.archetypes[from_idx].columns[i].get_ptr(from_row);
+                    let src = self.archetypes[from_idx].columns[i].get_ptr(from_row as usize);
                     let dst = self.archetypes[to_idx].columns[to_col].get_ptr(to_row);
                     std::ptr::copy_nonoverlapping(src, dst, item_size);
                 }
-                let src_tick = self.archetypes[from_idx].columns[i].get_tick(from_row);
+                let src_tick = self.archetypes[from_idx].columns[i].get_tick(from_row as usize);
                 self.archetypes[to_idx].columns[to_col].change_ticks.push(src_tick);
                 self.archetypes[to_idx].columns[to_col].len += 1;
             }
@@ -728,12 +728,12 @@ impl World {
         unsafe {
             let from_last = self.archetypes[from_idx].entities.len() - 1;
             for (i, col) in self.archetypes[from_idx].columns.iter_mut().enumerate() {
-                if is_common[i] { col.swap_remove_no_drop(from_row); }
-                else            { col.swap_remove_and_drop(from_row); }
+                if is_common[i] { col.swap_remove_no_drop(from_row as usize); }
+                else            { col.swap_remove_and_drop(from_row as usize); }
             }
-            if from_row != from_last {
+            if (from_row as usize) != from_last {
                 let displaced = self.archetypes[from_idx].entities[from_last];
-                self.archetypes[from_idx].entities.swap(from_row, from_last);
+                self.archetypes[from_idx].entities.swap(from_row as usize, from_last);
                 self.archetypes[from_idx].entities.pop();
                 self.entities.set_location(displaced, EntityLocation {
                     archetype_id: from_location.archetype_id,
@@ -743,7 +743,7 @@ impl World {
                 self.archetypes[from_idx].entities.pop();
             }
         }
-        to_row
+        to_row as u32
     }
 }
 
@@ -907,6 +907,7 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
     world:        &'w World,
     arch_indices: &'w [usize],
     last_run:     Tick,
+    cached_ids:   Vec<ComponentId>,
     _phantom:     std::marker::PhantomData<Q>,
 }
 
@@ -927,17 +928,23 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             &[]
         };
 
-        Self { world, arch_indices, last_run, _phantom: std::marker::PhantomData }
+        Self {
+            world,
+            arch_indices,
+            last_run,
+            cached_ids: ids,
+            _phantom: std::marker::PhantomData,
+        }
     }
 
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
+        let ids = &self.cached_ids;
+        if ids.len() != Q::component_count() { return; }
         for &arch_idx in self.arch_indices {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
-            let state    = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
+            let state    = unsafe { Q::fetch_state(arch, ids, self.last_run) };
             let entities = &arch.entities;
             for row in 0..arch.len() {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
@@ -949,12 +956,12 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
     #[inline]
     pub fn for_each_component<F: FnMut(Q::Item<'_>)>(&self, mut f: F) {
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
+        let ids = &self.cached_ids;
+        if ids.len() != Q::component_count() { return; }
         for &arch_idx in self.arch_indices {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
-            let state = unsafe { Q::fetch_state(arch, &ids, self.last_run) };
+            let state = unsafe { Q::fetch_state(arch, ids, self.last_run) };
             for row in 0..arch.len() {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
             }
@@ -972,8 +979,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
         let num_threads = rayon::current_num_threads();
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
+        let ids = &self.cached_ids;
         if ids.len() != Q::component_count() { return; }
 
         let world    = self.world;
@@ -989,7 +995,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch  = &world.archetypes[arch_idx];
-            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            let state = unsafe { Q::fetch_state(arch, ids, last_run) };
             for row in start..end {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
             }
@@ -1013,8 +1019,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
         let num_threads = rayon::current_num_threads();
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
+        let ids = &self.cached_ids;
         if ids.len() != Q::component_count() { return; }
 
         let world    = self.world;
@@ -1030,7 +1035,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch     = &world.archetypes[arch_idx];
-            let state    = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            let state    = unsafe { Q::fetch_state(arch, ids, last_run) };
             let entities = &arch.entities;
             for row in start..end {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {

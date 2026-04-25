@@ -532,7 +532,7 @@ impl WorldSerializer {
             }
 
             // Сериализуем сырые данные компонента в байты
-            let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row)) }
+            let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize)) }
                 .map_err(|e| SerializationError::SerializeFailed {
                     type_name: info.name.to_string(),
                     reason: e.to_string(),

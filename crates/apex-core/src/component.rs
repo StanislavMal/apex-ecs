@@ -12,7 +12,7 @@ impl Tick {
 
     #[inline]
     pub fn is_newer_than(self, last_run: Tick) -> bool {
-        self.0 > last_run.0
+        self.0.wrapping_sub(last_run.0) as i32 > 0
     }
 }
 
