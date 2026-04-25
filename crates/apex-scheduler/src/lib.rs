@@ -311,6 +311,12 @@ pub struct Scheduler {
     /// Owned storage для Vec<usize>, используемых SubWorld.
     /// Позволяет избежать Box::leak — данные живут в Scheduler.
     archetype_indices_storage: Vec<Vec<usize>>,
+    /// Owned storage для row-level range ограничений SubWorld (5.7).
+    /// Каждый элемент: `(arch_idx, start, end)` — если не пусто, то
+    /// итерация по этому архетипу ограничена строками [start, end).
+    /// Позволяет нескольким системам с одинаковым набором архетипов
+    /// параллельно обрабатывать разные строки одного архетипа.
+    row_ranges_storage: Vec<Vec<(usize, usize, usize)>>,
     /// Количество архетипов в World на момент последнего compute_archetype_indices().
     /// Используется для кеширования — пересчёт только при изменении.
     cached_archetype_count: usize,
@@ -348,6 +354,7 @@ impl Scheduler {
             graph_dirty:      false,
             system_archetype_indices: FxHashMap::default(),
             archetype_indices_storage: Vec::new(),
+            row_ranges_storage: Vec::new(),
             cached_archetype_count: 0,
             sub_worlds_dirty: true,
             startup_completed: false,
@@ -568,6 +575,8 @@ impl Scheduler {
     }
 
     fn invalidate_plan(&mut self) {
+        // ВНИМАНИЕ: НЕ сбрасываем stage_order — он должен сохраняться
+        // между перекомпиляциями (см. тест configure_stages_persists_across_compiles).
         self.execution_plan = None;
         self.graph_dirty    = true;
     }
@@ -695,6 +704,7 @@ impl Scheduler {
 
         self.system_archetype_indices.clear();
         self.archetype_indices_storage.clear();
+        self.row_ranges_storage.clear();
 
         // Данные изменились — prepare_sub_worlds нужно пересоздать storage
         self.sub_worlds_dirty = true;
@@ -1161,29 +1171,48 @@ impl Scheduler {
         }
     }
 
-    /// Создать SubWorld для системы на основе предвычисленных archetype_indices.
+    /// Создать SubWorld для системы на основе предвычисленных archetype_indices
+    /// и row_ranges (5.7).
     ///
-    /// Использует `archetype_indices_storage` для owned хранения данных,
-    /// что позволяет избежать `Box::leak`. Storage заполняется заранее
-    /// в `prepare_sub_worlds()`.
+    /// Использует `archetype_indices_storage` и `row_ranges_storage` для owned
+    /// хранения данных, что позволяет избежать `Box::leak`. Storage заполняется
+    /// заранее в `prepare_sub_worlds()`.
     ///
     /// # SAFETY
     /// - `storage_idx` должен быть валидным индексом в `archetype_indices_storage`
-    /// - `archetype_indices_storage` не должен изменяться, пока SubWorld жив
+    ///   и `row_ranges_storage`
+    /// - Storage не должен изменяться, пока SubWorld жив
+    #[cfg(feature = "parallel")]
     fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
         let arch_indices: &'w [usize] = unsafe {
             let vec = &self.archetype_indices_storage[storage_idx];
             std::slice::from_raw_parts(vec.as_ptr(), vec.len())
         };
-        apex_core::SubWorld::new(world, arch_indices)
+        let ranges: &'w [(usize, usize, usize)] = unsafe {
+            let vec = &self.row_ranges_storage[storage_idx];
+            std::slice::from_raw_parts(vec.as_ptr(), vec.len())
+        };
+        if ranges.is_empty() {
+            apex_core::SubWorld::new(world, arch_indices)
+        } else {
+            apex_core::SubWorld::with_ranges(world, arch_indices, ranges)
+        }
     }
 
     /// Подготовить storage для SubWorld — заполняет `archetype_indices_storage`
-    /// для всех систем. Вызывается перед `run_hybrid_parallel()`.
+    /// и `row_ranges_storage` для всех систем. Вызывается перед `run_hybrid_parallel()`.
     /// Позволяет избежать `Box::leak` в `make_sub_world`.
+    ///
+    /// # Row-level splits (5.7)
+    ///
+    /// Если несколько систем имеют одинаковый набор архетипов (одинаковые
+    /// `system_archetype_indices`), строки этих архетипов равномерно
+    /// распределяются между ними. Это позволяет системам в одном Stage
+    /// параллельно обрабатывать разные строки одних и тех же архетипов.
     ///
     /// Использует `sub_worlds_dirty` для кеширования: если данные не изменились
     /// с прошлого вызова, пересоздание storage пропускается.
+    #[cfg(feature = "parallel")]
     fn prepare_sub_worlds(&mut self, world: &World) {
         // Если данные не изменились — пропускаем клонирование
         if !self.sub_worlds_dirty {
@@ -1191,8 +1220,10 @@ impl Scheduler {
         }
 
         self.archetype_indices_storage.clear();
+        self.row_ranges_storage.clear();
         let arch_count = world.archetypes().len();
 
+        // ── 1. Заполняем archetype_indices_storage ────────────────
         for system in &self.systems {
             let indices = self.system_archetype_indices.get(&system.id);
             match indices {
@@ -1207,6 +1238,49 @@ impl Scheduler {
                 }
             }
         }
+
+        // ── 2. Row-level split (5.7) ─────────────────────────────
+        // Группируем системы по одинаковым наборам индексов архетипов.
+        // Если в группе 2+ системы, распределяем строки архетипов между ними.
+        let num_threads = rayon::current_num_threads();
+        let mut sig_to_systems: FxHashMap<Vec<usize>, Vec<usize>> = FxHashMap::default();
+
+        for (sys_idx, storage) in self.archetype_indices_storage.iter().enumerate() {
+            if storage.len() >= 2 {
+                sig_to_systems.entry(storage.clone()).or_default().push(sys_idx);
+            }
+        }
+
+        // Инициализируем пустыми Vec для всех систем
+        let mut row_ranges: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); self.systems.len()];
+
+        for (_sig, sys_indices) in &sig_to_systems {
+            if sys_indices.len() < 2 {
+                continue; // Только группы с реальным conflict (2+ системы)
+            }
+
+            let group_size = sys_indices.len().min(num_threads);
+
+            for &arch_idx in _sig.iter() {
+                if arch_idx >= arch_count {
+                    continue;
+                }
+                let arch_len = world.archetypes()[arch_idx].len();
+                if arch_len < group_size {
+                    continue; // Слишком мало entity для разделения
+                }
+
+                // Равномерно распределяем строки архетипа между системами группы
+                let chunk_size = arch_len / group_size;
+                for (i, &sys_idx) in sys_indices.iter().enumerate().take(group_size) {
+                    let start = i * chunk_size;
+                    let end = if i == group_size - 1 { arch_len } else { start + chunk_size };
+                    row_ranges[sys_idx].push((arch_idx, start, end));
+                }
+            }
+        }
+
+        self.row_ranges_storage = row_ranges;
 
         // Storage актуален до следующего изменения archetype indices
         self.sub_worlds_dirty = false;
@@ -2053,5 +2127,50 @@ mod tests {
         assert!(last_idx.is_some(), "Last должен присутствовать даже если не указан в configure_stages");
         assert!(last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
             "Last (не указанный в order) должен быть в конце");
+    }
+
+    #[test]
+    fn configure_stages_persists_across_compiles() {
+        let mut sched = Scheduler::new();
+
+        // Добавляем системы в Update и PreUpdate
+        sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
+        sched.add_system_to_stage("pre_work", |_| {}, StageLabel::PreUpdate);
+
+        // Настраиваем порядок: Update ДО PreUpdate
+        sched.configure_stages(vec![
+            StageLabel::Startup,
+            StageLabel::Update,
+            StageLabel::PreUpdate,
+        ]);
+
+        // Первая компиляция
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+        assert!(upd_idx.unwrap() < pre_idx.unwrap(), "Update должен быть перед PreUpdate после первой компиляции");
+
+        // Добавляем новую систему (триггерит invalidate_plan)
+        sched.add_system_to_stage("more_pre_work", |_| {}, StageLabel::PreUpdate);
+
+        // Вторая компиляция — stage_order должен сохраниться
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+        assert!(upd_idx.is_some(), "Update Stage должен быть после перекомпиляции");
+        assert!(pre_idx.is_some(), "PreUpdate Stage должен быть после перекомпиляции");
+        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate после перекомпиляции — stage_order должен сохраняться");
+
+        // Третья компиляция — ещё один вызов для уверенности
+        sched.add_system_to_stage("extra", |_| {}, StageLabel::Last);
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
+        let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
+        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update перед PreUpdate после третьей компиляции");
     }
 }

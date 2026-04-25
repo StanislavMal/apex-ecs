@@ -4,6 +4,14 @@
 //! Для вложенных структур достаточно реализовать `ScriptableRegistrar`,
 //! который внутри тоже использует Dynamic Map.
 //!
+//! # Zero-copy для примитивных полей
+//!
+//! Компоненты, состоящие из одного примитивного поля (например `Health(f32)`),
+//! могут читаться напрямую из Column без создания промежуточного Dynamic Map,
+//! что сокращает аллокации в `build_item()`.
+//!
+//! Для этого `ScriptableRegistrar::primitive_info()` должен вернуть `Some(...)`.
+//!
 //! # Добавление нового типа
 //!
 //! ```ignore
@@ -28,6 +36,113 @@ use rhai::Dynamic;
 pub trait ScriptableField: Sized + Clone {
     fn to_dynamic(&self) -> Dynamic;
     fn from_dynamic(d: &Dynamic) -> Option<Self>;
+}
+
+// ── PrimitiveInfo ────────────────────────────────────────────────
+
+/// Мета-информация о примитивном типе для zero-copy read path.
+///
+/// Позволяет `build_item()` читать значение напрямую из сырой памяти Column,
+/// минуя вызов `binding.read` (который для структур создаёт Dynamic Map).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrimitiveInfo {
+    F32,
+    F64,
+    I32,
+    I64,
+    U32,
+    U64,
+    Usize,
+    Bool,
+    String,
+}
+
+impl PrimitiveInfo {
+    /// Прочитать значение напрямую из сырого указателя, без создания Map.
+    ///
+    /// # Safety
+    /// `ptr` должен указывать на валидные данные соответствующего типа.
+    #[inline]
+    pub unsafe fn read_raw(&self, ptr: *const u8) -> Dynamic {
+        match self {
+            Self::F32 => Dynamic::from_float(*(ptr as *const f32) as rhai::FLOAT),
+            Self::F64 => Dynamic::from_float(*(ptr as *const f64) as rhai::FLOAT),
+            Self::I32 => Dynamic::from_int(*(ptr as *const i32) as rhai::INT),
+            Self::I64 => Dynamic::from_int(*(ptr as *const i64) as rhai::INT),
+            Self::U32 => Dynamic::from_int(*(ptr as *const u32) as rhai::INT),
+            Self::U64 => Dynamic::from_int(*(ptr as *const u64) as rhai::INT),
+            Self::Usize => Dynamic::from_int(*(ptr as *const usize) as rhai::INT),
+            Self::Bool => Dynamic::from_bool(*(ptr as *const bool)),
+            Self::String => {
+                let s = &*(ptr as *const String);
+                Dynamic::from(rhai::ImmutableString::from(s.as_str()))
+            }
+        }
+    }
+
+    /// Записать значение напрямую в сырой указатель, без создания Map.
+    ///
+    /// # Safety
+    /// `ptr` должен указывать на валидную память соответствующего типа.
+    #[inline]
+    pub unsafe fn write_raw(&self, ptr: *mut u8, dynamic: &Dynamic) -> bool {
+        match self {
+            Self::F32 => {
+                if let Ok(v) = dynamic.as_float() {
+                    *(ptr as *mut f32) = v as f32;
+                    true
+                } else { false }
+            }
+            Self::F64 => {
+                if let Ok(v) = dynamic.as_float() {
+                    *(ptr as *mut f64) = v;
+                    true
+                } else { false }
+            }
+            Self::I32 => {
+                if let Ok(v) = dynamic.as_int() {
+                    *(ptr as *mut i32) = v as i32;
+                    true
+                } else { false }
+            }
+            Self::I64 => {
+                if let Ok(v) = dynamic.as_int() {
+                    *(ptr as *mut i64) = v;
+                    true
+                } else { false }
+            }
+            Self::U32 => {
+                if let Ok(v) = dynamic.as_int() {
+                    *(ptr as *mut u32) = v as u32;
+                    true
+                } else { false }
+            }
+            Self::U64 => {
+                if let Ok(v) = dynamic.as_int() {
+                    *(ptr as *mut u64) = v as u64;
+                    true
+                } else { false }
+            }
+            Self::Usize => {
+                if let Ok(v) = dynamic.as_int() {
+                    *(ptr as *mut usize) = v as usize;
+                    true
+                } else { false }
+            }
+            Self::Bool => {
+                if let Ok(v) = dynamic.as_bool() {
+                    *(ptr as *mut bool) = v;
+                    true
+                } else { false }
+            }
+            Self::String => {
+                if let Ok(s) = dynamic.clone().into_string() {
+                    *(ptr as *mut String) = s;
+                    true
+                } else { false }
+            }
+        }
+    }
 }
 
 // ── f32 ────────────────────────────────────────────────────────

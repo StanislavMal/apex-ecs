@@ -214,6 +214,7 @@ impl ScriptEngine {
                     false
                 }
             },
+            primitive_info: T::primitive_info(),
         };
 
         self.ctx.borrow_mut().add_binding(binding);

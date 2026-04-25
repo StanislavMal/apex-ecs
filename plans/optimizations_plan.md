@@ -879,3 +879,357 @@ Phase 3 (долгосрочные):
 | `crates/apex-serialization/src/snapshot.rs` | WorldDiff byte-level delta | Long-term |
 | `crates/apex-core/src/sub_world.rs` | Row-level parallel (for_each_entity, par_for_each_entity, for_each_row, par_for_each_row) | Long-term |
 | `crates/apex-scripting/src/context.rs` | Rhai query caching | Long-term |
+| `crates/apex-core/src/par_utils.rs` | 5.1 compute_par_chunks SmallVec вместо Vec | Phase 5 |
+| `crates/apex-core/src/world.rs` | 5.2 adaptive_chunk_size runtime adaptation | Phase 5 |
+| `crates/apex-core/src/world.rs` | 5.3 Thread-local scratch buffer для is_common | Phase 5 |
+| `crates/apex-scheduler/src/lib.rs` | 5.4 Stage order persistence между compile() | Phase 5 |
+| `crates/apex-core/src/relations.rs` | 5.5 DenseRelationStorage для плотных графов | Phase 5 |
+| `crates/apex-scripting/src/field.rs` + iterators.rs | 5.6 Zero-copy для примитивных Rhai полей | Phase 5 |
+| `crates/apex-scheduler/src/lib.rs` + sub_world.rs | 5.7 Row-level SubWorld splits в scheduler | Phase 5 |
+
+---
+
+## Фаза 5: Финализация пропущенных оптимизаций `[x]`
+
+### 5.1 `compute_par_chunks` — SmallVec вместо Vec `[x]`
+
+**Проблема:**
+Функция [`compute_par_chunks()`](crates/apex-core/src/par_utils.rs:11) всегда аллоцирует новый `Vec<(usize, usize, usize)>` через `.collect()`.
+При каждом `par_for_each` (а их может быть тысячи за кадр) — новая heap-аллокация.
+
+**Решение:**
+Заменить возвращаемый тип на `SmallVec<[(usize, usize, usize); 64]>` из крейта `smallvec`.
+В типичном ECS-мире количество архетипов редко превышает 20–30, и каждый архетип
+создаёт 1–4 чанка — итого 64 элемента достаточно для heap-free работы в 95% случаев.
+
+При добавлении smallvec в зависимости apex-core нужно убедиться, что он уже есть
+в workspace (проверить `Cargo.toml` корня и apex-core).
+
+**Конкретные изменения:**
+1. В `crates/apex-core/Cargo.toml` добавить `smallvec = "1.14"`.
+2. В `crates/apex-core/src/par_utils.rs`:
+   - Импорт: `use smallvec::{SmallVec, smallvec};`
+   - Сигнатура: `pub(crate) fn compute_par_chunks<I>(...) -> SmallVec<[(usize, usize, usize); 64]>`
+   - Вместо `.collect()`: `let mut result: SmallVec<[_; 64]> = SmallVec::new(); result.extend(...); result`
+
+**Тесты:** Существующие тесты query/par_for_each должны продолжать работать.
+Никаких новых тестов не требуется, так как это внутренний рефакторинг.
+
+**Ожидаемый эффект:** ~0 аллокаций на вызов `par_for_each` для типичных сценариев (вместо 1).
+Для миров с 100+ архетипов — heap-аллокация всё равно будет, но через SmallVec (менее накладная).
+
+### 5.2 Adaptive parallelism threshold `[x]`
+
+**Проблема:**
+В [`adaptive_chunk_size()`](crates/apex-core/src/world.rs:783) константы
+`MIN_CHUNK_SIZE = 2` и `MAX_CHUNK_SIZE = 4096` жёстко заданы.
+Для сцен с малым числом сущностей (< 100) распараллеливание с чанками по 2 элемента
+создаёт оверхеда больше, чем выгоды от параллелизма.
+
+**Решение:**
+Добавить runtime-адаптацию: при малом числе сущностей увеличивать MIN_CHUNK_SIZE,
+чтобы параллелизм включался только когда выгода перевешивает overhead.
+
+Вариант реализации:
+```rust
+pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
+    let n = num_threads.max(1);
+    // Динамический MIN: для малых нагрузок увеличиваем порог
+    let min_size = if entity_count < 100 { 64 }
+                  else if entity_count < 1000 { 16 }
+                  else { 2 };
+    let max_size = 4096_usize;
+    let chunk = entity_count / n;
+    if chunk < min_size { chunk.max(1) }
+    else { chunk.min(max_size) }
+}
+```
+
+Альтернативно — вынести `MIN_CHUNK_SIZE` и `MAX_CHUNK_SIZE` в конфигурируемые
+параметры мира (поля в `World` или глобальные Atomic).
+
+**Конкретные изменения:**
+1. В [`world.rs`](crates/apex-core/src/world.rs:783) модифицировать `adaptive_chunk_size()`.
+2. Опционально: убрать `const MIN_CHUNK_SIZE` / `MAX_CHUNK_SIZE` или переименовать в defaults.
+3. Опционально: добавить `set_min_chunk_size()` / `set_max_chunk_size()` публичные функции.
+
+**Тесты:** Добавить тест для `adaptive_chunk_size` с разными значениями entity_count,
+проверяющий, что для малых нагрузок размер чанка адекватный.
+
+**Ожидаемый эффект:** На сценах с < 1000 entities параллельные запросы не создают
+тысячу микро-чанков, снижая overhead планировщика rayon.
+
+### 5.3 Thread-local scratch buffer для `is_common` в `move_entity` `[x]`
+
+**Проблема:**
+В [`move_entity()`](crates/apex-core/src/world.rs:697) при каждом вызове
+аллоцируется `SmallVec<[bool; 32]>` через `SmallVec::from_elem(false, from_len)`.
+Если `from_len > 32` (архетип с 33+ компонентами) — происходит heap-аллокация.
+Даже при < 32 это инициализация памяти.
+
+**Решение:**
+Использовать `thread_local!` с `RefCell<Vec<bool>>` как переиспользуемый буфер:
+
+```rust
+use std::cell::RefCell;
+
+thread_local! {
+    static IS_COMMON_BUF: RefCell<Vec<bool>> = RefCell::new(Vec::new());
+}
+
+pub(crate) fn move_entity(...) -> u32 {
+    // ...
+    let mut is_common = IS_COMMON_BUF.replace_with(|buf| {
+        buf.clear();
+        buf.resize(from_len, false);
+        std::mem::take(buf)
+    });
+    // ... использование is_common ...
+}
+```
+
+**Важно:** Убедиться, что буфер не удерживается между yield points и не нарушает
+безопасность в параллельном контексте. `move_entity` вызывается под `&mut self`,
+поэтому race condition невозможен.
+
+**Конкретные изменения:**
+1. В [`world.rs`](crates/apex-core/src/world.rs) добавить `thread_local! { static IS_COMMON_BUF: ... }`.
+2. В `move_entity()` (строка 697) заменить `SmallVec::from_elem` на использование буфера.
+3. Убрать использование `SmallVec` для `is_common`.
+
+**Тесты:** Существующие тесты `insert` / `remove` / `spawn` должны проходить.
+
+**Ожидаемый эффект:** Ноль аллокаций при каждом `move_entity` (insert компонента).
+Для архетипов с 33+ колонками — устранение heap-аллокации при каждом insert.
+
+### 5.4 Stage order persistence между перекомпиляциями `[x]`
+
+**Проблема:**
+Метод [`configure_stages()`](crates/apex-scheduler/src/lib.rs:565) сохраняет
+`self.stage_order = Some(order)` и вызывает `invalidate_plan()`.
+Однако при повторной компиляции (после добавления новой системы) поле `stage_order`
+сбрасывается? **Проверка кода:** `invalidate_plan()` (строка 570) сбрасывает только
+`execution_plan` и `graph_dirty`, НЕ `stage_order`. Но `compile()` (строка 600) использует
+`self.stage_order` на строке 651. Если пользователь добавил систему с новой stage_label,
+которая не была в исходном `order`, она попадёт в `remaining` (конец списка).
+Это корректное поведение.
+
+Однако **пользователь сообщает**, что порядок всё равно сбрасывается.
+Возможная причина: если `configure_stages()` вызывается ДО добавления систем,
+а потом вызывается `compile()` — порядок работает. Но если после `invalidate_plan()`
+(из-за добавления системы) порядок теряется — нужно проверить, не перезаписывает ли
+какой-нибудь другой код `stage_order`.
+
+**Истинная проблема скорее всего в том**, что `stage_order` хранит `Vec<StageLabel>`,
+и при перекомпиляции (например через `add_system` → `invalidate_plan`) порядок
+действительно сохраняется, но если пользователь ожидает, что можно задать порядок
+один раз при старте и забыть — это работает. Если же порядок сбрасывается при
+вызове `compile()` без предварительного `configure_stages()` — этого не должно
+происходить.
+
+**Решение (предупредительное):**
+Добавить явную проверку и логику сохранения порядка в `compile()`:
+
+1. Убедиться, что `stage_order` сохраняется между вызовами `compile()`.
+2. При каждом вызове `compile()` проверять: если `stage_order` есть — использовать его.
+3. Никакой код не должен сбрасывать `stage_order` кроме явного вызова `configure_stages()`.
+
+**Конкретные изменения:**
+1. Проверить все места, где могут сбрасывать `stage_order` — в `scheduler.rs`.
+2. Если нужно — добавить assert в `invalidate_plan()`, что `stage_order` не тронут.
+3. Добавить тест: `configure_stages() → add_system() → compile() → run() → add_system() → compile() → проверить stage_order`.
+
+**Тесты:** Добавить тест, который проверяет сохранение stage_order после повторной компиляции.
+
+**Ожидаемый эффект:** Стабильный порядок стадий после однократной настройки.
+
+### 5.5 `DenseRelationStorage` для heavily-connected графов `[x]`
+
+**Проблема:**
+Структура [`SubjectEntry`](crates/apex-core/src/relations.rs:94) использует
+`SmallVec<[u32; 4]>` для хранения отношений. Это оптимально для разреженных связей
+(≤4 отношений на сущность), но для heavily-connected сущностей (20+ отношений):
+1. SmallVec переполняется и аллоцирует на heap.
+2. `binary_search` на каждом insert/remove — O(log n) на heap-vec.
+3. `remove` может потребовать O(n) сдвигов.
+
+**Решение:**
+Добавить альтернативное хранилище с auto-upgrade: когда количество отношений превышает
+порог (например 8), переключаться на `DenseVec<u32>` или `HashSet<u32>`:
+
+Вариант A: `HashSet<u32>` для dense (O(1) insert/remove/has)
+```rust
+enum RelationStorage {
+    Sparse(SmallVec<[u32; 4]>),   // ≤8 relations — бинарный поиск
+    Dense(HashSet<u32>),           // >8 relations — hash lookup
+}
+```
+
+Вариант B: `Vec<u32>` с флагом sorted/dense
+```rust
+enum RelationStorage {
+    Sorted(SmallVec<[u32; 4]>),  // ≤4 relations
+    Dense(Vec<u32>),              // любые relations, без сортировки (O(n) поиск)
+}
+```
+
+Рекомендуется Вариант A, так как `HashSet` даёт O(1) для всех операций на плотных графах.
+
+**Конкретные изменения:**
+1. В [`relations.rs`](crates/apex-core/src/relations.rs:94) заменить:
+```rust
+use std::collections::HashSet;
+
+enum RelationStorage {
+    Sparse(SmallVec<[u32; 4]>),
+    Dense(HashSet<u32>),
+}
+
+struct SubjectEntry {
+    kind_mask: u64,
+    storage: RelationStorage,
+}
+```
+2. Реализовать auto-upgrade: при вставке, если `storage` Sparse и len >= 8 — конвертировать в Dense.
+3. Переписать методы `insert`, `remove`, `has`, `get_all` с учётом двух вариантов.
+4. `get_all()` для Dense возвращает собранный `Vec<u32>` (или хранить отдельно sorted copy).
+
+**Тесты:** Добавить тест с 20+ отношениями на одну сущность.
+
+**Ожидаемый эффект:** O(1) для heavily-connected сущностей вместо O(log n) + heap-реаллокаций.
+
+### 5.6 Zero-copy путь для примитивных полей в Rhai `[x]`
+
+**Проблема:**
+Трейт [`ScriptableField`](crates/apex-scripting/src/field.rs:28) определяет
+`to_dynamic(&self) -> Dynamic` и `from_dynamic(d: &Dynamic) -> Option<Self>`.
+В методе [`build_item()`](crates/apex-scripting/src/iterators.rs:227) каждое
+поле компонента читается через `(binding.read)(ptr)`, который вызывает
+`to_dynamic()` — создаёт новый `Dynamic` объект на каждое поле.
+
+Для примитивных типов (i32, f32, bool) можно читать данные напрямую из колонки
+без создания промежуточного Dynamic, если известен тип поля на этапе компиляции
+или если binding может предоставить zero-copy reader.
+
+**Решение:**
+Добавить в `ComponentBinding` опциональный zero-copy путь:
+
+```rust
+// В field.rs
+pub struct ComponentBinding {
+    pub type_name: String,
+    pub read: unsafe fn(*const u8) -> Dynamic,
+    pub write: unsafe fn(*mut u8, &Dynamic),
+    // Zero-copy reader: если Some — можно читать напрямую как &[u8]
+    pub primitive_info: Option<PrimitiveInfo>,
+}
+
+pub enum PrimitiveInfo {
+    I32, F32, F64, Bool, U32, I64, U64,
+}
+```
+
+Изменить `build_item()` в `iterators.rs`:
+```rust
+if let Some(prim_info) = binding.primitive_info {
+    // Zero-copy: данные уже лежат в колонке как примитив
+    let val: Dynamic = unsafe {
+        let col = &arch.columns_raw()[comp.col_idx];
+        let ptr = col.get_raw_ptr(row);
+        match prim_info {
+            PrimitiveInfo::I32  => Dynamic::from(*(ptr as *const i32)),
+            PrimitiveInfo::F32  => Dynamic::from(*(ptr as *const f32)),
+            PrimitiveInfo::Bool => Dynamic::from(*(ptr as *const bool)),
+            // ... и т.д.
+        }
+    };
+} else {
+    // Fallback: используем read функцию для сложных типов
+    let dynamic = unsafe { (binding.read)(ptr) };
+}
+```
+
+**Конкретные изменения:**
+1. В [`field.rs`](crates/apex-scripting/src/field.rs) добавить `PrimitiveInfo` enum
+   и поле `primitive_info: Option<PrimitiveInfo>` в `ComponentBinding`.
+2. В [`registrar.rs`](crates/apex-scripting/src/registrar.rs) (или где регистрируются компоненты)
+   при регистрации примитивных типов устанавливать `primitive_info`.
+3. В [`iterators.rs`](crates/apex-scripting/src/iterators.rs) в `build_item()`
+   добавить zero-copy ветку для примитивов.
+
+**Тесты:** Бенчмарк на чтение примитивных компонентов из Rhai.
+
+**Ожидаемый эффект:** Для i32/f32/bool — 0 копирований, Dynamic создаётся напрямую
+из примитива (Rhai это умеет). Ускорение ~2× на чтение примитивных полей.
+
+### 5.7 Row-level SubWorld splits в планировщике (ArchetypeMask) `[x]`
+
+**Проблема:**
+Метод [`compute_archetype_indices()`](crates/apex-scheduler/src/lib.rs:687)
+назначает целые архетипы системам, но не умеет делить строки одного архетипа
+между несколькими системами. Если две системы читают разные компоненты одного
+архетипа, они вынуждены исполняться последовательно (из-за конфликта), хотя
+реально конфликта нет — они читают разные колонки.
+
+**Решение:**
+Добавить механизм `ArchetypeMask`-based сплиттинга: каждая система получает
+не список `(archetype_index)`, а список пар `(archetype_index, row_start, row_end)`,
+основанный на `ArchetypeMask`.
+
+Механизм:
+1. В [`access.rs`](crates/apex-core/src/access.rs) уже есть `ArchetypeMask` с `overlaps()` и `iter_ones()`.
+2. Для каждой системы известен `AccessDescriptor` с read/write масками.
+3. Если две системы имеют непересекающиеся маски — они могут работать над разными
+   строками одного архетипа параллельно.
+4. В `compute_archetype_indices()` — добавить логику разделения строк архетипа
+   между неконфликтующими системами.
+5. В `prepare_sub_worlds()` — передавать не только arch_indices, но и row ranges.
+6. В `SubWorld` — добавить методы, принимающие row ranges.
+
+**Конкретные изменения:**
+1. [`scheduler.rs`](crates/apex-scheduler/src/lib.rs:687)
+   - Изменить `system_archetype_indices: HashMap<SystemId, Vec<usize>>`
+     на `system_archetype_ranges: HashMap<SystemId, Vec<(usize, usize, usize)>>`
+     (arch_idx, row_start, row_end).
+   - В `compute_archetype_indices()` после определения, какие архетипы нужны системе,
+     проверить: делится ли архетип с другими системами на этом же уровне.
+   - Если две системы читают разные колонки одного архетипа — разделить строки
+     (половина первой, половина второй).
+
+2. [`sub_world.rs`](crates/apex-core/src/sub_world.rs) — добавить методы с row ranges:
+   ```rust
+   pub fn for_each_entity_in_range<F: FnMut(Entity)>(&self, row_start: usize, row_end: usize, f: F);
+   pub fn par_for_each_entity_in_range<F: Fn(Entity) + Send + Sync>(&self, row_start: usize, row_end: usize, f: F);
+   ```
+
+3. [`scheduler.rs`](crates/apex-scheduler/src/lib.rs) — `prepare_sub_worlds()` и
+   `run_hybrid_parallel()` — адаптировать под новую структуру.
+
+**Примечание:** Это архитектурное изменение, требующее осторожности с безопасностью.
+SubWorld даёт доступ к `get_mut` для компонент — нужно гарантировать, что две системы
+не пишут в одну колонку одновременно.
+
+**Тесты:** Добавить тест: две системы с разными масками над одним архетипом —
+проверить, что выполняются параллельно и корректно.
+
+**Ожидаемый эффект:** Системы на одном уровне могут параллельно обрабатывать
+разные строки одного архетипа. Для read-only сценариев — до ~2× утилизация
+ядер на архетипах с большим числом систем.
+
+---
+
+## Порядок выполнения Phase 5
+
+```
+Phase 5 (пропущенные оптимизации):
+  ├── 5.1 compute_par_chunks SmallVec     ← нет зависимостей
+  ├── 5.2 Adaptive chunk size              ← нет зависимостей
+  ├── 5.3 Thread-local is_common buffer    ← нет зависимостей
+  ├── 5.4 Stage order persistence          ← нет зависимостей
+  ├── 5.5 DenseRelationStorage             ← нет зависимостей
+  ├── 5.6 Zero-copy Rhai fields            ← нет зависимостей
+  └── 5.7 ArchetypeMask scheduler splits   ← самая сложная, лучше последней
+```
+
+Рекомендуемый порядок реализации: 5.1 → 5.2 → 5.3 → 5.4 → 5.5 → 5.6 → 5.7
+(от простых к сложным). После каждой оптимизации — прогон тестов.

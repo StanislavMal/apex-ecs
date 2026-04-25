@@ -135,7 +135,7 @@ impl WorldSerializer {
         for arch in world.archetypes() {
             if arch.is_empty() { continue; }
             for &entity in arch.entities() {
-                for &raw_id in world.subject_index_raw(entity.index()) {
+                for raw_id in world.subject_index_raw(entity.index()) {
                     let rel_cid = ComponentId(raw_id);
                     if !is_relation_id(rel_cid) { continue; }
 

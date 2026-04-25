@@ -88,29 +88,133 @@ impl IdIndex {
     }
 }
 
+/// Порог переключения от Sparse к Dense хранению отношений.
+/// При количестве отношений > DENSE_THRESHOLD на сущность,
+/// хранилище переключается на HashSet для O(1) операций.
+const DENSE_THRESHOLD: usize = 8;
+
+/// Хранилище отношений для одной сущности.
+///
+/// - `Sparse`: отсортированный SmallVec для малого числа отношений (≤8).
+///   Использует binary_search — O(log n).
+/// - `Dense`: FxHashSet для большого числа отношений (>8).
+///   Все операции O(1) amortized.
+enum RelationStorage {
+    Sparse(SmallVec<[u32; 8]>),
+    Dense(rustc_hash::FxHashSet<u32>),
+}
+
+impl Default for RelationStorage {
+    fn default() -> Self {
+        Self::Sparse(SmallVec::new())
+    }
+}
+
+impl RelationStorage {
+    #[inline]
+    fn insert(&mut self, raw: u32) {
+        match self {
+            Self::Sparse(sv) => {
+                let pos = match sv.binary_search(&raw) {
+                    Ok(_) => return,  // уже существует
+                    Err(pos) => pos,
+                };
+                sv.insert(pos, raw);
+                // Auto-upgrade: при превышении порога переключаемся на Dense
+                if sv.len() > DENSE_THRESHOLD {
+                    let set: rustc_hash::FxHashSet<u32> = sv.drain(..).collect();
+                    *self = Self::Dense(set);
+                }
+            }
+            Self::Dense(set) => {
+                set.insert(raw);
+            }
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, raw: u32) -> bool {
+        match self {
+            Self::Sparse(sv) => {
+                if let Ok(pos) = sv.binary_search(&raw) {
+                    sv.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Dense(set) => set.remove(&raw),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, raw: u32) -> bool {
+        match self {
+            Self::Sparse(sv) => sv.binary_search(&raw).is_ok(),
+            Self::Dense(set) => set.contains(&raw),
+        }
+    }
+
+    #[inline]
+    fn contains_kind(&self, kind_idx: u32) -> bool {
+        match self {
+            Self::Sparse(sv) => {
+                sv.iter().any(|&r| {
+                    let cid = ComponentId(r);
+                    is_relation_id(cid) && decode_kind(cid) == kind_idx
+                })
+            }
+            Self::Dense(set) => {
+                set.iter().any(|&r| {
+                    let cid = ComponentId(r);
+                    is_relation_id(cid) && decode_kind(cid) == kind_idx
+                })
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Sparse(sv) => sv.clear(),
+            Self::Dense(set) => set.clear(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Sparse(sv) => sv.len(),
+            Self::Dense(set) => set.len(),
+        }
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        match self {
+            Self::Sparse(sv) => Box::new(sv.iter().copied()),
+            Self::Dense(set) => Box::new(set.iter().copied()),
+        }
+    }
+}
+
 // ── SubjectIndex ───────────────────────────────────────────────
 
 #[derive(Default)]
 struct SubjectEntry {
     /// Битовая маска: бит k установлен ↔ есть relation с kind_idx = k.
     kind_mask: u64,
-    /// Отсортированный список полных relation ComponentId (как u32).
-    relations: SmallVec<[u32; 4]>,
+    /// Хранилище отношений (Sparse для ≤8, Dense для >8).
+    storage: RelationStorage,
 }
 
 impl SubjectEntry {
     #[inline]
     fn has_kind(&self, kind_idx: u32) -> bool {
-        if kind_idx >= 64 { return self.has_kind_slow(kind_idx); }
+        if kind_idx >= 64 { return self.storage.contains_kind(kind_idx); }
         self.kind_mask & (1u64 << kind_idx) != 0
     }
 
     #[cold]
     fn has_kind_slow(&self, kind_idx: u32) -> bool {
-        self.relations.iter().any(|&r| {
-            let cid = ComponentId(r);
-            is_relation_id(cid) && decode_kind(cid) == kind_idx
-        })
+        self.storage.contains_kind(kind_idx)
     }
 
     #[inline]
@@ -120,25 +224,17 @@ impl SubjectEntry {
         if kind_idx < 64 {
             self.kind_mask |= 1u64 << kind_idx;
         }
-        match self.relations.binary_search(&raw) {
-            Ok(_)    => {}
-            Err(pos) => self.relations.insert(pos, raw),
-        }
+        self.storage.insert(raw);
     }
 
     #[inline]
     fn remove(&mut self, relation_id: ComponentId) {
         let raw = relation_id.0;
-        if let Ok(pos) = self.relations.binary_search(&raw) {
-            self.relations.remove(pos);
-        }
         let kind_idx = decode_kind(relation_id);
-        if kind_idx < 64 {
-            let still_has_kind = self.relations.iter().any(|&r| {
-                let cid = ComponentId(r);
-                is_relation_id(cid) && decode_kind(cid) == kind_idx
-            });
-            if !still_has_kind {
+        let existed = self.storage.remove(raw);
+        if existed && kind_idx < 64 {
+            // Проверяем, остались ли ещё отношения этого вида
+            if !self.storage.contains_kind(kind_idx) {
                 self.kind_mask &= !(1u64 << kind_idx);
             }
         }
@@ -148,7 +244,7 @@ impl SubjectEntry {
     fn has(&self, relation_id: ComponentId) -> bool {
         let kind_idx = decode_kind(relation_id);
         if !self.has_kind(kind_idx) { return false; }
-        self.relations.binary_search(&relation_id.0).is_ok()
+        self.storage.contains(relation_id.0)
     }
 }
 
@@ -189,13 +285,12 @@ impl SubjectIndex {
         idx < self.entries.len() && self.entries[idx].has(relation_id)
     }
 
-    #[inline]
-    pub fn get_all(&self, entity_index: u32) -> &[u32] {
+    pub fn get_all(&self, entity_index: u32) -> Vec<u32> {
         let idx = entity_index as usize;
         if idx < self.entries.len() {
-            &self.entries[idx].relations
+            self.entries[idx].storage.iter().collect()
         } else {
-            &[]
+            Vec::new()
         }
     }
 
@@ -203,7 +298,7 @@ impl SubjectIndex {
         let idx = entity_index as usize;
         if idx < self.entries.len() {
             self.entries[idx].kind_mask = 0;
-            self.entries[idx].relations.clear();
+            self.entries[idx].storage.clear();
         }
     }
 }
@@ -424,7 +519,7 @@ impl World {
         _kind:   R,
     ) -> Option<Entity> {
         let kind_idx = self.relations.get_idx::<R>()?;
-        for &raw_id in self.subject_index.get_all(subject.index) {
+        for raw_id in self.subject_index.get_all(subject.index) {
             let cid = ComponentId(raw_id);
             if is_relation_id(cid) && decode_kind(cid) == kind_idx && !is_wildcard(cid) {
                 let target_idx = decode_target(cid);

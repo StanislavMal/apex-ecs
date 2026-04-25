@@ -41,6 +41,7 @@
 //! ```
 
 use rhai::{Dynamic, Engine};
+use crate::field::PrimitiveInfo;
 
 /// Трейт для компонентов, доступных из Rhai-скриптов.
 ///
@@ -71,6 +72,17 @@ pub trait ScriptableRegistrar: Sized + 'static {
     ///
     /// Вызывается один раз при `ScriptEngine::register_component::<T>()`.
     fn register_rhai_type(engine: &mut Engine);
+
+    /// Возвращает информацию о примитивном типе, если компонент
+    /// является простой обёрткой над одним примитивным полем.
+    ///
+    /// Если вернуть `Some(...)`, то `build_item()` будет читать значение
+    /// напрямую из Column без создания Dynamic Map, что сокращает аллокации.
+    ///
+    /// По умолчанию — `None` (структурный тип, читается через Map).
+    fn primitive_info() -> Option<PrimitiveInfo> {
+        None
+    }
 }
 
 // ── ResourceBinding ─────────────────────────────────────────────

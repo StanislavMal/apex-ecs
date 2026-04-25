@@ -27,6 +27,7 @@ use apex_core::{
     world::World,
 };
 
+use crate::field::PrimitiveInfo;
 use crate::iterators::{ArchState, QueryDesc};
 use crate::registrar::{ResourceBinding, EventBinding, ScriptableRegistrar};
 
@@ -44,6 +45,13 @@ pub struct ComponentBinding {
     pub read: unsafe fn(*const u8) -> rhai::Dynamic,
     /// Записать компонент в Column[row] из Dynamic; возвращает false если тип неверен
     pub write: unsafe fn(*mut u8, &rhai::Dynamic) -> bool,
+    /// Мета-информация о примитивном типе для zero-copy read/write path.
+    ///
+    /// Если `Some(...)`, то `build_item()` может читать значение напрямую из
+    /// сырой памяти Column без вызова `read`, что сокращает аллокации.
+    /// Устанавливается автоматически если `ScriptableRegistrar::primitive_info()`
+    /// возвращает `Some`.
+    pub primitive_info: Option<PrimitiveInfo>,
 }
 
 // ── SpawnRequest ───────────────────────────────────────────────

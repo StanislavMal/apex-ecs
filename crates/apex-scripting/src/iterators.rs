@@ -177,7 +177,14 @@ impl RhaiQueryIter {
                     // Получаем указатель на данные в колонке
                     let col = &world.archetypes()[arch_idx].columns_raw()[col_idx];
                     let ptr = col.get_raw_ptr(row) as *mut u8;
-                    (binding.write)(ptr, &dynamic);
+
+                    // Zero-copy write path для примитивных компонентов
+                    if let Some(prim_info) = &binding.primitive_info {
+                        prim_info.write_raw(ptr, &dynamic);
+                    } else {
+                        (binding.write)(ptr, &dynamic);
+                    }
+
                     // Обновляем change tick для корректной работы change detection
                     arch.set_change_tick(row, binding.id, world.current_tick());
                 }
@@ -241,11 +248,21 @@ impl RhaiQueryIter {
                 None    => continue,
             };
 
-            // SAFETY: col_idx и row валидны в пределах этого arch
-            let dynamic = unsafe {
-                let col = &arch.columns_raw()[comp.col_idx];
-                let ptr = col.get_raw_ptr(row);
-                (binding.read)(ptr)
+            // Zero-copy path: если компонент примитивный, читаем напрямую из Column
+            // без создания Dynamic Map (экономит аллокацию на каждый entity).
+            let dynamic = if let Some(prim_info) = &binding.primitive_info {
+                unsafe {
+                    let col = &arch.columns_raw()[comp.col_idx];
+                    let ptr = col.get_raw_ptr(row);
+                    prim_info.read_raw(ptr)
+                }
+            } else {
+                // SAFETY: col_idx и row валидны в пределах этого arch
+                unsafe {
+                    let col = &arch.columns_raw()[comp.col_idx];
+                    let ptr = col.get_raw_ptr(row);
+                    (binding.read)(ptr)
+                }
             };
 
             // Для Write-компонентов запоминаем arch_idx и row чтобы flush мог найти колонку

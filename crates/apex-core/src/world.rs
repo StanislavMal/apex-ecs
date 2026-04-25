@@ -14,6 +14,13 @@ use crate::{
     template::TemplateRegistry,
 };
 
+// Thread-local scratch-буфер для `is_common` в `move_entity`.
+// Позволяет избежать heap-аллокации при каждом перемещении entity между архетипами.
+// Буфер переиспользуется между вызовами move_entity в пределах одного потока.
+thread_local! {
+    static IS_COMMON_BUF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 // ── QueryCache ─────────────────────────────────────────────────
 
 struct CacheEntry {
@@ -206,7 +213,7 @@ impl World {
 
     pub fn relation_registry_mut(&mut self) -> &mut RelationRegistry { &mut self.relations }
 
-    pub fn subject_index_raw(&self, entity_index: u32) -> &[u32] {
+    pub fn subject_index_raw(&self, entity_index: u32) -> Vec<u32> {
         self.subject_index.get_all(entity_index)
     }
 
@@ -694,7 +701,12 @@ impl World {
         let from_row = from_location.row;
 
         let from_len = self.archetypes[from_idx].columns.len();
-        let mut is_common: SmallVec<[bool; 32]> = SmallVec::from_elem(false, from_len);
+        // Используем thread-local переиспользуемый буфер вместо SmallVec::from_elem,
+        // чтобы избежать heap-аллокации при каждом move_entity.
+        // take() вынимает существующий Vec без лишней аллокации.
+        let mut is_common = IS_COMMON_BUF.take();
+        is_common.clear();
+        is_common.resize(from_len, false);
         for i in 0..from_len {
             let cid      = self.archetypes[from_idx].columns[i].component_id;
             is_common[i] = self.archetypes[to_idx].has_component(cid);
@@ -743,6 +755,9 @@ impl World {
                 self.archetypes[from_idx].entities.pop();
             }
         }
+        // Возвращаем буфер в thread-local storage для переиспользования
+        // set() — RefCell пуст после take(), так что это просто установка
+        IS_COMMON_BUF.set(is_common);
         to_row as u32
     }
 }
@@ -777,17 +792,26 @@ pub const MAX_CHUNK_SIZE: usize = 65536;
 /// Результат ограничен [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
 /// num_threads — количество потоков rayon (передаётся из вызывающего кода).
 ///
-/// Для entity_count < MIN_CHUNK_SIZE * num_threads размер чанка динамически
-/// уменьшается до `entity_count / n`, гарантируя n параллельных задач.
-/// Для entity_count > MAX_CHUNK_SIZE * num_threads используется MAX_CHUNK_SIZE.
+/// **Runtime-адаптация:** для малых нагрузок (< 100 entities) динамически
+/// увеличиваем минимальный размер чанка до 128, чтобы избежать оверхеда
+/// rayon на микро-задачах. Для средних (100–1000) — 32. Для больших — 64.
 pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
     let n = num_threads.max(1);
+    // Динамический минимум: чем меньше сущностей, тем крупнее чанки,
+    // чтобы не плодить микро-задачи на малых наборах данных.
+    let dynamic_min = if entity_count < 100 {
+        128_usize
+    } else if entity_count < 1000 {
+        32_usize
+    } else {
+        MIN_CHUNK_SIZE
+    };
     // Целевое количество чанков: n (1 чанк на поток)
     let chunk = entity_count / n;
-    // Если target chunk size меньше MIN_CHUNK_SIZE — оставляем как есть,
+    // Если target chunk size меньше dynamic_min — оставляем как есть,
     // чтобы обеспечить параллелизм для малых наборов entity.
-    // Иначе ограничиваем [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
-    if chunk < MIN_CHUNK_SIZE {
+    // Иначе ограничиваем [dynamic_min, MAX_CHUNK_SIZE].
+    if chunk < dynamic_min {
         chunk.max(1)
     } else {
         chunk.min(MAX_CHUNK_SIZE)
