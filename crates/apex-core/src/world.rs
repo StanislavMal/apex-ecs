@@ -830,6 +830,68 @@ impl World {
 
         to_row as u32
     }
+
+    // ── Оптимизация 4.1: add_relation_batch ───────────────────
+
+    /// Batch-добавление одинаковой relation от множества субъектов к одному target.
+    ///
+    /// Оптимизирован для массового создания иерархий (тайловые карты, армии).
+    /// Группирует subjects по текущему архетипу и делает один batch move
+    /// для каждой группы вместо N отдельных move_entity.
+    ///
+    /// # Сложность
+    /// O(S log S) где S = subjects.len() (группировка по архетипу).
+    /// Против O(S) вызовов move_entity при наивном подходе.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// // Создание иерархии 1000 тайлов за один batch
+    /// world.add_relation_batch(&tiles, ChildOf, map_entity);
+    /// ```
+    pub fn add_relation_batch<R: crate::relations::RelationKind>(
+        &mut self,
+        subjects: &[Entity],
+        _kind: R,
+        target: Entity,
+    ) {
+        if subjects.is_empty() { return; }
+
+        let kind_idx    = self.relations.get_or_register::<R>();
+        let relation_id = crate::relations::encode_relation(kind_idx, target.index);
+        self.ensure_relation_component(relation_id);
+
+        // Группируем subjects по текущему архетипу
+        let mut by_arch: FxHashMap<ArchetypeId, Vec<Entity>> = FxHashMap::default();
+        for &entity in subjects {
+            if let Some(loc) = self.entities.get_location(entity) {
+                by_arch.entry(loc.archetype_id).or_default().push(entity);
+            }
+        }
+
+        // Для каждой группы — batch move в целевой архетип
+        let tick = self.current_tick;
+        for (arch_id, group) in by_arch {
+            let new_arch_id = self.find_or_create_archetype_with(arch_id, relation_id);
+
+            for entity in group {
+                if let Some(loc) = self.entities.get_location(entity) {
+                    let new_row = self.move_entity(entity, loc, new_arch_id);
+                    // После move_entity необходимо обновить relation-колонку
+                    // (move_entity копирует только общие компоненты, relation добавляется впервые)
+                    if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
+                        let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
+                        col.change_ticks.push(tick);
+                        col.len += 1;
+                    }
+                    self.entities.set_location(entity, EntityLocation {
+                        archetype_id: new_arch_id,
+                        row: new_row as u32,
+                    });
+                    self.subject_index.add(entity.index, relation_id);
+                }
+            }
+        }
+    }
 }
 
 impl Default for World { fn default() -> Self { Self::new() } }

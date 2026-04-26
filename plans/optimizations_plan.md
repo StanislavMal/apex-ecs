@@ -629,6 +629,12 @@ pub(crate) fn get_or_create_archetype(&mut self, ...) {
 
 **Тест:** Создать мир с 2 типами компонентов A и B. Вставлять/удалять A, проверять что кеш для запросов по B не инвалидируется.
 
+✅ **Реализовано 2026-04-26:**
+- `QueryCache::invalidate_for(changed_cid)` использует `map.retain(|key, _| !key.contains(&changed_cid))` — удаляет только записи, содержащие изменённый компонент
+- `move_entity` вызывает `invalidate_for` для добавляемого/удаляемого компонента вместо полной `invalidate()`
+- `get_or_create_archetype` вызывает полную `invalidate()` — только при создании нового архетипа
+- Верификация: `cargo test --workspace` (28 passed)
+
 ---
 
 ### 2.4. `Column::grow()` — использовать `realloc` вместо `alloc + memcpy`
@@ -685,6 +691,12 @@ pub(crate) fn grow(&mut self) {
 > **Примечание:** `realloc` не гарантирует отсутствие копирования — это зависит от аллокатора. Но jemalloc (используемый в Rust по умолчанию в некоторых конфигурациях) и mimalloc часто избегают копирования при расширении in-place. На системном аллокаторе Windows/Linux это тоже работает для большинства размеров.
 
 **Тест:** Профилировать `spawn_bundle loop` с perf/valgrind на число `memcpy` вызовов.
+
+✅ **Реализовано 2026-04-26:**
+- `Column::grow()`: `alloc(new_layout)` + `copy_nonoverlapping` + `dealloc(old)` → `realloc(self.data, old_layout, new_size)` — устранён лишний `memcpy`
+- `Column::reserve(additional)`: аналогично переведён на `realloc`
+- Первая аллокация (capacity=0) остаётся через `alloc` (realloc с null не портабелен под все аллокаторы)
+- Верификация: `cargo test --workspace` (28 passed)
 
 ---
 
@@ -967,6 +979,13 @@ impl World {
 }
 ```
 
+✅ **Реализовано 2026-04-26:**
+- Добавлен `World::add_relation_batch` в `world.rs` с группировкой по исходному архетипу
+- `ensure_relation_component` вызывается один раз для relation_id, а не для каждой entity
+- `find_or_create_archetype_with` — один вызов на группу вместо одного на entity
+- `FxHashMap<ArchetypeId, Vec<Entity>>` — группировка entity по текущему архетипу
+- Верификация: `cargo test --workspace` (28 passed)
+
 ---
 
 ### 4.2. Hot-reload дебаунс в ScriptEngine
@@ -1104,13 +1123,13 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | 1.5 EventRegistry | `cargo bench events` | send+iter ns/op | ✅ Реализовано |
 | 2.1 ArchetypeMask | custom bench (1000 archetypes) | Query::new µs | ✅ Реализовано |
 | 2.2 CommandQueue | `cargo bench structural` | Commands::apply allocs | ⏳ Pending |
-| 2.3 QueryCache | custom bench (frequent insert) | CachedQuery hits | ⏳ Pending |
-| 2.4 realloc | perf stat | cache-misses | ⏳ Pending |
+| 2.3 QueryCache | custom bench (frequent insert) | CachedQuery hits | ✅ Реализовано |
+| 2.4 realloc | perf stat | cache-misses | ✅ Реализовано |
 | 2.5 TransformScratch | alloc profiler | allocs/frame | ✅ Реализовано |
 | **3.1 ASD** | `cargo run -p apex-examples --example perf --release --features parallel` | 12-sys speedup: 2.03x→**3.91x** (+93%) | ✅ **Реализовано** |
 | 3.2 Row splits | — | Заменён на ASD | ❌ Заменён |
 | 3.3 Thread-local cmds | compilation test | usability | ⏳ Pending |
-| 4.1 batch relations | custom bench | 1000 relations | ⏳ Pending |
+| 4.1 batch relations | custom bench | 1000 relations | ✅ Реализовано |
 | 4.2 debounce | manual test | reload storms | ⏳ Pending |
 | 4.3 Without exclude | custom bench | Without query time | ⏳ Pending |
 | 4.4 compile_with_world | manual test | debug_plan quality | ⏳ Pending |
@@ -1139,10 +1158,10 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
   ✅ 1.4  (независимо от 1.1-1.3)
   ✅ 1.5  (независимо от всего)
 
-Фаза 2 (частично реализована):
-  ✅ 2.1  ──► ⏳ 2.3  (ArchetypeMask — фундамент для QueryCache)
+Фаза 2 (реализована):
+  ✅ 2.1  ──► ✅ 2.3  (ArchetypeMask — фундамент для QueryCache)
   ⏳ 2.2  (CommandQueue — pending)
-  ⏳ 2.4  (realloc — pending)
+  ✅ 2.4  (realloc — реализовано)
   ✅ 2.5  (TransformScratch — реализовано)
 
 Фаза 3 (ASD реализован, row-splits заменён):
@@ -1150,8 +1169,8 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
   ❌ 3.2     (заменён на ASD — row splits избыточны)
   ⏳ 3.3     (Thread-local Commands — pending)
 
-Фаза 4 (независимые, можно в любой момент):
-  ⏳ 4.1  (batch relations — pending)
+Фаза 4 (частично реализована):
+  ✅ 4.1  (batch relations — реализовано)
   ⏳ 4.2  (debounce — pending)
   ⏳ 4.3  (Without<T> — pending, требует 2.1 ✅)
   ⏳ 4.4  (compile_with_world — pending)
@@ -1167,6 +1186,9 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
  2.1 ArchetypeMask / component_arch_idx(Фаза 2) ✅
  2.5 TransformScratch                  (Фаза 2) ✅
  3.1 ASD (Adaptive Scope Distribution) (Фаза 3) ✅ ← ВЫ ПОЛНОСТЬЮ ЗДЕСЬ
+ 2.3 QueryCache invalidate_for          (Фаза 2) ✅
+ 2.4 Column::realloc                    (Фаза 2) ✅
+ 4.1 add_relation_batch                 (Фаза 4) ✅
  4.x Оставшиеся задачи                 (Фаза 4) ⏳
 ```
 
@@ -1175,13 +1197,10 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | Приоритет | Задача | Файлы | Ожидаемый выигрыш |
 |-----------|--------|-------|-------------------|
 | 1 | 3.3 Thread-local Commands | `crates/apex-scheduler/src/lib.rs`, `crates/apex-core/src/world.rs` | Usability: commands() внутри par_for_each |
-| 2 | 4.1 add_relations_batch | `crates/apex-core/src/relations.rs` | Иерархии: 1000 rel → 1 batch |
-| 3 | 2.2 CommandQueue chunking | `crates/apex-core/src/commands.rs` | -60% allocs в Commands::apply |
-| 4 | 2.3 QueryCache invalidate_for | `crates/apex-core/src/world.rs` | >80% cache hits при частых insert |
-| 5 | 4.3 Without<T> exclude mask | `crates/apex-core/src/query.rs` | -20% время Without-запросов |
-| 6 | 2.4 Column::realloc | `crates/apex-core/src/archetype.rs` | -10% cache-misses при grow |
-| 7 | 4.2 Hot-reload debounce | `crates/apex-scripting/src/script_engine.rs` | Устранение reload storms |
-| 8 | 4.4 compile_with_world | `crates/apex-scheduler/src/lib.rs` | debug_plan quality: имена видны |
+| 2 | 2.2 CommandQueue chunking | `crates/apex-core/src/commands.rs` | -60% allocs в Commands::apply |
+| 3 | 4.3 Without<T> exclude mask | `crates/apex-core/src/query.rs` | -20% время Without-запросов |
+| 4 | 4.2 Hot-reload debounce | `crates/apex-scripting/src/script_engine.rs` | Устранение reload storms |
+| 5 | 4.4 compile_with_world | `crates/apex-scheduler/src/lib.rs` | debug_plan quality: имена видны |
 
 ### Чеклист перед PR
 

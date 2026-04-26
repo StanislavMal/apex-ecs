@@ -352,6 +352,43 @@ fn main() {
     world.despawn_recursive(ChildOf, root);
     println!("despawn_recursive(root): {} → {} entities", before, world.entity_count());
 
+    // ── Batch Relations ───────────────────────────────────────
+    println!("\n=== Batch Relations (add_relation_batch) ===");
+
+    // Создаём 100 дочерних entity + 1 родитель
+    let parent = world.spawn_bundle((Name("BatchParent"),));
+    let mut children: Vec<Entity> = Vec::with_capacity(100);
+    for i in 0..100 {
+        children.push(world.spawn_bundle((Name("BatchChild"), Position { x: i as f32, y: 0.0 })));
+    }
+
+    // add_relation_batch — одна операция вместо 100 поштучных add_relation
+    let before = world.entity_count();
+    world.add_relation_batch(&children, ChildOf, parent);
+    println!(
+        "add_relation_batch: {} children → parent={} (entities: {})",
+        children.len(),
+        parent,
+        world.entity_count(),
+    );
+
+    // Проверяем что relations установлены
+    let mut found = 0;
+    for &child in &children {
+        if world.has_relation(child, ChildOf, parent) {
+            found += 1;
+        }
+    }
+    println!("Verified: {}/{} children have ChildOf relation to parent", found, children.len());
+
+    // Проверяем children_of
+    let direct: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+    println!("children_of(parent) count: {} (expected 100)", direct.len());
+
+    // Очищаем
+    world.despawn_recursive(ChildOf, parent);
+    println!("despawn_recursive(parent): {} → {} entities", children.len() + 1, world.entity_count());
+
     // ── Commands ──────────────────────────────────────────────
     println!("\n=== Commands ===");
 
