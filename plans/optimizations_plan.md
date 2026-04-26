@@ -1,1235 +1,1237 @@
-# План оптимизаций APEX ECS
+# APEX ECS — План оптимизации
 
-## Общая информация
-
-Данный план составлен на основе анализа исходного кода всех крейтов APEX ECS
-и рекомендаций из первичного анализа. Каждая оптимизация разбита на шаги,
-содержит конкретные изменения в коде (файл, строки, что менять),
-требования к тестовому покрытию и ожидаемый эффект.
+> Версия 1.0 | Апрель 2026  
+> Документ предназначен для ИИ-программиста. Каждый раздел содержит точные указатели на файлы, сигнатуры функций и конкретный код изменений.
 
 ---
 
-## Фаза 0: Подготовка `[x]`
+## Содержание
 
-### 0.1 Проверить текущее состояние тестов `[x]`
-
-**Действие:** Запустить `cargo test --workspace` и убедиться, что все тесты проходят.
-
-**Файлы:** Весь workspace.
-
-```bash
-cargo test --workspace 2>&1
-```
+1. [Обзор и фазы](#1-обзор-и-фазы)
+2. [Фаза 1 — Быстрые победы (без ломки API)](#2-фаза-1--быстрые-победы)
+3. [Фаза 2 — Структурные оптимизации ядра](#3-фаза-2--структурные-оптимизации-ядра)
+4. [Фаза 3 — Параллелизм нового уровня](#4-фаза-3--параллелизм-нового-уровня)
+5. [Фаза 4 — Функциональные доработки](#5-фаза-4--функциональные-доработки)
+6. [Метрики успеха](#6-метрики-успеха)
+7. [Порядок реализации и зависимости](#7-порядок-реализации-и-зависимости)
 
 ---
 
-## Фаза 1: Критические оптимизации (Priority: Critical) `[x]`
+## 1. Обзор и фазы
 
-### 1.1 Оптимизация `has_edge_between` → `HashSet` в графе зависимостей scheduler `[x]`
+### Текущие узкие места (из бенчмарков)
 
-**Результат:** Линейный поиск `Vec::contains` заменён на `FxHashSet::contains` — O(1) amortized вместо O(N). Для 100 систем проверка конфликтов графа ускорена с ~247500 операций (линейный поиск по ~50 successors) до ~4950 hash-lookup. Ускорение ~50× на `compile()`.
+| Проблема | Текущий результат | Цель |
+|---|---|---|
+| Межсистемный параллелизм (12 систем) | 3.30x speedup | 7x–9x speedup |
+| CPU-bound 2 системы (изол. архетипы) | 1.13x speedup | 1.8x–2.0x speedup |
+| `insert component` | 72 ns/op | 45–55 ns/op |
+| `spawn_bundle loop` | 105 ns/op | уже OK, цель — batch |
+| `compile()` при N=50 | 110 800 ns | < 30 000 ns |
 
-**Проблема:**  
-[`scheduler/src/lib.rs:739-741`](../crates/apex-scheduler/src/lib.rs:739) — метод `has_edge_between()` выполняет линейный
-проход по всем successors: `self.dependency_graph.successors(from).any(|succ| succ == to)`.
-Вызывается O(N²) раз в [`add_new_nodes_and_edges()`](../crates/apex-scheduler/src/lib.rs:748)
-при каждой компиляции графа.
+### Принципы изменений
 
-**Решение:**  
-Добавить `FxHashSet<(NodeIndex, NodeIndex)>` (множество рёбер) в структуру Scheduler.
-Проверять наличие ребра через `self.edge_set.contains(&(from, to))` — O(1) amortized.
-Обновлять `edge_set` при каждом добавлении ребра.
+- **API stability first.** Фазы 1–2 не меняют публичный API.
+- **Измеряемый прогресс.** Каждая задача сопровождается конкретным бенчмарком.
+- **Атомарность.** Каждый пункт — отдельный PR/commit с тестами.
 
-**Конкретные изменения:**
+---
 
-1. В структуру [`Scheduler`](../crates/apex-scheduler/src/lib.rs:282-329) добавить поле:
+## 2. Фаза 1 — Быстрые победы
+
+> Срок: 1–2 недели. Сложность: низкая. Никаких изменений публичного API.
+
+---
+
+### 1.1. Линейный поиск в `write_into_batch` → позиционный индекс
+
+**Файл:** `crates/apex-core/src/world.rs`  
+**Функция:** макрос `impl_bundle!`, метод `write_into_batch`  
+**Выигрыш:** 15–25% ускорение batch-спавна при 3+ компонентах
+
+**Проблема:**
+
 ```rust
-edge_set: FxHashSet<(petgraph::graph::NodeIndex, petgraph::graph::NodeIndex)>,
+// Текущий код — линейный поиск O(K) на каждый компонент каждой entity:
+if let Some(&(_cid, col_idx)) = col_indices.iter().find(|&&(id, _)| id == cid)
 ```
 
-2. Инициализировать в [`Scheduler::new()`](../crates/apex-scheduler/src/lib.rs:332).
+При `spawn_many(10_000, |i| (A, B, C, D))` это 10 000 × 4 = 40 000 вызовов `find()`, каждый сканирует до 4 элементов.
 
-3. Переписать [`has_edge_between()`](../crates/apex-scheduler/src/lib.rs:739):
+**Решение:** Вычислить `col_idx` один раз в `spawn_many_inner` и передать напрямую как позиционный массив.
+
+**Изменение в `world.rs`:**
+
 ```rust
-fn has_edge_between(&self, from: Index, to: Index) -> bool {
-    self.edge_set.contains(&(from, to))
+// Заменить структуру col_indices:
+// Было:
+let col_indices: Vec<(ComponentId, usize)> = ids.iter()
+    .filter_map(|&id| {
+        self.archetypes[arch_idx].column_index(id).map(|col_idx| (id, col_idx))
+    })
+    .collect();
+
+// Стало — храним только col_idx в порядке компонентов бандла:
+let col_indices: SmallVec<[usize; 8]> = ids.iter()
+    .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
+    .collect();
+```
+
+**Изменение в макросе `impl_bundle!`:**
+
+```rust
+// Было в write_into_batch:
+fn write_into_batch(self, world, archetype_id, row, tick, col_indices: &[(ComponentId, usize)]) {
+    let ($($T,)+) = self;
+    $(
+        if let Some(cid) = world.registry.get_id::<$T>() {
+            if let Some(&(_cid, col_idx)) = col_indices.iter().find(|&&(id, _)| id == cid) {
+                // ...
+            }
+        }
+    )+
+}
+
+// Стало — enumerate + позиционный доступ:
+fn write_into_batch(self, world, archetype_id, row, tick, col_indices: &[usize]) {
+    let ($($T,)+) = self;
+    let mut i = 0;
+    $(
+        {
+            let col_idx = col_indices[i];
+            i += 1;
+            unsafe {
+                let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
+                if col.item_size > 0 {
+                    if col.len >= col.capacity { col.grow(); }
+                    std::ptr::copy_nonoverlapping(
+                        &$T as *const $T as *const u8,
+                        col.get_ptr(row),
+                        col.item_size,
+                    );
+                }
+                col.change_ticks.push(tick);
+                col.len += 1;
+            }
+            std::mem::forget($T);
+        }
+    )+
 }
 ```
 
-4. При каждом `self.dependency_graph.add_edge(...)` добавлять в `edge_set`.
-
-5. При инвалидации плана ([`invalidate_plan()`](../crates/apex-scheduler/src/lib.rs:563)) очищать `edge_set`.
-
-**Тесты:** Существующие тесты планировщика (24 теста в конце файла) должны покрыть.
-Добавить тест на корректность `has_edge_between` после серии add_edge/add_dependency.
-
-**Ожидаемый эффект:** Ускорение `compile()` с O(N²) до O(N²) с константой ~100× меньше
-(линейный поиск → HashMap lookup). Для 100 систем: ~4950 проверок, каждая с линейным
-поиском по ~50 successors в среднем → ~247500 операций → ~4950 операций.
+**Тест:** `cargo bench --bench benchmark simple_insert` — ожидаемое улучшение для `spawn_many`.
 
 ---
 
-### 1.2 Добавление `Column::reserve(n)` и оптимизация `spawn_many_inner` `[x]`
+### 1.2. SmallVec ключ для `archetype_index` — устранение Vec-аллокаций
 
-**Результат:** Добавлен `Column::reserve(additional)`, вызываемый в `spawn_many_inner()` перед массовым spawn. Устраняет множественные realloc-ы (до log₂(N) на колонку) — теперь один alloc + copy до целевой capacity. Ускорение batch spawn ~2-5× для 10000 entity.
+**Файл:** `crates/apex-core/src/world.rs`  
+**Структура:** `World.archetype_index`  
+**Выигрыш:** 5–15% ускорение всех операций с архетипами (insert, remove, spawn_bundle)
 
-**Проблема:**  
-[`Column::grow()`](../crates/apex-core/src/archetype.rs:155) только удваивает capacity (64→128→256→...).
-В [`spawn_many_inner()`](../crates/apex-core/src/world.rs:357-399) вызов `grow()` в цикле
-(строка 376) приводит к многократным realloc+copy (до log₂(count) раз на колонку).
+**Проблема:**
 
-**Решение:**  
-Добавить [`Column::reserve(n)`](../crates/apex-core/src/archetype.rs:155-174) — метод,
-который увеличивает capacity сразу до `target_cap` (или ближайшей степени двойки ≥ target_cap)
-одним alloc + copy.
-
-**Конкретные изменения:**
-
-1. В [`Column`](../crates/apex-core/src/archetype.rs:22-32) добавить:
 ```rust
-pub(crate) fn reserve(&mut self, additional: usize) {
-    let needed = self.len + additional;
-    if needed <= self.capacity { return; }
-    // Вычисляем новую capacity как степень двойки >= needed
-    let new_cap = if needed < 64 { 64 } else { needed.next_power_of_two() };
-    // ... аналогично grow() но с new_cap вместо self.capacity * 2
-}
+pub(crate) archetype_index: FxHashMap<Vec<ComponentId>, ArchetypeId>,
 ```
 
-2. В [`spawn_many_inner()`](../crates/apex-core/src/world.rs:357) заменить:
+При каждом `get_or_create_archetype(&components)`:
+- `find_or_create_archetype_with` вызывает `get_or_create_archetype`
+- Внутри `self.archetype_index.get(components)` — `components` уже `&[ComponentId]`
+- Но ключ `Vec<ComponentId>` требует сравнения через `PartialEq` с внутренним Vec
+
+**Решение:** Создать newtype-обёртку, реализующую `Hash` и `Eq` через содержимое среза без аллокации:
+
+```rust
+// Добавить в world.rs:
+
+/// Ключ для archetype_index — хэшируется без аллокации.
+/// Внутри хранит компоненты inline до 12 штук.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ArchetypeKey(SmallVec<[ComponentId; 12]>);
+
+impl From<&[ComponentId]> for ArchetypeKey {
+    fn from(ids: &[ComponentId]) -> Self {
+        Self(ids.iter().copied().collect())
+    }
+}
+
+// Обновить поле:
+pub(crate) archetype_index: FxHashMap<ArchetypeKey, ArchetypeId>,
+
+// Обновить все обращения (3 места):
+self.archetype_index.get(&ArchetypeKey::from(components))
+self.archetype_index.insert(ArchetypeKey::from(components), id)
+```
+
+**Дополнительно:** В `get_or_create_archetype` убрать `.to_vec()`:
+
 ```rust
 // Было:
-for col in &mut self.archetypes[arch_idx].columns {
-    while col.capacity < target_cap { col.grow(); }
-}
+self.archetype_index.insert(components.to_vec(), id);
+
 // Стало:
-for col in &mut self.archetypes[arch_idx].columns {
-    col.reserve(target_cap);
-}
+self.archetype_index.insert(ArchetypeKey::from(components), id);
 ```
 
-3. В макросе [`impl_bundle!`](../crates/apex-core/src/world.rs:1081-1163) в `write_into_batch`
-заменить вызов `if col.len >= col.capacity { col.grow(); }` на `col.grow()` если capacity < row+1,
-либо тоже использовать reserve.
-
-**Тесты:**  
-- unit тест на Column::reserve — проверить что после reserve(n) capacity ≥ n и данные целы.
-- spawn_many с 1000 entity — проверить что все созданы корректно.
-- Существующие тесты spawn_bundle / spawn_many должны проходить.
-
-**Ожидаемый эффект:** Ускорение spawn_many для 10000 entity с 3+ realloc'ов на колонку
-до 1 realloc'а. Ускорение ~2-5× на batch spawn.
+**Тест:** Профилировать `insert component` бенчмарк — должно сократиться количество аллокаций.
 
 ---
 
-### 1.3 Оптимизация `CachedQuery` — кеширование `ids` `[x]`
+### 1.3. Однопроходный `move_entity` — убрать двойной цикл
 
-**Результат:** В структуру `CachedQuery` добавлено поле `ids: Vec<ComponentId>`, кэширующее разрешение типов → ComponentId. Устраняет повторные `fill_ids()` + аллокацию Vec при каждом `for_each`/`par_for_each`. Экономия ~20-40ns на каждый query вызов. Для 1000 entity/кадр — ~40 мкс экономии.
+**Файл:** `crates/apex-core/src/world.rs`  
+**Функция:** `World::move_entity`  
+**Выигрыш:** 10–20% ускорение `insert`/`remove`/`add_relation`
 
-**Проблема:**  
-[`CachedQuery::new()`](../crates/apex-core/src/world.rs:914) и все методы итерации
-([`for_each`](../crates/apex-core/src/world.rs:934), [`for_each_component`](../crates/apex-core/src/world.rs:951),
-[`par_for_each`](../crates/apex-core/src/world.rs:1008)) каждый раз выделяют `Vec`
-и вызывают `Q::fill_ids()` — аллокация + поиск ComponentId в реестре.
-Для частых запросов (каждый кадр) это избыточно.
+**Проблема:** Три прохода по колонкам:
+1. Вычисление `is_common[]`
+2. Копирование данных в целевой архетип
+3. `swap_remove` из исходного архетипа
 
-**Решение:**  
-Кешировать `Vec<ComponentId>` в структуре `CachedQuery` вместе с `arch_indices`.
-
-**Конкретные изменения:**
-
-1. В [`CachedQuery`](../crates/apex-core/src/world.rs:906-911) добавить поле:
 ```rust
-ids: Vec<ComponentId>,
+// Текущий код упрощённо:
+let mut is_common = vec![false; from_len];
+for i in 0..from_len { is_common[i] = ...; }  // проход 1
+for i in 0..from_len { if is_common[i] { /* copy */ } }  // проход 2
+for col in columns { col.swap_remove... }  // проход 3 через iter_mut
 ```
 
-2. В [`new()`](../crates/apex-core/src/world.rs:914) сохранять `ids`:
+**Решение — объединить все три прохода:**
+
 ```rust
-pub fn new(world: &'w World, last_run: Tick) -> Self {
+pub(crate) fn move_entity(
+    &mut self,
+    entity: Entity,
+    from_location: EntityLocation,
+    to_archetype_id: ArchetypeId,
+) -> u32 {
+    self.query_cache.invalidate();
+
+    let from_idx = from_location.archetype_id.0 as usize;
+    let to_idx   = to_archetype_id.0 as usize;
+    let from_row = from_location.row as usize;
+
+    let to_row = self.archetypes[to_idx].entities.len();
+    self.archetypes[to_idx].entities.push(entity);
+
+    // Единственный проход: для каждой колонки из исходного архетипа
+    // определяем наличие в целевом и сразу копируем или дропаем.
+    let from_len = self.archetypes[from_idx].columns.len();
+
+    for i in 0..from_len {
+        let cid       = self.archetypes[from_idx].columns[i].component_id;
+        let item_size = self.archetypes[from_idx].columns[i].item_size;
+
+        if let Some(to_col_idx) = self.archetypes[to_idx].column_index(cid) {
+            // Компонент присутствует в обоих архетипах — копируем
+            unsafe {
+                if item_size > 0 {
+                    if self.archetypes[to_idx].columns[to_col_idx].len
+                        >= self.archetypes[to_idx].columns[to_col_idx].capacity
+                    {
+                        self.archetypes[to_idx].columns[to_col_idx].grow();
+                    }
+                    let src = self.archetypes[from_idx].columns[i].get_ptr(from_row);
+                    let dst = self.archetypes[to_idx].columns[to_col_idx].get_ptr(to_row);
+                    std::ptr::copy_nonoverlapping(src, dst, item_size);
+                }
+                let tick = self.archetypes[from_idx].columns[i].get_tick(from_row);
+                self.archetypes[to_idx].columns[to_col_idx].change_ticks.push(tick);
+                self.archetypes[to_idx].columns[to_col_idx].len += 1;
+
+                // swap_remove без drop (данные перемещены)
+                self.archetypes[from_idx].columns[i].swap_remove_no_drop(from_row);
+            }
+        } else {
+            // Компонент отсутствует в целевом — дропаем
+            unsafe {
+                self.archetypes[from_idx].columns[i].swap_remove_and_drop(from_row);
+            }
+        }
+    }
+
+    // Исправляем location для вытесненной entity
+    unsafe {
+        let from_last = self.archetypes[from_idx].entities.len() - 1;
+        if from_row != from_last {
+            let displaced = self.archetypes[from_idx].entities[from_last];
+            self.archetypes[from_idx].entities.swap(from_row, from_last);
+            self.archetypes[from_idx].entities.pop();
+            self.entities.set_location(displaced, EntityLocation {
+                archetype_id: from_location.archetype_id,
+                row: from_row as u32,
+            });
+        } else {
+            self.archetypes[from_idx].entities.pop();
+        }
+    }
+
+    // IS_COMMON_BUF больше не нужен — убрать thread_local
+    to_row as u32
+}
+```
+
+**Дополнительно:** Удалить `IS_COMMON_BUF` thread_local и связанный код — он больше не нужен.
+
+**Тест:** `cargo bench structural` — метрика `insert component`.
+
+---
+
+### 1.4. O(N) обнаружение sequential-барьеров в Scheduler
+
+**Файл:** `crates/apex-scheduler/src/lib.rs`  
+**Функция:** `Scheduler::add_new_nodes_and_edges`  
+**Выигрыш:** compile() при 50 системах: 110 800 ns → < 30 000 ns
+
+**Проблема:** При добавлении sequential системы код делает O(N) проходов по всем системам для расстановки барьеров, а внутри каждого — `has_path()` (BFS). Итого O(N²·V) в худшем случае.
+
+```rust
+// Текущий код — для каждой новой системы:
+for &idx in &systems_to_process {
+    if !system.kind.is_parallel() {
+        for j in 0..n {   // O(N)
+            if self.systems[j].kind.is_parallel() {
+                // has_path() — O(V+E) BFS
+            }
+        }
+    }
+}
+```
+
+**Решение:** Разделить системы на два списка и добавлять барьеры точечно:
+
+```rust
+// Добавить в структуру Scheduler:
+seq_system_indices: Vec<usize>,   // индексы sequential систем в self.systems
+par_system_indices: Vec<usize>,   // индексы parallel систем
+
+// В add_new_nodes_and_edges — вместо двойного цикла:
+
+// При добавлении новой sequential системы:
+// Добавить рёбра: каждый par ПЕРЕД seq → par→seq
+// Добавить рёбра: каждый par ПОСЛЕ seq → seq→par
+// Это O(P) вместо O(N) где P = число par-систем
+
+fn add_sequential_barriers_for(&mut self, seq_idx: usize) {
+    let seq_id   = self.systems[seq_idx].id;
+    let seq_node = self.graph_nodes[&seq_id];
+
+    for &par_idx in &self.par_system_indices {
+        let par_id   = self.systems[par_idx].id;
+        let par_node = self.graph_nodes[&par_id];
+
+        if par_idx < seq_idx {
+            // par → seq
+            if !self.has_edge_between(par_node, seq_node)
+               && !self.dependency_graph.has_path(seq_node, par_node)
+            {
+                self.add_barrier_edge(par_node, seq_node, par_id, seq_id);
+            }
+        } else {
+            // seq → par
+            if !self.has_edge_between(seq_node, par_node)
+               && !self.dependency_graph.has_path(par_node, seq_node)
+            {
+                self.add_barrier_edge(seq_node, par_node, seq_id, par_id);
+            }
+        }
+    }
+}
+```
+
+**Тест:** `cargo bench compile_overhead` — секция "Фиксированный N" при N=50.
+
+---
+
+### 1.5. Кеш EventRegistry — убрать `downcast_ref` из горячего пути
+
+**Файл:** `crates/apex-core/src/events.rs`  
+**Структура:** `EventRegistry`  
+**Выигрыш:** ~30% ускорение `send_event` / `events::<T>()` в горячем пути
+
+**Проблема:**
+
+```rust
+pub fn get<T>(&self) -> &TrackedEventQueue<T> {
+    self.queues.get(&TypeId::of::<T>())
+        .and_then(|b| b.as_any().downcast_ref::<TrackedEventQueue<T>>())  // vtable call
+        .unwrap()
+}
+```
+
+**Решение:** Добавить параллельную карту с raw-указателями без виртуального вызова:
+
+```rust
+pub struct EventRegistry {
+    queues:    FxHashMap<TypeId, Box<dyn AnyEventQueue>>,
+    // Дополнительная карта для O(1) typed access без downcast:
+    raw_ptrs:  FxHashMap<TypeId, *mut u8>,
+}
+
+impl EventRegistry {
+    pub fn register<T: Send + Sync + 'static>(&mut self) {
+        let entry = self.queues.entry(TypeId::of::<T>()).or_insert_with(|| {
+            Box::new(TrackedEventQueue::<T>::new())
+        });
+        // Сохраняем raw ptr для быстрого доступа
+        let raw_ptr = entry.as_ptr_mut();
+        self.raw_ptrs.insert(TypeId::of::<T>(), raw_ptr);
+    }
+
+    /// Zero-cost typed access — никакого downcast.
+    #[inline]
+    pub fn get_typed_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut TrackedEventQueue<T>> {
+        self.raw_ptrs.get(&TypeId::of::<T>())
+            .map(|&ptr| ptr as *mut TrackedEventQueue<T>)
+    }
+
+    #[inline]
+    pub fn get<T: Send + Sync + 'static>(&self) -> &TrackedEventQueue<T> {
+        // SAFETY: ptr валиден пока Box жив (жив пока EventRegistry жив)
+        unsafe {
+            &*self.get_typed_ptr::<T>()
+                .expect("Event not registered")
+        }
+    }
+}
+```
+
+**Тест:** `cargo bench events` — метрика `send + iter_current`.
+
+---
+
+## 3. Фаза 2 — Структурные оптимизации ядра
+
+> Срок: 2–4 недели. Сложность: средняя. Изменения внутренней архитектуры, API совместим.
+
+---
+
+### 2.1. ArchetypeMask в Query matching — O(1) фильтрация архетипов
+
+**Файлы:** `crates/apex-core/src/access.rs`, `crates/apex-core/src/query.rs`, `crates/apex-core/src/world.rs`  
+**Выигрыш:** При большом мире (500+ архетипов) — 40–60% ускорение `Query::new` и `CachedQuery`
+
+**Контекст:** `ArchetypeMask` (128 байт, до 1024 архетипов) уже реализован в `access.rs`. `AccessDescriptor` имеет поле `archetype_mask`. Но `Query::new` делает линейный обход ВСЕХ архетипов:
+
+```rust
+// Текущий код в query.rs:
+world.archetypes
+    .iter()
+    .enumerate()
+    .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+    .map(|(arch_idx, arch)| { ... })
+    .collect()
+```
+
+**Шаг 1:** Добавить в `World` индекс компонент → архетипы (аналог `id_index` для relations):
+
+```rust
+// В world.rs — уже есть IdIndex для relations, сделать аналогичный для компонентов:
+pub(crate) component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>,
+
+// Заполнять в get_or_create_archetype:
+for &cid in &arch.component_ids {
+    self.component_arch_index
+        .entry(cid)
+        .or_default()
+        .push(id);
+}
+```
+
+**Шаг 2:** В `Query::new` использовать пересечение списков, а не обход всех архетипов:
+
+```rust
+pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
     let mut ids = Vec::with_capacity(Q::component_count());
     Q::fill_ids(world, &mut ids);
-    // ...
-    Self { world, arch_indices, ids, last_run, _phantom: std::marker::PhantomData }
-}
-```
 
-3. В методах `for_each`, `for_each_component`, `par_for_each`, `par_for_each_component`
-убрать повторные `fill_ids()` и использовать `self.ids`.
-
-**Тесты:**  
-Существующие тесты query/cached_query (через [`World`](../crates/apex-core/src/world.rs:617-625)).
-Добавить тест на CachedQuery — проверить что после изменения компонентов query возвращает
-корректные данные (кеш инвалидируется при изменении archetypes).
-
-**Ожидаемый эффект:** Ускорение ~20-40ns на каждый query for_each (убираем аллокацию Vec
-+ fill_ids). Для систем с 1000 entity/кадр: ~40 мкс экономии.
-
----
-
-### 1.4 Исправление `Tick::is_newer_than` — защита от переполнения `[x]`
-
-**Результат:** `Tick::is_newer_than()` изменён с прямого `self.0 > last_run.0` на `self.0.wrapping_sub(last_run.0) as i32 > 0`. Корректная работа change detection при переполнении u32 (после ~1190 часов при 60fps или ~50 дней при 1000 tick/сек). Предотвращает баг со «сломанным» change detection.
-
-**Проблема:**  
-[`Tick::is_newer_than()`](../crates/apex-core/src/component.rs:14) использует `self.0 > last_run.0`.
-После ~4 миллиардов тиков (wrapping u32) сравнение сломается: tick=1 будет считаться
-"новее" чем last_run=4_000_000_000.
-
-**Решение:**  
-Использовать wrapping_sub со знаком как в Bevy:
-```rust
-pub fn is_newer_than(&self, last_run: Tick) -> bool {
-    self.0.wrapping_sub(last_run.0) as i32 > 0
-}
-```
-
-**Конкретные изменения:**
-
-1. [`component.rs:14`](../crates/apex-core/src/component.rs:14):
-```rust
-pub fn is_newer_than(&self, last_run: Tick) -> bool {
-    self.0.wrapping_sub(last_run.0) as i32 > 0
-}
-```
-
-2. Аналогично проверить все места где сравниваются Tick'и:
-   - [`Changed<T>::fetch_item`](../crates/apex-core/src/query.rs:199-206)
-   - [`Column::get_tick`](../crates/apex-core/src/archetype.rs:178) — только чтение, ок
-   - Поискать `Tick::ZERO`, `change_ticks` во всём коде
-
-**Тесты:**  
-Добавить unit тест для Tick:
-```rust
-#[test]
-fn tick_wrapping_comparison() {
-    let a = Tick(u32::MAX - 5);
-    let b = Tick(3);  // после wrapping: 0,1,2,3
-    assert!(b.is_newer_than(a));  // 3 новее чем MAX-5
-    assert!(!a.is_newer_than(b));
-}
-```
-
-**Ожидаемый эффект:** Предотвращение бага с change detection после ~50 часов работы
-при 60 FPS (4e9 / (60*3600) ≈ 18500 часов, но для серверов с 1000 tick/сек — ~50 дней).
-
----
-
-### 1.5 Исправление `par_for_each` — `Tick::ZERO` → `self.last_run` `[x]`
-
-**Результат:** В `par_for_each()` и `par_for_each_component()` добавлено копирование `self.last_run` в локальную переменную перед замыканием Rayon. Change detection теперь работает и в параллельных запросах — `Changed<T>` корректно фильтрует entity при параллельной итерации.
-
-**Проблема:**  
-[`Query::par_for_each()`](../crates/apex-core/src/query.rs:408-440) использует
-`Tick::ZERO` вместо `self.last_run` (строка 426 в вызове fetch_state).
-То же в [`par_for_each_component()`](../crates/apex-core/src/query.rs:366-396) (строка 382).
-Change detection не работает в параллельных запросах.
-
-**Причина:** `par_for_each` берёт `&self` (shared ref), а `self.last_run` — поле `Query`.
-В замыкании для rayon нужно скопировать `last_run` заранее.
-
-**Решение:**
-
-```rust
-pub fn par_for_each<F>(&self, f: F)
-where
-    Q: Send,
-    F: Fn(Entity, Q::Item<'_>) + Send + Sync,
-{
-    let last_run = self.last_run;  // <-- копируем ДО замыкания
-    // ...
-    let state = unsafe { Q::fetch_state(arch, &ids, last_run) };  // <-- используем
-}
-```
-
-**Конкретные изменения:**
-
-1. [`query.rs:419`](../crates/apex-core/src/query.rs:419) — `par_for_each`:
-   - Перед `compute_par_chunks` скопировать `self.last_run` в локальную переменную
-   - В замыкании `.par_iter().for_each(...)` использовать эту переменную вместо `Tick::ZERO`
-
-2. [`query.rs:377`](../crates/apex-core/src/query.rs:377) — `par_for_each_component`:
-   - Аналогичное изменение
-
-**Тесты:**  
-- Добавить тест на `Changed<T>` в параллельном запросе:
-  1. Создать 10 entity с компонентом Position
-  2. Изменить 5 из них
-  3. Выполнить `query_changed::<Changed<Position>>().par_for_each(...)`
-  4. Проверить что итерация видит только 5 изменённых
-
-**Ожидаемый эффект:** Исправление бага — change detection теперь работает и в параллельных
-запросах. Для систем, полагающихся на `Changed<T>` в `par_for_each`, критично.
-
----
-
-### 1.6 Расширение `ComponentMask` до 256-bit `[x]`
-
-**Результат:** `ComponentMask` расширен с `{ lo: u64, hi: u64 }` (128 бит) до `[u64; 4]` (256 бит). Поддержка до 256 компонентов (было 128) для конфликт-детекции в шедулере. Необходимо при активном использовании relations. Минимальный overhead — 4 регистра вместо 2, без влияния на производительность.
-
-**Проблема:**
-[`ComponentMask`](../crates/apex-core/src/access.rs:11-14) сейчас `{ lo: u64, hi: u64 }` — поддерживает
-максимум 128 различных компонентов. При активном использовании relations (каждый relation вид
-занимает слот в маске) лимит может быть быстро достигнут.
-
-**Решение:**
-Заменить на `pub struct ComponentMask(pub [u64; 4])` — 256 бит.
-
-**Конкретные изменения:**
-
-1. [`access.rs:11-14`](../crates/apex-core/src/access.rs:11):
-```rust
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ComponentMask(pub [u64; 4]);
-```
-
-2. Метод [`set(&mut self, idx: u8)`](../crates/apex-core/src/access.rs:20-26):
-```rust
-pub fn set(&mut self, idx: u8) {
-    if (idx as usize) < 256 {
-        self.0[(idx / 64) as usize] |= 1u64 << (idx % 64);
-    }
-}
-```
-
-3. Метод [`get(&self, idx: u8) -> bool`](../crates/apex-core/src/access.rs:29-35):
-```rust
-pub fn get(&self, idx: u8) -> bool {
-    if (idx as usize) < 256 {
-        (self.0[(idx / 64) as usize] & (1u64 << (idx % 64))) != 0
+    // Находим архетипы для НАИМЕНЕЕ РАСПРОСТРАНЁННОГО компонента (smallest set)
+    // и затем фильтруем по остальным компонентам:
+    let candidate_archetypes = if ids.is_empty() {
+        // Запрос без компонентов — все архетипы
+        (0..world.archetypes.len()).collect::<Vec<_>>()
     } else {
-        false
-    }
-}
-```
-
-4. Метод [`overlaps`](../crates/apex-core/src/access.rs:38-44):
-```rust
-pub fn overlaps(&self, other: &Self) -> bool {
-    (self.0[0] & other.0[0]) != 0
-        || (self.0[1] & other.0[1]) != 0
-        || (self.0[2] & other.0[2]) != 0
-        || (self.0[3] & other.0[3]) != 0
-}
-```
-
-5. Метод [`is_subset_of`](../crates/apex-core/src/access.rs:47-55):
-```rust
-pub fn is_subset_of(&self, other: &Self) -> bool {
-    (self.0[0] & !other.0[0]) == 0
-        && (self.0[1] & !other.0[1]) == 0
-        && (self.0[2] & !other.0[2]) == 0
-        && (self.0[3] & !other.0[3]) == 0
-}
-```
-
-6. [`assign_masks`](../crates/apex-core/src/access.rs:218-227) — параметр `type_to_idx: &HashMap<TypeId, u8>`:
-убедиться что маппинг поддерживает до 256 значений. Параметр уже `u8`, что даёт 0..255 — достаточно.
-
-7. Все места где используется `mask.lo` / `mask.hi`:
-```rust
-// Было:
-if mask.lo & other.lo != 0 || mask.hi & other.hi != 0 { ... }
-// Стало:
-for i in 0..4 {
-    if (mask.0[i] & other.0[i]) != 0 { ... }
-}
-```
-
-**Тесты:**
-- unit тест ComponentMask: set/get для граничных значений (0, 127, 128, 255)
-- test overlaps с разными комбинациями битов
-- test is_subset_of
-- Интеграционный: создать 200+ различных компонентов и проверить что маска работает
-
-**Ожидаемый эффект:** Увеличение максимального числа компонентов со 128 до 256.
-Небольшой overhead на регистры (4 u64 вместо 2), но практически без влияния на производительность.
-
----
-
-### 1.7 Оптимизация `EventCursor` — FreeList для reader_id `[x]`
-
-**Результат:** В `TrackedEventQueue` добавлен `free_list: Vec<EventCursor>`. При `remove_reader()` ID курсора возвращается в FreeList, при `add_reader()` — переиспользуется из FreeList. Устраняет рост ID курсоров при частом create/remove reader. `add_reader()` ускорен с O(R) до O(1) amortized.
-
-**Проблема:**
-[`TrackedEventQueue::add_reader()`](../crates/apex-core/src/events.rs:69-82) делает O(R) линейный
-поиск `None` слотов в `cursors: Vec<Option<u32>>`.
-[`all_readers_caught_up()`](../crates/apex-core/src/events.rs:234-240) тоже O(R) — итерирует все
-слоты включая удалённые.
-
-**Решение:**
-Добавить FreeList (список свободных индексов) для переиспользования reader_id.
-
-**Конкретные изменения:**
-
-1. В [`TrackedEventQueue<T>`](../crates/apex-core/src/events.rs:33-42) добавить:
-```rust
-pub struct TrackedEventQueue<T> {
-    events:    Vec<T>,
-    cursors:   Vec<Option<u32>>,
-    free_list: Vec<EventCursor>,  // <-- новый
-}
-```
-
-2. [`add_reader()`](../crates/apex-core/src/events.rs:69):
-```rust
-pub fn add_reader(&mut self) -> EventCursor {
-    if let Some(free) = self.free_list.pop() {
-        let idx = free.0 as usize;
-        self.cursors[idx] = Some(self.events.len() as u32);
-        return free;
-    }
-    let id = EventCursor(self.cursors.len() as u32);
-    self.cursors.push(Some(self.events.len() as u32));
-    id
-}
-```
-
-3. [`remove_reader()`](../crates/apex-core/src/events.rs:88-97):
-```rust
-pub fn remove_reader(&mut self, reader_id: EventCursor) {
-    let idx = reader_id.0 as usize;
-    if idx < self.cursors.len() {
-        self.cursors[idx] = None;
-        self.free_list.push(reader_id);  // <-- возвращаем в FreeList
-    }
-}
-```
-
-4. [`all_readers_caught_up()`](../crates/apex-core/src/events.rs:234):
-   - Итерировать только `Some` слоты, либо хранить счётчик `active_readers`.
-
-**Тесты:**
-- Существующие тесты send_and_read, two_readers_independent, reader_removed_still_works
-- Добавить тест: создать 1000 readers, удалить 500, создать ещё 500 — проверить что
-  add_reader O(1) и free_list переиспользуется
-
-**Ожидаемый эффект:** `add_reader()` — с O(R) до O(1) amortized.
-
----
-
-### 1.8 Оптимизация поиска Archetype — избежать аллокации `Vec<ComponentId>` при lookup `[x]`
-
-**Результат:** Сигнатуры `find_or_create_archetype_with/without` изменены на приём `&[ComponentId]` вместо `Vec<ComponentId>`. Устранены 2-3 лишние heap-аллокации на каждый structural change (insert/remove компонента). Ускорение insert компонента на ~15-25ns. Использование `SmallVec<[ComponentId; 8]>` минимизирует аллокации для типичных случаев.
-
-**Проблема:**
-[`get_or_create_archetype(components: Vec<ComponentId>)`](../crates/apex-core/src/world.rs:665-680)
-принимает `Vec<ComponentId>` как ключ, каждый раз аллоцируя новую `Vec` при вызове.
-Кроме того, [`find_or_create_archetype_with()`](../crates/apex-core/src/world.rs:629-645)
-собирает `Vec` через clone + push + sort — 3 аллокации на один insert компонента.
-
-**Решение:**
-Использовать interned (кэшированные) ID для наборов компонентов, чтобы lookup
-работал через `u64` или `&[ComponentId]` без аллокаций.
-
-**Вариант A (лёгкий):** Изменить сигнатуру `get_or_create_archetype` на
-`get_or_create_archetype(&mut self, components: &[ComponentId])` — принимает слайс,
-внутри клонирует только при создании нового archetype (редкий случай).
-
-**Вариант B (средний):** Добавить `ArchetypeKey` — хэш от набора ComponentId,
-вычисляемый без аллокации:
-```rust
-fn archetype_key(components: &[ComponentId]) -> u64 {
-    let mut state = FxHasher::default();
-    for &id in components { id.hash(&mut state); }
-    state.finish()
-}
-```
-
-**Вариант C (продвинутый):** ArchetypeId interner — хранить `Vec<Vec<ComponentId>>`
-и искать по хэшу + сравнению слайсов.
-
-**Конкретные изменения (Вариант A — рекомендуется):**
-
-1. [`world.rs:665-680`](../crates/apex-core/src/world.rs:665):
-```rust
-pub(crate) fn get_or_create_archetype(
-    &mut self,
-    components: &[ComponentId],
-) -> ArchetypeId {
-    // Используем &[ComponentId] для lookup
-    if let Some(&id) = self.archetype_index.get(components) { return id; }
-    let id = ArchetypeId(self.archetypes.len() as u32);
-    let owned: Vec<ComponentId> = components.to_vec();
-    let infos: Vec<&ComponentInfo> = components.iter()
-        .filter_map(|&cid| self.registry.get_info(cid))
-        .collect();
-    let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
-    for &cid in &arch.component_ids { self.id_index.register_archetype(cid, id); }
-    self.archetypes.push(arch);
-    self.archetype_index.insert(owned, id);
-    self.query_cache.invalidate();
-    id
-}
-```
-
-2. [`world.rs:629-645`](../crates/apex-core/src/world.rs:629):
-```rust
-pub(crate) fn find_or_create_archetype_with(
-    &mut self,
-    current: ArchetypeId,
-    add: ComponentId,
-) -> ArchetypeId {
-    if let Some(&id) = self.archetypes[current.0 as usize].add_edges.get(&add) {
-        return id;
-    }
-    // Используем SmallVec для избежания heap-аллокации для малых наборов
-    let current_ids = &self.archetypes[current.0 as usize].component_ids;
-    let mut new_components: SmallVec<[ComponentId; 8]> = current_ids.iter().copied().collect();
-    new_components.push(add);
-    new_components.sort_unstable();
-    let new_id = self.get_or_create_archetype(&new_components);
-    self.archetypes[current.0 as usize].add_edges.insert(add, new_id);
-    self.archetypes[new_id.0 as usize].remove_edges.insert(add, current);
-    new_id
-}
-```
-
-3. [`world.rs:647-663`](../crates/apex-core/src/world.rs:647):
-```rust
-pub(crate) fn find_or_create_archetype_without(
-    &mut self,
-    current: ArchetypeId,
-    remove: ComponentId,
-) -> ArchetypeId {
-    if let Some(&id) = self.archetypes[current.0 as usize].remove_edges.get(&remove) {
-        return id;
-    }
-    let current_ids = &self.archetypes[current.0 as usize].component_ids;
-    let new_components: SmallVec<[ComponentId; 8]> = current_ids.iter()
-        .copied().filter(|&id| id != remove).collect();
-    let new_id = self.get_or_create_archetype(&new_components);
-    // ... остальное без изменений
-}
-```
-
-4. Тип `archetype_index`: `FxHashMap<Vec<ComponentId>, ArchetypeId>` → `FxHashMap<SmallVec<[ComponentId; 8]>, ArchetypeId>`
-   или лучше оставить `Vec<ComponentId>` для ключа, но изменить метод поиска.
-
-**Тесты:**
-- Существующие тесты spawn_bundle, insert, remove — должны проходить
-- Добавить микро-тест на скорость: 10000 insert'ов компонентов, замерить
-  количество аллокаций (через `#[cfg(debug_assertions)]` счётчик)
-
-**Ожидаемый эффект:** Ускорение insert компонента на ~15-25ns за счёт
-устранения 2-3 лишних heap-аллокаций на каждый structural change.
-
----
-
-## Фаза 2: Средне-приоритетные оптимизации (Priority: Medium) `[x]`
-
-### 2.1 Оптимизация `EntityLocation` — компактное представление `[x]`
-
-**Результат:** `EntityLocation.row` изменён с `usize` (8 байт на x64) на `u32` (4 байта). Экономия 4 байта на каждый EntityLocation. При максимальных 4M entity — ~16 MB экономии RAM в EntityAllocator. Дополнительное ускорение cache locality при batch-операциях.
-
-**Проблема:**  
-[`EntityLocation`](../crates/apex-core/src/entity.rs:20-23) занимает 16 байт
-(`archetype_id: ArchetypeId(u32)` = 4б + выравнивание 4б + `row: usize` = 8б).
-
-**Решение:**  
-Использовать `archetype_id.0: u16` (максимум 65536 archetypes — более чем достаточно)
-и `row: u32` (максимум 4 млрд entity в одном archetype). Итого 8 байт вместо 16.
-
-**Конкретные изменения:**
-
-1. [`entity.rs:20-23`](../crates/apex-core/src/entity.rs:20):
-```rust
-pub struct EntityLocation {
-    pub archetype_id: ArchetypeId,  // ArchetypeId уже u32, ничего не меняем
-    pub row: u32,                   // было: usize
-}
-```
-
-2. [`EntityRecord`](../crates/apex-core/src/entity.rs:25-28):
-```rust
-struct EntityRecord {
-    generation: u32,
-    location: Option<EntityLocation>,  // EntityLocation теперь компактнее
-}
-```
-
-3. Все места, где `location.row` используется как индекс массива (нужен каст `as usize`):
-   - [`archetype.rs:262-266`](../crates/apex-core/src/archetype.rs:262) — `allocate_row`
-   - [`archetype.rs:279-292`](../crates/apex-core/src/archetype.rs:279) — `remove_row`
-   - [`world.rs:419-451`](../crates/apex-core/src/world.rs:419) — `insert`
-   - [`world.rs:682-747`](../crates/apex-core/src/world.rs:682) — `move_entity`
-   - и все остальные места использования `location.row`
-
-   Везде добавить ` as usize` при обращении к массиву:
-   ```rust
-   self.archetypes[current_idx].columns[col_idx].write_at(location.row as usize, ...)
-   ```
-
-4. [`EntityAllocator::set_locations_batch`](../crates/apex-core/src/entity.rs:94-109) —
-   параметр `start_row: usize` → `start_row: u32`.
-
-**Тесты:**  
-- Существующие 4 теста entity (allocate_free_reuse, allocate_batch_basic, allocate_batch_uses_free_list, set_locations_batch)
-- Добавить тест на EntityLocation — проверить что row корректно конвертируется в usize.
-
-**Ожидаемый эффект:** Уменьшение `EntityLocation` с 16 до 8 байт. В `EntityAllocator`
-с 1M entity: экономия ~8 MB RAM. Ускорение за счёт cache locality при копировании
-Location в batch-операциях.
-
----
-
-### 2.2 Расширение `Command` enum — конкретные варианты вместо `Box<dyn FnOnce>` `[x]`
-
-**Результат:** `enum Command` теперь содержит конкретные варианты: `SpawnWithBundle`, `Insert`, `Remove`, `Despawn`, `SpawnFromTemplate`, `SpawnTemplate`, `AddRelation`, `RemoveRelation` — вместо единого `Apply(Box<dyn FnOnce>)`. Устраняет vtable-вызовы и лишние heap-аллокации для ~90% команд. Enum помещается в ~40+ байт вместо ~80+ (Box + vtable). Ускорение insert через Commands с ~75ns до ~20-30ns.
-
-**Проблема:**  
-[`Command` enum](../crates/apex-core/src/commands.rs:13-19) содержит только
-`Despawn(Entity)` и `Apply(Box<dyn FnOnce>)`. Все `spawn_bundle`, `insert`, `remove`
-идут через `Apply(Box::new(...))` — heap аллокация + vtable dispatch.
-
-**Решение:**  
-Добавить конкретные варианты для часто используемых команд.
-
-**Конкретные изменения:**
-
-1. [`commands.rs:13-19`](../crates/apex-core/src/commands.rs:13):
-```rust
-enum Command {
-    Spawn { bundle: BundleBox },
-    Insert { entity: Entity, component: ComponentBox },
-    Remove { entity: Entity, component_id: ComponentId },
-    Despawn(Entity),
-    SpawnFromTemplate { name: String, params: TemplateParams },
-    Apply(Box<dyn FnOnce(&mut World) + Send>),
-}
-```
-
-2. Определить трейты для type-erased bundle и component:
-```rust
-// В commands.rs или bundle.rs
-pub trait ErasedBundle: Send {
-    fn apply(self: Box<Self>, world: &mut World);
-}
-type BundleBox = Box<dyn ErasedBundle>;
-
-pub trait ErasedComponent: Send {
-    fn apply(self: Box<Self>, world: &mut World, entity: Entity);
-}
-type ComponentBox = Box<dyn ErasedComponent>;
-```
-
-3. В [`Commands::spawn_bundle`](../crates/apex-core/src/commands.rs:56-60):
-```rust
-pub fn spawn_bundle<B: Bundle + Send + 'static>(&mut self, bundle: B) {
-    self.queue.push(Command::Spawn {
-        bundle: Box::new(bundle),
-    });
-}
-```
-
-4. В [`Commands::insert`](../crates/apex-core/src/commands.rs:63-67):
-```rust
-pub fn insert<T: Component + Send + 'static>(&mut self, entity: Entity, component: T) {
-    self.queue.push(Command::Insert {
-        entity,
-        component: Box::new(component),
-    });
-}
-```
-
-5. В [`Commands::apply`](../crates/apex-core/src/commands.rs:109-116):
-```rust
-match cmd {
-    Command::Spawn { bundle } => { bundle.apply(world); }
-    Command::Insert { entity, component } => { component.apply(world, entity); }
-    Command::Remove { entity, component_id } => { world.remove_raw(entity, component_id); }
-    Command::Despawn(entity) => { world.despawn(entity); }
-    Command::SpawnFromTemplate { name, params } => { world.spawn_from_template(&name, &params); }
-    Command::Apply(f) => { f(world); }
-}
-```
-
-**Тесты:**  
-- Добавить unit тест на Commands:
-  1. spawn_bundle через Commands → проверить entity создана
-  2. insert через Commands → проверить компонент добавлен
-  3. remove через Commands → проверить компонент удалён
-  4. despawn через Commands → проверить entity удалена
-
-**Ожидаемый эффект:** Ускорение insert через Commands с ~75ns до ~20-30ns
-(убираем динамическую диспетчеризацию для большинства случаев).
-
----
-
-### 2.3 Кеширование `prepare_sub_worlds` между кадрами `[x]`
-
-**Результат:** В `Scheduler` добавлен кэш `(SystemId, storage_idx) → SubWorld` на этапе run. SubWorld создаётся один раз и переиспользуется, пока archetypes не изменились. Экономия O(N_systems × N_archetypes) копирований памяти на каждом кадре. Для 100 систем и 50 archetypes: ~40 KB/кадр.
-
-**Проблема:**  
-[`prepare_sub_worlds()`](../crates/apex-scheduler/src/lib.rs:1167-1185) вызывается каждый
-кадр и клонирует `Vec<usize>` для каждой системы. Если archetypes не менялись,
-это избыточно.
-
-**Решение:**  
-Кешировать `archetype_indices_storage` между вызовами run, инвалидировать только
-при изменении archetypes.
-
-**Конкретные изменения:**
-
-1. В [`Scheduler`](../crates/apex-scheduler/src/lib.rs:282-329) добавить поля:
-```rust
-sub_worlds_ready: bool,
-cached_arch_count_for_sub_worlds: usize,
-```
-
-2. В [`prepare_sub_worlds()`](../crates/apex-scheduler/src/lib.rs:1167):
-```rust
-fn prepare_sub_worlds(&mut self, world: &World) {
-    let arch_count = world.archetypes().len();
-    if self.sub_worlds_ready && arch_count == self.cached_arch_count_for_sub_worlds {
-        return;  // Кеш актуален
-    }
-    // ... существующий код ...
-    self.cached_arch_count_for_sub_worlds = arch_count;
-    self.sub_worlds_ready = true;
-}
-```
-
-3. Инвалидировать в [`add_new_nodes_and_edges()`](../crates/apex-scheduler/src/lib.rs:748)
-и при добавлении/удалении систем.
-
-4. Инвалидировать при изменении archetypes в World (вызывать из планировщика).
-
-**Тесты:**  
-- Тест: создать 2 системы, запустить run 2 раза, проверить что prepare_sub_worlds
-  не пересчитывается на втором вызове (можно через debug_plan или счётчик).
-
-**Ожидаемый эффект:** Экономия O(N_systems * N_archetypes) копирований памяти
-на каждом кадре. Для 100 систем и 50 archetypes: клонирование 5000 usize = ~40 KB/кадр.
-
----
-
-### 2.4 Обновление change ticks при Rhai write-back `[x]`
-
-**Результат:** В `flush_writes()` добавлен вызов `arch.set_change_tick(row, binding.id, world.current_tick())`. При модификации компонентов из Rhai-скриптов теперь корректно обновляются change ticks. `Changed<T>` query видит изменения, сделанные скриптами. Системы с `Changed<T>` корректно реагируют на изменения из Rhai.
-
-**Проблема:**  
-[`apply_deferred_resources_and_events()`](../crates/apex-scripting/src/context.rs:206-247)
-записывает компоненты из скриптов, но не обновляет change ticks (не вызывает
-`world.current_tick`).
-
-**Решение:**  
-При каждой записи компонента через ComponentBinding установить change_tick.
-
-**Конкретные изменения:**
-
-1. В [`context.rs`](../crates/apex-scripting/src/context.rs) — найти место записи компонента
-(скорее всего в [`apply_deferred`](../crates/apex-scripting/src/context.rs:191-200)
-или внутри [`apply_deferred_resources_and_events`](../crates/apex-scripting/src/context.rs:206)):
-
-Добавить:
-```rust
-// При записи компонента:
-let tick = world.current_tick;
-// После записи данных:
-if let Some(col_idx) = arch.column_index(component_id) {
-    arch.columns[col_idx].change_ticks[row] = tick;
-}
-```
-
-**Тесты:**  
-- Создать Rhai скрипт, который изменяет компонент Position
-- После выполнения скрипта проверить что `Changed<Position>` query видит изменения
-- (Тест может быть в apex-scripting крейте или в интеграционном тесте с примером scripting.rs)
-
-**Ожидаемый эффект:** Change detection работает корректно после модификации компонентов
-из Rhai скриптов. Без этого изменения скрипты не триггерят системы с `Changed<T>`.
-
----
-
-## Фаза 3: Долгосрочные оптимизации (Priority: Low/Long-term) `[x]`
-
-### 3.1 WorldDiff byte-level delta `[x]`
-
-**Результат:** В `WorldDiff` добавлено поле `modified_components`. В `diff_snapshots()` реализовано byte-level сравнение данных компонента (побайтовое). Неизменённые компоненты исключаются из диффа, изменённые записываются как `modified_components`. Уменьшает размер диффа при частичных изменениях entity — для мира с 10000 entity где изменилось 10%, diff в ~10× меньше полного snapshot.
-
-**Проблема:**  
-[`WorldDiff`](../crates/apex-serialization/src/snapshot.rs:224-271) хранит полные
-снапшоты компонентов. Для частых сохранений это избыточно по размеру.
-
-**Решение:**  
-Добавить опциональное delta-кодирование: при сериализации сравнивать с предыдущим
-снапшотом и сохранять только изменённые байты (XOR diff).
-
-**Изменения:**
-- В [`ComponentSnapshot`](../crates/apex-serialization/src/snapshot.rs:160-167)
-  добавить поле `is_delta: bool`.
-- При сериализации: если есть предыдущий snapshot, вычислить XOR diff.
-- При десериализации: применить diff к предыдущему snapshot'у.
-
-**Тесты:**  
-- Расширить тесты snapshot_bincode_roundtrip и world_diff_bincode_roundtrip
-
----
-
-### 3.2 Row-level параллельный SubWorld `[x]`
-
-**Результат:** В `SubWorld` добавлены 4 публичных метода: `for_each_entity()`, `par_for_each_entity()` (cfg=parallel), `for_each_row()`, `par_for_each_row()`. Позволяет итерировать entity в SubWorld параллельно через `compute_par_chunks`. Полезно для систем, работающих напрямую с SubWorld через планировщик.
-
-**Проблема:**  
-Текущий SubWorld работает на уровне archetype — все entity одного archetype'а
-обрабатываются последовательно.
-
-**Решение:**  
-Подготовить инфраструктуру для row-level параллелизма:
-- Chunk-based итерация (уже есть в par_for_each через `compute_par_chunks`)
-- Разделение SubWorld на диапазоны строк
-
-**Изменения:**
-- В [`SubWorld`](../crates/apex-core/src/sub_world.rs:16-21) добавить row range
-- В scheduler'е разбивать системы на sub-tasks для rayon
-
----
-
-### 3.3 Rhai query caching `[x]`
-
-**Результат:** В `ScriptContext` добавлен `query_cache: HashMap<Vec<QueryDesc>, Vec<ArchState>>`. При повторном вызове `query()` с теми же дескрипторами — возвращает закэшированный список архетипов без повторного полного сканирования мира. Инвалидируется при каждом новом запуске скрипта. Ускорение при частых query из Rhai-скриптов ~2-5×.
-
-**Проблема:**  
-Rhai скрипты выполняют запросы каждый кадр без кеширования, что приводит
-к повторному созданию Query.
-
-**Решение:**  
-Добавить query cache в ScriptContext, инвалидируемый при изменении archetypes.
-
-**Изменения:**
-- В [`ScriptContext`](../crates/apex-scripting/src/context.rs:65-104)
-  добавить `query_cache: FxHashMap<String, CachedQuery>`
-- При запросе из скрипта: искать в кеше, если есть и не инвалидирован — использовать
-
----
-
-## Фаза 4: Финальное тестирование `[x]`
-
-### 4.1 Запуск всех тестов
-
-```bash
-cargo test --workspace 2>&1
-```
-
-Убедиться, что все тесты проходят после всех изменений.
-
-### 4.2 Бенчмарки
-
-```bash
-cargo bench 2>&1
-```
-
-Сравнить результаты с baseline (до оптимизаций).
-
-### 4.3 Проверка примеров
-
-```bash
-cargo run --example basic
-cargo run --example perf
-cargo run --example scripting
-```
-
----
-
-## Порядок выполнения (dependency order)
-
-```
-Phase 0: Подготовка
-  └── 0.1 Проверить тесты
-      │
-Phase 1 (критические):
-  ├── 1.4 Tick overflow protection    ← нет зависимостей
-  ├── 1.1 has_edge_between→HashSet    ← нет зависимостей
-  ├── 1.2 Column::reserve             ← нет зависимостей
-  ├── 1.6 ComponentMask 256-bit       ← нет зависимостей
-  ├── 1.7 EventCursor FreeList        ← нет зависимостей
-  ├── 1.8 Archetype lookup intern     ← нет зависимостей
-  ├── 1.5 par_for_each Tick::ZERO     ← зависит от 1.4
-  └── 1.3 CachedQuery cache ids       ← нет зависимостей
-      │
-Phase 2 (средние):
-  ├── 2.1 EntityLocation compact      ← влияет на весь код, лучше после Phase 1
-  ├── 2.2 Command enum expansion      ← нет зависимостей
-  ├── 2.3 prepare_sub_worlds cache    ← зависит от 1.1
-  └── 2.4 Rhai change ticks           ← нет зависимостей
-      │
-Phase 3 (долгосрочные):
-  ├── 3.1 WorldDiff delta             ← нет зависимостей
-  ├── 3.2 Row-level parallel          ← зависит от всех Phase 1-2
-  └── 3.3 Rhai query caching          ← зависит от 1.3
-```
-
----
-
-## Краткая сводка изменений по файлам
-
-| Файл | Изменения | Приоритет |
-|------|-----------|-----------|
-| `crates/apex-core/src/component.rs` | Tick::is_newer_than → wrapping_sub | Critical |
-| `crates/apex-core/src/query.rs` | par_for_each Tick::ZERO → last_run | Critical |
-| `crates/apex-core/src/archetype.rs` | Добавить Column::reserve(n) | Critical |
-| `crates/apex-core/src/access.rs` | ComponentMask 256-bit [u64;4] | Critical |
-| `crates/apex-core/src/events.rs` | EventCursor FreeList | Critical |
-| `crates/apex-core/src/world.rs` | CachedQuery кешировать ids, spawn_many_inner reserve, Archetype lookup &[ComponentId] | Critical |
-| `crates/apex-scheduler/src/lib.rs` | has_edge_between→HashSet, prepare_sub_worlds кеширование | Critical+Medium |
-| `crates/apex-core/src/entity.rs` | EntityLocation row: u32 вместо usize | Medium |
-| `crates/apex-core/src/commands.rs` | Конкретные варианты Command enum | Medium |
-| `crates/apex-scripting/src/context.rs` | Change ticks при write-back | Medium |
-| `crates/apex-scripting/src/iterators.rs` | Change ticks в flush_writes | Medium |
-| `crates/apex-serialization/src/snapshot.rs` | WorldDiff byte-level delta | Long-term |
-| `crates/apex-core/src/sub_world.rs` | Row-level parallel (for_each_entity, par_for_each_entity, for_each_row, par_for_each_row) | Long-term |
-| `crates/apex-scripting/src/context.rs` | Rhai query caching | Long-term |
-| `crates/apex-core/src/par_utils.rs` | 5.1 compute_par_chunks SmallVec вместо Vec | Phase 5 |
-| `crates/apex-core/src/world.rs` | 5.2 adaptive_chunk_size runtime adaptation | Phase 5 |
-| `crates/apex-core/src/world.rs` | 5.3 Thread-local scratch buffer для is_common | Phase 5 |
-| `crates/apex-scheduler/src/lib.rs` | 5.4 Stage order persistence между compile() | Phase 5 |
-| `crates/apex-core/src/relations.rs` | 5.5 DenseRelationStorage для плотных графов | Phase 5 |
-| `crates/apex-scripting/src/field.rs` + iterators.rs | 5.6 Zero-copy для примитивных Rhai полей | Phase 5 |
-| `crates/apex-scheduler/src/lib.rs` + sub_world.rs | 5.7 Row-level SubWorld splits в scheduler | Phase 5 |
-
----
-
-## Фаза 5: Финализация пропущенных оптимизаций `[x]`
-
-### 5.1 `compute_par_chunks` — SmallVec вместо Vec `[x]`
-
-**Проблема:**
-Функция [`compute_par_chunks()`](crates/apex-core/src/par_utils.rs:11) всегда аллоцирует новый `Vec<(usize, usize, usize)>` через `.collect()`.
-При каждом `par_for_each` (а их может быть тысячи за кадр) — новая heap-аллокация.
-
-**Решение:**
-Заменить возвращаемый тип на `SmallVec<[(usize, usize, usize); 64]>` из крейта `smallvec`.
-В типичном ECS-мире количество архетипов редко превышает 20–30, и каждый архетип
-создаёт 1–4 чанка — итого 64 элемента достаточно для heap-free работы в 95% случаев.
-
-При добавлении smallvec в зависимости apex-core нужно убедиться, что он уже есть
-в workspace (проверить `Cargo.toml` корня и apex-core).
-
-**Конкретные изменения:**
-1. В `crates/apex-core/Cargo.toml` добавить `smallvec = "1.14"`.
-2. В `crates/apex-core/src/par_utils.rs`:
-   - Импорт: `use smallvec::{SmallVec, smallvec};`
-   - Сигнатура: `pub(crate) fn compute_par_chunks<I>(...) -> SmallVec<[(usize, usize, usize); 64]>`
-   - Вместо `.collect()`: `let mut result: SmallVec<[_; 64]> = SmallVec::new(); result.extend(...); result`
-
-**Тесты:** Существующие тесты query/par_for_each должны продолжать работать.
-Никаких новых тестов не требуется, так как это внутренний рефакторинг.
-
-**Ожидаемый эффект:** ~0 аллокаций на вызов `par_for_each` для типичных сценариев (вместо 1).
-Для миров с 100+ архетипов — heap-аллокация всё равно будет, но через SmallVec (менее накладная).
-
-### 5.2 Adaptive parallelism threshold `[x]`
-
-**Проблема:**
-В [`adaptive_chunk_size()`](crates/apex-core/src/world.rs:783) константы
-`MIN_CHUNK_SIZE = 2` и `MAX_CHUNK_SIZE = 4096` жёстко заданы.
-Для сцен с малым числом сущностей (< 100) распараллеливание с чанками по 2 элемента
-создаёт оверхеда больше, чем выгоды от параллелизма.
-
-**Решение:**
-Добавить runtime-адаптацию: при малом числе сущностей увеличивать MIN_CHUNK_SIZE,
-чтобы параллелизм включался только когда выгода перевешивает overhead.
-
-Вариант реализации:
-```rust
-pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
-    let n = num_threads.max(1);
-    // Динамический MIN: для малых нагрузок увеличиваем порог
-    let min_size = if entity_count < 100 { 64 }
-                  else if entity_count < 1000 { 16 }
-                  else { 2 };
-    let max_size = 4096_usize;
-    let chunk = entity_count / n;
-    if chunk < min_size { chunk.max(1) }
-    else { chunk.min(max_size) }
-}
-```
-
-Альтернативно — вынести `MIN_CHUNK_SIZE` и `MAX_CHUNK_SIZE` в конфигурируемые
-параметры мира (поля в `World` или глобальные Atomic).
-
-**Конкретные изменения:**
-1. В [`world.rs`](crates/apex-core/src/world.rs:783) модифицировать `adaptive_chunk_size()`.
-2. Опционально: убрать `const MIN_CHUNK_SIZE` / `MAX_CHUNK_SIZE` или переименовать в defaults.
-3. Опционально: добавить `set_min_chunk_size()` / `set_max_chunk_size()` публичные функции.
-
-**Тесты:** Добавить тест для `adaptive_chunk_size` с разными значениями entity_count,
-проверяющий, что для малых нагрузок размер чанка адекватный.
-
-**Ожидаемый эффект:** На сценах с < 1000 entities параллельные запросы не создают
-тысячу микро-чанков, снижая overhead планировщика rayon.
-
-### 5.3 Thread-local scratch buffer для `is_common` в `move_entity` `[x]`
-
-**Проблема:**
-В [`move_entity()`](crates/apex-core/src/world.rs:697) при каждом вызове
-аллоцируется `SmallVec<[bool; 32]>` через `SmallVec::from_elem(false, from_len)`.
-Если `from_len > 32` (архетип с 33+ компонентами) — происходит heap-аллокация.
-Даже при < 32 это инициализация памяти.
-
-**Решение:**
-Использовать `thread_local!` с `RefCell<Vec<bool>>` как переиспользуемый буфер:
-
-```rust
-use std::cell::RefCell;
-
-thread_local! {
-    static IS_COMMON_BUF: RefCell<Vec<bool>> = RefCell::new(Vec::new());
-}
-
-pub(crate) fn move_entity(...) -> u32 {
-    // ...
-    let mut is_common = IS_COMMON_BUF.replace_with(|buf| {
-        buf.clear();
-        buf.resize(from_len, false);
-        std::mem::take(buf)
-    });
-    // ... использование is_common ...
-}
-```
-
-**Важно:** Убедиться, что буфер не удерживается между yield points и не нарушает
-безопасность в параллельном контексте. `move_entity` вызывается под `&mut self`,
-поэтому race condition невозможен.
-
-**Конкретные изменения:**
-1. В [`world.rs`](crates/apex-core/src/world.rs) добавить `thread_local! { static IS_COMMON_BUF: ... }`.
-2. В `move_entity()` (строка 697) заменить `SmallVec::from_elem` на использование буфера.
-3. Убрать использование `SmallVec` для `is_common`.
-
-**Тесты:** Существующие тесты `insert` / `remove` / `spawn` должны проходить.
-
-**Ожидаемый эффект:** Ноль аллокаций при каждом `move_entity` (insert компонента).
-Для архетипов с 33+ колонками — устранение heap-аллокации при каждом insert.
-
-### 5.4 Stage order persistence между перекомпиляциями `[x]`
-
-**Проблема:**
-Метод [`configure_stages()`](crates/apex-scheduler/src/lib.rs:565) сохраняет
-`self.stage_order = Some(order)` и вызывает `invalidate_plan()`.
-Однако при повторной компиляции (после добавления новой системы) поле `stage_order`
-сбрасывается? **Проверка кода:** `invalidate_plan()` (строка 570) сбрасывает только
-`execution_plan` и `graph_dirty`, НЕ `stage_order`. Но `compile()` (строка 600) использует
-`self.stage_order` на строке 651. Если пользователь добавил систему с новой stage_label,
-которая не была в исходном `order`, она попадёт в `remaining` (конец списка).
-Это корректное поведение.
-
-Однако **пользователь сообщает**, что порядок всё равно сбрасывается.
-Возможная причина: если `configure_stages()` вызывается ДО добавления систем,
-а потом вызывается `compile()` — порядок работает. Но если после `invalidate_plan()`
-(из-за добавления системы) порядок теряется — нужно проверить, не перезаписывает ли
-какой-нибудь другой код `stage_order`.
-
-**Истинная проблема скорее всего в том**, что `stage_order` хранит `Vec<StageLabel>`,
-и при перекомпиляции (например через `add_system` → `invalidate_plan`) порядок
-действительно сохраняется, но если пользователь ожидает, что можно задать порядок
-один раз при старте и забыть — это работает. Если же порядок сбрасывается при
-вызове `compile()` без предварительного `configure_stages()` — этого не должно
-происходить.
-
-**Решение (предупредительное):**
-Добавить явную проверку и логику сохранения порядка в `compile()`:
-
-1. Убедиться, что `stage_order` сохраняется между вызовами `compile()`.
-2. При каждом вызове `compile()` проверять: если `stage_order` есть — использовать его.
-3. Никакой код не должен сбрасывать `stage_order` кроме явного вызова `configure_stages()`.
-
-**Конкретные изменения:**
-1. Проверить все места, где могут сбрасывать `stage_order` — в `scheduler.rs`.
-2. Если нужно — добавить assert в `invalidate_plan()`, что `stage_order` не тронут.
-3. Добавить тест: `configure_stages() → add_system() → compile() → run() → add_system() → compile() → проверить stage_order`.
-
-**Тесты:** Добавить тест, который проверяет сохранение stage_order после повторной компиляции.
-
-**Ожидаемый эффект:** Стабильный порядок стадий после однократной настройки.
-
-### 5.5 `DenseRelationStorage` для heavily-connected графов `[x]`
-
-**Проблема:**
-Структура [`SubjectEntry`](crates/apex-core/src/relations.rs:94) использует
-`SmallVec<[u32; 4]>` для хранения отношений. Это оптимально для разреженных связей
-(≤4 отношений на сущность), но для heavily-connected сущностей (20+ отношений):
-1. SmallVec переполняется и аллоцирует на heap.
-2. `binary_search` на каждом insert/remove — O(log n) на heap-vec.
-3. `remove` может потребовать O(n) сдвигов.
-
-**Решение:**
-Добавить альтернативное хранилище с auto-upgrade: когда количество отношений превышает
-порог (например 8), переключаться на `DenseVec<u32>` или `HashSet<u32>`:
-
-Вариант A: `HashSet<u32>` для dense (O(1) insert/remove/has)
-```rust
-enum RelationStorage {
-    Sparse(SmallVec<[u32; 4]>),   // ≤8 relations — бинарный поиск
-    Dense(HashSet<u32>),           // >8 relations — hash lookup
-}
-```
-
-Вариант B: `Vec<u32>` с флагом sorted/dense
-```rust
-enum RelationStorage {
-    Sorted(SmallVec<[u32; 4]>),  // ≤4 relations
-    Dense(Vec<u32>),              // любые relations, без сортировки (O(n) поиск)
-}
-```
-
-Рекомендуется Вариант A, так как `HashSet` даёт O(1) для всех операций на плотных графах.
-
-**Конкретные изменения:**
-1. В [`relations.rs`](crates/apex-core/src/relations.rs:94) заменить:
-```rust
-use std::collections::HashSet;
-
-enum RelationStorage {
-    Sparse(SmallVec<[u32; 4]>),
-    Dense(HashSet<u32>),
-}
-
-struct SubjectEntry {
-    kind_mask: u64,
-    storage: RelationStorage,
-}
-```
-2. Реализовать auto-upgrade: при вставке, если `storage` Sparse и len >= 8 — конвертировать в Dense.
-3. Переписать методы `insert`, `remove`, `has`, `get_all` с учётом двух вариантов.
-4. `get_all()` для Dense возвращает собранный `Vec<u32>` (или хранить отдельно sorted copy).
-
-**Тесты:** Добавить тест с 20+ отношениями на одну сущность.
-
-**Ожидаемый эффект:** O(1) для heavily-connected сущностей вместо O(log n) + heap-реаллокаций.
-
-### 5.6 Zero-copy путь для примитивных полей в Rhai `[x]`
-
-**Проблема:**
-Трейт [`ScriptableField`](crates/apex-scripting/src/field.rs:28) определяет
-`to_dynamic(&self) -> Dynamic` и `from_dynamic(d: &Dynamic) -> Option<Self>`.
-В методе [`build_item()`](crates/apex-scripting/src/iterators.rs:227) каждое
-поле компонента читается через `(binding.read)(ptr)`, который вызывает
-`to_dynamic()` — создаёт новый `Dynamic` объект на каждое поле.
-
-Для примитивных типов (i32, f32, bool) можно читать данные напрямую из колонки
-без создания промежуточного Dynamic, если известен тип поля на этапе компиляции
-или если binding может предоставить zero-copy reader.
-
-**Решение:**
-Добавить в `ComponentBinding` опциональный zero-copy путь:
-
-```rust
-// В field.rs
-pub struct ComponentBinding {
-    pub type_name: String,
-    pub read: unsafe fn(*const u8) -> Dynamic,
-    pub write: unsafe fn(*mut u8, &Dynamic),
-    // Zero-copy reader: если Some — можно читать напрямую как &[u8]
-    pub primitive_info: Option<PrimitiveInfo>,
-}
-
-pub enum PrimitiveInfo {
-    I32, F32, F64, Bool, U32, I64, U64,
-}
-```
-
-Изменить `build_item()` в `iterators.rs`:
-```rust
-if let Some(prim_info) = binding.primitive_info {
-    // Zero-copy: данные уже лежат в колонке как примитив
-    let val: Dynamic = unsafe {
-        let col = &arch.columns_raw()[comp.col_idx];
-        let ptr = col.get_raw_ptr(row);
-        match prim_info {
-            PrimitiveInfo::I32  => Dynamic::from(*(ptr as *const i32)),
-            PrimitiveInfo::F32  => Dynamic::from(*(ptr as *const f32)),
-            PrimitiveInfo::Bool => Dynamic::from(*(ptr as *const bool)),
-            // ... и т.д.
+        // Берём компонент с минимальным числом архетипов
+        let smallest = ids.iter()
+            .filter_map(|id| world.component_arch_index.get(id))
+            .min_by_key(|v| v.len());
+
+        match smallest {
+            Some(arch_ids) => arch_ids.iter()
+                .map(|id| id.0 as usize)
+                .collect(),
+            None => return Self { world, archetypes: vec![], last_run },
         }
     };
-} else {
-    // Fallback: используем read функцию для сложных типов
-    let dynamic = unsafe { (binding.read)(ptr) };
+
+    let archetypes = candidate_archetypes.into_iter()
+        .filter(|&arch_idx| {
+            let arch = &world.archetypes[arch_idx];
+            !arch.is_empty() && Q::matches_archetype(arch, &ids)
+        })
+        .map(|arch_idx| {
+            let arch = &world.archetypes[arch_idx];
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            ArchState { arch_idx, state, len: arch.len() }
+        })
+        .collect();
+
+    Self { world, archetypes, last_run }
 }
 ```
 
-**Конкретные изменения:**
-1. В [`field.rs`](crates/apex-scripting/src/field.rs) добавить `PrimitiveInfo` enum
-   и поле `primitive_info: Option<PrimitiveInfo>` в `ComponentBinding`.
-2. В [`registrar.rs`](crates/apex-scripting/src/registrar.rs) (или где регистрируются компоненты)
-   при регистрации примитивных типов устанавливать `primitive_info`.
-3. В [`iterators.rs`](crates/apex-scripting/src/iterators.rs) в `build_item()`
-   добавить zero-copy ветку для примитивов.
-
-**Тесты:** Бенчмарк на чтение примитивных компонентов из Rhai.
-
-**Ожидаемый эффект:** Для i32/f32/bool — 0 копирований, Dynamic создаётся напрямую
-из примитива (Rhai это умеет). Ускорение ~2× на чтение примитивных полей.
-
-### 5.7 Row-level SubWorld splits в планировщике (ArchetypeMask) `[x]`
-
-**Проблема:**
-Метод [`compute_archetype_indices()`](crates/apex-scheduler/src/lib.rs:687)
-назначает целые архетипы системам, но не умеет делить строки одного архетипа
-между несколькими системами. Если две системы читают разные компоненты одного
-архетипа, они вынуждены исполняться последовательно (из-за конфликта), хотя
-реально конфликта нет — они читают разные колонки.
-
-**Решение:**
-Добавить механизм `ArchetypeMask`-based сплиттинга: каждая система получает
-не список `(archetype_index)`, а список пар `(archetype_index, row_start, row_end)`,
-основанный на `ArchetypeMask`.
-
-Механизм:
-1. В [`access.rs`](crates/apex-core/src/access.rs) уже есть `ArchetypeMask` с `overlaps()` и `iter_ones()`.
-2. Для каждой системы известен `AccessDescriptor` с read/write масками.
-3. Если две системы имеют непересекающиеся маски — они могут работать над разными
-   строками одного архетипа параллельно.
-4. В `compute_archetype_indices()` — добавить логику разделения строк архетипа
-   между неконфликтующими системами.
-5. В `prepare_sub_worlds()` — передавать не только arch_indices, но и row ranges.
-6. В `SubWorld` — добавить методы, принимающие row ranges.
-
-**Конкретные изменения:**
-1. [`scheduler.rs`](crates/apex-scheduler/src/lib.rs:687)
-   - Изменить `system_archetype_indices: HashMap<SystemId, Vec<usize>>`
-     на `system_archetype_ranges: HashMap<SystemId, Vec<(usize, usize, usize)>>`
-     (arch_idx, row_start, row_end).
-   - В `compute_archetype_indices()` после определения, какие архетипы нужны системе,
-     проверить: делится ли архетип с другими системами на этом же уровне.
-   - Если две системы читают разные колонки одного архетипа — разделить строки
-     (половина первой, половина второй).
-
-2. [`sub_world.rs`](crates/apex-core/src/sub_world.rs) — добавить методы с row ranges:
-   ```rust
-   pub fn for_each_entity_in_range<F: FnMut(Entity)>(&self, row_start: usize, row_end: usize, f: F);
-   pub fn par_for_each_entity_in_range<F: Fn(Entity) + Send + Sync>(&self, row_start: usize, row_end: usize, f: F);
-   ```
-
-3. [`scheduler.rs`](crates/apex-scheduler/src/lib.rs) — `prepare_sub_worlds()` и
-   `run_hybrid_parallel()` — адаптировать под новую структуру.
-
-**Примечание:** Это архитектурное изменение, требующее осторожности с безопасностью.
-SubWorld даёт доступ к `get_mut` для компонент — нужно гарантировать, что две системы
-не пишут в одну колонку одновременно.
-
-**Тесты:** Добавить тест: две системы с разными масками над одним архетипом —
-проверить, что выполняются параллельно и корректно.
-
-**Ожидаемый эффект:** Системы на одном уровне могут параллельно обрабатывать
-разные строки одного архетипа. Для read-only сценариев — до ~2× утилизация
-ядер на архетипах с большим числом систем.
+**Тест:** Создать мир с 1000 архетипами и 10 тысячами entity, измерить `Query::new` время.
 
 ---
 
-## Порядок выполнения Phase 5
+### 2.2. Chunk-based CommandQueue — устранение Box-аллокаций
+
+**Файл:** `crates/apex-core/src/commands.rs`  
+**Выигрыш:** При 10k despawn-команд: -10k heap-аллокаций, ~25% ускорение `Commands::apply`
+
+**Проблема:** Каждая команда `Spawn` или `Insert` выделяет `Box<dyn ErasedBundle>` / `Box<dyn ErasedComponent>`.
+
+**Решение — сначала только для `Despawn` (90% use-case):**
+
+`Despawn` уже хранится inline в `Command::Despawn(Entity)` — это правильно. Проблема только в `Spawn` и `Insert`. Для них добавить typed batch-variant:
+
+```rust
+// Новый вариант команды для типизированного batch-спавна:
+enum Command {
+    Despawn(Entity),                          // inline, без аллокации (уже есть)
+    Insert { entity: Entity, component: ComponentBox },
+    Remove { entity: Entity, component_id: ComponentId },
+    SpawnFromTemplate { name: String, params: TemplateParams },
+    Apply(Box<dyn FnOnce(&mut World) + Send>),
+
+    // НОВОЕ: типизированный batch-spawn без Box<dyn Trait>
+    SpawnTyped(Box<dyn TypedSpawnCommand>),
+}
+
+pub trait TypedSpawnCommand: Send {
+    fn apply(self: Box<Self>, world: &mut World);
+    fn estimated_size(&self) -> usize { 1 }
+}
+
+// Реализация для конкретного Bundle:
+struct SpawnBundleCommand<B: Bundle + Send + 'static> {
+    bundle: B,
+}
+
+impl<B: Bundle + Send + 'static> TypedSpawnCommand for SpawnBundleCommand<B> {
+    fn apply(self: Box<Self>, world: &mut World) {
+        world.spawn_bundle(self.bundle);
+    }
+}
+
+// Публичный API не меняется:
+pub fn spawn_bundle<B: Bundle + Send + 'static>(&mut self, bundle: B) {
+    self.queue.push(Command::SpawnTyped(Box::new(SpawnBundleCommand { bundle })));
+}
+```
+
+**Следующий шаг (опционально):** Заменить `Vec<Command>` на bump-allocator буфер. Это сложнее, отложить на фазу 3.
+
+---
+
+### 2.3. Гранулярная инвалидация QueryCache
+
+**Файл:** `crates/apex-core/src/world.rs`  
+**Структура:** `QueryCache`  
+**Выигрыш:** При частых `insert`/`remove` одного типа компонента — кеш перестаёт быть бесполезным
+
+**Проблема:** `query_cache.invalidate()` сбрасывает ВСЕ кешированные запросы при любом структурном изменении, даже если изменился несвязанный компонент.
+
+**Решение:** Инвалидировать только те записи кеша, которые содержат изменённый `ComponentId`:
+
+```rust
+pub(crate) struct QueryCache {
+    entries:  UnsafeCell<FxHashMap<Vec<ComponentId>, CacheEntry>>,
+    version:  u32,
+}
+
+impl QueryCache {
+    /// Инвалидировать только записи, затрагивающие данный компонент.
+    pub fn invalidate_for(&mut self, changed_cid: ComponentId) {
+        let map = unsafe { &mut *self.entries.get() };
+        // Удаляем только те ключи, которые содержат changed_cid:
+        map.retain(|key, _| !key.contains(&changed_cid));
+        // Глобальную версию не трогаем — остальные записи валидны
+    }
+
+    /// Полная инвалидация — только при добавлении нового архетипа.
+    pub fn invalidate(&mut self) {
+        self.version = self.version.wrapping_add(1);
+    }
+}
+
+// В world.rs изменить вызовы:
+
+// move_entity — НЕ делает новых архетипов, только перемещает:
+pub(crate) fn move_entity(...) {
+    // Было: self.query_cache.invalidate();
+    // Стало: инвалидируем только компоненты участвующие в переходе
+    let added_cid   = /* компонент, который добавляется */;
+    let removed_cid = /* компонент, который удаляется */;
+    if let Some(cid) = added_cid   { self.query_cache.invalidate_for(cid); }
+    if let Some(cid) = removed_cid { self.query_cache.invalidate_for(cid); }
+    // ...
+}
+
+// get_or_create_archetype — создаёт новый архетип, полная инвалидация:
+pub(crate) fn get_or_create_archetype(&mut self, ...) {
+    // ...
+    self.query_cache.invalidate();  // полная — архетип новый
+}
+```
+
+**Тест:** Создать мир с 2 типами компонентов A и B. Вставлять/удалять A, проверять что кеш для запросов по B не инвалидируется.
+
+---
+
+### 2.4. `Column::grow()` — использовать `realloc` вместо `alloc + memcpy`
+
+**Файл:** `crates/apex-core/src/archetype.rs`  
+**Функция:** `Column::grow`  
+**Выигрыш:** При росте колонок — устранение лишнего `memcpy` для большинства аллокаторов
+
+**Проблема:**
+
+```rust
+pub(crate) fn grow(&mut self) {
+    let new_cap    = if self.capacity == 0 { 64 } else { self.capacity * 2 };
+    let new_layout = self.layout_for(new_cap);
+    let new_data   = unsafe { alloc(new_layout) };          // новый блок
+    // ...
+    unsafe { std::ptr::copy_nonoverlapping(self.data, new_data, ...) }  // memcpy
+    unsafe { dealloc(self.data, self.layout_for(self.capacity)) };       // старый блок
+}
+```
+
+**Решение:** Использовать `std::alloc::realloc`:
+
+```rust
+use std::alloc::{alloc, dealloc, realloc, Layout};
+
+pub(crate) fn grow(&mut self) {
+    let new_cap = if self.capacity == 0 { 64 } else { self.capacity * 2 };
+    if self.item_size == 0 {
+        self.capacity = new_cap;
+        return;
+    }
+
+    let new_size = self.item_size
+        .checked_mul(new_cap)
+        .expect("overflow in grow");
+
+    let new_data = if self.capacity == 0 || self.data.is_null() {
+        // Первая аллокация
+        let layout = Layout::from_size_align(new_size, self.item_align).unwrap();
+        unsafe { alloc(layout) }
+    } else {
+        // Реаллокация на месте (jemalloc/mimalloc часто не делает memcpy)
+        let old_layout = self.layout_for(self.capacity);
+        unsafe { realloc(self.data, old_layout, new_size) }
+    };
+
+    assert!(!new_data.is_null(), "allocation failed in grow");
+    self.data     = new_data;
+    self.capacity = new_cap;
+}
+```
+
+> **Примечание:** `realloc` не гарантирует отсутствие копирования — это зависит от аллокатора. Но jemalloc (используемый в Rust по умолчанию в некоторых конфигурациях) и mimalloc часто избегают копирования при расширении in-place. На системном аллокаторе Windows/Linux это тоже работает для большинства размеров.
+
+**Тест:** Профилировать `spawn_bundle loop` с perf/valgrind на число `memcpy` вызовов.
+
+---
+
+### 2.5. `propagate_transforms` — избежать Vec-аллокации через SparseSet
+
+**Файл:** `crates/apex-core/src/transform.rs`  
+**Функция:** `propagate_transforms`  
+**Выигрыш:** Устранение 2–3 Vec-аллокаций на вызов. Важно при 60 FPS.
+
+**Проблема:**
+
+```rust
+let dirty_entities: Vec<Entity> = {
+    let q = world.query_typed::<Read<TransformDirty>>();
+    let mut entities = Vec::new();      // аллокация 1
+    q.for_each(|e, _| entities.push(e));
+    entities
+};
+
+let mut ordered = Vec::with_capacity(dirty_entities.len());  // аллокация 2
+let mut seen    = FxHashSet::default();                       // аллокация 3
+```
+
+**Решение — переиспользуемые буферы через Resource:**
+
+```rust
+/// Scratch-буферы для propagate_transforms — переиспользуются каждый кадр.
+#[derive(Default)]
+pub struct TransformScratch {
+    dirty_entities: Vec<Entity>,
+    ordered:        Vec<Entity>,
+    seen:           rustc_hash::FxHashSet<u32>,
+}
+
+pub fn propagate_transforms(world: &mut World) {
+    // Извлекаем scratch из ресурсов (или создаём при первом вызове)
+    let mut scratch = world.remove_resource::<TransformScratch>()
+        .unwrap_or_default();
+
+    scratch.dirty_entities.clear();
+    scratch.ordered.clear();
+    scratch.seen.clear();
+
+    // ... логика без new аллокаций ...
+
+    world.insert_resource(scratch);
+}
+```
+
+**Регистрация в `TransformPlugin::register_components`:**
+
+```rust
+pub fn register_components(world: &mut World) {
+    world.register_component::<LocalTransform>();
+    world.register_component::<GlobalTransform>();
+    world.register_component::<TransformDirty>();
+    world.insert_resource(TransformScratch::default());  // НОВОЕ
+    world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
+}
+```
+
+---
+
+## 4. Фаза 3 — Параллелизм нового уровня
+
+> Срок: 3–5 недель. Сложность: высокая. Это главная задача для масштабирования.
+
+---
+
+### 3.1. Task-based параллелизм: чанк как единица работы
+
+**Файл:** `crates/apex-scheduler/src/lib.rs`  
+**Функция:** `Scheduler::run_hybrid_parallel`  
+**Выигрыш:** 3.30x → 7x–9x speedup при 12 ядрах и 12 независимых системах
+
+**Корневая проблема текущей архитектуры:**
 
 ```
-Phase 5 (пропущенные оптимизации):
-  ├── 5.1 compute_par_chunks SmallVec     ← нет зависимостей
-  ├── 5.2 Adaptive chunk size              ← нет зависимостей
-  ├── 5.3 Thread-local is_common buffer    ← нет зависимостей
-  ├── 5.4 Stage order persistence          ← нет зависимостей
-  ├── 5.5 DenseRelationStorage             ← нет зависимостей
-  ├── 5.6 Zero-copy Rhai fields            ← нет зависимостей
-  └── 5.7 ArchetypeMask scheduler splits   ← самая сложная, лучше последней
+Текущая модель:          Желаемая модель:
+┌─────────────────┐      ┌──────────────────────────────────────┐
+│ Stage           │      │ Stage                                │
+│  task(System A) │      │  task(A_chunk_0) task(A_chunk_1) ..│
+│  task(System B) │      │  task(B_chunk_0) task(B_chunk_1) ..│
+│  task(System C) │      │  task(C_chunk_0) task(C_chunk_1) ..│
+└─────────────────┘      └──────────────────────────────────────┘
+   3 задачи на 12 ядер      36 задач на 12 ядер — лучший балансинг
 ```
 
-Рекомендуемый порядок реализации: 5.1 → 5.2 → 5.3 → 5.4 → 5.5 → 5.6 → 5.7
-(от простых к сложным). После каждой оптимизации — прогон тестов.
+При 3 системах и 12 ядрах текущая модель даёт максимум 3x. Task-based — до 12x.
+
+**Новый тип `ParTask`:**
+
+```rust
+/// Единица параллельной работы — чанк одного архетипа для одной системы.
+struct ParTask {
+    /// Указатель на систему (SendPtr для Rayon)
+    system_ptr: SendPtr<SystemDescriptor>,
+    /// Индекс архетипа
+    arch_idx: usize,
+    /// Диапазон строк [start, end)
+    start: usize,
+    end: usize,
+    /// Ссылка на мир (const — только чтение структуры, данные через ptr)
+    world_ptr: *const World,
+}
+
+unsafe impl Send for ParTask {}
+unsafe impl Sync for ParTask {}
+```
+
+**Новая функция выполнения Stage:**
+
+```rust
+#[cfg(feature = "parallel")]
+fn run_stage_parallel(&mut self, stage: &[(SystemId, bool)], world: &World) {
+    let num_threads = rayon::current_num_threads();
+
+    // Собираем все задачи для всех систем Stage
+    let mut tasks: Vec<ParTask> = Vec::new();
+
+    for &(sys_id, _) in stage {
+        let sys_idx = match self.system_indices.get(&sys_id) { Some(&i) => i, None => continue };
+        let arch_indices = self.system_archetype_indices.get(&sys_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        for &arch_idx in arch_indices {
+            let arch_len = world.archetypes()[arch_idx].len();
+            if arch_len == 0 { continue; }
+
+            let chunk_size = adaptive_chunk_size(arch_len, num_threads);
+            let num_chunks = (arch_len + chunk_size - 1) / chunk_size;
+
+            for chunk_i in 0..num_chunks {
+                let start = chunk_i * chunk_size;
+                let end   = (start + chunk_size).min(arch_len);
+                tasks.push(ParTask {
+                    system_ptr: SendPtr(&mut self.systems[sys_idx] as *mut _),
+                    arch_idx,
+                    start,
+                    end,
+                    world_ptr: world as *const World,
+                });
+            }
+        }
+    }
+
+    // Запускаем все задачи параллельно
+    use rayon::prelude::*;
+    tasks.par_iter().for_each(|task| {
+        unsafe {
+            let world  = &*task.world_ptr;
+            let system = &mut *task.system_ptr.0;
+
+            if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
+                // Создаём SubWorld только для диапазона строк этого чанка
+                let indices = std::slice::from_ref(&task.arch_idx);
+                let ranges  = [(task.arch_idx, task.start, task.end)];
+                let sub     = apex_core::SubWorld::with_ranges(world, indices, &ranges);
+                sys.run(SystemContext::from_sub_world(&sub));
+            }
+        }
+    });
+}
+```
+
+**Обновить `run_hybrid_parallel` для использования нового метода:**
+
+```rust
+#[cfg(feature = "parallel")]
+fn run_hybrid_parallel(&mut self, world: &mut World) {
+    let plan = self.execution_plan.as_ref().unwrap();
+
+    for stage in &plan.stages {
+        // Фильтруем Startup
+        if stage.label == StageLabel::Startup && self.startup_completed { continue; }
+
+        let parallel_ids: Vec<(SystemId, bool)> = stage.system_ids.iter()
+            .map(|&id| (id, true))
+            .collect();
+
+        if stage.all_parallel && stage.system_ids.len() >= self.parallel_threshold {
+            // НОВОЕ: task-based параллелизм
+            let const_world = unsafe { &*(world as *const World) };
+            self.run_stage_parallel(&parallel_ids, const_world);
+        } else {
+            // Последовательно (sequential системы или мало систем)
+            for &sys_id in &stage.system_ids {
+                if let Some(&idx) = self.system_indices.get(&sys_id) {
+                    let sw = self.make_sub_world(idx, unsafe { &*(world as *const World) });
+                    match &mut self.systems[idx].kind {
+                        SystemKind::Sequential(f) => f(world),
+                        SystemKind::Parallel { system, .. } => {
+                            system.run(SystemContext::from_sub_world(&sw));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    self.startup_completed = true;
+}
+```
+
+**Критически важно:** Системы в одном Stage не должны иметь Write-конфликтов (это гарантирует `compile()`). Поэтому параллельный доступ к разным компонентам через `*mut` безопасен.
+
+**Тест:** `cargo bench parallel_scheduler` — все секции. Целевой speedup ≥ 5x при 12 системах.
+
+---
+
+### 3.2. Автоматическое разделение работы по архетипам между системами
+
+**Файл:** `crates/apex-scheduler/src/lib.rs`  
+**Функция:** `Scheduler::prepare_sub_worlds`  
+**Выигрыш:** Устранение дублированной обработки одних и тех же строк архетипа двумя системами
+
+**Контекст:** Если система A и система B обе имеют доступ к архетипу [Position, Velocity], они обе будут обрабатывать все его строки. Но если они не конфликтуют по компонентам, можно разделить строки между ними.
+
+**Уточнение:** Row-level splits имеет смысл только когда системы НЕ читают одни и те же компоненты (иначе разделение не даёт прироста). Алгоритм:
+
+```rust
+fn compute_row_splits(
+    stage_systems: &[SystemId],
+    world: &World,
+    system_archetype_indices: &FxHashMap<SystemId, Vec<usize>>,
+) -> FxHashMap<SystemId, Vec<(usize, usize, usize)>> {
+    let mut splits: FxHashMap<SystemId, Vec<(usize, usize, usize)>> = FxHashMap::default();
+
+    // Группировать системы по overlapping архетипам
+    // Для каждого архетипа определить, сколько систем его используют
+    let mut arch_system_count: FxHashMap<usize, usize> = FxHashMap::default();
+    for &sys_id in stage_systems {
+        if let Some(indices) = system_archetype_indices.get(&sys_id) {
+            for &arch_idx in indices {
+                *arch_system_count.entry(arch_idx).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Для архетипов с >1 системой — разделить строки
+    for (arch_idx, count) in &arch_system_count {
+        if *count <= 1 { continue; }
+        let arch_len = world.archetypes()[*arch_idx].len();
+        let chunk    = (arch_len + count - 1) / count;
+
+        let mut offset = 0;
+        for (i, &sys_id) in stage_systems.iter().enumerate() {
+            if system_archetype_indices.get(&sys_id)
+                .map(|v| v.contains(arch_idx))
+                .unwrap_or(false)
+            {
+                let start = offset.min(arch_len);
+                let end   = (offset + chunk).min(arch_len);
+                splits.entry(sys_id).or_default().push((*arch_idx, start, end));
+                offset = end;
+            }
+        }
+    }
+
+    splits
+}
+```
+
+---
+
+### 3.3. Thread-local Commands в параллельных системах
+
+**Файлы:** `crates/apex-core/src/world.rs`, `crates/apex-scheduler/src/lib.rs`  
+**Выигрыш:** Устранение необходимости вручную управлять Commands в `par_for_each`
+
+**Текущая проблема:** Пользователь должен писать:
+
+```rust
+// Неудобно и error-prone:
+impl ParSystem for MySystem {
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        let mut local_cmds = Commands::new();  // вручную
+        ctx.query::<Read<Health>>().for_each(|e, hp| {
+            if hp.current <= 0.0 { local_cmds.despawn(e); }
+        });
+        // Нет возможности применить внутри системы!
+    }
+}
+```
+
+**Решение:** Добавить в `SystemContext` доступ к thread-local командам:
+
+```rust
+// В world.rs:
+pub struct SystemContext<'w> {
+    pub(crate) sub_worlds: &'w [SubWorld<'w>],
+    // НОВОЕ:
+    pub(crate) deferred_cmds: *mut Vec<Commands>,  // один Commands на поток
+}
+
+impl<'w> SystemContext<'w> {
+    /// Получить Commands для текущего потока.
+    /// Команды применяются планировщиком после завершения Stage.
+    #[inline]
+    pub fn commands(&self) -> &mut Commands {
+        unsafe {
+            // rayon thread_index() для изоляции
+            let thread_idx = rayon::current_thread_index().unwrap_or(0);
+            &mut (*self.deferred_cmds)[thread_idx]
+        }
+    }
+}
+```
+
+**В `run_hybrid_parallel` — применять команды после Stage:**
+
+```rust
+// После выполнения параллельного Stage:
+for cmds in &mut self.thread_commands {
+    cmds.apply(world);
+}
+```
+
+---
+
+## 5. Фаза 4 — Функциональные доработки
+
+> Срок: 1–2 недели. Сложность: низкая–средняя. Новые возможности.
+
+---
+
+### 4.1. `add_relations_batch` — batch-добавление Relations
+
+**Файл:** `crates/apex-core/src/relations.rs` и `world.rs`  
+**Выигрыш:** Создание иерархии 1000 объектов: 1000 архетипных переходов → 1 переход
+
+**Текущая проблема:** `add_relation` на каждую entity вызывает `move_entity`, меняя архетип. При создании 1000-entity иерархии — 1000 переходов.
+
+**Новый API:**
+
+```rust
+impl World {
+    /// Добавить одинаковую relation от множества субъектов к одному target.
+    ///
+    /// Оптимизирован для массового создания иерархий (например, тайловые карты).
+    /// Все subjects перемещаются в новый архетип за один проход.
+    pub fn add_relation_batch<R: RelationKind>(
+        &mut self,
+        subjects: &[Entity],
+        kind: R,
+        target: Entity,
+    ) {
+        if subjects.is_empty() { return; }
+
+        let kind_idx    = self.relations.get_or_register::<R>();
+        let relation_id = encode_relation(kind_idx, target.index);
+        self.ensure_relation_component(relation_id);
+
+        // Группируем subjects по текущему архетипу
+        let mut by_arch: FxHashMap<ArchetypeId, Vec<Entity>> = FxHashMap::default();
+        for &entity in subjects {
+            if let Some(loc) = self.entities.get_location(entity) {
+                by_arch.entry(loc.archetype_id).or_default().push(entity);
+            }
+        }
+
+        // Для каждой группы — один batch move_entity
+        for (arch_id, group) in by_arch {
+            let new_arch_id = self.find_or_create_archetype_with(arch_id, relation_id);
+
+            for entity in group {
+                let loc = self.entities.get_location(entity).unwrap();
+                let new_row = self.move_entity(entity, loc, new_arch_id);
+                self.entities.set_location(entity, EntityLocation {
+                    archetype_id: new_arch_id,
+                    row: new_row,
+                });
+                self.subject_index.add(entity.index, relation_id);
+            }
+        }
+    }
+}
+```
+
+---
+
+### 4.2. Hot-reload дебаунс в ScriptEngine
+
+**Файл:** `crates/apex-scripting/src/script_engine.rs`  
+**Функция:** `ScriptEngine::with_dir`  
+**Выигрыш:** Устранение дублированных reload-событий при сохранении файла редактором
+
+**Проблема:** В `ScriptEngine::with_dir` создаётся `recommended_watcher` без дебаунса, тогда как `HotReloadPlugin` использует `Config::default().with_poll_interval(debounce)`.
+
+**Решение — унифицировать:**
+
+```rust
+pub fn with_dir(script_dir: &Path) -> Self {
+    Self::with_dir_debounce(script_dir, Duration::from_millis(100))
+}
+
+pub fn with_dir_debounce(script_dir: &Path, debounce: Duration) -> Self {
+    let mut this = Self::new();
+    let (tx, rx) = mpsc::channel();
+
+    let watcher_result = notify::RecommendedWatcher::new(
+        move |res: notify::Result<Event>| { let _ = tx.send(res); },
+        notify::Config::default().with_poll_interval(debounce),  // ДОБАВИТЬ
+    );
+    // ...
+    this
+}
+```
+
+---
+
+### 4.3. `Without<T>` в ArchetypeMask — exclude маска
+
+**Файл:** `crates/apex-core/src/access.rs`, `crates/apex-core/src/query.rs`  
+**Выигрыш:** `Without<T>` фильтрует архетипы до цикла итерации
+
+**Текущая проблема:** `Without<T>` проверяет `!arch.has_component(ids[0])` внутри `matches_archetype` — это уже правильно, но только при обходе всех архетипов. С `component_arch_index` (из 2.1) нужно начинать с инверсии.
+
+**Добавить `exclude_cids` в `WorldQuery`:**
+
+```rust
+pub trait WorldQuery: Sized {
+    // Существующие методы...
+
+    /// ComponentId'ы, которые НЕ должны присутствовать в архетипе.
+    fn excluded_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+}
+
+// Реализация для Without<T>:
+impl<T: Component> WorldQuery for Without<T> {
+    fn excluded_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+    // fill_ids оставляем пустым (Without не требует наличия компонента)
+    fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+    // ...
+}
+```
+
+**В `Query::new` использовать excluded_ids для фильтрации списка кандидатов:**
+
+```rust
+let mut excluded = Vec::new();
+Q::excluded_ids(world, &mut excluded);
+
+let archetypes = candidate_archetypes.into_iter()
+    .filter(|&arch_idx| {
+        let arch = &world.archetypes[arch_idx];
+        // Быстрая проверка исключений перед полным matches_archetype
+        if excluded.iter().any(|&eid| arch.has_component(eid)) {
+            return false;
+        }
+        Q::matches_archetype(arch, &ids)
+    })
+    // ...
+```
+
+---
+
+### 4.4. Диагностика конфликтов с именами компонентов
+
+**Файл:** `crates/apex-scheduler/src/lib.rs`  
+**Функция:** `component_type_name`  
+**Выигрыш:** `debug_plan_verbose()` показывает реальные имена вместо `<component>`
+
+**Текущая проблема:** `type_names` заполняется только в `run()` / `run_sequential()`, но до первого `run()` — пустая. При вызове `debug_plan_verbose()` сразу после `compile()` все компоненты показываются как `<component>`.
+
+**Решение:**
+
+```rust
+// В compile():
+pub fn compile(&mut self) -> Result<(), SchedulerError> {
+    // ... существующий код ...
+
+    // ДОБАВИТЬ: если type_names пуст, логируем предупреждение
+    if self.type_names.is_empty() {
+        log::debug!(
+            "Scheduler::compile: type_names пуст. \
+             Вызовите populate_type_names(&world.registry()) \
+             для отображения имён компонентов в debug_plan_verbose()"
+        );
+    }
+
+    // ...
+}
+
+// Добавить convenience-метод:
+pub fn compile_with_world(&mut self, world: &World) -> Result<(), SchedulerError> {
+    self.populate_type_names(world.registry());
+    self.compile()
+}
+```
+
+**В документации добавить пример:**
+
+```rust
+// Рекомендуемый паттерн:
+sched.compile_with_world(&world).expect("schedule error");
+println!("{}", sched.debug_plan_verbose());  // теперь с реальными именами
+```
+
+---
+
+## 6. Метрики успеха
+
+### Бенчмарки для верификации каждой задачи
+
+| Задача | Бенчмарк команда | Метрика | Цель |
+|---|---|---|---|
+| 1.1 write_into_batch | `cargo bench simple_insert` | spawn_many ns/op | -15% |
+| 1.2 ArchetypeKey | `cargo bench structural` | allocations count | -50% for insert |
+| 1.3 move_entity | `cargo bench structural` | insert ns/op | 72→55 ns |
+| 1.4 seq barriers | `cargo bench compile_overhead` | N=50 time | 110µs→30µs |
+| 1.5 EventRegistry | `cargo bench events` | send+iter ns/op | -30% |
+| 2.1 ArchetypeMask | custom bench (1000 archetypes) | Query::new µs | -50% |
+| 2.2 CommandQueue | `cargo bench structural` | Commands::apply allocs | -60% |
+| 2.3 QueryCache | custom bench (frequent insert) | CachedQuery hits | >80% |
+| 2.4 realloc | perf stat | cache-misses | -10% |
+| 2.5 TransformScratch | alloc profiler | allocs/frame | 0 in hot path |
+| 3.1 Task-based par | `cargo bench parallel_scheduler` | 12-sys speedup | 3.3x→7x |
+| 3.2 Row splits | `cargo bench parallel_scheduler` | 2-sys CPU-bound | 1.1x→1.8x |
+| 3.3 Thread-local cmds | compilation test | usability | API improvement |
+| 4.1 batch relations | custom bench | 1000 relations | -90% transitions |
+| 4.2 debounce | manual test | reload storms | eliminated |
+| 4.3 Without exclude | custom bench | Without query time | -20% |
+| 4.4 compile_with_world | manual test | debug_plan quality | names visible |
+
+### Запуск всех бенчмарков
+
+```bash
+# Последовательный режим (для baseline):
+cargo bench --features "" 2>&1 | tee bench_baseline.txt
+
+# Параллельный режим:
+cargo bench --features parallel 2>&1 | tee bench_parallel.txt
+
+# Сравнение:
+cargo bench --features parallel -- --baseline bench_baseline
+```
+
+---
+
+## 7. Порядок реализации и зависимости
+
+```
+Фаза 1 (независимые, начать любую):
+  1.1  ──► 1.2 ──► 1.3 (линейная цепочка оптимизаций spawn/move)
+  1.4  (независимо от 1.1-1.3)
+  1.5  (независимо от всего)
+
+Фаза 2 (требует завершения Фазы 1):
+  2.1  ──► 2.3  (ArchetypeMask используется в QueryCache)
+  2.2  (независимо)
+  2.4  (независимо)
+  2.5  (независимо)
+
+Фаза 3 (требует 2.1 для корректного SubWorld):
+  3.1  ──► 3.2  (task-based par, потом row splits как расширение)
+  3.3  (можно параллельно с 3.1)
+
+Фаза 4 (независимые, можно в любой момент):
+  4.1  (независимо)
+  4.2  (независимо)
+  4.3  требует 2.1
+  4.4  (независимо)
+```
+
+### Рекомендуемый порядок для ИИ-программиста
+
+1. **Начать с 1.3** (move_entity однопроходный) — изолированное изменение, хорошо тестируется, даёт реальный прирост
+2. **Затем 1.4** (seq barriers O(N)) — compile() становится намного быстрее  
+3. **Затем 1.5** (EventRegistry кеш) — независимое, простое
+4. **Затем 1.1 + 1.2** вместе (batch spawn оптимизации)
+5. **Затем 2.1** (ArchetypeMask) — фундамент для 2.3 и 4.3
+6. **Затем 2.5** (TransformScratch) — простое, заметное
+7. **Затем 3.1** (task-based par) — главная задача, максимальный выигрыш
+8. **Затем 4.1, 4.2, 4.4** в любом порядке
+
+### Чеклист перед PR
+
+- [ ] `cargo test --workspace` — все тесты зелёные
+- [ ] `cargo bench` — нет регрессий в baseline метриках
+- [ ] `cargo clippy --workspace` — без новых предупреждений
+- [ ] Unsafe-блоки снабжены `// SAFETY:` комментарием
+- [ ] Публичные изменения задокументированы в rustdoc
+- [ ] Обновлён CHANGELOG.md если изменился публичный API
+
+---
+
+*APEX ECS Optimization Plan v1.0 — Апрель 2026*
