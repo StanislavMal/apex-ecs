@@ -990,10 +990,10 @@ impl Scheduler {
                         {
                             // Для symmetric конфликтов (WriteWrite, EventWriteWrite) has_path не нужен:
                             // direction гарантирован idx < j, цикл невозможен.
-                            // Для asymmetric (WriteRead/EventWriteRead) проверяем has_path,
-                            // но только при непустом графе (has_existing_edges).
-                            // При пустом графе (первый compile) BFS всегда возвращает false.
-                            let need_cycle_check = !is_symmetric && has_existing_edges;
+                            // Для asymmetric (WriteRead/EventWriteRead) ВСЕГДА проверяем has_path,
+                            // чтобы избежать циклов при первом compile (has_existing_edges = false).
+                            // BFS на первом compile дешёвый — граф ещё маленький.
+                            let need_cycle_check = !is_symmetric;
                             if !self.has_edge_between(from, to)
                                 && (!need_cycle_check || !self.dependency_graph.has_path(to, from))
                             {

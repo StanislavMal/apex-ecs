@@ -1,4 +1,4 @@
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc, dealloc, realloc, Layout};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -164,18 +164,24 @@ impl Column {
             self.capacity = new_cap;
             return;
         }
-        let new_layout = self.layout_for(new_cap);
-        let new_data = unsafe { alloc(new_layout) };
-        assert!(!new_data.is_null(), "allocation failed");
-        if self.len > 0 && !self.data.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.data, new_data, self.len * self.item_size);
-            }
+        if self.capacity == 0 {
+            // Первое выделение — через alloc (realloc с null ptr — UB)
+            let new_layout = self.layout_for(new_cap);
+            self.data = unsafe {
+                let ptr = alloc(new_layout);
+                assert!(!ptr.is_null(), "allocation failed");
+                ptr
+            };
+        } else {
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            let old_layout = self.layout_for(self.capacity);
+            let new_size = self.item_size * new_cap;
+            self.data = unsafe {
+                let ptr = realloc(self.data, old_layout, new_size);
+                assert!(!ptr.is_null(), "reallocation failed");
+                ptr
+            };
         }
-        if self.capacity > 0 && !self.data.is_null() {
-            unsafe { dealloc(self.data, self.layout_for(self.capacity)); }
-        }
-        self.data = new_data;
         self.capacity = new_cap;
     }
 
@@ -193,18 +199,24 @@ impl Column {
             self.change_ticks.reserve(additional);
             return;
         }
-        let new_layout = self.layout_for(new_cap);
-        let new_data = unsafe { alloc(new_layout) };
-        assert!(!new_data.is_null(), "allocation failed");
-        if self.len > 0 && !self.data.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.data, new_data, self.len * self.item_size);
-            }
+        if self.capacity == 0 {
+            // Первое выделение — через alloc
+            let new_layout = self.layout_for(new_cap);
+            self.data = unsafe {
+                let ptr = alloc(new_layout);
+                assert!(!ptr.is_null(), "allocation failed");
+                ptr
+            };
+        } else {
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            let old_layout = self.layout_for(self.capacity);
+            let new_size = self.item_size * new_cap;
+            self.data = unsafe {
+                let ptr = realloc(self.data, old_layout, new_size);
+                assert!(!ptr.is_null(), "reallocation failed");
+                ptr
+            };
         }
-        if self.capacity > 0 && !self.data.is_null() {
-            unsafe { dealloc(self.data, self.layout_for(self.capacity)); }
-        }
-        self.data = new_data;
         self.capacity = new_cap;
         self.change_ticks.reserve(additional);
     }
