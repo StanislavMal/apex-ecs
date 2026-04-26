@@ -301,15 +301,58 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         Q::fill_ids(world, &mut ids);
 
         let archetypes = if ids.len() == Q::component_count() {
-            world.archetypes
-                .iter()
-                .enumerate()
-                .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
-                .map(|(arch_idx, arch)| {
-                    let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-                    ArchState { arch_idx, state, len: arch.len() }
-                })
-                .collect()
+            // Линейный обход архетипов — быстрее для малых запросов (≤3 компонента)
+            // и малых миров (≤128 архетипов). ComponentArchIndex даёт выигрыш только
+            // для больших миров (500+ архетипов) и запросов с 4+ компонентами.
+            if !ids.is_empty() && (ids.len() <= 3 || world.archetypes.len() <= 128) {
+                // Линейный обход: O(N) по числу архетипов, без HashMap lookup'ов
+                world.archetypes.iter().enumerate()
+                    .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+                    .map(|(arch_idx, arch)| {
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        ArchState { arch_idx, state, len: arch.len() }
+                    })
+                    .collect()
+            } else if ids.is_empty() {
+                // Запрос без компонентов — все архетипы
+                world.archetypes.iter().enumerate()
+                    .filter(|(_, arch)| !arch.is_empty())
+                    .map(|(arch_idx, arch)| {
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        ArchState { arch_idx, state, len: arch.len() }
+                    })
+                    .collect()
+            } else {
+                // component_arch_index — O(K) поиск кандидатов через наименее
+                // распространённый компонент. Для больших миров (500+ архетипов)
+                // и сложных запросов (4+ компонентов) это K << N.
+                let candidate_archetypes = {
+                    let smallest = ids.iter()
+                        .filter_map(|id| world.component_arch_index.get(id))
+                        .min_by_key(|v| v.len());
+
+                    match smallest {
+                        Some(arch_ids) => arch_ids.iter()
+                            .map(|id| id.0 as usize)
+                            .collect(),
+                        None => {
+                            (0..world.archetypes.len()).collect::<Vec<_>>()
+                        }
+                    }
+                };
+
+                candidate_archetypes.into_iter()
+                    .filter(|&arch_idx| {
+                        let arch = &world.archetypes[arch_idx];
+                        !arch.is_empty() && Q::matches_archetype(arch, &ids)
+                    })
+                    .map(|arch_idx| {
+                        let arch = &world.archetypes[arch_idx];
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        ArchState { arch_idx, state, len: arch.len() }
+                    })
+                    .collect()
+            }
         } else {
             Vec::new()
         };

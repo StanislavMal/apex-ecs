@@ -31,6 +31,7 @@
 //! ```
 
 use glam::{Mat4, Quat, Vec3};
+use rustc_hash::FxHashSet;
 
 use crate::{
     entity::Entity,
@@ -127,6 +128,22 @@ pub struct TransformDirty;
 
 // ── Система Propagation ─────────────────────────────────────────
 
+/// Scratch-буферы для [`propagate_transforms`] — переиспользуются каждый кадр,
+/// избегая Vec-аллокаций в горячем пути.
+#[derive(Default)]
+pub struct TransformScratch {
+    /// Список dirty entity из query (шаг 1)
+    pub(crate) dirty_entities: Vec<Entity>,
+    /// Топологически отсортированные entity (шаг 2–3)
+    pub(crate) ordered: Vec<Entity>,
+    /// Множество уже обработанных entity (для DFS)
+    pub(crate) seen: FxHashSet<u32>,
+    /// Стек для итеративного DFS
+    pub(crate) stack: Vec<Entity>,
+    /// Временный буфер для children (шаг 3)
+    pub(crate) children: Vec<Entity>,
+}
+
 /// Sequential-система: пересчитывает GlobalTransform для всех entity с TransformDirty.
 ///
 /// Выполняется в PostUpdate этапе.
@@ -136,38 +153,52 @@ pub struct TransformDirty;
 /// 1. Найти все entity с TransformDirty (через query_typed)
 /// 2. Для каждой: вычислить GlobalTransform = parent.GlobalTransform * self.LocalTransform
 /// 3. Снять флаг TransformDirty
+///
+/// # Ресурсы
+///
+/// Использует [`TransformScratch`] для переиспользования буферов между кадрами.
 pub fn propagate_transforms(world: &mut World) {
-    // 1. Собираем dirty entity
-    let dirty_entities: Vec<Entity> = {
-        let q = world.query_typed::<Read<TransformDirty>>();
-        let mut entities = Vec::new();
-        q.for_each(|e, _| entities.push(e));
-        entities
-    };
+    // Извлекаем scratch-буфер из ресурсов (или создаём новый при первом вызове)
+    // remove_resource перемещает значение в локальную переменную, освобождая
+    // заимствование world — это позволяет вызывать world.get()/world.insert()
+    // без конфликта borrow checker.
+    let mut scratch = world.remove_resource::<TransformScratch>()
+        .unwrap_or_default();
 
-    if dirty_entities.is_empty() {
+    // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
+    scratch.dirty_entities.clear();
+    scratch.ordered.clear();
+    scratch.seen.clear();
+    scratch.stack.clear();
+    scratch.children.clear();
+
+    // 1. Собираем dirty entity
+    {
+        let q = world.query_typed::<Read<TransformDirty>>();
+        q.for_each(|e, _| scratch.dirty_entities.push(e));
+    } // query Q дропается здесь
+
+    if scratch.dirty_entities.is_empty() {
+        // Возвращаем scratch в ресурсы перед ранним выходом
+        world.insert_resource(scratch);
         return;
     }
 
     // 2. Топологическая сортировка dirty entity (корни → листья)
     //    Итеративный DFS: для каждого dirty entity поднимаемся по предкам
     //    и добавляем их в порядке от корня к листьям.
-    use rustc_hash::FxHashSet;
-
-    let mut ordered = Vec::with_capacity(dirty_entities.len());
-    let mut seen = FxHashSet::default();
-
-    for &entity in &dirty_entities {
+    for &entity in &scratch.dirty_entities {
         if !world.get::<TransformDirty>(entity).is_some() {
             continue;
         }
 
-        // Явный стек для итеративного DFS
-        let mut stack = vec![entity];
+        // Явный стек для итеративного DFS (очищаем перед каждым entity)
+        scratch.stack.clear();
+        scratch.stack.push(entity);
 
-        while let Some(top) = stack.last().copied() {
-            if seen.contains(&top.index) {
-                stack.pop();
+        while let Some(top) = scratch.stack.last().copied() {
+            if scratch.seen.contains(&top.index) {
+                scratch.stack.pop();
                 continue;
             }
 
@@ -175,16 +206,16 @@ pub fn propagate_transforms(world: &mut World) {
             let parent = world.get_relation_target(top, ChildOf);
             let need_parent = parent
                 .map(|p| {
-                    world.get::<TransformDirty>(p).is_some() && !seen.contains(&p.index)
+                    world.get::<TransformDirty>(p).is_some() && !scratch.seen.contains(&p.index)
                 })
                 .unwrap_or(false);
 
             if need_parent {
-                stack.push(parent.unwrap());
+                scratch.stack.push(parent.unwrap());
             } else {
-                seen.insert(top.index);
-                ordered.push(top);
-                stack.pop();
+                scratch.seen.insert(top.index);
+                scratch.ordered.push(top);
+                scratch.stack.pop();
             }
         }
     }
@@ -193,8 +224,8 @@ pub fn propagate_transforms(world: &mut World) {
     //    Используем while i < ordered.len(), т.к. ordered динамически растёт
     //    при добавлении детей dirty-родителя.
     let mut i = 0;
-    while i < ordered.len() {
-        let entity = ordered[i];
+    while i < scratch.ordered.len() {
+        let entity = scratch.ordered[i];
 
         if !world.is_alive(entity) {
             i += 1;
@@ -229,20 +260,26 @@ pub fn propagate_transforms(world: &mut World) {
         // Если у этой entity есть дети (ChildOf), помечаем их как dirty,
         // чтобы их GlobalTransform тоже пересчитался.
         // Это решает проблему "пользователь пометил только родителя" (Feature 2, issue #2).
-        let children: Vec<Entity> = world.children_of(ChildOf, entity).collect();
-        for child in children {
+        scratch.children.clear();
+        for child in world.children_of(ChildOf, entity) {
+            scratch.children.push(child);
+        }
+        for &child in &scratch.children {
             if !world.is_alive(child) {
                 continue;
             }
             if world.get::<TransformDirty>(child).is_none() {
                 world.insert(child, TransformDirty);
                 // Добавляем в ordered-список для обработки в этом же проходе
-                ordered.push(child);
+                scratch.ordered.push(child);
             }
         }
 
         i += 1;
     }
+
+    // Возвращаем scratch в ресурсы для переиспользования в следующем кадре
+    world.insert_resource(scratch);
 }
 
 // ── Plugin ───────────────────────────────────────────────────────
@@ -286,6 +323,10 @@ impl TransformPlugin {
         // при любом вызове get_mut::<LocalTransform>().
         // Это решает проблему "забыл пометить Dirty" (Feature 2, issue #1).
         world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
+
+        // Инициализируем scratch-буфер для propagate_transforms
+        // (переиспользуется между кадрами, избегая Vec-аллокаций)
+        world.insert_resource(TransformScratch::default());
     }
 }
 

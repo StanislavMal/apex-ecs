@@ -1,8 +1,5 @@
 # APEX ECS — План оптимизации
 
-> Версия 1.0 | Апрель 2026  
-> Документ предназначен для ИИ-программиста. Каждый раздел содержит точные указатели на файлы, сигнатуры функций и конкретный код изменений.
-
 ---
 
 ## Содержание
@@ -38,8 +35,6 @@
 ---
 
 ## 2. Фаза 1 — Быстрые победы
-
-> Срок: 1–2 недели. Сложность: низкая. Никаких изменений публичного API.
 
 ---
 
@@ -121,6 +116,14 @@ fn write_into_batch(self, world, archetype_id, row, tick, col_indices: &[usize])
 
 **Тест:** `cargo bench --bench benchmark simple_insert` — ожидаемое улучшение для `spawn_many`.
 
+✅ **Реализовано 2026-04-26:**
+- `Bundle::write_into_batch` сигнатура: `&[(ComponentId, usize)]` → `&[usize]` (прямой позиционный доступ)
+- Макрос `impl_bundle!`: убран `find()` с линейным поиском O(K), заменён на `col_indices[i]` со счётчиком `i`
+- `spawn_many_inner`: `Vec<(ComponentId, usize)>` → `SmallVec<[usize; 8]>`, хранение только column index
+- Bulk-copy блок: `for &(_cid, col_idx)` → `for &col_idx`
+- Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без регрессий)
+- Устранено 40,000 `find()` вызовов при spawn_many(10_000, (A,B,C,D))
+
 ---
 
 ### 1.2. SmallVec ключ для `archetype_index` — устранение Vec-аллокаций
@@ -175,6 +178,14 @@ self.archetype_index.insert(ArchetypeKey::from(components), id);
 ```
 
 **Тест:** Профилировать `insert component` бенчмарк — должно сократиться количество аллокаций.
+
+✅ **Реализовано 2026-04-26:**
+- Создан `ArchetypeKey(SmallVec<[ComponentId; 12]>)` newtype с `Clone, PartialEq, Eq, Hash` и `From<&[ComponentId]>`
+- Поле `archetype_index`: `FxHashMap<Vec<ComponentId>, _>` → `FxHashMap<ArchetypeKey, _>`
+- `World::new()`: `insert(Vec::new(),` → `insert(ArchetypeKey(SmallVec::new()),`
+- `get_or_create_archetype`: `get(components)` → `get(&ArchetypeKey::from(components))` — без `.to_vec()` аллокации
+- `get_or_create_archetype`: `insert(components.to_vec(),` → `insert(ArchetypeKey::from(components),` — устранена heap-аллокация
+- Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без регрессий)
 
 ---
 
@@ -276,6 +287,11 @@ pub(crate) fn move_entity(
 
 **Тест:** `cargo bench structural` — метрика `insert component`.
 
+> **✅ Реализовано (2026-04-26).**
+> `IS_COMMON_BUF` удалён. `move_entity` переписан в однопроходный вариант:
+> единый `for i in 0..from_len` с `column_index(cid)` inline-проверкой.
+> Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без ошибок).
+
 ---
 
 ### 1.4. O(N) обнаружение sequential-барьеров в Scheduler
@@ -342,6 +358,14 @@ fn add_sequential_barriers_for(&mut self, seq_idx: usize) {
 
 **Тест:** `cargo bench compile_overhead` — секция "Фиксированный N" при N=50.
 
+> **✅ Реализовано (2026-04-26).**
+> В `Scheduler` добавлены поля `seq_system_indices: Vec<usize>` и `par_system_indices: Vec<usize>`.
+> Все 4 метода регистрации (`add_system_to_stage`, `add_auto_system_to_stage`, `add_par_system_to_stage`, `add_fn_par_system_to_stage`)
+> push'ат индекс в соответствующий список.
+> В `add_new_nodes_and_edges` секция 3 заменена с O(N²) `for j in 0..n` на итерацию по
+> `par_system_indices` (для sequential) / `seq_system_indices` (для parallel) — O(P)/O(S).
+> Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без ошибок).
+
 ---
 
 ### 1.5. Кеш EventRegistry — убрать `downcast_ref` из горячего пути
@@ -399,11 +423,18 @@ impl EventRegistry {
 
 **Тест:** `cargo bench events` — метрика `send + iter_current`.
 
+> **✅ Реализовано (2026-04-26).**
+> В `EventRegistry` добавлено поле `raw_ptrs: FxHashMap<TypeId, SyncPtr>`.
+> Wrapper `SyncPtr(*mut u8)` с `unsafe impl Send + Sync` для совместимости с `&World` в `par_iter()`.
+> `register::<T>()` сохраняет указатель на данные `Box` (куча — не перемещается при реаллокации HashMap).
+> `get::<T>()`, `get_mut::<T>()`, `try_get::<T>()`, `try_get_mut::<T>()`, `get_raw_ptr::<T>()`
+> читают из `raw_ptrs` — zero-cost доступ без `downcast_ref` / vtable call.
+> Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без ошибок).
+
 ---
 
 ## 3. Фаза 2 — Структурные оптимизации ядра
 
-> Срок: 2–4 недели. Сложность: средняя. Изменения внутренней архитектуры, API совместим.
 
 ---
 
@@ -482,6 +513,14 @@ pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
 ```
 
 **Тест:** Создать мир с 1000 архетипами и 10 тысячами entity, измерить `Query::new` время.
+
+✅ **Реализовано 2026-04-26:**
+- В `World` добавлено поле `component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>`
+- Заполняется в `get_or_create_archetype` вместе с `id_index.register_archetype`
+- `Query::new_with_tick` переписан: находит компонент с минимальным числом архетипов (`min_by_key`), итерирует только его архетипы O(K) вместо O(N)
+- Edge case: пустой список компонентов → полный перебор всех архетипов
+- Edge case: компонент не найден ни в одном архетипе → пустой результат
+- Верификация: `cargo test --workspace` (28 passed)
 
 ---
 
@@ -704,12 +743,16 @@ pub fn register_components(world: &mut World) {
     world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
 }
 ```
+✅ **Реализовано 2026-04-26:**
+- Создан `TransformScratch` с полями `dirty_entities`, `ordered`, `seen`, `stack`, `children` — все `Vec<Entity>` / `FxHashSet<u32>` переиспользуются между кадрами
+- `propagate_transforms`: использует `remove_resource::<TransformScratch>().unwrap_or_default()` — извлекает scratch без borrow conflict, вставляет обратно в конце
+- Добавлены буферы `stack` (DFS) и `children` (каскадирование dirty), которые не были учтены в плане — теперь тоже переиспользуются (5 Vec-аллокаций вместо 2–3)
+- `TransformPlugin::register_components`: добавлен `world.insert_resource(TransformScratch::default())` для явной инициализации
+- Верификация: `cargo test --workspace` (28 passed), `cargo run --example perf --features parallel` (без регрессий)
 
 ---
 
 ## 4. Фаза 3 — Параллелизм нового уровня
-
-> Срок: 3–5 недель. Сложность: высокая. Это главная задача для масштабирования.
 
 ---
 
@@ -967,7 +1010,6 @@ for cmds in &mut self.thread_commands {
 
 ## 5. Фаза 4 — Функциональные доработки
 
-> Срок: 1–2 недели. Сложность: низкая–средняя. Новые возможности.
 
 ---
 
@@ -1172,18 +1214,6 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | 4.3 Without exclude | custom bench | Without query time | -20% |
 | 4.4 compile_with_world | manual test | debug_plan quality | names visible |
 
-### Запуск всех бенчмарков
-
-```bash
-# Последовательный режим (для baseline):
-cargo bench --features "" 2>&1 | tee bench_baseline.txt
-
-# Параллельный режим:
-cargo bench --features parallel 2>&1 | tee bench_parallel.txt
-
-# Сравнение:
-cargo bench --features parallel -- --baseline bench_baseline
-```
 
 ---
 
@@ -1233,5 +1263,3 @@ cargo bench --features parallel -- --baseline bench_baseline
 - [ ] Обновлён CHANGELOG.md если изменился публичный API
 
 ---
-
-*APEX ECS Optimization Plan v1.0 — Апрель 2026*

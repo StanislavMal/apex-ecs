@@ -14,13 +14,6 @@ use crate::{
     template::TemplateRegistry,
 };
 
-// Thread-local scratch-буфер для `is_common` в `move_entity`.
-// Позволяет избежать heap-аллокации при каждом перемещении entity между архетипами.
-// Буфер переиспользуется между вызовами move_entity в пределах одного потока.
-thread_local! {
-    static IS_COMMON_BUF: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 // ── QueryCache ─────────────────────────────────────────────────
 
 struct CacheEntry {
@@ -65,6 +58,16 @@ impl QueryCache {
     }
 
     pub fn invalidate(&mut self) { self.version = self.version.wrapping_add(1); }
+
+    /// Инвалидировать только записи кеша, затрагивающие данный компонент.
+    /// Позволяет сохранить кеш для несвязанных запросов.
+    pub fn invalidate_for(&mut self, changed_cid: ComponentId) {
+        let map = unsafe { &mut *self.entries.get() };
+        // Удаляем только те ключи (списки компонентов запроса),
+        // которые содержат изменённый ComponentId.
+        map.retain(|key, _| !key.contains(&changed_cid));
+    }
+
     pub fn version(&self) -> u32 { self.version }
 }
 
@@ -143,18 +146,43 @@ impl Default for DeferredQueue {
     fn default() -> Self { Self::new() }
 }
 
+// ── ArchetypeKey ───────────────────────────────────────────────
+
+/// Ключ для archetype_index — хэшируется без heap-аллокации.
+/// Внутри хранит компоненты inline до 12 штук через SmallVec.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ArchetypeKey(SmallVec<[ComponentId; 12]>);
+
+impl From<&[ComponentId]> for ArchetypeKey {
+    fn from(ids: &[ComponentId]) -> Self {
+        Self(ids.iter().copied().collect())
+    }
+}
+
+/// Zero-copy lookup: позволяет `archetype_index.get(components)` работать
+/// напрямую с `&[ComponentId]` без создания временного ArchetypeKey.
+impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
+    fn borrow(&self) -> &[ComponentId] {
+        &self.0
+    }
+}
+
 // ── World ──────────────────────────────────────────────────────
 
 pub struct World {
-    pub(crate) entities:        EntityAllocator,
-    pub(crate) registry:        ComponentRegistry,
-    pub(crate) archetypes:      Vec<Archetype>,
-    pub(crate) archetype_index: FxHashMap<Vec<ComponentId>, ArchetypeId>,
-    pub(crate) current_tick:    Tick,
-    pub(crate) query_cache:     QueryCache,
-    pub(crate) relations:       RelationRegistry,
-    pub(crate) id_index:        IdIndex,
-    pub(crate) subject_index:   SubjectIndex,
+    pub(crate) entities:             EntityAllocator,
+    pub(crate) registry:             ComponentRegistry,
+    pub(crate) archetypes:           Vec<Archetype>,
+    pub(crate) archetype_index:      FxHashMap<ArchetypeKey, ArchetypeId>,
+    /// Индекс компонент → список архетипов, содержащих этот компонент.
+    /// Используется в Query::new_with_tick для O(1) поиска архетипов-кандидатов
+    /// вместо линейного обхода всех архетипов.
+    pub(crate) component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>,
+    pub(crate) current_tick:         Tick,
+    pub(crate) query_cache:          QueryCache,
+    pub(crate) relations:            RelationRegistry,
+    pub(crate) id_index:             IdIndex,
+    pub(crate) subject_index:        SubjectIndex,
     pub        resources:       ResourceMap,
     pub(crate) events:          EventRegistry,
     /// Коллбэки, вызываемые при записи компонента (вызове get_mut).
@@ -171,7 +199,8 @@ impl World {
             entities:        EntityAllocator::new(),
             registry:        ComponentRegistry::new(),
             archetypes:      Vec::new(),
-            archetype_index: FxHashMap::default(),
+            archetype_index:      FxHashMap::default(),
+            component_arch_index: FxHashMap::default(),
             current_tick:    Tick(1),
             query_cache:     QueryCache::new(),
             relations:       RelationRegistry::new(),
@@ -183,7 +212,7 @@ impl World {
             templates:       TemplateRegistry::new(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
-        world.archetype_index.insert(Vec::new(), ArchetypeId::EMPTY);
+        world.archetype_index.insert(ArchetypeKey(SmallVec::new()), ArchetypeId::EMPTY);
         world
     }
 
@@ -387,9 +416,11 @@ impl World {
         // Предвычисляем column indices для всех компонентов бандла,
         // чтобы избежать повторных вызовов get_or_register и column_index
         // в write_into для каждой entity (экономит ~40k HashMap lookup'ов при 10k entity).
-        let col_indices: Vec<(ComponentId, usize)> = ids.iter()
+        // Храним только позиционный индекс колонки — без ComponentId,
+        // так как порядок col_indices соответствует порядку ids.
+        let col_indices: SmallVec<[usize; 8]> = ids.iter()
             .filter_map(|&id| {
-                self.archetypes[arch_idx].column_index(id).map(|col_idx| (id, col_idx))
+                self.archetypes[arch_idx].column_index(id)
             })
             .collect();
 
@@ -420,7 +451,7 @@ impl World {
             for (i, &entity) in entities[1..].iter().enumerate() {
                 let row = start_row + 1 + i;
                 self.archetypes[arch_idx].entities.push(entity);
-                for &(_cid, col_idx) in &col_indices {
+                for &col_idx in &col_indices {
                     unsafe {
                         let col = &mut self.archetypes[arch_idx].columns[col_idx];
                         if col.item_size > 0 {
@@ -478,6 +509,7 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
+        self.query_cache.invalidate_for(component_id);
         let new_row     = self.move_entity(entity, location, new_arch_id);
         let tick        = self.current_tick;
         unsafe {
@@ -518,6 +550,7 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
+        self.query_cache.invalidate_for(component_id);
         let new_row     = self.move_entity(entity, location, new_arch_id);
         unsafe {
             self.archetypes[new_arch_id.0 as usize]
@@ -542,6 +575,7 @@ impl World {
             location.archetype_id,
             component_id,
         );
+        self.query_cache.invalidate_for(component_id);
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
@@ -565,6 +599,7 @@ impl World {
             location.archetype_id,
             component_id,
         );
+        self.query_cache.invalidate_for(component_id);
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
@@ -708,15 +743,22 @@ impl World {
         &mut self,
         components: &[ComponentId],
     ) -> ArchetypeId {
+        // Borrow<[ComponentId]> — zero-copy lookup без создания ArchetypeKey
         if let Some(&id) = self.archetype_index.get(components) { return id; }
         let id    = ArchetypeId(self.archetypes.len() as u32);
         let infos: Vec<&ComponentInfo> = components.iter()
             .filter_map(|&cid| self.registry.get_info(cid))
             .collect();
         let arch  = Archetype::new(id, components.iter().copied().collect(), &infos);
-        for &cid in &arch.component_ids { self.id_index.register_archetype(cid, id); }
+        for &cid in &arch.component_ids {
+            self.id_index.register_archetype(cid, id);
+            self.component_arch_index
+                .entry(cid)
+                .or_default()
+                .push(id);
+        }
         self.archetypes.push(arch);
-        self.archetype_index.insert(components.to_vec(), id);
+        self.archetype_index.insert(ArchetypeKey::from(components), id);
         self.query_cache.invalidate();
         id
     }
@@ -727,72 +769,65 @@ impl World {
         from_location:   EntityLocation,
         to_archetype_id: ArchetypeId,
     ) -> u32 {
-        // Любое перемещение entity между archetypes может изменить
-        // результаты запросов → сбрасываем кэш.
-        self.query_cache.invalidate();
-
         let from_idx = from_location.archetype_id.0 as usize;
         let to_idx   = to_archetype_id.0 as usize;
-        let from_row = from_location.row;
-
-        let from_len = self.archetypes[from_idx].columns.len();
-        // Используем thread-local переиспользуемый буфер вместо SmallVec::from_elem,
-        // чтобы избежать heap-аллокации при каждом move_entity.
-        // take() вынимает существующий Vec без лишней аллокации.
-        let mut is_common = IS_COMMON_BUF.take();
-        is_common.clear();
-        is_common.resize(from_len, false);
-        for i in 0..from_len {
-            let cid      = self.archetypes[from_idx].columns[i].component_id;
-            is_common[i] = self.archetypes[to_idx].has_component(cid);
-        }
+        let from_row = from_location.row as usize;
 
         let to_row = self.archetypes[to_idx].entities.len();
         self.archetypes[to_idx].entities.push(entity);
 
+        // Единственный проход: для каждой колонки из исходного архетипа
+        // определяем наличие в целевом и сразу копируем или дропаем.
+        let from_len = self.archetypes[from_idx].columns.len();
+
         for i in 0..from_len {
-            if !is_common[i] { continue; }
-            let cid    = self.archetypes[from_idx].columns[i].component_id;
-            let to_col = self.archetypes[to_idx].column_index(cid).unwrap();
-            unsafe {
-                let item_size = self.archetypes[from_idx].columns[i].item_size;
-                if item_size > 0 {
-                    if self.archetypes[to_idx].columns[to_col].len
-                        >= self.archetypes[to_idx].columns[to_col].capacity
-                    {
-                        self.archetypes[to_idx].columns[to_col].grow();
+            let cid       = self.archetypes[from_idx].columns[i].component_id;
+            let item_size = self.archetypes[from_idx].columns[i].item_size;
+
+            if let Some(to_col_idx) = self.archetypes[to_idx].column_index(cid) {
+                // Компонент присутствует в обоих архетипах — копируем
+                unsafe {
+                    if item_size > 0 {
+                        if self.archetypes[to_idx].columns[to_col_idx].len
+                            >= self.archetypes[to_idx].columns[to_col_idx].capacity
+                        {
+                            self.archetypes[to_idx].columns[to_col_idx].grow();
+                        }
+                        let src = self.archetypes[from_idx].columns[i].get_ptr(from_row);
+                        let dst = self.archetypes[to_idx].columns[to_col_idx].get_ptr(to_row);
+                        std::ptr::copy_nonoverlapping(src, dst, item_size);
                     }
-                    let src = self.archetypes[from_idx].columns[i].get_ptr(from_row as usize);
-                    let dst = self.archetypes[to_idx].columns[to_col].get_ptr(to_row);
-                    std::ptr::copy_nonoverlapping(src, dst, item_size);
+                    let tick = self.archetypes[from_idx].columns[i].get_tick(from_row);
+                    self.archetypes[to_idx].columns[to_col_idx].change_ticks.push(tick);
+                    self.archetypes[to_idx].columns[to_col_idx].len += 1;
+
+                    // swap_remove без drop (данные перемещены в целевой архетип)
+                    self.archetypes[from_idx].columns[i].swap_remove_no_drop(from_row);
                 }
-                let src_tick = self.archetypes[from_idx].columns[i].get_tick(from_row as usize);
-                self.archetypes[to_idx].columns[to_col].change_ticks.push(src_tick);
-                self.archetypes[to_idx].columns[to_col].len += 1;
+            } else {
+                // Компонент отсутствует в целевом — дропаем
+                unsafe {
+                    self.archetypes[from_idx].columns[i].swap_remove_and_drop(from_row);
+                }
             }
         }
 
+        // Исправляем location для вытесненной entity (swap_remove)
         unsafe {
             let from_last = self.archetypes[from_idx].entities.len() - 1;
-            for (i, col) in self.archetypes[from_idx].columns.iter_mut().enumerate() {
-                if is_common[i] { col.swap_remove_no_drop(from_row as usize); }
-                else            { col.swap_remove_and_drop(from_row as usize); }
-            }
-            if (from_row as usize) != from_last {
+            if from_row != from_last {
                 let displaced = self.archetypes[from_idx].entities[from_last];
-                self.archetypes[from_idx].entities.swap(from_row as usize, from_last);
+                self.archetypes[from_idx].entities.swap(from_row, from_last);
                 self.archetypes[from_idx].entities.pop();
                 self.entities.set_location(displaced, EntityLocation {
                     archetype_id: from_location.archetype_id,
-                    row:          from_row,
+                    row:          from_row as u32,
                 });
             } else {
                 self.archetypes[from_idx].entities.pop();
             }
         }
-        // Возвращаем буфер в thread-local storage для переиспользования
-        // set() — RefCell пуст после take(), так что это просто установка
-        IS_COMMON_BUF.set(is_common);
+
         to_row as u32
     }
 }
@@ -1135,7 +1170,7 @@ pub trait Bundle: Sized {
         archetype_id: ArchetypeId,
         row: usize,
         tick: Tick,
-        _col_indices: &[(ComponentId, usize)],
+        _col_indices: &[usize],
     ) {
         self.write_into(world, archetype_id, row, tick);
     }
@@ -1192,31 +1227,31 @@ macro_rules! impl_bundle {
                 archetype_id: ArchetypeId,
                 row:          usize,
                 tick:         Tick,
-                col_indices:  &[(ComponentId, usize)],
+                col_indices:  &[usize],
             ) {
                 let ($($T,)+) = self;
+                #[allow(unused_assignments)]
+                let mut i = 0;
                 $(
                     {
-                        // Используем get_id (без регистрации) — компонент уже зарегистрирован
-                        if let Some(cid) = world.registry.get_id::<$T>() {
-                            // Линейный поиск по предвычисленному списку col_indices
-                            if let Some(&(_cid, col_idx)) = col_indices.iter().find(|&&(id, _)| id == cid) {
-                                unsafe {
-                                    let col = &mut world.archetypes[archetype_id.0 as usize]
-                                        .columns[col_idx];
-                                    if col.item_size > 0 {
-                                        if col.len >= col.capacity { col.grow(); }
-                                        let dst = col.get_ptr(row);
-                                        std::ptr::copy_nonoverlapping(
-                                            &$T as *const $T as *const u8,
-                                            dst,
-                                            col.item_size,
-                                        );
-                                    }
-                                    col.change_ticks.push(tick);
-                                    col.len += 1;
-                                }
+                        // Прямой позиционный доступ — col_indices[i] уже вычислен
+                        // в spawn_many_inner, устраняет O(K) поиск через find()
+                        let col_idx = col_indices[i];
+                        i += 1;
+                        unsafe {
+                            let col = &mut world.archetypes[archetype_id.0 as usize]
+                                .columns[col_idx];
+                            if col.item_size > 0 {
+                                if col.len >= col.capacity { col.grow(); }
+                                let dst = col.get_ptr(row);
+                                std::ptr::copy_nonoverlapping(
+                                    &$T as *const $T as *const u8,
+                                    dst,
+                                    col.item_size,
+                                );
                             }
+                            col.change_ticks.push(tick);
+                            col.len += 1;
                         }
                         std::mem::forget($T);
                     }

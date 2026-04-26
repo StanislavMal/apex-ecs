@@ -560,6 +560,7 @@ impl World {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, relation_id);
+        self.query_cache.invalidate_for(relation_id);
         let new_row     = self.move_entity(entity, location, new_arch_id);
         let tick        = self.current_tick;
         if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
@@ -582,6 +583,7 @@ impl World {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_without(location.archetype_id, relation_id);
+        self.query_cache.invalidate_for(relation_id);
         let new_row     = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, crate::entity::EntityLocation {
             archetype_id: new_arch_id,
