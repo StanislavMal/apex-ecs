@@ -44,16 +44,23 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Создать SubWorld с row-level range ограничениями.
+    ///
+    /// # Safety
+    /// Переданные срезы `archetype_indices` и `row_ranges` должны жить
+    /// не меньше самого SubWorld. Внутренне lifetimes продлеваются через
+    /// transmute, так как SubWorld не экспортирует эти ссылки наружу.
     #[inline]
     pub fn with_ranges(
         world: &'w World,
-        archetype_indices: &'w [usize],
-        row_ranges: &'w [(usize, usize, usize)],
+        archetype_indices: &[usize],
+        row_ranges: &[(usize, usize, usize)],
     ) -> Self {
-        Self {
-            world,
-            archetype_indices,
-            row_ranges,
+        unsafe {
+            Self {
+                world,
+                archetype_indices: std::mem::transmute::<&[usize], &'w [usize]>(archetype_indices),
+                row_ranges: std::mem::transmute::<&[(usize, usize, usize)], &'w [(usize, usize, usize)]>(row_ranges),
+            }
         }
     }
 

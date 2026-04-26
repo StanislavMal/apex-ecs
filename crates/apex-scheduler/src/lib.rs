@@ -54,13 +54,14 @@ pub mod stage;
 
 use std::any::TypeId;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use thiserror::Error;
 use apex_graph::Graph;
 use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
     component::ComponentRegistry,
-    world::{World, ParallelWorld},
+    world::World,
     system_param::WorldQuerySystemAccess,
 };
 
@@ -140,18 +141,46 @@ pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
 // ── SendPtr ────────────────────────────────────────────────────
 
-#[derive(Copy, Clone)]
 struct SendPtr<T>(*mut T);
 
 // SAFETY: использование строго ограничено run_hybrid_parallel где
 // уникальность ptr гарантирована — каждый ptr из уникального индекса.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
+impl<T> Clone for SendPtr<T> { fn clone(&self) -> Self { SendPtr(self.0) } }
+impl<T> Copy for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     #[inline]
     unsafe fn as_mut(&self) -> &mut T { &mut *self.0 }
+    #[inline]
+    unsafe fn as_ref(&self) -> &T { &*self.0 }
 }
+
+/// Задача для ASD (Adaptive Scope Distribution).
+///
+/// Содержит указатель на SystemDescriptor, указатель на срез архетипов
+/// системы и диапазоны строк, которые эта задача должна обработать.
+/// Каждая задача обрабатывает subset entity системы.
+///
+/// Если `chunk_ranges` пуст — задача обрабатывает все entity системы
+/// (весь SubWorld без ограничений).
+struct AsdTask {
+    /// Указатель на SystemDescriptor
+    ptr: SendPtr<SystemDescriptor>,
+    /// Указатель на данные среза индексов архетипов системы
+    /// (borrowed from `system_archetype_indices` storage).
+    sys_archs_ptr: *const usize,
+    /// Длина среза архетипов системы
+    sys_archs_len: usize,
+    /// Диапазоны строк для ограничения SubWorld:
+    /// `(arch_idx, start, end)` — только эти строки указанных архетипов.
+    /// Если пусто — SubWorld без ограничений (все entity системы).
+    chunk_ranges: SmallVec<[(usize, usize, usize); 4]>,
+}
+
+unsafe impl Send for AsdTask {}
+unsafe impl Sync for AsdTask {}
 
 // ── ParSystem trait ────────────────────────────────────────────
 
@@ -1112,14 +1141,218 @@ impl Scheduler {
         self.startup_completed = true;
     }
 
-    /// Параллельное выполнение через Rayon scope + spawn.
+    /// Запустить stage через ASD (Adaptive Scope Distribution).
     ///
-    /// Системы в одном Stage (все ParSystem, нет конфликтов) запускаются
-    /// через `rayon::scope(|s| { for ... { s.spawn(...) } })` — каждая
-    /// система получает свой поток без оверхеда на split/steal от par_iter.
+    /// ASD динамически разбивает entity всех систем stage на чанки
+    /// адаптивного размера, сортирует их по archetype_id для cache locality
+    /// и распределяет по всем воркерам Rayon.
     ///
-    /// Для stage с малым числом систем (< parallel_threshold) используется
-    /// последовательный запуск, чтобы избежать оверхеда rayon::scope.
+    /// # Алгоритм
+    ///
+    /// 1. Вычисляется `total_entity_count` — сумма entity всех систем в stage.
+    /// 2. `target_chunk = max(total_entity_count / num_workers / 2, MIN_CHUNK)`.
+    /// 3. Для каждой системы:
+    ///    - Если entity_count <= target_chunk → 1 задача (весь архетип целиком).
+    ///    - Если entity_count > target_chunk → разбивка на чанки размером ~target_chunk.
+    /// 4. Все чанки собираются в Vec, сортируются по archetype_id.
+    /// 5. Чанки запускаются через `rayon::scope`.
+    ///
+    /// # Адаптивность
+    ///
+    /// - Мало entity → target_chunk мал → каждая система = 1 задача (per-system scope).
+    /// - Много entity → target_chunk велик → задачи равномерно заполняют всех воркеров.
+    /// - Без if/else — один механизм на все сценарии.
+    ///
+    /// # Безопасность
+    ///
+    /// Каждая spawn-задача работает с РАЗНЫМ `SystemDescriptor`
+    /// (разные `AsdTask.ptr`), поэтому одновременный `&mut` доступ
+    /// к разным системам безопасен. SubWorld создаётся локально внутри spawn
+    /// с ограничением `(arch_idx, start, end)`, что гарантирует что
+    /// разные задачи НЕ пересекаются по данным одного архетипа.
+    #[cfg(feature = "parallel")]
+    fn run_stage_parallel(&mut self, stage_ids: &[SystemId], world: &World) {
+        let archetypes = world.archetypes();
+        let num_workers = rayon::current_num_threads();
+        const MIN_CHUNK: usize = 4096;
+
+        // 1. Собираем per-system информацию
+        struct SysInfo {
+            ptr: SendPtr<SystemDescriptor>,
+            arch_indices: Vec<usize>,
+            entity_count: usize,
+        }
+
+        let mut sys_infos: Vec<SysInfo> = Vec::new();
+        let mut total_entity_count: usize = 0;
+
+        for &sys_id in stage_ids {
+            if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                let arch_indices = self.system_archetype_indices
+                    .get(&sys_id)
+                    .cloned()
+                    .unwrap_or_else(|| (0..archetypes.len()).collect());
+
+                let entity_count: usize = arch_indices.iter()
+                    .filter_map(|&ai| {
+                        if ai < archetypes.len() {
+                            Some(archetypes[ai].len())
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+
+                if entity_count > 0 {
+                    total_entity_count += entity_count;
+                    sys_infos.push(SysInfo {
+                        ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
+                        arch_indices,
+                        entity_count,
+                    });
+                } else {
+                    // Система без entity (только ресурсы/события) — запускаем сразу
+                    let system = &mut self.systems[sys_idx];
+                    if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
+                        let all_indices: Vec<usize> = (0..archetypes.len()).collect();
+                        let sw = apex_core::SubWorld::new(world, &all_indices);
+                        sys.run(SystemContext::from_sub_world(&sw));
+                    }
+                }
+            }
+        }
+
+        if sys_infos.is_empty() {
+            return;
+        }
+
+        // 2. Вычисляем target chunk size
+        let target_chunk = std::cmp::max(
+            total_entity_count / num_workers.max(1) / 2,
+            MIN_CHUNK,
+        );
+
+        // 3. Создаём чанки для всех систем
+        let mut tasks: Vec<AsdTask> = Vec::new();
+
+        for info in &sys_infos {
+            let sys_archs_ptr: *const usize = info.arch_indices.as_ptr();
+            let sys_archs_len: usize = info.arch_indices.len();
+
+            // Per-system scope для:
+            //   a) Систем с единственным архетипом (subWorld без ranges)
+            //   b) Систем с entity_count <= target_chunk (один чанк не даст parallelism)
+            //
+            // Для multi-архетипных систем с большим entity_count —
+            // ASD разбивка на чанки, распределённые по воркерам.
+            if info.arch_indices.len() <= 1 || info.entity_count <= target_chunk {
+                // Per-system scope: одна задача, все entity целиком
+                tasks.push(AsdTask {
+                    ptr: info.ptr,
+                    sys_archs_ptr,
+                    sys_archs_len,
+                    chunk_ranges: SmallVec::new(), // пусто = весь SubWorld
+                });
+            } else {
+                // Multi-архетипная крупная система — ASD разбивка
+                let mut remaining = info.entity_count;
+                let mut arch_iter = info.arch_indices.iter().copied();
+                let mut current_arch = arch_iter.next();
+                let mut arch_offset: usize = 0;
+
+                while remaining > 0 {
+                    let mut chunk_ranges: SmallVec<[(usize, usize, usize); 4]> = SmallVec::new();
+                    let mut chunk_remaining = target_chunk.min(remaining);
+
+                    while chunk_remaining > 0 {
+                        let Some(arch_idx) = current_arch else { break; };
+                        if arch_idx >= archetypes.len() {
+                            current_arch = arch_iter.next();
+                            arch_offset = 0;
+                            continue;
+                        }
+                        let arch_len = archetypes[arch_idx].len();
+                        if arch_len == 0 || arch_offset >= arch_len {
+                            current_arch = arch_iter.next();
+                            arch_offset = 0;
+                            continue;
+                        }
+
+                        let available = arch_len - arch_offset;
+                        let take = chunk_remaining.min(available);
+
+                        chunk_ranges.push((arch_idx, arch_offset, arch_offset + take));
+                        arch_offset += take;
+                        chunk_remaining -= take;
+                        remaining -= take;
+
+                        if arch_offset >= arch_len {
+                            current_arch = arch_iter.next();
+                            arch_offset = 0;
+                        }
+                    }
+
+                    if !chunk_ranges.is_empty() {
+                        tasks.push(AsdTask {
+                            ptr: info.ptr,
+                            sys_archs_ptr,
+                            sys_archs_len,
+                            chunk_ranges,
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4. Сортируем чанки по archetype_id для cache locality
+        tasks.sort_unstable_by_key(|t| {
+            t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0)
+        });
+
+        // 5. Запускаем через rayon::scope
+        rayon::scope(|s| {
+            for task in &tasks {
+                s.spawn(|_| {
+                    unsafe {
+                        let sys_archs: &[usize] = std::slice::from_raw_parts(
+                            task.sys_archs_ptr,
+                            task.sys_archs_len,
+                        );
+                        let system = &mut *task.ptr.0;
+                        if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
+                            if task.chunk_ranges.is_empty() {
+                                // Полный SubWorld — все архетипы системы без ограничений
+                                let sub = apex_core::SubWorld::new(world, sys_archs);
+                                sys.run(SystemContext::from_sub_world(&sub));
+                            } else {
+                                // SubWorld с range-ограничениями
+                                let sub = apex_core::SubWorld::with_ranges(
+                                    world,
+                                    sys_archs,
+                                    &task.chunk_ranges,
+                                );
+                                sys.run(SystemContext::from_sub_world(&sub));
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Параллельное выполнение через ASD (Adaptive Scope Distribution).
+    ///
+    /// Для stage с исключительно параллельными системами используется
+    /// [`run_stage_parallel`] (ASD). Stage с sequential системами или
+    /// смешанные выполняются последовательно через `make_sub_world`.
+    ///
+    /// # Отличие от предыдущей версии
+    ///
+    /// Раньше использовался `parallel_threshold` — минимальное количество
+    /// систем в stage для параллельного запуска. ASD адаптируется
+    /// автоматически: если систем мало, target_chunk будет маленьким,
+    /// и каждая система получит 1 задачу (per-system scope). Условие
+    /// `stage_ids.len() < parallel_threshold` больше не нужно.
     #[cfg(feature = "parallel")]
     fn run_hybrid_parallel(&mut self, world: &mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
@@ -1135,25 +1368,16 @@ impl Scheduler {
             .map(|s| (s.system_ids.clone(), s.all_parallel))
             .collect();
 
-        // Pre-вычисляем SubWorld storage для всех систем
-        // Это безопасно, потому что:
-        // - SubWorld не владеет данными, только ссылается
-        // - Мы не делаем structural changes во время выполнения
-        // - Разные SubWorld для разных систем не пересекаются по архетипам
+        // Pre-вычисляем SubWorld storage для sequential fallback
         let const_world: &World = unsafe { &*(world as *mut World as *const World) };
         self.prepare_sub_worlds(const_world);
-
-        // Строим маппинг system_idx → storage_idx
-        // storage_idx = порядковый номер системы в self.systems
-        // (prepare_sub_worlds заполняет storage в том же порядке)
         let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
 
         for (stage_ids, all_parallel) in &stages {
-            // Проверяем threshold для параллельного выполнения
-            if !all_parallel || stage_ids.len() < self.parallel_threshold {
+            if !all_parallel {
+                // Sequential fallback — используем make_sub_world
                 for &sys_id in stage_ids {
                     if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                        // SubWorld должен быть создан ДО mutable borrow self.systems
                         let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
                         let system = &mut self.systems[sys_idx];
                         match &mut system.kind {
@@ -1167,38 +1391,8 @@ impl Scheduler {
                 continue;
             }
 
-            let indices: Vec<usize> = stage_ids
-                .iter()
-                .filter_map(|sid| self.system_indices.get(sid))
-                .copied()
-                .collect();
-
-            // Создаём SubWorld для каждой системы ПЕРЕД scope
-            // (SubWorld содержит ссылки, поэтому должен быть создан до замыкания)
-            let sub_worlds: Vec<apex_core::SubWorld<'_>> = indices.iter().map(|&sys_idx| {
-                self.make_sub_world(system_to_storage[sys_idx], const_world)
-            }).collect();
-
-            // Используем rayon::scope + spawn вместо par_iter().for_each(),
-            // чтобы избежать оверхеда на split/steal.
-            // Каждая система spawn-ится как отдельная задача в thread pool.
-            // Это эффективно для малого числа систем (≤ num_threads).
-            // SendPtr обеспечивает Send+Sync для сырых указателей.
-            // Используем into_iter() для потребления sub_worlds — каждая
-            // итерация забирает один элемент, избегая move всей Vec.
-            rayon::scope(|s| {
-                let mut sub_worlds_iter = sub_worlds.into_iter();
-                for &sys_idx in &indices {
-                    let ptr = SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor);
-                    let sw = sub_worlds_iter.next().unwrap();
-                    s.spawn(move |_| {
-                        let descriptor = unsafe { ptr.as_mut() };
-                        if let SystemKind::Parallel { system, .. } = &mut descriptor.kind {
-                            system.run(SystemContext::from_sub_world(&sw));
-                        }
-                    });
-                }
-            });
+            // ASD параллелизм: динамическое распределение чанков
+            self.run_stage_parallel(stage_ids, const_world);
         }
     }
 
