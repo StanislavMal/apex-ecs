@@ -904,24 +904,23 @@ impl Default for World { fn default() -> Self { Self::new() } }
 /// Слишком маленький → overhead rayon съедает выигрыш.
 /// Слишком большой → мало задач, плохой load balancing.
 ///
-/// 64 — оптимально для малых наборов entity (обеспечивает параллелизм);
-/// для больших наборов размер чанка адаптивно увеличивается.
-///
-/// Можно переопределить через переменную окружения APEX_PAR_CHUNK_SIZE
-/// или через `set_par_chunk_size()` для экспериментов.
-pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+/// Пользовательский максимальный размер чанка для `adaptive_chunk_size`.
+/// 
+/// Если равен 0 (по умолчанию) — используется `DEFAULT_MAX_CHUNK_SIZE` (16384).
+/// Можно переопределить через переменную окружения `APEX_PAR_CHUNK_SIZE` 
+/// или через `set_par_chunk_size()`.
+pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Минимальный размер чанка.
-/// Для малых наборов entity размер чанка может быть меньше MIN_CHUNK_SIZE,
-/// чтобы обеспечить параллелизм (см. adaptive_chunk_size).
-pub const MIN_CHUNK_SIZE: usize = 64;
-/// Максимальный размер чанка (предотвращает слишком крупные чанки).
-pub const MAX_CHUNK_SIZE: usize = 65536;
+// Константы заменены адаптивной логикой в adaptive_chunk_size.
+// MIN_CHUNK_SIZE и MAX_CHUNK_SIZE больше не используются.
+// Оставляем только для обратной совместимости, если нужно.
 
+pub const DEFAULT_MAX_CHUNK_SIZE: usize = 16384;
 /// Вычислить адаптивный размер чанка на основе количества entity.
 ///
-/// Формула: `entity_count / num_threads` — 1 чанк на поток.
-/// Результат ограничен [MIN_CHUNK_SIZE, MAX_CHUNK_SIZE].
+/// Формула: `entity_count / num_threads` (1 чанк на поток),
+/// но не более абсолютного потолка (по умолчанию 16384, или из `PAR_CHUNK_SIZE`).
+/// Для малых миров динамически увеличивается минимальный размер чанка.
 /// num_threads — количество потоков rayon (передаётся из вызывающего кода).
 ///
 /// **Runtime-адаптация:** для малых нагрузок (< 100 entities) динамически
@@ -929,24 +928,37 @@ pub const MAX_CHUNK_SIZE: usize = 65536;
 /// rayon на микро-задачах. Для средних (100–1000) — 32. Для больших — 64.
 pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
     let n = num_threads.max(1);
-    // Динамический минимум: чем меньше сущностей, тем крупнее чанки,
-    // чтобы не плодить микро-задачи на малых наборах данных.
-    let dynamic_min = if entity_count < 100 {
-        128_usize
-    } else if entity_count < 1000 {
-        32_usize
-    } else {
-        MIN_CHUNK_SIZE
-    };
-    // Целевое количество чанков: n (1 чанк на поток)
+
+    // 1. Базовый размер: поровну на каждый поток
     let mut chunk = entity_count / n;
-    // Нижняя граница: dynamic_min предотвращает создание микро-чанков
-    // для малых наборов entity (overhead rayon > выгода параллелизма).
+
+    // 2. Абсолютный потолок: берём из PAR_CHUNK_SIZE (если задан и >0),
+    //    иначе DEFAULT_MAX_CHUNK_SIZE (16384).
+    let absolute_max = {
+        let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+        if user > 0 { user } else { DEFAULT_MAX_CHUNK_SIZE }
+    };
+    if chunk > absolute_max {
+        chunk = absolute_max;
+    }
+
+    // 3. Динамический минимум — чтобы не плодить микро-задачи
+    let dynamic_min = if entity_count < 100 {
+        128
+    } else if entity_count < 1000 {
+        32
+    } else {
+        // Для крупных миров — не меньше 64, но если world очень большой,
+        // не стоит опускаться ниже absolute_max/256 (эвристика).
+        // Пока оставим 64.
+        64
+    };
     if chunk < dynamic_min {
         chunk = dynamic_min;
     }
-    // Верхняя граница: MAX_CHUNK_SIZE
-    chunk.min(MAX_CHUNK_SIZE)
+
+    // 4. Не больше entity_count (если dynamic_min перекрывает)
+    chunk.min(entity_count)
 }
 
 /// Установить размер чанка для par_for_each_component.
@@ -1459,9 +1471,9 @@ mod tests {
     fn adaptive_chunk_size_max_cap() {
         // chunk не превышает MAX_CHUNK_SIZE
         // 1 thread: entity_count / 1 = 131072 > MAX_CHUNK_SIZE → cap
-        assert_eq!(adaptive_chunk_size(MAX_CHUNK_SIZE * 2, 1), MAX_CHUNK_SIZE);
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1), DEFAULT_MAX_CHUNK_SIZE);
         // 8 threads: entity_count / 8 = 16384 < MAX_CHUNK_SIZE → 16384
-        assert_eq!(adaptive_chunk_size(MAX_CHUNK_SIZE * 2, 8), 16384);
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 16384);
     }
 
     #[test]

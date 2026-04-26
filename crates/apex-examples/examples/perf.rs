@@ -1702,8 +1702,13 @@ fn main() {
     println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
     #[cfg(not(feature = "parallel"))]
     println!("Mode:  sequential  (--features parallel для rayon)");
-    println!("PAR_CHUNK_SIZE: {} (установи APEX_PAR_CHUNK_SIZE для изменения)",
-        apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed));
+    let par_chunk_val = apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    if par_chunk_val == 0 {
+        println!("PAR_CHUNK_SIZE: auto (DEFAULT_MAX_CHUNK_SIZE={}) (задай APEX_PAR_CHUNK_SIZE для переопределения)",
+            apex_core::world::DEFAULT_MAX_CHUNK_SIZE);
+    } else {
+        println!("PAR_CHUNK_SIZE: {} (явно задан через APEX_PAR_CHUNK_SIZE)", par_chunk_val);
+    }
     println!();
 
     const N: usize = 100; // → N*1000 entity в большинстве тестов
