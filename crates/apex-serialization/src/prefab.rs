@@ -283,9 +283,9 @@ mod tests {
 
     fn setup_world() -> World {
         let mut world = World::new();
-        world.register_component_serde::<Health>();
-        world.register_component_serde::<Name>();
-        world.register_component_serde::<Position>();
+        world.register_component_serde_json::<Health>();
+        world.register_component_serde_json::<Name>();
+        world.register_component_serde_json::<Position>();
         world
     }
 

@@ -16,6 +16,8 @@ impl std::fmt::Display for Entity {
     }
 }
 
+const NO_LOCATION: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug)]
 pub struct EntityLocation {
     pub archetype_id: crate::archetype::ArchetypeId,
@@ -23,8 +25,40 @@ pub struct EntityLocation {
 }
 
 struct EntityRecord {
-    generation: u32,
-    location:   Option<EntityLocation>,
+    generation:       u32,
+    encoded_location: u64,
+}
+
+impl EntityRecord {
+    #[inline]
+    fn location(&self) -> Option<EntityLocation> {
+        if self.encoded_location == NO_LOCATION {
+            None
+        } else {
+            let row          = (self.encoded_location & 0xFFFF_FFFF) as u32;
+            let archetype_id = (self.encoded_location >> 32) as u32;
+            Some(EntityLocation {
+                archetype_id: crate::archetype::ArchetypeId(archetype_id),
+                row,
+            })
+        }
+    }
+
+    #[inline]
+    fn set_location(&mut self, loc: EntityLocation) {
+        self.encoded_location =
+            (loc.row as u64) | ((loc.archetype_id.0 as u64) << 32);
+    }
+
+    #[inline]
+    fn clear_location(&mut self) {
+        self.encoded_location = NO_LOCATION;
+    }
+
+    #[inline]
+    fn has_location(&self) -> bool {
+        self.encoded_location != NO_LOCATION
+    }
 }
 
 /// Менеджер entity — generational IDs с batch API.
@@ -47,7 +81,7 @@ impl EntityAllocator {
         } else {
             let index = self.next_index;
             self.next_index += 1;
-            self.records.push(EntityRecord { generation: 0, location: None });
+            self.records.push(EntityRecord { generation: 0, encoded_location: NO_LOCATION });
             Entity { index, generation: 0 }
         }
     }
@@ -77,7 +111,7 @@ impl EntityAllocator {
             self.next_index += remaining as u32;
             self.records.resize_with(start + remaining, || EntityRecord {
                 generation: 0,
-                location:   None,
+                encoded_location: NO_LOCATION,
             });
             for i in 0..remaining {
                 entities.push(Entity { index: (start + i) as u32, generation: 0 });
@@ -101,7 +135,7 @@ impl EntityAllocator {
             let record = &mut self.records[entity.index as usize];
             // Проверяем generation только в debug
             debug_assert_eq!(record.generation, entity.generation);
-            record.location = Some(EntityLocation {
+            record.set_location(EntityLocation {
                 archetype_id,
                 row: start_row + i as u32,
             });
@@ -115,7 +149,7 @@ impl EntityAllocator {
         };
         if record.generation != entity.generation { return false; }
         record.generation = record.generation.wrapping_add(1);
-        record.location   = None;
+        record.clear_location();
         self.free_list.push(entity.index);
         true
     }
@@ -124,7 +158,7 @@ impl EntityAllocator {
     pub fn is_alive(&self, entity: Entity) -> bool {
         self.records
             .get(entity.index as usize)
-            .map(|r| r.generation == entity.generation && r.location.is_some())
+            .map(|r| r.generation == entity.generation && r.has_location())
             .unwrap_or(false)
     }
 
@@ -133,14 +167,14 @@ impl EntityAllocator {
         self.records
             .get(entity.index as usize)
             .filter(|r| r.generation == entity.generation)
-            .and_then(|r| r.location)
+            .and_then(|r| r.location())
     }
 
     #[inline]
     pub fn set_location(&mut self, entity: Entity, location: EntityLocation) {
         if let Some(record) = self.records.get_mut(entity.index as usize) {
             if record.generation == entity.generation {
-                record.location = Some(location);
+                record.set_location(location);
             }
         }
     }
@@ -151,7 +185,7 @@ impl EntityAllocator {
 
     pub fn get_by_index(&self, index: u32) -> Option<Entity> {
         let record = self.records.get(index as usize)?;
-        if record.location.is_some() {
+        if record.has_location() {
             Some(Entity { index, generation: record.generation })
         } else {
             None

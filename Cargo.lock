@@ -99,6 +99,7 @@ name = "apex-core"
 version = "0.1.0"
 dependencies = [
  "apex-graph",
+ "bincode",
  "bitvec",
  "glam",
  "log",

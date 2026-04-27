@@ -32,6 +32,11 @@ pub struct Graph<N, W> {
     pub(crate) bfs_visited: Vec<bool>,
     /// Буфер очереди для has_path/bfs — избегает аллокации на каждый вызов.
     pub(crate) bfs_queue: Vec<Index>,
+
+    /// Буфер visited для dfs — избегает аллокации на каждый вызов.
+    pub(crate) dfs_visited: Vec<bool>,
+    /// Буфер стека для dfs — избегает аллокации на каждый вызов.
+    pub(crate) dfs_stack: Vec<Index>,
 }
 
 /// Данные ребра.
@@ -69,6 +74,8 @@ impl<N, W> Graph<N, W> {
             dirty: false,
             bfs_visited: Vec::new(),
             bfs_queue: Vec::new(),
+            dfs_visited: Vec::new(),
+            dfs_stack: Vec::new(),
         }
     }
 

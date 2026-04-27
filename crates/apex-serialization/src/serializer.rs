@@ -618,8 +618,8 @@ mod tests {
     fn setup_world() -> World {
         let mut world = World::new();
         world.register_component::<RenderHandle>();
-        world.register_component_serde::<Position>();
-        world.register_component_serde::<Health>();
+        world.register_component_serde_json::<Position>();
+        world.register_component_serde_json::<Health>();
 
         let e1 = world.spawn_bundle((
             Position { x: 10.0, y: 20.0 },
@@ -644,8 +644,8 @@ mod tests {
 
         let mut restored_world = World::new();
         restored_world.register_component::<RenderHandle>();
-        restored_world.register_component_serde::<Position>();
-        restored_world.register_component_serde::<Health>();
+        restored_world.register_component_serde_json::<Position>();
+        restored_world.register_component_serde_json::<Health>();
 
         // Регистрируем ChildOf, чтобы restore нашёл kind
         let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
@@ -672,8 +672,8 @@ mod tests {
 
         let mut restored_world = World::new();
         restored_world.register_component::<RenderHandle>();
-        restored_world.register_component_serde::<Position>();
-        restored_world.register_component_serde::<Health>();
+        restored_world.register_component_serde_json::<Position>();
+        restored_world.register_component_serde_json::<Health>();
 
         let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
         let c = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
@@ -850,8 +850,8 @@ mod tests {
         // Restore после миграции
         let mut restored_world = World::new();
         restored_world.register_component::<RenderHandle>();
-        restored_world.register_component_serde::<Position>();
-        restored_world.register_component_serde::<Health>();
+        restored_world.register_component_serde_json::<Position>();
+        restored_world.register_component_serde_json::<Health>();
         let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
         let c = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);

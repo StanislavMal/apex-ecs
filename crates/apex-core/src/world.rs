@@ -269,6 +269,11 @@ impl World {
         self.registry.register_serde::<T>()
     }
 
+    /// Зарегистрировать компонент с поддержкой сериализации в JSON-формате.
+    pub fn register_component_serde_json<T: crate::component::Serializable>(&mut self) -> ComponentId {
+        self.registry.register_serde_json::<T>()
+    }
+
     pub fn registry(&self) -> &ComponentRegistry { &self.registry }
 
     pub fn archetypes(&self) -> &[Archetype] { &self.archetypes }

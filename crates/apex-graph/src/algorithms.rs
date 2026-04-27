@@ -154,25 +154,30 @@ impl<N, W> Graph<N, W> {
     /// BFS обход с заданного узла.
     ///
     /// Оптимизация: visited = Vec<bool> по slot-space (быстрее HashSet).
-    pub fn bfs(&self, start: Index) -> Vec<Index> {
+    /// Переиспользует буферы `bfs_visited` и `bfs_queue` из Graph.
+    pub fn bfs(&mut self, start: Index) -> Vec<Index> {
         if self.nodes.get(start).is_none() {
             return Vec::new();
         }
 
         let slot_cap = self.slot_capacity();
-        let mut visited = vec![false; slot_cap];
 
-        let mut queue: Vec<Index> = Vec::new();
+        // Переиспользуем буферы из Graph
+        self.bfs_visited.clear();
+        self.bfs_visited.resize(slot_cap, false);
+        self.bfs_queue.clear();
         let mut head = 0usize;
 
         let start_slot = start.slot() as usize;
-        visited[start_slot] = true;
-        queue.push(start);
+        if start_slot < self.bfs_visited.len() {
+            self.bfs_visited[start_slot] = true;
+        }
+        self.bfs_queue.push(start);
 
         let mut result = Vec::new();
 
-        while head < queue.len() {
-            let node = queue[head];
+        while head < self.bfs_queue.len() {
+            let node = self.bfs_queue[head];
             head += 1;
             result.push(node);
 
@@ -185,12 +190,9 @@ impl<N, W> Graph<N, W> {
                         continue;
                     }
                     let succ_slot = succ.slot() as usize;
-                    if succ_slot >= visited.len() {
-                        continue;
-                    }
-                    if !visited[succ_slot] {
-                        visited[succ_slot] = true;
-                        queue.push(succ);
+                    if succ_slot < self.bfs_visited.len() && !self.bfs_visited[succ_slot] {
+                        self.bfs_visited[succ_slot] = true;
+                        self.bfs_queue.push(succ);
                     }
                 }
             }
@@ -200,24 +202,27 @@ impl<N, W> Graph<N, W> {
     }
 
     /// DFS обход с заданного узла (итеративный, без рекурсии).
-    pub fn dfs(&self, start: Index) -> Vec<Index> {
+    ///
+    /// Переиспользует буферы `dfs_visited` и `dfs_stack` из Graph.
+    pub fn dfs(&mut self, start: Index) -> Vec<Index> {
         if self.nodes.get(start).is_none() {
             return Vec::new();
         }
 
         let slot_cap = self.slot_capacity();
-        let mut visited = vec![false; slot_cap];
-        let mut stack: Vec<Index> = Vec::new();
-        stack.push(start);
+        self.dfs_visited.clear();
+        self.dfs_visited.resize(slot_cap, false);
+        self.dfs_stack.clear();
+        self.dfs_stack.push(start);
 
         let mut result = Vec::new();
 
-        while let Some(node) = stack.pop() {
+        while let Some(node) = self.dfs_stack.pop() {
             let slot = node.slot() as usize;
-            if slot >= visited.len() || visited[slot] {
+            if slot >= self.dfs_visited.len() || self.dfs_visited[slot] {
                 continue;
             }
-            visited[slot] = true;
+            self.dfs_visited[slot] = true;
             result.push(node);
 
             // Чтобы порядок был ближе к рекурсивному DFS,
@@ -230,8 +235,8 @@ impl<N, W> Graph<N, W> {
                         continue;
                     }
                     let succ_slot = succ.slot() as usize;
-                    if succ_slot < visited.len() && !visited[succ_slot] {
-                        stack.push(succ);
+                    if succ_slot < self.dfs_visited.len() && !self.dfs_visited[succ_slot] {
+                        self.dfs_stack.push(succ);
                     }
                 }
             }
@@ -301,7 +306,7 @@ impl<N, W> Graph<N, W> {
     }
 
     /// Все узлы достижимые из start.
-    pub fn reachable_from(&self, start: Index) -> FxHashSet<Index> {
+    pub fn reachable_from(&mut self, start: Index) -> FxHashSet<Index> {
         self.bfs(start).into_iter().collect()
     }
 }

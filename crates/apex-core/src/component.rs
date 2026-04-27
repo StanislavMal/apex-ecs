@@ -109,12 +109,44 @@ pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
 
 /// Создаёт `ComponentSerdeFns` для типа T реализующего `Serializable`.
 ///
-/// Внутри использует `serde_json` как дефолтный формат.
+/// Внутри использует `bincode` как компактный бинарный формат.
 /// Формат можно сменить — достаточно поменять реализацию двух замыканий.
 pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
         serialize_fn: |ptr| {
             // SAFETY: вызывающий гарантирует валидность ptr как *const T
+            let val = unsafe { &*(ptr as *const T) };
+            bincode::serialize(val)
+                .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
+        },
+        deserialize_fn: |bytes| {
+            let val: T = bincode::deserialize(bytes)
+                .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
+            // Упаковываем T в выровненный байтовый буфер для записи в Column.
+            let size = std::mem::size_of::<T>();
+            let mut buf = vec![0u8; size];
+            if size > 0 {
+                // SAFETY: buf достаточного размера, T: Copy-compatible через serde
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &val as *const T as *const u8,
+                        buf.as_mut_ptr(),
+                        size,
+                    );
+                }
+            }
+            std::mem::forget(val);
+            Ok(buf)
+        },
+        format: "bincode",
+    }
+}
+
+/// Создаёт `ComponentSerdeFns` для типа T реализующего `Serializable`
+/// с использованием `serde_json` (текстовый формат для отладки/логов).
+pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
+    ComponentSerdeFns {
+        serialize_fn: |ptr| {
             let val = unsafe { &*(ptr as *const T) };
             serde_json::to_vec(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
@@ -122,11 +154,9 @@ pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
         deserialize_fn: |bytes| {
             let val: T = serde_json::from_slice(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
-            // Упаковываем T в выровненный байтовый буфер для записи в Column.
             let size = std::mem::size_of::<T>();
             let mut buf = vec![0u8; size];
             if size > 0 {
-                // SAFETY: buf достаточного размера, T: Copy-compatible через serde
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         &val as *const T as *const u8,
@@ -190,6 +220,20 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(&id.0) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
+            }
+        }
+        id
+    }
+
+    /// Зарегистрировать компонент с поддержкой сериализации (JSON-формат).
+    ///
+    /// Если компонент уже зарегистрирован — только добавляет serde-функции,
+    /// ID и layout не меняются.
+    pub fn register_serde_json<T: Serializable>(&mut self) -> ComponentId {
+        let id = self.register::<T>();
+        if let Some(info) = self.by_id.get_mut(&id.0) {
+            if info.serde.is_none() {
+                info.serde = Some(make_serde_fns_json::<T>());
             }
         }
         id

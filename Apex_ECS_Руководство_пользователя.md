@@ -320,6 +320,8 @@ let count = Query::<Read<Health>>::new(&world)
 ```
 
 > **Примечание:** `Query::new()` собирает список подходящих архетипов при создании. Для горячих путей используйте `CachedQuery`, который переиспользует этот список.
+>
+> **Оптимизация cache hit (v0.1.0):** `CachedQuery` использует `SmallVec<[ComponentId; 8]>` в качестве ключа кэша. При cache hit (наиболее частый сценарий в горячем цикле) **не происходит heap-аллокации** — ключ хранится на стеке. Реализовано через типаж `Borrow<[ComponentId]>`, позволяющий поиску в `HashMap` идти по заимствованному срезу без создания `Vec`.
 
 ### 4.3 `CachedQuery`
 
@@ -395,7 +397,11 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 ### 5.2 Events
 
-События используют двойную буферизацию: `current` (текущий тик) и `previous` (прошлый тик). Вызов `world.tick()` переключает буферы.
+События используют двойную буферизацию: `current` (текущий тик, буфер `pending`) и `previous` (прошлый тик, буфер `events`). Вызов `world.tick()` переключает буферы.
+
+Внутренний тип очереди — [`TrackedEventQueue<T>`](crates/apex-core/src/events.rs:33) (он же `EventQueue<T>` — устаревший alias). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
+
+#### 5.2.1 Базовая отправка и чтение (старый API)
 
 ```rust
 #[derive(Clone, Copy)]
@@ -436,6 +442,111 @@ for ev in world.events::<DamageEvent>().iter_all() { /* ... */ }
 // Переключение буферов (вызывать раз в кадр):
 world.tick(); // current → previous, новый current пустой
 ```
+
+#### 5.2.2 Per-reader чтение (новый API)
+
+[`TrackedEventQueue<T>`](crates/apex-core/src/events.rs:33) поддерживает произвольное количество независимых читателей, каждый со своим курсором [`EventCursor`](crates/apex-core/src/events.rs:365).
+
+```rust
+// Получаем мутабельную ссылку на очередь:
+let queue = world.events_mut::<DamageEvent>();
+
+// Создаём читателя:
+let reader_a = queue.add_reader();   // -> EventCursor
+let reader_b = queue.add_reader();
+
+// Отправляем несколько событий:
+queue.send(DamageEvent { target: e1, amount: 10.0 });
+queue.send(DamageEvent { target: e2, amount: 25.0 });
+
+// Каждый читатель видит только непрочитанные события:
+for ev in queue.iter(&reader_a) {
+    println!("reader_a: {:?}", ev);
+}
+
+// Ручное продвижение курсора:
+queue.advance_reader_mut(&reader_a);
+
+// reader_b всё ещё видит все события (его курсор не двигали):
+for ev in queue.iter(&reader_b) { /* ... */ }
+
+// Удаление читателя:
+queue.remove_reader(reader_b);
+
+// Количество непрочитанных событий в буфере:
+let n = queue.len_pending();
+```
+
+#### 5.2.3 RAII-чтение с автоматическим продвижением (`EventReadGuard`)
+
+[`EventReadGuard<T>`](crates/apex-core/src/events.rs:306) — RAII-обёртка, которая при Drop автоматически продвигает курсор до конца буфера. Исключает забытые `advance_reader_mut()`.
+
+```rust
+let queue = world.events_mut::<DamageEvent>();
+
+// read() возвращает EventReadGuard — курсор продвинется при выходе из scope:
+{
+    let guard = queue.read(&reader_a);  // -> EventReadGuard<DamageEvent>
+    for ev in guard.iter() {
+        process(ev);
+    }
+} // ← здесь cursor автоматически продвигается
+
+// Можно использовать Deref к срезу:
+let guard = queue.read(&reader_a);
+if !guard.is_empty() {
+    let first: &DamageEvent = &guard[0];
+}
+```
+
+#### 5.2.4 Просмотр без продвижения (`PeekGuard`)
+
+[`PeekGuard<T>`](crates/apex-core/src/events.rs:346) — обёртка над `EventReadGuard`, которая **не** продвигает курсор при Drop.
+
+```rust
+let queue = world.events_mut::<DamageEvent>();
+
+// Посмотреть события, но не отмечать их как прочитанные:
+let peek = queue.read(&reader_a).peek();  // -> PeekGuard<DamageEvent>
+println!("{} pending events", peek.len());
+// курсор не сдвинулся — следующий read() покажет те же события
+```
+
+#### 5.2.5 Пакетная отправка (`send_batch`)
+
+Для массовой отправки событий используйте [`send_batch`](crates/apex-core/src/events.rs:64):
+
+```rust
+let queue = world.events_mut::<DamageEvent>();
+
+// Вектор событий:
+let batch: Vec<DamageEvent> = (0..100).map(|i| {
+    DamageEvent { target: entity, amount: i as f32 }
+}).collect();
+queue.send_batch(batch);
+
+// Или итератор:
+queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 }));
+```
+
+#### 5.2.6 Сводка методов `TrackedEventQueue<T>`
+
+| Метод | Описание |
+|-------|----------|
+| `send(event)` | Отправить одно событие в текущий тик |
+| `send_batch(events)` | Отправить пачку событий (любой `IntoIterator`) |
+| `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
+| `remove_reader(reader_id)` | Удалить читателя |
+| `iter(reader_id) -> &[T]` | Непрочитанные события для reader (без продвижения курсора) |
+| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
+| `advance_reader_mut(reader_id)` | Ручное продвижение курсора до конца буфера |
+| `len_pending() -> usize` | Количество событий в буфере записи |
+| `len_readable() -> usize` | Количество событий, доступных для чтения |
+| `clear()` | Очистить оба буфера и сбросить все курсоры |
+| `iter_previous()` | Итерация по буферу чтения (старый API) |
+| `iter_current()` | Итерация по буферу записи (старый API) |
+| `iter_all()` | Итерация по всем событиям (старый API) |
+| `update()` | Переключить буферы (вызывается автоматически в `world.tick()`) |
 
 ---
 
@@ -1557,28 +1668,47 @@ cargo run --release --features parallel
 
 | Операция | Throughput | Масштабирование |
 |----------|:----------:|:---------------:|
-| `spawn_many_silent` (1 comp) | **35.6 M ops/s** | 🟢 O(N) |
-| `spawn_many_silent` (4 comp) | **15.6 M ops/s** | 🟢 O(N) |
-| `Query::for_each_component` | **143 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each_component` | **141.6 M ops/s** | 🟢 O(N) |
-| `Query<(Read, Write)>` | **127.6 M ops/s** | 🟢 O(N) |
-| insert component | **12.2 M ops/s** | 🟢 O(N) |
-| despawn | **47.5 M ops/s** | 🟢 O(N) |
-| resource read | **291 M ops/s** | 🟢 O(1) |
-| resource write | **396 M ops/s** | 🟢 O(1) |
-| event send + read | **152 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (1 comp) | **35.4 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (4 comp) | **15.7 M ops/s** | 🟢 O(N) |
+| `Query::for_each_component` | **145.8 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each_component` | **150.0 M ops/s** | 🟢 O(N) |
+| `Query<(Read, Write)>` | **125.7 M ops/s** | 🟢 O(N) |
+| insert component | **12.3 M ops/s** | 🟢 O(N) |
+| despawn | **52.5 M ops/s** | 🟢 O(N) |
+| resource read | **298 M ops/s** | 🟢 O(1) |
+| resource write | **405 M ops/s** | 🟢 O(1) |
+| event send + iter_current | **165 M ops/s** | 🟢 O(N) |
+| event send → tick → iter_prev | **117 M ops/s** | 🟢 O(N) |
+| event send_batch (100) | **5 882 M ops/s** | 🟢 O(N) |
 
 **Параллельное ускорение (speedup = seq/par, 12 потоков):**
 
 | Сценарий | 100k | 1000k | Комментарий |
 |----------|:----:|:-----:|-------------|
-| `par_for_each` CPU-bound (atan2+cos) | 1.56x | **3.98x** | 🟢 Растёт с N |
-| `par_for_each` memory-bound (sqrt) | 0.23x | 1.08x | 🟡 Memory bound |
+| `par_for_each` CPU-bound (atan2+cos) | 1.64x | **4.06x** | 🟢 Растёт с N |
+| `par_for_each` memory-bound (sqrt) | 0.23x | 1.11x | 🟡 Memory bound |
 | Межсистемный, 2 CPU-bound | 1.07x | 1.07x | 🔴 Memory bound |
-| Solo 8 систем | 3.79x | **4.63x** | 🟢 Растёт с N |
-| Solo 12 систем | 4.02x | 4.65x | 🟡 Насыщение на 8 потоках |
+| Solo 8 систем | 4.09x | **4.80x** | 🟢 Растёт с N |
+| Solo 12 систем | 4.22x | 4.72x | 🟡 Насыщение на 8 потоках |
 
-> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **3.98x ускорение**. Межсистемный параллелизм упирается в пропускную способность памяти (L3 кеш 18 MB) — это архитектурное ограничение CPU.
+> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send+iter_current (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
+
+### 14.8 Применённые оптимизации
+
+В версии 0.1.0 применён ряд оптимизаций внутренних структур данных:
+
+| Оптимизация | Суть | Эффект |
+|------------|------|--------|
+| **QueryCache zero-copy key** (`SmallVec<[ComponentId; 8]>`) | Ключ кэша хранится на стеке, heap-аллокация только при >8 компонентах | Ускорение cache-hit (горячий путь) |
+| **Column::grow начальная ёмкость 16** (было 64) | Меньше начального overshoot для небольших архетипов | Экономия памяти на старте |
+| **ArchetypeMask::iter_ones — bit manipulation** | Замена `filter_map` на `trailing_zeros()` | Ускорение итерации по маскам архетипов |
+| **Bundle::component_ids — SmallVec** | `SmallVec<[ComponentId; 8]>` вместо `Vec` | Без heap-аллокации для типичных бандлов |
+| **SparseSet adaptive backend** | Auto-switch: Dense (Vec) для плотных индексов, Sparse (HashMap) для разреженных | Переключение при `entity_index > dense.len() * 4 && entity_index > 1024` |
+| **EntityAllocator — pack EntityLocation в u64** | `encoded_location: u64` с битовой упаковкой (нижние 32 бита — row, верхние — archetype_id); `u64::MAX` как sentinel для None | Уменьшение размера EntityRecord и количества кеш-миссов |
+| **propagate_transforms HashSet** | Сбор dirty entity в HashSet вместо повторных world-запросов | Ускорение propagation при большом числе иерархий |
+| **EventReadGuard RAII** | Guard автоматически продвигает курсор при Drop, исключая ручное управление курсором | Упрощение кода, устранение забытых `advance_reader_mut()` |
+| **bincode по умолчанию** | `make_serde_fns` и Prefab-десериализация используют bincode вместо JSON | Ускорение runtime-сериализации в ~1.5-2x |
+| **Graph::bfs/dfs buffer reuse** | Переиспользование `visit_order`, `stack`, `visited` между вызовами | Устранение повторных аллокаций в планировщике |
 
 ---
 

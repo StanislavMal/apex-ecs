@@ -1181,3 +1181,112 @@ impl EntityAllocator {
 1 → 2 → 7 → 9 (все минимального риска, высокий ROI)
 → 3 → 8 → 4 (низкий риск, заметный выигрыш)
 → 6 → 10 → 11 → 5 (требуют тестирования совместимости)
+
+---
+
+## Нюансы реализации (applied patches)
+
+### Патч 1 — QueryCache
+✅ **Статус:** Применён без отклонений.
+- `QueryCacheKey(SmallVec<[ComponentId; 8]>)` с `Borrow<[ComponentId]>` работает как описано.
+- `get_or_compute` теперь делает zero-copy lookup через `map.get_mut(key)` на cache hit.
+- Аллокация `QueryCacheKey` происходит только при cache miss.
+- `invalidate_for` использует `key.0.contains(&changed_cid)` — O(n) по длине ключа, что нормально для типичных 1–8 component ID.
+
+### Патч 2 — AccessDescriptor
+✅ **Статус:** Применён без отклонений.
+- `reads.clear()` + `reads.shrink_to_fit()` и `writes.clear()` + `writes.shrink_to_fit()` добавлены в конец `assign_masks()`.
+- `reads_event` / `writes_event` оставлены как есть (нужны для event-конфликтов).
+- `dedup_push` с порогом `< 8` для линейного поиска — работает, никаких конфликтов с существующими тестами.
+
+### Патч 7 — Column::grow
+✅ **Статус:** Применён без отклонений.
+- Формула `(256 / self.item_size.max(1)).clamp(4, 64)` даёт:
+  - `size=1` (u8) → 64 элемента
+  - `size=4` (f32, u32) → 64 элемента
+  - `size=8` (u64, Entity) → 32 элемента
+  - `size=64` (Mat4) → 4 элемента
+- `reserve()` изменён с `.max(64)` на `.max(4)` — минимальная ёмкость теперь 4 вместо 64.
+
+### Патч 9 — ArchetypeMask::iter_ones
+✅ **Статус:** Применён без отклонений.
+- `BitIter` с `trailing_zeros()` и `x & (x - 1)` работает как описано.
+- Итерация O(popcount) вместо O(64) на чанк.
+- В `access.rs` дополнительно понадобился импорт `BitIter` (локальная структура в том же файле).
+
+### Патч 3 — propagate_transforms
+✅ **Статус:** Применён, потребовался импорт `FxHashSet`.
+- Добавлено поле `dirty_set: FxHashSet<u32>` в `TransformScratch`.
+- Потребовался импорт `use rustc_hash::FxHashSet;` в `transform.rs`.
+- Замена `world.get::<TransformDirty>(entity).is_some()` → `scratch.dirty_set.contains(&entity.index)` убрала world lookup в горячем цикле DFS.
+- `dirty_set` поддерживается актуальным: insert при сборе dirty, remove при обработке, insert при каскадировании dirty на children.
+- **Тесты:** все тесты transform проходят.
+
+### Патч 8 — Bundle::component_ids
+✅ **Статус:** Применён без отклонений.
+- `component_ids()` возвращает `SmallVec<[ComponentId; 8]>` вместо `Vec<ComponentId>`.
+- Макрос `impl_bundle!` обновлён: `smallvec::smallvec![]` вместо `vec![]`.
+- Все call sites (`spawn_bundle`, `spawn_many_inner`) работают через `&[ComponentId]` — deref от `SmallVec` срабатывает автоматически.
+- **Сборка:** `cargo build` (весь workspace) — OK.
+
+### Патч 4 — TrackedEventQueue / EventReadGuard
+✅ **Статус:** Применён без отклонений.
+- `EventReadGuard` — RAII-обёртка, продвигает курсор на `Drop` через `self.queue.advance_reader_mut(&self.reader_id)`.
+- `PeekGuard` — обёртка, **не** продвигающая курсор на Drop.
+- `read()` метод на `TrackedEventQueue` создаёт guard.
+- Существующие методы `iter()`, `advance_reader_mut()`, `read_and_advance()` сохранены для обратной совместимости.
+- **Тесты:** все тесты events проходят.
+
+### Патч 6 — make_serde_fns (bincode)
+✅ **Статус:** Применён, потребовались дополнительные изменения в тестах и экспортах.
+- **Нюанс:** тесты `apex-serialization` используют JSON-формат для префабов и снэпшотов. Пришлось:
+  - Добавить `make_serde_fns_json<T>()` — JSON-версия для human-readable export.
+  - Добавить `register_serde_json<T>()` в `ComponentRegistry`.
+  - Добавить `register_component_serde_json<T>()` в `World`.
+  - Экспортировать `make_serde_fns_json` из `lib.rs`.
+  - Перевести `apex-serialization` (prefab, serializer, snapshot) на `register_component_serde_json`.
+- `bincode = { workspace = true }` добавлен в `crates/apex-core/Cargo.toml`.
+- `make_serde_fns` использует `bincode::serialize` / `bincode::deserialize` с форматом `"bincode"`.
+- **Сборка:** `cargo build --package apex-core` — OK.
+- **Тесты:** `cargo test --package apex-serialization --lib` — 28/28 passed.
+
+### Патч 10 — Graph::bfs/dfs — переиспользование буферов
+✅ **Статус:** Применён, потребовалось изменение сигнатуры `&self` → `&mut self`.
+- Добавлены поля `dfs_visited: Vec<bool>` и `dfs_stack: Vec<Index>` в структуру [`Graph<N, W>`](crates/apex-graph/src/lib.rs:16).
+- Инициализируются в [`Graph::new()`](crates/apex-graph/src/lib.rs:67) с `Vec::with_capacity(64)`.
+- `bfs()` переиспользует `self.bfs_visited`/`self.bfs_queue` вместо локальных `vec![]` — fill/reset pattern.
+- `dfs()` аналогично переиспользует `self.dfs_visited`/`self.dfs_stack`.
+- **Сигнатура изменена:** `bfs(&self, start)` → `bfs(&mut self, start)`, `dfs(&self)` → `dfs(&mut self)`, `reachable_from(&self)` → `reachable_from(&mut self)`.
+- **Внешние callers не затронуты:** `bfs`/`dfs`/`reachable_from` вызываются только внутри [`algorithms.rs`](crates/apex-graph/src/algorithms.rs) из методов `has_path`, `topological_sort`, `parallel_levels`, которые уже принимают `&mut self` (строят граф перед обходом).
+- **Сборка:** `cargo build --package apex-graph` — OK.
+
+### Патч 11 — EntityAllocator — pack EntityLocation в u64
+✅ **Статус:** Применён без отклонений.
+- `EntityRecord` изменён: `Option<EntityLocation>` → `encoded_location: u64`.
+- `NO_LOCATION: u64 = u64::MAX` — sentinel-значение для `None`.
+- Битовое кодирование: **нижние 32 бита** = `row`, **верхние 32 бита** = `archetype_id.0`.
+- Методы на [`EntityRecord`](crates/apex-core/src/entity.rs:27):
+  - [`location()`](crates/apex-core/src/entity.rs:34) — `Some(EntityLocation { archetype_id: ArchetypeId(archetype_id), row })` если `encoded_location != NO_LOCATION`, иначе `None`.
+  - [`set_location()`](crates/apex-core/src/entity.rs:48) — упаковка `(loc.archetype_id.0 as u64) << 32 | loc.row as u64`.
+  - [`clear_location()`](crates/apex-core/src/entity.rs:53) — `self.encoded_location = NO_LOCATION`.
+  - [`has_location()`](crates/apex-core/src/entity.rs:59) — `self.encoded_location != NO_LOCATION`.
+- Все методы `EntityAllocator` обновлены: `allocate`, `free`, `is_alive`, `get_location`, `set_location`, `allocate_batch`, `set_locations_batch`.
+- **Ограничение:** максимум 2³² archetypes и 2³² rows — более чем достаточно для ECS.
+- **Сборка:** `cargo build --package apex-core` — OK.
+
+### Патч 5 — SparseSet — adaptive backend
+✅ **Статус:** Применён, потребовались `unsafe` и `SparseIterMut`.
+- Полная замена реализации: [`enum SparseSetInner<T>`](crates/apex-core/src/storage/sparse_set.rs:18) с двумя вариантами:
+  - **`Dense`** — оригинальный dense-бекенд: `{ sparse: Vec<u32>, dense: Vec<u32>, data: Vec<T> }`. Используется по умолчанию.
+  - **`Sparse`** — hashmap для разреженных индексов: `{ map: FxHashMap<u32, T>, dense: Vec<u32> }`. Включается автоматически при пороге.
+- **Порог переключения** Dense → Sparse: `entity_index > dense.len() * 4` **И** `entity_index > 1024`. При вставке элемента, чей индекс значительно (в 4×) превышает размер dense-массива и больше 1024, бекенд конвертируется.
+- **Конверсия:** строит `FxHashMap` из пар `(dense[i], data[i])` через zip-итератор, затем переключает вариант.
+- **`SparseIterMut`** — отдельная структура с `unsafe` для корректной работы `iter_mut` в Sparse-варианте. Rust borrow checker не может выразить `Iterator<Item = (u32, &mut T)>` для `HashMap::iter_mut()` без unsafe, т.к. у `HashMap` нет детерминированного порядка и borrow на self конфликтует.
+- `iter_mut` для Sparse использует `std::mem::take(&mut self.dense)` — временно забирает dense-вектор, чтобы разорвать borrow на self.
+- `values()` и `values_mut()` возвращают `Either`-итераторы (`EitherIterV`/`EitherIterVM`) для диспетчеризации по вариантам.
+- **Тесты:** 3 теста:
+  - `test_sparse_set` — базовая вставка/удаление/получение.
+  - `test_sparse_set_adaptive_switch` — проверка переключения на Sparse при индексе > 1024.
+  - `test_sparse_set_iter_values` — итерация values()/values_mut(), len(), contains().
+- **Сборка:** `cargo build --package apex-core` — OK.
+- **Тесты:** `cargo test --package apex-core` — 3/3 passed.

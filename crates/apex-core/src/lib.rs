@@ -16,7 +16,7 @@ pub mod transform;
 pub mod world;
 
 pub use access::AccessDescriptor;
-pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde_fns};
+pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
 pub use entity::Entity;
 pub use events::{EventQueue, EventRegistry};
 pub use resources::ResourceMap;
