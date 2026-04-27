@@ -572,6 +572,14 @@ sched.add_dependency(stats_id,   despawn_id); // stats после despawn
 // Компиляция — строит граф, проверяет циклы, группирует в Stage:
 sched.compile().expect("circular dependency detected");
 
+> **`compile_with_world()`:** Начиная с v0.1.0, доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
+>
+> ```rust
+> sched.compile_with_world(&world).expect("circular dependency detected");
+> ```
+>
+> Разница с `compile()`: `compile_with_world()` также вызывает `populate_type_names(world.registry())`, что позволяет `debug_plan_verbose()` показывать реальные имена компонентов (например, `Position` вместо `<component>`). Вызывайте его после регистрации всех систем и компонентов, но перед первым `run()`.
+
 // Диагностика плана:
 println!("{}", sched.debug_plan());
 
@@ -613,8 +621,14 @@ fn run(&mut self, ctx: SystemContext<'_>) {
         .par_for_each_component(|(v, p)| {
             /* выполняется на нескольких потоках */
         });
+
+    // Thread-local Commands (начиная с v0.1.0):
+    ctx.commands().despawn(entity);
+    ctx.commands().insert(entity, NewComponent { value: 42 });
 }
 ```
+
+> **`ctx.commands()` (начиная с v0.1.0):** Возвращает `&mut Commands` для текущего потока. В параллельных системах каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. В последовательном режиме возвращается статическая заглушка. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
 
 ---
 
@@ -697,7 +711,19 @@ world.remove_relation(child, ChildOf, parent);
 world.despawn_recursive(ChildOf, root); // удаляет root + всех потомков
 ```
 
-### 8.2 Кастомный `RelationKind`
+### 8.1.1 Массовое добавление Relations
+
+```rust
+// Массовое добавление одинаковой relation от множества субъектов к одному target.
+// Оптимизировано для создания иерархий (например, тайловые карты).
+// Все subjects группируются по текущему архетипу и перемещаются за один проход.
+let subjects = vec![entity1, entity2, entity3];
+world.add_relation_batch(subjects, ChildOf, parent);
+```
+
+> **Производительность:** При создании иерархии 1000 объектов `add_relation_batch` выполняет 1 архетипный переход на группу вместо 1000 отдельных переходов. Используйте вместо цикла `add_relation()` при пакетном создании связей.
+
+### 8.2
 
 ```rust
 // Создание своего типа связи:
@@ -712,7 +738,7 @@ impl RelationKind for Targets {
 world.add_relation(archer, Targets, goblin);
 ```
 
-### 8.3 Query по Relations
+### 8.3
 
 ```rust
 // Найти всех entity с ChildOf-связью к конкретному parent:
@@ -1305,7 +1331,7 @@ handle.join().unwrap();
 
 ### 13.1 Параллельный запуск систем
 
-Планировщик автоматически группирует совместимые Par-системы в одну Stage и запускает их параллельно через Rayon.
+Планировщик автоматически группирует совместимые Par-системы в одну Stage и запускает их параллельно через Rayon. Начиная с v0.1.0, используется алгоритм **ASD (Adaptive Scope Distribution)** — единый адаптивный механизм, заменяющий два раздельных режима (per-system scope + intra-system chunking).
 
 ```toml
 # Включение параллелизма (Cargo.toml):
@@ -1317,6 +1343,22 @@ parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 # Запуск:
 cargo run --features parallel
 ```
+
+**Как работает ASD:**
+
+```
+target_chunk = max(total_entity_count / num_workers / 2, 64)
+
+for each system:
+    if arch_indices.len() <= 1 || entity_count <= target_chunk:
+        → 1 задача (per-system scope, без ranges — zero overhead)
+    else:
+        → N задач (чанки размером ~target_chunk), сортировка по archetype_id
+```
+
+- Мало entity → per-system scope (одна задача на систему, zero overhead)
+- Много entity → чанки заполняют все ядра
+- Запуск через `rayon::scope` + `s.spawn(|_| ...)` (не `par_iter` — избегает двойного chunking Rayon)
 
 Правила параллелизма — аналог Rust borrow checker:
 
@@ -1334,11 +1376,31 @@ cargo run --features parallel
 
 1. **Archetype-level sharing.** Параллельные системы получают `SubWorld` — shared borrow на уровне архетипов. Rayon гарантирует, что два `SubWorld` не перекрываются по конфликтующим архетипам (аналог borrow checker, но на stage-уровне).
 2. **Deferred structural changes.** `Commands::apply()` и `DeferredQueue::apply()` вызываются вне параллельного контекста. Это значит, что insert/remove не может произойти одновременно с параллельным чтением.
-3. **Per-system Commands.** Каждая параллельная система получает собственный экземпляр `Commands` (не `Sync`) — conflicts нет по определению.
+3. **Thread-local Commands (v0.1.0).** Каждая параллельная система автоматически получает собственный экземпляр `Commands` через `ctx.commands()` — не нужно создавать вручную. Команды применяются после каждого Stage.
+
+**Результаты ASD (12 потоков, i5-12400F):**
+
+| Сценарий | До ASD | ASD | Ускорение |
+|---|---|---|---|
+| 12 solo систем | 2.03x | **3.91x** | +93% |
+| 2 CPU-bound (shared arch) | 0.36x | **1.10x** | +206% |
+| Pipeline sequential barrier | 0.35x | **0.92x** | +163% |
 
 ### 13.2 Параллельная итерация внутри системы
 
-`par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128 для <100 entities, 32 для 100–1000, 64 для ≥1000).
+`par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798):
+
+```
+chunk = entity_count / max(num_threads, 1)
+# Абсолютный максимум — пользовательская настройка или 16384
+if chunk > MAX_CHUNK_SIZE → chunk = MAX_CHUNK_SIZE
+# Динамический минимум:
+if   entity_count < 100   → min = 128   # очень мало entity → крупные чанки
+elif entity_count < 1000  → min = 32    # средний размер → умеренное дробление
+else                      → min = 64    # много entity → баланс
+if chunk < min → chunk = min
+chunk = min(chunk, entity_count)
+```
 
 ```rust
 impl ParSystem for PhysicsSystem {
@@ -1358,7 +1420,9 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 });
 ```
 
-> **Примечание:** После фазы 5 размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798). Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
+> **Настройка `MAX_CHUNK_SIZE`:** По умолчанию 16384. Можно изменить через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`. Увеличение уменьшает число задач (меньше overhead), уменьшение — более равномерная загрузка ядер.
+
+> **Примечание:** Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
 
 ### 13.3 Row-level параллельный SubWorld
 
@@ -1386,7 +1450,7 @@ sub_world.par_for_each_row(|_row| {
 });
 ```
 
-> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют [`compute_par_chunks`](crates/apex-core/src/par_utils.rs:14) — размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128 для <100 entities, 32 для 100–1000, 64 для ≥1000). Дают выигрыш при CPU-bound нагрузках, когда chunk-size достаточно велик для амортизации overhead Rayon.
+> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют [`compute_par_chunks`](crates/apex-core/src/par_utils.rs:14) — размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798) (см. [раздел 13.2](#132-параллельная-итерация-внутри-системы)).
 
 ### 13.4 Ограничения параллелизма
 
@@ -1455,7 +1519,7 @@ impl ParSystem for ScriptedMovement {
 ### 14.5 Intra-system Parallelism
 
 `par_for_each_component` и `par_for_each` на `Query`/`CachedQuery` дают реальный прирост только когда:
-- **Размер чанка** — вычисляется динамически [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): `entity_count / num_threads`, с адаптивным минимумом (128/32/64) и верхним лимитом [`MAX_CHUNK_SIZE`](crates/apex-core/src/world.rs:797) (65536). Убедитесь, что chunk-size достаточен для амортизации overhead Rayon.
+- **Размер чанка** — вычисляется динамически [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): трёхуровневый минимум (128/32/64) и верхний лимит 16384 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
 
 ```rust
@@ -1728,6 +1792,7 @@ fn main() {
 | `query_relation::<K, Q>(kind, target)` | Query по relation |
 | `query_wildcard::<K, Q>(kind)` | Query по relation (любой target) |
 | `add_relation(s, kind, t)` | Создать связь subject→target |
+| `add_relation_batch(subjects, kind, target)` | Массовое добавление relation (оптимизировано) |
 | `has_relation(s, kind, t)` | Проверить наличие связи |
 | `get_relation_target(s, kind)` | Получить target связи → `Option<Entity>` |
 | `children_of(kind, parent)` | Итерация по дочерним entity |
@@ -1752,10 +1817,23 @@ fn main() {
 | `add_system(name, f)` | Добавить Sequential систему |
 | `add_dependency(a, b)` | `a` выполняется после `b` |
 | `compile()` | Скомпилировать план → `Result` |
+| `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |
 | `debug_plan()` | Краткий план выполнения |
 | `debug_plan_verbose()` | Подробная диагностика плана |
+
+### SystemContext API (раздел 6.6)
+
+| Метод | Описание |
+|---|---|
+| `query::<Q>()` | CachedQuery по типу Q |
+| `resource::<T>()` | Чтение ресурса (panic если нет) |
+| `resource_mut::<T>()` | Изменение ресурса |
+| `event_reader::<T>()` | Чтение событий |
+| `event_writer::<T>()` | Запись событий |
+| `entity_count()` | Количество entity |
+| **`commands()`** | Thread-local Commands (v0.1.0) |
 
 ### Commands API
 
