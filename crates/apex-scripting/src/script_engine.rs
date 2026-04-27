@@ -36,7 +36,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -80,6 +80,8 @@ pub struct ScriptEngine {
     script_dir:     Option<PathBuf>,
     watcher:        Option<Box<dyn Watcher>>,
     watch_rx:       Option<mpsc::Receiver<notify::Result<Event>>>,
+    /// Для debounce хот-релоада: имя_скрипта → время последней перезагрузки
+    last_reload:    HashMap<String, Instant>,
     /// Обработчики spawn: type_name → fn(dynamic, entity, world)
     spawn_appliers: HashMap<String, SpawnApplierFn>,
     /// Накопленные spawn-запросы (перемещаются из ctx после run)
@@ -115,6 +117,7 @@ impl ScriptEngine {
             script_dir:     None,
             watcher:        None,
             watch_rx:       None,
+            last_reload:    HashMap::new(),
             spawn_appliers: HashMap::new(),
             spawn_queue:    Vec::new(),
         }
@@ -578,8 +581,24 @@ impl ScriptEngine {
         changed_paths.sort();
         changed_paths.dedup();
 
-        for path in changed_paths {
-            self.reload_file(&path);
+        let now = Instant::now();
+        let debounce = Duration::from_millis(50);
+
+        for path in &changed_paths {
+            let name = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None    => continue,
+            };
+
+            // DEBOUNCE: если файл перезагружался менее 50ms назад — пропускаем
+            if let Some(last) = self.last_reload.get(&name) {
+                if now.duration_since(*last) < debounce {
+                    continue;
+                }
+            }
+
+            self.reload_file(path);
+            self.last_reload.insert(name, now);
         }
     }
 

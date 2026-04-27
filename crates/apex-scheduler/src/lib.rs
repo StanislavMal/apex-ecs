@@ -649,6 +649,15 @@ impl Scheduler {
     /// Также вычисляет для каждой системы индексы архетипов, которые ей нужны
     /// (для создания SubWorld в run_hybrid_parallel).
     pub fn compile(&mut self) -> Result<(), SchedulerError> {
+        if self.type_names.is_empty() {
+            log::debug!(
+                "Scheduler::compile: type_names пуст. \
+                 Вызовите populate_type_names(&world.registry()) или \
+                 compile_with_world(&world) для отображения имён компонентов \
+                 в debug_plan_verbose()"
+            );
+        }
+
         if self.graph_dirty {
             // Инкрементальное обновление: добавляем только новые узлы и рёбра
             self.add_new_nodes_and_edges()?;
@@ -729,6 +738,24 @@ impl Scheduler {
 
         self.execution_plan = Some(ExecutionPlan { stages, flat_order });
         Ok(())
+    }
+
+    /// Скомпилировать расписание, предварительно заполнив имена компонентов.
+    ///
+    /// Эквивалентно вызову `populate_type_names(world.registry())` затем `compile()`.
+    /// После этого `debug_plan_verbose()` будет показывать реальные имена компонентов.
+    ///
+    /// # Пример
+    ///
+    /// ```ignore
+    /// let mut sched = Scheduler::new();
+    /// // ... добавляем системы ...
+    /// sched.compile_with_world(&world).expect("schedule error");
+    /// println!("{}", sched.debug_plan_verbose()); // с именами компонентов!
+    /// ```
+    pub fn compile_with_world(&mut self, world: &World) -> Result<(), SchedulerError> {
+        self.populate_type_names(world.registry());
+        self.compile()
     }
 
     /// Вычислить для каждой системы индексы архетипов, которые ей нужны.
@@ -1617,10 +1644,10 @@ impl Scheduler {
                     match &s.kind {
                         SystemKind::Parallel { access, .. } => {
                             let reads: Vec<_>  = access.reads.iter()
-                                .map(|tid| format!("{:?}", tid))
+                                .map(|tid| component_type_name(*tid, &self.type_names))
                                 .collect();
                             let writes: Vec<_> = access.writes.iter()
-                                .map(|tid| format!("{:?}", tid))
+                                .map(|tid| component_type_name(*tid, &self.type_names))
                                 .collect();
                             out.push_str(&format!(
                                 "  - {} [par | R:{} W:{}]\n",
@@ -1940,6 +1967,36 @@ mod tests {
         assert!(plan.contains("sequential"),  "должен быть sequential Stage");
         assert!(plan.contains("Conflict"),    "должен показывать конфликты");
         assert!(plan.contains("Summary"),     "должен показывать summary");
+    }
+
+    #[test]
+    fn compile_with_world_shows_component_names() {
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_component::<Vel>();
+
+        // Система, использующая Pos и Vel — их имена появятся в reads/writes
+        struct MovementSystem;
+        impl ParSystem for MovementSystem {
+            fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("move", MovementSystem);
+        sched.compile_with_world(&world).unwrap();
+
+        let plan = sched.debug_plan_verbose();
+        assert!(
+            plan.contains("Pos"),
+            "debug_plan должен содержать 'Pos', содержит: {}",
+            plan
+        );
+        assert!(
+            plan.contains("Vel"),
+            "debug_plan должен содержать 'Vel', содержит: {}",
+            plan
+        );
     }
 
     // ── Инкрементальность тест ────────────────────────────────

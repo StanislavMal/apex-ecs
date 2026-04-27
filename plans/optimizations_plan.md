@@ -1020,31 +1020,43 @@ impl World {
 
 ### 4.2. Hot-reload дебаунс в ScriptEngine
 
-**Файл:** `crates/apex-scripting/src/script_engine.rs`  
-**Функция:** `ScriptEngine::with_dir`  
-**Выигрыш:** Устранение дублированных reload-событий при сохранении файла редактором
+**Файл:** `crates/apex-scripting/src/script_engine.rs`
+**Функция:** `ScriptEngine::poll_hot_reload`
+**Выигрыш:** Устранение reload storms — при одном сохранении файла множественные события notify coalesce в одну перекомпиляцию
 
-**Проблема:** В `ScriptEngine::with_dir` создаётся `recommended_watcher` без дебаунса, тогда как `HotReloadPlugin` использует `Config::default().with_poll_interval(debounce)`.
+**Проблема:** При сохранении `.rhai` файла ОС генерирует несколько событий (Modify(Data), Modify(Metadata)), каждое из которых вызывает `reload_file()` независимо. Для больших скриптов это 3+ перекомпиляции вместо одной.
 
-**Решение — унифицировать:**
+**Решение — time-based debounce в `poll_hot_reload()`:**
+
+Добавлено поле `last_reload: HashMap<String, Instant>` в `ScriptEngine`. В `poll_hot_reload()` после дедупликации путей проверяется, сколько времени прошло с последней перезагрузки файла. Если менее 50ms — событие пропускается.
 
 ```rust
-pub fn with_dir(script_dir: &Path) -> Self {
-    Self::with_dir_debounce(script_dir, Duration::from_millis(100))
-}
+// В ScriptEngine:
+last_reload: HashMap<String, Instant>,
 
-pub fn with_dir_debounce(script_dir: &Path, debounce: Duration) -> Self {
-    let mut this = Self::new();
-    let (tx, rx) = mpsc::channel();
-
-    let watcher_result = notify::RecommendedWatcher::new(
-        move |res: notify::Result<Event>| { let _ = tx.send(res); },
-        notify::Config::default().with_poll_interval(debounce),  // ДОБАВИТЬ
-    );
-    // ...
-    this
+// В poll_hot_reload(), после dedup:
+let now = Instant::now();
+let debounce = Duration::from_millis(50);
+for path in &changed_paths {
+    let name = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(n) => n.to_string(),
+        None    => continue,
+    };
+    if let Some(last) = self.last_reload.get(&name) {
+        if now.duration_since(*last) < debounce {
+            continue;
+        }
+    }
+    self.reload_file(path);
+    self.last_reload.insert(name, now);
 }
 ```
+
+✅ **Реализовано 2026-04-27:**
+- Поле `last_reload: HashMap<String, Instant>` в `ScriptEngine`
+- Инициализация в `new()` (и через `with_dir()` → `new()`)
+- Debounce 50ms в `poll_hot_reload()` — coalescing множественных событий в одну перекомпиляцию
+- Верификация: `cargo test --workspace`, `cargo clippy`, `hot_reload_test`
 
 ---
 
@@ -1109,45 +1121,27 @@ let exclude_mask = {
 
 ### 4.4. Диагностика конфликтов с именами компонентов
 
-**Файл:** `crates/apex-scheduler/src/lib.rs`  
-**Функция:** `component_type_name`  
+**Файл:** `crates/apex-scheduler/src/lib.rs`
+**Функция:** `component_type_name`
 **Выигрыш:** `debug_plan_verbose()` показывает реальные имена вместо `<component>`
 
 **Текущая проблема:** `type_names` заполняется только в `run()` / `run_sequential()`, но до первого `run()` — пустая. При вызове `debug_plan_verbose()` сразу после `compile()` все компоненты показываются как `<component>`.
 
-**Решение:**
+**Решение — `compile_with_world()` и улучшение `debug_plan_verbose()`:**
 
 ```rust
-// В compile():
-pub fn compile(&mut self) -> Result<(), SchedulerError> {
-    // ... существующий код ...
-
-    // ДОБАВИТЬ: если type_names пуст, логируем предупреждение
-    if self.type_names.is_empty() {
-        log::debug!(
-            "Scheduler::compile: type_names пуст. \
-             Вызовите populate_type_names(&world.registry()) \
-             для отображения имён компонентов в debug_plan_verbose()"
-        );
-    }
-
-    // ...
-}
-
-// Добавить convenience-метод:
 pub fn compile_with_world(&mut self, world: &World) -> Result<(), SchedulerError> {
     self.populate_type_names(world.registry());
     self.compile()
 }
 ```
 
-**В документации добавить пример:**
-
-```rust
-// Рекомендуемый паттерн:
-sched.compile_with_world(&world).expect("schedule error");
-println!("{}", sched.debug_plan_verbose());  // теперь с реальными именами
-```
+✅ **Реализовано 2026-04-27:**
+- Добавлен метод `compile_with_world(&mut self, world: &World) -> Result<(), SchedulerError>` — удобная обёртка над `populate_type_names` + `compile`
+- В `compile()` добавлено `log::debug!`-предупреждение если `type_names` пуст
+- `debug_plan_verbose()` теперь использует `component_type_name()` для отображения имён в reads/writes
+- Добавлен тест `compile_with_world_shows_component_names`
+- Верификация: `cargo test --workspace` (все пройдены), `cargo clippy`
 
 ---
 
@@ -1171,9 +1165,9 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | 3.2 Row splits | — | Заменён на ASD | ❌ Заменён |
 | 3.3 Thread-local cmds | compilation test | usability | ✅ Реализовано |
 | 4.1 batch relations | custom bench | 1000 relations | ✅ Реализовано |
-| 4.2 debounce | manual test | reload storms | ⏳ Pending |
+| 4.2 debounce | manual test | reload storms | ✅ Реализовано |
 | 4.3 Without exclude | custom bench | Without query time | ✅ Реализовано |
-| 4.4 compile_with_world | manual test | debug_plan quality | ⏳ Pending |
+| 4.4 compile_with_world | manual test | debug_plan quality | ✅ Реализовано |
 
 #### Доп. результаты ASD-бенчмарков
 
@@ -1210,11 +1204,11 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
   ❌ 3.2     (заменён на ASD — row splits избыточны)
   ✅ 3.3     (Thread-local Commands — реализовано)
 
-Фаза 4 (частично реализована):
+Фаза 4 (полностью реализована ✅):
   ✅ 4.1  (batch relations — реализовано)
-  ⏳ 4.2  (debounce — pending)
+  ✅ 4.2  (debounce — реализовано)
   ✅ 4.3  (Without<T> — exclude mask, реализовано, требует 2.1 ✅)
-  ⏳ 4.4  (compile_with_world — pending)
+  ✅ 4.4  (compile_with_world — реализовано)
 ```
 
 ### Фактический порядок реализации
@@ -1232,16 +1226,11 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
  4.1 add_relation_batch                 (Фаза 4) ✅
  2.2 CommandQueue chunking            (Фаза 2) ✅
  3.3 Thread-local Commands            (Фаза 3) ✅
+ 4.2 Hot-reload debounce               (Фаза 4) ✅
  4.3 Without<T> exclude mask          (Фаза 4) ✅
- 4.x Оставшиеся задачи                 (Фаза 4) ⏳
+ 4.4 compile_with_world                (Фаза 4) ✅
+                                  🎉 ВСЕ ЗАДАЧИ ВЫПОЛНЕНЫ
 ```
-
-### Следующие шаги (prioritised)
-
-| Приоритет | Задача | Файлы | Ожидаемый выигрыш |
-|-----------|--------|-------|-------------------|
-| 4 | 4.2 Hot-reload debounce | `crates/apex-scripting/src/script_engine.rs` | Устранение reload storms |
-| 5 | 4.4 compile_with_world | `crates/apex-scheduler/src/lib.rs` | debug_plan quality: имена видны |
 
 ### Чеклист перед PR
 
