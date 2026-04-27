@@ -1,5 +1,5 @@
 use crate::{
-    access::AccessDescriptor,
+    access::{AccessDescriptor, ArchetypeMask},
     archetype::Archetype,
     component::{Component, ComponentId, Tick},
     entity::Entity,
@@ -18,12 +18,21 @@ pub trait WorldQuery: Sized {
 
     fn component_count() -> usize;
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>);
+
+    /// Заполняет только "positive" (не-Without) component IDs.
+    /// По умолчанию — то же что fill_ids.
+    fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        Self::fill_ids(world, ids);
+    }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State;
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
     fn is_filter() -> bool { false }
+    /// Возвращает true для компонентов, которые ДОЛЖНЫ присутствовать.
+    /// Для Without<T> возвращает false.
+    fn is_positive() -> bool { true }
 }
 
 // ── Read<T> ────────────────────────────────────────────────────
@@ -138,10 +147,13 @@ impl<T: Component> WorldQuery for Without<T> {
 
     #[inline] fn component_count() -> usize { 1 }
     #[inline] fn is_filter() -> bool { true }
+    #[inline] fn is_positive() -> bool { false }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
     }
+
+    fn fill_positive_ids(_: &World, _: &mut Vec<ComponentId>) {}
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         ids.is_empty() || !arch.has_component(ids[0])
@@ -227,6 +239,10 @@ macro_rules! impl_world_query_tuple {
                 $( $Q::fill_ids(world, ids); )+
             }
 
+            fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
+                $( $Q::fill_positive_ids(world, ids); )+
+            }
+
             fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
                 let mut offset = 0;
                 $(
@@ -300,20 +316,56 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
 
+        // Собираем positive IDs (не-Without) для candidate selection
+        let mut positive_ids = Vec::with_capacity(Q::component_count());
+        Q::fill_positive_ids(world, &mut positive_ids);
+
+        // Строим exclude_mask из negative (Without) компонентов
+        let exclude_mask = {
+            let mut mask = ArchetypeMask::EMPTY;
+            for &id in ids.iter().filter(|id| !positive_ids.contains(id)) {
+                if let Some(arch_ids) = world.component_arch_index.get(&id) {
+                    for arch_id in arch_ids {
+                        mask.set(arch_id.0 as usize);
+                    }
+                }
+            }
+            mask
+        };
+
+        // Predicate для фильтрации архетипов: проверка exclude_mask + matches_archetype
+        let arch_filter = |arch_idx: usize| -> bool {
+            if exclude_mask.get(arch_idx) {
+                return false;
+            }
+            let arch = &world.archetypes[arch_idx];
+            !arch.is_empty() && Q::matches_archetype(arch, &ids)
+        };
+
         let archetypes = if ids.len() == Q::component_count() {
             // Линейный обход архетипов — быстрее для малых запросов (≤3 компонента)
             // и малых миров (≤128 архетипов). ComponentArchIndex даёт выигрыш только
             // для больших миров (500+ архетипов) и запросов с 4+ компонентами.
-            if !ids.is_empty() && (ids.len() <= 3 || world.archetypes.len() <= 128) {
+            if !positive_ids.is_empty() && (positive_ids.len() <= 3 || world.archetypes.len() <= 128) {
                 // Линейный обход: O(N) по числу архетипов, без HashMap lookup'ов
                 world.archetypes.iter().enumerate()
-                    .filter(|(_, arch)| !arch.is_empty() && Q::matches_archetype(arch, &ids))
+                    .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
                         ArchState { arch_idx, state, len: arch.len() }
                     })
                     .collect()
-            } else if ids.is_empty() {
+            } else if positive_ids.is_empty() && !ids.is_empty() {
+                // Только Without-компоненты (нет positive) — используем exclude_mask
+                // для отсеивания архетипов, которые содержат excluding-компонент
+                world.archetypes.iter().enumerate()
+                    .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
+                    .map(|(arch_idx, arch)| {
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        ArchState { arch_idx, state, len: arch.len() }
+                    })
+                    .collect()
+            } else if positive_ids.is_empty() {
                 // Запрос без компонентов — все архетипы
                 world.archetypes.iter().enumerate()
                     .filter(|(_, arch)| !arch.is_empty())
@@ -327,7 +379,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 // распространённый компонент. Для больших миров (500+ архетипов)
                 // и сложных запросов (4+ компонентов) это K << N.
                 let candidate_archetypes = {
-                    let smallest = ids.iter()
+                    let smallest = positive_ids.iter()
                         .filter_map(|id| world.component_arch_index.get(id))
                         .min_by_key(|v| v.len());
 
@@ -342,10 +394,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 };
 
                 candidate_archetypes.into_iter()
-                    .filter(|&arch_idx| {
-                        let arch = &world.archetypes[arch_idx];
-                        !arch.is_empty() && Q::matches_archetype(arch, &ids)
-                    })
+                    .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let arch = &world.archetypes[arch_idx];
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
@@ -631,5 +680,82 @@ impl<'w> QueryBuilder<'w> {
         self.reads.iter().all(|id| arch.has_component(*id))
             && self.writes.iter().all(|id| arch.has_component(*id))
             && self.excludes.iter().all(|id| !arch.has_component(*id))
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::World;
+
+    struct A;
+    struct B;
+
+    #[test]
+    fn without_exclude_mask_works() {
+        let mut world = World::new();
+
+        // Создаём сущность только с A
+        let e1 = world.spawn().insert(A).id();
+        // Создаём сущность с A и B
+        let _e2 = world.spawn().insert(A).insert(B).id();
+        // Создаём сущность только с B
+        let e3 = world.spawn().insert(B).id();
+
+        // Query<Read<A>, Without<B>> должен вернуть только e1
+        let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        assert_eq!(results, vec![e1], "Without<B> должен исключить сущности с B");
+
+        // Query<Read<B>, Without<A>> должен вернуть только e3
+        let query: Query<'_, (Read<B>, Without<A>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        assert_eq!(results, vec![e3], "Without<A> должен исключить сущности с A");
+
+        // Query<Without<A>, Without<B>> — пустой результат (все имеют хотя бы один компонент)
+        let query: Query<'_, (Without<A>, Without<B>)> = Query::new(&world);
+        assert!(query.is_empty(), "Без A и B ничего не должно остаться");
+    }
+
+    #[test]
+    fn without_with_large_world() {
+        let mut world = World::new();
+
+        // Создаём много сущностей с (A) и много с (A, B)
+        let mut only_a = Vec::new();
+        let mut with_b = Vec::new();
+
+        for _ in 0..50 {
+            only_a.push(world.spawn().insert(A).id());
+        }
+        for _ in 0..50 {
+            with_b.push(world.spawn().insert(A).insert(B).id());
+        }
+
+        // Query<Read<A>, Without<B>> — должны получить только entities с A без B
+        let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+
+        assert_eq!(results.len(), 50, "Должно быть 50 сущностей с A без B");
+        for e in &results {
+            assert!(only_a.contains(e), "Сущность должна быть из only_a");
+            assert!(!with_b.contains(e), "Сущность не должна быть из with_b");
+        }
+    }
+
+    #[test]
+    fn without_alone_query() {
+        let mut world = World::new();
+
+        let _e1 = world.spawn().insert(A).id();
+        let e2 = world.spawn().insert(B).id();
+        let _e3 = world.spawn().insert(A).insert(B).id();
+
+        // Чистый Without<A> — все сущности без A
+        let query: Query<'_, Without<A>> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        assert_eq!(results, vec![e2], "Without<A> должен вернуть сущности без A");
     }
 }

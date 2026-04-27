@@ -1050,49 +1050,60 @@ pub fn with_dir_debounce(script_dir: &Path, debounce: Duration) -> Self {
 
 ### 4.3. `Without<T>` в ArchetypeMask — exclude маска
 
-**Файл:** `crates/apex-core/src/access.rs`, `crates/apex-core/src/query.rs`  
+**Файл:** `crates/apex-core/src/access.rs`, `crates/apex-core/src/query.rs`
 **Выигрыш:** `Without<T>` фильтрует архетипы до цикла итерации
 
 **Текущая проблема:** `Without<T>` проверяет `!arch.has_component(ids[0])` внутри `matches_archetype` — это уже правильно, но только при обходе всех архетипов. С `component_arch_index` (из 2.1) нужно начинать с инверсии.
 
-**Добавить `exclude_cids` в `WorldQuery`:**
+**Решение — is_positive / fill_positive_ids + exclude mask:**
 
 ```rust
 pub trait WorldQuery: Sized {
-    // Существующие методы...
-
-    /// ComponentId'ы, которые НЕ должны присутствовать в архетипе.
-    fn excluded_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+    fn is_positive() -> bool { true }
+    fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        Self::fill_ids(world, ids);
+    }
 }
 
-// Реализация для Without<T>:
 impl<T: Component> WorldQuery for Without<T> {
-    fn excluded_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
-    }
-    // fill_ids оставляем пустым (Without не требует наличия компонента)
-    fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
-    // ...
+    fn is_positive() -> bool { false }
+    fn fill_positive_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
 }
 ```
 
-**В `Query::new` использовать excluded_ids для фильтрации списка кандидатов:**
+В `Query::new_with_tick`:
+- `positive_ids` собираются через `fill_positive_ids` — используются для `component_arch_index` candidate selection
+- `negative_ids` = `ids[positive_ids.len()..]` — из Without-компонентов
+- Для negative IDs строится `ArchetypeMask` через `component_arch_index` — O(1) exclude check
 
 ```rust
-let mut excluded = Vec::new();
-Q::excluded_ids(world, &mut excluded);
-
-let archetypes = candidate_archetypes.into_iter()
-    .filter(|&arch_idx| {
-        let arch = &world.archetypes[arch_idx];
-        // Быстрая проверка исключений перед полным matches_archetype
-        if excluded.iter().any(|&eid| arch.has_component(eid)) {
-            return false;
+let exclude_mask = {
+    let mut mask = ArchetypeMask::EMPTY;
+    for &id in &negative_ids {
+        if let Some(arch_ids) = world.component_arch_index.get(&id) {
+            for arch_id in arch_ids {
+                mask.set(arch_id.0 as usize);
+            }
         }
-        Q::matches_archetype(arch, &ids)
-    })
-    // ...
+    }
+    mask
+};
+// Фильтрация:
+.filter(|&arch_idx| {
+    if exclude_mask.get(arch_idx) { return false; }
+    let arch = &world.archetypes[arch_idx];
+    !arch.is_empty() && Q::matches_archetype(arch, &ids)
+})
 ```
+
+✅ **Реализовано 2026-04-27:**
+- `WorldQuery` trait: добавлены `is_positive()` и `fill_positive_ids()` с default-реализациями
+- `Without<T>`: `is_positive() -> false`, `fill_positive_ids()` — пустая
+- `impl_world_query_tuple!`: делегирует `fill_positive_ids` каждому элементу кортежа
+- `Query::new_with_tick`: candidate selection использует только `positive_ids`; построение `exclude_mask` из negative IDs через `component_arch_index`
+- Исправлен потенциальный баг: `component_arch_index` больше не выбирает кандидатов из Without-компонентов
+- Добавлены 3 unit-теста: `without_exclude_mask_works`, `without_with_large_world`, `without_alone_query`
+- Верификация: `cargo test --workspace` (все пройдены), `cargo clippy`, `cargo run --example basic`
 
 ---
 
@@ -1161,7 +1172,7 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | 3.3 Thread-local cmds | compilation test | usability | ✅ Реализовано |
 | 4.1 batch relations | custom bench | 1000 relations | ✅ Реализовано |
 | 4.2 debounce | manual test | reload storms | ⏳ Pending |
-| 4.3 Without exclude | custom bench | Without query time | ⏳ Pending |
+| 4.3 Without exclude | custom bench | Without query time | ✅ Реализовано |
 | 4.4 compile_with_world | manual test | debug_plan quality | ⏳ Pending |
 
 #### Доп. результаты ASD-бенчмарков
@@ -1202,7 +1213,7 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 Фаза 4 (частично реализована):
   ✅ 4.1  (batch relations — реализовано)
   ⏳ 4.2  (debounce — pending)
-  ⏳ 4.3  (Without<T> — pending, требует 2.1 ✅)
+  ✅ 4.3  (Without<T> — exclude mask, реализовано, требует 2.1 ✅)
   ⏳ 4.4  (compile_with_world — pending)
 ```
 
@@ -1221,6 +1232,7 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
  4.1 add_relation_batch                 (Фаза 4) ✅
  2.2 CommandQueue chunking            (Фаза 2) ✅
  3.3 Thread-local Commands            (Фаза 3) ✅
+ 4.3 Without<T> exclude mask          (Фаза 4) ✅
  4.x Оставшиеся задачи                 (Фаза 4) ⏳
 ```
 
@@ -1228,7 +1240,6 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 
 | Приоритет | Задача | Файлы | Ожидаемый выигрыш |
 |-----------|--------|-------|-------------------|
-| 3 | 4.3 Without<T> exclude mask | `crates/apex-core/src/query.rs` | -20% время Without-запросов |
 | 4 | 4.2 Hot-reload debounce | `crates/apex-scripting/src/script_engine.rs` | Устранение reload storms |
 | 5 | 4.4 compile_with_world | `crates/apex-scheduler/src/lib.rs` | debug_plan quality: имена видны |
 
