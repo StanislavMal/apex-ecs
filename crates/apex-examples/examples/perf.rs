@@ -1068,7 +1068,6 @@ fn bench_parallel_scheduler(n: usize) {
 
     // ── Лёгкая нагрузка (memory-bound) ──────────────────────
     println!("\n  --- Лёгкая нагрузка (memory-bound) ---");
-    println!("  Ожидание: speedup ≈ 1.0–1.3x (шина памяти — узкое место)");
 
     {
         let (seq, par) = make_scheds!(
@@ -1110,11 +1109,9 @@ fn bench_parallel_scheduler(n: usize) {
     // Архетип C: Mana              → HeavyManaSys (write Mana)
     //
     // Системы не пересекаются ни по компонентам, ни по памяти.
-    // Ожидаемый speedup: ≈ min(N_systems, N_cores) ≈ 2x–3x.
 
     println!("\n  --- Тяжёлая нагрузка (CPU-bound, ИЗОЛИРОВАННЫЕ архетипы) ---");
     println!("  Архетип A: Pos+Vel → HeavyPhys | Архетип B: Temp → HeavyTemp");
-    println!("  Ожидание: speedup ≈ 2x для 2 систем, ≈ 3x для 3 систем (12 ядер)");
 
     let make_isolated_world = |n: usize| {
         let mut world = World::new();
@@ -1171,12 +1168,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     // ── Для сравнения: те же системы, общий архетип ───────────
     //
-    // Ожидание: speedup ≈ 1.1x (false sharing, конкуренция за кеш)
     // Разница с изолированным тестом показывает стоимость false sharing.
 
     println!("\n  --- Тяжёлая нагрузка (CPU-bound, ОБЩИЙ архетип — для сравнения) ---");
     println!("  Все компоненты в одном архетипе → false sharing кеш-линий");
-    println!("  Ожидание: speedup ≈ 1.1x (деградация из-за конкуренции за кеш)");
 
     {
         let (seq, par) = make_scheds!(
@@ -1214,11 +1209,9 @@ fn bench_parallel_scheduler(n: usize) {
     // Системы: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
     // vs HeavyPhysSys (for_each) + HeavyTempSys (for_each)
     //
-    // Ожидание: par_for_each должен использовать все 12 ядер для каждой системы,
     // в то время как for_each использует только 1 ядро на систему.
 
     println!("\n  --- Сравнение for_each vs par_for_each (межсистемный) ---");
-    println!("  Ожидание: par_for_each даст speedup ≈ 2x–6x за счёт использования всех ядер");
 
     struct HeavyPhysParSys;
     impl ParSystem for HeavyPhysParSys {
@@ -1331,12 +1324,10 @@ fn bench_parallel_scheduler(n: usize) {
     // Это позволяет измерить максимальный achievable speedup
     // межсистемного параллелизма без конкуренции за данные.
     //
-    // Ожидание: speedup ≈ 8x–10x (12 ядер, минимальные накладные расходы).
     // Если speedup << 8x — проблема в планировщике (rayon::par_iter),
     // а не в SubWorld или кеш-конкуренции.
 
     println!("\n  --- Максимальный межсистемный параллелизм: 12 систем × 1 компонент ---");
-    println!("  Ожидание: speedup ≈ 8x–10x (12 ядер, без конкуренции за данные)");
 
     // ── 12 уникальных компонентов ─────────────────────────────
     struct C0(f32);
@@ -1521,7 +1512,8 @@ fn bench_parallel_scheduler(n: usize) {
         sched.add_system("commands", |_| {});
         sched.add_par_system("move2", MoveSys);
         sched.add_par_system("hp2",   HpSys);
-        sched.compile().unwrap();
+        let test_world = make_world_5comp(n * 1000);
+        sched.compile_with_world(&test_world).unwrap();
         println!("\n  Pipeline plan:\n{}", sched.debug_plan());
     }
 }
@@ -1679,7 +1671,6 @@ fn bench_intra_system_parallel(n: usize) {
     );
 
     println!("  Note: speedup при CPU-bound и кол-во entity >> PAR_CHUNK_SIZE(4096)");
-    println!("        memory-bound → speedup ≈ 1.0x (шина памяти — узкое место)");
 }
 
 #[cfg(not(feature = "parallel"))]

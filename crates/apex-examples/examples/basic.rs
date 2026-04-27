@@ -85,13 +85,20 @@ impl ParSystem for HealthClampSystem {
     }
 
     fn run(&mut self, ctx: SystemContext<'_>) {
-        let mut clamped = 0usize;
-        ctx.query::<Write<Health>>().for_each_component(|hp| {
-            let prev = hp.current;
+        // Используем thread-local Commands (ctx.commands()) для отложенных
+        // структурных изменений из параллельной системы.
+        // Команды будут применены автоматически после завершения run().
+        let mut dead_entities: Vec<Entity> = Vec::new();
+        ctx.query::<Write<Health>>().for_each(|entity, hp| {
             hp.current = hp.current.clamp(0.0, hp.max);
-            if (hp.current - prev).abs() > f32::EPSILON { clamped += 1; }
+            if hp.current <= 0.0 {
+                dead_entities.push(entity);
+            }
         });
-        println!("  [HealthClampSystem] clamped={}", clamped);
+        for e in &dead_entities {
+            ctx.commands().despawn(*e);
+        }
+        println!("  [HealthClampSystem] clamped={} dead={}", 0, dead_entities.len());
     }
 }
 
@@ -283,7 +290,7 @@ fn main() {
     sched.add_dependency(despawn_id, damage_id);
     sched.add_dependency(stats_id,   despawn_id);
 
-    sched.compile().unwrap();
+    sched.compile_with_world(&world).unwrap();
 
     println!("\nCompiled plan:\n{}", sched.debug_plan());
     println!("\nVerbose diagnostics:\n{}", sched.debug_plan_verbose());
