@@ -74,9 +74,10 @@ impl Drop for CommandArena {
 
 // ── Function pointer types ───────────────────────────────────────
 
-type SpawnApply  = unsafe fn(*mut u8, &mut World);
-type InsertApply = unsafe fn(*mut u8, &mut World, Entity);
-type DropFn      = unsafe fn(*mut u8);
+type SpawnApply   = unsafe fn(*mut u8, &mut World);
+type InsertApply  = unsafe fn(*mut u8, &mut World, Entity);
+type RemoveApply  = unsafe fn(Entity, &mut World);
+type DropFn       = unsafe fn(*mut u8);
 
 // ── Typed command enum ───────────────────────────────────────────
 //
@@ -90,6 +91,12 @@ enum Command {
     Insert { entity: Entity, offset: u32, apply: InsertApply, drop: DropFn },
     /// Remove — inline
     Remove { entity: Entity, component_id: ComponentId },
+    /// Remove typed — без Box, через function pointer, не требует данных в арене
+    RemoveTyped {
+        entity: Entity,
+        /// function pointer для вызова world.remove::<T>()
+        remove_fn: RemoveApply,
+    },
     /// Despawn — inline, без аллокации
     Despawn(Entity),
     /// SpawnFromTemplate — String уже на heap, но это исключение
@@ -168,11 +175,17 @@ impl Commands {
         });
     }
 
-    /// Удалить компонент у entity
+    /// Удалить компонент у entity — typed variant, без Box-аллокации
     pub fn remove<T: Component + Send + 'static>(&mut self, entity: Entity) {
-        self.queue.push(Command::Apply(Box::new(move |world: &mut World| {
+        // SAFETY: typed_remove::<T> вызывается только в apply() с корректным T.
+        // function pointer не требует данных в bump-арене, entity передаётся напрямую.
+        unsafe fn typed_remove<T: Component>(entity: Entity, world: &mut World) {
             world.remove::<T>(entity);
-        })));
+        }
+        self.queue.push(Command::RemoveTyped {
+            entity,
+            remove_fn: typed_remove::<T>,
+        });
     }
 
     /// Произвольная команда
@@ -214,6 +227,10 @@ impl Commands {
                 Command::Spawn { offset, apply, .. } => unsafe { apply(self.arena.get_ptr(offset), world); },
                 Command::Insert { entity, offset, apply, .. } => unsafe { apply(self.arena.get_ptr(offset), world, entity); },
                 Command::Remove { entity, component_id } => { world.remove_raw(entity, component_id); }
+                // SAFETY: remove_fn — корректный function pointer, созданный в remove::<T>.
+                // Вызов типа-специализированной функции world.remove::<T>(entity) безопасен,
+                // т.к. T статически задан при создании команды.
+                Command::RemoveTyped { entity, remove_fn } => unsafe { remove_fn(entity, world); },
                 Command::Despawn(entity)           => { world.despawn(entity); }
                 Command::SpawnFromTemplate { name, params } => { world.spawn_from_template(&name, &params); }
                 Command::Apply(f)                  => { f(world); }
@@ -231,6 +248,8 @@ impl Commands {
             match cmd {
                 Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
                 Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
+                // RemoveTyped не хранит данных в bump-арене — ничего не надо дропать
+                Command::RemoveTyped { .. } => {}
                 _ => {}
             }
         }
@@ -245,6 +264,8 @@ impl Drop for Commands {
             match cmd {
                 Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
                 Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
+                // RemoveTyped не хранит данных в bump-арене — ничего не надо дропать
+                Command::RemoveTyped { .. } => {}
                 _ => {}
             }
         }

@@ -60,6 +60,7 @@ use apex_graph::Graph;
 use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
+    commands::Commands,
     component::ComponentRegistry,
     world::World,
     system_param::WorldQuerySystemAccess,
@@ -1171,7 +1172,7 @@ impl Scheduler {
     /// с ограничением `(arch_idx, start, end)`, что гарантирует что
     /// разные задачи НЕ пересекаются по данным одного архетипа.
     #[cfg(feature = "parallel")]
-    fn run_stage_parallel(&mut self, stage_ids: &[SystemId], world: &World) {
+    fn run_stage_parallel(&mut self, stage_ids: &[SystemId], world: &World, cmds_ptr: usize) {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
         const MIN_CHUNK: usize = 4096;
@@ -1216,7 +1217,9 @@ impl Scheduler {
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
                         let sw = apex_core::SubWorld::new(world, &all_indices);
-                        sys.run(SystemContext::from_sub_world(&sw));
+                        // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
+                        // указывает на thread_commands, который жив до конца run_hybrid_parallel.
+                        sys.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
                     }
                 }
             }
@@ -1310,9 +1313,13 @@ impl Scheduler {
         });
 
         // 5. Запускаем через rayon::scope
+        // cmds_ptr — это usize (из &mut Vec<Commands>), который является Copy + Send + Sync.
+        // Внутри замыкания преобразуем обратно в *mut Vec<Commands>.
         rayon::scope(|s| {
             for task in &tasks {
-                s.spawn(|_| {
+                let cmds = cmds_ptr;
+                s.spawn(move |_| {
+                    let cmds_ptr = cmds as *mut Vec<Commands>;
                     unsafe {
                         let sys_archs: &[usize] = std::slice::from_raw_parts(
                             task.sys_archs_ptr,
@@ -1323,7 +1330,10 @@ impl Scheduler {
                             if task.chunk_ranges.is_empty() {
                                 // Полный SubWorld — все архетипы системы без ограничений
                                 let sub = apex_core::SubWorld::new(world, sys_archs);
-                                sys.run(SystemContext::from_sub_world(&sub));
+                                // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
+                                // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
+                                // Каждый поток обращается к своему индексу через current_thread_index().
+                                sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                             } else {
                                 // SubWorld с range-ограничениями
                                 let sub = apex_core::SubWorld::with_ranges(
@@ -1331,7 +1341,10 @@ impl Scheduler {
                                     sys_archs,
                                     &task.chunk_ranges,
                                 );
-                                sys.run(SystemContext::from_sub_world(&sub));
+                                // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
+                                // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
+                                // Каждый поток обращается к своему индексу через current_thread_index().
+                                sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                             }
                         }
                     }
@@ -1373,6 +1386,17 @@ impl Scheduler {
         self.prepare_sub_worlds(const_world);
         let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
 
+        // Создаём thread-local Commands для каждого потока rayon.
+        // Каждый параллельный поток получает доступ к своему Commands
+        // через current_thread_index(). После завершения Stage команды применяются.
+        let num_threads = rayon::current_num_threads();
+        let mut thread_commands: Vec<Commands> = (0..num_threads)
+            .map(|_| Commands::new())
+            .collect();
+        // SAFETY: cmds_ptr — usize из &mut thread_commands, жив до конца этой функции.
+        // Все обращения к нему синхронизированы: каждый поток пишет только в свой индекс.
+        let cmds_ptr: usize = &mut thread_commands as *mut Vec<Commands> as usize;
+
         for (stage_ids, all_parallel) in &stages {
             if !all_parallel {
                 // Sequential fallback — используем make_sub_world
@@ -1383,16 +1407,26 @@ impl Scheduler {
                         match &mut system.kind {
                             SystemKind::Sequential(f)           => f(world),
                             SystemKind::Parallel { system, .. } => {
-                                system.run(SystemContext::from_sub_world(&sw));
+                                // SAFETY: cmds_ptr корректен, thread_commands жив.
+                                system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
                             }
                         }
                     }
+                }
+                // Применяем thread-локальные команды после sequential stage.
+                for cmds in &mut thread_commands {
+                    cmds.apply(world);
                 }
                 continue;
             }
 
             // ASD параллелизм: динамическое распределение чанков
-            self.run_stage_parallel(stage_ids, const_world);
+            self.run_stage_parallel(stage_ids, const_world, cmds_ptr);
+
+            // Применяем thread-локальные команды после параллельного stage.
+            for cmds in &mut thread_commands {
+                cmds.apply(world);
+            }
         }
     }
 

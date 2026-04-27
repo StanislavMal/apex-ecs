@@ -1,9 +1,11 @@
 use std::cell::UnsafeCell;
+use std::sync::OnceLock;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::{
     archetype::{Archetype, ArchetypeId},
+    commands::Commands,
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick, Serializable},
     entity::{EntityAllocator, EntityLocation, Entity},
     events::EventRegistry,
@@ -977,11 +979,40 @@ pub fn init_par_chunk_size_from_env() {
     }
 }
 
+/// Обёртка для хранения `Commands` в static c `UnsafeCell`.
+///
+/// # SAFETY
+/// `Commands` содержит `*mut u8` в `CommandArena` (owned pointer),
+/// что формально не `Send`/`Sync`. Однако заглушка используется
+/// **только** в single-thread контексте (sequential fallback или
+/// когда `deferred_cmds` is null), поэтому гонок быть не может.
+struct SyncCommands(UnsafeCell<Commands>);
+unsafe impl Send for SyncCommands {}
+unsafe impl Sync for SyncCommands {}
+
+/// Статическая заглушка для `Commands` когда `deferred_cmds` is null.
+/// Используется в `commands()` для безопасного возврата `&mut Commands`
+/// когда thread-local команды не были предоставлены (например, в sequential режиме).
+static DUMMY_COMMANDS: OnceLock<SyncCommands> = OnceLock::new();
+
+fn dummy_commands() -> &'static mut Commands {
+    let sc = DUMMY_COMMANDS.get_or_init(|| SyncCommands(UnsafeCell::new(Commands::new())));
+    // SAFETY: заглушка инициализируется один раз и используется только
+    // в single-thread контексте (sequential fallback или когда
+    // deferred_cmds is null). Никакой другой код не имеет доступа
+    // к этой памяти одновременно.
+    unsafe { &mut *sc.0.get() }
+}
+
 pub struct SystemContext<'w> {
     /// SubWorld'ы, которые видит эта система.
     /// Обычно один SubWorld, но может быть несколько если система
     /// работает с несколькими группами архетипов.
     pub(crate) sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
+    /// Thread-local команды. Указатель на `Vec<Commands>` из Scheduler.
+    /// Каждый поток rayon имеет свой `Commands` по индексу `current_thread_index()`.
+    /// Если `null` — метод `commands()` возвращает заглушку.
+    pub(crate) deferred_cmds: *mut Vec<Commands>,
 }
 
 unsafe impl Send for SystemContext<'_> {}
@@ -989,12 +1020,42 @@ unsafe impl Sync for SystemContext<'_> {}
 
 impl<'w> SystemContext<'w> {
     pub fn new(sub_worlds: &'w [crate::sub_world::SubWorld<'w>]) -> Self {
-        Self { sub_worlds }
+        Self { sub_worlds, deferred_cmds: std::ptr::null_mut() }
     }
 
     /// Создаёт SystemContext из одного SubWorld (наиболее частый случай).
     pub fn from_sub_world(sub_world: &'w crate::sub_world::SubWorld<'w>) -> Self {
-        Self { sub_worlds: std::slice::from_ref(sub_world) }
+        Self { sub_worlds: std::slice::from_ref(sub_world), deferred_cmds: std::ptr::null_mut() }
+    }
+
+    /// Создать контекст с thread-local командами.
+    pub fn with_commands(
+        sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
+        deferred_cmds: *mut Vec<Commands>,
+    ) -> Self {
+        Self { sub_worlds, deferred_cmds }
+    }
+
+    /// Получить `Commands` для текущего потока.
+    /// Команды применяются планировщиком после завершения Stage.
+    ///
+    /// Если `deferred_cmds` is null (например, в sequential режиме),
+    /// возвращает статическую заглушку — вызов не паникует.
+    #[inline]
+    pub fn commands(&self) -> &mut Commands {
+        if self.deferred_cmds.is_null() {
+            return dummy_commands();
+        }
+        #[cfg(feature = "parallel")]
+        unsafe {
+            let thread_idx = rayon::current_thread_index().unwrap_or(0);
+            let vec = &mut *self.deferred_cmds;
+            &mut vec[thread_idx]
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            dummy_commands()
+        }
     }
 
     /// Получить World (для обратной совместимости).

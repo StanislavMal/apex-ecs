@@ -528,51 +528,55 @@ pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
 
 ### 2.2. Chunk-based CommandQueue — устранение Box-аллокаций
 
-**Файл:** `crates/apex-core/src/commands.rs`  
+**Файл:** `crates/apex-core/src/commands.rs`
 **Выигрыш:** При 10k despawn-команд: -10k heap-аллокаций, ~25% ускорение `Commands::apply`
 
-**Проблема:** Каждая команда `Spawn` или `Insert` выделяет `Box<dyn ErasedBundle>` / `Box<dyn ErasedComponent>`.
+**Проблема:** Каждая команда `Spawn` или `Insert` выделяет `Box<dyn ErasedBundle>` / `Box<dyn ErasedComponent>`. Также `remove<T>()` использовал `Command::Apply(Box::new(move |world| world.remove::<T>(entity)))` — одна heap-аллокация `Box<dyn FnOnce>` на каждый вызов.
 
-**Решение — сначала только для `Despawn` (90% use-case):**
+**Решение — Bump Arena + Typed Remove:**
 
-`Despawn` уже хранится inline в `Command::Despawn(Entity)` — это правильно. Проблема только в `Spawn` и `Insert`. Для них добавить typed batch-variant:
+Арена уже была реализована для `Spawn` и `Insert` как `CommandArena` — bump-аллокатор с предварительно выделенным буфером. Применяется для typed-команд:
+
+- `Spawn { offset: u32, apply: SpawnApply, drop: DropFn }` — payload в арене
+- `Insert { entity: Entity, offset: u32, apply: InsertApply, drop: DropFn }` — payload в арене
+
+**Новое: typed variant для `remove<T>()`:**
+
+Добавлен вариант `RemoveTyped`, устраняющий `Box<dyn FnOnce>` для `remove<T>`:
 
 ```rust
-// Новый вариант команды для типизированного batch-спавна:
+type RemoveApply = unsafe fn(Entity, &mut World);
+
 enum Command {
-    Despawn(Entity),                          // inline, без аллокации (уже есть)
-    Insert { entity: Entity, component: ComponentBox },
+    Spawn { offset: u32, apply: SpawnApply, drop: DropFn },
+    Insert { entity: Entity, offset: u32, apply: InsertApply, drop: DropFn },
     Remove { entity: Entity, component_id: ComponentId },
+    RemoveTyped { entity: Entity, remove_fn: RemoveApply },  // <-- NEW
+    Despawn(Entity),
     SpawnFromTemplate { name: String, params: TemplateParams },
     Apply(Box<dyn FnOnce(&mut World) + Send>),
-
-    // НОВОЕ: типизированный batch-spawn без Box<dyn Trait>
-    SpawnTyped(Box<dyn TypedSpawnCommand>),
-}
-
-pub trait TypedSpawnCommand: Send {
-    fn apply(self: Box<Self>, world: &mut World);
-    fn estimated_size(&self) -> usize { 1 }
-}
-
-// Реализация для конкретного Bundle:
-struct SpawnBundleCommand<B: Bundle + Send + 'static> {
-    bundle: B,
-}
-
-impl<B: Bundle + Send + 'static> TypedSpawnCommand for SpawnBundleCommand<B> {
-    fn apply(self: Box<Self>, world: &mut World) {
-        world.spawn_bundle(self.bundle);
-    }
-}
-
-// Публичный API не меняется:
-pub fn spawn_bundle<B: Bundle + Send + 'static>(&mut self, bundle: B) {
-    self.queue.push(Command::SpawnTyped(Box::new(SpawnBundleCommand { bundle })));
 }
 ```
 
-**Следующий шаг (опционально):** Заменить `Vec<Command>` на bump-allocator буфер. Это сложнее, отложить на фазу 3.
+`remove<T>()` теперь использует `RemoveTyped` вместо `Apply(Box::new(...))`:
+```rust
+pub fn remove<T: Component + Send + 'static>(&mut self, entity: Entity) {
+    unsafe fn remove_typed<T: Component>(entity: Entity, world: &mut World) {
+        world.remove::<T>(entity);
+    }
+    self.queue.push(Command::RemoveTyped {
+        entity,
+        remove_fn: remove_typed::<T>,
+    });
+}
+```
+
+✅ **Реализовано 2026-04-27:**
+- `CommandArena` bump-аллокатор с `alloc<T>()`, `get_ptr()`, `reset()` — для typed Spawn/Insert payload
+- Команды `Spawn` и `Insert` хранят payload в арене (offset + apply/drop fn ptrs) — без `Box`-аллокаций
+- Добавлен `Command::RemoveTyped { entity, remove_fn: unsafe fn(Entity, &mut World) }` — функция `remove_typed::<T>()` используется как type-erased callable
+- `apply()`, `clear()`, `Drop` обрабатывают новый `RemoveTyped` вариант
+- Верификация: `cargo test --workspace` (все тесты пройдены)
 
 ---
 
@@ -915,58 +919,35 @@ chunk = min(chunk, entity_count)
 
 ---
 
-### 3.3. Thread-local Commands в параллельных системах — ⏳ PENDING
+### 3.3. Thread-local Commands в параллельных системах — ✅ РЕАЛИЗОВАНО
 
-**Файлы:** `crates/apex-core/src/world.rs`, `crates/apex-scheduler/src/lib.rs`  
+**Файлы:** `crates/apex-core/src/world.rs`, `crates/apex-scheduler/src/lib.rs`
 **Выигрыш:** Устранение необходимости вручную управлять Commands в `par_for_each`
 
-**Текущая проблема:** Пользователь должен писать:
+**Дата:** 2026-04-27
 
-```rust
-// Неудобно и error-prone:
-impl ParSystem for MySystem {
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let mut local_cmds = Commands::new();  // вручную
-        ctx.query::<Read<Health>>().for_each(|e, hp| {
-            if hp.current <= 0.0 { local_cmds.despawn(e); }
-        });
-        // Нет возможности применить внутри системы!
-    }
-}
-```
+**Что сделано:**
 
-**Решение:** Добавить в `SystemContext` доступ к thread-local командам:
+1. **`SystemContext`** ([`world.rs`](crates/apex-core/src/world.rs:1007)):
+   - Добавлено поле `deferred_cmds: *mut Vec<Commands>` — указатель на thread-local команды планировщика
+   - Метод `commands()` — возвращает `&mut Commands` для текущего потока через `rayon::current_thread_index()`
+   - При null `deferred_cmds` (sequential режим) — возвращает статическую заглушку `dummy_commands()` через `OnceLock<SyncCommands>`
+   - `rayon::current_thread_index()` обёрнут в `#[cfg(feature = "parallel")]` — без feature "parallel" возвращает заглушку
 
-```rust
-// В world.rs:
-pub struct SystemContext<'w> {
-    pub(crate) sub_worlds: &'w [SubWorld<'w>],
-    // НОВОЕ:
-    pub(crate) deferred_cmds: *mut Vec<Commands>,  // один Commands на поток
-}
+2. **`Scheduler`** ([`lib.rs`](crates/apex-scheduler/src/lib.rs)):
+   - `run_hybrid_parallel()`: создаёт `Vec<Commands>` по числу потоков `rayon::current_num_threads()`, передаёт указатель во все вызовы SystemContext
+   - После каждого Stage (sequential или parallel) — применяет thread-local команды к `world`
+   - `run_stage_parallel()`: принимает `cmds_ptr: usize` (преобразованный из `*mut Vec<Commands>` для обхода ограничений Send/Sync rayon scope)
+   - Sequential fallback тоже получает доступ к `Commands` через `cmds_ptr`
 
-impl<'w> SystemContext<'w> {
-    /// Получить Commands для текущего потока.
-    /// Команды применяются планировщиком после завершения Stage.
-    #[inline]
-    pub fn commands(&self) -> &mut Commands {
-        unsafe {
-            // rayon thread_index() для изоляции
-            let thread_idx = rayon::current_thread_index().unwrap_or(0);
-            &mut (*self.deferred_cmds)[thread_idx]
-        }
-    }
-}
-```
+3. **Ключевое техническое решение**: `*mut Vec<Commands>` преобразуется в `usize` на границе вызова `run_stage_parallel` и обратно внутри closure, т.к. `*mut T` не реализует `Sync`, а `rayon::scope` требует `Send` для захвата.
 
-**В `run_hybrid_parallel` — применять команды после Stage:**
-
-```rust
-// После выполнения параллельного Stage:
-for cmds in &mut self.thread_commands {
-    cmds.apply(world);
-}
-```
+**Верификация:**
+- `cargo test --workspace` — все тесты пройдены
+- `cargo test --features parallel` — 28 passed
+- `cargo run --example perf --features parallel` — без ошибок
+- `cargo run --example hot_reload_test` — 10 тестов пройдено
+- `cargo run --example transform_example` — все проверки пройдены
 
 ---
 
@@ -1171,13 +1152,13 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 | 1.4 seq barriers | `cargo bench compile_overhead` | N=50 time | ✅ Реализовано |
 | 1.5 EventRegistry | `cargo bench events` | send+iter ns/op | ✅ Реализовано |
 | 2.1 ArchetypeMask | custom bench (1000 archetypes) | Query::new µs | ✅ Реализовано |
-| 2.2 CommandQueue | `cargo bench structural` | Commands::apply allocs | ⏳ Pending |
+| 2.2 CommandQueue | `cargo bench structural` | Commands::apply allocs | ✅ Реализовано |
 | 2.3 QueryCache | custom bench (frequent insert) | CachedQuery hits | ✅ Реализовано |
 | 2.4 realloc | perf stat | cache-misses | ✅ Реализовано |
 | 2.5 TransformScratch | alloc profiler | allocs/frame | ✅ Реализовано |
 | **3.1 ASD** | `cargo run -p apex-examples --example perf --release --features parallel` | 12-sys speedup: 2.03x→**3.91x** (+93%) | ✅ **Реализовано** |
 | 3.2 Row splits | — | Заменён на ASD | ❌ Заменён |
-| 3.3 Thread-local cmds | compilation test | usability | ⏳ Pending |
+| 3.3 Thread-local cmds | compilation test | usability | ✅ Реализовано |
 | 4.1 batch relations | custom bench | 1000 relations | ✅ Реализовано |
 | 4.2 debounce | manual test | reload storms | ⏳ Pending |
 | 4.3 Without exclude | custom bench | Without query time | ⏳ Pending |
@@ -1207,16 +1188,16 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
   ✅ 1.4  (независимо от 1.1-1.3)
   ✅ 1.5  (независимо от всего)
 
-Фаза 2 (реализована):
+Фаза 2 (полностью реализована ✅):
   ✅ 2.1  ──► ✅ 2.3  (ArchetypeMask — фундамент для QueryCache)
-  ⏳ 2.2  (CommandQueue — pending)
+  ✅ 2.2  (CommandQueue — bump arena + typed remove, реализовано)
   ✅ 2.4  (realloc — реализовано)
   ✅ 2.5  (TransformScratch — реализовано)
 
 Фаза 3 (ASD реализован, row-splits заменён):
   ✅ 3.1 ASD  (Adaptive Scope Distribution — реализовано)
   ❌ 3.2     (заменён на ASD — row splits избыточны)
-  ⏳ 3.3     (Thread-local Commands — pending)
+  ✅ 3.3     (Thread-local Commands — реализовано)
 
 Фаза 4 (частично реализована):
   ✅ 4.1  (batch relations — реализовано)
@@ -1238,6 +1219,8 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
  2.3 QueryCache invalidate_for          (Фаза 2) ✅
  2.4 Column::realloc                    (Фаза 2) ✅
  4.1 add_relation_batch                 (Фаза 4) ✅
+ 2.2 CommandQueue chunking            (Фаза 2) ✅
+ 3.3 Thread-local Commands            (Фаза 3) ✅
  4.x Оставшиеся задачи                 (Фаза 4) ⏳
 ```
 
@@ -1245,8 +1228,6 @@ println!("{}", sched.debug_plan_verbose());  // теперь с реальным
 
 | Приоритет | Задача | Файлы | Ожидаемый выигрыш |
 |-----------|--------|-------|-------------------|
-| 1 | 3.3 Thread-local Commands | `crates/apex-scheduler/src/lib.rs`, `crates/apex-core/src/world.rs` | Usability: commands() внутри par_for_each |
-| 2 | 2.2 CommandQueue chunking | `crates/apex-core/src/commands.rs` | -60% allocs в Commands::apply |
 | 3 | 4.3 Without<T> exclude mask | `crates/apex-core/src/query.rs` | -20% время Without-запросов |
 | 4 | 4.2 Hot-reload debounce | `crates/apex-scripting/src/script_engine.rs` | Устранение reload storms |
 | 5 | 4.4 compile_with_world | `crates/apex-scheduler/src/lib.rs` | debug_plan quality: имена видны |
