@@ -857,6 +857,55 @@ for each system:
 
 ---
 
+#### 3.1.1. Adaptive chunk size — адаптивное чанкование для `par_for_each` — ✅ РЕАЛИЗОВАНО
+
+**Файл:** `crates/apex-core/src/world.rs`
+**Функция:** `adaptive_chunk_size(entity_count, num_threads) -> usize`
+**Константы:** `DEFAULT_MAX_CHUNK_SIZE = 16384`, `PAR_CHUNK_SIZE` (AtomicUsize, env `APEX_PAR_CHUNK_SIZE`)
+**Дата:** 2026-04-26
+
+В дополнение к ASD (распределение систем по ядрам на уровне планировщика) реализован адаптивный алгоритм чанкования для параллельных итераций внутри одной системы (`CachedQuery::par_for_each`, `par_for_each_component`).
+
+**Алгоритм:**
+
+```
+chunk = entity_count / max(num_threads, 1)
+
+# Абсолютный максимум — пользовательская настройка или 16384
+if chunk > ABSOLUTE_MAX → chunk = ABSOLUTE_MAX
+
+# Динамический минимум: зависит от общего числа entity
+if   entity_count < 100   → min = 128   // очень мало сущностей → крупные чанки (минимум накладных расходов)
+elif entity_count < 1000  → min = 32    // средний размер → умеренное дробление
+else                      → min = 64    // много сущностей → баланс дробления и кеш-промахов
+
+if chunk < min → chunk = min
+
+# Финальная гарантия: чанк не больше числа entity
+chunk = min(chunk, entity_count)
+```
+
+**Ключевые особенности:**
+
+1. **Трёхуровневый dynamic minimum** — вместо жёсткой константы `MIN_CHUNK`:
+   - `< 100` entity → `min = 128` (минимум накладных расходов на spawn, почти всегда 1 чанк целиком)
+   - `100–1000` entity → `min = 32` (умеренное дробление, заполнение всех ядер)
+   - `>= 1000` entity → `min = 64` (баланс: чанки не слишком мелкие, но достаточно для всех workers)
+
+2. **`chunk.min(entity_count)`** — финальный предохранитель: исключает ситуацию `chunk > entity_count`, когда dynamic min превышает количество сущностей. Например, для 50 entity и 8 workers: `50/8=6 → min=128 → chunk=128 → min(128,50)=50`.
+
+3. **Настраиваемый абсолютный максимум** — через `PAR_CHUNK_SIZE` (AtomicUsize):
+   - Устанавливается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`
+   - Значение `0` означает «использовать `DEFAULT_MAX_CHUNK_SIZE = 16384`»
+   - Инициализация из env происходит при старте через `init_par_chunk_size_from_env()`
+
+4. **Интеграция с ASD:** ASD дробит системы на уровне планировщика, а `adaptive_chunk_size` — на уровне запроса. Они не конфликтуют: если ASD уже создал 1 задачу для системы с малым числом entity, то `par_for_each` внутри этой задачи всё равно корректно поделит работу между ядрами.
+
+**Верификация:**
+- `cargo test adaptive_chunk_size --workspace` — 6 passed (small_world, medium_world, large_world, single_thread, max_cap, transition_points)
+
+---
+
 ### 3.2. Автоматическое разделение работы по архетипам между системами — ❌ ЗАМЕНЕНО НА ASD
 
 **Статус:** План 3.2 (row-level splits между системами) признан избыточным. ASD уже решает проблему загрузки workers автоматически:

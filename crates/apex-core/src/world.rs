@@ -1432,61 +1432,54 @@ mod tests {
 
     #[test]
     fn adaptive_chunk_size_small_world() {
-        // < 100 entities: dynamic_min = 128 → chunk = 128, даже при 8 threads
-        assert_eq!(adaptive_chunk_size(50, 8), 128);
-        assert_eq!(adaptive_chunk_size(50, 4), 128);
-        assert_eq!(adaptive_chunk_size(1, 8), 128);
-        assert_eq!(adaptive_chunk_size(99, 8), 128);
+        // < 100 entities: dynamic_min = 128, но chunk не может быть > entity_count
+        assert_eq!(adaptive_chunk_size(50, 8), 50);   // 50/8=6, min(128,50)=50
+        assert_eq!(adaptive_chunk_size(50, 4), 50);   // 50/4=12, min(128,50)=50
+        assert_eq!(adaptive_chunk_size(1, 8), 1);     // 1/8=0,  min(128,1)=1
+        assert_eq!(adaptive_chunk_size(99, 8), 99);   // 99/8=12, min(128,99)=99
     }
 
     #[test]
     fn adaptive_chunk_size_medium_world() {
         // 100..1000 entities: dynamic_min = 32
-        // 200 / 8 = 25 < 32 → chunk = 32
-        assert_eq!(adaptive_chunk_size(200, 8), 32);
-        // 500 / 8 = 62 >= 32 → chunk = 62
-        assert_eq!(adaptive_chunk_size(500, 8), 62);
-        // 100 / 8 = 12 < 32 → chunk = 32
-        assert_eq!(adaptive_chunk_size(100, 8), 32);
+        assert_eq!(adaptive_chunk_size(200, 8), 32);   // 200/8=25 < 32 → 32
+        assert_eq!(adaptive_chunk_size(500, 8), 62);   // 500/8=62 >= 32 → 62
+        assert_eq!(adaptive_chunk_size(100, 8), 32);   // 100/8=12 < 32 → 32
     }
 
     #[test]
     fn adaptive_chunk_size_large_world() {
-        // >= 1000 entities: dynamic_min = MIN_CHUNK_SIZE (64)
-        // 1000 / 8 = 125 >= 64 → chunk = 125
-        assert_eq!(adaptive_chunk_size(1000, 8), 125);
-        // 10000 / 8 = 1250 < MAX_CHUNK_SIZE → chunk = 1250
-        assert_eq!(adaptive_chunk_size(10000, 8), 1250);
+        // >= 1000 entities: dynamic_min = 64
+        assert_eq!(adaptive_chunk_size(1000, 8), 125);   // 1000/8=125 >= 64 → 125
+        assert_eq!(adaptive_chunk_size(10000, 8), 1250); // 10000/8=1250 → 1250
     }
 
     #[test]
     fn adaptive_chunk_size_single_thread() {
-        // num_threads = 1 → chunk = entity_count
-        assert_eq!(adaptive_chunk_size(50, 1), 128); // 50 < 128 → 128
+        // num_threads = 1 → chunk = entity_count (или dynamic_min, если entity_count мал)
+        assert_eq!(adaptive_chunk_size(50, 1), 50);   // 50/1=50, min(128,50)=50
         assert_eq!(adaptive_chunk_size(200, 1), 200); // 200 >= 32 → 200
         assert_eq!(adaptive_chunk_size(1000, 1), 1000); // 1000 >= 64 → 1000
     }
 
     #[test]
     fn adaptive_chunk_size_max_cap() {
-        // chunk не превышает MAX_CHUNK_SIZE
-        // 1 thread: entity_count / 1 = 131072 > MAX_CHUNK_SIZE → cap
+        // chunk не превышает DEFAULT_MAX_CHUNK_SIZE (16384)
         assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1), DEFAULT_MAX_CHUNK_SIZE);
-        // 8 threads: entity_count / 8 = 16384 < MAX_CHUNK_SIZE → 16384
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 16384);
+        // 8 threads: 32768/8=4096 <= 16384 → cap не срабатывает
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 4096);
     }
 
     #[test]
     fn adaptive_chunk_size_transition_points() {
-        // Точки перехода между диапазонами
-        // entity_count=99 → dynamic_min=128
-        // entity_count=100 → dynamic_min=32
-        assert_eq!(adaptive_chunk_size(99, 8), 128);
-        assert_eq!(adaptive_chunk_size(100, 8), 32);
+        // entity_count=99 (<100) → dynamic_min=128, но capped entity_count
+        assert_eq!(adaptive_chunk_size(99, 8), 99);   // min(128,99)=99
+        // entity_count=100 (>=100) → dynamic_min=32
+        assert_eq!(adaptive_chunk_size(100, 8), 32);  // 100/8=12 < 32 → 32
 
         // entity_count=999 → dynamic_min=32
-        // entity_count=1000 → dynamic_min=64
         assert_eq!(adaptive_chunk_size(999, 8), 124); // 999/8=124 >= 32 → 124
+        // entity_count=1000 → dynamic_min=64
         assert_eq!(adaptive_chunk_size(1000, 8), 125); // 1000/8=125 >= 64 → 125
     }
 }
