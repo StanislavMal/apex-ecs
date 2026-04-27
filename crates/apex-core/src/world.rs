@@ -23,8 +23,18 @@ struct CacheEntry {
     version:      u32,
 }
 
+/// Обёртка над SmallVec для zero-copy lookup через Borrow<[ComponentId]>.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct QueryCacheKey(SmallVec<[ComponentId; 8]>);
+
+impl std::borrow::Borrow<[ComponentId]> for QueryCacheKey {
+    fn borrow(&self) -> &[ComponentId] {
+        &self.0
+    }
+}
+
 pub(crate) struct QueryCache {
-    entries: UnsafeCell<FxHashMap<Vec<ComponentId>, CacheEntry>>,
+    entries: UnsafeCell<FxHashMap<QueryCacheKey, CacheEntry>>,
     version: u32,
 }
 
@@ -42,21 +52,44 @@ impl QueryCache {
         archetypes:    &[Archetype],
         matches:       impl Fn(&Archetype) -> bool,
     ) -> &[usize] {
-        let map   = &mut *self.entries.get();
-        let entry = map.entry(key.to_vec()).or_insert(CacheEntry {
-            arch_indices: Vec::new(),
-            version:      u32::MAX,
-        });
-        if entry.version != world_version {
-            entry.arch_indices = archetypes
-                .iter()
-                .enumerate()
-                .filter(|(_, arch)| !arch.is_empty() && matches(arch))
-                .map(|(i, _)| i)
-                .collect();
-            entry.version = world_version;
+        // SAFETY: весь метод unsafe, caller гарантирует отсутствие других &self доступа.
+        // Управляем временем жизни заимствований через raw pointer, чтобы
+        // избежать конфликта mutable borrow'ов между hit-paths (get_mut) и miss-paths (insert).
+        let raw = self.entries.get();
+
+        // Hit path — lookup по &[ComponentId] через Borrow, zero-copy, без аллокации
+        // При hit или stale — немедленный return, borrow заканчивается.
+        {
+            let map = &mut *raw;
+            if let Some(entry) = map.get_mut(key) {
+                if entry.version == world_version {
+                    return &entry.arch_indices;
+                }
+                // Cache stale — обновляем на месте, не создаём новую запись
+                entry.arch_indices = archetypes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, arch)| !arch.is_empty() && matches(arch))
+                    .map(|(i, _)| i)
+                    .collect();
+                entry.version = world_version;
+                return &entry.arch_indices;
+            }
         }
-        &entry.arch_indices
+
+        // Miss — вставляем новую запись (аллокация QueryCacheKey только здесь).
+        // Используем сырой указатель, т.к. предыдущий &mut из `raw` уже не используется.
+        let query_key = QueryCacheKey(key.iter().copied().collect());
+        let arch_indices = archetypes
+            .iter()
+            .enumerate()
+            .filter(|(_, arch)| !arch.is_empty() && matches(arch))
+            .map(|(i, _)| i)
+            .collect();
+        (*raw).insert(query_key, CacheEntry { arch_indices, version: world_version });
+
+        // Возвращаем ссылку на вставленные данные через сырой указатель
+        &(*raw).get(key).unwrap().arch_indices
     }
 
     pub fn invalidate(&mut self) { self.version = self.version.wrapping_add(1); }
@@ -67,7 +100,7 @@ impl QueryCache {
         let map = unsafe { &mut *self.entries.get() };
         // Удаляем только те ключи (списки компонентов запроса),
         // которые содержат изменённый ComponentId.
-        map.retain(|key, _| !key.contains(&changed_cid));
+        map.retain(|key, _| !key.0.contains(&changed_cid));
     }
 
     pub fn version(&self) -> u32 { self.version }
@@ -1291,7 +1324,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 // ── Bundle ─────────────────────────────────────────────────────
 
 pub trait Bundle: Sized {
-    fn component_ids(&self, registry: &mut ComponentRegistry) -> Vec<ComponentId>;
+    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]>;
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
 
     /// Пакетная запись компонентов с предвычисленными column indices.
@@ -1315,8 +1348,10 @@ macro_rules! impl_bundle {
     ($($T:ident),+) => {
         #[allow(non_snake_case)]
         impl<$($T: Component),+> Bundle for ($($T,)+) {
-            fn component_ids(&self, registry: &mut ComponentRegistry) -> Vec<ComponentId> {
-                let mut ids = vec![$( registry.get_or_register::<$T>() ),+];
+            fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
+                let mut ids: SmallVec<[ComponentId; 8]> = smallvec::smallvec![
+                    $( registry.get_or_register::<$T>() ),+
+                ];
                 ids.sort_unstable();
                 ids
             }

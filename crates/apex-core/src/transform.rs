@@ -134,6 +134,8 @@ pub struct TransformDirty;
 pub struct TransformScratch {
     /// Список dirty entity из query (шаг 1)
     pub(crate) dirty_entities: Vec<Entity>,
+    /// Set для O(1) проверки dirty (по entity.index)
+    pub(crate) dirty_set:      FxHashSet<u32>,
     /// Топологически отсортированные entity (шаг 2–3)
     pub(crate) ordered: Vec<Entity>,
     /// Множество уже обработанных entity (для DFS)
@@ -167,15 +169,19 @@ pub fn propagate_transforms(world: &mut World) {
 
     // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
     scratch.dirty_entities.clear();
+    scratch.dirty_set.clear();
     scratch.ordered.clear();
     scratch.seen.clear();
     scratch.stack.clear();
     scratch.children.clear();
 
-    // 1. Собираем dirty entity
+    // 1. Собираем dirty entity и сразу строим set
     {
         let q = world.query_typed::<Read<TransformDirty>>();
-        q.for_each(|e, _| scratch.dirty_entities.push(e));
+        q.for_each(|e, _| {
+            scratch.dirty_entities.push(e);
+            scratch.dirty_set.insert(e.index);  // заполняем set
+        });
     } // query Q дропается здесь
 
     if scratch.dirty_entities.is_empty() {
@@ -188,7 +194,7 @@ pub fn propagate_transforms(world: &mut World) {
     //    Итеративный DFS: для каждого dirty entity поднимаемся по предкам
     //    и добавляем их в порядке от корня к листьям.
     for &entity in &scratch.dirty_entities {
-        if !world.get::<TransformDirty>(entity).is_some() {
+        if !scratch.dirty_set.contains(&entity.index) {  // O(1), без world lookup
             continue;
         }
 
@@ -206,7 +212,8 @@ pub fn propagate_transforms(world: &mut World) {
             let parent = world.get_relation_target(top, ChildOf);
             let need_parent = parent
                 .map(|p| {
-                    world.get::<TransformDirty>(p).is_some() && !scratch.seen.contains(&p.index)
+                    scratch.dirty_set.contains(&p.index)  // O(1) вместо world.get
+                        && !scratch.seen.contains(&p.index)
                 })
                 .unwrap_or(false);
 
@@ -255,6 +262,7 @@ pub fn propagate_transforms(world: &mut World) {
 
         // Снимаем TransformDirty
         world.remove::<TransformDirty>(entity);
+        scratch.dirty_set.remove(&entity.index);  // поддерживаем set актуальным
 
         // ── Каскадирование TransformDirty на детей ─────────────────
         // Если у этой entity есть дети (ChildOf), помечаем их как dirty,
@@ -268,8 +276,9 @@ pub fn propagate_transforms(world: &mut World) {
             if !world.is_alive(child) {
                 continue;
             }
-            if world.get::<TransformDirty>(child).is_none() {
+            if !scratch.dirty_set.contains(&child.index) {
                 world.insert(child, TransformDirty);
+                scratch.dirty_set.insert(child.index);  // обновляем set
                 // Добавляем в ordered-список для обработки в этом же проходе
                 scratch.ordered.push(child);
             }

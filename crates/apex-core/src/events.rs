@@ -206,6 +206,20 @@ impl<T> TrackedEventQueue<T> {
         }
     }
 
+    /// Прочитать непрочитанные события с автоматическим продвижением курсора.
+    ///
+    /// Курсор продвигается при дропе возвращённого [`EventReadGuard`].
+    #[inline]
+    pub fn read(&mut self, reader_id: &EventCursor) -> EventReadGuard<'_, T> {
+        let idx   = reader_id.0 as usize;
+        let start = self.cursors.get(idx)
+            .and_then(|c| c.as_ref())
+            .copied()
+            .unwrap_or(0) as usize;
+        let start = start.min(self.events.len());
+        EventReadGuard { queue: self, reader_id: *reader_id, start }
+    }
+
     /// Количество событий в буфере чтения.
     #[inline]
     pub fn len(&self) -> usize {
@@ -283,6 +297,63 @@ impl<T> TrackedEventQueue<T> {
 impl<T> Default for TrackedEventQueue<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII-обёртка: при дропе автоматически продвигает курсор до конца буфера.
+///
+/// Создаётся через [`TrackedEventQueue::read`].
+pub struct EventReadGuard<'q, T> {
+    queue:     &'q mut TrackedEventQueue<T>,
+    reader_id: EventCursor,
+    start:     usize,
+}
+
+impl<'q, T> EventReadGuard<'q, T> {
+    /// Срез непрочитанных событий.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        &self.queue.events[self.start..]
+    }
+
+    /// Итерация без потребления guard.
+    #[inline]
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.as_slice().iter()
+    }
+
+    /// Отказаться от автоматического продвижения курсора.
+    /// Курсор останется на месте после дропа guard.
+    pub fn peek(self) -> PeekGuard<'q, T> {
+        PeekGuard(self)
+    }
+}
+
+impl<T> std::ops::Deref for EventReadGuard<'_, T> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] { self.as_slice() }
+}
+
+impl<T> Drop for EventReadGuard<'_, T> {
+    fn drop(&mut self) {
+        // Автоматически продвигаем курсор при дропе
+        self.queue.advance_reader_mut(&self.reader_id);
+    }
+}
+
+/// Обёртка для "посмотреть без продвижения".
+pub struct PeekGuard<'q, T>(EventReadGuard<'q, T>);
+
+impl<T> std::ops::Deref for PeekGuard<'_, T> {
+    type Target = [T];
+    #[inline]
+    fn deref(&self) -> &[T] { self.0.as_slice() }
+}
+
+impl<T> Drop for PeekGuard<'_, T> {
+    fn drop(&mut self) {
+        // Намеренно НЕ продвигаем курсор
     }
 }
 

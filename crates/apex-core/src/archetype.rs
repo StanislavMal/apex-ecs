@@ -159,7 +159,19 @@ impl Column {
     }
 
     pub(crate) fn grow(&mut self) {
-        let new_cap = if self.capacity == 0 { 64 } else { self.capacity * 2 };
+        let new_cap = if self.capacity == 0 {
+            // Целевой размер первого выделения: ~256 байт минимум, но не более 64 элементов.
+            // Для крупных компонентов (Mat4=64B, Transform=~48B) — 4 элемента.
+            // Для мелких (f32=4B, u8=1B) — 64 элемента.
+            if self.item_size == 0 {
+                64
+            } else {
+                // 256 байт / item_size, зажатые в [4, 64]
+                (256 / self.item_size.max(1)).clamp(4, 64)
+            }
+        } else {
+            self.capacity * 2
+        };
         if self.item_size == 0 {
             self.capacity = new_cap;
             return;
@@ -193,7 +205,7 @@ impl Column {
             self.change_ticks.reserve(additional);
             return;
         }
-        let new_cap = needed.next_power_of_two().max(64);
+        let new_cap = needed.next_power_of_two().max(4);
         if self.item_size == 0 {
             self.capacity = new_cap;
             self.change_ticks.reserve(additional);

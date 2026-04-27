@@ -1,5 +1,4 @@
 use std::any::TypeId;
-use std::collections::HashSet;
 
 /// Битовая маска компонентов — до 256 компонентов.
 ///
@@ -144,17 +143,29 @@ impl ArchetypeMask {
         self.bits.iter().map(|&b| b.count_ones()).sum()
     }
 
-    /// Итерация по установленным индексам.
+    /// Итерация по установленным индексам через trailing_zeros — O(popcount).
     pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
         self.bits.iter().enumerate().flat_map(|(chunk_i, &chunk)| {
-            (0..64).filter_map(move |bit| {
-                if chunk & (1u64 << bit) != 0 {
-                    Some(chunk_i * 64 + bit)
-                } else {
-                    None
-                }
-            })
+            BitIter { word: chunk, base: chunk_i * 64 }
         })
+    }
+}
+
+struct BitIter {
+    word: u64,
+    base: usize,
+}
+
+impl Iterator for BitIter {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.word == 0 {
+            return None;
+        }
+        let bit = self.word.trailing_zeros() as usize;
+        self.word &= self.word - 1;  // сбрасываем младший установленный бит
+        Some(self.base + bit)
     }
 }
 
@@ -244,6 +255,14 @@ impl AccessDescriptor {
         for tid in &self.writes {
             if let Some(&idx) = type_to_idx.get(tid) { self.write_mask.set(idx); }
         }
+        // Освобождаем векторы — после назначения масок они больше не нужны.
+        // Маски содержат всю информацию в O(1) доступе.
+        self.reads.clear();
+        self.reads.shrink_to_fit();
+        self.writes.clear();
+        self.writes.shrink_to_fit();
+        // reads_event / writes_event пока оставляем — они нужны для event-конфликтов.
+        // Если event конфликты тоже переведены на маски — можно очистить и их.
     }
 
     /// O(1) проверка конфликта через битовые маски.
@@ -278,16 +297,20 @@ impl AccessDescriptor {
         false
     }
 
-    /// O(N+M) дедупликация через HashSet — заменяет O(N²) contains+push в merge.
+    /// O(N+M) дедупликация — для малых наборов linear scan, для больших — HashSet.
     fn dedup_push(vec: &mut Vec<TypeId>, items: &[TypeId]) {
-        if items.is_empty() {
+        if items.is_empty() { return; }
+        // Порог: если суммарный размер < 8 — O(N²) дешевле аллокации HashSet
+        if vec.len() + items.len() < 8 {
+            for &item in items {
+                if !vec.contains(&item) { vec.push(item); }
+            }
             return;
         }
-        let mut set: HashSet<TypeId> = vec.iter().cloned().collect();
+        // Для больших наборов — HashSet как прежде
+        let mut set: std::collections::HashSet<TypeId> = vec.iter().cloned().collect();
         for &item in items {
-            if set.insert(item) {
-                vec.push(item);
-            }
+            if set.insert(item) { vec.push(item); }
         }
     }
 
