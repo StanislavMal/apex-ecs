@@ -516,12 +516,12 @@ impl ScriptEngine {
 
         for req in requests {
             if req.components.is_empty() {
-                world.spawn_empty();
+                world.spawn(());
                 continue;
             }
 
             // Создаём entity и добавляем компоненты по одному
-            let entity = world.spawn_empty();
+            let entity = world.spawn(());
             for (key, dynamic) in &req.components {
                 let key_lower = key.to_lowercase();
                 // Также пробуем без подчёркиваний, чтобы tile_kind → tilekind → TileKind

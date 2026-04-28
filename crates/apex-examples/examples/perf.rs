@@ -175,7 +175,7 @@ impl ParSystem for MoveSys {
         AccessDescriptor::new().read::<Velocity>().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
+        ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
             p.z += v.z * 0.016;
@@ -187,7 +187,7 @@ struct HpSys;
 impl ParSystem for HpSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Health>>().for_each_component(|hp| {
+        ctx.query::<Write<Health>>().for_each(|_, hp| {
             hp.current = hp.current.min(hp.max).max(0.0);
         });
     }
@@ -197,7 +197,7 @@ struct TempSys;
 impl ParSystem for TempSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Temperature>>().for_each_component(|t| {
+        ctx.query::<Write<Temperature>>().for_each(|_, t| {
             t.0 += (20.0 - t.0) * 0.001;
         });
     }
@@ -207,7 +207,7 @@ struct ManaSys;
 impl ParSystem for ManaSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Mana>>().for_each_component(|m| {
+        ctx.query::<Write<Mana>>().for_each(|_, m| {
             m.current = (m.current + 0.2).min(m.max);
         });
     }
@@ -219,7 +219,7 @@ impl ParSystem for HeavyPhysSys {
         AccessDescriptor::new().write::<Velocity>().write::<Position>()
     }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<(Write<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
+        ctx.query::<(Write<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
             let dt    = 0.016f32;
             let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
             let angle = speed.atan2(1.0);
@@ -239,7 +239,7 @@ struct HeavyTempSys;
 impl ParSystem for HeavyTempSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Temperature>>().for_each_component(|t| {
+        ctx.query::<Write<Temperature>>().for_each(|_, t| {
             let ambient = 20.0f32;
             let diff    = t.0 - ambient;
             let rate    = (diff * 0.1).tanh() * 0.05;
@@ -256,7 +256,7 @@ struct HeavyManaSys;
 impl ParSystem for HeavyManaSys {
     fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Mana>>().for_each_component(|m| {
+        ctx.query::<Write<Mana>>().for_each(|_, m| {
             let ratio = m.current / m.max;
             let regen = (1.0 - ratio).sqrt() * 0.5;
             m.current = (m.current + regen).min(m.max);
@@ -271,7 +271,7 @@ struct AutoMoveSys;
 impl AutoSystem for AutoMoveSys {
     type Query = (Read<Velocity>, Write<Position>);
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each_component(|(v, p)| {
+        ctx.query::<Self::Query>().for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
         });
@@ -285,7 +285,7 @@ fn bench_batch_allocator(n: usize) {
 
     // setup = () : весь код внутри f(), так как мы измеряем именно спавн
     bench_with_setup(
-        &format!("spawn_bundle loop      ({n}k) [baseline]"),
+        &format!("spawn loop      ({n}k) [baseline]"),
         || (),
         |()| {
             let mut world = World::new();
@@ -294,7 +294,7 @@ fn bench_batch_allocator(n: usize) {
             world.register_component::<Health>();
             for i in 0..n * 1000 {
                 let f = i as f32;
-                world.spawn_bundle((
+                world.spawn((
                     Position { x: f, y: f * 0.5, z: 0.0 },
                     Velocity { x: 1.0, y: 0.5, z: 0.0 },
                     Health   { current: 100.0, max: 100.0 },
@@ -414,12 +414,12 @@ fn bench_has_relation(n: usize) {
         world.register_component::<Position>();
 
         let parents: Vec<Entity> = (0..parent_count)
-            .map(|i| world.spawn_bundle((Position { x: i as f32, y: 0.0, z: 0.0 },)))
+            .map(|i| world.spawn((Position { x: i as f32, y: 0.0, z: 0.0 },)))
             .collect();
 
         for &parent in &parents {
             for j in 0..children_per {
-                let child = world.spawn_bundle(
+                let child = world.spawn(
                     (Position { x: j as f32, y: 0.0, z: 0.0 },)
                 );
                 world.add_relation(child, ChildOf, parent);
@@ -533,7 +533,7 @@ fn bench_scheduler_throughput(n: usize) {
             "physics",
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
-                ctx.query::<Write<Position>>().for_each_component(|pos| { pos.x += dt; });
+                ctx.query::<Write<Position>>().for_each(|_, pos| { pos.x += dt; });
             },
             AccessDescriptor::new().read::<PhysicsConfig>().write::<Position>(),
         );
@@ -557,7 +557,7 @@ fn bench_scheduler_throughput(n: usize) {
         let mut sched = Scheduler::new();
         sched.add_system("move", |world: &mut World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(world)
-                .for_each_component(|(v, p)| { p.x += v.x; p.y += v.y; });
+                .for_each(|_, (v, p)| { p.x += v.x; p.y += v.y; });
         });
         sched.compile().unwrap();
         bench_with_setup(
@@ -898,24 +898,24 @@ fn bench_query(n: usize) {
     println!("\n── Query ({n}k entities) ─────────────────────────────────────────────────────────");
 
     bench_with_setup(
-        &format!("Query::new + for_each_component   ({n}k)"),
+        &format!("Query::new + for_each              ({n}k)"),
         || make_world_3comp(n * 1000),
         |world: World| {
             let mut sum = 0.0f32;
             Query::<Read<Position>>::new(&world)
-                .for_each_component(|p| { sum += p.x; });
+                .for_each(|_, p| { sum += p.x; });
             std::hint::black_box(sum);
             (n * 1000) as u64
         },
     );
 
     bench_with_setup(
-        &format!("CachedQuery + for_each_component  ({n}k)"),
+        &format!("CachedQuery + for_each             ({n}k)"),
         || make_world_3comp(n * 1000),
         |world: World| {
             let mut sum = 0.0f32;
             world.query_typed::<Read<Position>>()
-                .for_each_component(|p| { sum += p.x; });
+                .for_each(|_, p| { sum += p.x; });
             std::hint::black_box(sum);
             (n * 1000) as u64
         },
@@ -926,7 +926,7 @@ fn bench_query(n: usize) {
         || make_world_3comp(n * 1000),
         |mut world: World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(&mut world)
-                .for_each_component(|(v, p)| { p.x += v.x; p.y += v.y; });
+                .for_each(|_, (v, p)| { p.x += v.x; p.y += v.y; });
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
         },
@@ -944,14 +944,14 @@ fn bench_query(n: usize) {
             // Добавляем несколько Player-entity в отдельный архетип
             // (не совпадающий с запросом Read<Position> + With<Player>
             //  потому что у них нет Position)
-            for _ in 0..100 { world.spawn_bundle((Player,)); }
+            for _ in 0..100 { world.spawn((Player,)); }
             world
         },
         |world: World| {
             let mut c = 0u64;
             // Запрос: нужны entity с Position И Player — таких нет
             Query::<(Read<Position>, With<Player>)>::new(&world)
-                .for_each_component(|_| { c += 1; });
+                .for_each(|_, _| { c += 1; });
             std::hint::black_box(c);
             // ops = кол-во entity в мире (обошли все архетипы)
             world.entity_count() as u64
@@ -979,7 +979,7 @@ fn bench_structural(n: usize) {
             world.register_component::<Mass>();
             let mut entities = Vec::with_capacity(n * 1000);
             for i in 0..n * 1000 {
-                let e = world.spawn_bundle((
+                let e = world.spawn((
                     Position { x: i as f32, y: 0.0, z: 0.0 },
                     Velocity { x: 1.0, y: 0.0, z: 0.0 },
                 ));
@@ -1203,10 +1203,10 @@ fn bench_parallel_scheduler(n: usize) {
         );
     }
 
-    // ── Сравнение for_each_component vs par_for_each_component ──────────
+    // ── Сравнение for_each vs par_for_each ──────────────────────────────
     //
-    // Ключевой тест: проверяем, даёт ли par_for_each_component (intra-system
-    // parallelism) прирост по сравнению с for_each_component (sequential)
+    // Ключевой тест: проверяем, даёт ли par_for_each (intra-system
+    // parallelism) прирост по сравнению с for_each (sequential)
     // в межсистемном режиме.
     //
     // Системы: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
@@ -1222,7 +1222,7 @@ fn bench_parallel_scheduler(n: usize) {
             AccessDescriptor::new().write::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
+            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1242,7 +1242,7 @@ fn bench_parallel_scheduler(n: usize) {
     impl ParSystem for HeavyTempParSys {
         fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Temperature>>().par_for_each_component(|t| {
+            ctx.query::<Write<Temperature>>().par_for_each(|_, t| {
                 let ambient = 20.0f32;
                 let diff    = t.0 - ambient;
                 let rate    = (diff * 0.1).tanh() * 0.05;
@@ -1259,7 +1259,7 @@ fn bench_parallel_scheduler(n: usize) {
     impl ParSystem for HeavyManaParSys {
         fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Mana>>().par_for_each_component(|m| {
+            ctx.query::<Write<Mana>>().par_for_each(|_, m| {
                 let ratio = m.current / m.max;
                 let regen = (1.0 - ratio).sqrt() * 0.5;
                 m.current = (m.current + regen).min(m.max);
@@ -1355,7 +1355,7 @@ fn bench_parallel_scheduler(n: usize) {
                     AccessDescriptor::new().write::<$comp>()
                 }
                 fn run(&mut self, ctx: SystemContext<'_>) {
-                    ctx.query::<Write<$comp>>().for_each_component(|c| {
+                    ctx.query::<Write<$comp>>().for_each(|_, c| {
                         c.0 = (c.0 * 1.01 + 0.5).sin();
                     });
                 }
@@ -1530,7 +1530,7 @@ fn bench_parallel_scheduler(_n: usize) {
 
 #[cfg(feature = "parallel")]
 fn bench_intra_system_parallel(n: usize) {
-    println!("\n── Intra-system Parallelism — par_for_each_component ───────────────────────────");
+    println!("\n── Intra-system Parallelism — par_for_each ────────────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
     println!("  setup=World, f=только run() | speedup = seq_frame / par_frame");
 
@@ -1577,7 +1577,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1592,7 +1592,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1607,7 +1607,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each_component(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1625,7 +1625,7 @@ fn bench_intra_system_parallel(n: usize) {
             AccessDescriptor::new().read::<Velocity>().write::<Position>()
         }
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each_component(|(v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);

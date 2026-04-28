@@ -316,7 +316,7 @@ mod tests {
         let mut iso = IsolatedWorld::new();
 
         // Спавним сущность в основном мире
-        main_world.spawn_empty();
+        main_world.spawn(());
 
         // В изолированном мире ничего нет
         assert_eq!(iso.world.entity_count(), 0);
@@ -377,7 +377,7 @@ mod tests {
         let (bridge_a, bridge_b) = WorldBridge::new();
 
         bridge_a.send_action(Box::new(|world: &mut World| {
-            world.spawn_empty();
+            world.spawn(());
         }));
 
         let mut world = World::new();
@@ -420,7 +420,7 @@ mod tests {
 
         // Отправляем действие из под-мира в основной
         to_sub_bridge.send_action(Box::new(|world: &mut World| {
-            world.spawn_empty();
+            world.spawn(());
         }));
 
         let mut world = World::new();
@@ -449,7 +449,7 @@ mod tests {
             AccessDescriptor::new(),
         );
 
-        iso.world_mut().spawn_empty();
+        iso.world_mut().spawn(());
         iso.tick();
 
         assert_eq!(iso.world.entity_count(), 1);

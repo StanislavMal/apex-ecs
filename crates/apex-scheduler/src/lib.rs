@@ -9,7 +9,7 @@
 //! impl AutoSystem for MovementSystem {
 //!     type Query = (Read<Velocity>, Write<Position>);
 //!     fn run(&mut self, ctx: SystemContext<'_>) {
-//!         ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
+//!         ctx.for_each::<Self::Query, _>(|(vel, pos)| {
 //!             pos.x += vel.x;
 //!         });
 //!     }
@@ -37,7 +37,7 @@
 //! Топосорт выполняется лениво при первом `run()` или явном `compile()`.
 //! При добавлении новой системы добавляются только новые узлы/рёбра.
 //!
-//! ## 4. `par_for_each_component` в SystemContext (в apex-core/world.rs)
+//! ## 4. `par_for_each` в SystemContext (в apex-core/world.rs)
 //!
 //! Параллелизм внутри одной системы по архетипам через Rayon.
 //!
@@ -1841,7 +1841,7 @@ mod tests {
         type Query = (Read<Vel>, Write<Pos>);
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Self::Query>()
-                .for_each_component(|(vel, pos)| {
+                .for_each(|_, (vel, pos)| {
                     pos.x += vel.x;
                     pos.y += vel.y;
                 });
@@ -1853,7 +1853,7 @@ mod tests {
         type Query = Write<Hp>;
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Self::Query>()
-                .for_each_component(|hp| {
+                .for_each(|_, hp| {
                     hp.0 = hp.0.max(0.0);
                 });
         }
@@ -1875,12 +1875,12 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Pos>();
         world.register_component::<Vel>();
-        world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 3.0, y: 4.0 }));
+        world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { x: 3.0, y: 4.0 }));
 
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each_component(|p| { result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| { result = (p.x, p.y); });
         assert!((result.0 - 3.0).abs() < 1e-6);
         assert!((result.1 - 4.0).abs() < 1e-6);
     }
@@ -2031,7 +2031,7 @@ mod tests {
             fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
             fn run(&mut self, ctx: SystemContext<'_>) {
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
-                    .for_each_component(|(vel, pos)| {
+                    .for_each(|_, (vel, pos)| {
                         pos.x += vel.x; pos.y += vel.y;
                     });
             }
@@ -2119,7 +2119,7 @@ mod tests {
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
-                    .for_each_component(|(vel, pos)| {
+                    .for_each(|_, (vel, pos)| {
                         pos.x += vel.x * (*dt).0;
                         pos.y += vel.y * (*dt).0;
                     });
@@ -2134,12 +2134,12 @@ mod tests {
         world.register_component::<Pos>();
         world.register_component::<Vel>();
         world.insert_resource(DeltaTime(0.5));
-        world.spawn_bundle((Pos { x: 0.0, y: 0.0 }, Vel { x: 2.0, y: 4.0 }));
+        world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { x: 2.0, y: 4.0 }));
 
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each_component(|p| { result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| { result = (p.x, p.y); });
 
         assert!((result.0 - 1.0).abs() < 1e-6);
         assert!((result.1 - 2.0).abs() < 1e-6);
@@ -2159,7 +2159,7 @@ mod tests {
         world.register_component::<Pos>();
         world.register_component::<Vel>();
         world.register_component::<Hp>();
-        world.spawn_bundle((
+        world.spawn((
             Pos { x: 0.0, y: 0.0 },
             Vel { x: 1.0, y: 2.0 },
             Hp(-5.0),
@@ -2168,12 +2168,12 @@ mod tests {
         sched.run(&mut world);
 
         let mut pos_result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each_component(|p| { pos_result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| { pos_result = (p.x, p.y); });
         assert!((pos_result.0 - 1.0).abs() < 1e-6);
         assert!((pos_result.1 - 2.0).abs() < 1e-6);
 
         let mut hp_result = -1.0f32;
-        Query::<Read<Hp>>::new(&world).for_each_component(|hp| { hp_result = hp.0; });
+        Query::<Read<Hp>>::new(&world).for_each(|_, hp| { hp_result = hp.0; });
         assert!((hp_result - 0.0).abs() < 1e-6);
     }
 

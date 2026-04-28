@@ -62,7 +62,7 @@ struct EnemyTemplate;
 
 impl EntityTemplate for EnemyTemplate {
     fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
-        let e = world.spawn_empty();
+        let e = world.spawn(());
         world.insert(e, Position { x: 100.0, y: 200.0 });
         world.insert(e, Health {
             current: 50.0,
@@ -218,7 +218,7 @@ fn main() {
     iso.world_mut().add_event::<String>();
 
     // Спавним врага в изолированном мире
-    let iso_enemy = iso.world_mut().spawn_empty();
+    let iso_enemy = iso.world_mut().spawn(());
     iso.world_mut().insert(iso_enemy, Position { x: 300.0, y: 400.0 });
     iso.world_mut().insert(iso_enemy, Health {
         current: 80.0,
@@ -291,7 +291,7 @@ fn main() {
     println!("\n--- Hierarchy export: parent-child ---");
 
     // Создаём иерархию: player → child
-    let child = world.spawn_empty();
+    let child = world.spawn(());
     world.insert(child, Position { x: 5.0, y: 10.0 });
     world.insert(child, Health {
         current: 30.0,

@@ -21,7 +21,7 @@ pub use entity::Entity;
 pub use events::{Events, EventRegistry};
 pub use resources::Resources;
 pub use sub_world::SubWorld;
-pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext, DeferredQueue};
+pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext};
 pub use query::{Query, Read, Write, With, Without, Changed, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns};
@@ -36,7 +36,7 @@ pub mod prelude {
     pub use crate::entity::Entity;
     pub use crate::events::Events;
     pub use crate::resources::Resources;
-    pub use crate::world::{World, Bundle, CachedQuery, SystemContext, DeferredQueue};
+    pub use crate::world::{World, Bundle, CachedQuery, SystemContext};
     pub use crate::query::{Query, Read, Write, With, Without, Changed, QueryBuilder, WorldQuery};
     pub use crate::commands::Commands;
     pub use crate::relations::{RelationKind, ChildOf, Owns};
@@ -44,6 +44,6 @@ pub mod prelude {
         Res, ResMut, EventReader, EventWriter,
         WorldQuerySystemAccess, AutoSystem,
     };
-    pub use crate::template::{TemplateParams, EntityTemplate};
+    pub use crate::template::{TemplateParams, EntityTemplate, TemplateParam};
     pub use crate::impl_entity_template;
 }

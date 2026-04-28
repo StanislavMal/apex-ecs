@@ -425,11 +425,6 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     #[inline]
-    pub fn iter_components(&self) -> QueryComponentIter<'_, Q> {
-        QueryComponentIter { archetypes: &self.archetypes, arch_cursor: 0, row_cursor: 0 }
-    }
-
-    #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         for a in &self.archetypes {
             let entities = &self.world.archetypes[a.arch_idx].entities;
@@ -441,64 +436,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         }
     }
 
-    #[inline]
-    pub fn for_each_component<F: FnMut(Q::Item<'_>)>(&self, mut f: F) {
-        for a in &self.archetypes {
-            for row in 0..a.len {
-                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
-                    f(item);
-                }
-            }
-        }
-    }
-
-    /// Параллельная итерация по компонентам (chunk-level parallelism).
-    /// Автоматически использует `adaptive_chunk_size` для каждого архетипа.
-    #[cfg(feature = "parallel")]
-    pub fn par_for_each_component<F>(&self, f: F)
-    where
-        Q: Send,
-        F: Fn(Q::Item<'_>) + Send + Sync,
-    {
-        use rayon::prelude::*;
-
-        let num_threads = rayon::current_num_threads();
-
-        // Предварительно вычисляем ID компонентов (как в new_with_tick)
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self.world, &mut ids);
-        if ids.len() != Q::component_count() {
-            return;
-        }
-
-        let chunks = compute_par_chunks(
-            self.archetypes.iter().map(|a| (a.arch_idx, a.len)),
-            num_threads,
-        );
-
-        let last_run = self.last_run;
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(item);
-                }
-            }
-        });
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each_component<F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: FnMut(Q::Item<'_>),
-    {
-        self.for_each_component(f);
-    }
-
-    /// Параллельная итерация с Entity.
+    /// Параллельная итерация.
     #[cfg(feature = "parallel")]
     pub fn par_for_each<F>(&self, f: F)
     where
@@ -612,33 +550,6 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
     }
 }
 
-pub struct QueryComponentIter<'q, Q: WorldQuery> {
-    archetypes:  &'q [ArchState<Q::State>],
-    arch_cursor: usize,
-    row_cursor:  usize,
-}
-
-impl<'q, Q: WorldQuery> Iterator for QueryComponentIter<'q, Q> {
-    type Item = Q::Item<'q>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let a = self.archetypes.get(self.arch_cursor)?;
-            if self.row_cursor >= a.len {
-                self.arch_cursor += 1;
-                self.row_cursor  = 0;
-                continue;
-            }
-            let row = self.row_cursor;
-            self.row_cursor += 1;
-            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
-                return Some(item);
-            }
-        }
-    }
-}
-
 // ── QueryBuilder ───────────────────────────────────────────────
 
 pub struct QueryBuilder<'w> {
@@ -698,11 +609,11 @@ mod tests {
         let mut world = World::new();
 
         // Создаём сущность только с A
-        let e1 = world.spawn().insert(A).id();
+        let e1 = world.spawn((A,));
         // Создаём сущность с A и B
-        let _e2 = world.spawn().insert(A).insert(B).id();
+        let _e2 = world.spawn((A, B));
         // Создаём сущность только с B
-        let e3 = world.spawn().insert(B).id();
+        let e3 = world.spawn((B,));
 
         // Query<Read<A>, Without<B>> должен вернуть только e1
         let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
@@ -728,10 +639,10 @@ mod tests {
         let mut with_b = Vec::new();
 
         for _ in 0..50 {
-            only_a.push(world.spawn().insert(A).id());
+            only_a.push(world.spawn((A,)));
         }
         for _ in 0..50 {
-            with_b.push(world.spawn().insert(A).insert(B).id());
+            with_b.push(world.spawn((A, B)));
         }
 
         // Query<Read<A>, Without<B>> — должны получить только entities с A без B
@@ -749,9 +660,9 @@ mod tests {
     fn without_alone_query() {
         let mut world = World::new();
 
-        let _e1 = world.spawn().insert(A).id();
-        let e2 = world.spawn().insert(B).id();
-        let _e3 = world.spawn().insert(A).insert(B).id();
+        let _e1 = world.spawn((A,));
+        let e2 = world.spawn((B,));
+        let _e3 = world.spawn((A, B));
 
         // Чистый Without<A> — все сущности без A
         let query: Query<'_, Without<A>> = Query::new(&world);

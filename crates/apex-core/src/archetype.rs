@@ -402,7 +402,7 @@ pub struct ArchetypeChunk<'a> {
 /// Разбить архетип на чанки фиксированного размера.
 ///
 /// Возвращает срезы `entities` длиной `chunk_size` (последний может быть меньше).
-/// Используется `par_for_each_component` для параллельной итерации внутри одного архетипа.
+/// Используется `par_for_each` для параллельной итерации внутри одного архетипа.
 pub fn archetype_chunks(arch: &Archetype, chunk_size: usize) -> impl Iterator<Item = ArchetypeChunk<'_>> {
     let total = arch.entities.len();
     let num_chunks = (total + chunk_size - 1) / chunk_size;

@@ -12,7 +12,7 @@
 //! impl AutoSystem for MovementSystem {
 //!     type Query = (Read<Velocity>, Write<Position>);
 //!     fn run(&mut self, ctx: SystemContext<'_>) {
-//!         ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
+//!         ctx.for_each::<Self::Query, _>(|(vel, pos)| {
 //!             pos.x += vel.x * 0.016;
 //!         });
 //!     }
@@ -204,7 +204,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 ///     AccessDescriptor::new().read::<Velocity>() // забыли write::<Position>()
 /// }
 /// fn run(&mut self, ctx: SystemContext<'_>) {
-///     ctx.for_each_component::<(Read<Velocity>, Write<Position>), _>(...)
+///     ctx.for_each::<(Read<Velocity>, Write<Position>), _>(...)
 ///     //                                        ^^^^^^^^^^^^^^^ пишем, но не декларировали
 /// }
 /// ```
@@ -235,7 +235,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 ///     type Query = (Read<Velocity>, Write<Position>);
 ///
 ///     fn run(&mut self, ctx: SystemContext<'_>) {
-///         ctx.for_each_component::<Self::Query, _>(|(vel, pos)| {
+///         ctx.for_each::<Self::Query, _>(|(vel, pos)| {
 ///             pos.x += vel.x * 0.016;
 ///             pos.y += vel.y * 0.016;
 ///         });

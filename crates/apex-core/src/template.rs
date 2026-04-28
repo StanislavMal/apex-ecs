@@ -15,10 +15,21 @@
 //!     speed:  f32,
 //! }
 //!
+//! struct MonsterTemplate {
+//!     health: f32,
+//!     speed:  f32,
+//! }
+//!
+//! struct MonsterHealth;
+//! impl TemplateParam for MonsterHealth { type Value = f32; }
+//!
+//! struct MonsterSpeed;
+//! impl TemplateParam for MonsterSpeed { type Value = f32; }
+//!
 //! impl EntityTemplate for MonsterTemplate {
 //!     fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity {
-//!         let health = params.get::<f32>("health").copied().unwrap_or(self.health);
-//!         let speed  = params.get::<f32>("speed").copied().unwrap_or(self.speed);
+//!         let health = params.get::<MonsterHealth>().copied().unwrap_or(self.health);
+//!         let speed  = params.get::<MonsterSpeed>().copied().unwrap_or(self.speed);
 //!
 //!         world.spawn()
 //!             .insert(Health { current: health, max: health })
@@ -32,7 +43,7 @@
 //! world.register_template("Monster", MonsterTemplate { health: 100.0, speed: 5.0 });
 //!
 //! let entity = world.spawn_from_template("Monster", &TemplateParams::new()
-//!     .with("speed", 10.0f32)
+//!     .set::<MonsterSpeed>(10.0f32)
 //! ).unwrap();
 //! ```
 
@@ -41,46 +52,74 @@ use crate::{
     relations::ChildOf,
     world::World,
 };
-use rustc_hash::FxHashMap;
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+
+// ── TemplateParam trait ──────────────────────────────────────────
+
+/// Маркерный трейт для типизированных параметров шаблонов.
+///
+/// Каждый параметр идентифицируется типом-маркером, реализующим `TemplateParam`.
+/// Это позволяет использовать `TypeId` в качестве ключа вместо строк.
+///
+/// # Пример
+///
+/// ```ignore
+/// struct SpawnX;
+/// impl TemplateParam for SpawnX { type Value = f32; }
+///
+/// let params = TemplateParams::new()
+///     .set::<SpawnX>(99.0f32);
+/// let val = params.get::<SpawnX>().copied().unwrap_or(10.0);
+/// ```
+pub trait TemplateParam: Send + Sync + 'static {
+    /// Тип значения параметра.
+    type Value: Send + Sync + 'static;
+}
 
 // ── TemplateParams ───────────────────────────────────────────────
 
 /// Параметры шаблона — значения для переопределения полей при спавне.
 ///
-/// Хранит `HashMap<String, Box<dyn Any + Send>>`. Типизированный доступ
-/// через [`get::<T>()`](TemplateParams::get).
+/// Хранит `HashMap<TypeId, Box<dyn Any + Send + Sync>>`. Доступ через
+/// [`set::<P>()`](TemplateParams::set) и [`get::<P>()`](TemplateParams::get)
+/// по типу-маркеру `P: TemplateParam`.
 #[derive(Default)]
 pub struct TemplateParams {
-    overrides: FxHashMap<String, Box<dyn Any + Send>>,
+    params: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 impl TemplateParams {
     pub fn new() -> Self {
-        Self { overrides: FxHashMap::default() }
+        Self { params: HashMap::default() }
     }
 
-    /// Переопределить значение по ключу.
+    /// Установить параметр по типу-маркеру.
     ///
     /// # Пример
     /// ```ignore
+    /// struct HealthParam;
+    /// impl TemplateParam for HealthParam { type Value = f32; }
+    ///
     /// let params = TemplateParams::new()
-    ///     .with("health", 150.0f32)
-    ///     .with("name", "Elite Monster".to_string());
+    ///     .set::<HealthParam>(150.0f32)
+    ///     .set::<NameParam>("Elite Monster".to_string());
     /// ```
-    pub fn with<T: Send + 'static>(mut self, key: &str, value: T) -> Self {
-        self.overrides.insert(key.to_string(), Box::new(value));
+    pub fn set<P: TemplateParam>(mut self, value: P::Value) -> Self {
+        self.params.insert(TypeId::of::<P>(), Box::new(value));
         self
     }
 
-    /// Получить значение по ключу, если оно было переопределено и тип совпадает.
-    pub fn get<T: 'static>(&self, key: &str) -> Option<&T> {
-        self.overrides.get(key)?.downcast_ref::<T>()
+    /// Получить значение параметра по типу-маркеру.
+    pub fn get<P: TemplateParam>(&self) -> Option<&P::Value> {
+        self.params
+            .get(&TypeId::of::<P>())
+            .and_then(|b| b.downcast_ref::<P::Value>())
     }
 
     /// Есть ли переопределения?
     pub fn is_empty(&self) -> bool {
-        self.overrides.is_empty()
+        self.params.is_empty()
     }
 }
 
@@ -124,12 +163,12 @@ pub trait EntityTemplate: Send + Sync {
 /// Хранит `HashMap<String, Box<dyn EntityTemplate>>`.
 /// Каждый шаблон можно вызвать по имени через [`World::spawn_from_template`].
 pub struct TemplateRegistry {
-    templates: FxHashMap<String, Box<dyn EntityTemplate>>,
+    templates: HashMap<String, Box<dyn EntityTemplate>>,
 }
 
 impl TemplateRegistry {
     pub fn new() -> Self {
-        Self { templates: FxHashMap::default() }
+        Self { templates: HashMap::default() }
     }
 
     /// Зарегистрировать именованный шаблон.
@@ -196,9 +235,15 @@ impl Default for TemplateRegistry {
 ///
 /// struct MonsterTemplate { health: f32, speed: f32 }
 ///
+/// struct MonsterHealth;
+/// impl TemplateParam for MonsterHealth { type Value = f32; }
+///
+/// struct MonsterSpeed;
+/// impl TemplateParam for MonsterSpeed { type Value = f32; }
+///
 /// impl_entity_template!(MonsterTemplate, |this, world, params| {
-///     let health = params.get::<f32>("health").copied().unwrap_or(this.health);
-///     let speed  = params.get::<f32>("speed").copied().unwrap_or(this.speed);
+///     let health = params.get::<MonsterHealth>().copied().unwrap_or(this.health);
+///     let speed  = params.get::<MonsterSpeed>().copied().unwrap_or(this.speed);
 ///     world.spawn()
 ///         .insert(Health { current: health, max: health })
 ///         .insert(Velocity(Vec3::new(speed, 0.0, 0.0)))
@@ -235,6 +280,20 @@ mod tests {
 
     struct Label(String);
 
+    // ── Marker-типы для типизированных параметров ────────────────
+
+    struct ParamX;
+    impl TemplateParam for ParamX { type Value = f32; }
+
+    struct ParamY;
+    impl TemplateParam for ParamY { type Value = f32; }
+
+    struct ParamLabel;
+    impl TemplateParam for ParamLabel { type Value = String; }
+
+    struct ParamVal;
+    impl TemplateParam for ParamVal { type Value = i32; }
+
     // ── Helper template ──────────────────────────────────────────
 
     struct TestTemplate {
@@ -244,14 +303,11 @@ mod tests {
 
     impl EntityTemplate for TestTemplate {
         fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity {
-            let x = params.get::<f32>("x").copied().unwrap_or(self.default_x);
-            let y = params.get::<f32>("y").copied().unwrap_or(self.default_y);
-            let label = params.get::<String>("label").cloned().unwrap_or_else(|| "default".to_string());
+            let x = params.get::<ParamX>().copied().unwrap_or(self.default_x);
+            let y = params.get::<ParamY>().copied().unwrap_or(self.default_y);
+            let label = params.get::<ParamLabel>().cloned().unwrap_or_else(|| "default".to_string());
 
-            world.spawn()
-                .insert(Position { x, y })
-                .insert(Label(label))
-                .id()
+            world.spawn((Position { x, y }, Label(label)))
         }
     }
 
@@ -282,8 +338,8 @@ mod tests {
         world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
 
         let entity = world.spawn_from_template("test", &TemplateParams::new()
-            .with("x", 99.0f32)
-            .with("label", "custom".to_string())
+            .set::<ParamX>(99.0f32)
+            .set::<ParamLabel>("custom".to_string())
         ).unwrap();
 
         let pos = world.get::<Position>(entity).unwrap();
@@ -331,8 +387,8 @@ mod tests {
         struct MyTemplate { value: i32 }
 
         impl_entity_template!(MyTemplate, |this, world, params| {
-            let val = params.get::<i32>("val").copied().unwrap_or(this.value);
-            world.spawn().insert(MyTemplate { value: val }).id()
+            let val = params.get::<ParamVal>().copied().unwrap_or(this.value);
+            world.spawn((MyTemplate { value: val },))
         });
 
         let mut world = World::new();
@@ -344,7 +400,7 @@ mod tests {
         assert_eq!(v.value, 42);
 
         let entity2 = world.spawn_from_template("my", &TemplateParams::new()
-            .with("val", 100i32)
+            .set::<ParamVal>(100i32)
         ).unwrap();
         let v2 = world.get::<MyTemplate>(entity2).unwrap();
         assert_eq!(v2.value, 100);
@@ -378,7 +434,7 @@ mod tests {
 
         impl EntityTemplate for ChildTemplate {
             fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
-                world.spawn().insert(Position { x: 1.0, y: 2.0 }).id()
+                world.spawn((Position { x: 1.0, y: 2.0 },))
             }
             fn parent(&self) -> Option<Entity> {
                 // Будет установлен внешним кодом через замыкание или хранение parent в структуре.
@@ -393,7 +449,7 @@ mod tests {
 
         impl EntityTemplate for ParentBoundChild {
             fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
-                world.spawn().insert(Label("child".to_string())).id()
+                world.spawn((Label("child".to_string()),))
             }
             fn parent(&self) -> Option<Entity> {
                 Some(self.parent)
@@ -404,7 +460,7 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Label>();
 
-        let parent = world.spawn_empty();
+        let parent = world.spawn(());
 
         world.register_template("child", ParentBoundChild { parent });
 

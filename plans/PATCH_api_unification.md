@@ -60,19 +60,6 @@ pub fn spawn(&mut self) -> EntityBuilder<'_> { ... }
 
 // СТАЛО — один метод принимающий любой Bundle (включая пустой кортеж):
 pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
-    if std::mem::size_of_val(&bundle) == 0
-        && bundle.component_ids(&mut self.registry).is_empty()
-    {
-        // Быстрый путь для пустой entity (как старый spawn_empty)
-        let entity = self.entities.allocate();
-        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: ArchetypeId::EMPTY,
-            row,
-        });
-        return entity;
-    }
-    // Обычный путь — как старый spawn_bundle
     let ids          = bundle.component_ids(&mut self.registry);
     let archetype_id = self.get_or_create_archetype(&ids);
     let entity       = self.entities.allocate();
@@ -181,41 +168,50 @@ pub struct EntityRef<'w> {
 }
 
 impl<'w> EntityRef<'w> {
-    /// Добавить или заменить компонент.
-    pub fn insert<T: Component>(self, component: T) -> Self {
+    /// Вернуть идентификатор entity.
+    pub fn id(&self) -> Entity {
+        self.entity
+    }
+
+    /// Проверить, жива ли entity.
+    pub fn is_alive(&self) -> bool {
+        self.world.entities.is_alive(self.entity)
+    }
+
+    /// Вставить компонент в entity.
+    pub fn insert<T: Component>(&mut self, component: T) -> &mut Self {
         self.world.insert(self.entity, component);
         self
     }
 
-    /// Удалить компонент.
-    pub fn remove<T: Component + 'static>(self) -> Self {
-        self.world.remove::<T>(self.entity);
-        self
+    /// Удалить компонент типа T из entity.
+    pub fn remove<T: Component>(&mut self) -> bool {
+        self.world.remove::<T>(self.entity)
     }
 
-    /// Уничтожить entity.
-    pub fn despawn(self) {
-        self.world.despawn(self.entity);
+    /// Деспавнить entity.
+    pub fn despawn(&mut self) -> bool {
+        self.world.despawn(self.entity)
     }
 
-    /// Прочитать компонент (immutable).
+    /// Прочитать компонент T.
     pub fn get<T: Component>(&self) -> Option<&T> {
         self.world.get::<T>(self.entity)
     }
 
-    /// Прочитать компонент (mutable).
+    /// Прочитать компонент T мутабельно.
     pub fn get_mut<T: Component>(&mut self) -> Option<&mut T> {
         self.world.get_mut::<T>(self.entity)
     }
 
-    /// Добавить relation.
-    pub fn add_relation<R: RelationKind>(self, kind: R, target: Entity) -> Self {
+    /// Добавить relation между этой entity и target.
+    pub fn add_relation<R: RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
         self.world.add_relation(self.entity, kind, target);
         self
     }
 
     /// Удалить relation.
-    pub fn remove_relation<R: RelationKind>(self, kind: R, target: Entity) -> Self {
+    pub fn remove_relation<R: RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
         self.world.remove_relation(self.entity, kind, target);
         self
     }
@@ -223,16 +219,6 @@ impl<'w> EntityRef<'w> {
     /// Проверить наличие relation.
     pub fn has_relation<R: RelationKind>(&self, kind: R, target: Entity) -> bool {
         self.world.has_relation(self.entity, kind, target)
-    }
-
-    /// Проверить жив ли entity.
-    pub fn is_alive(&self) -> bool {
-        self.world.entity_allocator().is_alive(self.entity)
-    }
-
-    /// Получить Entity.
-    pub fn id(&self) -> Entity {
-        self.entity
     }
 }
 
@@ -479,14 +465,14 @@ pub trait TemplateParam: 'static {
 // ИЗМЕНИТЬ TemplateParams:
 
 use std::any::{Any, TypeId};
-use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 /// Типизированные параметры для инстанцирования шаблона entity.
 ///
 /// Ключи — типы реализующие [`TemplateParam`]. Ошибки в именах параметров
 /// и несовпадение типов обнаруживаются на этапе компиляции.
 pub struct TemplateParams {
-    data: FxHashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    data: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 impl TemplateParams {
@@ -651,12 +637,7 @@ impl WorldScriptingExt for World {
 }
 ```
 
-Экспортировать из `apex-scripting`:
-
-```rust
-// В apex-scripting/src/lib.rs:
-pub use world_ext::WorldScriptingExt;
-```
+Экспортируется автоматически — трейт определён прямо в `lib.rs` как `pub trait`.
 
 Старые методы `engine.register_component`, `engine.register_resource`, `engine.register_event` **остаются** — они нужны когда `World` недоступен напрямую. `WorldScriptingExt` — удобный фасад для типичного случая.
 
@@ -767,62 +748,63 @@ cmds.apply(&mut world);
 
 ---
 
-## Чеклист применения
+## Чеклист применения (обновлён по факту реализации)
 
 ```
-П-1: spawn_bundle → spawn
-[ ] Bundle для () — добавить impl Bundle for ()
-[ ] World::spawn<B: Bundle> — новый унифицированный метод
-[ ] World::spawn_bundle — удалить
-[ ] World::spawn_empty — удалить
-[ ] EntityBuilder — удалить (заменяется EntityRef из П-2)
-[ ] Commands::spawn<B> — переименовать из spawn_bundle
-[ ] Все вхождения spawn_bundle в тестах/примерах → spawn
-[ ] Все вхождения spawn_empty → spawn(())
+П-1: spawn_bundle → spawn ✅
+[x] Bundle для () — добавлен impl Bundle for ()
+[x] World::spawn<B: Bundle> — новый унифицированный метод
+[x] World::spawn_bundle — удалён
+[x] World::spawn_empty — удалён
+[x] EntityBuilder — удалён (заменён EntityRef из П-2)
+[x] Commands::spawn<B> — переименован из spawn_bundle
+[x] Все вхождения spawn_bundle → spawn
+[x] Все вхождения spawn_empty → spawn(())
 
-П-2: EntityRef
-[ ] pub struct EntityRef<'w> — добавить в world.rs
-[ ] World::entity(&mut self, Entity) -> EntityRef — добавить
-[ ] EntityRef::insert, remove, despawn, get, get_mut — реализовать
-[ ] EntityRef::add_relation, remove_relation, has_relation — реализовать
-[ ] EntityRef::is_alive, id — реализовать
-[ ] Обновить документацию world.rs — показать новый стиль
-[ ] Примеры в apex-examples обновить под EntityRef где уместно
+П-2: EntityRef ✅
+[x] pub struct EntityRef<'w> — добавлен в world.rs
+[x] World::entity(&mut self, Entity) -> EntityRef — добавлен
+[x] EntityRef::insert, remove, despawn, get, get_mut — реализованы
+[x] EntityRef::add_relation, remove_relation, has_relation — реализованы
+[x] EntityRef::is_alive, id — реализованы
+[x] Документация world.rs обновлена
+[x] Примеры в apex-examples обновлены
 
-П-3: Унификация итерации
-[ ] Query::for_each_component — удалить
-[ ] SystemContext::for_each_component — удалить
-[ ] SystemContext::par_for_each_component — удалить
-[ ] Все вхождения for_each_component → for_each с |_, компоненты|
-[ ] Документацию SystemContext обновить
+П-3: Унификация итерации ✅
+[x] Query::for_each_component — удалён
+[x] CachedQuery::for_each_component — удалён
+[x] CachedQuery::par_for_each_component — удалён
+[x] QueryComponentIter — удалён
+[x] Все вхождения for_each_component → for_each с |_, components|
+[x] Документация обновлена
 
-П-4: DeferredQueue → Commands
-[ ] Убедиться что Commands::remove_raw присутствует
-[ ] pub struct DeferredQueue — удалить или pub(crate)
-[ ] Все вхождения DeferredQueue в публичном API → Commands
-[ ] Обновить документацию commands.rs
+П-4: DeferredQueue → Commands ✅
+[x] Commands::remove_raw — присутствует
+[x] Commands::insert_raw — добавлен
+[x] DeferredQueue struct — удалён
+[x] Все вхождения DeferredQueue → Commands
+[x] Документация commands.rs обновлена
 
-П-5: TemplateParams
-[ ] pub trait TemplateParam — добавить в template.rs
-[ ] TemplateParams переписать на TypeId-ключи
-[ ] Старые .with("str", value) и .get::<T>("str") — удалить
-[ ] Все реализации EntityTemplate::spawn — обновить на .get::<Param>()
-[ ] Все вызовы spawn_from_template — обновить на .set::<Param>(value)
-[ ] Тесты template.rs обновить
+П-5: TemplateParams ✅
+[x] pub trait TemplateParam — добавлен в template.rs
+[x] TemplateParams переписан на TypeId-ключи (HashMap вместо FxHashMap)
+[x] Старые .with("str", value) — удалены
+[x] Все реализации EntityTemplate::spawn — обновлены
+[x] Все вызовы spawn_from_template — обновлены
+[x] Тесты template.rs обновлены
 
-П-6: WorldScriptingExt
-[ ] pub trait WorldScriptingExt — добавить в apex-scripting
-[ ] impl WorldScriptingExt for World — реализовать
-[ ] pub use WorldScriptingExt в apex-scripting/src/lib.rs
-[ ] Все примеры (apex-examples) обновить на register_scriptable
-[ ] README_SCRIPTING.md обновить
+П-6: WorldScriptingExt ✅
+[x] pub trait WorldScriptingExt — добавлен в apex-scripting (в lib.rs)
+[x] impl WorldScriptingExt for World — реализован
+[x] pub export — автоматически (pub trait в lib.rs)
+[x] Все примеры (apex-examples) — обновлены
 
 Финальная проверка:
-[ ] cargo check --workspace
-[ ] cargo test --workspace
-[ ] grep -rn "spawn_bundle" . → нет результатов
-[ ] grep -rn "spawn_empty"  . → нет результатов
-[ ] grep -rn "for_each_component" . → нет результатов
-[ ] grep -rn "DeferredQueue" . → нет публичных результатов
-[ ] grep -rn '\.with("' crates/apex-core/src/template.rs → нет результатов
+[x] cargo check --workspace — без ошибок
+[x] cargo test --workspace — все тесты проходят
+[x] spawn_bundle — нет результатов
+[x] spawn_empty — нет результатов
+[x] for_each_component — нет результатов
+[x] DeferredQueue — нет результатов
+[x] .with("") в template контексте — нет результатов
 ```

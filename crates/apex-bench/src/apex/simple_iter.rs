@@ -25,7 +25,7 @@ impl SimpleIter {
 
     pub fn run(&self) {
         self.world.query_typed::<(Read<Velocity>, Write<Position>)>()
-            .for_each_component(|(vel, pos)| {
+            .for_each(|_, (vel, pos)| {
                 pos.0 += vel.0;
             });
     }

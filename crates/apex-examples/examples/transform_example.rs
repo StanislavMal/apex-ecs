@@ -171,12 +171,11 @@ fn create_transform_entity(
     translation: Vec3,
     parent: Option<Entity>,
 ) -> Entity {
-    let entity = world
-        .spawn()
-        .insert(transform::LocalTransform::from_translation(translation))
-        .insert(transform::GlobalTransform::default())
-        .insert(transform::TransformDirty)
-        .id();
+    let entity = world.spawn((
+        transform::LocalTransform::from_translation(translation),
+        transform::GlobalTransform::default(),
+        transform::TransformDirty,
+    ));
 
     // Добавляем имя для отладки
     world.insert(entity, DebugName(name));

@@ -376,12 +376,11 @@ mod tests {
         // Регистрируем компоненты
         TransformPlugin::register_components(&mut world);
 
-        let entity = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .insert(TransformDirty)
-            .id();
+        let entity = world.spawn((
+            LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+            TransformDirty,
+        ));
 
         propagate_transforms(&mut world);
 
@@ -405,18 +404,16 @@ mod tests {
         TransformPlugin::register_components(&mut world);
 
         // Создаём иерархию: parent → child
-        let parent = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .id();
+        let parent = world.spawn((
+            LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+        ));
 
-        let child = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .insert(TransformDirty)
-            .id();
+        let child = world.spawn((
+            LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+            TransformDirty,
+        ));
 
         world.add_relation(child, ChildOf, parent);
 
@@ -453,25 +450,22 @@ mod tests {
         TransformPlugin::register_components(&mut world);
 
         // grandparent → parent → child
-        let grandparent = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(50.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .id();
+        let grandparent = world.spawn((
+            LocalTransform::from_translation(Vec3::new(50.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+        ));
 
-        let parent = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(30.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .insert(TransformDirty)
-            .id();
+        let parent = world.spawn((
+            LocalTransform::from_translation(Vec3::new(30.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+            TransformDirty,
+        ));
 
-        let child = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .insert(TransformDirty)
-            .id();
+        let child = world.spawn((
+            LocalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+            TransformDirty,
+        ));
 
         world.add_relation(parent, ChildOf, grandparent);
         world.add_relation(child, ChildOf, parent);
@@ -507,11 +501,10 @@ mod tests {
         TransformPlugin::register_components(&mut world);
 
         // Entity без TransformDirty
-        let entity = world
-            .spawn()
-            .insert(LocalTransform::from_translation(Vec3::new(5.0, 0.0, 0.0)))
-            .insert(GlobalTransform::default())
-            .id();
+        let entity = world.spawn((
+            LocalTransform::from_translation(Vec3::new(5.0, 0.0, 0.0)),
+            GlobalTransform::default(),
+        ));
 
         propagate_transforms(&mut world);
 

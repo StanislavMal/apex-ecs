@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use apex_core::prelude::*;
-use apex_scripting::{ScriptEngine, Scriptable};
+use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 
 // ── Компоненты ─────────────────────────────────────────────────────────────
 //
@@ -115,43 +115,32 @@ fn main() {
 
     println!("=== Apex ECS — Rhai Scripting ===\n");
 
-    // ── Мир ──────────────────────────────────────────────────────
+    // ── Мир + ScriptEngine ──────────────────────────────────────
 
     let mut world = World::new();
+    let mut engine = ScriptEngine::new();
 
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world.register_component::<Tags>();
-    world.register_component::<Stats>();
-    world.register_component::<TileKind>();
+    // Единая регистрация: и в ECS, и в ScriptEngine
+    world.register_scriptable::<Position>(&mut engine);
+    world.register_scriptable::<Velocity>(&mut engine);
+    world.register_scriptable::<Health>(&mut engine);
+    world.register_scriptable::<Tags>(&mut engine);
+    world.register_scriptable::<Stats>(&mut engine);
+    world.register_scriptable::<TileKind>(&mut engine);
 
     // Создаём несколько entity вручную
-    world.spawn_bundle((
+    world.spawn((
         Position { x: 0.0,  y: 0.0 },
         Velocity { x: 1.0,  y: 0.5 },
         Health   { current: 100.0, max: 100.0 },
     ));
-    world.spawn_bundle((
+    world.spawn((
         Position { x: 5.0,  y: 2.0 },
         Velocity { x: -0.5, y: 1.0 },
         Health   { current: 50.0,  max: 50.0  },
     ));
 
     println!("Начальное количество entity: {}", world.entity_count());
-
-    // ── ScriptEngine ─────────────────────────────────────────────
-    //
-    // Вариант A: загрузка из строки (тесты, встроенные скрипты)
-    let mut engine = ScriptEngine::new();
-
-    // Регистрируем компоненты — ПОСЛЕ world.register_component::<T>()
-    engine.register_component::<Position>(&world);
-    engine.register_component::<Velocity>(&world);
-    engine.register_component::<Health>(&world);
-    engine.register_component::<Tags>(&world);
-    engine.register_component::<Stats>(&world);
-    engine.register_component::<TileKind>(&world);
 
     // Загружаем встроенный скрипт
     engine.load_script_str("game", GAME_SCRIPT)

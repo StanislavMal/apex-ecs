@@ -662,8 +662,8 @@ mod tests {
     fn add_has_remove_relation() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let parent = world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let child  = world.spawn_bundle((Position { x: 1.0, y: 0.0 },));
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child  = world.spawn((Position { x: 1.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, parent);
         assert!(world.has_relation(child, ChildOf, parent));
@@ -713,9 +713,9 @@ mod tests {
     fn despawn_recursive() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let root  = world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let child = world.spawn_bundle((Position { x: 1.0, y: 0.0 },));
-        let leaf  = world.spawn_bundle((Position { x: 2.0, y: 0.0 },));
+        let root  = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let leaf  = world.spawn((Position { x: 2.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, root);
         world.add_relation(leaf,  ChildOf, child);
@@ -729,8 +729,8 @@ mod tests {
     fn get_relation_target() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let parent = world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let child  = world.spawn_bundle((Position { x: 1.0, y: 0.0 },));
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child  = world.spawn((Position { x: 1.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, parent);
         assert_eq!(world.get_relation_target(child, ChildOf), Some(parent));

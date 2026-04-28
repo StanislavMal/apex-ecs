@@ -61,7 +61,7 @@ fn main() {
 
     // ── 2. Спавн entity ────────────────────────────────────────
 
-    let player = world.spawn_bundle((
+    let player = world.spawn((
         Position { x: 0.0, y: 10.0 },
         Velocity { x: 1.0, y:  0.0 },
         Health   { current: 100.0, max: 100.0 },
@@ -69,7 +69,7 @@ fn main() {
     // RenderHandle НЕ включаем в spawn — покажем insert отдельно
     world.insert(player, RenderHandle(42));
 
-    let enemy = world.spawn_bundle((
+    let enemy = world.spawn((
         Position { x: 20.0, y: 0.0 },
         Velocity { x: -0.5, y: 0.0 },
         Health   { current: 30.0, max: 30.0 },
@@ -141,7 +141,7 @@ fn main() {
         .expect("snapshot for diff failed");
 
     // Добавляем новую entity
-    let _e3 = world.spawn_bundle((
+    let _e3 = world.spawn((
         Position { x: 100.0, y: 200.0 },
         Health { current: 50.0, max: 50.0 },
     ));
@@ -174,8 +174,8 @@ fn main() {
     world2.register_component_serde::<Velocity>();
     world2.register_component_serde::<Health>();
     // Relations kinds нужно зарегистрировать чтобы restore смог восстановить их
-    let parent = world2.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-    let child = world2.spawn_bundle((Position { x: 0.0, y: 0.0 },));
+    let parent = world2.spawn((Position { x: 0.0, y: 0.0 },));
+    let child = world2.spawn((Position { x: 0.0, y: 0.0 },));
     world2.add_relation(
         child,
         apex_core::relations::ChildOf,

@@ -106,81 +106,6 @@ impl QueryCache {
     pub fn version(&self) -> u32 { self.version }
 }
 
-// ── DeferredCommand (deferred structural changes) ──────────────
-
-/// Отложенные structural changes — накапливаются во время итерации,
-/// применяются batch'ем после завершения системы.
-///
-/// Это устраняет необходимость прерывать итерацию для каждого insert/remove.
-enum DeferredCommand {
-    Despawn(Entity),
-    InsertRaw {
-        entity:       Entity,
-        component_id: ComponentId,
-        data:         Vec<u8>,
-        tick:         Tick,
-    },
-    RemoveRaw {
-        entity:       Entity,
-        component_id: ComponentId,
-    },
-}
-
-/// Очередь отложенных команд.
-///
-/// Используется когда нужно избежать borrow conflicts во время итерации.
-/// `apply` выполняет все команды за один проход.
-pub struct DeferredQueue {
-    commands: Vec<DeferredCommand>,
-}
-
-impl DeferredQueue {
-    pub fn new() -> Self { Self { commands: Vec::new() } }
-    pub fn with_capacity(cap: usize) -> Self { Self { commands: Vec::with_capacity(cap) } }
-
-    pub fn despawn(&mut self, entity: Entity) {
-        self.commands.push(DeferredCommand::Despawn(entity));
-    }
-
-    pub fn insert_raw(
-        &mut self,
-        entity:       Entity,
-        component_id: ComponentId,
-        data:         Vec<u8>,
-        tick:         Tick,
-    ) {
-        self.commands.push(DeferredCommand::InsertRaw { entity, component_id, data, tick });
-    }
-
-    pub fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
-        self.commands.push(DeferredCommand::RemoveRaw { entity, component_id });
-    }
-
-    pub fn len(&self) -> usize { self.commands.len() }
-    pub fn is_empty(&self) -> bool { self.commands.is_empty() }
-
-    /// Применить все отложенные команды к миру за один проход.
-    pub fn apply(&mut self, world: &mut World) {
-        for cmd in self.commands.drain(..) {
-            match cmd {
-                DeferredCommand::Despawn(e) => { world.despawn(e); }
-                DeferredCommand::InsertRaw { entity, component_id, data, tick } => {
-                    world.insert_raw(entity, component_id, data, tick);
-                }
-                DeferredCommand::RemoveRaw { entity, component_id } => {
-                    world.remove_raw(entity, component_id);
-                }
-            }
-        }
-    }
-
-    pub fn clear(&mut self) { self.commands.clear(); }
-}
-
-impl Default for DeferredQueue {
-    fn default() -> Self { Self::new() }
-}
-
 // ── ArchetypeKey ───────────────────────────────────────────────
 
 /// Ключ для archetype_index — хэшируется без heap-аллокации.
@@ -284,16 +209,6 @@ impl World {
 
     pub fn subject_index_raw(&self, entity_index: u32) -> Vec<u32> {
         self.subject_index.get_all(entity_index)
-    }
-
-    pub fn spawn_empty(&mut self) -> Entity {
-        let entity = self.entities.allocate();
-        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: ArchetypeId::EMPTY,
-            row,
-        });
-        entity
     }
 
     pub fn insert_relation_raw(&mut self, subject: Entity, relation_id: ComponentId, _target: Entity) {
@@ -405,17 +320,12 @@ impl World {
 
     // ── Spawn ──────────────────────────────────────────────────
 
-    pub fn spawn(&mut self) -> EntityBuilder<'_> {
-        let entity = self.entities.allocate();
-        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: ArchetypeId::EMPTY,
-            row,
-        });
-        EntityBuilder { world: self, entity }
-    }
-
-    pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Entity {
+    /// Создать entity из Bundle.
+    ///
+    /// Для пустой сущности (без компонентов) используйте `spawn(())`.
+    /// Для единичного компонента — `spawn((MyComponent,))`.
+    /// Для нескольких — `spawn((A, B, C))`.
+    pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let ids          = bundle.component_ids(&mut self.registry);
         let archetype_id = self.get_or_create_archetype(&ids);
         let entity       = self.entities.allocate();
@@ -541,7 +451,7 @@ impl World {
     /// ]);
     /// ```
     ///
-    /// Внутри собирает итератор в `Vec` и вызывает `spawn_bundle` для каждого элемента.
+    /// Внутри собирает итератор в `Vec` и вызывает `spawn` для каждого элемента.
     /// Для массового спавна **одинаковых** бандлов используйте [`spawn_many`] —
     /// он оптимизирован через bulk-copy.
     pub fn spawn_batch<I>(&mut self, iter: I) -> Vec<Entity>
@@ -552,7 +462,7 @@ impl World {
         let items: Vec<I::Item> = iter.into_iter().collect();
         let mut entities = Vec::with_capacity(items.len());
         for bundle in items {
-            entities.push(self.spawn_bundle(bundle));
+            entities.push(self.spawn(bundle));
         }
         entities
     }
@@ -594,7 +504,7 @@ impl World {
         });
     }
 
-    /// Вставить компонент по raw данным — используется DeferredQueue.
+    /// Вставить компонент по raw данным.
     pub(crate) fn insert_raw(
         &mut self,
         entity:       Entity,
@@ -633,7 +543,7 @@ impl World {
         });
     }
 
-    /// Удалить компонент по raw ComponentId — используется DeferredQueue.
+    /// Удалить компонент по raw ComponentId.
     pub(crate) fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
@@ -969,16 +879,16 @@ impl Default for World { fn default() -> Self { Self::new() } }
 
 // ── SystemContext ──────────────────────────────────────────────
 
-/// Размер чанка для par_for_each_component.
+/// Размер чанка для par_for_each.
 ///
 /// Разбивает архетип на блоки по N entity для параллельной обработки.
 /// Слишком маленький → overhead rayon съедает выигрыш.
 /// Слишком большой → мало задач, плохой load balancing.
 ///
 /// Пользовательский максимальный размер чанка для `adaptive_chunk_size`.
-/// 
+///
 /// Если равен 0 (по умолчанию) — используется `DEFAULT_MAX_CHUNK_SIZE` (16384).
-/// Можно переопределить через переменную окружения `APEX_PAR_CHUNK_SIZE` 
+/// Можно переопределить через переменную окружения `APEX_PAR_CHUNK_SIZE`
 /// или через `set_par_chunk_size()`.
 pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -1032,7 +942,7 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
     chunk.min(entity_count)
 }
 
-/// Установить размер чанка для par_for_each_component.
+/// Установить размер чанка для par_for_each.
 /// Используется для экспериментов — позволяет менять CHUNK_SIZE без перекомпиляции.
 pub fn set_par_chunk_size(chunk_size: usize) {
     PAR_CHUNK_SIZE.store(chunk_size, std::sync::atomic::Ordering::Relaxed);
@@ -1256,61 +1166,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         }
     }
 
-    #[inline]
-    pub fn for_each_component<F: FnMut(Q::Item<'_>)>(&self, mut f: F) {
-        let ids = &self.cached_ids;
-        if ids.len() != Q::component_count() { return; }
-        for &arch_idx in self.arch_indices {
-            let arch = &self.world.archetypes[arch_idx];
-            if arch.is_empty() { continue; }
-            let state = unsafe { Q::fetch_state(arch, ids, self.last_run) };
-            for row in 0..arch.len() {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
-            }
-        }
-    }
-
-    /// Параллельная итерация по компонентам (без Entity).
-    /// Работает только с `feature = "parallel"`.
-    #[cfg(feature = "parallel")]
-    pub fn par_for_each_component<F>(&self, f: F)
-    where
-        Q: Send,
-        F: Fn(Q::Item<'_>) + Send + Sync,
-    {
-        use rayon::prelude::*;
-        use crate::par_utils::compute_par_chunks;
-        let num_threads = rayon::current_num_threads();
-        let ids = &self.cached_ids;
-        if ids.len() != Q::component_count() { return; }
-
-        let world    = self.world;
-        let last_run = self.last_run;
-        let chunks = compute_par_chunks(
-            self.arch_indices
-                .iter()
-                .copied()
-                .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
-                .map(|arch_idx| (arch_idx, world.archetypes[arch_idx].len())),
-            num_threads,
-        );
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch  = &world.archetypes[arch_idx];
-            let state = unsafe { Q::fetch_state(arch, ids, last_run) };
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } { f(item); }
-            }
-        });
-    }
-
-    /// Параллельная итерация по компонентам (без Entity) — fallback для sequential.
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each_component<F: FnMut(Q::Item<'_>)>(&self, f: F) {
-        self.for_each_component(f);
-    }
-
-    /// Параллельная итерация по (Entity, компонентам).
+    /// Параллельная итерация.
     /// Работает только с `feature = "parallel"`.
     #[cfg(feature = "parallel")]
     pub fn par_for_each<F>(&self, f: F)
@@ -1480,22 +1336,90 @@ impl_bundle!(A, B, C, D, E);
 impl_bundle!(A, B, C, D, E, F);
 impl_bundle!(A, B, C, D, E, F, G);
 impl_bundle!(A, B, C, D, E, F, G, H);
+// ── impl Bundle for () ────────────────────────────────────────
 
-// ── EntityBuilder ──────────────────────────────────────────────
+impl Bundle for () {
+    fn component_ids(&self, _registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
+        SmallVec::new()
+    }
 
-pub struct EntityBuilder<'w> {
+    fn write_into(self, _world: &mut World, _archetype_id: ArchetypeId, _row: usize, _tick: Tick) {
+        // ()
+    }
+}
+
+// ── EntityRef ──────────────────────────────────────────────────
+
+/// Facade для операций над одной entity: вставка, удаление, деспавн, чтение.
+///
+/// Создаётся через [`World::entity`].
+pub struct EntityRef<'w> {
     world:  &'w mut World,
     entity: Entity,
 }
 
-impl<'w> EntityBuilder<'w> {
-    pub fn insert<T: Component>(self, component: T) -> Self {
+impl<'w> EntityRef<'w> {
+    /// Вернуть идентификатор entity.
+    pub fn id(&self) -> Entity {
+        self.entity
+    }
+
+    /// Проверить, жива ли entity.
+    pub fn is_alive(&self) -> bool {
+        self.world.entities.is_alive(self.entity)
+    }
+
+    /// Вставить компонент в entity.
+    pub fn insert<T: Component>(&mut self, component: T) -> &mut Self {
         self.world.insert(self.entity, component);
         self
     }
 
-    pub fn id(self) -> Entity { self.entity }
+    /// Удалить компонент типа T из entity.
+    pub fn remove<T: Component>(&mut self) -> bool {
+        self.world.remove::<T>(self.entity)
+    }
+
+    /// Деспавнить entity.
+    pub fn despawn(&mut self) -> bool {
+        self.world.despawn(self.entity)
+    }
+
+    /// Прочитать компонент T.
+    pub fn get<T: Component>(&self) -> Option<&T> {
+        self.world.get::<T>(self.entity)
+    }
+
+    /// Прочитать компонент T мутабельно.
+    pub fn get_mut<T: Component>(&mut self) -> Option<&mut T> {
+        self.world.get_mut::<T>(self.entity)
+    }
+
+    /// Добавить relation между этой entity и target.
+    pub fn add_relation<R: crate::relations::RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
+        self.world.add_relation(self.entity, kind, target);
+        self
+    }
+
+    /// Удалить relation.
+    pub fn remove_relation<R: crate::relations::RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
+        self.world.remove_relation(self.entity, kind, target);
+        self
+    }
+
+    /// Проверить наличие relation.
+    pub fn has_relation<R: crate::relations::RelationKind>(&self, kind: R, target: Entity) -> bool {
+        self.world.has_relation(self.entity, kind, target)
+    }
 }
+
+impl<'w> World {
+    /// Получить [`EntityRef`] для entity.
+    pub fn entity(&mut self, entity: Entity) -> EntityRef<'_> {
+        EntityRef { world: self, entity }
+    }
+}
+
 
 // ── Scripting API ──────────────────────────────────────────────────────────
 //

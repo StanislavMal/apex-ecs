@@ -182,7 +182,7 @@ impl PrefabLoader {
         manifest: &PrefabManifest,
         overrides: &[PrefabComponent],
     ) -> Result<Entity, PrefabError> {
-        let entity = world.spawn_empty();
+        let entity = world.spawn(());
         let tick = world.current_tick();
 
         // Строим HashMap overrides для быстрого поиска

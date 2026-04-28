@@ -15,7 +15,7 @@
 //!   cargo run -p apex-examples --example hot_reload_test
 
 use apex_core::prelude::*;
-use apex_scripting::{ScriptEngine, Scriptable};
+use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -155,9 +155,9 @@ fn run() {
     println!("─── Тест 3: query с Read доступом ───");
 
     // Создаём entity с компонентами вручную
-    world.spawn_bundle((Position { x: 1.0, y: 2.0 },));
-    world.spawn_bundle((Position { x: 3.0, y: 4.0 },));
-    world.spawn_bundle((Position { x: 5.0, y: 6.0 },));
+    world.spawn((Position { x: 1.0, y: 2.0 },));
+    world.spawn((Position { x: 3.0, y: 4.0 },));
+    world.spawn((Position { x: 5.0, y: 6.0 },));
 
     write_script(&script_path, r#"
 fn run() {
@@ -250,15 +250,15 @@ fn run() {
 
     // Создаём отдельный мир для чистоты эксперимента
     let mut world5 = World::new();
-    world5.register_component::<Position>();
+    let mut engine5 = ScriptEngine::new();
+
+    // Единая регистрация: и в ECS, и в ScriptEngine
+    world5.register_scriptable::<Position>(&mut engine5);
 
     // Создаём 3 entity с Position
-    world5.spawn_bundle((Position { x: 1.0, y: 1.0 },));
-    world5.spawn_bundle((Position { x: 2.0, y: 2.0 },));
-    world5.spawn_bundle((Position { x: 3.0, y: 3.0 },));
-
-    let mut engine5 = ScriptEngine::new();
-    engine5.register_component::<Position>(&world5);
+    world5.spawn((Position { x: 1.0, y: 1.0 },));
+    world5.spawn((Position { x: 2.0, y: 2.0 },));
+    world5.spawn((Position { x: 3.0, y: 3.0 },));
 
     let before5 = world5.entity_count();
     println!("  Entity до despawn: {}", before5);
@@ -376,18 +376,16 @@ fn run() {
     println!("─── Тест 8: Комплексный сценарий ───");
 
     let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
+    let mut engine = ScriptEngine::with_dir(&dir);
+
+    // Единая регистрация: и в ECS, и в ScriptEngine
+    world.register_scriptable::<Position>(&mut engine);
+    world.register_scriptable::<Velocity>(&mut engine);
+    world.register_scriptable::<Health>(&mut engine);
 
     // Создаём начальные entity
-    world.spawn_bundle((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.5 }, Health { current: 100.0, max: 100.0 }));
-    world.spawn_bundle((Position { x: 5.0, y: 2.0 }, Velocity { x: -0.5, y: 1.0 }, Health { current: 50.0, max: 50.0 }));
-
-    let mut engine = ScriptEngine::with_dir(&dir);
-    engine.register_component::<Position>(&world);
-    engine.register_component::<Velocity>(&world);
-    engine.register_component::<Health>(&world);
+    world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.5 }, Health { current: 100.0, max: 100.0 }));
+    world.spawn((Position { x: 5.0, y: 2.0 }, Velocity { x: -0.5, y: 1.0 }, Health { current: 50.0, max: 50.0 }));
 
     // Комплексный скрипт: движение + урон + спавн + деспавн
     write_script(&script_path, r#"
@@ -517,10 +515,10 @@ fn run() {
     struct PlayerDied { x: f32, y: f32 }
 
     let mut world = World::new();
-    world.add_event::<PlayerDied>();
-
     let mut engine = ScriptEngine::new();
-    engine.register_event::<PlayerDied>();
+
+    // Единая регистрация: и в ECS, и в ScriptEngine
+    world.register_scriptable_event::<PlayerDied>(&mut engine);
 
     // Добавляем курсор для чтения событий
     let mut event_cursor = world.events_mut::<PlayerDied>().add_reader();

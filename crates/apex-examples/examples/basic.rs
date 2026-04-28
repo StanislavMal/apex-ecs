@@ -63,8 +63,8 @@ impl ParSystem for PhysicsSystem {
 
         let count = ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().len();
 
-        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().for_each_component(
-            |(mass, vel, pos)| {
+        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().for_each(
+            |_, (mass, vel, pos)| {
                 vel.y  -= g * mass.0 * dt;
                 pos.x  += vel.x * dt;
                 pos.y  += vel.y * dt;
@@ -111,7 +111,7 @@ impl AutoSystem for MovementSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let count = ctx.query::<Self::Query>().len();
-        ctx.query::<Self::Query>().for_each_component(|(vel, pos)| {
+        ctx.query::<Self::Query>().for_each(|_, (vel, pos)| {
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -175,7 +175,7 @@ fn init_resources(world: &mut World) {
 }
 
 fn spawn_player(world: &mut World) {
-    world.spawn_bundle((
+    world.spawn((
         Position { x: 0.0,  y: 10.0 },
         Velocity { x: 1.0,  y: 0.0  },
         Health   { current: 100.0, max: 100.0 },
@@ -184,7 +184,7 @@ fn spawn_player(world: &mut World) {
         Name("Hero"),
     ));
 
-    world.spawn_bundle((
+    world.spawn((
         Position { x: 20.0, y:  5.0 },
         Velocity { x: -0.5, y:  0.0 },
         Health   { current: 30.0, max: 30.0 },
@@ -192,7 +192,7 @@ fn spawn_player(world: &mut World) {
         Name("Goblin"),
     ));
 
-    world.spawn_bundle((
+    world.spawn((
         Position { x: -5.0, y: 3.0 },
         Velocity { x:  0.3, y: 0.0 },
         Health   { current: 75.0, max: 75.0 },
@@ -262,7 +262,7 @@ fn main() {
         "enemy_ai",
         |ctx: SystemContext<'_>| {
             let count = ctx.query::<(Read<Enemy>, Write<Velocity>)>().len();
-            ctx.query::<(Read<Enemy>, Write<Velocity>)>().for_each_component(|(_, vel)| {
+            ctx.query::<(Read<Enemy>, Write<Velocity>)>().for_each(|_, (_, vel)| {
                 vel.x *= 0.99; // трение
                 vel.y *= 0.99;
             });
@@ -329,10 +329,10 @@ fn main() {
     // ── Relations ─────────────────────────────────────────────
     println!("\n=== Relations ===");
 
-    let root   = world.spawn_bundle((Name("Root"),));
-    let child1 = world.spawn_bundle((Name("Child1"), Position { x: 1.0, y: 0.0 }));
-    let child2 = world.spawn_bundle((Name("Child2"), Position { x: 2.0, y: 0.0 }));
-    let leaf   = world.spawn_bundle((Name("Leaf"),   Position { x: 3.0, y: 0.0 }));
+    let root   = world.spawn((Name("Root"),));
+    let child1 = world.spawn((Name("Child1"), Position { x: 1.0, y: 0.0 }));
+    let child2 = world.spawn((Name("Child2"), Position { x: 2.0, y: 0.0 }));
+    let leaf   = world.spawn((Name("Leaf"),   Position { x: 3.0, y: 0.0 }));
 
     world.add_relation(child1, ChildOf, root);
     world.add_relation(child2, ChildOf, root);
@@ -359,10 +359,10 @@ fn main() {
     println!("\n=== Batch Relations (add_relation_batch) ===");
 
     // Создаём 100 дочерних entity + 1 родитель
-    let parent = world.spawn_bundle((Name("BatchParent"),));
+    let parent = world.spawn((Name("BatchParent"),));
     let mut children: Vec<Entity> = Vec::with_capacity(100);
     for i in 0..100 {
-        children.push(world.spawn_bundle((Name("BatchChild"), Position { x: i as f32, y: 0.0 })));
+        children.push(world.spawn((Name("BatchChild"), Position { x: i as f32, y: 0.0 })));
     }
 
     // add_relation_batch — одна операция вместо 100 поштучных add_relation

@@ -1,5 +1,5 @@
 use crate::{
-    component::{Component, ComponentId},
+    component::{Component, ComponentId, Tick},
     entity::Entity,
     template::TemplateParams,
     world::{Bundle, World},
@@ -97,6 +97,13 @@ enum Command {
         /// function pointer для вызова world.remove::<T>()
         remove_fn: RemoveApply,
     },
+    /// InsertRaw — вставка по ComponentId с сырыми данными (Vec<u8>)
+    InsertRaw {
+        entity: Entity,
+        component_id: ComponentId,
+        data: Vec<u8>,
+        tick: Tick,
+    },
     /// Despawn — inline, без аллокации
     Despawn(Entity),
     /// SpawnFromTemplate — String уже на heap, но это исключение
@@ -141,10 +148,10 @@ impl Commands {
     }
 
     /// Создать entity из Bundle — typed payload в bump-арене
-    pub fn spawn_bundle<B: Bundle + Send + 'static>(&mut self, bundle: B) {
+    pub fn spawn<B: Bundle + Send + 'static>(&mut self, bundle: B) {
         unsafe fn apply_spawn<B: Bundle>(ptr: *mut u8, world: &mut World) {
                 let bundle = std::ptr::read(ptr as *const B);
-                world.spawn_bundle(bundle);
+                world.spawn(bundle);
             }
         unsafe fn drop_typed<T>(ptr: *mut u8) {
             std::ptr::drop_in_place(ptr as *mut T);
@@ -175,6 +182,24 @@ impl Commands {
         });
     }
 
+    /// Вставить компонент по ComponentId с сырыми данными (raw).
+    /// Используется когда ComponentId известен динамически (не через тип).
+    pub fn insert_raw(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+        data: Vec<u8>,
+        tick: Tick,
+    ) {
+        self.queue.push(Command::InsertRaw { entity, component_id, data, tick });
+    }
+
+    /// Удалить компонент по ComponentId (raw).
+    /// Используется когда ComponentId известен динамически (не через тип).
+    pub fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
+        self.queue.push(Command::Remove { entity, component_id });
+    }
+
     /// Удалить компонент у entity — typed variant, без Box-аллокации
     pub fn remove<T: Component + Send + 'static>(&mut self, entity: Entity) {
         // SAFETY: typed_remove::<T> вызывается только в apply() с корректным T.
@@ -197,8 +222,11 @@ impl Commands {
     ///
     /// # Пример
     /// ```ignore
+    /// struct MonsterSpeed;
+    /// impl apex_core::template::TemplateParam for MonsterSpeed { type Value = f32; }
+    ///
     /// cmds.spawn_from_template("Monster", TemplateParams::new()
-    ///     .with("speed", 10.0f32));
+    ///     .set::<MonsterSpeed>(10.0f32));
     /// ```
     pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
         self.queue.push(Command::SpawnFromTemplate {
@@ -231,6 +259,9 @@ impl Commands {
                 // Вызов типа-специализированной функции world.remove::<T>(entity) безопасен,
                 // т.к. T статически задан при создании команды.
                 Command::RemoveTyped { entity, remove_fn } => unsafe { remove_fn(entity, world); },
+                Command::InsertRaw { entity, component_id, data, tick } => {
+                    world.insert_raw(entity, component_id, data, tick);
+                }
                 Command::Despawn(entity)           => { world.despawn(entity); }
                 Command::SpawnFromTemplate { name, params } => { world.spawn_from_template(&name, &params); }
                 Command::Apply(f)                  => { f(world); }
@@ -248,8 +279,10 @@ impl Commands {
             match cmd {
                 Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
                 Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
-                // RemoveTyped не хранит данных в bump-арене — ничего не надо дропать
+                // RemoveTyped / Remove / InsertRaw не хранят данных в bump-арене — ничего не надо дропать
                 Command::RemoveTyped { .. } => {}
+                Command::Remove { .. } => {}
+                Command::InsertRaw { .. } => {}
                 _ => {}
             }
         }
@@ -264,8 +297,10 @@ impl Drop for Commands {
             match cmd {
                 Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
                 Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
-                // RemoveTyped не хранит данных в bump-арене — ничего не надо дропать
+                // RemoveTyped / Remove / InsertRaw не хранят данных в bump-арене — ничего не надо дропать
                 Command::RemoveTyped { .. } => {}
+                Command::Remove { .. } => {}
+                Command::InsertRaw { .. } => {}
                 _ => {}
             }
         }

@@ -82,3 +82,56 @@ pub use script_engine::ScriptEngine;
 // Re-export макроса из apex-macros чтобы пользователи писали
 // `use apex_scripting::Scriptable` а не импортировали отдельно
 pub use apex_macros::Scriptable;
+
+use apex_core::world::World;
+
+/// Extension trait: регистрирует типы одновременно в World и ScriptEngine.
+///
+/// Устраняет необходимость двойной регистрации:
+/// ```ignore
+/// // Было:
+/// world.register_component::<Position>();
+/// engine.register_component::<Position>(&world);
+///
+/// // Стало:
+/// world.register_scriptable::<Position>(&mut engine);
+/// ```
+pub trait WorldScriptingExt {
+    fn register_scriptable<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + apex_core::component::Component;
+
+    fn register_scriptable_resource<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + Send + Sync + 'static;
+
+    fn register_scriptable_event<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + Send + Sync + 'static;
+}
+
+impl WorldScriptingExt for World {
+    fn register_scriptable<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + apex_core::component::Component,
+    {
+        self.register_component::<T>();
+        engine.register_component::<T>(self);
+    }
+
+    fn register_scriptable_resource<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + Send + Sync + 'static,
+    {
+        // Ресурс уже вставлен пользователем через world.resources.insert(...)
+        engine.register_resource::<T>();
+    }
+
+    fn register_scriptable_event<T>(&mut self, engine: &mut ScriptEngine)
+    where
+        T: ScriptableRegistrar + Send + Sync + 'static,
+    {
+        self.add_event::<T>();
+        engine.register_event::<T>();
+    }
+}

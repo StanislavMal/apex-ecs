@@ -27,7 +27,7 @@ impl HeavyCompute {
     pub fn run(&mut self) {
         // Запрос: изменяем Matrix4<f32> и Position (как в Bevy heavy_compute)
         let query = self.world.query_typed::<(Write<Matrix4<f32>>, Write<Position>)>();
-        query.par_for_each_component(|(mat, pos)| {
+        query.par_for_each(|_, (mat, pos)| {
             let mut m = *mat;
             for _ in 0..100 {
                 m = m.invert().unwrap();

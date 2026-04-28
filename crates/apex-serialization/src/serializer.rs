@@ -190,7 +190,7 @@ impl WorldSerializer {
 
         // ── Шаг 1: Entity + компоненты ────────────────────────
         for entity_snap in &snapshot.entities {
-            let new_entity = world.spawn_empty();
+            let new_entity = world.spawn(());
             entity_map.insert(entity_snap.original_index, new_entity);
 
             for comp_snap in &entity_snap.components {
@@ -621,13 +621,13 @@ mod tests {
         world.register_component_serde_json::<Position>();
         world.register_component_serde_json::<Health>();
 
-        let e1 = world.spawn_bundle((
+        let e1 = world.spawn((
             Position { x: 10.0, y: 20.0 },
             Health { current: 100.0, max: 100.0 },
         ));
         world.insert(e1, RenderHandle(42));
 
-        let e2 = world.spawn_bundle((
+        let e2 = world.spawn((
             Position { x: 30.0, y: 40.0 },
         ));
 
@@ -648,8 +648,8 @@ mod tests {
         restored_world.register_component_serde_json::<Health>();
 
         // Регистрируем ChildOf, чтобы restore нашёл kind
-        let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let c = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
+        let p = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
+        let c = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);
 
         let restored_snap = WorldSnapshot::from_json(&json).unwrap();
@@ -675,8 +675,8 @@ mod tests {
         restored_world.register_component_serde_json::<Position>();
         restored_world.register_component_serde_json::<Health>();
 
-        let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let c = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
+        let p = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
+        let c = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);
 
         let restored_snap = WorldSnapshot::from_bincode(&binary).unwrap();
@@ -707,7 +707,7 @@ mod tests {
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
         // Добавляем entity
-        let _e3 = world.spawn_bundle((
+        let _e3 = world.spawn((
             Position { x: 50.0, y: 60.0 },
             Health { current: 50.0, max: 50.0 },
         ));
@@ -725,9 +725,9 @@ mod tests {
         world.register_component_serde::<Position>();
 
         // Спавним entity, запоминаем index
-        let e1 = world.spawn_bundle((Position { x: 1.0, y: 2.0 },));
+        let e1 = world.spawn((Position { x: 1.0, y: 2.0 },));
         let e1_idx = e1.index();
-        let _e2 = world.spawn_bundle((Position { x: 3.0, y: 4.0 },));
+        let _e2 = world.spawn((Position { x: 3.0, y: 4.0 },));
 
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
@@ -775,7 +775,7 @@ mod tests {
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
         // Модифицируем мир
-        let _e3 = world.spawn_bundle((
+        let _e3 = world.spawn((
             Position { x: 100.0, y: 200.0 },
         ));
 
@@ -852,8 +852,8 @@ mod tests {
         restored_world.register_component::<RenderHandle>();
         restored_world.register_component_serde_json::<Position>();
         restored_world.register_component_serde_json::<Health>();
-        let p = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
-        let c = restored_world.spawn_bundle((Position { x: 0.0, y: 0.0 },));
+        let p = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
+        let c = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);
 
         let result = WorldSerializer::restore(&mut restored_world, &snap);
