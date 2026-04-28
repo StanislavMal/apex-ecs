@@ -592,28 +592,32 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 
 ## 6. Системы и планировщик
 
-Apex ECS предоставляет четыре уровня API для систем — от простого к гибкому.
+Apex ECS предоставляет три уровня API для систем — от простого к гибкому.
 
 ### 6.1 `AutoSystem` (рекомендуется)
 
-`AutoSystem` автоматически выводит `AccessDescriptor` из типа Query. Это исключает класс ошибок, где разработчик забыл задекларировать компонент.
+`AutoSystem` автоматически выводит `AccessDescriptor` из трёх источников: типа Query, типа Resources и типа Events. Это исключает класс ошибок, где разработчик забыл задекларировать компонент, ресурс или событие.
 
-> **Как это работает:** `AutoSystem` анализирует `type Query = (Read<A>, Write<B>, With<C>, Without<D>)` и автоматически строит `AccessDescriptor`:
-> - `Read<T>` → read access к компоненту `T`
-> - `Write<T>` → write access к компоненту `T`
-> - `With<T>` / `Without<T>` → read access (для фильтрации)
-> - Если система использует ресурсы или события — используйте `ParSystem` с явным `AccessDescriptor`
+> **Как это работает:** `AutoSystem` анализирует:
+> - `type Query = (Read<A>, Write<B>, ...)` → access к компонентам
+> - `type Resources = ResRead<C>` → read access к ресурсу `C`
+> - `type Resources = ResWrite<D>` → write access к ресурсу `D`
+> - `type Events = Listen<E>` → read_event access к событию `E`
+> - `type Events = Emit<F>` → write_event access к событию `F`
+> - Кортежи из `ResRead`/`ResWrite`/`Listen`/`Emit` также поддерживаются
+
+**Только компоненты:**
 
 ```rust
-use apex_scheduler::{Scheduler, ParSystem};
+use apex_scheduler::Scheduler;
 use apex_core::prelude::*;
 
 struct MovementSystem;
 
 impl AutoSystem for MovementSystem {
-    // Доступ выводится автоматически из Query:
-    // reads: [Velocity], writes: [Position]
     type Query = (Read<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>()
@@ -628,40 +632,38 @@ let mut sched = Scheduler::new();
 sched.add_auto_system("movement", MovementSystem);
 ```
 
-### 6.2 `ParSystem` (явный access)
-
-Используйте, когда система использует несколько Query, ресурсы или события — то, что `AutoSystem` не может вывести автоматически.
+**Компоненты + ресурсы + события:**
 
 ```rust
 struct PhysicsSystem;
 
-impl ParSystem for PhysicsSystem {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new()
-            .read::<PhysicsConfig>()  // ресурс
-            .read::<Mass>()
-            .write::<Velocity>()
-            .write::<Position>()
-    }
+impl AutoSystem for PhysicsSystem {
+    type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
+    type Resources = ResRead<PhysicsConfig>;
+    type Events    = Emit<CollisionEvent>;
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let cfg = ctx.resource::<PhysicsConfig>();
         let dt = cfg.dt;
         let g = cfg.gravity;
+        let mut writer = ctx.event_writer::<CollisionEvent>();
 
-        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
-            .for_each(|_, (mass, vel, pos)| {
+        ctx.query::<Self::Query>()
+            .for_each(|entity, (mass, vel, pos)| {
                 vel.y -= g * mass.0 * dt;
                 pos.x += vel.x * dt;
                 pos.y += vel.y * dt;
+                if pos.y < 0.0 {
+                    writer.send(CollisionEvent { entity });
+                }
             });
     }
 }
 
-sched.add_par_system("physics", PhysicsSystem);
+sched.add_auto_system("physics", PhysicsSystem);
 ```
 
-### 6.3 `FnParSystem` (замыкание)
+### 6.2 `FnParSystem` (замыкание)
 
 ```rust
 // Inline-система без отдельного struct:
@@ -680,7 +682,7 @@ sched.add_fn_par_system(
 );
 ```
 
-### 6.4 Sequential система
+### 6.3 Sequential система
 
 Sequential система получает `&mut World` и выполняется строго одна в своём Stage — используется для structural changes (spawn/despawn).
 
@@ -700,16 +702,16 @@ sched.add_system("despawn_dead", |world: &mut World| {
 });
 ```
 
-> **Правило порядка:** Регистрируйте все Par-системы **ПЕРЕД** Sequential-системами. Sequential создаёт барьер «все системы до → я → все системы после», поэтому Par-система после Sequential автоматически получает зависимость от неё — это может создавать циклы через data-конфликты.
+> **Правило порядка:** Регистрируйте все параллельные системы (`AutoSystem`/`FnParSystem`) **ПЕРЕД** Sequential-системами. Sequential создаёт барьер «все системы до → я → все системы после», поэтому параллельная система после Sequential автоматически получает зависимость от неё — это может создавать циклы через data-конфликты.
 
-### 6.5 Компиляция и запуск планировщика
+### 6.4 Компиляция и запуск планировщика
 
 ```rust
 let mut sched = Scheduler::new();
 
-// Регистрация — СНАЧАЛА все Par, ПОТОМ Sequential:
-sched.add_par_system("physics",      PhysicsSystem);
-sched.add_par_system("health_clamp", HealthClampSystem);
+// Регистрация — СНАЧАЛА все параллельные, ПОТОМ Sequential:
+sched.add_auto_system("physics",      PhysicsSystem);
+sched.add_auto_system("health_clamp", HealthClampSystem);
 sched.add_auto_system("movement",    MovementSystem);
 
 // Sequential ПОСЛЕ:
@@ -724,14 +726,6 @@ sched.add_dependency(stats_id,   despawn_id); // stats после despawn
 // Компиляция — строит граф, проверяет циклы, группирует в Stage:
 sched.compile().expect("circular dependency detected");
 
-> **`compile_with_world()`:** Начиная с v0.1.0, доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
->
-> ```rust
-> sched.compile_with_world(&world).expect("circular dependency detected");
-> ```
->
-> Разница с `compile()`: `compile_with_world()` также вызывает `populate_type_names(world.registry())`, что позволяет `debug_plan_verbose()` показывать реальные имена компонентов (например, `Position` вместо `<component>`). Вызывайте его после регистрации всех систем и компонентов, но перед первым `run()`.
-
 // Диагностика плана:
 println!("{}", sched.debug_plan());
 
@@ -742,7 +736,15 @@ sched.run_sequential(&mut world);
 sched.run(&mut world);
 ```
 
-#### 6.5.1 Группировка систем по этапам (StageLabel)
+> **`compile_with_world()`:** Начиная с v0.1.0, доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
+>
+> ```rust
+> sched.compile_with_world(&world).expect("circular dependency detected");
+> ```
+>
+> Разница с `compile()`: `compile_with_world()` также вызывает `populate_type_names(world.registry())`, что позволяет `debug_plan_verbose()` показывать реальные имена компонентов (например, `Position` вместо `<component>`). Вызывайте его после регистрации всех систем и компонентов, но перед первым `run()`.
+
+#### 6.4.1 Группировка систем по этапам (StageLabel)
 
 Этапы (`StageLabel`) — механизм группировки систем с гарантированным порядком выполнения. В отличие от явных `add_dependency()` между каждой парой систем, этапы задают порядок **групп** одной строкой.
 
@@ -1637,7 +1639,7 @@ iso_bridge.apply_incoming(iso.world_mut());
 
 ### 13.1 Параллельный запуск систем
 
-Планировщик автоматически группирует совместимые Par-системы в одну Stage и запускает их параллельно через Rayon. Начиная с v0.1.0, используется алгоритм **ASD (Adaptive Scope Distribution)** — единый адаптивный механизм, заменяющий два раздельных режима (per-system scope + intra-system chunking).
+Планировщик автоматически группирует совместимые параллельные системы в одну Stage и запускает их параллельно через Rayon. Начиная с v0.1.0, используется алгоритм **ASD (Adaptive Scope Distribution)** — единый адаптивный механизм, заменяющий два раздельных режима (per-system scope + intra-system chunking).
 
 ```toml
 # Включение параллелизма (Cargo.toml):
@@ -1709,9 +1711,12 @@ chunk = min(chunk, entity_count)
 ```
 
 ```rust
-impl ParSystem for PhysicsSystem {
+impl AutoSystem for PhysicsSystem {
+    type Query = (Read<Mass>, Write<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
+        ctx.query::<Self::Query>()
             .par_for_each(|_, (mass, vel, pos)| {
                 vel.y -= 9.8 * mass.0 * 0.016;
                 pos.x += vel.x * 0.016;
@@ -1794,15 +1799,13 @@ impl SequentialSystem for ScriptedSystem {
 }
 ```
 
-**В `ParSystem` — НЕЛЬЗЯ.** Даже с `Send`-совместимостью, `run()` требует `&mut self` и `&mut World`, что несовместимо с параллельным доступом:
+**В параллельной системе (`AutoSystem`/`FnParSystem`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте (доступен только `SystemContext`):
 
 ```rust
-// ❌ НЕПРАВИЛЬНО: ScriptEngine не Sync, run() требует &mut self
-impl ParSystem for ScriptedMovement {
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        self.engine.run(0.016, ctx.world_mut()); // невозможно в параллельном контексте
-    }
-}
+// ❌ НЕПРАВИЛЬНО: engine.run() требует &mut World
+// impl AutoSystem for ScriptedMovement { ... }
+//   self.engine.run(0.016, ctx.world_mut()); // &mut World не существует в SystemContext
+// }
 ```
 
 Подробнее — в [разделе 17](#17-rhai-scripting).
@@ -1832,9 +1835,9 @@ impl ParSystem for ScriptedMovement {
 
 ### 14.4 Планировщик
 
-- Регистрируйте все Par-системы **ДО** Sequential — это максимизирует размер параллельных Stage
+- Регистрируйте все параллельные системы **ДО** Sequential — это максимизирует размер параллельных Stage
 - Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
-- Чем больше Par-систем без конфликтов — тем лучше масштабируется на N ядер
+- Чем больше параллельных систем (`AutoSystem`/`FnParSystem`) без конфликтов — тем лучше масштабируется на N ядер
 - `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 
 ### 14.5 Intra-system Parallelism
@@ -1928,8 +1931,7 @@ cargo run --release --features parallel
 
 ```rust
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, StageLabel};
-use apex_core::access::AccessDescriptor;
+use apex_scheduler::{Scheduler, StageLabel};
 use serde::{Serialize, Deserialize};
 
 // Компоненты
@@ -1953,11 +1955,12 @@ struct DeltaTime(f32);
 #[derive(Clone, Copy)]
 struct DeathEvent { entity: Entity }
 
-// Par-система (AutoSystem)
 struct MovementSystem;
 
 impl AutoSystem for MovementSystem {
     type Query = (Read<Velocity>, Write<Position>);
+    type Resources = ResRead<DeltaTime>;
+    type Events = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let dt = ctx.resource::<DeltaTime>().0;
@@ -2164,14 +2167,12 @@ fn main() {
 ### Scheduler API
 
 | Метод | Описание |
-|---|---|
-| `add_auto_system(name, sys)` | Добавить AutoSystem в default_stage_label |
-| `add_par_system(name, sys)` | Добавить ParSystem в default_stage_label |
-| `add_fn_par_system(name, f, acc)` | Добавить FnParSystem (closure) в default_stage_label |
+|---|---|---|
+| `add_auto_system(name, sys)` | Добавить AutoSystem (компоненты + ресурсы + события) |
+| `add_fn_par_system(name, f, acc)` | Добавить FnParSystem (closure) с явным access |
 | `add_system(name, f)` | Добавить Sequential систему в default_stage_label |
 | `add_system_to_stage(name, f, label)` | Добавить Sequential систему в указанный этап |
 | `add_auto_system_to_stage(name, sys, label)` | Добавить AutoSystem в указанный этап |
-| `add_par_system_to_stage(name, sys, label)` | Добавить ParSystem в указанный этап |
 | `add_fn_par_system_to_stage(name, f, acc, label)` | Добавить FnParSystem в указанный этап |
 | `add_startup_system(name, f)` | Добавить систему в Startup этап |
 | `add_dependency(a, b)` | `a` выполняется после `b` |
@@ -2313,12 +2314,12 @@ fn main() {
 
 **Назначение — непроизводительные элементы.** Rhai-скриптинг однопоточный
 внутренне (скрипты выполняются последовательно), и не может выполняться
-в параллельных системах (`ParSystem`). Однако сам `ScriptEngine` теперь
+в параллельных системах (`AutoSystem`/`FnParSystem`). Однако сам `ScriptEngine` теперь
 реализует `Send` и может быть передан в другой поток для выполнения
 в `Sequential`-системе шедулера. Он идеален для
 событийно-ориентированной логики (диалоги, квесты, триггеры), тюнинга
 параметров и быстрого прототипирования. Для CPU-bound обработки тысяч
-сущностей оставайтесь на чистых Rust-системах (`AutoSystem` / `ParSystem`).
+сущностей оставайтесь на чистых Rust-системах (`AutoSystem`).
 
 ### 17.1 Быстрый старт
 
@@ -2545,7 +2546,7 @@ loop {
 > **`Send` + однопоточное выполнение:** `ScriptEngine` использует `Arc<Mutex<>>`
 > (вместо `Rc<RefCell<>>`) благодаря включению фичи `"sync"` в крейт `rhai`.
 > Это делает `ScriptEngine: Send` — его можно передать в другой поток.
-> **Не используйте `ScriptEngine` в `ParSystem`** — `run()` требует `&mut self`,
+> **Не используйте `ScriptEngine` в параллельных системах (`AutoSystem`/`FnParSystem`)** — `run()` требует `&mut World`,
 > что несовместимо с параллельным доступом. Скриптинг предназначен для
 > последовательного выполнения в `Sequential`-системах шедулера или в главном
 > цикле. Внутренне Rhai остаётся однопоточным — скрипты выполняются

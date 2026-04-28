@@ -11,8 +11,7 @@
 //! cargo test --workspace
 
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, StageLabel};
-use apex_core::access::AccessDescriptor;
+use apex_scheduler::{Scheduler, StageLabel};
 
 // ── Компоненты ────────────────────────────────────────────────
 
@@ -43,27 +42,23 @@ struct DamageEvent { target: Entity, amount: f32 }
 #[derive(Clone, Copy, Debug)]
 struct DeathEvent { entity: Entity }
 
-// ── ParSystem: Physics ─────────────────────────────────────────
+// ── AutoSystem: Physics ────────────────────────────────────────
 
 struct PhysicsSystem;
 
-impl ParSystem for PhysicsSystem {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new()
-            .read::<PhysicsConfig>()
-            .read::<Mass>()
-            .write::<Velocity>()
-            .write::<Position>()
-    }
+impl AutoSystem for PhysicsSystem {
+    type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
+    type Resources = (ResRead<PhysicsConfig>, ResRead<DeltaTime>);
+    type Events    = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let cfg  = ctx.resource::<PhysicsConfig>();
         let dt   = cfg.dt;
         let g    = cfg.gravity;
 
-        let count = ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().len();
+        let count = ctx.query::<Self::Query>().len();
 
-        ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>().for_each(
+        ctx.query::<Self::Query>().for_each(
             |_, (mass, vel, pos)| {
                 vel.y  -= g * mass.0 * dt;
                 pos.x  += vel.x * dt;
@@ -75,14 +70,14 @@ impl ParSystem for PhysicsSystem {
     }
 }
 
-// ── ParSystem: HealthClamp ─────────────────────────────────────
+// ── AutoSystem: HealthClamp ────────────────────────────────────
 
 struct HealthClampSystem;
 
-impl ParSystem for HealthClampSystem {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new().write::<Health>()
-    }
+impl AutoSystem for HealthClampSystem {
+    type Query = Write<Health>;
+    type Resources = ();
+    type Events = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         // Используем thread-local Commands (ctx.commands()) для отложенных
@@ -108,6 +103,8 @@ struct MovementSystem;
 
 impl AutoSystem for MovementSystem {
     type Query = (Read<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         let count = ctx.query::<Self::Query>().len();
@@ -256,8 +253,8 @@ fn main() {
     // ╔══════════════════════════════════════════════════════════╗
     // ║  Update — ParSystem + FnParSystem (параллельные)       ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_par_system_to_stage("physics",      PhysicsSystem,      StageLabel::Update);
-    sched.add_par_system_to_stage("health_clamp", HealthClampSystem,  StageLabel::Update);
+    sched.add_auto_system_to_stage("physics",      PhysicsSystem,      StageLabel::Update);
+    sched.add_auto_system_to_stage("health_clamp", HealthClampSystem,  StageLabel::Update);
     sched.add_fn_par_system_to_stage(
         "enemy_ai",
         |ctx: SystemContext<'_>| {

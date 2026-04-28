@@ -45,8 +45,7 @@
 //!
 //! | Тип | Access | Использование |
 //! |-----|--------|---------------|
-//! | AutoSystem | автовывод из Query | рекомендуется |
-//! | ParSystem | явный AccessDescriptor | сложные системы |
+//! | AutoSystem | автовывод из Query + Resources + Events | рекомендуется |
 //! | FnParSystem | явный + замыкание | быстрые прототипы |
 //! | Sequential | полный &mut World | structural changes |
 
@@ -67,8 +66,8 @@ use apex_core::{
 };
 
 pub use stage::{Stage, StageLabel};
+pub use apex_core::system_param::{AutoSystem, ResourceAccessList, EventAccessList, ResRead, ResWrite, Listen, Emit};
 pub use apex_core::AccessDescriptor as Access;
-pub use apex_core::system_param::AutoSystem;
 pub use apex_core::world::SystemContext;
 
 // ── ConflictKind ───────────────────────────────────────────────
@@ -187,8 +186,8 @@ unsafe impl Sync for AsdTask {}
 
 /// Параллельная система с явным AccessDescriptor.
 ///
-/// Используй `AutoSystem` если access полностью покрывается одним Query.
-pub trait ParSystem: Send + Sync {
+/// Внутренний механизм — используйте `AutoSystem` для публичного API.
+pub(crate) trait ParSystem: Send + Sync {
     fn access() -> AccessDescriptor where Self: Sized;
     fn run(&mut self, ctx: SystemContext<'_>);
     fn name() -> &'static str where Self: Sized { std::any::type_name::<Self>() }
@@ -206,8 +205,9 @@ struct AutoSystemAdapter<S: AutoSystem> {
 
 impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
     fn access() -> AccessDescriptor where Self: Sized {
-        // Ключевой момент: access выводится из типа Query, не из ручного кода
         S::Query::system_access()
+            .merge(&S::Resources::resource_accesses())
+            .merge(&S::Events::event_accesses())
     }
 
     fn run(&mut self, ctx: SystemContext<'_>) {
@@ -476,7 +476,9 @@ impl Scheduler {
     {
         let id     = SystemId(self.next_id);
         self.next_id += 1;
-        let access = S::Query::system_access();
+        let access = S::Query::system_access()
+            .merge(&S::Resources::resource_accesses())
+            .merge(&S::Events::event_accesses());
         let adapter = AutoSystemAdapter { inner: system };
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
@@ -503,7 +505,7 @@ impl Scheduler {
 
     /// Регистрировать ParSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_par_system<S: ParSystem + 'static>(
+    pub(crate) fn add_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
         system: S,
@@ -512,7 +514,7 @@ impl Scheduler {
     }
 
     /// Регистрировать ParSystem в указанном этапе.
-    pub fn add_par_system_to_stage<S: ParSystem + 'static>(
+    pub(crate) fn add_par_system_to_stage<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
         system: S,
@@ -537,7 +539,7 @@ impl Scheduler {
     }
 
     /// Регистрировать ParSystem в Startup этапе.
-    pub fn add_startup_par_system<S: ParSystem + 'static>(
+    pub(crate) fn add_startup_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
         system: S,
@@ -1903,6 +1905,8 @@ mod tests {
     struct AutoMovement;
     impl AutoSystem for AutoMovement {
         type Query = (Read<Vel>, Write<Pos>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Self::Query>()
                 .for_each(|_, (vel, pos)| {
@@ -1915,6 +1919,8 @@ mod tests {
     struct AutoHealth;
     impl AutoSystem for AutoHealth {
         type Query = Write<Hp>;
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Self::Query>()
                 .for_each(|_, hp| {
@@ -1969,6 +1975,8 @@ mod tests {
         struct AutoMovement2;
         impl AutoSystem for AutoMovement2 {
             type Query = Write<Pos>;
+            type Resources = ();
+            type Events = ();
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 

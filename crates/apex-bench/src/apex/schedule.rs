@@ -19,6 +19,8 @@ struct SysCE;
 
 impl AutoSystem for SysAB {
     type Query = (Write<A>, Write<B>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>().for_each(|_, (a, b)| {
             std::mem::swap(&mut a.0, &mut b.0);
@@ -28,6 +30,8 @@ impl AutoSystem for SysAB {
 
 impl AutoSystem for SysCD {
     type Query = (Write<C>, Write<D>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>().for_each(|_, (c, d)| {
             std::mem::swap(&mut c.0, &mut d.0);
@@ -37,6 +41,8 @@ impl AutoSystem for SysCD {
 
 impl AutoSystem for SysCE {
     type Query = (Write<C>, Write<E>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>().for_each(|_, (c, e)| {
             std::mem::swap(&mut c.0, &mut e.0);

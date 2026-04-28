@@ -4,8 +4,7 @@
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem, SystemId};
-use apex_core::access::AccessDescriptor;
+use apex_scheduler::{Scheduler, SystemId};
 
 // ── Компоненты ─────────────────────────────────────────────────
 
@@ -170,10 +169,10 @@ fn make_world_5comp(n: usize) -> World {
 // ── Системы ────────────────────────────────────────────────────
 
 struct MoveSys;
-impl ParSystem for MoveSys {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new().read::<Velocity>().write::<Position>()
-    }
+impl AutoSystem for MoveSys {
+    type Query = (Read<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
@@ -184,8 +183,10 @@ impl ParSystem for MoveSys {
 }
 
 struct HpSys;
-impl ParSystem for HpSys {
-    fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Health>() }
+impl AutoSystem for HpSys {
+    type Query = Write<Health>;
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Write<Health>>().for_each(|_, hp| {
             hp.current = hp.current.min(hp.max).max(0.0);
@@ -194,8 +195,10 @@ impl ParSystem for HpSys {
 }
 
 struct TempSys;
-impl ParSystem for TempSys {
-    fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+impl AutoSystem for TempSys {
+    type Query = Write<Temperature>;
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Write<Temperature>>().for_each(|_, t| {
             t.0 += (20.0 - t.0) * 0.001;
@@ -204,8 +207,10 @@ impl ParSystem for TempSys {
 }
 
 struct ManaSys;
-impl ParSystem for ManaSys {
-    fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+impl AutoSystem for ManaSys {
+    type Query = Write<Mana>;
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Write<Mana>>().for_each(|_, m| {
             m.current = (m.current + 0.2).min(m.max);
@@ -214,10 +219,10 @@ impl ParSystem for ManaSys {
 }
 
 struct HeavyPhysSys;
-impl ParSystem for HeavyPhysSys {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new().write::<Velocity>().write::<Position>()
-    }
+impl AutoSystem for HeavyPhysSys {
+    type Query = (Write<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<(Write<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
             let dt    = 0.016f32;
@@ -236,8 +241,10 @@ impl ParSystem for HeavyPhysSys {
 }
 
 struct HeavyTempSys;
-impl ParSystem for HeavyTempSys {
-    fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+impl AutoSystem for HeavyTempSys {
+    type Query = Write<Temperature>;
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Write<Temperature>>().for_each(|_, t| {
             let ambient = 20.0f32;
@@ -253,8 +260,10 @@ impl ParSystem for HeavyTempSys {
 }
 
 struct HeavyManaSys;
-impl ParSystem for HeavyManaSys {
-    fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+impl AutoSystem for HeavyManaSys {
+    type Query = Write<Mana>;
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Write<Mana>>().for_each(|_, m| {
             let ratio = m.current / m.max;
@@ -270,6 +279,8 @@ impl ParSystem for HeavyManaSys {
 struct AutoMoveSys;
 impl AutoSystem for AutoMoveSys {
     type Query = (Read<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>().for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
@@ -504,20 +515,20 @@ fn bench_scheduler_throughput(n: usize) {
     }
 
     sched_bench!(
-        &format!("1 ParSystem: movement      ({n}k)"),
-        { let mut s = Scheduler::new(); s.add_par_system("move", MoveSys); s },
+        &format!("1 AutoSystem: movement      ({n}k)"),
+        { let mut s = Scheduler::new(); s.add_auto_system("move", MoveSys); s },
         make_world_3comp(n * 1000)
     );
 
     {
         let mut sched = Scheduler::new();
-        sched.add_par_system("move", MoveSys);
-        sched.add_par_system("hp",   HpSys);
+        sched.add_auto_system("move", MoveSys);
+        sched.add_auto_system("hp",   HpSys);
         sched.compile().unwrap();
         let stages = sched.stages().unwrap().len();
         debug_assert_eq!(stages, 1, "ожидаем 1 Stage без конфликтов");
         bench_with_setup(
-            &format!("2 ParSystem no-conflict    ({n}k, 1 Stage)"),
+            &format!("2 AutoSystem no-conflict    ({n}k, 1 Stage)"),
             || make_world_3comp(n * 1000),
             |mut world: World| {
                 sched.run_sequential(&mut world);
@@ -580,10 +591,10 @@ fn bench_scheduler_throughput(n: usize) {
     // Debug plan
     {
         let mut sched = Scheduler::new();
-        sched.add_par_system("physics",  MoveSys);
-        sched.add_par_system("hp_clamp", HpSys);
+        sched.add_auto_system("physics",  MoveSys);
+        sched.add_auto_system("hp_clamp", HpSys);
         sched.add_system("commands", |_| {});
-        sched.add_par_system("ai", MoveSys);
+        sched.add_auto_system("ai", MoveSys);
         sched.compile().unwrap();
         println!("  Mixed pipeline plan:\n{}", sched.debug_plan());
     }
@@ -595,14 +606,18 @@ fn bench_compile_overhead() {
     println!("\n── Scheduler compile() overhead ────────────────────────────────────────────────");
 
     struct SimpleSys;
-    impl ParSystem for SimpleSys {
-        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Position>() }
+    impl AutoSystem for SimpleSys {
+        type Query = Write<Position>;
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, _: SystemContext<'_>) {}
     }
 
     struct OtherSys;
-    impl ParSystem for OtherSys {
-        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Velocity>() }
+    impl AutoSystem for OtherSys {
+        type Query = Write<Velocity>;
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, _: SystemContext<'_>) {}
     }
 
@@ -615,8 +630,8 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    if i % 2 == 0 { sched.add_par_system(format!("s{i}"), SimpleSys); }
-                    else           { sched.add_par_system(format!("s{i}"), OtherSys);  }
+                    if i % 2 == 0 { sched.add_auto_system(format!("s{i}"), SimpleSys); }
+                    else           { sched.add_auto_system(format!("s{i}"), OtherSys);  }
                 }
                 sched.compile().unwrap();
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -632,7 +647,7 @@ fn bench_compile_overhead() {
             || (),
             |()| {
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_par_system(format!("s{i}"), SimpleSys); }
+                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), SimpleSys); }
                 sched.compile().unwrap();
                 debug_assert_eq!(sched.stages().unwrap().len(), n_sys);
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -647,7 +662,7 @@ fn bench_compile_overhead() {
         || (),
         |()| {
             let mut sched = Scheduler::new();
-            for i in 0..5 { sched.add_par_system(format!("p{i}"), OtherSys); }
+            for i in 0..5 { sched.add_auto_system(format!("p{i}"), OtherSys); }
             for i in 0..5 { sched.add_system(format!("s{i}"), |_| {}); }
             sched.compile().unwrap();
             std::hint::black_box(sched.stages().unwrap().len());
@@ -665,7 +680,7 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    sched.add_par_system(format!("s{i}"), OtherSys);
+                    sched.add_auto_system(format!("s{i}"), OtherSys);
                     sched.compile().unwrap();
                 }
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -683,7 +698,7 @@ fn bench_compile_overhead() {
             || (),
             |()| {
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_par_system(format!("s{i}"), OtherSys); }
+                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), OtherSys); }
                 sched.compile().unwrap();
                 std::hint::black_box(sched.stages().unwrap().len());
                 1
@@ -695,7 +710,7 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    sched.add_par_system(format!("s{i}"), OtherSys);
+                    sched.add_auto_system(format!("s{i}"), OtherSys);
                     sched.compile().unwrap();
                 }
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -714,7 +729,7 @@ fn bench_compile_overhead() {
             || {
                 // setup: первый compile — не входит в измерение
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_par_system(format!("s{i}"), OtherSys); }
+                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), OtherSys); }
                 sched.compile().unwrap();
                 sched
             },
@@ -734,12 +749,12 @@ fn bench_compile_overhead() {
         "add 1 system → recompile (N=10 → 11)",
         || {
             let mut sched = Scheduler::new();
-            for i in 0..10 { sched.add_par_system(format!("s{i}"), OtherSys); }
+            for i in 0..10 { sched.add_auto_system(format!("s{i}"), OtherSys); }
             sched.compile().unwrap();
             sched
         },
         |mut sched: Scheduler| {
-            sched.add_par_system("s_new", OtherSys);
+            sched.add_auto_system("s_new", OtherSys);
             sched.compile().unwrap();
             std::hint::black_box(sched.stages().unwrap().len());
             1
@@ -750,9 +765,9 @@ fn bench_compile_overhead() {
         "add_dependency → recompile (N=5)",
         || {
             let mut sched = Scheduler::new();
-            let a = sched.add_par_system("sa", OtherSys);
-            let b = sched.add_par_system("sb", OtherSys);
-            for i in 2..5 { sched.add_par_system(format!("s{i}"), OtherSys); }
+            let a = sched.add_auto_system("sa", OtherSys);
+            let b = sched.add_auto_system("sb", OtherSys);
+            for i in 2..5 { sched.add_auto_system(format!("s{i}"), OtherSys); }
             sched.compile().unwrap();
             (sched, a, b)
         },
@@ -1074,8 +1089,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("move", MoveSys),
-            |s: &mut Scheduler| s.add_par_system("hp",   HpSys)
+            |s: &mut Scheduler| s.add_auto_system("move", MoveSys),
+            |s: &mut Scheduler| s.add_auto_system("hp",   HpSys)
         );
         bench_seq_par(
             &format!("2 лёгких системы ({n}k)  Move+Hp"),
@@ -1087,10 +1102,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("move", MoveSys),
-            |s: &mut Scheduler| s.add_par_system("hp",   HpSys),
-            |s: &mut Scheduler| s.add_par_system("temp", TempSys),
-            |s: &mut Scheduler| s.add_par_system("mana", ManaSys)
+            |s: &mut Scheduler| s.add_auto_system("move", MoveSys),
+            |s: &mut Scheduler| s.add_auto_system("hp",   HpSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", TempSys),
+            |s: &mut Scheduler| s.add_auto_system("mana", ManaSys)
         );
         // Проверяем 1 Stage
         debug_assert_eq!(seq.stages().unwrap().len(), 1);
@@ -1144,8 +1159,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
         );
         bench_seq_par(
             &format!("2 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1157,9 +1172,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
+            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
         );
         bench_seq_par(
             &format!("3 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1178,8 +1193,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
         );
         bench_seq_par(
             &format!("2 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1191,9 +1206,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
+            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
         );
         bench_seq_par(
             &format!("3 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1217,10 +1232,10 @@ fn bench_parallel_scheduler(n: usize) {
     println!("\n  --- Сравнение for_each vs par_for_each (межсистемный) ---");
 
     struct HeavyPhysParSys;
-    impl ParSystem for HeavyPhysParSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().write::<Velocity>().write::<Position>()
-        }
+    impl AutoSystem for HeavyPhysParSys {
+        type Query = (Write<Velocity>, Write<Position>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
@@ -1239,8 +1254,10 @@ fn bench_parallel_scheduler(n: usize) {
     }
 
     struct HeavyTempParSys;
-    impl ParSystem for HeavyTempParSys {
-        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Temperature>() }
+    impl AutoSystem for HeavyTempParSys {
+        type Query = Write<Temperature>;
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Write<Temperature>>().par_for_each(|_, t| {
                 let ambient = 20.0f32;
@@ -1256,8 +1273,10 @@ fn bench_parallel_scheduler(n: usize) {
     }
 
     struct HeavyManaParSys;
-    impl ParSystem for HeavyManaParSys {
-        fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Mana>() }
+    impl AutoSystem for HeavyManaParSys {
+        type Query = Write<Mana>;
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<Write<Mana>>().par_for_each(|_, m| {
                 let ratio = m.current / m.max;
@@ -1273,12 +1292,12 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysParSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempParSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysParSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempParSys)
         );
         bench_seq_par(
             &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1297,14 +1316,14 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
+            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("phys", HeavyPhysParSys),
-            |s: &mut Scheduler| s.add_par_system("temp", HeavyTempParSys),
-            |s: &mut Scheduler| s.add_par_system("mana", HeavyManaParSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysParSys),
+            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempParSys),
+            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaParSys)
         );
         bench_seq_par(
             &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1350,10 +1369,10 @@ fn bench_parallel_scheduler(n: usize) {
     macro_rules! make_solo_sys {
         ($name:ident, $comp:ty) => {
             struct $name;
-            impl ParSystem for $name {
-                fn access() -> AccessDescriptor {
-                    AccessDescriptor::new().write::<$comp>()
-                }
+            impl AutoSystem for $name {
+                type Query = Write<$comp>;
+                type Resources = ();
+                type Events = ();
                 fn run(&mut self, ctx: SystemContext<'_>) {
                     ctx.query::<Write<$comp>>().for_each(|_, c| {
                         c.0 = (c.0 * 1.01 + 0.5).sin();
@@ -1410,8 +1429,8 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 1: 2 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1)
+            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1)
         );
         bench_seq_par(
             &format!("2 solo-системы, 2 архетипа ({n}k each)"),
@@ -1424,10 +1443,10 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 2: 4 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1),
-            |s: &mut Scheduler| s.add_par_system("s2", SoloSys2),
-            |s: &mut Scheduler| s.add_par_system("s3", SoloSys3)
+            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1),
+            |s: &mut Scheduler| s.add_auto_system("s2", SoloSys2),
+            |s: &mut Scheduler| s.add_auto_system("s3", SoloSys3)
         );
         bench_seq_par(
             &format!("4 solo-системы, 4 архетипа ({n}k each)"),
@@ -1440,14 +1459,14 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 3: 8 систем ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_par_system("s1", SoloSys1),
-            |s: &mut Scheduler| s.add_par_system("s2", SoloSys2),
-            |s: &mut Scheduler| s.add_par_system("s3", SoloSys3),
-            |s: &mut Scheduler| s.add_par_system("s4", SoloSys4),
-            |s: &mut Scheduler| s.add_par_system("s5", SoloSys5),
-            |s: &mut Scheduler| s.add_par_system("s6", SoloSys6),
-            |s: &mut Scheduler| s.add_par_system("s7", SoloSys7)
+            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
+            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1),
+            |s: &mut Scheduler| s.add_auto_system("s2", SoloSys2),
+            |s: &mut Scheduler| s.add_auto_system("s3", SoloSys3),
+            |s: &mut Scheduler| s.add_auto_system("s4", SoloSys4),
+            |s: &mut Scheduler| s.add_auto_system("s5", SoloSys5),
+            |s: &mut Scheduler| s.add_auto_system("s6", SoloSys6),
+            |s: &mut Scheduler| s.add_auto_system("s7", SoloSys7)
         );
         bench_seq_par(
             &format!("8 solo-систем, 8 архетипов ({n}k each)"),
@@ -1460,18 +1479,18 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 4: 12 систем (полная загрузка всех ядер) ─────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_par_system("s0",  SoloSys0),
-            |s: &mut Scheduler| s.add_par_system("s1",  SoloSys1),
-            |s: &mut Scheduler| s.add_par_system("s2",  SoloSys2),
-            |s: &mut Scheduler| s.add_par_system("s3",  SoloSys3),
-            |s: &mut Scheduler| s.add_par_system("s4",  SoloSys4),
-            |s: &mut Scheduler| s.add_par_system("s5",  SoloSys5),
-            |s: &mut Scheduler| s.add_par_system("s6",  SoloSys6),
-            |s: &mut Scheduler| s.add_par_system("s7",  SoloSys7),
-            |s: &mut Scheduler| s.add_par_system("s8",  SoloSys8),
-            |s: &mut Scheduler| s.add_par_system("s9",  SoloSys9),
-            |s: &mut Scheduler| s.add_par_system("s10", SoloSys10),
-            |s: &mut Scheduler| s.add_par_system("s11", SoloSys11)
+            |s: &mut Scheduler| s.add_auto_system("s0",  SoloSys0),
+            |s: &mut Scheduler| s.add_auto_system("s1",  SoloSys1),
+            |s: &mut Scheduler| s.add_auto_system("s2",  SoloSys2),
+            |s: &mut Scheduler| s.add_auto_system("s3",  SoloSys3),
+            |s: &mut Scheduler| s.add_auto_system("s4",  SoloSys4),
+            |s: &mut Scheduler| s.add_auto_system("s5",  SoloSys5),
+            |s: &mut Scheduler| s.add_auto_system("s6",  SoloSys6),
+            |s: &mut Scheduler| s.add_auto_system("s7",  SoloSys7),
+            |s: &mut Scheduler| s.add_auto_system("s8",  SoloSys8),
+            |s: &mut Scheduler| s.add_auto_system("s9",  SoloSys9),
+            |s: &mut Scheduler| s.add_auto_system("s10", SoloSys10),
+            |s: &mut Scheduler| s.add_auto_system("s11", SoloSys11)
         );
         bench_seq_par(
             &format!("12 solo-систем, 12 архетипов ({n}k each)"),
@@ -1487,11 +1506,11 @@ fn bench_parallel_scheduler(n: usize) {
     {
         let build_sched = || {
             let mut s = Scheduler::new();
-            s.add_par_system("p1", MoveSys);
-            s.add_par_system("h1", HpSys);
+            s.add_auto_system("p1", MoveSys);
+            s.add_auto_system("h1", HpSys);
             s.add_system("barrier", |_: &mut World| {});
-            s.add_par_system("p2", MoveSys);
-            s.add_par_system("h2", HpSys);
+            s.add_auto_system("p2", MoveSys);
+            s.add_auto_system("h2", HpSys);
             s.compile().unwrap();
             s
         };
@@ -1508,13 +1527,13 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Debug plan ────────────────────────────────────────────
     {
         let mut sched = Scheduler::new();
-        sched.add_par_system("move", MoveSys);
-        sched.add_par_system("hp",   HpSys);
-        sched.add_par_system("temp", TempSys);
-        sched.add_par_system("mana", ManaSys);
+        sched.add_auto_system("move", MoveSys);
+        sched.add_auto_system("hp",   HpSys);
+        sched.add_auto_system("temp", TempSys);
+        sched.add_auto_system("mana", ManaSys);
         sched.add_system("commands", |_| {});
-        sched.add_par_system("move2", MoveSys);
-        sched.add_par_system("hp2",   HpSys);
+        sched.add_auto_system("move2", MoveSys);
+        sched.add_auto_system("hp2",   HpSys);
         let test_world = make_world_5comp(n * 1000);
         sched.compile_with_world(&test_world).unwrap();
         println!("\n  Pipeline plan:\n{}", sched.debug_plan());
@@ -1572,10 +1591,10 @@ fn bench_intra_system_parallel(n: usize) {
     };
 
     struct LightSeqSys;
-    impl ParSystem for LightSeqSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>()
-        }
+    impl AutoSystem for LightSeqSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
                 p.x += v.x * 0.016;
@@ -1587,10 +1606,10 @@ fn bench_intra_system_parallel(n: usize) {
     }
 
     struct LightParSys;
-    impl ParSystem for LightParSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>()
-        }
+    impl AutoSystem for LightParSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 p.x += v.x * 0.016;
@@ -1602,10 +1621,10 @@ fn bench_intra_system_parallel(n: usize) {
     }
 
     struct HeavySeqSys;
-    impl ParSystem for HeavySeqSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>()
-        }
+    impl AutoSystem for HeavySeqSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
@@ -1620,10 +1639,10 @@ fn bench_intra_system_parallel(n: usize) {
     }
 
     struct HeavyIntraParSys;
-    impl ParSystem for HeavyIntraParSys {
-        fn access() -> AccessDescriptor {
-            AccessDescriptor::new().read::<Velocity>().write::<Position>()
-        }
+    impl AutoSystem for HeavyIntraParSys {
+        type Query = (Read<Velocity>, Write<Position>);
+        type Resources = ();
+        type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
             ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
                 let dt    = 0.016f32;
@@ -1643,13 +1662,13 @@ fn bench_intra_system_parallel(n: usize) {
         make_multiarch,
         |world| {
             let mut s = Scheduler::new();
-            s.add_par_system("seq", LightSeqSys);
+            s.add_auto_system("seq", LightSeqSys);
             s.compile().unwrap();
             s.run_sequential(world);
         },
         |world| {
             let mut s = Scheduler::new();
-            s.add_par_system("par", LightParSys);
+            s.add_auto_system("par", LightParSys);
             s.compile().unwrap();
             s.run_sequential(world); // intra-sys par через rayon внутри системы
         },
@@ -1661,13 +1680,13 @@ fn bench_intra_system_parallel(n: usize) {
         make_multiarch,
         |world| {
             let mut s = Scheduler::new();
-            s.add_par_system("seq", HeavySeqSys);
+            s.add_auto_system("seq", HeavySeqSys);
             s.compile().unwrap();
             s.run_sequential(world);
         },
         |world| {
             let mut s = Scheduler::new();
-            s.add_par_system("par", HeavyIntraParSys);
+            s.add_auto_system("par", HeavyIntraParSys);
             s.compile().unwrap();
             s.run_sequential(world);
         },

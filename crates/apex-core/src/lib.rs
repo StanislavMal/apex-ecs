@@ -27,6 +27,8 @@ pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns};
 pub use system_param::{
     Res, ResMut, EventReader, EventWriter,
+    ResRead, ResWrite, Listen, Emit,
+    ResourceAccessList, EventAccessList,
     WorldQuerySystemAccess, AutoSystem,
 };
 
@@ -42,6 +44,7 @@ pub mod prelude {
     pub use crate::relations::{RelationKind, ChildOf, Owns};
     pub use crate::system_param::{
         Res, ResMut, EventReader, EventWriter,
+        ResRead, ResWrite, Listen, Emit,
         WorldQuerySystemAccess, AutoSystem,
     };
     pub use crate::template::{TemplateParams, EntityTemplate, TemplateParam};
