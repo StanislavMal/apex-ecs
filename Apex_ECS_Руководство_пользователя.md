@@ -395,6 +395,10 @@ if let Some(mut stats) = world.try_resource_mut::<FrameStats>() {
     stats.frame += 1;
 }
 
+// В системах — те же методы через ctx (см. раздел 6.6):
+let cfg   = ctx.resource::<PhysicsConfig>();       // Res<T>
+let stats = ctx.try_resource::<FrameStats>();       // Option<Res<T>>
+
 // Проверка наличия:
 world.has_resource::<PhysicsConfig>() // -> bool
 
@@ -737,8 +741,16 @@ fn run(&mut self, ctx: SystemContext<'_>) {
         .for_each(|_, (v, p)| { /* ... */ });
 
     // Ресурсы:
-    let cfg   = ctx.resource::<PhysicsConfig>();        // Res<T>
-    let mut s = ctx.resource_mut::<FrameStats>();       // ResMut<T>
+    let cfg   = ctx.resource::<PhysicsConfig>();        // Res<T> — паникует если нет
+    let mut s = ctx.resource_mut::<FrameStats>();       // ResMut<T> — паникует если нет
+
+    // Безопасный доступ (без паники):
+    if let Some(stats) = ctx.try_resource::<FrameStats>() {
+        println!("frame: {}", stats.frame);
+    }
+    if let Some(mut stats) = ctx.try_resource_mut::<FrameStats>() {
+        stats.frame += 1;
+    }
 
     // События:
     let reader     = ctx.event_reader::<DamageEvent>(); // EventReader<T>
@@ -1113,19 +1125,30 @@ println!("modified components: {}", diff.modified_components.len());
 
 Prefabs — это JSON-формат для описания и переиспользования entity и их иерархий. В отличие от `EntityTemplate`, префабы загружаются из файлов и могут изменяться без перекомпиляции.
 
-#### 10.4.1 Формат `PrefabManifest`
+#### 10.4.1 Формат `PrefabManifest` и регистрация компонентов
+
+Для инстанциирования префаба компоненты должны быть зарегистрированы через `register_component_serde_json<T>()` — PrefabLoader читает JSON и использует `serde_json::from_slice` для десериализации. `register_component_serde<T>()` (bincode) НЕ подходит — bincode не может разобрать JSON.
+
+```rust
+// ✅ ПРАВИЛЬНО: для префабов
+world.register_component_serde_json::<Position>();
+world.register_component_serde_json::<Health>();
+
+// ❌ НЕПРАВИЛЬНО: bincode не читает JSON
+// world.register_component_serde::<Position>();
+```
 
 ```json
 {
   "name": "Orc",
   "components": [
-    { "type": "prefab_isolated::Position", "value": { "x": 0.0, "y": 0.0 } },
-    { "type": "prefab_isolated::Health",   "value": { "current": 100.0, "max": 100.0 } },
-    { "type": "prefab_isolated::Enemy",    "value": null }
+    { "type_name": "prefab_isolated::Position", "value": { "x": 0.0, "y": 0.0 } },
+    { "type_name": "prefab_isolated::Health",   "value": { "current": 100.0, "max": 100.0 } },
+    { "type_name": "prefab_isolated::Enemy",    "value": null }
   ],
   "children": [
     { "prefab": "Weapon", "overrides": [
-      { "type": "prefab_isolated::Damage", "value": 15 }
+      { "type_name": "prefab_isolated::Damage", "value": 15 }
     ]}
   ]
 }
@@ -1148,15 +1171,15 @@ let mut loader = PrefabLoader::new();
 let manifest = loader.load_json(r#"{
     "name": "Orc",
     "components": [
-        { "type": "prefab_isolated::Position", "value": { "x": 10.0, "y": 0.0 } },
-        { "type": "prefab_isolated::Health",   "value": { "current": 100.0, "max": 100.0 } },
-        { "type": "prefab_isolated::Enemy",    "value": null }
+        { "type_name": "prefab_isolated::Position", "value": { "x": 10.0, "y": 0.0 } },
+        { "type_name": "prefab_isolated::Health",   "value": { "current": 100.0, "max": 100.0 } },
+        { "type_name": "prefab_isolated::Enemy",    "value": null }
     ]
 }"#).expect("invalid prefab");
 
 // Инстанциирование:
-let orc = loader.instantiate(&mut world, "Orc")
-    .expect("prefab not found");
+let orc = loader.instantiate(&mut world, &manifest, &[], None, None)
+    .expect("prefab instantiation failed");
 ```
 
 #### 10.4.3 `PrefabManifest` как `EntityTemplate`
@@ -1354,9 +1377,8 @@ use apex_isolated::IsolatedWorld;
 let mut sub = IsolatedWorld::new();
 
 // Зарегистрировать компоненты и системы как в обычном мире:
-sub.world.register_component::<Position>();
-sub.scheduler.add_system("move", |w: &mut World| { /* ... */ });
-sub.scheduler.compile().unwrap();
+sub.world_mut().register_component::<Position>();
+sub.scheduler_mut().add_system("move", |w: &mut World| { /* ... */ });
 
 // Один кадр: scheduler.run() + world.tick()
 sub.tick();
@@ -1364,32 +1386,102 @@ sub.tick();
 
 ### 12.2 `WorldBridge`
 
-`WorldBridge` — двунаправленный канал для обмена сериализуемыми событиями между мирами:
+`WorldBridge` — двунаправленный канал для обмена событиями между мирами.
+Предоставляет три способа отправки:
+
+| Метод | Сериализация | Требуется `register_event`? | Тип данных |
+|---|---|---|---|
+| `send_action_event(event)` | Нет (closure) | Нет | `Send + Sync + 'static` |
+| `send_event(event)` | Да (bincode) | Да | `Serialize + Send + Sync + 'static` |
+
+#### 12.2.1 `send_action_event` (без сериализации)
+
+Самый простой и эффективный способ — отправляет замыкание, которое вызовет `world.send_event()` на другой стороне. Не требует регистрации типа.
 
 ```rust
 use apex_isolated::WorldBridge;
 
-// Создать пару (a → b) и (b → a):
 let (bridge_a, bridge_b) = WorldBridge::new();
 
-// В основном мире: отправить событие в изолированный мир
-bridge_a.send_event(&SomeEvent { value: 42 });
+// Отправить действие — любое Send + Sync + 'static:
+bridge_a.send_action_event("Hello from main!".to_string());
 
-// В изолированном мире: применить все входящие события
-bridge_b.apply_incoming(&mut sub.world);
+// На принимающей стороне:
+bridge_b.apply_incoming(&mut world);
+// Вызовет world.send_event("Hello from main!".to_string())
+```
+
+#### 12.2.2 `send_event` + `register_event` (с сериализацией)
+
+Сериализует событие через bincode и десериализует на принимающей стороне. Перед отправкой нужно вызвать `register_event`, который:
+1. Регистрирует тип в `EventQueue` принимающего мира (`world.add_event::<T>()`)
+2. Сохраняет bincode-десериализатор в реестре моста
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScoreEvent(u32);
+
+let (bridge_a, bridge_b) = WorldBridge::new();
+let mut world = World::new();
+
+// Шаг 1: зарегистрировать на ПРИНИМАЮЩЕЙ стороне
+bridge_b.register_event::<ScoreEvent>(&mut world);
+
+// Шаг 2: отправить
+bridge_a.send_event(&ScoreEvent(42));
+
+// Шаг 3: применить — десериализуется и вызовет world.send_event(ScoreEvent(42))
+bridge_b.apply_incoming(&mut world);
+
+assert_eq!(world.events::<ScoreEvent>().len(), 1);
+```
+
+> **Внимание:** Без `register_event` сериализованное событие будет отброшено с предупреждением в лог. `send_action_event` не требует регистрации и предпочтителен для внутрипроцессной передачи.
+
+#### 12.2.3 Создание каналов (правильная схема)
+
+`WorldBridge::new()` возвращает пару `(main_to_sub, sub_to_main)`. Важно не перепутать каналы:
+
+```rust
+// main_to_sub: отправляет в IsolatedWorld, принимает из IsolatedWorld
+// sub_to_main: отправляет в основной мир, принимает из основного мира
+let (main_to_sub, sub_to_main) = WorldBridge::new();
+```
+
+#### 12.2.4 `send_action` (низкоуровневый)
+
+Отправить произвольное замыкание:
+
+```rust
+bridge_a.send_action(Box::new(|world: &mut World| {
+    world.spawn(());
+}));
 ```
 
 ### 12.3 `CloneableBridge`
 
-Для хранения моста в `Resources` (требуется `Clone`) используйте `CloneableBridge`:
+`CloneableBridge` — клонируемый мост для хранения в `Resources` (требуется `Clone`). Имеет тот же API, что и `WorldBridge`.
 
 ```rust
 use apex_isolated::{CloneableBridge, sync_bridge_cloneable};
 
-let (a, b) = WorldBridge::new();
-let bridge = CloneableBridge::new(a);
+// Создаём каналы вручную — то же что WorldBridge::new():
+let (main_tx, sub_rx) = crossbeam_channel::unbounded();  // main → sub
+let (sub_tx, main_rx) = crossbeam_channel::unbounded();  // sub → main
 
-world.insert_resource(bridge.clone());
+// Мост для основного мира: to_sub = main_tx (отправляет в sub),
+// from_sub = main_rx (принимает из sub)
+let main_bridge = CloneableBridge::new(main_tx, main_rx);
+world.insert_resource(main_bridge);
+
+// Мост для изолированного мира:
+let sub_bridge = CloneableBridge::new(sub_tx, sub_rx);
+
+// Использование — полный аналог WorldBridge:
+main_bridge.send_action_event("action".to_string());       // без сериализации
+main_bridge.register_event::<String>(sub.world_mut());     // регистрация
+main_bridge.send_event(&"serialized".to_string());          // с сериализацией
+main_bridge.apply_incoming(&mut main_world);                // приём
 
 // Система синхронизации — применяет входящие события каждый кадр:
 sched.add_system("sync_bridge", |world: &mut World| {
@@ -1397,59 +1489,50 @@ sched.add_system("sync_bridge", |world: &mut World| {
 });
 ```
 
-### 12.4 Важные ограничения
-
-- `WorldBridge::send_event()` принимает только `Serialize + Send + Sync + 'static` типы (сериализация в `bincode`)
-- `WorldBridge::send_action_event()` принимает любые `Send + Sync + 'static` (без сериализации)
-- `IsolatedWorld` использует собственный `Scheduler` — зависимости между мирами не отслеживаются
-- Канал `WorldBridge` гарантирует FIFO-порядок событий
-
-### 12.5 Полный пример: два мира на двух потоках
+### 12.4 Полный пример: два мира
 
 ```rust
-use apex_isolated::{IsolatedWorld, WorldBridge};
-use std::thread;
-use std::sync::mpsc;
+use apex_isolated::{IsolatedWorld, WorldBridge, CloneableBridge, sync_bridge_cloneable};
+use crossbeam_channel;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
-struct DamageEvent { amount: f32 };
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct ScoreEvent(u32);
 
-// Основной мир
-let mut world = /* ... */;
+let mut world = World::new();
 
-// Создать пару мостов
-let (main_bridge, sub_bridge) = WorldBridge::new();
-world.insert_resource(sub_bridge);  // в изолированном мире
+// 1. Создаём мосты
+let (to_sub, from_sub) = crossbeam_channel::unbounded();   // main → sub
+let (sub_tx, main_rx) = crossbeam_channel::unbounded();    // sub → main
+let main_bridge = CloneableBridge::new(to_sub, main_rx);
+world.insert_resource(main_bridge);
 
-// Изолированный мир
-let mut sub = IsolatedWorld::new();
-sub.world.register_component::<Health>();
-sub.world.insert_resource(main_bridge);
+// 2. Изолированный мир
+let mut iso = IsolatedWorld::new();
+let iso_bridge = CloneableBridge::new(sub_tx, from_sub);
 
-sub.scheduler.add_system("damage", |w: &mut World| {
-    // Применить входящие события
-    if let Some(bridge) = w.try_resource::<WorldBridge>() {
-        bridge.apply_incoming(w);
-    }
-});
-sub.scheduler.compile().unwrap();
+// 3. Регистрируем событие и отправляем
+iso_bridge.register_event::<ScoreEvent>(iso.world_mut());
+iso_bridge.send_event(&ScoreEvent(100));
 
-// Запуск изолированного мира в отдельном потоке
-let handle = thread::spawn(move || {
-    for _ in 0..60 {
-        sub.tick();  // scheduler.run() + world.tick()
-        thread::sleep(std::time::Duration::from_millis(16));
-    }
-});
+// 4. Применяем
+iso_bridge.apply_incoming(iso.world_mut());
+iso.world_mut().tick();
+let events = iso.world_mut().events::<ScoreEvent>();
+assert_eq!(events.len(), 1);
 
-// Отправка события из основного мира
-let bridge = world.resource::<WorldBridge>();
-bridge.send_event(&DamageEvent { amount: 10.0 });
-
-handle.join().unwrap();
+// 5. Или проще — send_action_event (без регистрации):
+iso_bridge.send_action_event(ScoreEvent(200));
+iso_bridge.apply_incoming(iso.world_mut());
 ```
 
-> **Примечание:** Для синхронизации между потоками используется канал `mpsc` внутри `WorldBridge`. `IsolatedWorld` не требует `Sync` — каждый мир работает в своём потоке. Мосты являются `Send`, но не `Sync`.
+### 12.5 Важные ограничения
+
+- `send_event::<T>()` требует `T: Serialize + Send + Sync + 'static`
+- `send_action_event::<T>()` требует только `T: Send + Sync + 'static` (без сериализации)
+- `register_event::<T>()` требует `T: Serialize + DeserializeOwned + Send + Sync + 'static`
+- Без вызова `register_event` сериализованные события отбрасываются (warning в лог)
+- Изолированный мир использует собственный `Scheduler` — зависимости между мирами не отслеживаются
+- Канал `CloneableBridge`/`WorldBridge` гарантирует FIFO-порядок
 
 ---
 
@@ -1959,7 +2042,8 @@ fn main() {
 | `children_of(kind, parent)` | Итерация по дочерним entity |
 | `despawn_recursive(kind, e)` | Удалить entity + потомков |
 | `register_component::<T>()` | Зарегистрировать компонент |
-| `register_component_serde::<T>()` | Зарегистрировать + сериализация |
+| `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
+| `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
 | `entity_count()` | Количество живых entity → `usize` |
 | `is_alive(entity)` | Проверить, жив ли entity → `bool` |
 | `current_tick()` | Текущий тик мира → `Tick` |
@@ -1991,6 +2075,8 @@ fn main() {
 | `query::<Q>()` | CachedQuery по типу Q |
 | `resource::<T>()` | Чтение ресурса (panic если нет) |
 | `resource_mut::<T>()` | Изменение ресурса |
+| `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |
+| `try_resource_mut::<T>()` | Безопасное мутабельное чтение → `Option<ResMut<T>>` |
 | `event_reader::<T>()` | Чтение событий |
 | `event_writer::<T>()` | Запись событий |
 | `entity_count()` | Количество entity |
@@ -2029,7 +2115,7 @@ fn main() {
 | `PrefabLoader::new()` | Создать загрузчик префабов |
 | `PrefabLoader::load_json(json)` | Загрузить префаб из JSON-строки |
 | `PrefabLoader::load_file(path)` | Загрузить префаб из файла |
-| `PrefabLoader::instantiate(world, name)` | Создать entity из префаба |
+| `PrefabLoader::instantiate(world, manifest, overrides, parent, params)` | Создать entity из префаба |
 | `WorldSerializer::entity_to_prefab(world, e)` | Экспорт entity в префаб |
 | `WorldSerializer::hierarchy_to_prefab(world, e)` | Экспорт entity + children в префаб |
 
@@ -2053,11 +2139,17 @@ fn main() {
 | `IsolatedWorld::new()` | Создать изолированный мир |
 | `IsolatedWorld::tick()` | Выполнить один кадр (scheduler.run + world.tick) |
 | `IsolatedWorld::read_resource::<T>()` | Прочитать ресурс → `Option<&T>` |
-| `WorldBridge::new()` | Создать пару мостов (a, b) |
-| `WorldBridge::send_event::<T>(event)` | Отправить сериализуемое событие через мост |
+| `WorldBridge::new()` | Создать пару мостов (main_to_sub, sub_to_main) |
+| `WorldBridge::send_action_event::<T>(event)` | Отправить action-событие (без сериализации) |
+| `WorldBridge::send_event::<T>(event)` | Отправить сериализуемое событие (нужен register_event) |
+| `WorldBridge::send_action(f)` | Отправить произвольное замыкание |
+| `WorldBridge::register_event::<T>(world)` | Зарегистрировать тип для десериализации |
 | `WorldBridge::apply_incoming(world)` | Применить входящие события в мир |
-| `WorldBridge::send_action_event(event)` | Отправить action-событие (несериализуемое) |
-| `CloneableBridge::new(bridge)` | Создать клонируемый мост |
+| `CloneableBridge::new(to_sub, from_sub)` | Создать клонируемый мост из пары каналов |
+| `CloneableBridge::send_action_event::<T>(event)` | Отправить action-событие |
+| `CloneableBridge::send_event::<T>(event)` | Отправить сериализуемое событие |
+| `CloneableBridge::register_event::<T>(world)` | Зарегистрировать тип для десериализации |
+| `CloneableBridge::apply_incoming(world)` | Применить входящие события |
 | `sync_bridge_cloneable(world)` | Система синхронизации CloneableBridge |
 
 ### WorldScriptingExt API (рекомендуемый способ регистрации)
