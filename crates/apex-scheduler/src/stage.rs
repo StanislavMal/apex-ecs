@@ -24,6 +24,18 @@ pub enum StageLabel {
 }
 
 impl StageLabel {
+    /// Создать пользовательский этап по имени (аналог `StageLabel::Custom`).
+    ///
+    /// Это краткий конструктор для группировки систем::
+    /// ```
+    /// # use apex_scheduler::StageLabel;
+    /// let sim = StageLabel::tag("simulation");
+    /// assert_eq!(sim, StageLabel::Custom("simulation".into()));
+    /// ```
+    pub fn tag(name: impl Into<String>) -> Self {
+        StageLabel::Custom(name.into())
+    }
+
     /// Все стандартные этапы в порядке выполнения.
     pub fn standard_order() -> &'static [StageLabel] {
         &[

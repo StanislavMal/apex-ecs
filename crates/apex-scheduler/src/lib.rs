@@ -368,6 +368,13 @@ pub struct Scheduler {
     /// Если None — используется StageLabel::standard_order().
     stage_order: Option<Vec<StageLabel>>,
 
+    /// Этап по умолчанию для `add_system`, `add_auto_system`, `add_par_system`,
+    /// `add_fn_par_system` (без суффикса `_to_stage`).
+    ///
+    /// По умолчанию — `StageLabel::Update`. Меняется через `set_default_stage()`
+    /// или временно подменяется внутри `staged()`.
+    default_stage_label: StageLabel,
+
     /// Реестр имён компонентов TypeId → &'static str.
     /// Заполняется из ComponentRegistry перед compile() в run()/run_sequential().
     /// Используется `component_type_name()` для отображения реальных имён компонентов
@@ -397,18 +404,20 @@ impl Scheduler {
             sub_worlds_dirty: true,
             startup_completed: false,
             stage_order:      None,
+            default_stage_label: StageLabel::Update,
             type_names:       FxHashMap::default(),
         }
     }
 
     // ── Регистрация ────────────────────────────────────────────
 
-    /// Регистрировать Sequential систему (полный &mut World) в указанном этапе.
+    /// Регистрировать Sequential систему (полный &mut World).
+    /// Этап — `default_stage_label` (по умолчанию `Update`).
     pub fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
-        self.add_system_to_stage(name, func, StageLabel::Update)
+        self.add_system_to_stage(name, func, self.default_stage_label.clone())
     }
 
     /// Регистрировать Sequential систему в указанном этапе.
@@ -446,12 +455,13 @@ impl Scheduler {
         self.add_system_to_stage(name, func, StageLabel::Startup)
     }
 
-    /// Регистрировать AutoSystem в этапе Update (по умолчанию).
+    /// Регистрировать AutoSystem.
+    /// Этап — `default_stage_label` (по умолчанию `Update`).
     pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemId
     where
         S: AutoSystem + 'static,
     {
-        self.add_auto_system_to_stage(name, system, StageLabel::Update)
+        self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
     }
 
     /// Регистрировать AutoSystem в указанном этапе.
@@ -491,13 +501,14 @@ impl Scheduler {
         self.add_auto_system_to_stage(name, system, StageLabel::Startup)
     }
 
-    /// Регистрировать ParSystem в этапе Update (по умолчанию).
+    /// Регистрировать ParSystem.
+    /// Этап — `default_stage_label` (по умолчанию `Update`).
     pub fn add_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
         system: S,
     ) -> SystemId {
-        self.add_par_system_to_stage(name, system, StageLabel::Update)
+        self.add_par_system_to_stage(name, system, self.default_stage_label.clone())
     }
 
     /// Регистрировать ParSystem в указанном этапе.
@@ -534,7 +545,8 @@ impl Scheduler {
         self.add_par_system_to_stage(name, system, StageLabel::Startup)
     }
 
-    /// Регистрировать FnParSystem в этапе Update (по умолчанию).
+    /// Регистрировать FnParSystem.
+    /// Этап — `default_stage_label` (по умолчанию `Update`).
     pub fn add_fn_par_system<F>(
         &mut self,
         name:   impl Into<String>,
@@ -544,7 +556,7 @@ impl Scheduler {
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
-        self.add_fn_par_system_to_stage(name, func, access, StageLabel::Update)
+        self.add_fn_par_system_to_stage(name, func, access, self.default_stage_label.clone())
     }
 
     /// Регистрировать FnParSystem в указанном этапе.
@@ -587,6 +599,58 @@ impl Scheduler {
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
         self.add_fn_par_system_to_stage(name, func, access, StageLabel::Startup)
+    }
+
+    /// Установить этап по умолчанию для `add_system`, `add_auto_system`,
+    /// `add_par_system`, `add_fn_par_system`.
+    ///
+    /// Все системы, добавленные без явного `*_to_stage`, попадут в этот этап.
+    /// По умолчанию — `StageLabel::Update`.
+    ///
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// let mut sched = Scheduler::new();
+    /// sched.set_default_stage(StageLabel::tag("update"));
+    /// ```
+    pub fn set_default_stage(&mut self, label: StageLabel) -> &mut Self {
+        self.default_stage_label = label;
+        self
+    }
+
+    /// Зарегистрировать системы в указанном этапе через замыкание.
+    ///
+    /// Внутри замыкания `default_stage_label` временно подменяется на `label`,
+    /// поэтому все `add_*_system` (без `_to_stage`) внутри попадают в этот этап.
+    ///
+    /// После замыкания предыдущий этап восстанавливается.
+    ///
+    /// Удобно для группировки систем плагина:
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # use apex_core::access::AccessDescriptor;
+    /// # use apex_core::world::SystemContext;
+    /// let mut sched = Scheduler::new();
+    ///
+    /// sched.set_default_stage(StageLabel::tag("update"));
+    ///
+    /// sched.staged(StageLabel::tag("input"), |s| {
+    ///     s.add_fn_par_system("read_keys", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    /// });
+    ///
+    /// sched.staged(StageLabel::tag("render"), |s| {
+    ///     s.add_fn_par_system("draw", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    /// });
+    ///
+    /// sched.add_fn_par_system("particles", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    /// ```
+    pub fn staged<F>(&mut self, label: StageLabel, f: F) -> &mut Self
+    where
+        F: FnOnce(&mut Self)
+    {
+        let previous = std::mem::replace(&mut self.default_stage_label, label);
+        f(self);
+        self.default_stage_label = previous;
+        self
     }
 
     /// Добавить явную зависимость: `system` выполняется после `after_id`.

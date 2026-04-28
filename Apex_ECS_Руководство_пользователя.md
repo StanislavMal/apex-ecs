@@ -742,6 +742,87 @@ sched.run_sequential(&mut world);
 sched.run(&mut world);
 ```
 
+#### 6.5.1 Группировка систем по этапам (StageLabel)
+
+Этапы (`StageLabel`) — механизм группировки систем с гарантированным порядком выполнения. В отличие от явных `add_dependency()` между каждой парой систем, этапы задают порядок **групп** одной строкой.
+
+**Краткий конструктор `StageLabel::tag()`:**
+
+```rust
+use apex_scheduler::StageLabel;
+
+// Вместо:
+StageLabel::Custom("physics".to_string());
+
+// Теперь:
+StageLabel::tag("physics");
+```
+
+**Смена этапа по умолчанию (`set_default_stage()`):**
+
+```rust
+sched.set_default_stage(StageLabel::tag("update"));
+sched.add_auto_system("particles", Particles); // → этап "update"
+```
+
+**Скоуп-регистрация (`staged()`):** временно подменяет `default_stage_label` внутри замыкания. Все `add_*_system` (без `_to_stage`) внутри closure попадают в указанный этап:
+
+```rust
+sched.staged(StageLabel::tag("input"), |s| {
+    s.add_auto_system("read_keys", ReadKeys);  // → этап "input"
+    s.add_auto_system("parse", Parse);         // → этап "input"
+});
+
+sched.staged(StageLabel::tag("sim"), |s| {
+    s.add_auto_system("physics", Physics);     // → этап "sim"
+    s.add_auto_system("ai", AI);               // → этап "sim"
+});
+```
+
+**Порядок этапов (`configure_stages()`):**
+
+```rust
+sched.configure_stages(vec![
+    StageLabel::tag("input"),
+    StageLabel::tag("sim"),
+    StageLabel::tag("render"),
+]);
+// input → sim → render → остальные (включая default)
+```
+
+**Пример: два плагина, независимые друг от друга:**
+
+```rust
+// Plugin A — знает только свой этап
+fn plugin_a(sched: &mut Scheduler) {
+    sched.staged(StageLabel::tag("input"), |s| {
+        s.add_auto_system("read_keys", ReadKeys);
+    });
+    sched.staged(StageLabel::tag("render"), |s| {
+        s.add_auto_system("draw", Draw);
+    });
+}
+
+// Plugin B — тоже знает только свой этап
+fn plugin_b(sched: &mut Scheduler) {
+    sched.staged(StageLabel::tag("sim"), |s| {
+        s.add_auto_system("physics", Physics);
+        s.add_auto_system("ai", AI);
+    });
+}
+
+// App — одна строка порядка:
+sched.configure_stages(vec![
+    StageLabel::tag("input"),
+    StageLabel::tag("sim"),
+    StageLabel::tag("render"),
+]);
+
+// Результат: input → sim (physics + ai параллельно) → render
+```
+
+> **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `staged()` временно подменяет `default_stage_label` на время замыкания и восстанавливает предыдущее значение после выхода. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных.
+
 ### 6.6 `SystemContext`
 
 `SystemContext` — read-only view на мир, доступный внутри системы. Предоставляет доступ к Query, ресурсам и событиям.
@@ -1847,7 +1928,7 @@ cargo run --release --features parallel
 
 ```rust
 use apex_core::prelude::*;
-use apex_scheduler::{Scheduler, ParSystem};
+use apex_scheduler::{Scheduler, ParSystem, StageLabel};
 use apex_core::access::AccessDescriptor;
 use serde::{Serialize, Deserialize};
 
@@ -1916,14 +1997,26 @@ fn main() {
     // Планировщик
     let mut sched = Scheduler::new();
 
-    sched.add_auto_system("movement", MovementSystem);
-    sched.add_system("cleanup", |world: &mut World| {
-        let mut cmds = Commands::new();
-        Query::<Read<Health>>::new(world).for_each(|e, hp| {
-            if hp.current <= 0.0 { cmds.despawn(e); }
-        });
-        cmds.apply(world);
+    // Группировка систем по этапам через StageLabel::tag() + staged():
+    sched.staged(StageLabel::tag("sim"), |s| {
+        s.add_auto_system("movement", MovementSystem);
     });
+
+    sched.staged(StageLabel::tag("cleanup"), |s| {
+        s.add_system("cleanup", |world: &mut World| {
+            let mut cmds = Commands::new();
+            Query::<Read<Health>>::new(world).for_each(|e, hp| {
+                if hp.current <= 0.0 { cmds.despawn(e); }
+            });
+            cmds.apply(world);
+        });
+    });
+
+    // sim → cleanup → остальные
+    sched.configure_stages(vec![
+        StageLabel::tag("sim"),
+        StageLabel::tag("cleanup"),
+    ]);
 
     sched.compile().unwrap();
 
@@ -2072,17 +2165,38 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
-| `add_auto_system(name, sys)` | Добавить AutoSystem |
-| `add_par_system(name, sys)` | Добавить ParSystem |
-| `add_fn_par_system(name, f, acc)` | Добавить FnParSystem (closure) |
-| `add_system(name, f)` | Добавить Sequential систему |
+| `add_auto_system(name, sys)` | Добавить AutoSystem в default_stage_label |
+| `add_par_system(name, sys)` | Добавить ParSystem в default_stage_label |
+| `add_fn_par_system(name, f, acc)` | Добавить FnParSystem (closure) в default_stage_label |
+| `add_system(name, f)` | Добавить Sequential систему в default_stage_label |
+| `add_system_to_stage(name, f, label)` | Добавить Sequential систему в указанный этап |
+| `add_auto_system_to_stage(name, sys, label)` | Добавить AutoSystem в указанный этап |
+| `add_par_system_to_stage(name, sys, label)` | Добавить ParSystem в указанный этап |
+| `add_fn_par_system_to_stage(name, f, acc, label)` | Добавить FnParSystem в указанный этап |
+| `add_startup_system(name, f)` | Добавить систему в Startup этап |
 | `add_dependency(a, b)` | `a` выполняется после `b` |
+| `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
+| `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |
+| `configure_stages(order)` | Задать порядок этапов (вместо порядка по приоритету) |
 | `compile()` | Скомпилировать план → `Result` |
 | `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |
 | `debug_plan()` | Краткий план выполнения |
 | `debug_plan_verbose()` | Подробная диагностика плана |
+
+### `StageLabel` API
+
+| Метод | Описание |
+|---|---|
+| `StageLabel::tag("name")` | Краткий конструктор `StageLabel::Custom("name".into())` |
+| `StageLabel::Update` | Этап по умолчанию (основная логика) |
+| `StageLabel::Startup` | Однократный запуск при первом `run()` |
+| `StageLabel::First` | Выполняется до всех остальных |
+| `StageLabel::PreUpdate` | Обработка ввода |
+| `StageLabel::PostUpdate` | Пост-обработка (трансформации, коллизии) |
+| `StageLabel::Last` | Финальная обработка, статистика |
+| `StageLabel::Custom("name")` | Пользовательский этап |
 
 ### SystemContext API (раздел 6.6)
 
