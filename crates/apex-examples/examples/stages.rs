@@ -1,13 +1,17 @@
 //! Apex ECS — Stages & Tags Example
 //!
-//! Демонстрирует группировку систем по этапам (StageLabel::tag)
-//! и скоуп-регистрацию staged().
+//! Демонстрирует группировку систем по этапам (StageLabel::tag),
+//! скоуп-регистрацию staged() и автоматическое переупорядочивание
+//! parallel-систем перед sequential в пределах одного этапа.
 //!
 //! Проблема: два плагина должны гарантировать порядок выполнения,
 //! не зная имён систем друг друга.
 //!
 //! Решение: каждый плагин регистрирует свои системы в своём этапе,
 //! а приложение задаёт порядок этапов одной строкой.
+//!
+//! Дополнительно: sequential-системы можно регистрировать вперемешку
+//! с parallel — планировщик сам выстроит правильный порядок.
 //!
 //! cargo run -p apex-examples --example stages --release --features parallel
 //! cargo test --workspace
@@ -16,8 +20,10 @@
 //!   [Input] read_keyboard  ← Plugin A
 //!   [Sim]   physics        ← Plugin B (параллельно с ai)
 //!   [Sim]   ai             ← Plugin B
+//!   [SimSeq] print_stats   ← Sequential (выполняется после parallel внутри sim)
 //!   [Render] draw          ← Plugin A
 //!   [Update] particles     ← без явного этапа → default "update"
+//!   [UpdateSeq] finalize   ← Sequential (выполняется после particles)
 
 use apex_core::prelude::*;
 use apex_scheduler::{Scheduler, StageLabel};
@@ -60,6 +66,13 @@ fn plugin_a(sched: &mut Scheduler) {
 
 fn plugin_b(sched: &mut Scheduler) {
     sched.staged(StageLabel::tag("sim"), |s| {
+        // sequential-система регистрируется ПЕРЕД parallel
+        // (проверка автоматического переупорядочивания: sequential будет
+        //  вынесена в конец этапа sim после compile)
+        s.add_system("print_stats", |_| {
+            println!("  [SimSeq] print_stats");
+        });
+
         s.add_fn_par_system(
             "physics",
             |_ctx: SystemContext<'_>| {
@@ -95,7 +108,12 @@ fn main() {
     plugin_a(&mut sched);
     plugin_b(&mut sched);
 
-    // Система вне плагинов — попадёт в "update" (default_stage_label)
+    // Sequential-система вне плагинов — попадёт в "update" (default_stage_label)
+    sched.add_system("finalize", |_| {
+        println!("  [UpdateSeq] finalize");
+    });
+
+    // Parallel-система зарегистрирована ПОСЛЕ sequential (та же проверка)
     sched.add_fn_par_system(
         "particles",
         |_ctx: SystemContext<'_>| {

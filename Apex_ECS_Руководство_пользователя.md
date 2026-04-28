@@ -702,21 +702,19 @@ sched.add_system("despawn_dead", |world: &mut World| {
 });
 ```
 
-> **Правило порядка:** Регистрируйте все параллельные системы (`AutoSystem`/`FnParSystem`) **ПЕРЕД** Sequential-системами. Sequential создаёт барьер «все системы до → я → все системы после», поэтому параллельная система после Sequential автоматически получает зависимость от неё — это может создавать циклы через data-конфликты.
+> **Автоматическое переупорядочивание (v0.1.0):** Планировщик сам группирует параллельные системы в более ранних топологических уровнях, а Sequential — в более поздних, независимо от порядка регистрации. Регистрируйте системы в любом порядке — `compile()` выстроит оптимальную группировку. Явные `add_dependency()` по-прежнему работают и имеют приоритет над автоматическим порядком.
 
 ### 6.4 Компиляция и запуск планировщика
 
 ```rust
 let mut sched = Scheduler::new();
 
-// Регистрация — СНАЧАЛА все параллельные, ПОТОМ Sequential:
+// Регистрация — порядок не важен, планировщик сам переупорядочит:
 sched.add_auto_system("physics",      PhysicsSystem);
-sched.add_auto_system("health_clamp", HealthClampSystem);
-sched.add_auto_system("movement",    MovementSystem);
-
-// Sequential ПОСЛЕ:
 let damage_id  = sched.add_system("damage_apply", damage_apply).id();
+sched.add_auto_system("health_clamp", HealthClampSystem);
 let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
+sched.add_auto_system("movement",    MovementSystem);
 let stats_id   = sched.add_system("stats_update", stats_update).id();
 
 // Явные зависимости (опционально):
@@ -1835,7 +1833,7 @@ impl SequentialSystem for ScriptedSystem {
 
 ### 14.4 Планировщик
 
-- Регистрируйте все параллельные системы **ДО** Sequential — это максимизирует размер параллельных Stage
+- **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential при `compile()`. Явные `add_dependency()` имеют приоритет.
 - Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
 - Чем больше параллельных систем (`AutoSystem`/`FnParSystem`) без конфликтов — тем лучше масштабируется на N ядер
 - `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок

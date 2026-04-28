@@ -973,104 +973,56 @@ impl Scheduler {
             }
         }
 
-        // ── 3. Sequential барьеры для новых/изменённых систем ─
-        // Оптимизация O(N²) → O(P) / O(S):
-        // Для sequential систем итерируемся только по par_system_indices (O(P))
-        // Для parallel систем итерируемся только по seq_system_indices (O(S))
+        // ── 3. Sequential барьеры ──
+        // Всегда направляем parallel → sequential, чтобы группировать
+        // параллельные системы в более ранних топологических уровнях,
+        // а последовательные — в более поздних.
+        // Если явная зависимость противоречит (sequential должен быть раньше),
+        // has_path() предотвратит создание цикла.
         for &idx in &systems_to_process {
             let system = &self.systems[idx];
             
             if !system.kind.is_parallel() {
-                // Sequential система: барьеры со всеми parallel системами O(P)
-                // Sequential ↔ Sequential: НЕ добавляем барьер,
-                // чтобы не конфликтовать с explicit dependencies.
+                // Sequential система: барьеры от всех parallel → seq O(P)
                 for &par_idx in &self.par_system_indices {
                     if par_idx == idx { continue; }
-
-                    if par_idx < idx {
-                        // par → sequential (par зарегистрирована раньше)
-                        if let (Some(&from), Some(&to)) =
-                            (self.graph_nodes.get(&self.systems[par_idx].id),
-                             self.graph_nodes.get(&system.id))
+                    if let (Some(&from), Some(&to)) =
+                        (self.graph_nodes.get(&self.systems[par_idx].id),
+                         self.graph_nodes.get(&system.id))
+                    {
+                        if !self.has_edge_between(from, to)
+                            && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                || !has_existing_edges)
                         {
-                            if !self.has_edge_between(from, to)
-                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                    || !has_existing_edges)
-                            {
-                                self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                                self.edge_set.insert((from, to));
-                                self.edge_info.push(GraphEdgeInfo {
-                                    from_id: self.systems[par_idx].id,
-                                    to_id:   system.id,
-                                    kind:    ConflictKind::SequentialBarrier,
-                                });
-                            }
-                        }
-                    } else {
-                        // sequential → par (seq раньше — par позже)
-                        if let (Some(&from), Some(&to)) =
-                            (self.graph_nodes.get(&system.id),
-                             self.graph_nodes.get(&self.systems[par_idx].id))
-                        {
-                            if !self.has_edge_between(from, to)
-                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                    || !has_existing_edges)
-                            {
-                                self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                                self.edge_set.insert((from, to));
-                                self.edge_info.push(GraphEdgeInfo {
-                                    from_id: system.id,
-                                    to_id:   self.systems[par_idx].id,
-                                    kind:    ConflictKind::SequentialBarrier,
-                                });
-                            }
+                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                            self.edge_set.insert((from, to));
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: self.systems[par_idx].id,
+                                to_id:   system.id,
+                                kind:    ConflictKind::SequentialBarrier,
+                            });
                         }
                     }
                 }
             } else {
-                // Параллельная система: барьеры со всеми sequential системами O(S)
-                // (дополнительная страховка на случай, если sequential система
-                // ещё не попала в systems_to_process на этом проходе)
+                // Parallel система: барьеры от неё ко всем sequential O(S)
                 for &seq_idx in &self.seq_system_indices {
                     if seq_idx == idx { continue; }
-
-                    if seq_idx < idx {
-                        // sequential → par (sequential раньше)
-                        if let (Some(&from), Some(&to)) =
-                            (self.graph_nodes.get(&self.systems[seq_idx].id),
-                             self.graph_nodes.get(&system.id))
+                    if let (Some(&from), Some(&to)) =
+                        (self.graph_nodes.get(&system.id),
+                         self.graph_nodes.get(&self.systems[seq_idx].id))
+                    {
+                        if !self.has_edge_between(from, to)
+                            && (has_existing_edges && !self.dependency_graph.has_path(to, from)
+                                || !has_existing_edges)
                         {
-                            if !self.has_edge_between(from, to)
-                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                    || !has_existing_edges)
-                            {
-                                self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                                self.edge_set.insert((from, to));
-                                self.edge_info.push(GraphEdgeInfo {
-                                    from_id: self.systems[seq_idx].id,
-                                    to_id:   system.id,
-                                    kind:    ConflictKind::SequentialBarrier,
-                                });
-                            }
-                        }
-                    } else {
-                        // par → sequential (par раньше — sequential позже)
-                        if let (Some(&from), Some(&to)) =
-                            (self.graph_nodes.get(&system.id),
-                             self.graph_nodes.get(&self.systems[seq_idx].id))
-                        {
-                            if !self.has_edge_between(from, to)
-                                && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                    || !has_existing_edges)
-                            {
-                                self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                                self.edge_set.insert((from, to));
-                                self.edge_info.push(GraphEdgeInfo {
-                                    from_id: system.id,
-                                    to_id:   self.systems[seq_idx].id,
-                                    kind:    ConflictKind::SequentialBarrier,
-                                });
-                            }
+                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
+                            self.edge_set.insert((from, to));
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: system.id,
+                                to_id:   self.systems[seq_idx].id,
+                                kind:    ConflictKind::SequentialBarrier,
+                            });
                         }
                     }
                 }
@@ -2179,8 +2131,10 @@ mod tests {
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 3);
-        assert!(stages.iter().any(|s| !s.all_parallel));
+        // sequential больше не фрагментирует — параллельные группируются до него
+        assert_eq!(stages.len(), 2);
+        assert!(stages[0].all_parallel);
+        assert!(!stages[1].all_parallel);
     }
 
     #[test]
