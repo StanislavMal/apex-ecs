@@ -281,6 +281,8 @@ Query — основной способ итерации по компонент
 | `With<T>` | Только фильтр | Entity должен иметь T |
 | `Without<T>` | Только фильтр | Entity не должен иметь T |
 | `Changed<T>` | Иммутабельный (`&T`) | Только изменённые с тика |
+| `Maybe<T>` | Опциональный (`Option<&T>`) | Чтение, если компонент есть |
+| `MaybeWrite<T>` | Опциональный (`Option<&mut T>`) | Запись, если компонент есть |
 
 ### 4.2 `Query<Q>`
 
@@ -327,10 +329,26 @@ let count = Query::<Read<Health>>::new(&world)
 ```
 
 > **Примечание:** `Query::new()` собирает список подходящих архетипов при создании. Для горячих путей используйте `CachedQuery`, который переиспользует этот список.
->
-> **Оптимизация cache hit (v0.1.0):** `CachedQuery` использует `SmallVec<[ComponentId; 8]>` в качестве ключа кэша. При cache hit (наиболее частый сценарий в горячем цикле) **не происходит heap-аллокации** — ключ хранится на стеке. Реализовано через типаж `Borrow<[ComponentId]>`, позволяющий поиску в `HashMap` идти по заимствованному срезу без создания `Vec`.
-
-### 4.3 `CachedQuery`
+> 
+> **`Maybe<T>`** — опциональный компонент: возвращает `None` если компонент отсутствует, без фильтрации entity:
+> ```rust
+> // Все entity с Position, Health опционально — один проход:
+> Query::<(Read<Position>, Maybe<Health>)>::new(&world)
+>     .for_each(|entity, (pos, hp)| {
+>         match hp {
+>             Some(hp) => println!("HP: {}/{}", hp.current, hp.max),
+>             None     => println!("без Health"),
+>         }
+>     });
+> 
+> // MaybeWrite<T> — опциональная мутация:
+> Query::<(Read<Position>, MaybeWrite<Speed>)>::new(&world)
+>     .for_each(|_, (pos, speed)| {
+>         if let Some(speed) = speed {
+>             speed.0 *= 0.9;  // замедлить, если есть Speed
+>         }
+>     });
+> ```
 
 `CachedQuery` кеширует список архетипов и инвалидируется только при изменении состава архетипов мира.
 
@@ -412,6 +430,8 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:33). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
 
+> **Авторегистрация (v0.1.0):** `world.send_event::<T>()` и `world.try_send_event::<T>()` автоматически регистрируют тип события, если он ещё не был зарегистрирован. Явный вызов `world.add_event::<T>()` больше не требуется для отправки. `EventReader::new()` по-прежнему требует предварительной регистрации через `add_event` или `send_event`.
+
 #### 5.2.1 Базовая отправка и чтение через `EventReader`
 
 Для чтения событий используется [`EventReader<T>`](crates/apex-core/src/system_param.rs:110) с per-reader курсором. `EventReader::new()` безопасно создаёт читателя, автоматически регистрируя его через `add_reader()`.
@@ -423,22 +443,18 @@ struct DamageEvent { target: Entity, amount: f32 }
 #[derive(Clone, Copy)]
 struct DeathEvent { entity: Entity }
 
-// Регистрация типа события:
-world.add_event::<DamageEvent>();
-world.add_event::<DeathEvent>();
+// Регистрация типа события (опционально — send_event регистрирует сам):
+// world.add_event::<DamageEvent>();
+// world.add_event::<DeathEvent>();
 
 // Создание читателя событий (safe — сам вызывает add_reader()):
 let mut reader = EventReader::new(world.events_mut::<DamageEvent>());
 
-// Отправка события (паникует если тип не зарегистрирован):
+// Отправка события (авторегистрация — add_event не нужен):
 world.send_event(DamageEvent { target: enemy, amount: 35.0 });
 
-// Безопасная отправка (возвращает bool, не паникует):
-if world.try_send_event(DamageEvent { target: enemy, amount: 35.0 }) {
-    // событие отправлено
-} else {
-    // тип не зарегистрирован — вызовите world.add_event::<DamageEvent>()
-}
+// Безопасная отправка (всегда успешна — авторегистрация):
+world.try_send_event(DamageEvent { target: enemy, amount: 35.0 });
 
 // Чтение непрочитанных событий через slice (без продвижения курсора):
 for ev in reader.iter() {
@@ -1881,7 +1897,7 @@ fn main() {
     world.register_component_serde::<Health>();
     world.register_component::<Player>();
     world.insert_resource(DeltaTime(0.016));
-    world.add_event::<DeathEvent>();
+    world.add_event::<DeathEvent>();  // опционально — send_event регистрирует сам
 
     // Спавн
     let player = world.spawn((
@@ -2025,9 +2041,9 @@ fn main() {
 | `try_resource_mut::<T>()` | Безопасное мутабельное чтение → `Option<ResMut<T>>` |
 | `has_resource::<T>()` | Проверить наличие ресурса → `bool` |
 | `remove_resource::<T>()` | Удалить ресурс → `Option<T>` |
-| `add_event::<T>()` | Зарегистрировать тип события |
-| `send_event(event)` | Отправить событие (panic если не зарегистрирован) |
-| `try_send_event(event)` | Безопасная отправка события → `bool` |
+| `add_event::<T>()` | Зарегистрировать тип события (опционально — `send_event` регистрирует сам) |
+| `send_event(event)` | Отправить событие (авторегистрация, не паникует) |
+| `try_send_event(event)` | Безопасная отправка события → `bool` (всегда true) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
 | `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
 | `tick()` | Переключить буферы событий, +1 тик |

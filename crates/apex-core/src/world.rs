@@ -296,20 +296,19 @@ impl World {
         self.events.get_mut::<T>()
     }
 
-    #[track_caller]
+    /// Отправить событие.
+    ///
+    /// Если тип события ещё не зарегистрирован — регистрирует автоматически
+    /// (вызов `world.add_event::<T>()` не требуется).
     pub fn send_event<T: Send + Sync + 'static>(&mut self, event: T) {
-        self.events.get_mut::<T>().send(event);
+        self.events.get_or_register_mut::<T>().send(event);
     }
 
-    /// Безопасная версия `send_event` — возвращает `false` если событие
-    /// не зарегистрировано (не вызван `add_event::<T>()`), вместо паники.
+    /// Безопасная версия `send_event` — всегда успешна, так как
+    /// при необходимости автоматически регистрирует тип.
     pub fn try_send_event<T: Send + Sync + 'static>(&mut self, event: T) -> bool {
-        if let Some(queue) = self.events.try_get_mut::<T>() {
-            queue.send(event);
-            true
-        } else {
-            false
-        }
+        self.events.get_or_register_mut::<T>().send(event);
+        true
     }
 
     pub fn event_queue_ptr<T: Send + Sync + 'static>(

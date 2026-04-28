@@ -33,6 +33,9 @@ pub trait WorldQuery: Sized {
     /// Возвращает true для компонентов, которые ДОЛЖНЫ присутствовать.
     /// Для Without<T> возвращает false.
     fn is_positive() -> bool { true }
+    /// Возвращает false, если запрос может работать без всех ComponentId
+    /// (например, Maybe<T> для незарегистрированного компонента).
+    fn requires_all_ids() -> bool { true }
 }
 
 // ── Read<T> ────────────────────────────────────────────────────
@@ -172,6 +175,150 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Without<T> {
     }
 }
 
+// ── Maybe<T> — опциональное чтение (Optional <T>) ──────────────
+
+/// Опциональный компонент — аналог `Option<&T>`.
+///
+/// В отличие от `Read<T>`, не требует обязательного наличия компонента.
+/// Всегда итерирует все entity: если компонент отсутствует — возвращает `None`.
+///
+/// # Пример
+///
+/// ```ignore
+/// Query::<(Read<A>, Maybe<B>)>::new(&world)
+///     .for_each(|entity, (a, b)| {
+///         // a: &A — всегда есть
+///         // b: Option<&B> — может быть None
+///     });
+/// ```
+pub struct Maybe<T: Component>(std::marker::PhantomData<T>);
+
+#[derive(Clone, Copy)]
+pub struct MaybeState {
+    data: *const u8,
+    item_size: usize,
+    present: bool,
+}
+
+unsafe impl Send for MaybeState {}
+unsafe impl Sync for MaybeState {}
+
+impl MaybeState {
+    fn absent() -> Self {
+        MaybeState { data: std::ptr::null(), item_size: 0, present: false }
+    }
+}
+
+impl<T: Component> WorldQuery for Maybe<T> {
+    type Item<'w> = Option<&'w T>;
+    type State    = MaybeState;
+
+    #[inline] fn component_count() -> usize { 1 }
+
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+
+    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool { true }
+
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+        if ids.is_empty() || !arch.has_component(ids[0]) {
+            return MaybeState::absent();
+        }
+        let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
+        let col = &arch.columns[col_idx];
+        MaybeState { data: col.data, item_size: col.item_size, present: true }
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        if state.present {
+            if state.item_size == 0 {
+                // ZST — колонка не аллоцирует память, используем dangling
+                Some(Some(&*(std::ptr::NonNull::<T>::dangling().as_ptr())))
+            } else {
+                Some(Some(&*(state.data.add(row * state.item_size) as *const T)))
+            }
+        } else {
+            Some(None)
+        }
+    }
+
+    fn requires_all_ids() -> bool { false }
+}
+
+impl<T: Component + 'static> WorldQuerySystemAccess for Maybe<T> {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+}
+
+// ── MaybeWrite<T> — опциональная запись (Optional <&mut T>) ────
+
+/// Опциональный мутабельный компонент — аналог `Option<&mut T>`.
+///
+/// Всегда итерирует все entity: если компонент отсутствует — возвращает `None`.
+pub struct MaybeWrite<T: Component>(std::marker::PhantomData<T>);
+
+#[derive(Clone, Copy)]
+pub struct MaybeMutState {
+    data: *mut u8,
+    item_size: usize,
+    present: bool,
+}
+
+unsafe impl Send for MaybeMutState {}
+unsafe impl Sync for MaybeMutState {}
+
+impl MaybeMutState {
+    fn absent() -> Self {
+        MaybeMutState { data: std::ptr::null_mut(), item_size: 0, present: false }
+    }
+}
+
+impl<T: Component> WorldQuery for MaybeWrite<T> {
+    type Item<'w> = Option<&'w mut T>;
+    type State    = MaybeMutState;
+
+    #[inline] fn component_count() -> usize { 1 }
+
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    }
+
+    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool { true }
+
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+        if ids.is_empty() || !arch.has_component(ids[0]) {
+            return MaybeMutState::absent();
+        }
+        let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
+        let col = &arch.columns[col_idx];
+        MaybeMutState { data: col.data as *mut u8, item_size: col.item_size, present: true }
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        if state.present {
+            if state.item_size == 0 {
+                Some(Some(&mut *std::ptr::NonNull::<T>::dangling().as_ptr()))
+            } else {
+                Some(Some(&mut *(state.data.add(row * state.item_size) as *mut T)))
+            }
+        } else {
+            Some(None)
+        }
+    }
+
+    fn requires_all_ids() -> bool { false }
+}
+
+impl<T: Component + 'static> WorldQuerySystemAccess for MaybeWrite<T> {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new().write::<T>()
+    }
+}
+
 // ── Changed<T> ─────────────────────────────────────────────────
 
 pub struct Changed<T: Component>(std::marker::PhantomData<T>);
@@ -247,10 +394,17 @@ macro_rules! impl_world_query_tuple {
                 let mut offset = 0;
                 $(
                     let n = $Q::component_count();
-                    if !$Q::matches_archetype(arch, &ids[offset..offset + n]) { return false; }
+                    let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                    if !$Q::matches_archetype(arch, slice) { return false; }
                     #[allow(unused_assignments)] { offset += n; }
                 )+
                 true
+            }
+
+            fn requires_all_ids() -> bool {
+                let mut all = true;
+                $( all = all && $Q::requires_all_ids(); )+
+                all
             }
 
             unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
@@ -258,7 +412,8 @@ macro_rules! impl_world_query_tuple {
                 ($(
                     {
                         let n = $Q::component_count();
-                        let s = $Q::fetch_state(arch, &ids[offset..offset + n], last_run);
+                        let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                        let s = $Q::fetch_state(arch, slice, last_run);
                         #[allow(unused_assignments)] { offset += n; }
                         s
                     },
@@ -267,7 +422,11 @@ macro_rules! impl_world_query_tuple {
 
             #[inline(always)]
             unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
-                Some(( $( $Q::fetch_item(state.$idx, row)?, )+ ))
+                Some(( $( {
+                    let item = $Q::fetch_item(state.$idx, row);
+                    if item.is_none() { return None; }
+                    item.unwrap_unchecked()
+                }, )+ ))
             }
         }
 
@@ -342,7 +501,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
 
-        let archetypes = if ids.len() == Q::component_count() {
+        let archetypes = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
             // Линейный обход архетипов — быстрее для малых запросов (≤3 компонента)
             // и малых миров (≤128 архетипов). ComponentArchIndex даёт выигрыш только
             // для больших миров (500+ архетипов) и запросов с 4+ компонентами.
@@ -668,5 +827,94 @@ mod tests {
         let query: Query<'_, Without<A>> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
         assert_eq!(results, vec![e2], "Without<A> должен вернуть сущности без A");
+    }
+
+    #[test]
+    fn maybe_optional_component_simple() {
+        let mut world = World::new();
+        // Все entity имеют и A и B — один архетип
+        world.spawn((A, B));
+        world.spawn((A, B));
+
+        let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let count = query.iter().count();
+        assert_eq!(count, 2, "Должно быть 2 entity с A");
+    }
+
+    #[test]
+    fn maybe_optional_component_mixed_archetypes() {
+        let mut world = World::new();
+        // Два архетипа: [A,B] и [A]
+        world.spawn((A, B));
+        world.spawn((A,));
+        world.spawn((B,));
+
+        let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter()
+            .map(|(_, (_, b))| b.is_some())
+            .collect();
+
+        assert_eq!(results.len(), 2, "Должно быть 2 сущности с A");
+        // e1 имеет A+B → b.is_some() == true
+        // e2 имеет A → b.is_some() == false
+        assert!(results[0] != results[1], "Одна должна иметь B, другая нет");
+    }
+
+    #[test]
+    fn maybe_write_optional_mut() {
+        let mut world = World::new();
+
+        world.spawn((A, B));
+        world.spawn((A,));
+
+        // Опциональная запись: у кого есть B — удваиваем
+        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter()
+            .map(|(_, (_, b_opt))| b_opt.is_some())
+            .collect();
+
+        assert_eq!(results.len(), 2);
+        let has_b_count = results.iter().filter(|b| **b).count();
+        assert_eq!(has_b_count, 1, "Только одна сущность имеет B");
+    }
+
+    #[test]
+    fn maybe_with_unregistered_component() {
+        let mut world = World::new();
+        // Регистрируем только A — B не используется
+        world.spawn((A,));
+
+        // Query<Maybe<B>> — B никогда не регистрировался
+        let query: Query<'_, Maybe<B>> = Query::new(&world);
+        // Должен вернуть entity, но B будет None
+        let results: Vec<_> = query.iter().collect();
+        assert_eq!(results.len(), 1, "Должна вернуться entity без B");
+        assert!(results[0].1.is_none(), "B должен быть None");
+    }
+
+    #[test]
+    fn maybe_tuple_integration() {
+        let mut world = World::new();
+
+        #[derive(Debug, PartialEq)]
+        struct C(u32);
+        #[derive(Debug, PartialEq)]
+        struct D(u32);
+
+        let e1 = world.spawn((A, C(1)));
+        let _e2 = world.spawn((B, D(2)));
+
+        // (Maybe<A>, Maybe<C>) — все entity
+        let query: Query<'_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
+        let results: Vec<_> = query.iter()
+            .map(|(_, (a, c))| (a.is_some(), c.is_some()))
+            .collect();
+
+        // Должно быть 2 entity
+        assert_eq!(results.len(), 2);
+        // e1: A=Some, C=Some
+        assert!(results[0].0 && results[0].1);
+        // e2: A=None, C=None
+        assert!(!results[1].0 && !results[1].1);
     }
 }

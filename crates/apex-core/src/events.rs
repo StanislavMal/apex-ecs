@@ -572,6 +572,16 @@ impl EventRegistry {
         }
     }
 
+    /// Получить мутабельный доступ к очереди, автоматически регистрируя
+    /// тип события, если он ещё не зарегистрирован.
+    /// O(1) через raw_ptrs — без vtable вызовов.
+    pub fn get_or_register_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
+        if !self.raw_ptrs.contains_key(&TypeId::of::<T>()) {
+            self.register::<T>();
+        }
+        unsafe { &mut *(self.raw_ptrs[&TypeId::of::<T>()].0 as *mut Events<T>) }
+    }
+
     /// Raw pointer для EventWriter (zero-cost, без vtable).
     ///
     /// # Safety
@@ -789,5 +799,31 @@ mod tests {
         queue.update();
         assert_eq!(queue.iter(&reader).len(), 1);
         assert_eq!(queue.iter(&reader)[0], 2);
+    }
+
+    #[test]
+    fn event_auto_register_via_send() {
+        use crate::world::World;
+
+        let mut world = World::new();
+        // Не вызываем add_event::<String>()
+        world.send_event("auto-registered".to_string());
+        // send_event не должен паниковать — тип регистрируется автоматически
+
+        world.tick();
+        let queue = world.events::<String>();
+        assert_eq!(queue.len_readable(), 1, "Событие должно быть доступно после tick()");
+    }
+
+    #[test]
+    fn event_auto_register_via_try_send() {
+        use crate::world::World;
+
+        let mut world = World::new();
+        // try_send_event всегда успешен — авторегистрация
+        assert!(world.try_send_event(42u32), "try_send_event должен вернуть true");
+        world.tick();
+        let queue = world.events::<u32>();
+        assert_eq!(queue.len_readable(), 1);
     }
 }

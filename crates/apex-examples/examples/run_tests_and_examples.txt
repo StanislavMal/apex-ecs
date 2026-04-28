@@ -10,6 +10,8 @@ cargo run --example serialization_hot_reload --release
 
 cargo run -p apex-examples --example transform_example
 
+cargo run --example maybe_and_events
+
 cargo run -p apex-examples --example basic --release --features parallel
 
 cargo run -p apex-examples --example perf --release --features parallel
