@@ -18,7 +18,7 @@
 //! - После тика основной мир печатает состояние
 
 use apex_core::prelude::*;
-use apex_isolated::{CloneableBridge, IsolatedWorld, BridgeEvent, sync_bridge_cloneable};
+use apex_isolated::{CloneableBridge, IsolatedWorld, sync_bridge_cloneable};
 use apex_serialization::prefab::PrefabLoader;
 use apex_serialization::WorldSerializer;
 
@@ -102,12 +102,13 @@ fn main() {
 
     let mut world = World::new();
 
-    // Регистрируем сериализуемые компоненты (для префабов)
-    world.register_component_serde::<Position>();
-    world.register_component_serde::<Health>();
-    world.register_component_serde::<Damage>();
-    world.register_component_serde::<Enemy>();
-    world.register_component_serde::<Player>();
+    // Регистрируем сериализуемые компоненты (для префабов).
+    // Префабы используют JSON-формат, поэтому register_component_serde_json.
+    world.register_component_serde_json::<Position>();
+    world.register_component_serde_json::<Health>();
+    world.register_component_serde_json::<Damage>();
+    world.register_component_serde_json::<Enemy>();
+    world.register_component_serde_json::<Player>();
 
     // Регистрируем событие для коммуникации между мирами
     world.add_event::<String>();
@@ -193,17 +194,20 @@ fn main() {
     }
 
     // ── 6. IsolatedWorld + CloneableBridge ─────────────────────────
+    //     Демонстрируются: send_action_event, register_event + send_event,
+    //     ctx.try_resource
 
     println!("\n--- IsolatedWorld: AI-симуляция ---");
 
-    // Создаём каналы для двусторонней связи между мирами
-    //   main_tx → sub_rx  (основной мир отправляет в IsolatedWorld)
-    //   sub_tx  → main_rx (IsolatedWorld отправляет в основной мир)
-    let (main_tx, _sub_rx) = crossbeam_channel::unbounded();
-    let (sub_tx,  main_rx) = crossbeam_channel::unbounded();
+    // Два независимых канала: main → sub и sub → main
+    let (main_to_sub, sub_recv) = crossbeam_channel::unbounded(); // main  → sub
+    let (sub_to_main, main_recv) = crossbeam_channel::unbounded(); // sub → main
 
-    // CloneableBridge для основного мира: может принимать из IsolatedWorld
-    let main_bridge = CloneableBridge::new(sub_tx, main_rx);
+    // Мост для основного мира (хранится в Resources):
+    //   - to_sub    = main_to_sub  → отправляет в IsolatedWorld
+    //   - from_sub  = main_recv    ← принимает из IsolatedWorld
+    //   (исправлено: раньше каналы были перепутаны)
+    let main_bridge = CloneableBridge::new(main_to_sub, main_recv);
     world.resources.insert(main_bridge);
 
     // Создаём изолированный мир
@@ -233,30 +237,58 @@ fn main() {
         iso.world_mut().entity_count()
     );
 
+    // ── 6a. register_event + send_event (main → sub) ──────────────
+    // send_event сериализует событие через bincode. На принимающей
+    // стороне нужен register_event, который регистрирует тип в EventQueue
+    // мира и сохраняет bincode-десериализатор в мосте.
+    {
+        println!("\n  --- send_event: сериализованное событие main → sub ---");
+        // Достаём мост из ресурсов
+        let bridge = world.resources.try_get::<CloneableBridge>().unwrap();
+        // Регистрируем тип String в IsolatedWorld
+        bridge.register_event::<String>(iso.world_mut());
+        // Отправляем сериализованное событие
+        bridge.send_event(&"Hello via bincode from main world!".to_string());
+        println!("  ✓ register_event + send_event: событие отправлено в IsolatedWorld");
+    }
+
+    // ── 6b. send_action_event (main → sub) ─────────────────────────
+    // send_action_event не требует сериализации и register_event.
+    // Это просто замыкание, которое вызовет world.send_event() на той стороне.
+    {
+        println!("\n  --- send_action_event: действие main → sub ---");
+        let bridge = world.resources.try_get::<CloneableBridge>().unwrap();
+        bridge.send_action_event("Action event from main!".to_string());
+        println!("  ✓ send_action_event отправлено в IsolatedWorld");
+    }
+
+    // ── 6c. AI-система с send_action_event и try_resource ─────────
+
     // Флаг для проверки, что AI-система выполнилась
     let ai_ran = Arc::new(AtomicBool::new(false));
     let ai_flag = ai_ran.clone();
 
-    // Sender для отправки событий из AI-системы в основной мир
-    let tx_to_main = main_tx.clone();
+    // CloneableBridge для IsolatedWorld: отправляет события в основной мир
+    let iso_bridge = CloneableBridge::new(sub_to_main, sub_recv);
 
     // Добавляем AI-систему в IsolatedWorld
-    // Система уменьшает HP всех врагов и отправляет событие в основной мир
     iso.scheduler_mut().add_fn_par_system(
         "ai_damage",
-        move |_ctx: SystemContext<'_>| {
+        move |ctx: SystemContext<'_>| {
             ai_flag.store(true, Ordering::SeqCst);
 
-            // Отправляем событие в основной мир через канал
-            let _ = tx_to_main.send(BridgeEvent::Action(Box::new(|world: &mut World| {
-                world.send_event("AI: enemy took damage!".to_string());
-            })));
+            // ── ctx.try_resource — безопасный доступ к ресурсу ──
+            // В IsolatedWorld нет ресурса String, поэтому вернётся None
+            if let Some(msg) = ctx.try_resource::<String>() {
+                println!("  [AI] Resource found: {}", *msg);
+            } else {
+                // Этот else выполнится — ресурс не вставлен
+            }
 
-            // Читаем Query для Enemy + Health
-            // Примечание: в add_fn_par_system доступ к компонентам
-            // должен быть указан в AccessDescriptor (см. ниже)
+            // ── send_action_event — отправка действия в основной мир ──
+            // В отличие от send_event, не требует сериализации и регистрации
+            iso_bridge.send_action_event("AI: enemy took damage!".to_string());
         },
-        // Доступ: Write<Health> (система изменяет Health)
         AccessDescriptor::new().write::<Health>(),
     );
 
@@ -280,10 +312,10 @@ fn main() {
 
     println!("\n--- CloneableBridge: приём событий из IsolatedWorld ---");
 
-    // Применяем входящие сообщения через sync_bridge_cloneable
+    // sync_bridge_cloneable применяет все накопленные сообщения
     sync_bridge_cloneable(&mut world);
 
-    // Обновляем события (world.tick() продвигает очереди событий)
+    // world.tick() продвигает очереди событий
     world.tick();
 
     // ── 8. Hierarchy export ─────────────────────────────────────────

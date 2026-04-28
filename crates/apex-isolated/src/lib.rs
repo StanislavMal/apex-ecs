@@ -7,6 +7,9 @@
 //! - [`BridgeEvent`] — события, передаваемые через WorldBridge
 //! - [`sync_bridge_cloneable`] — система синхронизации для Scheduler'а
 
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
 use apex_core::World;
 use apex_scheduler::Scheduler;
 
@@ -40,11 +43,15 @@ pub enum BridgeEvent {
 /// // to_sub   — отправляет в IsolatedWorld
 /// // from_sub — получает из IsolatedWorld
 /// ```
+type EventHandler = Box<dyn Fn(&[u8], &mut World) + Send + Sync>;
+
 pub struct WorldBridge {
     /// События из основного мира в IsolatedWorld.
     inbound:  crossbeam_channel::Sender<BridgeEvent>,
     /// События из IsolatedWorld в основной мир.
     outbound: crossbeam_channel::Receiver<BridgeEvent>,
+    /// Реестр десериализаторов: type_name → (data, world).
+    event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
 }
 
 impl WorldBridge {
@@ -57,17 +64,46 @@ impl WorldBridge {
         let (main_tx, sub_rx) = crossbeam_channel::unbounded();
         let (sub_tx, main_rx) = crossbeam_channel::unbounded();
 
+        let handlers = Arc::new(RwLock::new(HashMap::new()));
+
         let main_to_sub = Self {
             inbound:  main_tx,
             outbound: main_rx,
+            event_handlers: Arc::clone(&handlers),
         };
 
         let sub_to_main = Self {
             inbound:  sub_tx,
             outbound: sub_rx,
+            event_handlers: handlers,
         };
 
         (main_to_sub, sub_to_main)
+    }
+
+    /// Зарегистрировать тип события для десериализации на принимающей стороне.
+    ///
+    /// Вызывает `world.add_event::<T>()` и сохраняет десериализатор
+    /// в общий реестр моста.
+    pub fn register_event<T>(&self, world: &mut World)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        world.add_event::<T>();
+        let type_name = std::any::type_name::<T>().to_string();
+        self.event_handlers.write().unwrap().insert(
+            type_name,
+            Box::new(|data: &[u8], world: &mut World| {
+                if let Ok(event) = bincode::deserialize::<T>(data) {
+                    world.send_event(event);
+                } else {
+                    log::warn!(
+                        "WorldBridge: failed to deserialize Event `{}`",
+                        std::any::type_name::<T>()
+                    );
+                }
+            }),
+        );
     }
 
     /// Отправить действие в целевой мир.
@@ -78,6 +114,7 @@ impl WorldBridge {
     /// Отправить типизированное событие в целевой мир.
     ///
     /// Событие сериализуется с помощью `bincode` перед отправкой.
+    /// На принимающей стороне должен быть вызван [`register_event::<T>`](Self::register_event).
     pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
         let type_name = std::any::type_name::<T>().to_string();
         let data = match bincode::serialize(event) {
@@ -93,7 +130,8 @@ impl WorldBridge {
     ///
     /// Вычитывает все сообщения из `outbound` канала и применяет их:
     /// - `Action(f)` — вызывает `f(world)`
-    /// - `Event { type_name, data }` — логирует (требуется реестр типов)
+    /// - `Event { type_name, data }` — десериализует через зарегистрированный
+    ///   обработчик и вызывает `world.send_event()`
     pub fn apply_incoming(&self, world: &mut World) {
         while let Ok(event) = self.outbound.try_recv() {
             match event {
@@ -101,10 +139,15 @@ impl WorldBridge {
                     f(world);
                 }
                 BridgeEvent::Event { type_name, data } => {
-                    log::warn!(
-                        "WorldBridge: received serialized Event `{type_name}`, use Action instead"
-                    );
-                    let _ = data;
+                    let handlers = self.event_handlers.read().unwrap();
+                    if let Some(handler) = handlers.get(&type_name) {
+                        handler(&data, world);
+                    } else {
+                        log::warn!(
+                            "WorldBridge: received serialized Event `{type_name}` — \
+                             no handler registered. Call bridge.register_event::<{type_name}>() first."
+                        );
+                    }
                 }
             }
         }
@@ -113,6 +156,8 @@ impl WorldBridge {
     /// Отправить событие как `Action`.
     ///
     /// Позволяет отправить замыкание, которое вызовет `world.send_event(event)`.
+    /// В отличие от [`send_event`](Self::send_event), не требует сериализации и
+    /// работает без реестра на принимающей стороне.
     pub fn send_action_event<T: Send + Sync + 'static>(&self, event: T) {
         self.send_action(Box::new(move |world: &mut World| {
             world.send_event(event);
@@ -207,6 +252,8 @@ pub struct CloneableBridge {
     to_sub:   crossbeam_channel::Sender<BridgeEvent>,
     /// Receiver для получения событий из IsolatedWorld.
     from_sub: crossbeam_channel::Receiver<BridgeEvent>,
+    /// Реестр десериализаторов.
+    event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
 }
 
 impl CloneableBridge {
@@ -215,12 +262,62 @@ impl CloneableBridge {
         to_sub: crossbeam_channel::Sender<BridgeEvent>,
         from_sub: crossbeam_channel::Receiver<BridgeEvent>,
     ) -> Self {
-        Self { to_sub, from_sub }
+        Self {
+            to_sub,
+            from_sub,
+            event_handlers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Зарегистрировать тип события для десериализации на принимающей стороне.
+    ///
+    /// Вызывает `world.add_event::<T>()` и сохраняет десериализатор.
+    pub fn register_event<T>(&self, world: &mut World)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        world.add_event::<T>();
+        let type_name = std::any::type_name::<T>().to_string();
+        self.event_handlers.write().unwrap().insert(
+            type_name,
+            Box::new(|data: &[u8], world: &mut World| {
+                if let Ok(event) = bincode::deserialize::<T>(data) {
+                    world.send_event(event);
+                } else {
+                    log::warn!(
+                        "CloneableBridge: failed to deserialize Event `{}`",
+                        std::any::type_name::<T>()
+                    );
+                }
+            }),
+        );
     }
 
     /// Отправить действие в IsolatedWorld.
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
         let _ = self.to_sub.send(BridgeEvent::Action(f));
+    }
+
+    /// Отправить типизированное событие в целевой мир (сериализуется через bincode).
+    ///
+    /// На принимающей стороне должен быть вызван [`register_event::<T>`](Self::register_event).
+    pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
+        let type_name = std::any::type_name::<T>().to_string();
+        let data = match bincode::serialize(event) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let _ = self.to_sub.send(BridgeEvent::Event { type_name, data });
+    }
+
+    /// Отправить событие как `Action`.
+    ///
+    /// В отличие от [`send_event`](Self::send_event) не требует сериализации
+    /// и регистрации на принимающей стороне.
+    pub fn send_action_event<T: Send + Sync + 'static>(&self, event: T) {
+        self.send_action(Box::new(move |world: &mut World| {
+            world.send_event(event);
+        }));
     }
 
     /// Применить все накопленные сообщения ИЗ IsolatedWorld.
@@ -231,10 +328,15 @@ impl CloneableBridge {
                     f(world);
                 }
                 BridgeEvent::Event { type_name, data } => {
-                    log::warn!(
-                        "CloneableBridge: received serialized Event `{type_name}`, use Action instead"
-                    );
-                    let _ = data;
+                    let handlers = self.event_handlers.read().unwrap();
+                    if let Some(handler) = handlers.get(&type_name) {
+                        handler(&data, world);
+                    } else {
+                        log::warn!(
+                            "CloneableBridge: received serialized Event `{type_name}` — \
+                             no handler registered."
+                        );
+                    }
                 }
             }
         }
@@ -404,6 +506,31 @@ mod tests {
         bridge_b.apply_incoming(&mut world);
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+    struct ScoreEvent(u32);
+
+    #[test]
+    fn world_bridge_send_event_round_trip() {
+        let (bridge_a, bridge_b) = WorldBridge::new();
+        let mut world = World::new();
+
+        bridge_b.register_event::<ScoreEvent>(&mut world);
+        bridge_a.send_event(&ScoreEvent(42));
+        bridge_b.apply_incoming(&mut world);
+
+        assert_eq!(world.events::<ScoreEvent>().len(), 1, "event should be in pending buffer");
+    }
+
+    #[test]
+    fn world_bridge_send_event_missing_handler() {
+        let (bridge_a, bridge_b) = WorldBridge::new();
+        let mut world = World::new();
+
+        bridge_a.send_event(&ScoreEvent(99));
+        // No crash, just a log warning
+        bridge_b.apply_incoming(&mut world);
     }
 
     // -----------------------------------------------------------------------

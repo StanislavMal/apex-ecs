@@ -1081,6 +1081,21 @@ impl<'w> SystemContext<'w> {
     }
 
     #[inline]
+    pub fn try_resource<T: Send + Sync + 'static>(&self) -> Option<Res<'_, T>> {
+        self.world().try_resource::<T>().map(Res)
+    }
+
+    #[inline]
+    pub fn try_resource_mut<T: Send + Sync + 'static>(&self) -> Option<ResMut<'_, T>> {
+        unsafe {
+            self.world()
+                .resources
+                .get_raw_ptr::<T>()
+                .map(|ptr| ResMut::from_ptr(ptr))
+        }
+    }
+
+    #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
             let ptr = self.world()
@@ -1501,6 +1516,51 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct Score(u32);
+
+    #[test]
+    fn system_context_try_resource_some() {
+        let mut world = World::new();
+        world.insert_resource(Score(42));
+        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        let ctx = SystemContext::from_sub_world(&sw);
+
+        let res = ctx.try_resource::<Score>();
+        assert!(res.is_some());
+        assert_eq!(*res.unwrap(), Score(42));
+    }
+
+    #[test]
+    fn system_context_try_resource_none() {
+        let world = World::new();
+        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        let ctx = SystemContext::from_sub_world(&sw);
+
+        assert!(ctx.try_resource::<Score>().is_none());
+    }
+
+    #[test]
+    fn system_context_try_resource_mut_some() {
+        let mut world = World::new();
+        world.insert_resource(Score(10));
+        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        let ctx = SystemContext::from_sub_world(&sw);
+
+        let res_mut = ctx.try_resource_mut::<Score>();
+        assert!(res_mut.is_some());
+        assert_eq!(*res_mut.unwrap(), Score(10));
+    }
+
+    #[test]
+    fn system_context_try_resource_mut_none() {
+        let world = World::new();
+        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        let ctx = SystemContext::from_sub_world(&sw);
+
+        assert!(ctx.try_resource_mut::<Score>().is_none());
+    }
 
     #[test]
     fn adaptive_chunk_size_small_world() {
