@@ -326,7 +326,18 @@ impl World {
     /// Для единичного компонента — `spawn((MyComponent,))`.
     /// Для нескольких — `spawn((A, B, C))`.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
-        let ids          = bundle.component_ids(&mut self.registry);
+        let ids = bundle.component_ids(&mut self.registry);
+        if ids.is_empty() {
+            // Быстрый путь для пустой entity (spawn(()))
+            let entity = self.entities.allocate();
+            let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
+            self.entities.set_location(entity, EntityLocation {
+                archetype_id: ArchetypeId::EMPTY,
+                row,
+            });
+            return entity;
+        }
+        // Обычный путь
         let archetype_id = self.get_or_create_archetype(&ids);
         let entity       = self.entities.allocate();
         let row          = self.archetypes[archetype_id.0 as usize].entities.len();
@@ -1157,10 +1168,10 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
             let state    = unsafe { Q::fetch_state(arch, ids, self.last_run) };
-            let entities = &arch.entities;
-            for row in 0..arch.len() {
+            let entities = &arch.entities[..arch.len()];
+            for (row, &entity) in entities.iter().enumerate() {
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(entities[row], item);
+                    f(entity, item);
                 }
             }
         }
@@ -1194,10 +1205,10 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch     = &world.archetypes[arch_idx];
             let state    = unsafe { Q::fetch_state(arch, ids, last_run) };
-            let entities = &arch.entities;
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(entities[row], item);
+            let entities = &arch.entities[start..end];
+            for (row, &entity) in entities.iter().enumerate() {
+                if let Some(item) = unsafe { Q::fetch_item(state, start + row) } {
+                    f(entity, item);
                 }
             }
         });

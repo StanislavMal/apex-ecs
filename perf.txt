@@ -4,24 +4,24 @@ Mode:  PARALLEL (rayon threads: 12)
 PAR_CHUNK_SIZE: auto (DEFAULT_MAX_CHUNK_SIZE=16384) (задай APEX_PAR_CHUNK_SIZE для переопределения)
 
 ── Batch Entity Allocator (100k entities) ──────────────────────────────────────
-  spawn_bundle loop      (100k) [baseline]                                      68.82 ns/op     14.53 M ops/s
-  spawn_many             (100k) [batch+collect]                                 25.83 ns/op     38.71 M ops/s
-  spawn_many_silent      (100k) [batch, no collect]                             26.00 ns/op     38.47 M ops/s
-  spawn_many_silent 1comp (100k)                                                16.62 ns/op     60.16 M ops/s
-  spawn_many_silent 4comp (100k)                                                32.24 ns/op     31.01 M ops/s
-  EntityAllocator::allocate_batch (100k) [ZST only]                             12.73 ns/op     78.52 M ops/s
+  spawn loop      (100k) [baseline]                                             71.25 ns/op     14.03 M ops/s
+  spawn_many             (100k) [batch+collect]                                 28.10 ns/op     35.59 M ops/s
+  spawn_many_silent      (100k) [batch, no collect]                             25.21 ns/op     39.67 M ops/s
+  spawn_many_silent 1comp (100k)                                                15.69 ns/op     63.72 M ops/s
+  spawn_many_silent 4comp (100k)                                                32.22 ns/op     31.04 M ops/s
+  EntityAllocator::allocate_batch (100k) [ZST only]                             11.48 ns/op     87.12 M ops/s
 
 ── has_relation (100000 checks, SubjectIndex) ──────────────────────────────────
-  has_relation TRUE  (100000)                                                  342.56 ns/op      2.92 M ops/s
-  has_relation FALSE (100000, wrong parent, early-exit)                        347.70 ns/op      2.88 M ops/s
+  has_relation TRUE  (100000)                                                  355.14 ns/op      2.82 M ops/s
+  has_relation FALSE (100000, wrong parent, early-exit)                        340.01 ns/op      2.94 M ops/s
 
 ── Scheduler throughput (100k entities) — только run() ──────────────────────────
   setup=World, compile вне измерения, f=только sched.run()
-  1 ParSystem: movement      (100k)                                              6.78 ns/op    147.58 M ops/s
-  2 ParSystem no-conflict    (100k, 1 Stage)                                     8.01 ns/op    124.81 M ops/s
-  FnParSystem + resource     (100k)                                              6.99 ns/op    143.04 M ops/s
-  1 Sequential system        (100k)                                              6.95 ns/op    143.88 M ops/s
-  1 AutoSystem               (100k)                                              7.58 ns/op    132.01 M ops/s
+  1 ParSystem: movement      (100k)                                              7.27 ns/op    137.55 M ops/s
+  2 ParSystem no-conflict    (100k, 1 Stage)                                     8.98 ns/op    111.38 M ops/s
+  FnParSystem + resource     (100k)                                              6.72 ns/op    148.74 M ops/s
+  1 Sequential system        (100k)                                              6.81 ns/op    146.82 M ops/s
+  1 AutoSystem               (100k)                                              7.16 ns/op    139.70 M ops/s
   Mixed pipeline plan:
 Stage 0 [PARALLEL] (Update) :
   - physics [par | R:1 W:1]
@@ -36,96 +36,96 @@ Stage 2 [parallel/single] (Update) :
   --- A. Фиксированный N ---
   compile()  1 par (no conflicts)                                             2200.00 ns/op      0.45 M ops/s
   compile()  5 par (no conflicts)                                             5600.00 ns/op      0.18 M ops/s
-  compile() 10 par (no conflicts)                                             7700.00 ns/op      0.13 M ops/s
-  compile() 20 par (no conflicts)                                            19400.00 ns/op      0.05 M ops/s
-  compile() 50 par (no conflicts)                                           118900.00 ns/op      0.01 M ops/s
+  compile() 10 par (no conflicts)                                            10300.00 ns/op      0.10 M ops/s
+  compile() 20 par (no conflicts)                                            19600.00 ns/op      0.05 M ops/s
+  compile() 50 par (no conflicts)                                           379500.00 ns/op      0.00 M ops/s
 
-  compile()  2 par (all Write<Pos>, max conflicts)                            1700.00 ns/op      0.59 M ops/s
-  compile()  5 par (all Write<Pos>, max conflicts)                            4300.00 ns/op      0.23 M ops/s
-  compile() 10 par (all Write<Pos>, max conflicts)                            9200.00 ns/op      0.11 M ops/s
-  compile() 20 par (all Write<Pos>, max conflicts)                           24500.00 ns/op      0.04 M ops/s
+  compile()  2 par (all Write<Pos>, max conflicts)                            2800.00 ns/op      0.36 M ops/s
+  compile()  5 par (all Write<Pos>, max conflicts)                            5800.00 ns/op      0.17 M ops/s
+  compile() 10 par (all Write<Pos>, max conflicts)                            8800.00 ns/op      0.11 M ops/s
+  compile() 20 par (all Write<Pos>, max conflicts)                           40900.00 ns/op      0.02 M ops/s
 
-  compile() 10 sys: 5 par + 5 seq                                             8000.00 ns/op      0.12 M ops/s
+  compile() 10 sys: 5 par + 5 seq                                            29800.00 ns/op      0.03 M ops/s
 
   --- B. Инкрементальный ---
   Суммарно: compile(1)+compile(2)+...+compile(N), новый Scheduler per прогон
-  инкрементальный  1 sys (1 compile())                                        1200.00 ns/op      0.83 M ops/s
-  инкрементальный  5 sys (5 compile())                                        5000.00 ns/op      0.20 M ops/s
-  инкрементальный 10 sys (10 compile())                                      11300.00 ns/op      0.09 M ops/s
-  инкрементальный 20 sys (20 compile())                                      26200.00 ns/op      0.04 M ops/s
+  инкрементальный  1 sys (1 compile())                                        1600.00 ns/op      0.62 M ops/s
+  инкрементальный  5 sys (5 compile())                                        4500.00 ns/op      0.22 M ops/s
+  инкрементальный 10 sys (10 compile())                                      10800.00 ns/op      0.09 M ops/s
+  инкрементальный 20 sys (20 compile())                                     130400.00 ns/op      0.01 M ops/s
 
   --- C. batch vs инкрементальный ---
   Теория O(N²): инкрем. должен быть ~3.85x дороже для N=10
-  batch:          1 compile() для 10 sys                                      9200.00 ns/op      0.11 M ops/s
-  инкрементальный: 10 compile() для 10 sys                                   11200.00 ns/op      0.09 M ops/s
+  batch:          1 compile() для 10 sys                                      8300.00 ns/op      0.12 M ops/s
+  инкрементальный: 10 compile() для 10 sys                                   17900.00 ns/op      0.06 M ops/s
 
-  batch:          1 compile() для 20 sys                                     26400.00 ns/op      0.04 M ops/s
-  инкрементальный: 20 compile() для 20 sys                                   26500.00 ns/op      0.04 M ops/s
+  batch:          1 compile() для 20 sys                                     33600.00 ns/op      0.03 M ops/s
+  инкрементальный: 20 compile() для 20 sys                                   38900.00 ns/op      0.03 M ops/s
 
   --- D. Идемпотентность: только 2й compile() ---
   setup=первый compile(), f=только второй compile()
-  2й compile() (graph_dirty=false, N=5)                                       1800.00 ns/op      0.56 M ops/s
-  2й compile() (graph_dirty=false, N=10)                                      3500.00 ns/op      0.29 M ops/s
-  2й compile() (graph_dirty=false, N=20)                                      8200.00 ns/op      0.12 M ops/s
+  2й compile() (graph_dirty=false, N=5)                                       2600.00 ns/op      0.38 M ops/s
+  2й compile() (graph_dirty=false, N=10)                                      4100.00 ns/op      0.24 M ops/s
+  2й compile() (graph_dirty=false, N=20)                                      5500.00 ns/op      0.18 M ops/s
 
   --- E. recompile после изменений ---
   setup=compile(N), f=add+recompile(N+1)
-  add 1 system → recompile (N=10 → 11)                                        5200.00 ns/op      0.19 M ops/s
-  add_dependency → recompile (N=5)                                            1900.00 ns/op      0.53 M ops/s
+  add 1 system → recompile (N=10 → 11)                                        6300.00 ns/op      0.16 M ops/s
+  add_dependency → recompile (N=5)                                            2700.00 ns/op      0.37 M ops/s
 
 ── Resources (100k операций) ─────────────────────────────────────────────────────
-  resource::<T>() read      (100k)                                               2.63 ns/op    380.52 M ops/s
-  resource_mut::<T>() write (100k)                                               2.39 ns/op    418.41 M ops/s
-  has_resource::<T>()       (100k)                                               1.00 ns/op    996.02 M ops/s
+  resource::<T>() read      (100k)                                               2.60 ns/op    384.32 M ops/s
+  resource_mut::<T>() write (100k)                                               2.63 ns/op    380.66 M ops/s
+  has_resource::<T>()       (100k)                                               1.01 ns/op    986.19 M ops/s
 
 ── Events (100k событий) ─────────────────────────────────────────────────────────
-  send + iter_current   (100k)                                                   6.04 ns/op    165.65 M ops/s
-  send→tick→iter_prev   (100k)                                                   5.89 ns/op    169.64 M ops/s
-  send_batch            (100k)                                                   0.17 ns/op   5988.02 M ops/s
+  send→tick→iter        (100k)                                                   6.68 ns/op    149.63 M ops/s
+  send→tick→iter (prev) (100k)                                                   5.75 ns/op    173.79 M ops/s
+  send_batch            (100k)                                                   0.17 ns/op   6060.61 M ops/s
 
 ── Query (100k entities) ─────────────────────────────────────────────────────────
-  Query::new + for_each_component   (100k)                                       7.26 ns/op    137.70 M ops/s
-  CachedQuery + for_each_component  (100k)                                       6.75 ns/op    148.13 M ops/s
-  Query<(Read<Vel>, Write<Pos>)>    (100k)                                       7.28 ns/op    137.31 M ops/s
-  Query<With<Player>> 0 results     (100k entities, обход архетипов)             6.70 ns/op    149.18 M ops/s
+  Query::new + for_each              (100k)                                      6.52 ns/op    153.35 M ops/s
+  CachedQuery + for_each             (100k)                                      6.80 ns/op    147.12 M ops/s
+  Query<(Read<Vel>, Write<Pos>)>    (100k)                                       7.21 ns/op    138.73 M ops/s
+  Query<With<Player>> 0 results     (100k entities, обход архетипов)             6.10 ns/op    164.02 M ops/s
 
 ── Structural changes (100k entity) ─────────────────────────────────────────────
-  insert component  (100k) [архетип-переход per entity]                         72.84 ns/op     13.73 M ops/s
-  despawn           (100k)                                                      20.39 ns/op     49.04 M ops/s
-  Commands::despawn + apply (100k)                                              24.89 ns/op     40.17 M ops/s
+  insert component  (100k) [архетип-переход per entity]                         66.90 ns/op     14.95 M ops/s
+  despawn           (100k)                                                      20.49 ns/op     48.80 M ops/s
+  Commands::despawn + apply (100k)                                              28.15 ns/op     35.53 M ops/s
 
 ── Parallel Scheduler — frame time (rayon threads: 12) ─────────
   Метрика: frame_time = время sched.run() | speedup = seq/par
   compile() в setup() — не входит в измерение
 
   --- Лёгкая нагрузка (memory-bound) ---
-  2 лёгких системы (100k)  Move+Hp                                      SEQ=0.165ms  PAR=0.179ms  speedup=0.92x
-  4 лёгких системы (100k)  Move+Hp+Temp+Mana  [1 Stage]                 SEQ=0.277ms  PAR=0.197ms  speedup=1.41x
+  2 лёгких системы (100k)  Move+Hp                                      SEQ=0.236ms  PAR=0.193ms  speedup=1.22x
+  4 лёгких системы (100k)  Move+Hp+Temp+Mana  [1 Stage]                 SEQ=0.298ms  PAR=0.222ms  speedup=1.34x
 
   --- Тяжёлая нагрузка (CPU-bound, ИЗОЛИРОВАННЫЕ архетипы) ---
   Архетип A: Pos+Vel → HeavyPhys | Архетип B: Temp → HeavyTemp
-  2 CPU-bound, изолированные архетипы (100k each)                       SEQ=3.574ms  PAR=2.718ms  speedup=1.32x
-  3 CPU-bound, изолированные архетипы (100k each)                       SEQ=3.753ms  PAR=2.781ms  speedup=1.35x
+  2 CPU-bound, изолированные архетипы (100k each)                       SEQ=3.593ms  PAR=2.839ms  speedup=1.27x
+  3 CPU-bound, изолированные архетипы (100k each)                       SEQ=4.094ms  PAR=2.761ms  speedup=1.48x
 
   --- Тяжёлая нагрузка (CPU-bound, ОБЩИЙ архетип — для сравнения) ---
   Все компоненты в одном архетипе → false sharing кеш-линий
-  2 CPU-bound, общий архетип Pos+Vel+Temp+Mana (100k)                   SEQ=2.923ms  PAR=2.669ms  speedup=1.10x
-  3 CPU-bound, общий архетип Pos+Vel+Temp+Mana (100k)                   SEQ=3.111ms  PAR=2.740ms  speedup=1.14x
+  2 CPU-bound, общий архетип Pos+Vel+Temp+Mana (100k)                   SEQ=2.968ms  PAR=2.694ms  speedup=1.10x
+  3 CPU-bound, общий архетип Pos+Vel+Temp+Mana (100k)                   SEQ=3.113ms  PAR=2.778ms  speedup=1.12x
 
   --- Сравнение for_each vs par_for_each (межсистемный) ---
-  [for_each] 2 CPU-bound, изол. архетипы (100k each)                    SEQ=3.615ms  PAR=2.753ms  speedup=1.31x
-  [par_for_each] 2 CPU-bound, изол. архетипы (100k each)                SEQ=1.195ms  PAR=0.830ms  speedup=1.44x
-  [for_each] 3 CPU-bound, изол. архетипы (100k each)                    SEQ=3.757ms  PAR=3.225ms  speedup=1.17x
-  [par_for_each] 3 CPU-bound, изол. архетипы (100k each)                SEQ=1.182ms  PAR=0.914ms  speedup=1.29x
+  [for_each] 2 CPU-bound, изол. архетипы (100k each)                    SEQ=3.636ms  PAR=2.716ms  speedup=1.34x
+  [par_for_each] 2 CPU-bound, изол. архетипы (100k each)                SEQ=0.980ms  PAR=0.789ms  speedup=1.24x
+  [for_each] 3 CPU-bound, изол. архетипы (100k each)                    SEQ=3.879ms  PAR=2.787ms  speedup=1.39x
+  [par_for_each] 3 CPU-bound, изол. архетипы (100k each)                SEQ=1.081ms  PAR=0.809ms  speedup=1.34x
 
   --- Максимальный межсистемный параллелизм: 12 систем × 1 компонент ---
-  2 solo-системы, 2 архетипа (100k each)                                SEQ=1.016ms  PAR=0.618ms  speedup=1.64x
-  4 solo-системы, 4 архетипа (100k each)                                SEQ=2.041ms  PAR=1.016ms  speedup=2.01x
-  8 solo-систем, 8 архетипов (100k each)                                SEQ=4.217ms  PAR=1.449ms  speedup=2.91x
-  12 solo-систем, 12 архетипов (100k each)                              SEQ=6.402ms  PAR=1.560ms  speedup=4.10x
+  2 solo-системы, 2 архетипа (100k each)                                SEQ=1.022ms  PAR=0.594ms  speedup=1.72x
+  4 solo-системы, 4 архетипа (100k each)                                SEQ=2.053ms  PAR=1.059ms  speedup=1.94x
+  8 solo-систем, 8 архетипов (100k each)                                SEQ=4.245ms  PAR=1.373ms  speedup=3.09x
+  12 solo-систем, 12 архетипов (100k each)                              SEQ=6.403ms  PAR=1.411ms  speedup=4.54x
 
   --- Pipeline с Sequential барьером ---
-  [Move+Hp] → barrier → [Move2+Hp2] (100k)                              SEQ=0.318ms  PAR=0.259ms  speedup=1.23x
+  [Move+Hp] → barrier → [Move2+Hp2] (100k)                              SEQ=0.348ms  PAR=0.302ms  speedup=1.15x
 
   Pipeline plan:
 Stage 0 [PARALLEL] (Update) :
@@ -140,13 +140,13 @@ Stage 2 [PARALLEL] (Update) :
   - hp2 [par | R:0 W:1]
 
 
-── Intra-system Parallelism — par_for_each_component ───────────────────────────
+── Intra-system Parallelism — par_for_each ────────────────────────────────────
   rayon threads: 12
   setup=World, f=только run() | speedup = seq_frame / par_frame
   --- Лёгкая нагрузка (memory-bound) ---
-  for_each vs par_for_each (100k, 4 archetypes, sqrt)                   SEQ=0.011ms  PAR=0.048ms  speedup=0.23x
+  for_each vs par_for_each (100k, 4 archetypes, sqrt)                   SEQ=0.023ms  PAR=0.053ms  speedup=0.44x
   --- Тяжёлая нагрузка (CPU-bound: atan2 + cos) ---
-  for_each vs par_for_each (100k, 4 archetypes, atan2+cos)              SEQ=0.156ms  PAR=0.095ms  speedup=1.63x
+  for_each vs par_for_each (100k, 4 archetypes, atan2+cos)              SEQ=0.172ms  PAR=0.087ms  speedup=1.98x
   Note: speedup при CPU-bound и кол-во entity >> PAR_CHUNK_SIZE(4096)
 
 ── Методология ─────────────────────────────────────────────────────────────────

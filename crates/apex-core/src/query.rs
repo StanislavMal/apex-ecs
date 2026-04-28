@@ -427,10 +427,10 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         for a in &self.archetypes {
-            let entities = &self.world.archetypes[a.arch_idx].entities;
-            for row in 0..a.len {
+            let entities = &self.world.archetypes[a.arch_idx].entities[..a.len];
+            for (row, &entity) in entities.iter().enumerate() {
                 if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
-                    f(entities[row], item);
+                    f(entity, item);
                 }
             }
         }
@@ -464,10 +464,10 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
             let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-            let entities = &arch.entities;
-            for row in start..end {
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(entities[row], item);
+            let entities = &arch.entities[start..end];
+            for (row, &entity) in entities.iter().enumerate() {
+                if let Some(item) = unsafe { Q::fetch_item(state, start + row) } {
+                    f(entity, item);
                 }
             }
         });

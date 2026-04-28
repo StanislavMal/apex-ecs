@@ -60,7 +60,18 @@ pub fn spawn(&mut self) -> EntityBuilder<'_> { ... }
 
 // СТАЛО — один метод принимающий любой Bundle (включая пустой кортеж):
 pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
-    let ids          = bundle.component_ids(&mut self.registry);
+    let ids = bundle.component_ids(&mut self.registry);
+    if ids.is_empty() {
+        // Быстрый путь для пустой entity (spawn(()))
+        let entity = self.entities.allocate();
+        let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
+        self.entities.set_location(entity, EntityLocation {
+            archetype_id: ArchetypeId::EMPTY,
+            row,
+        });
+        return entity;
+    }
+    // Обычный путь — как старый spawn_bundle
     let archetype_id = self.get_or_create_archetype(&ids);
     let entity       = self.entities.allocate();
     let row          = self.archetypes[archetype_id.0 as usize].entities.len();
@@ -279,6 +290,12 @@ query.par_for_each(|_, (vel, pos)| {
 
 `for_each_component` и `par_for_each_component` **удаляются**.
 
+> **Оптимизация (2026-04-28):** После бенчмарков обнаружена регрессия +87% на fragmented\_iter.
+> Причина: `for_each` читает `entities[row]` на каждой итерации через bound-checked Vec indexing.
+> Исправление: `&entities[..a.len].iter().enumerate()` — один bound check на архетип,
+> последовательный итератор без проверки границ на элемент.
+> API не изменился: `for_each(|_, item)| { ... }` остаётся единым методом.
+
 ### Реализация
 
 В `Query` (`world.rs`):
@@ -477,7 +494,7 @@ pub struct TemplateParams {
 
 impl TemplateParams {
     pub fn new() -> Self {
-        Self { data: FxHashMap::default() }
+        Self { data: HashMap::default() }
     }
 
     /// Установить значение параметра.
@@ -776,6 +793,7 @@ cmds.apply(&mut world);
 [x] CachedQuery::par_for_each_component — удалён
 [x] QueryComponentIter — удалён
 [x] Все вхождения for_each_component → for_each с |_, components|
+[x] Оптимизация for_each: slice + iter вместо entities[row] (bound check elimination)
 [x] Документация обновлена
 
 П-4: DeferredQueue → Commands ✅
@@ -787,7 +805,7 @@ cmds.apply(&mut world);
 
 П-5: TemplateParams ✅
 [x] pub trait TemplateParam — добавлен в template.rs
-[x] TemplateParams переписан на TypeId-ключи (HashMap вместо FxHashMap)
+[x] TemplateParams переписан на TypeId-ключи (используется std::collections::HashMap)
 [x] Старые .with("str", value) — удалены
 [x] Все реализации EntityTemplate::spawn — обновлены
 [x] Все вызовы spawn_from_template — обновлены
