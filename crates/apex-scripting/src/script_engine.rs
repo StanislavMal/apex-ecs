@@ -31,11 +31,9 @@
 //! - Это исключает UB от мутации мира внутри query-итератора
 
 use std::{
-    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    rc::Rc,
-    sync::mpsc,
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -74,7 +72,7 @@ type SpawnApplierFn = Box<dyn Fn(&str, &rhai::Dynamic, apex_core::Entity, &mut W
 /// Управление Rhai-скриптами: компиляция, выполнение, хот-релоад.
 pub struct ScriptEngine {
     engine:         Engine,
-    ctx:            Rc<RefCell<ScriptContext>>,
+    ctx:            Arc<Mutex<ScriptContext>>,
     scripts:        HashMap<String, CompiledScript>,
     active_script:  String,
     script_dir:     Option<PathBuf>,
@@ -96,7 +94,7 @@ impl ScriptEngine {
     /// Использование: `engine.load_script_str("main", code)` для
     /// встроенных скриптов (тесты, конфиги в памяти).
     pub fn new() -> Self {
-        let ctx = Rc::new(RefCell::new(ScriptContext::new()));
+        let ctx = Arc::new(Mutex::new(ScriptContext::new()));
 
         let mut engine = Engine::new();
 
@@ -106,7 +104,7 @@ impl ScriptEngine {
         engine.set_max_operations(u64::MAX); // без ограничения операций в игре
 
         // Регистрируем глобальные API-функции
-        rhai_api::register_globals(&mut engine, Rc::clone(&ctx));
+        rhai_api::register_globals(&mut engine, Arc::clone(&ctx));
         rhai_api::register_log(&mut engine);
 
         Self {
@@ -220,7 +218,7 @@ impl ScriptEngine {
             primitive_info: T::primitive_info(),
         };
 
-        self.ctx.borrow_mut().add_binding(binding);
+        self.ctx.lock().unwrap().add_binding(binding);
 
         // 3. Регистрируем конструктор в Rhai Engine (Position(x, y) → Dynamic)
         T::register_rhai_type(&mut self.engine);
@@ -295,7 +293,7 @@ impl ScriptEngine {
                 }
             },
         };
-        self.ctx.borrow_mut().add_resource_binding(binding);
+        self.ctx.lock().unwrap().add_resource_binding(binding);
         log::debug!("ScriptEngine: зарегистрирован ресурс '{}'", T::type_name_str());
     }
 
@@ -339,7 +337,7 @@ impl ScriptEngine {
                 }
             },
         };
-        self.ctx.borrow_mut().add_event_binding(binding);
+        self.ctx.lock().unwrap().add_event_binding(binding);
         log::debug!("ScriptEngine: зарегистрировано событие '{}'", T::type_name_str());
     }
 
@@ -443,7 +441,7 @@ impl ScriptEngine {
 
         // Устанавливаем контекст
         {
-            let mut ctx = self.ctx.borrow_mut();
+            let mut ctx = self.ctx.lock().unwrap();
             ctx.delta_time = dt;
             // SAFETY: world живёт всё время выполнения этого метода.
             // clear_world_ptr() вызывается до любого возврата.
@@ -485,20 +483,20 @@ impl ScriptEngine {
         // (spawn-запросы обрабатываются отдельно через apply_spawn_queue)
         // ВАЖНО: apply_deferred вызывается ДО clear_world_ptr, т.к. внутри
         // использует world_mut() который требует world_ptr.
-        self.ctx.borrow_mut().apply_deferred();
+        self.ctx.lock().unwrap().apply_deferred();
 
         // Применяем отложенные записи ресурсов и отправки событий
         // (буферизированы чтобы избежать RefCell double-borrow при вызове
         // write_resource/emit_event внутри query()-итерации)
-        self.ctx.borrow_mut().apply_deferred_resources_and_events();
+        self.ctx.lock().unwrap().apply_deferred_resources_and_events();
 
         // Сбрасываем world_ptr после применения всех deferred-команд
-        self.ctx.borrow_mut().clear_world_ptr();
+        self.ctx.lock().unwrap().clear_world_ptr();
 
         // Перемещаем spawn-запросы из ScriptContext.deferred_spawns в self.spawn_queue
         {
-            let ctx = self.ctx.borrow_mut();
-            let spawns = std::mem::take(&mut *ctx.deferred_spawns.borrow_mut());
+            let ctx = self.ctx.lock().unwrap();
+            let spawns = std::mem::take(&mut *ctx.deferred_spawns.lock().unwrap());
             self.spawn_queue.extend(spawns);
         }
 

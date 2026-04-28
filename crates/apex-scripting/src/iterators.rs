@@ -19,7 +19,7 @@
 //! `query(["Read:Position", "Write:Velocity"])` — массив строк вида `"Mode:TypeName"`.
 //! Парсится в `QueryDesc` в `parse_query_descs()`.
 
-use std::{cell::RefCell, rc::Rc};
+use std::sync::{Arc, Mutex};
 
 use apex_core::{
     component::ComponentId,
@@ -110,7 +110,7 @@ pub(crate) struct ComponentState {
 /// Регистрируется через `engine.register_iterator::<RhaiQueryIter>()`.
 #[derive(Clone)]
 pub struct RhaiQueryIter {
-    ctx:             Rc<RefCell<ScriptContext>>,
+    ctx:             Arc<Mutex<ScriptContext>>,
     arch_states:     Vec<ArchState>,
     arch_cursor:     usize,
     row_cursor:      usize,
@@ -124,13 +124,13 @@ impl RhaiQueryIter {
     ///
     /// Перебирает все архетипы мира и отбирает те, которые содержат
     /// ВСЕ запрошенные компоненты.
-    pub fn new(ctx: Rc<RefCell<ScriptContext>>, descs: Vec<QueryDesc>) -> Self {
+    pub fn new(ctx: Arc<Mutex<ScriptContext>>, descs: Vec<QueryDesc>) -> Self {
         let arch_states = {
-            let ctx_ref = ctx.borrow();
+            let ctx_ref = ctx.lock().unwrap();
             let world   = ctx_ref.world_ref();
 
             // Проверяем кэш запросов в ScriptContext
-            let mut cache = ctx_ref.query_cache.borrow_mut();
+            let mut cache = ctx_ref.query_cache.write().unwrap();
             if let Some(cached) = cache.get(&descs) {
                 cached.clone()
             } else {
@@ -157,7 +157,7 @@ impl RhaiQueryIter {
             return;
         }
 
-        let ctx_ref = self.ctx.borrow();
+        let ctx_ref = self.ctx.lock().unwrap();
         // SAFETY: итератор завершён (flush_writes вызывается в Drop или
         // после исчерпания итератора), никаких shared borrow на Column нет.
         let world_ref = ctx_ref.world_ref();
@@ -232,7 +232,7 @@ impl Iterator for RhaiQueryIter {
 
 impl RhaiQueryIter {
     fn build_item(&mut self, arch_idx: usize, components: &[ComponentState], row: usize) -> Dynamic {
-        let ctx_ref  = self.ctx.borrow();
+        let ctx_ref  = self.ctx.lock().unwrap();
         let world    = ctx_ref.world_ref();
         let arch     = &world.archetypes()[arch_idx];
 

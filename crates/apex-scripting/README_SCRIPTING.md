@@ -272,28 +272,44 @@ for entity in query(["Read:Position", "Write:Velocity"]) {
 
 Эти методы используются скриптингом через `World::spawn_from_template()` при интеграции с `PrefabManifest` (который реализует `EntityTemplate`).
 
-> **⚠️ ВАЖНО: Однопоточность Rhai**
+> **⚠️ ВАЖНО: Однопоточность выполнения Rhai + Send-совместимость**
 >
-> `apex-scripting` использует `Rc<RefCell<>>` (не `Arc<Mutex<>>`), потому что
-> Rhai без фичи `"sync"` — однопоточный.
+> `apex-scripting` использует `Arc<Mutex<>>` (вместо `Rc<RefCell<>>`) благодаря
+> включению фичи `"sync"` в крейт `rhai`. Это делает `ScriptEngine: Send`.
 >
-> - **НЕ ИСПОЛЬЗУЙТЕ** `ScriptEngine::run()` внутри `ParSystem` или параллельных
->   потоков — это приведёт к панике при попытке клонирования `Rc`
+> - **НЕ ИСПОЛЬЗУЙТЕ** `ScriptEngine::run()` внутри `ParSystem` — `run()` требует
+>   `&mut self`, что несовместимо с параллельным доступом. Только `SequentialSystem`.
 > - **НЕ ИСПОЛЬЗУЙТЕ** `#[derive(Scriptable)]` компоненты в параллельных системах,
->   работающих с тем же миром — `ScriptContext` не `Sync`
-> - **НЕ ПЫТАЙТЕСЬ** передать `ScriptEngine` в другой поток — он не реализует `Send`
+>   работающих с тем же миром — `ScriptContext` не `Sync` (содержит `NonNull<World>`)
+> - **МОЖНО** передать `ScriptEngine` в другой поток через `Mutex<ScriptEngine>`
+>   или `Arc<Mutex<ScriptEngine>>` — он реализует `Send`
 >
-> Скриптинг предназначен **только для однопоточного последовательного выполнения**
-> в главном игровом цикле. Для параллельной обработки данных используйте
+> Внутренне Rhai остаётся однопоточным — скрипты выполняются последовательно
+> внутри одного вызова `run()`. Для параллельной обработки данных используйте
 > `ParSystem` и `Commands` (см. раздел 13 руководства пользователя).
 
 ## Архитектурные решения
 
-### Однопоток: `Rc<RefCell<>>` вместо `Arc<Mutex<>>`
+### `Arc<Mutex<>>` + `Send`-совместимость
 
-Rhai без фичи `"sync"` — однопоточный. `Rc<RefCell<>>` достаточно и не несёт
-накладных расходов атомиков. Попытка использовать `ScriptContext` из другого
-потока — compile error.
+Rhai с фичей `"sync"` использует `Arc<dyn Any + Send + Sync>` вместо
+`Rc<dyn Any>`, что делает `Dynamic: Send + Sync`. Благодаря этому
+`ScriptEngine` автоматически реализует `Send` — его можно передать
+в другой поток при условии внешней синхронизации (`Mutex<ScriptEngine>`).
+
+Внутренние поля `ScriptContext`:
+- `query_cache: RwLock<HashMap<...>>` — `RwLock` (много читателей, редкие записи)
+- `deferred_spawns: Mutex<Vec<SpawnRequest>>` — `Mutex`
+- `deferred_resource_writes: Mutex<Vec<...>>` — `Mutex`
+- `deferred_events: Mutex<Vec<...>>` — `Mutex`
+
+`RwLock` для кэша выбран осознанно: query-запросы из Rhai-скриптов
+преимущественно читают кэш, а запись (инвалидация) происходит редко.
+
+> **Важно:** `ScriptContext` содержит `NonNull<World>`, который не реализует
+> `Sync`. Поэтому `ScriptContext` помечен как `unsafe impl Send + Sync`.
+> Безопасность обеспечивается тем, что `world_ptr` устанавливается внутри
+> `run()` и не используется вне его.
 
 ### `NonNull<World>` вместо `*mut World`
 
@@ -306,12 +322,12 @@ Rhai без фичи `"sync"` — однопоточный. `Rc<RefCell<>>` до
 Spawn/despawn из скрипта нельзя применять во время итерации по архетипам.
 
 - **Despawn** — накапливается в `Commands` (требует `Send`), применяется через `apply_deferred()` после скрипта
-- **Spawn** — накапливается в `deferred_spawns: RefCell<Vec<SpawnRequest>>` (содержит `rhai::Dynamic` с `Rc`, не `Send`), перемещается в `ScriptEngine.spawn_queue` и применяется через `apply_spawn_queue()`
+- **Spawn** — накапливается в `deferred_spawns: Mutex<Vec<SpawnRequest>>` (теперь `Send` благодаря `Arc<Mutex<>>`), перемещается в `ScriptEngine.spawn_queue` и применяется через `apply_spawn_queue()`
 
 ### Двухбуферность для Resources/Events
 
 - **Чтение ресурсов** (`read_resource`) — использует shared borrow (`world_ref()`), безопасно во время выполнения скрипта
-- **Запись ресурсов** (`write_resource`) и **отправка событий** (`emit_event`) — буферизируются в `deferred_resource_writes` / `deferred_events` (RefCell<Vec<(String, Dynamic)>>) во время выполнения скрипта
+- **Запись ресурсов** (`write_resource`) и **отправка событий** (`emit_event`) — буферизируются в `deferred_resource_writes` / `deferred_events` (Mutex<Vec<(String, Dynamic)>>) во время выполнения скрипта
 - **Применение** — после завершения скрипта вызывается `apply_deferred_resources_and_events()`, которая извлекает буферы и применяет их через `world_mut()`, что гарантирует отсутствие RefCell double-borrow при вызове внутри query()-итерации
 
 ### Change ticks при записи из Rhai

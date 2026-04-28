@@ -533,6 +533,8 @@ impl World {
     /// ```rust
     /// # use apex_core::prelude::*;
     /// # let mut world = World::new();
+    /// # struct Health(f32);
+    /// # struct Armor(f32);
     /// world.spawn_batch([
     ///     (Health(100.0), Armor(10.0)),
     ///     (Health(50.0),  Armor(5.0)),

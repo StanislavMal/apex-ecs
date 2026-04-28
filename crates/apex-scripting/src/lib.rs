@@ -5,7 +5,7 @@
 //! ```text
 //! ScriptEngine
 //!   ├── rhai::Engine         — компилятор/исполнитель скриптов
-//!   ├── ScriptContext        — мост World ↔ Rhai (Rc<RefCell<>>)
+//!   ├── ScriptContext        — мост World ↔ Rhai (Arc<Mutex<>>)
 //!   ├── HashMap<name, AST>   — скомпилированные скрипты
 //!   └── FileWatcher          — хот-релоад .rhai файлов
 //!

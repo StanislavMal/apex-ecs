@@ -16,9 +16,9 @@
 //! Они накапливаются в `deferred: Commands` и применяются после завершения скрипта.
 
 use std::{
-    cell::RefCell,
     collections::HashMap,
     ptr::NonNull,
+    sync::{Mutex, RwLock},
 };
 
 use apex_core::{
@@ -69,7 +69,7 @@ pub struct SpawnRequest {
 
 /// Мост между Rhai-скриптом и миром ECS.
 ///
-/// Живёт в `Rc<RefCell<ScriptContext>>` — клоны `Rc` захватываются
+/// Живёт в `Arc<Mutex<ScriptContext>>` — клоны `Arc` захватываются
 /// замыканиями зарегистрированными в `rhai::Engine`.
 pub struct ScriptContext {
     /// Текущий delta time кадра — устанавливается перед `run()`
@@ -82,12 +82,12 @@ pub struct ScriptContext {
 
     /// Буфер отложенных команд spawn/despawn.
     /// Применяется после завершения скрипта через `apply_deferred()`.
-    pub(crate) deferred: RefCell<Commands>,
+    pub(crate) deferred: Mutex<Commands>,
 
     /// Буфер запросов spawn из скриптов (SpawnRequest содержит rhai::Dynamic,
-    /// который не Send, поэтому не может идти через Commands::add).
+    /// который теперь Send благодаря feature "sync").
     /// Применяется в apply_deferred_requests после завершения скрипта.
-    pub(crate) deferred_spawns: RefCell<Vec<SpawnRequest>>,
+    pub(crate) deferred_spawns: Mutex<Vec<SpawnRequest>>,
 
     /// Реестр компонентов доступных из скриптов: name → binding
     pub(crate) bindings: HashMap<&'static str, ComponentBinding>,
@@ -99,14 +99,12 @@ pub struct ScriptContext {
     pub(crate) event_bindings: HashMap<&'static str, EventBinding>,
 
     /// Буфер отложенных записей ресурсов: (type_name, Dynamic)
-    /// Применяется после завершения скрипта, чтобы избежать RefCell double-borrow
-    /// при вызове write_resource() внутри query()-итерации.
-    pub(crate) deferred_resource_writes: RefCell<Vec<(String, rhai::Dynamic)>>,
+    /// Применяется после завершения скрипта.
+    pub(crate) deferred_resource_writes: Mutex<Vec<(String, rhai::Dynamic)>>,
 
     /// Буфер отложенных событий: (type_name, Dynamic)
-    /// Применяется после завершения скрипта, чтобы избежать RefCell double-borrow
-    /// при вызове emit_event() внутри query()-итерации.
-    pub(crate) deferred_events: RefCell<Vec<(String, rhai::Dynamic)>>,
+    /// Применяется после завершения скрипта.
+    pub(crate) deferred_events: Mutex<Vec<(String, rhai::Dynamic)>>,
 
     /// Счётчик entity — кешируется чтобы не вызывать world через ptr каждый раз
     entity_count_cache: usize,
@@ -114,7 +112,7 @@ pub struct ScriptContext {
     /// Кэш результатов build_arch_states — избегает повторного сканирования
     /// всех архетипов при повторных query() с теми же дескрипторами.
     /// Инвалидируется при каждом новом запуске скрипта (в set_world_ptr).
-    pub(crate) query_cache: RefCell<HashMap<Vec<QueryDesc>, Vec<ArchState>>>,
+    pub(crate) query_cache: RwLock<HashMap<Vec<QueryDesc>, Vec<ArchState>>>,
 }
 
 impl ScriptContext {
@@ -122,15 +120,15 @@ impl ScriptContext {
         Self {
             delta_time:              0.0,
             world_ptr:               None,
-            deferred:                RefCell::new(Commands::new()),
-            deferred_spawns:         RefCell::new(Vec::new()),
+            deferred:                Mutex::new(Commands::new()),
+            deferred_spawns:         Mutex::new(Vec::new()),
             bindings:                HashMap::new(),
             resource_bindings:       HashMap::new(),
             event_bindings:          HashMap::new(),
-            deferred_resource_writes: RefCell::new(Vec::new()),
-            deferred_events:         RefCell::new(Vec::new()),
+            deferred_resource_writes: Mutex::new(Vec::new()),
+            deferred_events:         Mutex::new(Vec::new()),
             entity_count_cache:      0,
-            query_cache:             RefCell::new(HashMap::new()),
+            query_cache:             RwLock::new(HashMap::new()),
         }
     }
 
@@ -144,11 +142,11 @@ impl ScriptContext {
     pub(crate) unsafe fn set_world_ptr(&mut self, world: &mut World) {
         self.world_ptr         = Some(NonNull::new_unchecked(world as *mut World));
         self.entity_count_cache = world.entity_count();
-        self.deferred.borrow_mut().clear();
-        self.deferred_resource_writes.borrow_mut().clear();
-        self.deferred_events.borrow_mut().clear();
+        self.deferred.lock().unwrap().clear();
+        self.deferred_resource_writes.lock().unwrap().clear();
+        self.deferred_events.lock().unwrap().clear();
         // Инвалидируем кэш запросов — мир мог измениться между кадрами
-        self.query_cache.borrow_mut().clear();
+        self.query_cache.write().unwrap().clear();
     }
 
     /// Сбросить указатель на мир после завершения скрипта.
@@ -191,15 +189,14 @@ impl ScriptContext {
 
     /// Поставить в очередь запрос на создание entity.
     pub fn queue_spawn(&self, request: SpawnRequest) {
-        // Сохраняем запрос в отдельный буфер — Commands::add требует Send,
-        // а SpawnRequest содержит Rc (из rhai::Dynamic). Применение будет
-        // выполнено в apply_deferred_requests.
-        self.deferred_spawns.borrow_mut().push(request);
+        // Сохраняем запрос в отдельный буфер. SpawnRequest теперь Send
+        // благодаря feature "sync" у Rhai.
+        self.deferred_spawns.lock().unwrap().push(request);
     }
 
     /// Поставить в очередь уничтожение entity.
     pub fn queue_despawn(&self, entity: apex_core::Entity) {
-        self.deferred.borrow_mut().despawn(entity);
+        self.deferred.lock().unwrap().despawn(entity);
     }
 
     /// Применить все накопленные deferred-команды к миру.
@@ -207,13 +204,13 @@ impl ScriptContext {
     /// Вызывается `ScriptEngine::run()` после завершения скрипта.
     pub(crate) fn apply_deferred(&mut self) {
         // Извлекаем deferred ДО вызова world_mut, чтобы избежать borrow conflict
-        let mut deferred = std::mem::take(&mut *self.deferred.borrow_mut());
+        let mut deferred = std::mem::take(&mut *self.deferred.lock().unwrap());
         // SAFETY: apply_deferred вызывается только после того как скрипт
         // завершился и никаких borrow на world_ref больше нет.
         let world = unsafe { self.world_mut() };
         deferred.apply(world);
         // Возвращаем очищенный Commands обратно (уже пустой после apply)
-        *self.deferred.borrow_mut() = deferred;
+        *self.deferred.lock().unwrap() = deferred;
     }
 
     /// Применить отложенные записи ресурсов и отправки событий.
@@ -221,8 +218,8 @@ impl ScriptContext {
     /// Вызывается `ScriptEngine::run()` после завершения скрипта,
     /// когда никаких borrow на `ScriptContext` больше нет.
     pub(crate) fn apply_deferred_resources_and_events(&mut self) {
-        let writes = std::mem::take(&mut *self.deferred_resource_writes.borrow_mut());
-        let events = std::mem::take(&mut *self.deferred_events.borrow_mut());
+        let writes = std::mem::take(&mut *self.deferred_resource_writes.lock().unwrap());
+        let events = std::mem::take(&mut *self.deferred_events.lock().unwrap());
 
         if writes.is_empty() && events.is_empty() {
             return;
@@ -320,7 +317,7 @@ impl ScriptContext {
             log::warn!("write_resource: ресурс '{}' не зарегистрирован", type_name);
             return;
         }
-        self.deferred_resource_writes.borrow_mut()
+        self.deferred_resource_writes.lock().unwrap()
             .push((type_name.to_string(), value.clone()));
     }
 
@@ -333,7 +330,7 @@ impl ScriptContext {
             log::warn!("emit_event: событие '{}' не зарегистрировано", type_name);
             return;
         }
-        self.deferred_events.borrow_mut()
+        self.deferred_events.lock().unwrap()
             .push((type_name.to_string(), value.clone()));
     }
 }
@@ -341,3 +338,9 @@ impl ScriptContext {
 impl Default for ScriptContext {
     fn default() -> Self { Self::new() }
 }
+
+// SAFETY: ScriptContext используется только из одного потока за раз.
+// world_ptr валиден только в пределах run() и не передаётся между потоками.
+// Все поля кроме world_ptr защищены Mutex/RwLock.
+unsafe impl Send for ScriptContext {}
+unsafe impl Sync for ScriptContext {}
