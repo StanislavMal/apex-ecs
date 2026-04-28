@@ -7,6 +7,7 @@
 | `TrackedEventQueue<T>` | **`Events<T>`** | короче, идиоматичнее (Bevy) |
 | `ResourceMap` | **`Resources`** | симметрично `Events` |
 | `resource()`, `resource_mut()` | оставить | паника как `Res<T>` в Bevy |
+| `spawn_bundle` + match | **`spawn_batch(iter)`** | как Bevy `spawn_batch` |
 
 ## Удаление (без обратной совместимости)
 

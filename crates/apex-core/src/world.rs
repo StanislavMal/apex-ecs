@@ -526,6 +526,35 @@ impl World {
         self.spawn_many_inner(count, make_bundle);
     }
 
+    /// Создать entity из итератора бандлов (как Bevy `spawn_batch`).
+    ///
+    /// Позволяет порождать entity с разными наборами компонентов в одной пачке:
+    ///
+    /// ```rust
+    /// # use apex_core::prelude::*;
+    /// # let mut world = World::new();
+    /// world.spawn_batch([
+    ///     (Health(100.0), Armor(10.0)),
+    ///     (Health(50.0),  Armor(5.0)),
+    /// ]);
+    /// ```
+    ///
+    /// Внутри собирает итератор в `Vec` и вызывает `spawn_bundle` для каждого элемента.
+    /// Для массового спавна **одинаковых** бандлов используйте [`spawn_many`] —
+    /// он оптимизирован через bulk-copy.
+    pub fn spawn_batch<I>(&mut self, iter: I) -> Vec<Entity>
+    where
+        I: IntoIterator,
+        I::Item: Bundle,
+    {
+        let items: Vec<I::Item> = iter.into_iter().collect();
+        let mut entities = Vec::with_capacity(items.len());
+        for bundle in items {
+            entities.push(self.spawn_bundle(bundle));
+        }
+        entities
+    }
+
     // ── Component ops ──────────────────────────────────────────
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {

@@ -172,11 +172,18 @@ let entity = world.spawn()
     .insert(Velocity { x: 0.0, y: 0.0 })
     .id();
 
-// Batch-спавн (самый быстрый способ):
+// Batch-спавн одинаковых бандлов (самый быстрый способ):
 let entities = world.spawn_many(1000, |i| (
     Position { x: i as f32, y: 0.0 },
     Velocity { x: 0.1, y: 0.0 },
 ));
+
+// Batch-спавн из итератора (разные бандлы):
+world.spawn_batch([
+    (Health(100.0), Armor(10.0), Player),
+    (Health(50.0),  Armor(5.0),  Enemy),
+    (Health(25.0),  Armor(2.0),  Enemy),
+]);
 
 // Уничтожение entity:
 world.despawn(player);
@@ -1620,6 +1627,7 @@ impl ParSystem for ScriptedMovement {
 
 - Используйте `spawn_many()` вместо цикла `spawn_bundle()` — один batch-аллокатор вместо N отдельных
 - `spawn_many_silent()` — то же что `spawn_many`, но без возврата `Vec<Entity>` — экономит heap-аллокацию
+- `spawn_batch()` — для спавна из итератора с разными типами бандлов (удобно в тестах/примерах)
 - Определяйте компоненты для entity сразу при спавне — структурные изменения после спавна дороже
 
 ### 14.2 Query
@@ -1910,8 +1918,9 @@ fn main() {
 |---|---|
 | `spawn()` | Создать EntityBuilder для пошагового добавления компонентов |
 | `spawn_bundle(bundle)` | Создать entity с набором компонентов |
-| `spawn_many(n, \|i\| bundle)` | Batch-спавн N entity (возвращает Vec) |
-| `spawn_many_silent(n, \|i\| bundle)` | Batch-спавн N entity (без возврата Vec) |
+| `spawn_many(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (возвращает Vec) |
+| `spawn_many_silent(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (без возврата Vec) |
+| `spawn_batch(iter)` | Спавн из итератора бандлов (разные типы) |
 | `spawn_empty()` | Создать entity без компонентов |
 | `despawn(entity)` | Уничтожить entity |
 | `insert(entity, component)` | Добавить компонент |
