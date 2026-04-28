@@ -77,13 +77,13 @@ parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 
 ```toml
 [dependencies]
-apex-core          = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-scheduler     = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-serialization = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-hot-reload    = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-macros        = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-scripting     = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
-apex-isolated      = { git = "https://github.com/ваш-username/apex-ecs", rev = "latest-revision-hash" }
+apex-core          = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-scheduler     = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-serialization = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-hot-reload    = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-macros        = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-scripting     = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
+apex-isolated      = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
 
 [features]
 parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
