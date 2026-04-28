@@ -12,7 +12,7 @@
 4. [Query API](#4-query-api)
 5. [Ресурсы и события](#5-ресурсы-и-события)
 6. [Системы и планировщик](#6-системы-и-планировщик)
-7. [Commands и DeferredQueue](#7-commands-и-deferredqueue)
+7. [Commands](#7-commands)
 8. [Relations (связи между entity)](#8-relations-связи-между-entity)
 9. [EntityTemplate](#9-entitytemplate)
 10. [Сериализация](#10-сериализация)
@@ -160,17 +160,17 @@ world.register_component::<Velocity>();
 world.register_component::<Health>();
 
 // Создание entity с набором компонентов (Bundle):
-let player = world.spawn_bundle((
+let player = world.spawn((
     Position { x: 0.0, y: 0.0 },
     Velocity { x: 1.0, y: 0.0 },
     Health { current: 100.0, max: 100.0 },
 ));
 
-// Создание entity пошагово:
-let entity = world.spawn()
-    .insert(Position { x: 5.0, y: 0.0 })
-    .insert(Velocity { x: 0.0, y: 0.0 })
-    .id();
+// Пустая entity:
+let marker = world.spawn(());
+
+// Добавление компонента после создания через EntityRef:
+world.entity(player).insert(Armor { value: 10.0 });
 
 // Batch-спавн одинаковых бандлов (самый быстрый способ):
 let entities = world.spawn_many(1000, |i| (
@@ -289,7 +289,7 @@ use apex_core::prelude::*;
 
 // Простой запрос — итерация по Position:
 Query::<Read<Position>>::new(&world)
-    .for_each_component(|pos| {
+    .for_each(|_, pos| {
         println!("pos: ({}, {})", pos.x, pos.y);
     });
 
@@ -303,19 +303,19 @@ Query::<(Read<Velocity>, Write<Position>)>::new(&world)
 
 // Фильтрация по маркерному компоненту:
 Query::<(Read<Health>, With<Player>)>::new(&world)
-    .for_each_component(|hp| {
+    .for_each(|_, hp| {
         println!("player HP: {}/{}", hp.current, hp.max);
     });
 
 // Исключение компонента:
 Query::<(Read<Position>, Without<Enemy>)>::new(&world)
-    .for_each_component(|pos| { /* только не-Enemy */ });
+    .for_each(|_, pos| { /* только не-Enemy */ });
 
 // Change detection:
 let last_tick = world.current_tick();
 // ... (следующий тик) ...
 Query::<Changed<Position>>::new_with_tick(&world, last_tick)
-    .for_each_component(|pos| {
+    .for_each(|_, pos| {
         println!("position changed: ({}, {})", pos.x, pos.y);
     });
 
@@ -337,7 +337,7 @@ let count = Query::<Read<Health>>::new(&world)
 ```rust
 // CachedQuery — переиспользует список архетипов:
 world.query_typed::<Read<Position>>()
-    .for_each_component(|pos| { /* ... */ });
+    .for_each(|_, pos| { /* ... */ });
 
 // С change detection:
 world.query_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
@@ -597,7 +597,7 @@ impl AutoSystem for MovementSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<Self::Query>()
-            .for_each_component(|(vel, pos)| {
+            .for_each(|_, (vel, pos)| {
                 pos.x += vel.x * 0.016;
                 pos.y += vel.y * 0.016;
             });
@@ -630,7 +630,7 @@ impl ParSystem for PhysicsSystem {
         let g = cfg.gravity;
 
         ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
-            .for_each_component(|(mass, vel, pos)| {
+            .for_each(|_, (mass, vel, pos)| {
                 vel.y -= g * mass.0 * dt;
                 pos.x += vel.x * dt;
                 pos.y += vel.y * dt;
@@ -649,7 +649,7 @@ sched.add_fn_par_system(
     "enemy_ai",
     |ctx: SystemContext<'_>| {
         ctx.query::<(Read<Enemy>, Write<Velocity>)>()
-            .for_each_component(|(_, vel)| {
+            .for_each(|_, (_, vel)| {
                 vel.x *= 0.99;
                 vel.y *= 0.99;
             });
@@ -732,9 +732,9 @@ fn run(&mut self, ctx: SystemContext<'_>) {
     ctx.query::<(Read<Velocity>, Write<Position>)>()
         .for_each(|entity, (vel, pos)| { /* ... */ });
 
-    // Без Entity (чуть быстрее):
+    // Единый API — entity всегда доступна (используйте `_` если не нужна):
     ctx.query::<(Read<Vel>, Write<Pos>)>()
-        .for_each_component(|(v, p)| { /* ... */ });
+        .for_each(|_, (v, p)| { /* ... */ });
 
     // Ресурсы:
     let cfg   = ctx.resource::<PhysicsConfig>();        // Res<T>
@@ -750,7 +750,7 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 
     // Параллельная итерация (feature = "parallel"):
     ctx.query::<(Read<Vel>, Write<Pos>)>()
-        .par_for_each_component(|(v, p)| {
+        .par_for_each(|_, (v, p)| {
             /* выполняется на нескольких потоках */
         });
 
@@ -764,7 +764,7 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 
 ---
 
-## 7. Commands и DeferredQueue
+## 7. Commands
 
 ### 7.1 Commands
 
@@ -786,7 +786,7 @@ cmds.apply(&mut world);
 
 // Все поддерживаемые операции:
 cmds.despawn(entity);
-cmds.spawn_bundle((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.0 }));
+cmds.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.0 }));
 cmds.insert(entity, NewComponent { value: 42 });
 cmds.remove::<OldComponent>(entity);
 cmds.add(|world: &mut World| { /* произвольная команда */ });
@@ -796,16 +796,7 @@ cmds.add(|world: &mut World| { /* произвольная команда */ });
 
 > **Параллелизм:** В параллельных системах (см. [раздел 13](#13-параллелизм)) каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. Два `despawn()` одного entity — второй вызов будет no-op. `Commands` не должен пересекать границу параллельного вызова — применяйте `cmds.apply()` после завершения параллельного блока.
 
-### 7.2 DeferredQueue
-
-`DeferredQueue` работает с raw `ComponentId` — используется в системах, где тип компонента неизвестен статически.
-
-```rust
-let mut queue = DeferredQueue::new();
-queue.despawn(entity);
-queue.remove_raw(entity, component_id);
-queue.apply(&mut world);
-```
+> **`DeferredQueue` удалён.** Ранее существовал отдельный тип `DeferredQueue` для динамических операций с raw `ComponentId`. Теперь вся функциональность объединена в `Commands`: используйте `cmds.remove_raw(entity, component_id)` и `cmds.insert_raw(entity, component_id, value)` для динамических случаев.
 
 ---
 
@@ -903,9 +894,9 @@ struct MonsterTemplate {
 impl EntityTemplate for MonsterTemplate {
     fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity {
         // Параметры вызова могут переопределить поля:
-        let hp = params.get::<f32>("hp").copied().unwrap_or(self.base_hp);
+        let hp = params.get::<HpParam>().copied().unwrap_or(self.base_hp);
 
-        let entity = world.spawn_bundle((
+        let entity = world.spawn((
             Position { x: 0.0, y: 0.0 },
             Health { current: hp, max: self.base_hp },
             Enemy,
@@ -935,15 +926,18 @@ assert!(world.has_template("Monster"));
 
 ### 9.3 Параметры шаблонов (`TemplateParams`)
 
-Параметры позволяют переопределять значения при каждом спавне:
+Параметры позволяют переопределять значения при каждом спавне. Начиная с v0.1.0, `TemplateParams` использует **типизированные ключи** вместо строковых — ошибки в именах и типах обнаруживаются на этапе компиляции.
 
 ```rust
-use apex_core::template::TemplateParams;
+use apex_core::template::{TemplateParams, TemplateParam};
+
+// Определение типизированных параметров:
+struct HpParam;
+impl TemplateParam for HpParam { type Value = f32; }
 
 // Создание параметров:
 let params = TemplateParams::new()
-    .with("hp", 150.0_f32)
-    .build();
+    .set::<HpParam>(150.0);
 
 // Спавн из шаблона:
 let boss = world.spawn_from_template("Monster", &params)
@@ -957,7 +951,7 @@ let boss = world.spawn_from_template("Monster", &params)
 ```rust
 let mut cmds = Commands::new();
 cmds.spawn_template("Monster");
-cmds.spawn_from_template("Monster", params);
+cmds.spawn_from_template("Monster", params.clone());
 cmds.apply(&mut world);
 ```
 
@@ -972,7 +966,7 @@ struct ChildTemplate {
 
 impl EntityTemplate for ChildTemplate {
     fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
-        world.spawn_bundle((Position { x: 10.0, y: 0.0 },))
+        world.spawn((Position { x: 10.0, y: 0.0 },))
     }
 
     fn parent(&self) -> Option<Entity> {
@@ -981,7 +975,7 @@ impl EntityTemplate for ChildTemplate {
 }
 
 // При спавне child сразу получает ChildOf к parent:
-let child = world.spawn_from_template("Child", &TemplateParams::new().build());
+let child = world.spawn_from_template("Child", &TemplateParams::new());
 ```
 
 ### 9.6 Макрос `impl_entity_template!`
@@ -1171,7 +1165,7 @@ let orc = loader.instantiate(&mut world, "Orc")
 
 ```rust
 world.register_template("Orc", manifest);
-world.spawn_from_template("Orc", &TemplateParams::new().build());
+world.spawn_from_template("Orc", &TemplateParams::new());
 ```
 
 #### 10.4.4 Экспорт entity в префаб
@@ -1507,7 +1501,7 @@ for each system:
 Параллелизм безопасен благодаря трём архитектурным решениям:
 
 1. **Archetype-level sharing.** Параллельные системы получают `SubWorld` — shared borrow на уровне архетипов. Rayon гарантирует, что два `SubWorld` не перекрываются по конфликтующим архетипам (аналог borrow checker, но на stage-уровне).
-2. **Deferred structural changes.** `Commands::apply()` и `DeferredQueue::apply()` вызываются вне параллельного контекста. Это значит, что insert/remove не может произойти одновременно с параллельным чтением.
+2. **Deferred structural changes.** `Commands::apply()` вызывается вне параллельного контекста. Это значит, что insert/remove не может произойти одновременно с параллельным чтением.
 3. **Thread-local Commands (v0.1.0).** Каждая параллельная система автоматически получает собственный экземпляр `Commands` через `ctx.commands()` — не нужно создавать вручную. Команды применяются после каждого Stage.
 
 **Результаты ASD (12 потоков, i5-12400F):**
@@ -1520,7 +1514,7 @@ for each system:
 
 ### 13.2 Параллельная итерация внутри системы
 
-`par_for_each_component` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798):
+`par_for_each` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798):
 
 ```
 chunk = entity_count / max(num_threads, 1)
@@ -1538,7 +1532,7 @@ chunk = min(chunk, entity_count)
 impl ParSystem for PhysicsSystem {
     fn run(&mut self, ctx: SystemContext<'_>) {
         ctx.query::<(Read<Mass>, Write<Velocity>, Write<Position>)>()
-            .par_for_each_component(|(mass, vel, pos)| {
+            .par_for_each(|_, (mass, vel, pos)| {
                 vel.y -= 9.8 * mass.0 * 0.016;
                 pos.x += vel.x * 0.016;
                 pos.y += vel.y * 0.016;
@@ -1588,7 +1582,7 @@ sub_world.par_for_each_row(|_row| {
 
 #### Nested `par_for_each`
 
-Вызов `par_for_each` или `par_for_each_component` внутри callback'а другого `par_for_each` **запаникует** — Rayon не поддерживает вложенные вызовы `scope()` в одном thread pool. Используйте последовательную итерацию (`for_each`) внутри параллельного блока.
+Вызов `par_for_each` внутри callback'а другого `par_for_each` **запаникует** — Rayon не поддерживает вложенные вызовы `scope()` в одном thread pool. Используйте последовательную итерацию (`for_each`) внутри параллельного блока.
 
 #### Structural changes внутри `par_for_each`
 
@@ -1639,7 +1633,7 @@ impl ParSystem for ScriptedMovement {
 
 ### 14.1 Spawn
 
-- Используйте `spawn_many()` вместо цикла `spawn_bundle()` — один batch-аллокатор вместо N отдельных
+- Используйте `spawn_many()` вместо цикла `spawn()` — один batch-аллокатор вместо N отдельных
 - `spawn_many_silent()` — то же что `spawn_many`, но без возврата `Vec<Entity>` — экономит heap-аллокацию
 - `spawn_batch()` — для спавна из итератора с разными типами бандлов (удобно в тестах/примерах)
 - Определяйте компоненты для entity сразу при спавне — структурные изменения после спавна дороже
@@ -1648,7 +1642,7 @@ impl ParSystem for ScriptedMovement {
 
 - `CachedQuery` (`world.query_typed<Q>()`) переиспользует список архетипов — дешевле `Query::new()` в hot path
 - Используйте `With<T>`/`Without<T>` для фильтрации вместо `if` внутри closure
-- `for_each_component()` быстрее `for_each()` — не загружает Entity для каждой строки (доступно на `Query` и `CachedQuery`)
+- `for_each(|_, ...)` — единый метод; если entity не нужна, используйте `_` (компилятор оптимизирует загрузку entity)
 
 ### 14.3 Structural changes
 
@@ -1661,24 +1655,24 @@ impl ParSystem for ScriptedMovement {
 - Регистрируйте все Par-системы **ДО** Sequential — это максимизирует размер параллельных Stage
 - Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
 - Чем больше Par-систем без конфликтов — тем лучше масштабируется на N ядер
-- `par_for_each_component` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
+- `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 
 ### 14.5 Intra-system Parallelism
 
-`par_for_each_component` и `par_for_each` на `Query`/`CachedQuery` дают реальный прирост только когда:
+`par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
 - **Размер чанка** — вычисляется динамически [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): трёхуровневый минимум (128/32/64) и верхний лимит 16384 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
 
 ```rust
 // Хорошо: CPU-bound, много entity
 ctx.query::<(Read<Mass>, Write<Velocity>)>()
-    .par_for_each_component(|(mass, vel)| {
+    .par_for_each(|_, (mass, vel)| {
         vel.y -= 9.8 * mass.0 * 0.016; // CPU-bound
     });
 
 // Плохо: memory-bound, мало entity
 ctx.query::<Read<Position>>()
-    .par_for_each_component(|pos| {
+    .par_for_each(|_, pos| {
         let _ = pos.x.sqrt(); // memory-bound
     });
 ```
@@ -1706,8 +1700,8 @@ cargo run --release --features parallel
 |----------|:----------:|:---------------:|
 | `spawn_many_silent` (1 comp) | **35.4 M ops/s** | 🟢 O(N) |
 | `spawn_many_silent` (4 comp) | **15.7 M ops/s** | 🟢 O(N) |
-| `Query::for_each_component` | **145.8 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each_component` | **150.0 M ops/s** | 🟢 O(N) |
+| `Query::for_each` (без entity) | **145.8 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each` (без entity) | **150.0 M ops/s** | 🟢 O(N) |
 | `Query<(Read, Write)>` | **125.7 M ops/s** | 🟢 O(N) |
 | insert component | **12.3 M ops/s** | 🟢 O(N) |
 | despawn | **52.5 M ops/s** | 🟢 O(N) |
@@ -1721,13 +1715,13 @@ cargo run --release --features parallel
 
 | Сценарий | 100k | 1000k | Комментарий |
 |----------|:----:|:-----:|-------------|
-| `par_for_each` CPU-bound (atan2+cos) | 1.64x | **4.06x** | 🟢 Растёт с N |
+| `par_for_each` (без entity) CPU-bound (atan2+cos) | 1.64x | **4.06x** | 🟢 Растёт с N |
 | `par_for_each` memory-bound (sqrt) | 0.23x | 1.11x | 🟡 Memory bound |
 | Межсистемный, 2 CPU-bound | 1.07x | 1.07x | 🔴 Memory bound |
 | Solo 8 систем | 4.09x | **4.80x** | 🟢 Растёт с N |
 | Solo 12 систем | 4.22x | 4.72x | 🟡 Насыщение на 8 потоках |
 
-> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send + EventReader::iter (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
+> **Ключевой вывод:** `par_for_each` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send + EventReader::iter (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
 
 ### 14.8 Применённые оптимизации
 
@@ -1788,7 +1782,7 @@ impl AutoSystem for MovementSystem {
     fn run(&mut self, ctx: SystemContext<'_>) {
         let dt = ctx.resource::<DeltaTime>().0;
         ctx.query::<Self::Query>()
-            .for_each_component(|(vel, pos)| {
+            .for_each(|_, (vel, pos)| {
                 pos.x += vel.x * dt;
                 pos.y += vel.y * dt;
             });
@@ -1807,7 +1801,7 @@ fn main() {
     world.add_event::<DeathEvent>();
 
     // Спавн
-    let player = world.spawn_bundle((
+    let player = world.spawn((
         Position { x: 0.0, y: 0.0 },
         Velocity { x: 1.0, y: 0.0 },
         Health   { current: 100.0, max: 100.0 },
@@ -1881,13 +1875,14 @@ fn main() {
 >     world.register_component::<Player>();
 >     world.insert_resource(DeltaTime(0.016));
 >
->     // Настройка ScriptEngine
+>     // Настройка ScriptEngine — используем WorldScriptingExt
+>     use apex_scripting::WorldScriptingExt;
 >     let mut engine = ScriptEngine::new();
->     engine.register_component::<Position>(&world);
->     engine.register_component::<Velocity>(&world);
->     engine.register_component::<Health>(&world);
->     engine.register_component::<Player>(&world);
->     engine.register_resource::<DeltaTime>();
+>     world.register_scriptable::<Position>(&mut engine);
+>     world.register_scriptable::<Velocity>(&mut engine);
+>     world.register_scriptable::<Health>(&mut engine);
+>     world.register_scriptable::<Player>(&mut engine);
+>     world.register_scriptable_resource::<DeltaTime>(&mut engine);
 >
 >     engine.load_script_str("move", r#"
 >         let dt = delta_time();
@@ -1899,7 +1894,7 @@ fn main() {
 >     engine.set_active("move").unwrap();
 >
 >     // Спавн
->     let _player = world.spawn_bundle((
+>     let _player = world.spawn((
 >         Position { x: 0.0, y: 0.0 },
 >         Velocity { x: 1.0, y: 0.0 },
 >         Health   { current: 100.0, max: 100.0 },
@@ -1930,12 +1925,11 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
-| `spawn()` | Создать EntityBuilder для пошагового добавления компонентов |
-| `spawn_bundle(bundle)` | Создать entity с набором компонентов |
+| `spawn(bundle)` | Создать entity с набором компонентов (принимает Bundle; `spawn(())` для пустой entity) |
 | `spawn_many(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (возвращает Vec) |
 | `spawn_many_silent(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (без возврата Vec) |
 | `spawn_batch(iter)` | Спавн из итератора бандлов (разные типы) |
-| `spawn_empty()` | Создать entity без компонентов |
+| `entity(entity)` | Получить `EntityRef` для операций над entity (insert, remove, despawn, get, add_relation и т.д.) |
 | `despawn(entity)` | Уничтожить entity |
 | `insert(entity, component)` | Добавить компонент |
 | `remove::<T>(entity)` | Удалить компонент |
@@ -2006,8 +2000,16 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
+| `spawn(bundle)` | Создать entity с компонентами (отложенно) |
+| `despawn(entity)` | Уничтожить entity (отложенно) |
+| `insert(entity, component)` | Добавить компонент (отложенно) |
+| `remove::<T>(entity)` | Удалить компонент (отложенно) |
+| `remove_raw(entity, component_id)` | Удалить компонент по динамическому ComponentId |
+| `insert_raw(entity, component_id, value)` | Добавить компонент по динамическому ComponentId |
+| `add(fn)` | Произвольная команда `\|world: &mut World\|` |
 | `spawn_template(name)` | Создать entity из шаблона (без параметров) |
 | `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
+| `apply(&mut world)` | Применить все буферизованные команды |
 
 ### EntityTemplate API
 
@@ -2016,8 +2018,8 @@ fn main() {
 | `EntityTemplate::spawn(world, params)` | Создать entity из шаблона |
 | `EntityTemplate::parent()` | Опционально: вернуть Entity родителя |
 | `TemplateParams::new()` | Создать пустые параметры |
-| `TemplateParams::with(key, value)` | Добавить параметр |
-| `TemplateParams::build()` | Завершить сборку |
+| `TemplateParams::set::<P>(value)` | Установить значение типизированного параметра |
+| `TemplateParam` | Трейт для типизированного параметра (`type Value = ...`) |
 | `impl_entity_template!(T, name)` | Макрос: зарегистрировать тип как шаблон |
 
 ### Prefab API
@@ -2058,15 +2060,23 @@ fn main() {
 | `CloneableBridge::new(bridge)` | Создать клонируемый мост |
 | `sync_bridge_cloneable(world)` | Система синхронизации CloneableBridge |
 
+### WorldScriptingExt API (рекомендуемый способ регистрации)
+
+| Метод | Описание |
+|---|---|
+| `world.register_scriptable::<T>(&mut engine)` | Зарегистрировать компонент в World и ScriptEngine (один вызов) |
+| `world.register_scriptable_resource::<T>(&mut engine)` | Зарегистрировать ресурс в ScriptEngine |
+| `world.register_scriptable_event::<T>(&mut engine)` | Зарегистрировать событие в World и ScriptEngine (один вызов) |
+
 ### ScriptEngine API
 
 | Метод | Описание |
 |---|---|
 | `new()` | Создать ScriptEngine |
 | `with_dir(path)` | Создать ScriptEngine с файловым watcher для `.rhai` |
-| `register_component::<T>(&world)` | Зарегистрировать компонент для доступа из Rhai |
-| `register_resource::<T>()` | Зарегистрировать ресурс для доступа из Rhai |
-| `register_event::<T>()` | Зарегистрировать событие для отправки из Rhai |
+| `register_component::<T>(&world)` | Зарегистрировать компонент для доступа из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
+| `register_resource::<T>()` | Зарегистрировать ресурс для доступа из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
+| `register_event::<T>()` | Зарегистрировать событие для отправки из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
 | `load_script_str(name, code)` | Загрузить скрипт из строки |
 | `load_scripts()` | Загрузить все `.rhai`-файлы из директории |
 | `set_active(name)` | Установить активный скрипт |
@@ -2110,12 +2120,13 @@ struct CollisionEvent { entity: Entity }  // событие
 fn main() {
     let mut world = World::new();
 
-    // 2. Настроить движок
+    // 2. Настроить движок (используем WorldScriptingExt — один вызов вместо двух)
+    use apex_scripting::WorldScriptingExt;
     let mut engine = ScriptEngine::new();
-    engine.register_component::<Position>(&world);
-    engine.register_component::<Velocity>(&world);
-    engine.register_resource::<Gravity>();
-    engine.register_event::<CollisionEvent>();
+    world.register_scriptable::<Position>(&mut engine);
+    world.register_scriptable::<Velocity>(&mut engine);
+    world.register_scriptable_resource::<Gravity>(&mut engine);
+    world.register_scriptable_event::<CollisionEvent>(&mut engine);
 
     // 3. Загрузить скрипт
     engine.load_script_str("game", r#"

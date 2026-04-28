@@ -38,29 +38,24 @@ struct PlayerDied { x: f32, y: f32 }
 ### 2. Настроить движок
 
 ```rust
-use apex_scripting::ScriptEngine;
+use apex_scripting::{ScriptEngine, WorldScriptingExt};
 use std::path::Path;
-
-// Регистрируем компоненты в мире (обычно)
-world.register_component::<Position>();
-world.register_component::<Velocity>();
-
-// Регистрируем ресурсы и события
-world.resources.insert(Gravity { value: 9.8 });
-world.resources.insert(Score { value: 0 });
-world.add_event::<PlayerDied>();
 
 // Создаём ScriptEngine
 let mut engine = ScriptEngine::with_dir(Path::new("scripts/"));
 
-// Подключаем компоненты к скриптовому движку
-engine.register_component::<Position>(&world);
-engine.register_component::<Velocity>(&world);
+// Один вызов вместо двух — регистрирует и в ECS, и в ScriptEngine:
+world.register_scriptable::<Position>(&mut engine);
+world.register_scriptable::<Velocity>(&mut engine);
 
-// Подключаем ресурсы и события
-engine.register_resource::<Gravity>();
-engine.register_resource::<Score>();
-engine.register_event::<PlayerDied>();
+// Ресурсы: сначала вставить, потом зарегистрировать
+world.resources.insert(Gravity { value: 9.8 });
+world.resources.insert(Score { value: 0 });
+world.register_scriptable_resource::<Gravity>(&mut engine);
+world.register_scriptable_resource::<Score>(&mut engine);
+
+// События — один вызов:
+world.register_scriptable_event::<PlayerDied>(&mut engine);
 
 // Загружаем .rhai файлы
 engine.load_scripts().expect("ошибка загрузки скриптов");
@@ -158,7 +153,6 @@ fn run() {
 | `entity_count() → int` | Число живых entity (кешировано на момент `run()`) |
 | `query(descs) → iter` | Итератор entity с компонентами |
 | `spawn_entity(map)` | Создать entity с компонентами (отложено) |
-| `spawn_empty()` | Создать пустую entity (отложено) |
 | `despawn(entity_idx)` | Уничтожить entity (отложено) |
 | `read_resource(type_name) → Dynamic` | Прочитать глобальный ресурс по имени типа |
 | `write_resource(type_name, value)` | Записать глобальный ресурс (value — `Map` с полями) |
@@ -169,10 +163,15 @@ fn run() {
 ### Примеры работы с ресурсами и событиями
 
 ```rust
-// На стороне Rust — регистрация
+// Низкоуровневый API — прямая регистрация в ScriptEngine
 engine.register_resource::<Gravity>();
 engine.register_resource::<Score>();
 engine.register_event::<PlayerDied>();
+
+// Альтернатива — WorldScriptingExt (регистрирует и в ECS, и в ScriptEngine):
+// world.register_scriptable_resource::<Gravity>(&mut engine);
+// world.register_scriptable_resource::<Score>(&mut engine);
+// world.register_scriptable_event::<PlayerDied>(&mut engine);
 ```
 
 ```rhai
