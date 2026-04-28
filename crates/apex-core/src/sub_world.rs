@@ -101,7 +101,11 @@ impl<'w> SubWorld<'w> {
 
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
-        EventReader(self.world.events::<T>())
+        unsafe {
+            let ptr = self.world.event_queue_ptr::<T>()
+                .expect("event_reader: event type not registered");
+            EventReader::new(&mut *ptr)
+        }
     }
 
     #[inline]

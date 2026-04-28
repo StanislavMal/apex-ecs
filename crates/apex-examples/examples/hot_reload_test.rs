@@ -522,6 +522,9 @@ fn run() {
     let mut engine = ScriptEngine::new();
     engine.register_event::<PlayerDied>();
 
+    // Добавляем курсор для чтения событий
+    let mut event_cursor = world.events_mut::<PlayerDied>().add_reader();
+
     engine.load_script_str("emit", r#"
 fn run() {
     emit_event("PlayerDied", #{ x: 10.0, y: 20.0 });
@@ -530,10 +533,13 @@ fn run() {
     engine.set_active("emit").expect("set_active emit");
     engine.run(0.016, &mut world);
 
-    // Проверяем что событие дошло (ДО tick, т.к. tick перемещает current→previous)
-    let count = world.events::<PlayerDied>().iter_current().count();
+    // tick() перемещает pending → events, делая события доступными через курсор
+    world.tick();
+
+    // Проверяем что событие дошло (читаем через курсор)
+    let count = world.events::<PlayerDied>().iter(&event_cursor).len();
     if count == 1 {
-        let event = world.events::<PlayerDied>().iter_current().next().unwrap();
+        let event = &world.events::<PlayerDied>().iter(&event_cursor)[0];
         if (event.x - 10.0).abs() < 0.001 && (event.y - 20.0).abs() < 0.001 {
             println!("  ✅ emit_event: событие PlayerDied отправлено и получено");
         } else {
@@ -544,7 +550,6 @@ fn run() {
         println!("  ❌ emit_event: получено {} событий (ожидалось 1)", count);
         all_ok = false;
     }
-    world.tick();
     println!();
 
     // ═══════════════════════════════════════════════════════

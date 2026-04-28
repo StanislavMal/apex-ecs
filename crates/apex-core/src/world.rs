@@ -11,7 +11,7 @@ use crate::{
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
-    resources::ResourceMap,
+    resources::Resources,
     system_param::{Res, ResMut, EventReader, EventWriter, WorldQuerySystemAccess},
     template::TemplateRegistry,
 };
@@ -218,7 +218,7 @@ pub struct World {
     pub(crate) relations:            RelationRegistry,
     pub(crate) id_index:             IdIndex,
     pub(crate) subject_index:        SubjectIndex,
-    pub        resources:       ResourceMap,
+    pub        resources:       Resources,
     pub(crate) events:          EventRegistry,
     /// Коллбэки, вызываемые при записи компонента (вызове get_mut).
     /// Функция-указатель (Copy), чтобы избежать borrow conflict с self.
@@ -241,7 +241,7 @@ impl World {
             relations:       RelationRegistry::new(),
             id_index:        IdIndex::default(),
             subject_index:   SubjectIndex::new(),
-            resources:       ResourceMap::new(),
+            resources:       Resources::new(),
             events:          EventRegistry::new(),
             write_hooks:     FxHashMap::default(),
             templates:       TemplateRegistry::new(),
@@ -372,12 +372,12 @@ impl World {
     }
 
     #[track_caller]
-    pub fn events<T: Send + Sync + 'static>(&self) -> &crate::events::EventQueue<T> {
+    pub fn events<T: Send + Sync + 'static>(&self) -> &crate::events::Events<T> {
         self.events.get::<T>()
     }
 
     #[track_caller]
-    pub fn events_mut<T: Send + Sync + 'static>(&mut self) -> &mut crate::events::EventQueue<T> {
+    pub fn events_mut<T: Send + Sync + 'static>(&mut self) -> &mut crate::events::Events<T> {
         self.events.get_mut::<T>()
     }
 
@@ -399,7 +399,7 @@ impl World {
 
     pub fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
-    ) -> Option<*mut crate::events::EventQueue<T>> {
+    ) -> Option<*mut crate::events::Events<T>> {
         self.events.get_raw_ptr::<T>()
     }
 
@@ -1130,7 +1130,12 @@ impl<'w> SystemContext<'w> {
 
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
-        EventReader(unsafe { self.world().events::<T>() })
+        unsafe {
+            let ptr = self.world()
+                .event_queue_ptr::<T>()
+                .expect("event_reader: event type not registered");
+            EventReader::new(&mut *ptr)
+        }
     }
 
     #[inline]

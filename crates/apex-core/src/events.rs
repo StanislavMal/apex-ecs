@@ -2,11 +2,11 @@
 //!
 //! # Концепция
 //!
-//! - [`TrackedEventQueue<T>`] — основной тип. Содержит два буфера:
+//! - [`Events<T>`] — основной тип. Содержит два буфера:
 //!   `pending` (куда пишут в текущем тике) и `events` (доступно для чтения).
 //! - [`EventCursor`] — лёгкий дескриптор читателя. Каждый читатель
 //!   регистрирует свой курсор и двигает его по мере чтения.
-//! - После вызова [`update()`](TrackedEventQueue::update) (в конце тика) буферы
+//! - После вызова [`update()`](Events::update) (в конце тика) буферы
 //!   меняются местами: `pending` → `events`, а старые события из `events`
 //!   удаляются (если все читатели их прочитали).
 //! - [`EntityEvent<T>`] — событие, адресованное конкретной сущности.
@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::entity::Entity;
 
-// ── TrackedEventQueue ───────────────────────────────────────────
+// ── Events ──────────────────────────────────────────────────────
 
 /// Очередь событий с per-reader отслеживанием прогресса чтения.
 ///
@@ -30,7 +30,7 @@ use crate::entity::Entity;
 /// 4. После прочтения курсор читателя устанавливается на `events.len()`.
 /// 5. Garbage collection: если все активные читатели прочитали все события,
 ///    буфер `events` очищается.
-pub struct TrackedEventQueue<T> {
+pub struct Events<T> {
     /// Буфер, доступный для чтения (предыдущий тик).
     events: Vec<T>,
     /// Буфер, куда пишутся новые события (текущий тик).
@@ -43,7 +43,7 @@ pub struct TrackedEventQueue<T> {
     free_list: Vec<EventCursor>,
 }
 
-impl<T> TrackedEventQueue<T> {
+impl<T> Events<T> {
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
@@ -68,7 +68,7 @@ impl<T> TrackedEventQueue<T> {
     /// Зарегистрировать нового читателя.
     ///
     /// Возвращает [`EventCursor`], который нужно хранить и передавать
-    /// при каждом вызове [`iter()`](TrackedEventQueue::iter).
+    /// при каждом вызове [`iter()`](Events::iter).
     pub fn add_reader(&mut self) -> EventCursor {
         let id = self.next_cursor_id;
         self.next_cursor_id += 1;
@@ -169,40 +169,12 @@ impl<T> TrackedEventQueue<T> {
         }
     }
 
-    /// Продвинуть курсор читателя до конца буфера (отметить всё как прочитанное).
-    ///
-    /// **Внимание:** эта функция — заведомый no-op. Через `&self` невозможно
-    /// мутировать курсор, поэтому вызов ничего не делает.
-    /// Используйте [`advance_reader_mut`](TrackedEventQueue::advance_reader_mut).
-    #[deprecated(note = "Use advance_reader_mut instead — this function is a no-op")]
-    #[inline]
-    pub fn advance_reader(&self, reader_id: &EventCursor) {
-        let _ = reader_id;
-    }
-
     /// Мутабельная версия продвижения курсора.
     #[inline]
     pub fn advance_reader_mut(&mut self, reader_id: &EventCursor) {
         let idx = reader_id.0 as usize;
         if let Some(Some(pos)) = self.cursors.get_mut(idx) {
             *pos = self.events.len() as u32;
-        }
-    }
-
-    /// Прочитать непрочитанные события и сразу продвинуть курсор.
-    #[inline]
-    pub fn read_and_advance(&mut self, reader_id: &EventCursor) -> Vec<&T> {
-        let idx = reader_id.0 as usize;
-        let start = self.cursors.get(idx).and_then(|c| c.as_ref()).copied().unwrap_or(0) as usize;
-        let end = self.events.len();
-        if start < end {
-            if let Some(Some(pos)) = self.cursors.get_mut(idx) {
-                *pos = end as u32;
-            }
-            // Возвращаем ссылки на непрочитанные события
-            self.events[start..].iter().collect()
-        } else {
-            Vec::new()
         }
     }
 
@@ -262,39 +234,9 @@ impl<T> TrackedEventQueue<T> {
             None => true, // удалённые читатели не учитываем
         })
     }
-
-    // ── Backward-compatible методы (старый EventQueue API) ─────
-
-    /// Итерация по событиям из буфера чтения (предыдущий тик).
-    /// Аналог старого `iter_previous()`.
-    #[inline]
-    pub fn iter_previous(&self) -> std::slice::Iter<'_, T> {
-        self.events.iter()
-    }
-
-    /// Итерация по событиям из буфера записи (текущий тик).
-    /// Аналог старого `iter_current()`.
-    #[inline]
-    pub fn iter_current(&self) -> std::slice::Iter<'_, T> {
-        self.pending.iter()
-    }
-
-    /// Итерация по всем событиям (чтение + запись).
-    /// Аналог старого `iter_all()`.
-    #[inline]
-    pub fn iter_all(&self) -> impl Iterator<Item = &T> {
-        self.events.iter().chain(self.pending.iter())
-    }
-
-    /// Количество событий в буфере чтения.
-    /// Аналог старого `len_previous()`.
-    #[inline]
-    pub fn len_previous(&self) -> usize {
-        self.events.len()
-    }
 }
 
-impl<T> Default for TrackedEventQueue<T> {
+impl<T> Default for Events<T> {
     fn default() -> Self {
         Self::new()
     }
@@ -302,9 +244,9 @@ impl<T> Default for TrackedEventQueue<T> {
 
 /// RAII-обёртка: при дропе автоматически продвигает курсор до конца буфера.
 ///
-/// Создаётся через [`TrackedEventQueue::read`].
+/// Создаётся через [`Events::read`].
 pub struct EventReadGuard<'q, T> {
-    queue:     &'q mut TrackedEventQueue<T>,
+    queue:     &'q mut Events<T>,
     reader_id: EventCursor,
     start:     usize,
 }
@@ -359,7 +301,7 @@ impl<T> Drop for PeekGuard<'_, T> {
 
 /// Легковесный дескриптор читателя событий.
 ///
-/// Создаётся через [`TrackedEventQueue::add_reader`].
+/// Создаётся через [`Events::add_reader`].
 /// Хранится в [`EventReader`](crate::system_param::EventReader).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventCursor(pub u32);
@@ -439,7 +381,7 @@ impl<T> DelayedQueue<T> {
     /// Переместить все события, готовые к доставке, в `target_queue`.
     ///
     /// Возвращает количество доставленных событий.
-    pub fn flush_delayed(&mut self, current_tick: u32, target_queue: &mut TrackedEventQueue<T>) {
+    pub fn flush_delayed(&mut self, current_tick: u32, target_queue: &mut Events<T>) {
         if self.pending_delayed.is_empty() {
             return;
         }
@@ -497,9 +439,9 @@ pub trait AnyEventQueue: Any + Send + Sync {
     fn remove_reader(&mut self, reader_id: u32);
 }
 
-impl<T: Send + Sync + 'static> AnyEventQueue for TrackedEventQueue<T> {
+impl<T: Send + Sync + 'static> AnyEventQueue for Events<T> {
     fn update(&mut self) {
-        TrackedEventQueue::update(self);
+        Events::update(self);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -511,19 +453,19 @@ impl<T: Send + Sync + 'static> AnyEventQueue for TrackedEventQueue<T> {
     }
 
     fn len(&self) -> usize {
-        TrackedEventQueue::len(self)
+        Events::len(self)
     }
 
     fn as_ptr_mut(&mut self) -> *mut u8 {
-        self as *mut TrackedEventQueue<T> as *mut u8
+        self as *mut Events<T> as *mut u8
     }
 
     fn add_reader(&mut self) -> u32 {
-        TrackedEventQueue::add_reader(self).0
+        Events::add_reader(self).0
     }
 
     fn remove_reader(&mut self, reader_id: u32) {
-        TrackedEventQueue::remove_reader(self, EventCursor(reader_id));
+        Events::remove_reader(self, EventCursor(reader_id));
     }
 }
 
@@ -533,7 +475,7 @@ impl<T: Send + Sync + 'static> AnyEventQueue for TrackedEventQueue<T> {
 /// Wrapper around `*mut u8` that implements `Send + Sync`.
 ///
 /// # Safety
-/// Указатель указывает на `TrackedEventQueue<T>`, который живёт в `Box<dyn AnyEventQueue>`
+/// Указатель указывает на `Events<T>`, который живёт в `Box<dyn AnyEventQueue>`
 /// внутри `self.queues`. Box гарантирует, что данные на куче не перемещаются.
 /// `FxHashMap` может перемещать `Box` (указатель на кучу), но не данные внутри Box.
 /// Таким образом, указатель остаётся валидным на всё время жизни `EventRegistry`.
@@ -542,15 +484,15 @@ struct SyncPtr(*mut u8);
 unsafe impl Send for SyncPtr {}
 unsafe impl Sync for SyncPtr {}
 
-/// Реестр очередей событий — карта `TypeId → TrackedEventQueue<T>`.
+/// Реестр очередей событий — карта `TypeId → Events<T>`.
 ///
-/// Оптимизация: `raw_ptrs` хранит сырые указатели на `TrackedEventQueue<T>`,
+/// Оптимизация: `raw_ptrs` хранит сырые указатели на `Events<T>`,
 /// что позволяет `get::<T>()` и `get_mut::<T>()` работать без `downcast_ref`
 /// (vtable call). Указатели валидны, т.к. `Box<dyn AnyEventQueue>` в `queues`
 /// не перемещает данные на куче при реаллокации HashMap.
 pub struct EventRegistry {
     queues:   FxHashMap<TypeId, Box<dyn AnyEventQueue>>,
-    /// Zero-cost кеш для typed доступа: `TypeId → *mut TrackedEventQueue<T>`.
+    /// Zero-cost кеш для typed доступа: `TypeId → *mut Events<T>`.
     /// Позволяет избежать `downcast_ref` в get::<T>().
     /// SyncPtr — newtype с `unsafe impl Sync` для совместимости с `&World` в par_iter().
     raw_ptrs: FxHashMap<TypeId, SyncPtr>,
@@ -566,15 +508,15 @@ impl EventRegistry {
 
     /// Зарегистрировать тип события.
     ///
-    /// Создаёт новую `TrackedEventQueue<T>`, если ещё не зарегистрирован.
+    /// Создаёт новую `Events<T>`, если ещё не зарегистрирован.
     /// Одновременно сохраняет raw pointer в `raw_ptrs` для zero-cost доступа.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
         if !self.raw_ptrs.contains_key(&TypeId::of::<T>()) {
-            let boxed = Box::new(TrackedEventQueue::<T>::new());
+            let boxed = Box::new(Events::<T>::new());
             // Сохраняем указатель на данные Box (куча — не перемещается).
             // Box::as_ref() даёт ссылку на данные внутри Box, которые находятся
             // на куче и не изменят адрес при реаллокации HashMap.
-            let ptr = Box::as_ref(&boxed) as *const TrackedEventQueue<T> as *mut u8;
+            let ptr = Box::as_ref(&boxed) as *const Events<T> as *mut u8;
             self.raw_ptrs.insert(TypeId::of::<T>(), SyncPtr(ptr));
             self.queues.insert(TypeId::of::<T>(), boxed);
         }
@@ -583,7 +525,7 @@ impl EventRegistry {
     /// Получить очередь событий по типу (паникует если не зарегистрирована).
     /// O(1) через raw_ptrs — без vtable вызовов.
     #[track_caller]
-    pub fn get<T: Send + Sync + 'static>(&self) -> &TrackedEventQueue<T> {
+    pub fn get<T: Send + Sync + 'static>(&self) -> &Events<T> {
         unsafe {
             let ptr = self.raw_ptrs.get(&TypeId::of::<T>())
                 .unwrap_or_else(|| {
@@ -592,14 +534,14 @@ impl EventRegistry {
                         std::any::type_name::<T>()
                     )
                 });
-            &*(ptr.0 as *const TrackedEventQueue<T>)
+            &*(ptr.0 as *const Events<T>)
         }
     }
 
     /// Мутабельный доступ к очереди (паникует если не зарегистрирована).
     /// O(1) через raw_ptrs — без vtable вызовов.
     #[track_caller]
-    pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut TrackedEventQueue<T> {
+    pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
         unsafe {
             let ptr = self.raw_ptrs.get(&TypeId::of::<T>())
                 .unwrap_or_else(|| {
@@ -608,25 +550,25 @@ impl EventRegistry {
                         std::any::type_name::<T>()
                     )
                 });
-            &mut *(ptr.0 as *mut TrackedEventQueue<T>)
+            &mut *(ptr.0 as *mut Events<T>)
         }
     }
 
     /// Попробовать получить очередь событий по типу.
     /// O(1) через raw_ptrs — без vtable вызовов.
-    pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&TrackedEventQueue<T>> {
+    pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&Events<T>> {
         unsafe {
             self.raw_ptrs.get(&TypeId::of::<T>())
-                .map(|ptr| &*(ptr.0 as *const TrackedEventQueue<T>))
+                .map(|ptr| &*(ptr.0 as *const Events<T>))
         }
     }
 
     /// Попробовать получить мутабельный доступ к очереди.
     /// O(1) через raw_ptrs — без vtable вызовов.
-    pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut TrackedEventQueue<T>> {
+    pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut Events<T>> {
         unsafe {
             self.raw_ptrs.get(&TypeId::of::<T>())
-                .map(|ptr| &mut *(ptr.0 as *mut TrackedEventQueue<T>))
+                .map(|ptr| &mut *(ptr.0 as *mut Events<T>))
         }
     }
 
@@ -634,9 +576,9 @@ impl EventRegistry {
     ///
     /// # Safety
     /// Вызывающий гарантирует уникальный доступ.
-    pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut TrackedEventQueue<T>> {
+    pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut Events<T>> {
         self.raw_ptrs.get(&TypeId::of::<T>())
-            .map(|ptr| ptr.0 as *mut TrackedEventQueue<T>)
+            .map(|ptr| ptr.0 as *mut Events<T>)
     }
 
     /// Обновить все очереди (вызывается в конце тика).
@@ -668,11 +610,6 @@ impl Default for EventRegistry {
     }
 }
 
-// ── EventQueue (legacy alias для обратной совместимости) ────────
-
-/// Устаревший alias. Используйте [`TrackedEventQueue`].
-pub type EventQueue<T> = TrackedEventQueue<T>;
-
 // ── Тесты ─────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -681,7 +618,7 @@ mod tests {
 
     #[test]
     fn send_and_read() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
 
         queue.send(42);
@@ -701,7 +638,7 @@ mod tests {
 
     #[test]
     fn two_readers_independent() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader_a = queue.add_reader();
         let reader_b = queue.add_reader();
 
@@ -737,7 +674,7 @@ mod tests {
 
     #[test]
     fn reader_removed_still_works() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
 
         queue.send(10);
@@ -753,7 +690,7 @@ mod tests {
 
     #[test]
     fn entity_event_send_and_read() {
-        let mut queue = TrackedEventQueue::<EntityEvent<i32>>::new();
+        let mut queue = Events::<EntityEvent<i32>>::new();
         let reader = queue.add_reader();
 
         let entity = Entity { index: 42, generation: 1 };
@@ -769,7 +706,7 @@ mod tests {
 
     #[test]
     fn delayed_event_delivery() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
         let mut delayed = DelayedQueue::new();
 
@@ -799,7 +736,7 @@ mod tests {
 
     #[test]
     fn delayed_event_varying_delays() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
         let mut delayed = DelayedQueue::new();
 
@@ -820,7 +757,7 @@ mod tests {
 
     #[test]
     fn clear_resets_everything() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
 
         queue.send(1);
@@ -838,7 +775,7 @@ mod tests {
 
     #[test]
     fn multiple_updates_cycle() {
-        let mut queue = TrackedEventQueue::new();
+        let mut queue = Events::new();
         let reader = queue.add_reader();
 
         // Тик 1

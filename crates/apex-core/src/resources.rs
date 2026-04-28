@@ -16,11 +16,11 @@ impl ResourceStorage for ResourceStorageImpl {
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> { self.0 }
 }
 
-pub struct ResourceMap {
+pub struct Resources {
     data: FxHashMap<TypeId, Box<dyn ResourceStorage>>,
 }
 
-impl ResourceMap {
+impl Resources {
     pub fn new() -> Self {
         Self { data: FxHashMap::default() }
     }
@@ -93,7 +93,7 @@ impl ResourceMap {
     pub fn is_empty(&self) -> bool  { self.data.is_empty() }
 }
 
-impl Default for ResourceMap {
+impl Default for Resources {
     fn default() -> Self { Self::new() }
 }
 
@@ -106,14 +106,14 @@ mod tests {
 
     #[test]
     fn insert_get() {
-        let mut map = ResourceMap::new();
+        let mut map = Resources::new();
         map.insert(Gravity(9.8));
         assert_eq!(map.get::<Gravity>().0, 9.8);
     }
 
     #[test]
     fn get_mut() {
-        let mut map = ResourceMap::new();
+        let mut map = Resources::new();
         map.insert(Score(0));
         map.get_mut::<Score>().0 += 10;
         assert_eq!(map.get::<Score>().0, 10);
@@ -121,13 +121,13 @@ mod tests {
 
     #[test]
     fn try_get_missing() {
-        let map = ResourceMap::new();
+        let map = Resources::new();
         assert!(map.try_get::<Gravity>().is_none());
     }
 
     #[test]
     fn remove() {
-        let mut map = ResourceMap::new();
+        let mut map = Resources::new();
         map.insert(Score(42));
         assert!(map.contains::<Score>());
         map.remove::<Score>();
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn get_raw_ptr() {
-        let mut map = ResourceMap::new();
+        let mut map = Resources::new();
         map.insert(Score(10));
         let ptr = map.get_raw_ptr::<Score>().unwrap();
         // SAFETY: тест — единственный владелец
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "not found")]
     fn get_panics_if_missing() {
-        let map = ResourceMap::new();
+        let map = Resources::new();
         let _ = map.get::<Gravity>();
     }
 }

@@ -399,9 +399,11 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 События используют двойную буферизацию: `current` (текущий тик, буфер `pending`) и `previous` (прошлый тик, буфер `events`). Вызов `world.tick()` переключает буферы.
 
-Внутренний тип очереди — [`TrackedEventQueue<T>`](crates/apex-core/src/events.rs:33) (он же `EventQueue<T>` — устаревший alias). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
+Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:33). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
 
-#### 5.2.1 Базовая отправка и чтение (старый API)
+#### 5.2.1 Базовая отправка и чтение через `EventReader`
+
+Для чтения событий используется [`EventReader<T>`](crates/apex-core/src/system_param.rs:110) с per-reader курсором. `EventReader::new()` безопасно создаёт читателя, автоматически регистрируя его через `add_reader()`.
 
 ```rust
 #[derive(Clone, Copy)]
@@ -414,6 +416,9 @@ struct DeathEvent { entity: Entity }
 world.add_event::<DamageEvent>();
 world.add_event::<DeathEvent>();
 
+// Создание читателя событий (safe — сам вызывает add_reader()):
+let mut reader = EventReader::new(world.events_mut::<DamageEvent>());
+
 // Отправка события (паникует если тип не зарегистрирован):
 world.send_event(DamageEvent { target: enemy, amount: 35.0 });
 
@@ -424,34 +429,36 @@ if world.try_send_event(DamageEvent { target: enemy, amount: 35.0 }) {
     // тип не зарегистрирован — вызовите world.add_event::<DamageEvent>()
 }
 
-// Чтение событий предыдущего тика (стандартный режим):
-for ev in world.events::<DamageEvent>().iter_previous() {
+// Чтение непрочитанных событий через slice (без продвижения курсора):
+for ev in reader.iter() {
     println!("damage: {} → entity {:?}", ev.amount, ev.target);
 }
 
-// Чтение событий текущего тика:
-for ev in world.events::<DamageEvent>().iter_current() { /* ... */ }
-
-// Мутабельный доступ к очереди событий:
-let mut events = world.events_mut::<DamageEvent>();
-events.clear(); // очистить все события
-
-// Все события (current + previous):
-for ev in world.events::<DamageEvent>().iter_all() { /* ... */ }
+// RAII-чтение с авто-продвижением курсора при Drop:
+{
+    let guard = reader.read();  // -> EventReadGuard<DamageEvent>
+    for ev in guard.iter() {
+        process(ev);
+    }
+} // ← курсор автоматически продвинут
 
 // Переключение буферов (вызывать раз в кадр):
-world.tick(); // current → previous, новый current пустой
+world.tick();
+
+// После tick() курсор показывает новые события из предыдущего тика:
+for ev in reader.iter() {
+    println!("new tick: {:?}", ev);
+}
 ```
 
-#### 5.2.2 Per-reader чтение (новый API)
+#### 5.2.2 Per-reader чтение (низкоуровневое)
 
-[`TrackedEventQueue<T>`](crates/apex-core/src/events.rs:33) поддерживает произвольное количество независимых читателей, каждый со своим курсором [`EventCursor`](crates/apex-core/src/events.rs:365).
+[`Events<T>`](crates/apex-core/src/events.rs:33) поддерживает произвольное количество независимых читателей, каждый со своим курсором [`EventCursor`](crates/apex-core/src/events.rs:365). Для типовых сценариев используйте [`EventReader`](#521-базовая-отправка-и-чтение-через-eventreader), а низкоуровневый API — для максимального контроля:
 
 ```rust
-// Получаем мутабельную ссылку на очередь:
 let queue = world.events_mut::<DamageEvent>();
 
-// Создаём читателя:
+// Создаём читателя вручную:
 let reader_a = queue.add_reader();   // -> EventCursor
 let reader_b = queue.add_reader();
 
@@ -473,13 +480,13 @@ for ev in queue.iter(&reader_b) { /* ... */ }
 // Удаление читателя:
 queue.remove_reader(reader_b);
 
-// Количество непрочитанных событий в буфере:
+// Количество непрочитанных событий:
 let n = queue.len_pending();
 ```
 
 #### 5.2.3 RAII-чтение с автоматическим продвижением (`EventReadGuard`)
 
-[`EventReadGuard<T>`](crates/apex-core/src/events.rs:306) — RAII-обёртка, которая при Drop автоматически продвигает курсор до конца буфера. Исключает забытые `advance_reader_mut()`.
+[`EventReadGuard<T>`](crates/apex-core/src/events.rs:248) — RAII-обёртка, которая при Drop автоматически продвигает курсор до конца буфера. Исключает забытые `advance_reader_mut()`.
 
 ```rust
 let queue = world.events_mut::<DamageEvent>();
@@ -501,7 +508,7 @@ if !guard.is_empty() {
 
 #### 5.2.4 Просмотр без продвижения (`PeekGuard`)
 
-[`PeekGuard<T>`](crates/apex-core/src/events.rs:346) — обёртка над `EventReadGuard`, которая **не** продвигает курсор при Drop.
+[`PeekGuard<T>`](crates/apex-core/src/events.rs:290) — обёртка над `EventReadGuard`, которая **не** продвигает курсор при Drop.
 
 ```rust
 let queue = world.events_mut::<DamageEvent>();
@@ -514,7 +521,7 @@ println!("{} pending events", peek.len());
 
 #### 5.2.5 Пакетная отправка (`send_batch`)
 
-Для массовой отправки событий используйте [`send_batch`](crates/apex-core/src/events.rs:64):
+Для массовой отправки событий используйте [`send_batch`](crates/apex-core/src/events.rs:98):
 
 ```rust
 let queue = world.events_mut::<DamageEvent>();
@@ -529,7 +536,7 @@ queue.send_batch(batch);
 queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 }));
 ```
 
-#### 5.2.6 Сводка методов `TrackedEventQueue<T>`
+#### 5.2.6 Сводка методов `Events<T>`
 
 | Метод | Описание |
 |-------|----------|
@@ -541,12 +548,18 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
 | `advance_reader_mut(reader_id)` | Ручное продвижение курсора до конца буфера |
 | `len_pending() -> usize` | Количество событий в буфере записи |
-| `len_readable() -> usize` | Количество событий, доступных для чтения |
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
-| `iter_previous()` | Итерация по буферу чтения (старый API) |
-| `iter_current()` | Итерация по буферу записи (старый API) |
-| `iter_all()` | Итерация по всем событиям (старый API) |
 | `update()` | Переключить буферы (вызывается автоматически в `world.tick()`) |
+
+**`EventReader<T>`** (рекомендуемый высокоуровневый API):
+
+| Метод | Описание |
+|-------|----------|
+| `new(events: &mut Events<T>) -> Self` | Создать читателя (авто-регистрация через `add_reader()`) |
+| `iter(&self) -> &[T]` | Непрочитанные события в виде среза (без продвижения) |
+| `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
+| `len(&self) -> usize` | Количество непрочитанных событий |
+| `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
 
 ---
 
@@ -647,9 +660,10 @@ Sequential система получает `&mut World` и выполняетс�
 ```rust
 // Sequential системы — замыкания fn(&mut World):
 sched.add_system("despawn_dead", |world: &mut World| {
-    let deaths: Vec<Entity> = world
-        .events::<DeathEvent>()
-        .iter_current()
+    use apex_core::system_param::EventReader;
+    let mut reader = EventReader::new(world.events_mut::<DeathEvent>());
+    let deaths: Vec<Entity> = reader
+        .iter()
         .map(|ev| ev.entity)
         .collect();
 
@@ -1366,7 +1380,7 @@ bridge_b.apply_incoming(&mut sub.world);
 
 ### 12.3 `CloneableBridge`
 
-Для хранения моста в `ResourceMap` (требуется `Clone`) используйте `CloneableBridge`:
+Для хранения моста в `Resources` (требуется `Clone`) используйте `CloneableBridge`:
 
 ```rust
 use apex_isolated::{CloneableBridge, sync_bridge_cloneable};
@@ -1677,8 +1691,8 @@ cargo run --release --features parallel
 | despawn | **52.5 M ops/s** | 🟢 O(N) |
 | resource read | **298 M ops/s** | 🟢 O(1) |
 | resource write | **405 M ops/s** | 🟢 O(1) |
-| event send + iter_current | **165 M ops/s** | 🟢 O(N) |
-| event send → tick → iter_prev | **117 M ops/s** | 🟢 O(N) |
+| event send + EventReader::iter | **165 M ops/s** | 🟢 O(N) |
+| event send → tick → EventReader::iter | **117 M ops/s** | 🟢 O(N) |
 | event send_batch (100) | **5 882 M ops/s** | 🟢 O(N) |
 
 **Параллельное ускорение (speedup = seq/par, 12 потоков):**
@@ -1691,7 +1705,7 @@ cargo run --release --features parallel
 | Solo 8 систем | 4.09x | **4.80x** | 🟢 Растёт с N |
 | Solo 12 систем | 4.22x | 4.72x | 🟡 Насыщение на 8 потоках |
 
-> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send+iter_current (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
+> **Ключевой вывод:** `par_for_each_component` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send + EventReader::iter (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
 
 ### 14.8 Применённые оптимизации
 
@@ -1914,8 +1928,8 @@ fn main() {
 | `add_event::<T>()` | Зарегистрировать тип события |
 | `send_event(event)` | Отправить событие (panic если не зарегистрирован) |
 | `try_send_event(event)` | Безопасная отправка события → `bool` |
-| `events::<T>()` | Получить `EventQueue<T>` (иммутабельно) |
-| `events_mut::<T>()` | Получить `EventQueue<T>` (мутабельно) |
+| `events::<T>()` | Получить `Events<T>` (иммутабельно) |
+| `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
 | `tick()` | Переключить буферы событий, +1 тик |
 | `query_typed::<Q>()` | CachedQuery — кешированный запрос |
 | `query_changed::<Q>(tick)` | CachedQuery с change detection |

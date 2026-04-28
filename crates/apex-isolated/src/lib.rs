@@ -200,7 +200,7 @@ impl Default for IsolatedWorld {
 ///
 /// `WorldBridge` не реализует `Clone`, но его внутренние каналы
 /// (`crossbeam_channel::Sender`/`Receiver`) клонируются.
-/// Эта обёртка пригодна для хранения в `ResourceMap`.
+/// Эта обёртка пригодна для хранения в `Resources`.
 #[derive(Clone)]
 pub struct CloneableBridge {
     /// Sender для отправки событий в IsolatedWorld.

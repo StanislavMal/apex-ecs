@@ -57,7 +57,7 @@ use std::marker::PhantomData;
 use crate::{
     access::AccessDescriptor,
     entity::Entity,
-    events::EventQueue,
+    events::{EventCursor, Events, EventReadGuard},
     query::{Query, WorldQuery},
     world::World,
 };
@@ -106,29 +106,60 @@ unsafe impl<T: Send + Sync + 'static> Sync for ResMut<'_, T> {}
 
 // ── EventReader / EventWriter ──────────────────────────────────
 
-/// Читатель событий — иммутабельный доступ к EventQueue.
-pub struct EventReader<'w, T: Send + Sync + 'static>(pub &'w EventQueue<T>);
-
-impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
-    /// Итерация по событиям предыдущего тика (стандартный режим).
-    #[inline] pub fn iter(&self) -> std::slice::Iter<'_, T> { self.0.iter_previous() }
-    /// Итерация по событиям текущего тика (того же кадра).
-    #[inline] pub fn iter_current(&self) -> std::slice::Iter<'_, T> { self.0.iter_current() }
-    /// Все события: текущий + предыдущий тик.
-    #[inline] pub fn iter_all(&self) -> impl Iterator<Item = &T> { self.0.iter_all() }
-    #[inline] pub fn len(&self) -> usize { self.0.len_previous() }
-    #[inline] pub fn is_empty(&self) -> bool { self.0.len_previous() == 0 }
+/// Читатель событий — использует per-reader курсор.
+pub struct EventReader<'w, T: Send + Sync + 'static> {
+    /// Сырой указатель для возможности мутабельного доступа через `read()`.
+    ptr: *const Events<T>,
+    cursor: EventCursor,
+    _marker: PhantomData<&'w Events<T>>,
 }
 
-/// Отправитель событий — мутабельный доступ к EventQueue.
+impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
+    /// Создать читателя с новым курсором.
+    /// # Panics
+    /// Паникует если события типа T не зарегистрированы.
+    pub fn new(events: &'w mut Events<T>) -> Self {
+        let cursor = events.add_reader();
+        Self {
+            ptr: events as *const Events<T>,
+            cursor,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Итерация по непрочитанным событиям.
+    #[inline]
+    pub fn iter(&self) -> &[T] {
+        unsafe { (*self.ptr).iter(&self.cursor) }
+    }
+
+    /// Прочитать и автоматически продвинуть курсор (RAII).
+    #[inline]
+    pub fn read(&mut self) -> EventReadGuard<'_, T> {
+        unsafe { (self.ptr as *mut Events<T>).as_mut().unwrap().read(&self.cursor) }
+    }
+
+    /// Количество непрочитанных событий.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.iter().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.iter().is_empty()
+    }
+}
+
+/// Отправитель событий — мутабельный доступ к Events.
 pub struct EventWriter<'w, T: Send + Sync + 'static> {
-    ptr: *mut EventQueue<T>,
-    _marker: PhantomData<&'w mut EventQueue<T>>,
+    ptr: *mut Events<T>,
+    _marker: PhantomData<&'w mut Events<T>>,
 }
 
 impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
     /// # Safety: ptr валиден на 'w, уникальный доступ гарантирован планировщиком.
-    pub unsafe fn from_ptr(ptr: *mut EventQueue<T>) -> Self {
+    pub unsafe fn from_ptr(ptr: *mut Events<T>) -> Self {
         Self { ptr, _marker: PhantomData }
     }
 

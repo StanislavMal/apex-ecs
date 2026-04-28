@@ -829,37 +829,40 @@ fn bench_events(n: usize) {
     println!("\n── Events ({n}k событий) ─────────────────────────────────────────────────────────");
 
     bench_with_setup(
-        &format!("send + iter_current   ({n}k)"),
+        &format!("send→tick→iter        ({n}k)"),
         || {
             let mut w = World::new();
             w.add_event::<DamageEvent>();
             w
         },
         |mut world: World| {
+            let cursor = world.events_mut::<DamageEvent>().add_reader();
             for i in 0..n * 1000 {
                 world.send_event(DamageEvent { target_id: i as u32, amount: 10.0 });
             }
+            world.tick();
             let mut sum = 0.0f32;
-            for ev in world.events::<DamageEvent>().iter_current() { sum += ev.amount; }
+            for ev in world.events::<DamageEvent>().iter(&cursor) { sum += ev.amount; }
             std::hint::black_box(sum);
             (n * 1000) as u64
         },
     );
 
     bench_with_setup(
-        &format!("send→tick→iter_prev   ({n}k)"),
+        &format!("send→tick→iter (prev) ({n}k)"),
         || {
             let mut w = World::new();
             w.add_event::<DamageEvent>();
             w
         },
         |mut world: World| {
+            let cursor = world.events_mut::<DamageEvent>().add_reader();
             for i in 0..n * 1000 {
                 world.send_event(DamageEvent { target_id: i as u32, amount: 5.0 });
             }
             world.tick();
             let mut sum = 0.0f32;
-            for ev in world.events::<DamageEvent>().iter_previous() { sum += ev.amount; }
+            for ev in world.events::<DamageEvent>().iter(&cursor) { sum += ev.amount; }
             std::hint::black_box(sum);
             (n * 1000) as u64
         },

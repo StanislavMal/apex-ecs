@@ -122,11 +122,9 @@ impl AutoSystem for MovementSystem {
 // ── Sequential системы ────────────────────────────────────────
 
 fn damage_apply(world: &mut World) {
-    let events: Vec<DamageEvent> = world
-        .events::<DamageEvent>()
-        .iter_previous()
-        .copied()
-        .collect();
+    use apex_core::system_param::EventReader;
+    let mut reader = EventReader::new(world.events_mut::<DamageEvent>());
+    let events: Vec<DamageEvent> = reader.iter().to_vec();
 
     let mut deaths = Vec::new();
     for ev in &events {
@@ -141,11 +139,9 @@ fn damage_apply(world: &mut World) {
 }
 
 fn despawn_dead(world: &mut World) {
-    let deaths: Vec<DeathEvent> = world
-        .events::<DeathEvent>()
-        .iter_current()
-        .copied()
-        .collect();
+    use apex_core::system_param::EventReader;
+    let mut reader = EventReader::new(world.events_mut::<DeathEvent>());
+    let deaths: Vec<DeathEvent> = reader.iter().to_vec();
 
     if deaths.is_empty() { return; }
 
