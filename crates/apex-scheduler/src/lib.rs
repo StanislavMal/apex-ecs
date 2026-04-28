@@ -368,8 +368,8 @@ pub struct Scheduler {
     /// Если None — используется StageLabel::standard_order().
     stage_order: Option<Vec<StageLabel>>,
 
-    /// Этап по умолчанию для `add_system`, `add_auto_system`, `add_par_system`,
-    /// `add_fn_par_system` (без суффикса `_to_stage`).
+    /// Этап по умолчанию для `add_system`, `add_auto_system`, `add_par`,
+    /// `add_par_access` (без суффикса `_to_stage`).
     ///
     /// По умолчанию — `StageLabel::Update`. Меняется через `set_default_stage()`
     /// или временно подменяется внутри `staged()`.
@@ -547,26 +547,87 @@ impl Scheduler {
         self.add_par_system_to_stage(name, system, StageLabel::Startup)
     }
 
-    /// Регистрировать FnParSystem.
+    /// Регистрировать параллельную систему-замыкание без доступа к компонентам.
+    ///
+    /// Для систем, которым не нужен доступ к компонентам/ресурсам/событиям
+    /// (логирование, отладка, пустые хуки).
+    ///
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_fn_par_system<F>(
+    ///
+    /// Если системе нужен доступ — используй `add_par_access`.
+    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_par_to_stage(name, func, self.default_stage_label.clone())
+    }
+
+    /// Регистрировать параллельную систему-замыкание в указанном этапе.
+    /// Без доступа к компонентам.
+    pub fn add_par_to_stage<F>(
         &mut self,
-        name:   impl Into<String>,
-        func:   F,
-        access: AccessDescriptor,
+        name: impl Into<String>,
+        func: F,
+        stage_label: StageLabel,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
-        self.add_fn_par_system_to_stage(name, func, access, self.default_stage_label.clone())
+        self.add_par_access_to_stage(name, AccessDescriptor::new(), func, stage_label)
     }
 
-    /// Регистрировать FnParSystem в указанном этапе.
-    pub fn add_fn_par_system_to_stage<F>(
+    /// Регистрировать параллельную систему-замыкание в Startup этапе.
+    /// Без доступа к компонентам.
+    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_par_to_stage(name, func, StageLabel::Startup)
+    }
+
+    /// Регистрировать параллельную систему-замыкание с явным доступом.
+    ///
+    /// `access` описывает, какие компоненты/ресурсы/события система читает
+    /// и пишет — планировщик использует это для разрешения конфликтов.
+    ///
+    /// Этап — `default_stage_label` (по умолчанию `Update`).
+    ///
+    /// ```
+    /// # use apex_core::prelude::*;
+    /// # use apex_core::access_desc;
+    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # let mut sched = Scheduler::new();
+    /// # struct Pos { x: f32, y: f32 }
+    /// # struct Vel { x: f32, y: f32 }
+    /// sched.add_par_access(
+    ///     "physics",
+    ///     access_desc!(read<Vel>, write<Pos>),
+    ///     |ctx| {
+    ///         ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, p)| {
+    ///             p.x += v.x;
+    ///         });
+    ///     },
+    /// );
+    /// ```
+    pub fn add_par_access<F>(
         &mut self,
         name:   impl Into<String>,
-        func:   F,
         access: AccessDescriptor,
+        func:   F,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_par_access_to_stage(name, access, func, self.default_stage_label.clone())
+    }
+
+    /// Регистрировать параллельную систему-замыкание с явным доступом
+    /// в указанном этапе.
+    pub fn add_par_access_to_stage<F>(
+        &mut self,
+        name:   impl Into<String>,
+        access: AccessDescriptor,
+        func:   F,
         stage_label: StageLabel,
     ) -> SystemId
     where
@@ -590,21 +651,22 @@ impl Scheduler {
         id
     }
 
-    /// Регистрировать FnParSystem в Startup этапе.
-    pub fn add_startup_fn_par_system<F>(
+    /// Регистрировать параллельную систему-замыкание с явным доступом
+    /// в Startup этапе.
+    pub fn add_startup_par_access<F>(
         &mut self,
         name:   impl Into<String>,
-        func:   F,
         access: AccessDescriptor,
+        func:   F,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
-        self.add_fn_par_system_to_stage(name, func, access, StageLabel::Startup)
+        self.add_par_access_to_stage(name, access, func, StageLabel::Startup)
     }
 
     /// Установить этап по умолчанию для `add_system`, `add_auto_system`,
-    /// `add_par_system`, `add_fn_par_system`.
+    /// `add_par`, `add_par_access`.
     ///
     /// Все системы, добавленные без явного `*_to_stage`, попадут в этот этап.
     /// По умолчанию — `StageLabel::Update`.
@@ -629,21 +691,20 @@ impl Scheduler {
     /// Удобно для группировки систем плагина:
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel};
-    /// # use apex_core::access::AccessDescriptor;
     /// # use apex_core::world::SystemContext;
     /// let mut sched = Scheduler::new();
     ///
     /// sched.set_default_stage(StageLabel::tag("update"));
     ///
     /// sched.staged(StageLabel::tag("input"), |s| {
-    ///     s.add_fn_par_system("read_keys", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    ///     s.add_par("read_keys", |_: SystemContext<'_>| {});
     /// });
     ///
     /// sched.staged(StageLabel::tag("render"), |s| {
-    ///     s.add_fn_par_system("draw", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    ///     s.add_par("draw", |_: SystemContext<'_>| {});
     /// });
     ///
-    /// sched.add_fn_par_system("particles", |_: SystemContext<'_>| {}, AccessDescriptor::new());
+    /// sched.add_par("particles", |_: SystemContext<'_>| {});
     /// ```
     pub fn staged<F>(&mut self, label: StageLabel, f: F) -> &mut Self
     where
@@ -1846,6 +1907,7 @@ fn component_type_name(
 mod tests {
     use super::*;
     use apex_core::{prelude::*, world::World, query::Query};
+    use apex_core::access_desc;
 
     #[derive(Clone, Copy)] struct Pos { x: f32, y: f32 }
     #[derive(Clone, Copy)] struct Vel { x: f32, y: f32 }
@@ -2140,8 +2202,9 @@ mod tests {
     #[test]
     fn fn_par_system_with_resource() {
         let mut sched = Scheduler::new();
-        sched.add_fn_par_system(
+        sched.add_par_access(
             "scaled_movement",
+            access_desc!(read<DeltaTime>, read<Vel>, write<Pos>),
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
@@ -2150,10 +2213,6 @@ mod tests {
                         pos.y += vel.y * (*dt).0;
                     });
             },
-            AccessDescriptor::new()
-                .read::<DeltaTime>()
-                .read::<Vel>()
-                .write::<Pos>(),
         );
 
         let mut world = World::new();

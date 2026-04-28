@@ -319,3 +319,26 @@ impl AccessDescriptor {
             && self.reads_event.is_empty() && self.writes_event.is_empty()
     }
 }
+
+/// Создать `AccessDescriptor` декларативным синтаксисом.
+///
+/// Поддерживает `read<T>`, `write<T>`, `read_event<T>`, `write_event<T>`.
+///
+/// # Пример
+///
+/// ```ignore
+/// access_desc!(read<Vel>, write<Pos>, read_event<DamageEvent>)
+/// ```
+#[macro_export]
+macro_rules! access_desc {
+    () => {
+        $crate::AccessDescriptor::new()
+    };
+    ($($action:ident < $ty:ty >),+ $(,)?) => {{
+        let mut desc = $crate::AccessDescriptor::new();
+        $(
+            desc = desc.$action::<$ty>();
+        )+
+        desc
+    }};
+}

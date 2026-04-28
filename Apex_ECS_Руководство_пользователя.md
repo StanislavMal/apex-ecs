@@ -663,24 +663,49 @@ impl AutoSystem for PhysicsSystem {
 sched.add_auto_system("physics", PhysicsSystem);
 ```
 
-### 6.2 `FnParSystem` (замыкание)
+### 6.2 Параллельная система-замыкание (`add_par` / `add_par_access`)
+
+Для быстрых прототипов и простых систем можно использовать замыкания вместо
+отдельного `struct` + `impl AutoSystem`.
+
+**Без доступа к компонентам** (логирование, отладка):
 
 ```rust
-// Inline-система без отдельного struct:
-sched.add_fn_par_system(
+sched.add_par("debug", |_| {
+    println!("tick");
+});
+```
+
+**С явным доступом** — используйте `access_desc!` для компактного `AccessDescriptor`:
+
+```rust
+use apex_core::access_desc;
+
+sched.add_par_access(
     "enemy_ai",
-    |ctx: SystemContext<'_>| {
+    access_desc!(read<Enemy>, write<Velocity>),
+    |ctx| {
         ctx.query::<(Read<Enemy>, Write<Velocity>)>()
             .for_each(|_, (_, vel)| {
                 vel.x *= 0.99;
                 vel.y *= 0.99;
             });
     },
-    AccessDescriptor::new()
-        .read::<Enemy>()
-        .write::<Velocity>(),
 );
 ```
+
+**С этапом:**
+```rust
+sched.add_par_access_to_stage(
+    "enemy_ai",
+    access_desc!(read<Enemy>, write<Velocity>),
+    |ctx| { /* ... */ },
+    StageLabel::Update,
+);
+```
+
+> **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
+> сокращающий `AccessDescriptor::new().read::<T>().write::<T>()`.
 
 ### 6.3 Sequential система
 
@@ -1797,7 +1822,7 @@ impl SequentialSystem for ScriptedSystem {
 }
 ```
 
-**В параллельной системе (`AutoSystem`/`FnParSystem`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте (доступен только `SystemContext`):
+**В параллельной системе (`AutoSystem`/`add_par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте (доступен только `SystemContext`):
 
 ```rust
 // ❌ НЕПРАВИЛЬНО: engine.run() требует &mut World
@@ -1835,7 +1860,7 @@ impl SequentialSystem for ScriptedSystem {
 
 - **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential при `compile()`. Явные `add_dependency()` имеют приоритет.
 - Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
-- Чем больше параллельных систем (`AutoSystem`/`FnParSystem`) без конфликтов — тем лучше масштабируется на N ядер
+- Чем больше параллельных систем (`AutoSystem`/`add_par_access`) без конфликтов — тем лучше масштабируется на N ядер
 - `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 
 ### 14.5 Intra-system Parallelism
@@ -2167,12 +2192,13 @@ fn main() {
 | Метод | Описание |
 |---|---|---|
 | `add_auto_system(name, sys)` | Добавить AutoSystem (компоненты + ресурсы + события) |
-| `add_fn_par_system(name, f, acc)` | Добавить FnParSystem (closure) с явным access |
+| `add_par(name, f)` | Добавить параллельную систему-замыкание (без доступа к компонентам) |
+| `add_par_access(name, access, f)` | Добавить параллельную систему-замыкание с явным `AccessDescriptor` |
 | `add_system(name, f)` | Добавить Sequential систему в default_stage_label |
 | `add_system_to_stage(name, f, label)` | Добавить Sequential систему в указанный этап |
 | `add_auto_system_to_stage(name, sys, label)` | Добавить AutoSystem в указанный этап |
-| `add_fn_par_system_to_stage(name, f, acc, label)` | Добавить FnParSystem в указанный этап |
-| `add_startup_system(name, f)` | Добавить систему в Startup этап |
+| `add_par_access_to_stage(name, access, f, label)` | Добавить параллельную систему-замыкание с access в указанный этап |
+| `add_startup_system(name, f)` | Добавить Sequential систему в Startup этап |
 | `add_dependency(a, b)` | `a` выполняется после `b` |
 | `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
 | `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |
@@ -2312,7 +2338,7 @@ fn main() {
 
 **Назначение — непроизводительные элементы.** Rhai-скриптинг однопоточный
 внутренне (скрипты выполняются последовательно), и не может выполняться
-в параллельных системах (`AutoSystem`/`FnParSystem`). Однако сам `ScriptEngine` теперь
+в параллельных системах (`AutoSystem`/`add_par_access`). Однако сам `ScriptEngine` теперь
 реализует `Send` и может быть передан в другой поток для выполнения
 в `Sequential`-системе шедулера. Он идеален для
 событийно-ориентированной логики (диалоги, квесты, триггеры), тюнинга
@@ -2544,7 +2570,7 @@ loop {
 > **`Send` + однопоточное выполнение:** `ScriptEngine` использует `Arc<Mutex<>>`
 > (вместо `Rc<RefCell<>>`) благодаря включению фичи `"sync"` в крейт `rhai`.
 > Это делает `ScriptEngine: Send` — его можно передать в другой поток.
-> **Не используйте `ScriptEngine` в параллельных системах (`AutoSystem`/`FnParSystem`)** — `run()` требует `&mut World`,
+> **Не используйте `ScriptEngine` в параллельных системах (`AutoSystem`/`add_par_access`)** — `run()` требует `&mut World`,
 > что несовместимо с параллельным доступом. Скриптинг предназначен для
 > последовательного выполнения в `Sequential`-системах шедулера или в главном
 > цикле. Внутренне Rhai остаётся однопоточным — скрипты выполняются

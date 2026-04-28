@@ -26,8 +26,8 @@
 //!   [UpdateSeq] finalize   ← Sequential (выполняется после particles)
 
 use apex_core::prelude::*;
+use apex_core::access_desc;
 use apex_scheduler::{Scheduler, StageLabel};
-use apex_core::access::AccessDescriptor;
 
 // ── Компоненты ────────────────────────────────────────────────
 
@@ -39,23 +39,23 @@ use apex_core::access::AccessDescriptor;
 fn plugin_a(sched: &mut Scheduler) {
     sched
         .staged(StageLabel::tag("input"), |s| {
-            s.add_fn_par_system(
+            s.add_par_access(
                 "read_keyboard",
-                |ctx: SystemContext<'_>| {
+                access_desc!(write<FrameInput>),
+                |ctx| {
                     ctx.resource_mut::<FrameInput>().keys = 42;
                     println!("  [Input] read_keyboard");
                 },
-                AccessDescriptor::new().write::<FrameInput>(),
             );
         })
         .staged(StageLabel::tag("render"), |s| {
-            s.add_fn_par_system(
+            s.add_par_access(
                 "draw",
-                |ctx: SystemContext<'_>| {
+                access_desc!(read<FrameInput>),
+                |ctx| {
                     let input = ctx.resource::<FrameInput>();
                     println!("  [Render] draw (pressed keys: {})", input.keys);
                 },
-                AccessDescriptor::new().read::<FrameInput>(),
             );
         });
 }
@@ -73,20 +73,12 @@ fn plugin_b(sched: &mut Scheduler) {
             println!("  [SimSeq] print_stats");
         });
 
-        s.add_fn_par_system(
-            "physics",
-            |_ctx: SystemContext<'_>| {
-                println!("  [Sim]   physics");
-            },
-            AccessDescriptor::new(),
-        );
-        s.add_fn_par_system(
-            "ai",
-            |_ctx: SystemContext<'_>| {
-                println!("  [Sim]   ai");
-            },
-            AccessDescriptor::new(),
-        );
+        s.add_par("physics", |_| {
+            println!("  [Sim]   physics");
+        });
+        s.add_par("ai", |_| {
+            println!("  [Sim]   ai");
+        });
     });
 }
 
@@ -114,13 +106,9 @@ fn main() {
     });
 
     // Parallel-система зарегистрирована ПОСЛЕ sequential (та же проверка)
-    sched.add_fn_par_system(
-        "particles",
-        |_ctx: SystemContext<'_>| {
-            println!("  [Update] particles");
-        },
-        AccessDescriptor::new(),
-    );
+    sched.add_par("particles", |_| {
+        println!("  [Update] particles");
+    });
 
     // Задаём порядок этапов — одна строка.
     // input → sim → render → update (остальные в конец)

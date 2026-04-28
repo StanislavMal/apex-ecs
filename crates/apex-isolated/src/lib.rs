@@ -384,7 +384,7 @@ pub fn sync_bridge_cloneable(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::{AccessDescriptor, World};
+    use apex_core::World;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -399,13 +399,11 @@ mod tests {
         let invoked = Arc::new(AtomicBool::new(false));
         let inv = invoked.clone();
 
-        // Используем add_fn_par_system, который принимает FnMut(SystemContext)
-        iso.scheduler_mut().add_fn_par_system(
+        iso.scheduler_mut().add_par(
             "test",
-            move |_ctx: apex_core::SystemContext<'_>| {
+            move |_ctx| {
                 inv.store(true, Ordering::SeqCst);
             },
-            AccessDescriptor::new(),
         );
 
         iso.tick();
@@ -568,12 +566,11 @@ mod tests {
         let entity_count = Arc::new(AtomicUsize::new(0));
         let ec = entity_count.clone();
 
-        iso.scheduler_mut().add_fn_par_system(
+        iso.scheduler_mut().add_par(
             "counter",
-            move |ctx: apex_core::SystemContext<'_>| {
+            move |ctx| {
                 ec.store(ctx.entity_count(), Ordering::SeqCst);
             },
-            AccessDescriptor::new(),
         );
 
         iso.world_mut().spawn(());

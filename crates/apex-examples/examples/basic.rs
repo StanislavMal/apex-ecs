@@ -11,6 +11,7 @@
 //! cargo test --workspace
 
 use apex_core::prelude::*;
+use apex_core::access_desc;
 use apex_scheduler::{Scheduler, StageLabel};
 
 // ── Компоненты ────────────────────────────────────────────────
@@ -255,9 +256,10 @@ fn main() {
     // ╚══════════════════════════════════════════════════════════╝
     sched.add_auto_system_to_stage("physics",      PhysicsSystem,      StageLabel::Update);
     sched.add_auto_system_to_stage("health_clamp", HealthClampSystem,  StageLabel::Update);
-    sched.add_fn_par_system_to_stage(
+    sched.add_par_access_to_stage(
         "enemy_ai",
-        |ctx: SystemContext<'_>| {
+        access_desc!(read<Enemy>, write<Velocity>),
+        |ctx| {
             let count = ctx.query::<(Read<Enemy>, Write<Velocity>)>().len();
             ctx.query::<(Read<Enemy>, Write<Velocity>)>().for_each(|_, (_, vel)| {
                 vel.x *= 0.99; // трение
@@ -267,9 +269,6 @@ fn main() {
                 println!("  [enemy_ai] updated {} enemies", count);
             }
         },
-        AccessDescriptor::new()
-            .read::<Enemy>()
-            .write::<Velocity>(),
         StageLabel::Update,
     );
 

@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
+use apex_core::access_desc;
 use apex_scheduler::{Scheduler, SystemId};
 
 // ── Компоненты ─────────────────────────────────────────────────
@@ -540,13 +541,13 @@ fn bench_scheduler_throughput(n: usize) {
 
     {
         let mut sched = Scheduler::new();
-        sched.add_fn_par_system(
+        sched.add_par_access(
             "physics",
-            |ctx: SystemContext<'_>| {
+            access_desc!(read<PhysicsConfig>, write<Position>),
+            |ctx| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
                 ctx.query::<Write<Position>>().for_each(|_, pos| { pos.x += dt; });
             },
-            AccessDescriptor::new().read::<PhysicsConfig>().write::<Position>(),
         );
         sched.compile().unwrap();
         bench_with_setup(

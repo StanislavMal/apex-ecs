@@ -18,6 +18,7 @@
 //! - После тика основной мир печатает состояние
 
 use apex_core::prelude::*;
+use apex_core::access_desc;
 use apex_isolated::{CloneableBridge, IsolatedWorld, sync_bridge_cloneable};
 use apex_serialization::prefab::PrefabLoader;
 use apex_serialization::WorldSerializer;
@@ -272,9 +273,10 @@ fn main() {
     let iso_bridge = CloneableBridge::new(sub_to_main, sub_recv);
 
     // Добавляем AI-систему в IsolatedWorld
-    iso.scheduler_mut().add_fn_par_system(
+    iso.scheduler_mut().add_par_access(
         "ai_damage",
-        move |ctx: SystemContext<'_>| {
+        access_desc!(write<Health>),
+        move |ctx| {
             ai_flag.store(true, Ordering::SeqCst);
 
             // ── ctx.try_resource — безопасный доступ к ресурсу ──
@@ -289,7 +291,6 @@ fn main() {
             // В отличие от send_event, не требует сериализации и регистрации
             iso_bridge.send_action_event("AI: enemy took damage!".to_string());
         },
-        AccessDescriptor::new().write::<Health>(),
     );
 
     // Выполняем один тик IsolatedWorld
