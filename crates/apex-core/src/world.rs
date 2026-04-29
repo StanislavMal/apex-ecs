@@ -12,6 +12,7 @@ use crate::{
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
     resources::Resources,
+    sub_world::SubWorld,
     system_param::{Res, ResMut, EventReader, EventWriter, WorldQuerySystemAccess},
     template::TemplateRegistry,
 };
@@ -1063,12 +1064,13 @@ impl<'w> SystemContext<'w> {
 
     #[inline]
     pub fn query<Q: WorldQuery>(&self) -> crate::query::Query<'_, Q> {
-        crate::query::Query::new(self.world())
+        // Используем SubWorld для ограничения архетипов и строк (row-level splits)
+        crate::query::Query::from_sub_world(&self.sub_worlds[0], Tick::ZERO)
     }
 
     #[inline]
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> crate::query::Query<'_, Q> {
-        crate::query::Query::new_with_tick(self.world(), last_run)
+        crate::query::Query::from_sub_world(&self.sub_worlds[0], last_run)
     }
 
     #[inline]
@@ -1153,6 +1155,7 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
     arch_indices: &'w [usize],
     last_run:     Tick,
     cached_ids:   Vec<ComponentId>,
+    row_ranges:   &'w [(usize, usize, usize)],
     _phantom:     std::marker::PhantomData<Q>,
 }
 
@@ -1178,8 +1181,33 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             arch_indices,
             last_run,
             cached_ids: ids,
+            row_ranges: &[],
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Создать CachedQuery с ограничением на архетипы и строки из SubWorld.
+    pub fn from_sub_world(sub: &SubWorld<'w>, last_run: Tick) -> Self {
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(sub.world, &mut ids);
+
+        let arch_indices: &'w [usize] = sub.archetype_indices;
+        let row_ranges: &'w [(usize, usize, usize)] = sub.row_ranges;
+
+        Self {
+            world: sub.world,
+            arch_indices,
+            last_run,
+            cached_ids: ids,
+            row_ranges,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn row_range(&self, arch_idx: usize) -> (usize, usize) {
+        self.row_ranges.iter()
+            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+            .unwrap_or((0, usize::MAX))
     }
 
     #[inline]
@@ -1190,8 +1218,13 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
             let state    = unsafe { Q::fetch_state(arch, ids, self.last_run) };
-            let entities = &arch.entities[..arch.len()];
-            for (row, &entity) in entities.iter().enumerate() {
+            let (row_start, row_end) = self.row_range(arch_idx);
+            let end = row_end.min(arch.len());
+            let len = end.saturating_sub(row_start);
+            if len == 0 { continue; }
+            let entities = &arch.entities[row_start..end];
+            for (offset, &entity) in entities.iter().enumerate() {
+                let row = row_start + offset;
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
                     f(entity, item);
                 }
@@ -1213,23 +1246,39 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         let ids = &self.cached_ids;
         if ids.len() != Q::component_count() { return; }
 
-        let world    = self.world;
-        let last_run = self.last_run;
+        let world     = self.world;
+        let last_run  = self.last_run;
+        let row_ranges = self.row_ranges;
+        let rr = |arch_idx: usize| -> (usize, usize) {
+            row_ranges.iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX))
+        };
         let chunks = compute_par_chunks(
             self.arch_indices
                 .iter()
                 .copied()
                 .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
-                .map(|arch_idx| (arch_idx, world.archetypes[arch_idx].len())),
+                .map(|arch_idx| {
+                    let s = rr(arch_idx);
+                    let effective_len = s.1.min(world.archetypes[arch_idx].len())
+                        .saturating_sub(s.0);
+                    (arch_idx, effective_len)
+                }),
             num_threads,
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let (r_start, r_end) = rr(arch_idx);
+            let clamped_start = r_start + start;
+            let clamped_end = (r_start + end).min(r_end);
+            if clamped_start >= clamped_end { return; }
             let arch     = &world.archetypes[arch_idx];
             let state    = unsafe { Q::fetch_state(arch, ids, last_run) };
-            let entities = &arch.entities[start..end];
-            for (row, &entity) in entities.iter().enumerate() {
-                if let Some(item) = unsafe { Q::fetch_item(state, start + row) } {
+            let entities = &arch.entities[clamped_start..clamped_end];
+            for (offset, &entity) in entities.iter().enumerate() {
+                let row = clamped_start + offset;
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
                     f(entity, item);
                 }
             }

@@ -47,7 +47,7 @@ impl<T> Events<T> {
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
-            pending: Vec::new(),
+            pending: Vec::with_capacity(256),
             cursors: Vec::new(),
             next_cursor_id: 0,
             free_list: Vec::new(),
@@ -162,8 +162,11 @@ impl<T> Events<T> {
             }
 
             // Переносим старые события в конец буфера чтения
+            let pending_cap = self.pending.capacity();
             self.events.append(&mut self.pending);
-            // self.pending теперь пуст — append переместил все элементы
+            // Vec::append обнулил capacity у pending — восстанавливаем,
+            // чтобы следующий tick не аллоцировал с нуля
+            self.pending.reserve(pending_cap.min(256));
         }
     }
 

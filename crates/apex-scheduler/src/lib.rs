@@ -1425,13 +1425,11 @@ impl Scheduler {
             let sys_archs_ptr: *const usize = info.arch_indices.as_ptr();
             let sys_archs_len: usize = info.arch_indices.len();
 
-            // Per-system scope для:
-            //   a) Систем с единственным архетипом (subWorld без ranges)
-            //   b) Систем с entity_count <= target_chunk (один чанк не даст parallelism)
-            //
-            // Для multi-архетипных систем с большим entity_count —
-            // ASD разбивка на чанки, распределённые по воркерам.
-            if info.arch_indices.len() <= 1 || info.entity_count <= effective_chunk {
+            // Per-system scope для систем с малым entity_count:
+            // один чанк не даст parallelism.
+            // Для систем с большим entity_count — ASD разбивка на чанки,
+            // распределённые по воркерам (поддерживает row-level split).
+            if info.entity_count <= effective_chunk {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
@@ -1448,7 +1446,7 @@ impl Scheduler {
 
                 while remaining > 0 {
                     let mut chunk_ranges: SmallVec<[(usize, usize, usize); 4]> = SmallVec::new();
-                    let mut chunk_remaining = target_chunk.min(remaining);
+                    let mut chunk_remaining = effective_chunk.min(remaining);
 
                     while chunk_remaining > 0 {
                         let Some(arch_idx) = current_arch else { break; };

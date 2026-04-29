@@ -3,6 +3,7 @@ use crate::{
     archetype::Archetype,
     component::{Component, ComponentId, Tick},
     entity::Entity,
+    sub_world::SubWorld,
     system_param::WorldQuerySystemAccess,
     world::World,
 };
@@ -464,11 +465,72 @@ pub struct Query<'w, Q: WorldQuery> {
     world:      &'w World,
     archetypes: Vec<ArchState<Q::State>>,
     last_run:   Tick,
+    /// Ограничения строк для row-level splits.
+    /// Если не пусто — итерация ограничена `(arch_idx, start, end)`.
+    row_ranges: &'w [(usize, usize, usize)],
 }
 
 impl<'w, Q: WorldQuery> Query<'w, Q> {
     pub fn new(world: &'w World) -> Self {
         Self::new_with_tick(world, Tick::ZERO)
+    }
+
+    /// Создать Query с ограничением на архетипы и строки из SubWorld.
+    ///
+    /// Использует `sub.archetype_indices` для фильтрации архетипов
+    /// и `sub.row_ranges` для ограничения строк (row-level splits).
+    pub fn from_sub_world(sub: &SubWorld<'w>, last_run: Tick) -> Self {
+        let mut q = Self::new_within_archetypes(sub.world, sub.archetype_indices, last_run);
+        q.row_ranges = sub.row_ranges;
+        q
+    }
+
+    /// Создать Query, перебирающий только указанные архетипы.
+    /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
+    fn new_within_archetypes(
+        world: &'w World,
+        arch_indices: &[usize],
+        last_run: Tick,
+    ) -> Self {
+        let mut ids = Vec::with_capacity(Q::component_count());
+        Q::fill_ids(world, &mut ids);
+        let mut positive_ids = Vec::with_capacity(Q::component_count());
+        Q::fill_positive_ids(world, &mut positive_ids);
+
+        let exclude_mask = {
+            let mut mask = ArchetypeMask::EMPTY;
+            for &id in ids.iter().filter(|id| !positive_ids.contains(id)) {
+                if let Some(arch_ids) = world.component_arch_index.get(&id) {
+                    for arch_id in arch_ids {
+                        mask.set(arch_id.0 as usize);
+                    }
+                }
+            }
+            mask
+        };
+
+        let arch_filter = |arch_idx: usize| -> bool {
+            if exclude_mask.get(arch_idx) {
+                return false;
+            }
+            let arch = &world.archetypes[arch_idx];
+            !arch.is_empty() && Q::matches_archetype(arch, &ids)
+        };
+
+        let archetypes: Vec<ArchState<Q::State>> = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
+            arch_indices.iter()
+                .copied()
+                .filter(|&arch_idx| arch_filter(arch_idx))
+                .map(|arch_idx| {
+                    let state = unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run) };
+                    ArchState { arch_idx, state, len: world.archetypes[arch_idx].len() }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Self { world, archetypes, last_run, row_ranges: &[] }
     }
 
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
@@ -565,16 +627,24 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             Vec::new()
         };
 
-        Self { world, archetypes, last_run }
+        Self { world, archetypes, last_run, row_ranges: &[] }
     }
 
-    #[inline]
+    /// Получить диапазон строк для архетипа, если есть row_ranges.
+    fn row_range(&self, arch_idx: usize) -> (usize, usize) {
+        self.row_ranges.iter()
+            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+            .unwrap_or((0, usize::MAX))
+    }
+
+    /// Итератор по entity и компонентам.
     pub fn iter(&self) -> QueryIter<'_, Q> {
         QueryIter {
-            archetypes:   &self.archetypes,
-            world:        self.world,
-            arch_cursor:  0,
-            row_cursor:   0,
+            archetypes: &self.archetypes,
+            world: self.world,
+            arch_cursor: 0,
+            row_cursor: 0,
+            row_ranges: self.row_ranges,
         }
     }
 
@@ -586,8 +656,13 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         for a in &self.archetypes {
-            let entities = &self.world.archetypes[a.arch_idx].entities[..a.len];
-            for (row, &entity) in entities.iter().enumerate() {
+            let (row_start, row_end) = self.row_range(a.arch_idx);
+            let end = row_end.min(a.len);
+            let len = end.saturating_sub(row_start);
+            if len == 0 { continue; }
+            let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
+            for (offset, &entity) in entities.iter().enumerate() {
+                let row = row_start + offset;
                 if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
                     f(entity, item);
                 }
@@ -613,19 +688,36 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             return;
         }
 
+        // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
+        let row_ranges = self.row_ranges;
+        let rr = |arch_idx: usize| -> (usize, usize) {
+            row_ranges.iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX))
+        };
         let chunks = compute_par_chunks(
-            self.archetypes.iter().map(|a| (a.arch_idx, a.len)),
+            self.archetypes.iter().map(|a| {
+                let s = rr(a.arch_idx);
+                let effective_len = s.1.min(a.len).saturating_sub(s.0);
+                (a.arch_idx, effective_len)
+            }),
             num_threads,
         );
 
         let last_run = self.last_run;
+        let world = self.world;
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch = unsafe { &*self.world.archetypes.as_ptr().add(arch_idx) };
+            let (r_start, r_end) = rr(arch_idx);
+            let clamped_start = r_start + start;
+            let clamped_end = (r_start + end).min(r_end);
+            if clamped_start >= clamped_end { return; }
+            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
             let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-            let entities = &arch.entities[start..end];
-            for (row, &entity) in entities.iter().enumerate() {
-                if let Some(item) = unsafe { Q::fetch_item(state, start + row) } {
+            let entities = &arch.entities[clamped_start..clamped_end];
+            for (offset, &entity) in entities.iter().enumerate() {
+                let row = clamped_start + offset;
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
                     f(entity, item);
                 }
             }
@@ -657,6 +749,7 @@ pub struct QueryIter<'q, Q: WorldQuery> {
     world:       &'q World,
     arch_cursor: usize,
     row_cursor:  usize,
+    row_ranges:  &'q [(usize, usize, usize)],
 }
 
 impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
@@ -666,7 +759,12 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let a = self.archetypes.get(self.arch_cursor)?;
-            if self.row_cursor >= a.len {
+            let (r_start, r_end) = self.row_range(a.arch_idx);
+            let effective_end = r_end.min(a.len);
+            if self.row_cursor < r_start {
+                self.row_cursor = r_start;
+            }
+            if self.row_cursor >= effective_end {
                 self.arch_cursor += 1;
                 self.row_cursor  = 0;
                 continue;
@@ -678,6 +776,14 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
                 return Some((entity, item));
             }
         }
+    }
+}
+
+impl<'q, Q: WorldQuery> QueryIter<'q, Q> {
+    fn row_range(&self, arch_idx: usize) -> (usize, usize) {
+        self.row_ranges.iter()
+            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+            .unwrap_or((0, usize::MAX))
     }
 }
 
@@ -694,7 +800,12 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let a = self.query.archetypes.get(self.arch_cursor)?;
-            if self.row_cursor >= a.len {
+            let (r_start, r_end) = self.query.row_range(a.arch_idx);
+            let effective_end = r_end.min(a.len);
+            if self.row_cursor < r_start {
+                self.row_cursor = r_start;
+            }
+            if self.row_cursor >= effective_end {
                 self.arch_cursor += 1;
                 self.row_cursor  = 0;
                 continue;
