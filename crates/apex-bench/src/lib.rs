@@ -34,6 +34,8 @@ pub trait Benchmark {
 // Benchmark modules (всегда доступны, feature-gating внутри)
 // ---------------------------------------------------------------------------
 pub mod apex;
+#[cfg(feature = "flecs")]
+pub mod flecs;
 #[cfg(feature = "bevy")]
 pub mod bevy;
 #[cfg(feature = "legion")]

@@ -1,13 +1,15 @@
 use criterion::*;
 use apex_bench::*;
 
-// ---------------------------------------------------------------------------
-// simple_insert
-// ---------------------------------------------------------------------------
 fn bench_simple_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_insert");
     group.bench_function("apex", |b| {
         let mut bench = apex::simple_insert::SimpleInsert::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "flecs")]
+    group.bench_function("flecs", |b| {
+        let mut bench = flecs::FlecsSimpleInsert::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "legion")]
@@ -22,14 +24,16 @@ fn bench_simple_insert(c: &mut Criterion) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// simple_iter
-// ---------------------------------------------------------------------------
 fn bench_simple_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_iter");
     group.bench_function("apex", |b| {
         let mut bench = apex::simple_iter::SimpleIter::new();
         b.iter(move || bench.run());
+    });
+    #[cfg(feature = "flecs")]
+    group.bench_function("flecs", |b| {
+        let bench = flecs::FlecsSimpleIter::new();
+        b.iter(|| bench.run());
     });
     #[cfg(feature = "legion")]
     group.bench_function("legion", |b| {
@@ -43,14 +47,16 @@ fn bench_simple_iter(c: &mut Criterion) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// frag_iter
-// ---------------------------------------------------------------------------
 fn bench_frag_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("fragmented_iter");
     group.bench_function("apex", |b| {
         let mut bench = apex::frag_iter::FragIter::new();
         b.iter(move || bench.run());
+    });
+    #[cfg(feature = "flecs")]
+    group.bench_function("flecs", |b| {
+        let bench = flecs::FlecsFragIter::new();
+        b.iter(|| bench.run());
     });
     #[cfg(feature = "legion")]
     group.bench_function("legion", |b| {
@@ -64,9 +70,6 @@ fn bench_frag_iter(c: &mut Criterion) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// schedule
-// ---------------------------------------------------------------------------
 fn bench_schedule(c: &mut Criterion) {
     let mut group = c.benchmark_group("schedule");
     group.bench_function("apex", |b| {
@@ -85,14 +88,16 @@ fn bench_schedule(c: &mut Criterion) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// heavy_compute
-// ---------------------------------------------------------------------------
 fn bench_heavy_compute(c: &mut Criterion) {
     let mut group = c.benchmark_group("heavy_compute");
     group.bench_function("apex", |b| {
         let mut bench = apex::heavy_compute::HeavyCompute::new();
         b.iter(move || bench.run());
+    });
+    #[cfg(feature = "flecs")]
+    group.bench_function("flecs", |b| {
+        let bench = flecs::FlecsHeavyCompute::new();
+        b.iter(|| bench.run());
     });
     #[cfg(feature = "legion")]
     group.bench_function("legion", |b| {
@@ -106,13 +111,15 @@ fn bench_heavy_compute(c: &mut Criterion) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// add_remove
-// ---------------------------------------------------------------------------
 fn bench_add_remove(c: &mut Criterion) {
     let mut group = c.benchmark_group("add_remove_component");
     group.bench_function("apex", |b| {
         let mut bench = apex::add_remove::AddRemove::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "flecs")]
+    group.bench_function("flecs", |b| {
+        let mut bench = flecs::FlecsAddRemove::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "legion")]
@@ -120,12 +127,6 @@ fn bench_add_remove(c: &mut Criterion) {
         let mut bench = legion::add_remove::Benchmark::new();
         b.iter(move || bench.run());
     });
-    // Bevy 0.1 panics in this benchmark
-    // #[cfg(feature = "bevy")]
-    // group.bench_function("bevy", |b| {
-    //     let mut bench = bevy::add_remove::Benchmark::new();
-    //     b.iter(move || bench.run());
-    // });
 }
 
 criterion_group!(
