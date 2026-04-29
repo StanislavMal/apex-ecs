@@ -160,7 +160,10 @@ impl AutoSystem for HealthWriterSystem {
     type Events    = Emit<DamageEvent>;
 
     fn run(&mut self, ctx: SystemContext<'_>) {
+        let n = ctx.entity_count();
         let mut writer = ctx.event_writer::<DamageEvent>();
+        // Предварительно резервируем capacity — избегаем реаллокаций при массовой отправке
+        writer.reserve(n / 10 + 1);
         ctx.query::<(Write<Health>, Read<Damage>)>()
             .for_each(|entity, (hp, dmg)| {
                 hp.current -= dmg.0;

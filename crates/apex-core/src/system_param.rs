@@ -172,6 +172,13 @@ impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
     pub fn send_batch(&mut self, events: impl IntoIterator<Item = T>) {
         unsafe { (*self.ptr).send_batch(events); }
     }
+
+    /// Предварительно выделить capacity для отправляемых событий.
+    /// Позволяет избежать реаллокаций при массовой отправке.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        unsafe { (*self.ptr).reserve(additional); }
+    }
 }
 
 unsafe impl<T: Send + Sync + 'static> Send for EventWriter<'_, T> {}

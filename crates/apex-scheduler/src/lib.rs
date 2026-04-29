@@ -170,11 +170,10 @@ impl<T> SendPtr<T> {
 struct AsdTask {
     /// Указатель на SystemDescriptor
     ptr: SendPtr<SystemDescriptor>,
-    /// Указатель на данные среза индексов архетипов системы
-    /// (borrowed from `system_archetype_indices` storage).
-    sys_archs_ptr: *const usize,
-    /// Длина среза архетипов системы
-    sys_archs_len: usize,
+    /// Индексы архетипов для этой задачи.
+    /// Если `chunk_ranges` пусто — все архетипы системы.
+    /// Иначе — только те, что есть в `chunk_ranges` (сужение для 4-arch cases).
+    arch_indices: SmallVec<[usize; 8]>,
     /// Диапазоны строк для ограничения SubWorld:
     /// `(arch_idx, start, end)` — только эти строки указанных архетипов.
     /// Если пусто — SubWorld без ограничений (все entity системы).
@@ -329,6 +328,11 @@ pub struct Scheduler {
     /// 0 = без ограничений (текущее поведение).
     parallel_min_entities: usize,
 
+    /// Автоматически отключать параллелизм, если per-system entity count
+    /// ниже порога окупаемости (rayon overhead > выигрыш).
+    /// Использует эвристику на основе числа систем в Stage.
+    auto_disable_parallel: bool,
+
     // ── Инкрементальный граф ────────────────────────────────────
     /// Граф зависимостей: узлы = SystemId, рёбра = ConflictKind.
     /// Хранится между compile() для инкрементального обновления.
@@ -406,6 +410,7 @@ impl Scheduler {
             execution_plan:   None,
             parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             parallel_min_entities: 0, // 0 = без ограничений
+            auto_disable_parallel: true, // true = автоотключение по умолчанию
             dependency_graph: Graph::new(),
             graph_nodes:      FxHashMap::default(),
             edge_set:         FxHashSet::default(),
@@ -709,6 +714,30 @@ impl Scheduler {
         self
     }
 
+    /// Включить/выключить автоматическое отключение параллелизма на основе
+    /// эвристики per-system entity count.
+    ///
+    /// Когда включено, движок вычисляет среднее количество entity на одну
+    /// систему в Stage и отключает параллелизм, если порог не достигнут:
+    ///   - multi-system (2+): min 3000 entity/system
+    ///   - single-system (1): min 15000 entity/system
+    ///
+    /// По умолчанию: `false` (без автоотключения).
+    pub fn set_parallel_auto_disable(&mut self, enabled: bool) -> &mut Self {
+        self.auto_disable_parallel = enabled;
+        self
+    }
+
+    /// Эвристика: минимальное количество entity на одну систему для окупаемости
+    /// параллелизма (rayon overhead < выигрыш).
+    fn min_entities_for_parallelism(num_systems: usize) -> usize {
+        if num_systems >= 2 {
+            3000  // Больше систем → лучше амортизация rayon overhead
+        } else {
+            15000 // Одна система — только row-level chunking, overhead выше
+        }
+    }
+
     /// Зарегистрировать системы в указанном этапе через замыкание.
     ///
     /// Внутри замыкания `default_stage_label` временно подменяется на `label`,
@@ -845,6 +874,11 @@ impl Scheduler {
     /// Также вычисляет для каждой системы индексы архетипов, которые ей нужны
     /// (для создания SubWorld в run_hybrid_parallel).
     pub fn compile(&mut self) -> Result<(), SchedulerError> {
+        // Ранний выход: если граф не менялся и план уже построен
+        if !self.graph_dirty && self.execution_plan.is_some() {
+            return Ok(());
+        }
+
         if self.type_names.is_empty() {
             log::debug!(
                 "Scheduler::compile: type_names пуст. \
@@ -1429,9 +1463,6 @@ impl Scheduler {
         let mut tasks: Vec<AsdTask> = Vec::new();
 
         for info in &sys_infos {
-            let sys_archs_ptr: *const usize = info.arch_indices.as_ptr();
-            let sys_archs_len: usize = info.arch_indices.len();
-
             // Per-system scope для:
             //   a) Систем с малым entity_count (один чанк не даст parallelism)
             //   b) Систем с событиями (Emit/Listen) — Events<T> не thread-safe
@@ -1442,8 +1473,7 @@ impl Scheduler {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
-                    sys_archs_ptr,
-                    sys_archs_len,
+                    arch_indices: SmallVec::from_slice(&info.arch_indices),
                     chunk_ranges: SmallVec::new(), // пусто = весь SubWorld
                 });
             } else {
@@ -1455,6 +1485,8 @@ impl Scheduler {
 
                 while remaining > 0 {
                     let mut chunk_ranges: SmallVec<[(usize, usize, usize); 4]> = SmallVec::new();
+                    // Множество archetype_id в этом чанке — для сужения arch_indices
+                    let mut chunk_arch_set: SmallVec<[usize; 8]> = SmallVec::new();
                     let mut chunk_remaining = effective_chunk.min(remaining);
 
                     while chunk_remaining > 0 {
@@ -1475,6 +1507,10 @@ impl Scheduler {
                         let take = chunk_remaining.min(available);
 
                         chunk_ranges.push((arch_idx, arch_offset, arch_offset + take));
+                        // Добавляем archetype_id в set если его там нет
+                        if !chunk_arch_set.contains(&arch_idx) {
+                            chunk_arch_set.push(arch_idx);
+                        }
                         arch_offset += take;
                         chunk_remaining -= take;
                         remaining -= take;
@@ -1488,8 +1524,7 @@ impl Scheduler {
                     if !chunk_ranges.is_empty() {
                         tasks.push(AsdTask {
                             ptr: info.ptr,
-                            sys_archs_ptr,
-                            sys_archs_len,
+                            arch_indices: chunk_arch_set,
                             chunk_ranges,
                         });
                     }
@@ -1511,24 +1546,20 @@ impl Scheduler {
                 s.spawn(move |_| {
                     let cmds_ptr = cmds as *mut Vec<Commands>;
                     unsafe {
-                        let sys_archs: &[usize] = std::slice::from_raw_parts(
-                            task.sys_archs_ptr,
-                            task.sys_archs_len,
-                        );
                         let system = &mut *task.ptr.0;
                         if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                             if task.chunk_ranges.is_empty() {
                                 // Полный SubWorld — все архетипы системы без ограничений
-                                let sub = apex_core::SubWorld::new(world, sys_archs);
+                                let sub = apex_core::SubWorld::new(world, &task.arch_indices);
                                 // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
                                 // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
                                 // Каждый поток обращается к своему индексу через current_thread_index().
                                 sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                             } else {
-                                // SubWorld с range-ограничениями
+                                // SubWorld с range-ограничениями и суженными arch_indices
                                 let sub = apex_core::SubWorld::with_ranges(
                                     world,
-                                    sys_archs,
+                                    &task.arch_indices,
                                     &task.chunk_ranges,
                                 );
                                 // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
@@ -1607,31 +1638,41 @@ impl Scheduler {
                 continue;
             }
 
-            // Проверяем порог параллельности: если entity в Stage меньше
-            // parallel_min_entities — выполняем последовательно (rayon overhead).
-            if self.parallel_min_entities > 0 {
+            // Проверяем пороги параллельности: если entity в Stage меньше
+            // порога — выполняем последовательно (rayon overhead > выигрыш).
+            let should_fallback = if self.parallel_min_entities > 0 || self.auto_disable_parallel {
                 let stage_entity_count: usize = stage_ids.iter()
                     .filter_map(|&sys_id| self.system_archetype_indices.get(&sys_id))
                     .flat_map(|indices| indices.iter().copied())
                     .filter(|&ai| ai < arch_lengths.len())
                     .map(|ai| arch_lengths[ai])
                     .sum();
-                if stage_entity_count < self.parallel_min_entities {
-                    // Sequential fallback
-                    for &sys_id in stage_ids {
-                        if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                            let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
-                            let system = &mut self.systems[sys_idx];
-                            if let SystemKind::Parallel { system, .. } = &mut system.kind {
-                                system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
-                            }
+                let below_hard_limit = self.parallel_min_entities > 0
+                    && stage_entity_count < self.parallel_min_entities;
+                let below_auto_limit = self.auto_disable_parallel && {
+                    let sys_count = stage_ids.len();
+                    let per_system = stage_entity_count / sys_count.max(1);
+                    per_system < Self::min_entities_for_parallelism(sys_count)
+                };
+                below_hard_limit || below_auto_limit
+            } else {
+                false
+            };
+
+            if should_fallback {
+                for &sys_id in stage_ids {
+                    if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                        let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
+                        let system = &mut self.systems[sys_idx];
+                        if let SystemKind::Parallel { system, .. } = &mut system.kind {
+                            system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
                         }
                     }
-                    for cmds in &mut thread_commands {
-                        cmds.apply(world);
-                    }
-                    continue;
                 }
+                for cmds in &mut thread_commands {
+                    cmds.apply(world);
+                }
+                continue;
             }
 
             // ASD параллелизм: динамическое распределение чанков

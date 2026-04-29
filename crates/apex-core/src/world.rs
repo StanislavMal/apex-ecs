@@ -915,11 +915,11 @@ pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 // MIN_CHUNK_SIZE и MAX_CHUNK_SIZE больше не используются.
 // Оставляем только для обратной совместимости, если нужно.
 
-pub const DEFAULT_MAX_CHUNK_SIZE: usize = 16384;
+pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
 /// Вычислить адаптивный размер чанка на основе количества entity.
 ///
 /// Формула: `entity_count / num_threads` (1 чанк на поток),
-/// но не более абсолютного потолка (по умолчанию 16384, или из `PAR_CHUNK_SIZE`).
+/// но не более абсолютного потолка (по умолчанию 65536, или из `PAR_CHUNK_SIZE`).
 /// Для малых миров динамически увеличивается минимальный размер чанка.
 /// num_threads — количество потоков rayon (передаётся из вызывающего кода).
 ///
@@ -933,7 +933,7 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
     let mut chunk = entity_count / n;
 
     // 2. Абсолютный потолок: берём из PAR_CHUNK_SIZE (если задан и >0),
-    //    иначе DEFAULT_MAX_CHUNK_SIZE (16384).
+    //    иначе DEFAULT_MAX_CHUNK_SIZE (65536).
     let absolute_max = {
         let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
         if user > 0 { user } else { DEFAULT_MAX_CHUNK_SIZE }
@@ -1652,10 +1652,10 @@ mod tests {
 
     #[test]
     fn adaptive_chunk_size_max_cap() {
-        // chunk не превышает DEFAULT_MAX_CHUNK_SIZE (16384)
+        // chunk не превышает DEFAULT_MAX_CHUNK_SIZE (65536)
         assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1), DEFAULT_MAX_CHUNK_SIZE);
-        // 8 threads: 32768/8=4096 <= 16384 → cap не срабатывает
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 4096);
+        // 8 threads, вдвое больше max: 131072/8=16384 <= 65536 → cap не срабатывает
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 16384);
     }
 
     #[test]
