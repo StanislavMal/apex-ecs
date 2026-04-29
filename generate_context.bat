@@ -15,7 +15,7 @@ set "CODE_EXTENSIONS=rs ts js tsx jsx py go java cpp c cs php html css scss json
 set /a MAX_PART_SIZE=150000
 
 REM Инициализируем EXCLUDE_PATTERNS базовыми значениями
-set "EXCLUDE_PATTERNS=node_modules build dist .git .github venv __pycache__ *.dot *.csv project_context crates/apex-bench plans"
+set "EXCLUDE_PATTERNS=node_modules build dist .git .github venv __pycache__ *.dot *.csv project_context crates/apex-bench plans .opencode"
 
 REM Читаем .gitignore и добавляем его паттерны
 if exist ".gitignore" (
@@ -257,10 +257,10 @@ set /a PROCESSED_COUNT=0
 
 echo [INFO] Сканирую файлы с расширениями: %CODE_EXTENSIONS%...
 
-REM Используем dir для быстрого поиска файлов с нужными расширениями, исключая папки target, apex-bench и plans
+REM Используем dir для быстрого поиска файлов с нужными расширениями, исключая папки target, apex-bench, plans и .opencode
 (
     for %%x in (%CODE_EXTENSIONS%) do (
-        dir /b /s /a-d "*.%%x" 2>nul | findstr /v /i "\\target\\" | findstr /v /i "\\apex-bench\\" | findstr /v /i "\\plans\\"
+        dir /b /s /a-d "*.%%x" 2>nul | findstr /v /i "\\target\\" | findstr /v /i "\\apex-bench\\" | findstr /v /i "\\plans\\" | findstr /v /i "\\.opencode\\"
     )
 ) > "%TEMP%\filelist.txt" 2>nul
 
