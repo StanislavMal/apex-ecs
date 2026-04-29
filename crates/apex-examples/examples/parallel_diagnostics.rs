@@ -178,9 +178,8 @@ impl AutoSystem for DamageListenerSystem {
     type Events    = Listen<DamageEvent>;
 
     fn run(&mut self, ctx: SystemContext<'_>) {
-        let reader = ctx.event_reader::<DamageEvent>();
-        let mut count = 0u32;
-        for _ in reader.iter() { count += 1; }
+        let mut reader = ctx.event_reader::<DamageEvent>();
+        let count = reader.read().len() as u32;
         std::hint::black_box(count);
     }
 }

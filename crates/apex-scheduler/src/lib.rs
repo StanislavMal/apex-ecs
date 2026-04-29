@@ -1359,6 +1359,9 @@ impl Scheduler {
             ptr: SendPtr<SystemDescriptor>,
             arch_indices: Vec<usize>,
             entity_count: usize,
+            /// Система использует события (Emit/Listen) — чанкование
+            /// небезопасно из-за data race на Events<T>::pending.
+            has_events: bool,
         }
 
         let mut sys_infos: Vec<SysInfo> = Vec::new();
@@ -1382,11 +1385,15 @@ impl Scheduler {
                     .sum();
 
                 if entity_count > 0 {
+                    let has_events = self.systems[sys_idx].kind.access()
+                        .map(|a| !a.reads_event.is_empty() || !a.writes_event.is_empty())
+                        .unwrap_or(false);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
                         arch_indices,
                         entity_count,
+                        has_events,
                     });
                 } else {
                     // Система без entity (только ресурсы/события) — запускаем сразу
@@ -1425,11 +1432,13 @@ impl Scheduler {
             let sys_archs_ptr: *const usize = info.arch_indices.as_ptr();
             let sys_archs_len: usize = info.arch_indices.len();
 
-            // Per-system scope для систем с малым entity_count:
-            // один чанк не даст parallelism.
-            // Для систем с большим entity_count — ASD разбивка на чанки,
-            // распределённые по воркерам (поддерживает row-level split).
-            if info.entity_count <= effective_chunk {
+            // Per-system scope для:
+            //   a) Систем с малым entity_count (один чанк не даст parallelism)
+            //   b) Систем с событиями (Emit/Listen) — Events<T> не thread-safe
+            //
+            // Для систем с большим entity_count без событий — ASD разбивка
+            // на чанки, распределённые по воркерам (row-level split).
+            if info.has_events || info.entity_count <= effective_chunk {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
