@@ -380,6 +380,13 @@ pub struct Scheduler {
     /// Используется `component_type_name()` для отображения реальных имён компонентов
     /// в ConflictKind (вместо заглушки "<component>").
     type_names: FxHashMap<TypeId, &'static str>,
+
+    /// Флаг: учитывать ли Emit<E>/Listen<E> при построении графа зависимостей.
+    ///
+    /// По умолчанию `true` — событийный порядок гарантируется автоматически.
+    /// При `false` поведение соответствует состоянию до введения EventAccessList:
+    /// порядок Emit/Listen не определён (как в предыдущих версиях движка).
+    event_ordering_enabled: bool,
 }
 
 impl Scheduler {
@@ -406,6 +413,7 @@ impl Scheduler {
             stage_order:      None,
             default_stage_label: StageLabel::Update,
             type_names:       FxHashMap::default(),
+            event_ordering_enabled: true,
         }
     }
 
@@ -750,6 +758,20 @@ impl Scheduler {
         self.graph_dirty    = true;
     }
 
+    /// Управлять автоматическим упорядочиванием по событиям.
+    ///
+    /// При `true` (по умолчанию): все системы с `Emit<E>` гарантированно
+    /// выполняются до систем с `Listen<E>` в пределах одного кадра.
+    ///
+    /// При `false`: порядок Emit/Listen не определён планировщиком.
+    /// Используйте только для совместимости со старым кодом или если
+    /// порядок не важен и вы хотите максимизировать параллелизм.
+    pub fn enable_event_ordering(&mut self, enabled: bool) -> &mut Self {
+        self.event_ordering_enabled = enabled;
+        self.invalidate_plan();
+        self
+    }
+
     /// Заполнить `type_names` из ComponentRegistry World'а.
     ///
     /// После вызова этой функции `component_type_name()` будет возвращать
@@ -917,7 +939,9 @@ impl Scheduler {
                 None => continue, // Sequential — не использует SubWorld
             };
 
-            // Собираем все TypeId, которые система читает или пишет
+            // Только компонентные TypeId определяют, какие архетипы нужны системе.
+            // reads_event / writes_event — виртуальные доступы для планировщика,
+            // они не соответствуют реальным данным в архетипах.
             let mut system_type_ids: Vec<std::any::TypeId> = Vec::new();
             system_type_ids.extend(access.reads.iter().copied());
             system_type_ids.extend(access.writes.iter().copied());
@@ -1109,6 +1133,7 @@ impl Scheduler {
                     system_i.id,
                     system_j.id,
                     &self.type_names,
+                    self.event_ordering_enabled,
                 ) {
                     // direction = true означает i→j
                     if direction {
@@ -1814,7 +1839,22 @@ impl Default for Scheduler { fn default() -> Self { Self::new() } }
 
 // ── Вспомогательные функции ────────────────────────────────────
 
-/// Определить тип конфликта между двумя AccessDescriptor.
+/// Обнаружить конфликт между двумя системами.
+///
+/// # Порядок проверок
+/// 1. Компонентные Write+Write
+/// 2. Компонентные Write+Read (оба направления)
+/// 3. Event Write+Write (два Emit одного события → конфликт)
+/// 4. Event Write+Read (Emit + Listen → Emit идёт раньше)
+///
+/// # Гарантия порядка событий
+/// Ребро Emit(E) → Listen(E) гарантирует, что все отправители события E
+/// будут выполнены до любого слушателя E в пределах одного кадра.
+/// Два Listen(E) конфликта не создают — могут выполняться параллельно.
+///
+/// # Управление
+/// Если `event_ordering = false`, проверки событийных конфликтов (3, 4)
+/// пропускаются — порядок Emit/Listen не определён планировщиком.
 ///
 /// Возвращает (ConflictKind, направление) где направление true означает i→j.
 /// Если конфликтов нет — None.
@@ -1824,6 +1864,7 @@ fn detect_conflict_kind(
     id_i: SystemId,
     id_j: SystemId,
     type_names: &FxHashMap<TypeId, &'static str>,
+    event_ordering: bool,
 ) -> Option<(ConflictKind, bool)> {
     // ── Компонентные конфликты ──────────────────────────────────
 
@@ -1857,33 +1898,36 @@ fn detect_conflict_kind(
     }
 
     // ── Event конфликты ─────────────────────────────────────────
+    // Активны только если `event_ordering = true` (по умолчанию).
 
-    // EventWriteWrite: оба пишут в один тип событий
-    for w in &ai.writes_event {
-        if aj.writes_event.contains(w) {
-            return Some((ConflictKind::EventWriteWrite {
-                event_name: component_type_name(*w, type_names),
-            }, true)); // i→j
+    if event_ordering {
+        // EventWriteWrite: оба пишут в один тип событий
+        for w in &ai.writes_event {
+            if aj.writes_event.iter().any(|(id, _)| *id == w.0) {
+                return Some((ConflictKind::EventWriteWrite {
+                    event_name: w.1,
+                }, true)); // i→j
+            }
         }
-    }
-    // EventWrite(i)+EventRead(j): i пишет событие, j читает
-    for w in &ai.writes_event {
-        if aj.reads_event.contains(w) {
-            return Some((ConflictKind::EventWriteRead {
-                event_name: component_type_name(*w, type_names),
-                writer_id: id_i.0,
-                reader_id: id_j.0,
-            }, true)); // i→j (писатель → читатель)
+        // EventWrite(i)+EventRead(j): i пишет событие, j читает
+        for w in &ai.writes_event {
+            if aj.reads_event.iter().any(|(id, _)| *id == w.0) {
+                return Some((ConflictKind::EventWriteRead {
+                    event_name: w.1,
+                    writer_id: id_i.0,
+                    reader_id: id_j.0,
+                }, true)); // i→j (писатель → читатель)
+            }
         }
-    }
-    // EventWrite(j)+EventRead(i): j пишет событие, i читает
-    for w in &aj.writes_event {
-        if ai.reads_event.contains(w) {
-            return Some((ConflictKind::EventWriteRead {
-                event_name: component_type_name(*w, type_names),
-                writer_id: id_j.0,
-                reader_id: id_i.0,
-            }, false)); // j→i
+        // EventWrite(j)+EventRead(i): j пишет событие, i читает
+        for w in &aj.writes_event {
+            if ai.reads_event.iter().any(|(id, _)| *id == w.0) {
+                return Some((ConflictKind::EventWriteRead {
+                    event_name: w.1,
+                    writer_id: id_j.0,
+                    reader_id: id_i.0,
+                }, false)); // j→i
+            }
         }
     }
 
@@ -2440,6 +2484,26 @@ mod tests {
             "EventRead не должны конфликтовать: ожидается Stage с обеими системами");
     }
 
+    struct DifferentEventReader;
+    impl ParSystem for DifferentEventReader {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read_event::<f64>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    #[test]
+    fn event_read_different_events_no_conflict() {
+        let mut sched = Scheduler::new();
+        // Слушают разные события — конфликта нет
+        sched.add_par_system("reader_i32", EventReaderForTest);     // Listen<i32>
+        sched.add_par_system("reader_f64", DifferentEventReader);  // Listen<f64>
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert!(stages.iter().any(|s| s.system_ids.len() >= 2),
+            "EventRead разных событий не должны конфликтовать: ожидается Stage с обеими системами");
+    }
+
     #[test]
     fn event_conflict_kind_in_edge_info() {
         let mut sched = Scheduler::new();
@@ -2459,6 +2523,37 @@ mod tests {
         });
         assert!(has_event_conflict,
             "Конфликт должен быть EventWriteWrite");
+    }
+
+    #[test]
+    fn event_ordering_disabled_no_conflict() {
+        let mut sched = Scheduler::new();
+        sched.enable_event_ordering(false);
+
+        sched.add_par_system("emitter",  EventWriterForTest);  // Emit<i32>
+        sched.add_par_system("listener", EventReaderForTest);  // Listen<i32>
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        assert!(stages.iter().any(|s| s.system_ids.len() >= 2),
+            "При event_ordering=false Emit+Listen не должны конфликтовать");
+    }
+
+    #[test]
+    fn event_ordering_enabled_by_default() {
+        let mut sched = Scheduler::new();
+        // По умолчанию enable_event_ordering не вызывается — должен быть true
+
+        sched.add_par_system("emitter",  EventWriterForTest);  // Emit<i32>
+        sched.add_par_system("listener", EventReaderForTest);  // Listen<i32>
+
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        assert!(stages.len() >= 2,
+            "По умолчанию Emit+Listen должны быть в разных Stage, получено {}",
+            stages.len());
     }
 
     // ── configure_stages ─────────────────────────────────────────

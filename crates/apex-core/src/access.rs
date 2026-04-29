@@ -189,10 +189,10 @@ impl Iterator for BitIter {
 pub struct AccessDescriptor {
     pub reads:  Vec<TypeId>,
     pub writes: Vec<TypeId>,
-    /// Типы событий, которые система читает.
-    pub reads_event:  Vec<TypeId>,
-    /// Типы событий, которые система пишет.
-    pub writes_event: Vec<TypeId>,
+    /// Типы событий, которые система читает (TypeId, имя_типа).
+    pub reads_event:  Vec<(TypeId, &'static str)>,
+    /// Типы событий, которые система пишет (TypeId, имя_типа).
+    pub writes_event: Vec<(TypeId, &'static str)>,
     /// Битовые маски — заполняются планировщиком через `assign_masks`.
     pub read_mask:  ComponentMask,
     pub write_mask: ComponentMask,
@@ -219,14 +219,16 @@ impl AccessDescriptor {
     /// Декларировать чтение событий типа T.
     pub fn read_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
-        if !self.reads_event.contains(&tid) { self.reads_event.push(tid); }
+        let name = std::any::type_name::<T>();
+        if !self.reads_event.iter().any(|(id, _)| *id == tid) { self.reads_event.push((tid, name)); }
         self
     }
 
     /// Декларировать запись событий типа T.
     pub fn write_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
-        if !self.writes_event.contains(&tid) { self.writes_event.push(tid); }
+        let name = std::any::type_name::<T>();
+        if !self.writes_event.iter().any(|(id, _)| *id == tid) { self.writes_event.push((tid, name)); }
         self
     }
 
@@ -234,8 +236,8 @@ impl AccessDescriptor {
         // O(N+M) дедупликация через HashSet вместо O(N²) contains+push
         Self::dedup_push(&mut self.reads, &other.reads);
         Self::dedup_push(&mut self.writes, &other.writes);
-        Self::dedup_push(&mut self.reads_event, &other.reads_event);
-        Self::dedup_push(&mut self.writes_event, &other.writes_event);
+        Self::dedup_push_event(&mut self.reads_event, &other.reads_event);
+        Self::dedup_push_event(&mut self.writes_event, &other.writes_event);
         // Маски сливаем битовым OR
         self.read_mask  = self.read_mask.or(&other.read_mask);
         self.write_mask = self.write_mask.or(&other.write_mask);
@@ -311,6 +313,21 @@ impl AccessDescriptor {
         let mut set: std::collections::HashSet<TypeId> = vec.iter().cloned().collect();
         for &item in items {
             if set.insert(item) { vec.push(item); }
+        }
+    }
+
+    /// O(N+M) дедупликация для event-кортежей (TypeId, имя_типа).
+    fn dedup_push_event(vec: &mut Vec<(TypeId, &'static str)>, items: &[(TypeId, &'static str)]) {
+        if items.is_empty() { return; }
+        if vec.len() + items.len() < 8 {
+            for &item in items {
+                if !vec.iter().any(|(id, _)| *id == item.0) { vec.push(item); }
+            }
+            return;
+        }
+        let mut set: std::collections::HashSet<TypeId> = vec.iter().map(|(id, _)| *id).collect();
+        for &item in items {
+            if set.insert(item.0) { vec.push(item); }
         }
     }
 
