@@ -32,7 +32,7 @@
 ### 1.1 Ключевые возможности
 
 - **Архетипное хранилище компонентов (SoA layout)** — данные одного типа хранятся рядом в памяти, что максимизирует использование CPU-кеша
-- **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon
+- **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon с адаптивным отключением для малых миров
 - **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>` работают без overhead
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи закодированы как компоненты
 - **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
@@ -569,6 +569,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 |-------|----------|
 | `send(event)` | Отправить одно событие в текущий тик |
 | `send_batch(events)` | Отправить пачку событий (любой `IntoIterator`) |
+| `reserve(n)` | Предаллоцировать `pending` буфер для N событий (избежать реаллокаций) |
 | `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
 | `remove_reader(reader_id)` | Удалить читателя |
 | `iter(reader_id) -> &[T]` | Непрочитанные события для reader (без продвижения курсора) |
@@ -577,6 +578,14 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `len_pending() -> usize` | Количество событий в буфере записи |
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
 | `update()` | Переключить буферы (вызывается автоматически в `world.tick()`) |
+
+**`EventWriter<T>`** (доступен через `ctx.event_writer::<T>()`):
+
+| Метод | Описание |
+|-------|----------|
+| `send(event: T)` | Отправить одно событие |
+| `send_batch(events)` | Отправить пачку событий (любой `IntoIterator<Item=T>`) |
+| `reserve(additional)` | Предаллоцировать буфер для отправки |
 
 **`EventReader<T>`** (рекомендуемый высокоуровневый API):
 
@@ -1795,7 +1804,7 @@ iso_bridge.apply_incoming(iso.world_mut());
 
 ### 13.1 Параллельный запуск систем
 
-Планировщик автоматически группирует совместимые параллельные системы в одну Stage и запускает их параллельно через Rayon. Начиная с v0.1.0, используется алгоритм **ASD (Adaptive Scope Distribution)** — единый адаптивный механизм, заменяющий два раздельных режима (per-system scope + intra-system chunking).
+Планировщик автоматически группирует совместимые параллельные системы в одну Stage и запускает их параллельно через Rayon. Используется алгоритм **ASD (Adaptive Scope Distribution)** — адаптивное распределение чанков по worker'ам.
 
 ```toml
 # Включение параллелизма (Cargo.toml):
@@ -1808,23 +1817,59 @@ parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 cargo run --features parallel
 ```
 
-**Как работает ASD:**
+#### 13.1.1 Как работает ASD (Adaptive Scope Distribution)
 
 ```
-target_chunk = max(total_entity_count / num_workers / 2, 64)
+# Размер чанка вычисляется адаптивно (не жёсткая константа):
+per_system_entity = total_entity_count / num_systems
+target_chunk = adaptive_chunk_size(per_system_entity, num_workers)
+                         # clamp(per_sys/n, 64..65536)
+# Cache-line alignment:
+effective_chunk = (target_chunk / 8) * 8
 
 for each system:
-    if arch_indices.len() <= 1 || entity_count <= target_chunk:
-        → 1 задача (per-system scope, без ranges — zero overhead)
+    if entity_count <= effective_chunk or system has events:
+        → 1 задача (per-system scope, без row-level ranges)
     else:
-        → N задач (чанки размером ~target_chunk), сортировка по archetype_id
+        → N задач чанками ~effective_chunk
+        → arch_indices сужается до нужных каждому чанку
+        → сортировка по archetype_id для cache locality
 ```
 
-- Мало entity → per-system scope (одна задача на систему, zero overhead)
-- Много entity → чанки заполняют все ядра
+- **Мало entity** → per-system scope (одна задача на систему, без overhead)
+- **Много entity** → чанки равномерно заполняют все ядра, даже если архетип один (row-level split)
+- **Событийные системы** (Emit/Listen) не чанкуются — Events<T> не thread-safe
 - Запуск через `rayon::scope` + `s.spawn(|_| ...)` (не `par_iter` — избегает двойного chunking Rayon)
 
-Правила параллелизма — аналог Rust borrow checker:
+#### 13.1.2 Ключевое улучшение v0.1.0: Query через SubWorld
+
+Начиная с v0.1.0, `ctx.query::<Q>()` маршрутизируется через `SubWorld`, а не напрямую через `World`. Это означает:
+- Query итерирует только архетипы SubWorld'а, а не весь мир
+- Query уважает `row_ranges` SubWorld'а — безопасное чанкование внутри одного архетипа
+- Одиночные архетипы режутся на чанки без data race (раньше это было невозможно)
+
+#### 13.1.3 Параметры настройки параллелизма
+
+| Метод | По умолчанию | Описание |
+|-------|-------------|----------|
+| `set_parallel_min_entities(n)` | `0` (без ограничений) | Минимальное total entity в Stage для PAR. Меньше — sequential |
+| `set_parallel_auto_disable(bool)` | **`true`** | Автоотключение PAR при недостатке entity/system |
+| `set_par_chunk_size(n)` | `65536` | Максимальный размер чанка (через env `APEX_PAR_CHUNK_SIZE`) |
+
+**Автоотключение параллелизма** — по умолчанию **включено**. Эвристика:
+```
+min_per_sys = if num_systems >= 2 { 3_000 } else { 15_000 }
+if stage_entity_count / num_systems < min_per_sys → sequential
+```
+
+Это защищает от запуска PAR на малых мирах, где rayon overhead больше выигрыша:
+- 100 entity — PAR не запускается (0.13x → ~1.0x)
+- 3 системы по 10k — PAR включается (~1.0x → 2-3x)
+- 1 система с 50k — PAR включается (~1.0x → 1.5-2.5x)
+
+#### 13.1.4 Правила параллелизма
+
+Аналог Rust borrow checker:
 
 | Комбинация | Результат |
 |---|---|
@@ -1837,28 +1882,54 @@ for each system:
 
 > Правила для событий активны по умолчанию. Отключить: [`sched.enable_event_ordering(false)`](#651-управление-упорядочиванием-по-событиям).
 
-**Пример:** `PhysicsSystem` (write `Velocity`, write `Position`, read `Mass`) и `HealthClampSystem` (write `Health`) не имеют общих Write → выполняются в одном Stage параллельно.
+#### 13.1.5 Безопасность
 
-#### Как это работает (безопасность)
+Параллелизм безопасен благодаря четырём архитектурным решениям:
 
-Параллелизм безопасен благодаря трём архитектурным решениям:
+1. **SubWorld-aware Query.** `ctx.query()` маршрутизируется через `SubWorld`, ограничивая итерацию до архетипов и row_ranges, выделенных системe. Это предотвращает data race при чанковании внутри одного архетипа.
+2. **Archetype-level sharing.** Параллельные системы получают `SubWorld` — shared borrow на уровне архетипов.
+3. **Deferred structural changes.** `Commands::apply()` вызывается вне параллельного контекста.
+4. **Thread-local Commands.** Каждая параллельная система получает собственный `Commands` через `ctx.commands()`.
 
-1. **Archetype-level sharing.** Параллельные системы получают `SubWorld` — shared borrow на уровне архетипов. Rayon гарантирует, что два `SubWorld` не перекрываются по конфликтующим архетипам (аналог borrow checker, но на stage-уровне).
-2. **Deferred structural changes.** `Commands::apply()` вызывается вне параллельного контекста. Это значит, что insert/remove не может произойти одновременно с параллельным чтением.
-3. **Thread-local Commands (v0.1.0).** Каждая параллельная система автоматически получает собственный экземпляр `Commands` через `ctx.commands()` — не нужно создавать вручную. Команды применяются после каждого Stage.
+#### 13.1.6 Результаты (12 потоков, i5-12400F, 200k entities)
 
-**Результаты ASD (12 потоков, i5-12400F):**
-
-| Сценарий | До ASD | ASD | Ускорение |
+| Сценарий | До оптимизаций | После | Ускорение |
 |---|---|---|---|
-| 12 solo систем | 2.03x | **3.91x** | +93% |
-| 2 CPU-bound (shared arch) | 0.36x | **1.10x** | +206% |
-| Pipeline sequential barrier | 0.35x | **0.92x** | +163% |
+| 3 независимые read-only системы | 0.92x (PAR медленнее) | **3-5x** | +400% |
+| Внутрисистемный PAR (1 архетип) | 0.80x (PAR медленнее) | **2.5x** | +312% |
+| 4 архетипа (фрагментация) | PAR нестабилен | **2.6x** | исправлено |
+| Full pipeline (6 систем) | 1.2x | **3.4x** | +183% |
 
 ### 13.2 Параллельная итерация внутри системы
 
-`par_for_each` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798):
+`par_for_each` использует chunk-level параллелизм: архетип разбивается на chunks, каждый chunk обрабатывается независимо в Rayon thread pool. Размер чанка вычисляется динамически функцией `adaptive_chunk_size`:
 
+```
+chunk = entity_count / max(num_threads, 1)
+# Абсолютный максимум — пользовательская настройка или 65536
+if chunk > MAX_CHUNK_SIZE → chunk = MAX_CHUNK_SIZE
+# Динамический минимум:
+if   entity_count < 100   → min = 128   # очень мало entity → крупные чанки
+elif entity_count < 1000  → min = 32    # средний размер → умеренное дробление
+else                      → min = 64    # много entity → баланс
+if chunk < min → chunk = min
+chunk = min(chunk, entity_count)
+```
+
+```rust
+impl AutoSystem for PhysicsSystem {
+    type Query = (Read<Mass>, Write<Velocity>, Write<Position>);
+    type Resources = ();
+    type Events = ();
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        ctx.query::<Self::Query>()
+            .par_for_each(|_, (mass, vel, pos)| {
+                vel.y -= 9.8 * mass.0 * 0.016;
+                pos.x += vel.x * 0.016;
+                pos.y += vel.y * 0.016;
+            });
+    }
+}
 ```
 chunk = entity_count / max(num_threads, 1)
 # Абсолютный максимум — пользовательская настройка или 16384
@@ -1892,7 +1963,7 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 });
 ```
 
-> **Настройка `MAX_CHUNK_SIZE`:** По умолчанию 16384. Можно изменить через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`. Увеличение уменьшает число задач (меньше overhead), уменьшение — более равномерная загрузка ядер.
+> **Настройка `MAX_CHUNK_SIZE`:** По умолчанию 65536. Можно изменить через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`. Увеличение уменьшает число задач для больших миров (меньше overhead), уменьшение — более равномерная загрузка ядер.
 
 > **Примечание:** Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
 
@@ -1996,16 +2067,17 @@ impl SequentialSystem for ScriptedSystem {
 
 ### 14.4 Планировщик
 
-- **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential при `compile()`. Явные `add_dependency()` имеют приоритет.
-- Один `compile()` при старте, потом только `run()` — `compile` дорогой, `run` дешёвый
-- Чем больше параллельных систем (`AutoSystem`/`add_par_access`) без конфликтов — тем лучше масштабируется на N ядер
+- **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential. Явные `add_dependency()` имеют приоритет.
+- Один `compile()` при старте, потом только `run()` — повторный `compile()` при `graph_dirty=false` возвращается мгновенно (~0µs)
+- Автоотключение PAR (`set_parallel_auto_disable(true)` по умолчанию) защищает от деградации на малых мирах
+- Чем больше параллельных систем без конфликтов — тем лучше масштабируется на N ядер
 - `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 - **Event ordering:** Если порядок `Emit<E>` / `Listen<E>` не критичен, отключите его через `sched.enable_event_ordering(false)` — это уберёт лишние барьеры и увеличит параллелизм.
 
 ### 14.5 Intra-system Parallelism
 
 `par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
-- **Размер чанка** — вычисляется динамически [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798): трёхуровневый минимум (128/32/64) и верхний лимит 16384 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
+- **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: трёхуровневый минимум (128/32/64) и верхний лимит 65536 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
 
 ```rust
@@ -2039,34 +2111,33 @@ cargo run --release --features parallel
 
 ### 14.7 Эталонные метрики производительности
 
-Измерения на **i5-12400F (6P+4E, 12 потоков)**, 1000k entities, release + LTO:
+Измерения на **i5-12400F (6P+4E, 12 потоков)**, release + LTO:
 
 | Операция | Throughput | Масштабирование |
 |----------|:----------:|:---------------:|
-| `spawn_many_silent` (1 comp) | **35.4 M ops/s** | 🟢 O(N) |
-| `spawn_many_silent` (4 comp) | **15.7 M ops/s** | 🟢 O(N) |
-| `Query::for_each` (без entity) | **145.8 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each` (без entity) | **150.0 M ops/s** | 🟢 O(N) |
-| `Query<(Read, Write)>` | **125.7 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (1 comp) | **62 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (4 comp) | **28 M ops/s** | 🟢 O(N) |
+| `Query::for_each` (без entity) | **132 M ops/s** | 🟢 O(N) |
+| `Query<(Read<Vel>, Write<Pos>)>` | **135 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each` (без entity) | **133 M ops/s** | 🟢 O(N) |
 | insert component | **12.3 M ops/s** | 🟢 O(N) |
-| despawn | **52.5 M ops/s** | 🟢 O(N) |
-| resource read | **298 M ops/s** | 🟢 O(1) |
-| resource write | **405 M ops/s** | 🟢 O(1) |
-| event send + EventReader::iter | **165 M ops/s** | 🟢 O(N) |
-| event send → tick → EventReader::iter | **117 M ops/s** | 🟢 O(N) |
-| event send_batch (100) | **5 882 M ops/s** | 🟢 O(N) |
+| despawn | **50 M ops/s** | 🟢 O(N) |
+| resource read | **230 M ops/s** | 🟢 O(1) |
+| resource write | **385 M ops/s** | 🟢 O(1) |
+| event send → tick → EventReader | **107 M ops/s** | 🟢 O(N) |
+| event send_batch (100) | **6097 M ops/s** | 🟢 O(N) |
 
 **Параллельное ускорение (speedup = seq/par, 12 потоков):**
 
-| Сценарий | 100k | 1000k | Комментарий |
-|----------|:----:|:-----:|-------------|
-| `par_for_each` (без entity) CPU-bound (atan2+cos) | 1.64x | **4.06x** | 🟢 Растёт с N |
-| `par_for_each` memory-bound (sqrt) | 0.23x | 1.11x | 🟡 Memory bound |
-| Межсистемный, 2 CPU-bound | 1.07x | 1.07x | 🔴 Memory bound |
-| Solo 8 систем | 4.09x | **4.80x** | 🟢 Растёт с N |
-| Solo 12 систем | 4.22x | 4.72x | 🟡 Насыщение на 8 потоках |
+| Сценарий | 100k | 200k | Комментарий |
+|----------|:----:|:----:|-------------|
+| 3 независимые read-only системы | 3.5x | **4.4x** | 🟢 Растёт с N |
+| 1 система MovementWriter (1 arch) | 2.2x | **2.5x** | 🟢 Row-level split |
+| 1 система MovementWriter (4 arch) | 2.2x | **2.6x** | 🟢 Фикс сужения arch_indices |
+| `par_for_each` CPU-bound (atan2+cos) | 1.9x | — | 🟢 Одиночная система |
+| Solo 12 систем | 4.7x | — | 🟡 Насыщение ~8 потоков |
 
-> **Ключевой вывод:** `par_for_each` — основной инструмент для CPU-bound нагрузок. На 1000k entities дает **4.06x ускорение** (было 3.98x). Применённые оптимизации (SparseSet adaptive, EntityAllocator bit-packing, ArchetypeMask iter_ones, Column::grow) дали прирост в ряде бенчмарков: CachedQuery +5.9%, despawn +10.5%, resource read +2.4%, resource write +2.3%. Регрессия Events send + EventReader::iter (+8.6% относительно предыдущих замеров) связана с эффектами code placement при LTO="fat" + codegen-units=1.
+> **Ключевые улучшения v0.1.0:** `MIN_CHUNK=4096` заменён на `adaptive_chunk_size(64..65536)`, `Query` маршрутизируется через `SubWorld` с поддержкой `row_ranges`, добавлено автоотключение PAR для малых миров, сужение `arch_indices` для чанков, идемпотентный `compile()`. Внутрисистемный parallel корректно работает для single-archetype. Автоотключение защищает от запуска PAR на < 3000 entity/system.
 
 ### 14.8 Применённые оптимизации
 
@@ -2302,6 +2373,7 @@ fn main() {
 | `add_event::<T>()` | Зарегистрировать тип события (опционально — `send_event` регистрирует сам) |
 | `send_event(event)` | Отправить событие (авторегистрация, не паникует) |
 | `try_send_event(event)` | Безопасная отправка события → `bool` (всегда true) |
+| `event_reserve::<T>(cap)` | Предаллоцировать буфер для событий типа T (избежать реаллокаций) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
 | `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
 | `tick()` | Переключить буферы событий, +1 тик |
@@ -2342,9 +2414,11 @@ fn main() {
 | `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
 | `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |
 | `configure_stages(order)` | Задать порядок этапов (вместо порядка по приоритету) |
-| `compile()` | Скомпилировать план → `Result` |
+| `compile()` | Скомпилировать план → `Result` (возвращает мгновенно если граф не изменился) |
 | `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `enable_event_ordering(bool)` | Вкл/выкл автоматическое упорядочивание по `Emit`/`Listen` (по умолч. `true`) |
+| `set_parallel_min_entities(n)` | Минимальное total entity в Stage для PAR (по умолч. `0` — без ограничений) |
+| `set_parallel_auto_disable(bool)` | Автоотключение PAR по per-system entity count (по умолч. **`true`**) |
 | `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
 | `system_access(id)` | Получить `&AccessDescriptor` системы по `SystemId` (для валидации) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
