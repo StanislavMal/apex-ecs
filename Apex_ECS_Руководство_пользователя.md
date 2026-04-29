@@ -588,6 +588,91 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `len(&self) -> usize` | Количество непрочитанных событий |
 | `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
 
+### 5.3 Event Pipeline — конвейерная обработка событий
+
+`EventPipelineBuilder` — надстройка над механизмом явных зависимостей (`add_dependency`), которая декларативно описывает **цепочку обработки одного события**. Позволяет гарантировать порядок: `Producer → Transformer → [Consumer, Consumer (parallel)]` без ручного вызова `add_dependency` между каждой парой систем.
+
+#### 5.3.1 Мотивация
+
+Автоматическое правило `Emit<E> → Listen<E>` даёт гарантию: все отправители — до всех слушателей. Но внутри группы `Listen<E>` порядок не определён. Конвейер устраняет этот пробел.
+
+**Без конвейера:**
+```text
+Emit<Damage> → [ArmorSystem, HealthSystem, SoundSystem] (все Listen — без порядка)
+```
+
+**С конвейером:**
+```text
+CollisionSystem (Emit) → ArmorSystem (Listen+Emit) → [HealthSystem, SoundSystem] (Listen)
+```
+
+#### 5.3.2 Роли в конвейере
+
+| Роль | Требования к доступу | Описание |
+|------|---------------------|----------|
+| `produced_by` | `Emit<E>` | Только отправляет событие |
+| `transformed_by` | `Listen<E>` + `Emit<E>` | Читает, обрабатывает и перевыпускает событие |
+| `consumed_by` | `Listen<E>` | Только читает событие |
+
+#### 5.3.3 Базовое использование
+
+```rust
+use apex_scheduler::Scheduler;
+
+let mut sched = Scheduler::new();
+
+let collision_id = sched.add_auto_system("collision", CollisionSystem);  // Emit<DamageEvent>
+let armor_id     = sched.add_auto_system("armor",     ArmorSystem);      // Listen+Emit<DamageEvent>
+let health_id    = sched.add_auto_system("health",    HealthSystem);     // Listen<DamageEvent>
+let sound_id     = sched.add_auto_system("sound",     SoundSystem);      // Listen<DamageEvent>
+
+// Конвейер: collision → armor → [health, sound]
+Scheduler::event_pipeline::<DamageEvent>()
+    .produced_by(collision_id, "collision")
+    .transformed_by(armor_id,   "armor")
+    .consumed_by(health_id,    "health")
+    .consumed_by(sound_id,     "sound")
+    .build(&mut sched);
+
+sched.compile().unwrap();
+```
+
+Планировщик сгенерирует 3 Stage: `collision → armor → [health + sound]`. Несколько `consumed_by` подряд образуют параллельную группу (если нет компонентных конфликтов).
+
+#### 5.3.4 Валидация ролей
+
+`build_validated()` проверяет, что AccessDescriptor каждой системы соответствует заявленной роли:
+
+```rust
+let result = Scheduler::event_pipeline::<DamageEvent>()
+    .produced_by(bad_id, "bad_producer")
+    .build_validated(&mut sched);
+
+if let Err(errors) = result {
+    for e in &errors {
+        eprintln!("{}", e);
+        // Pipeline: система 'bad_producer' объявлена как Producer для 'DamageEvent',
+        // но не имеет Emit<DamageEvent>.
+    }
+}
+```
+
+#### 5.3.5 Особенности double-buffered events
+
+Конвейер управляет **порядком выполнения**, а не потоком данных. Двойная буферизация событий означает, что `event_writer` пишет в текущий буфер, а `event_reader` читает из предыдущего. Поэтому:
+
+- Трансформер может модифицировать **компоненты** — изменения видны консьюмерам того же кадра
+- Трансформер может перевыпускать события — консьюмеры увидят их **на следующем кадре**
+- Два `consumed_by` без компонентных конфликтов выполняются параллельно
+
+```text
+Кадр N:    Collision пишет → буфер A
+Кадр N+1:  tick → буфер A → prev. Armor читает ← prev. Health читает ← prev.
+           Armor пишет в Health (компонент) Health видит изменения (тот же кадр)
+           Armor пишет событие → буфер B
+Кадр N+2:  tick → буфер B → prev. Sound читает ← Armor-события
+```
+
 ---
 
 ## 6. Системы и планировщик
@@ -921,6 +1006,28 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 ```
 
 > **`ctx.commands()` (начиная с v0.1.0):** Возвращает `&mut Commands` для текущего потока. В параллельных системах каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. В последовательном режиме возвращается статическая заглушка. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
+
+### 6.7 `EventPipelineBuilder`
+
+`EventPipelineBuilder` — строитель конвейера событий. Создаётся через `Scheduler::event_pipeline::<E>()`, применяется через `.build()`.
+
+**Методы:**
+
+| Метод | Описание |
+|-------|----------|
+| `produced_by(id, name)` | Добавить систему-производитель (требует `Emit<E>`) |
+| `transformed_by(id, name)` | Добавить систему-трансформер (требует `Listen<E>` + `Emit<E>`) |
+| `consumed_by(id, name)` | Добавить систему-потребитель (требует `Listen<E>`) |
+| `build(sched)` | Применить зависимости к планировщику |
+| `build_validated(sched) -> Result<(), Vec<PipelineValidationError>>` | Применить с проверкой ролей |
+
+**Правила построения зависимостей:**
+
+- `Producer` → зависит от предыдущей не-Consumer стадии, становится новым барьером
+- `Transformer` → зависит от предыдущего барьера + от предыдущих Consumer
+- `Consumer` → зависит от последнего Producer/Transformer барьера, НО не от других Consumer — они параллельны
+
+**Полный пример:** `cargo run -p apex-examples --example event_pipeline --release`
 
 ---
 
@@ -2238,10 +2345,22 @@ fn main() {
 | `compile()` | Скомпилировать план → `Result` |
 | `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `enable_event_ordering(bool)` | Вкл/выкл автоматическое упорядочивание по `Emit`/`Listen` (по умолч. `true`) |
+| `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
+| `system_access(id)` | Получить `&AccessDescriptor` системы по `SystemId` (для валидации) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |
 | `debug_plan()` | Краткий план выполнения |
 | `debug_plan_verbose()` | Подробная диагностика плана |
+
+**Pipeline API:**
+
+| Метод | Описание |
+|-------|----------|
+| `EventPipelineBuilder::produced_by(id, name)` | Добавить Producer (Emit<E>) |
+| `EventPipelineBuilder::transformed_by(id, name)` | Добавить Transformer (Listen<E> + Emit<E>) |
+| `EventPipelineBuilder::consumed_by(id, name)` | Добавить Consumer (Listen<E>) |
+| `EventPipelineBuilder::build(sched)` | Применить зависимости к планировщику |
+| `EventPipelineBuilder::build_validated(sched)` | Применить с проверкой ролей |
 
 ### `StageLabel` API
 

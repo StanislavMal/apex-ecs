@@ -50,6 +50,7 @@
 //! | Sequential | полный &mut World | structural changes |
 
 pub mod stage;
+pub mod pipeline;
 
 use std::any::TypeId;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -69,6 +70,7 @@ pub use stage::{Stage, StageLabel};
 pub use apex_core::system_param::{AutoSystem, ResourceAccessList, EventAccessList, ResRead, ResWrite, Listen, Emit};
 pub use apex_core::AccessDescriptor as Access;
 pub use apex_core::world::SystemContext;
+pub use pipeline::{EventPipelineBuilder, PipelineRole, PipelineValidationError};
 
 // ── ConflictKind ───────────────────────────────────────────────
 
@@ -770,6 +772,33 @@ impl Scheduler {
         self.event_ordering_enabled = enabled;
         self.invalidate_plan();
         self
+    }
+
+    /// Создать конвейер событий для типа E.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// let physics_id = sched.add_auto_system("physics", PhysicsSystem);
+    /// let armor_id   = sched.add_auto_system("armor",   ArmorSystem);
+    /// let health_id  = sched.add_auto_system("health",  HealthSystem);
+    ///
+    /// Scheduler::event_pipeline::<DamageEvent>()
+    ///     .produced_by(physics_id, "physics")
+    ///     .transformed_by(armor_id, "armor")
+    ///     .consumed_by(health_id, "health")
+    ///     .build(&mut sched);
+    /// ```
+    pub fn event_pipeline<E: Send + Sync + 'static>() -> EventPipelineBuilder<E> {
+        EventPipelineBuilder::new()
+    }
+
+    /// Получить AccessDescriptor системы по её SystemId.
+    ///
+    /// Возвращает `None` если система не найдена или это sequential система.
+    pub fn system_access(&self, id: SystemId) -> Option<&AccessDescriptor> {
+        self.system_indices.get(&id).and_then(|&idx| {
+            self.systems.get(idx)?.kind.access()
+        })
     }
 
     /// Заполнить `type_names` из ComponentRegistry World'а.
@@ -2623,6 +2652,123 @@ mod tests {
         assert!(last_idx.is_some(), "Last должен присутствовать даже если не указан в configure_stages");
         assert!(last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
             "Last (не указанный в order) должен быть в конце");
+    }
+
+    // ── Pipeline тесты ─────────────────────────────────────────
+
+    #[derive(Clone, Copy)] struct DamageEvent;
+
+    struct EmitDamage;
+    impl ParSystem for EmitDamage {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write_event::<DamageEvent>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct TransformDmg;
+    impl ParSystem for TransformDmg {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new()
+                .read_event::<DamageEvent>()
+                .write_event::<DamageEvent>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct ListenDamage;
+    impl ParSystem for ListenDamage {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read_event::<DamageEvent>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct ListenDamage2;
+    impl ParSystem for ListenDamage2 {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read_event::<DamageEvent>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    struct ListenerOnly;
+    impl ParSystem for ListenerOnly {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read_event::<DamageEvent>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    #[test]
+    fn pipeline_basic_chain_ordering() {
+        let mut sched = Scheduler::new();
+
+        let physics_id = sched.add_par_system("physics", EmitDamage);
+        let armor_id   = sched.add_par_system("armor",   TransformDmg);
+        let health_id  = sched.add_par_system("health",  ListenDamage);
+
+        Scheduler::event_pipeline::<DamageEvent>()
+            .produced_by(physics_id,   "physics")
+            .transformed_by(armor_id,  "armor")
+            .consumed_by(health_id,    "health")
+            .build(&mut sched);
+
+        sched.compile().unwrap();
+
+        // Должно быть минимум 3 Stage: physics → armor → health
+        let stages = sched.stages().unwrap();
+        assert!(stages.len() >= 3,
+            "Конвейер из 3 стадий должен создать минимум 3 Stage, получено: {}", stages.len());
+
+        // Проверяем порядок плоского списка
+        let flat = &sched.execution_plan.as_ref().unwrap().flat_order;
+        let pos_physics = flat.iter().position(|&id| id == physics_id).unwrap();
+        let pos_armor   = flat.iter().position(|&id| id == armor_id).unwrap();
+        let pos_health  = flat.iter().position(|&id| id == health_id).unwrap();
+        assert!(pos_physics < pos_armor,  "physics должен быть до armor");
+        assert!(pos_armor   < pos_health, "armor должен быть до health");
+    }
+
+    #[test]
+    fn pipeline_parallel_consumers() {
+        let mut sched = Scheduler::new();
+
+        let physics_id = sched.add_par_system("physics", EmitDamage);
+        let health_id  = sched.add_par_system("health",  ListenDamage);
+        let sound_id   = sched.add_par_system("sound",   ListenDamage2);
+
+        Scheduler::event_pipeline::<DamageEvent>()
+            .produced_by(physics_id, "physics")
+            .consumed_by(health_id,  "health")
+            .consumed_by(sound_id,   "sound")
+            .build(&mut sched);
+
+        sched.compile().unwrap();
+
+        // health и sound — параллельные Consumer, должны оказаться в одном Stage
+        let stages = sched.stages().unwrap();
+        let parallel_stage = stages.iter().find(|s| {
+            s.system_ids.contains(&health_id) && s.system_ids.contains(&sound_id)
+        });
+        assert!(parallel_stage.is_some(), "health и sound должны быть в одном параллельном Stage");
+    }
+
+    #[test]
+    fn pipeline_validation_catches_wrong_role() {
+        let mut sched = Scheduler::new();
+
+        // ListenerOnly не имеет Emit<Damage> — не может быть Producer
+        let bad_id = sched.add_par_system("bad_producer", ListenerOnly);
+
+        let result = Scheduler::event_pipeline::<DamageEvent>()
+            .produced_by(bad_id, "bad_producer")
+            .build_validated(&mut sched);
+
+        assert!(result.is_err(), "Должна быть ошибка: система объявлена Producer но не имеет Emit");
+
+        let errors = result.unwrap_err();
+        assert!(matches!(errors[0], PipelineValidationError::ProducerMissingEmit { .. }));
     }
 
     #[test]
