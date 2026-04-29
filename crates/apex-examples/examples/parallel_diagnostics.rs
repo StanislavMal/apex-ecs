@@ -86,7 +86,7 @@ impl AutoSystem for MovementReaderSystem {
         let mut sum = 0.0f32;
         ctx.query::<(Read<Position>, Read<Velocity>)>()
             .for_each(|_, (pos, vel)| {
-                sum += pos.x + vel.x * dt;
+                sum += pos.x + vel.x * dt.0;
             });
         std::hint::black_box(sum);
     }
@@ -121,7 +121,7 @@ impl AutoSystem for PhysicsReaderSystem {
         let mut force_sum = 0.0f32;
         ctx.query::<(Read<Mass>, Read<Acceleration>)>()
             .for_each(|_, (m, a)| {
-                force_sum += m.0 * (a.y + g);
+                force_sum += m.0 * (a.y + g.0);
             });
         std::hint::black_box(force_sum);
     }
@@ -142,9 +142,9 @@ impl AutoSystem for MovementWriterSystem {
         let dt = ctx.resource::<DeltaTime>().0;
         ctx.query::<(Write<Position>, Read<Velocity>)>()
             .for_each(|_, (pos, vel)| {
-                pos.x += vel.x * dt;
-                pos.y += vel.y * dt;
-                pos.z += vel.z * dt;
+                pos.x += vel.x * dt.0;
+                pos.y += vel.y * dt.0;
+                pos.z += vel.z * dt.0;
             });
     }
 }
@@ -160,8 +160,8 @@ impl AutoSystem for MovementWriterSystem2 {
         let dt = ctx.resource::<DeltaTime>().0;
         ctx.query::<(Write<Position>, Read<Acceleration>)>()
             .for_each(|_, (pos, acc)| {
-                pos.x += acc.x * dt * dt * 0.5;
-                pos.y += acc.y * dt * dt * 0.5;
+                pos.x += acc.x * dt.0 * dt.0 * 0.5;
+                pos.y += acc.y * dt.0 * dt.0 * 0.5;
             });
     }
 }
@@ -210,7 +210,7 @@ impl AutoSystem for CounterWriterSystem {
 
     fn run(&mut self, ctx: SystemContext<'_>) {
         // resource_mut() возвращает &mut T
-        let counter = ctx.resource_mut::<GlobalCounter>();
+        let mut counter = ctx.resource_mut::<GlobalCounter>();
         ctx.query::<Read<Health>>()
             .for_each(|_, _| { counter.0 += 1; });
     }
@@ -227,7 +227,7 @@ impl AutoSystem for CooldownSystem {
         let dt = ctx.resource::<DeltaTime>().0;
         ctx.query::<Write<Cooldown>>()
             .for_each(|_, cd| {
-                if cd.0 > 0.0 { cd.0 -= dt; }
+                if cd.0 > 0.0 { cd.0 -= dt.0; }
             });
     }
 }
@@ -431,7 +431,7 @@ fn scenario_resource_contention(n: usize) -> TimedResult {
     // Анализ Stage через публичное API
     if let Some(stages) = sched.stages() {
         for (i, stage) in stages.iter().enumerate() {
-            let mode = if stage.all_parallel { "PARALLEL" } else { "sequential" };
+            let mode = if stage.is_parallel() { "PARALLEL" } else { "sequential" };
             println!("  Stage {:2} [{:10}] — {} system(s)", i, mode, stage.system_count());
         }
     }
@@ -589,11 +589,11 @@ fn scenario_full_pipeline(n: usize) -> TimedResult {
 
     // Анализ Stage
     if let Some(stages) = sched.stages() {
-        let parallel_count = stages.iter().filter(|s| s.all_parallel).count();
+        let parallel_count = stages.iter().filter(|s| s.is_parallel()).count();
         println!("  Stage итого: {} | Параллельных: {} | Последовательных: {}",
             stages.len(), parallel_count, stages.len() - parallel_count);
         for (i, stage) in stages.iter().enumerate() {
-            let mode = if stage.all_parallel { "PARALLEL" } else { "sequential" };
+            let mode = if stage.is_parallel() { "PARALLEL" } else { "sequential" };
             println!("    Stage {:2} [{:10}] — {} system(s)", i, mode, stage.system_count());
         }
     }

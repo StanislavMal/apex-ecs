@@ -101,6 +101,12 @@ impl Stage {
         self.all_parallel && self.system_ids.len() > 1
     }
 
+    /// Возвращает `true`, если Stage был скомпилирован в параллельном режиме
+    /// (все системы внутри не имеют конфликтов доступа).
+    pub fn is_parallel(&self) -> bool {
+        self.all_parallel
+    }
+
     pub fn system_count(&self) -> usize {
         self.system_ids.len()
     }

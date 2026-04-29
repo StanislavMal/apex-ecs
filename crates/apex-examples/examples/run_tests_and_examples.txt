@@ -22,6 +22,14 @@ cargo run -p apex-examples --example event_pipeline --release
 
 cargo bench --features bevy,legion,flecs > results.txt
 
+cargo clippy --workspace          
+
+
+APEX ECS — Диагностика параллелизма:
+
 cargo run -p apex-examples --example parallel_diagnostics --release
 
-cargo clippy --workspace          
+  Для flamegraph:
+    cargo flamegraph -p apex-examples --example parallel_diagnostics
+  Сохранить для сравнения:
+    cargo run -r ... --example parallel_diagnostics > diag_$(git rev-parse --short HEAD).txt
