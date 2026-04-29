@@ -22,4 +22,6 @@ cargo run -p apex-examples --example event_pipeline --release
 
 cargo bench --features bevy,legion,flecs > results.txt
 
+cargo run -p apex-examples --example parallel_diagnostics --release
+
 cargo clippy --workspace          
