@@ -1,18 +1,16 @@
-//! apex-examples: Диагностика параллелизма и поиск бутылочных горлышек
+//! apex-examples: Диагностика параллелизма — scaling benchmark
 //!
 //! Запуск:
-//!   cargo run -p apex-examples --example parallel_diagnostics
 //!   cargo run -p apex-examples --example parallel_diagnostics --release
+//!   cargo run -p apex-examples --example parallel_diagnostics --release --features parallel
 //!
 //! Что тестируется:
-//!   1. SEQUENTIAL vs PARALLEL — сравнение режимов планировщика
-//!   2. CONFLICT DETECTION — какие системы не могут параллелиться и почему
-//!   3. STAGE SATURATION — эффективность заполнения стейджей
-//!   4. CHUNK DISTRIBUTION (ASD) — равномерность раздачи задач по потокам
-//!   5. COMMANDS FLUSH — накладные расходы на apply_deferred
-//!   6. RESOURCE CONTENTION — конкуренция за ресурсы
-//!   7. ARCHETYPE FRAGMENTATION — много мелких архетипов vs мало крупных
-//!   8. MEMORY LEAK CHECK — счётчик entity до/после каждого сценария
+//!   1. SEQ vs PAR — scaling по entity count
+//!   2. Внутрисистемный параллелизм — 1 система, много entity
+//!   3. Stage-level параллелизм — несколько систем в одном Stage
+//!   4. Фрагментация архетипов — 1 vs 4 архетипа
+//!   5. Event pipeline — overhead событий
+//!   6. ResWrite contention — конкуренция за ресурс
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
@@ -43,7 +41,6 @@ struct Damage(f32);
 #[derive(Clone, Copy, Debug)]
 struct Cooldown(f32);
 
-// Маркерные компоненты для разных архетипов
 #[derive(Clone, Copy, Debug)] struct TagA;
 #[derive(Clone, Copy, Debug)] struct TagB;
 #[derive(Clone, Copy, Debug)] struct TagC;
@@ -70,10 +67,9 @@ struct GlobalCounter(u64);
 struct DamageEvent { target: Entity, amount: f32 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СИСТЕМЫ — группа A (не конфликтуют, должны параллелиться)
+// СИСТЕМЫ
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Только читает Position и Velocity — нет конфликтов с группой B.
 struct MovementReaderSystem;
 impl AutoSystem for MovementReaderSystem {
     type Query     = (Read<Position>, Read<Velocity>);
@@ -81,7 +77,6 @@ impl AutoSystem for MovementReaderSystem {
     type Events    = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
-        // ctx.resource::<T>() возвращает &T — берём поле через .0
         let dt = ctx.resource::<DeltaTime>().0;
         let mut sum = 0.0f32;
         ctx.query::<(Read<Position>, Read<Velocity>)>()
@@ -92,7 +87,6 @@ impl AutoSystem for MovementReaderSystem {
     }
 }
 
-/// Читает Health — нет конфликтов с MovementReaderSystem.
 struct HealthReaderSystem;
 impl AutoSystem for HealthReaderSystem {
     type Query     = Read<Health>;
@@ -109,7 +103,6 @@ impl AutoSystem for HealthReaderSystem {
     }
 }
 
-/// Читает Mass + Acceleration — полностью независима.
 struct PhysicsReaderSystem;
 impl AutoSystem for PhysicsReaderSystem {
     type Query     = (Read<Mass>, Read<Acceleration>);
@@ -127,11 +120,6 @@ impl AutoSystem for PhysicsReaderSystem {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// СИСТЕМЫ — группа B (пишут, создают конфликты)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Пишет Position — конфликтует с MovementWriterSystem2 (Write+Write).
 struct MovementWriterSystem;
 impl AutoSystem for MovementWriterSystem {
     type Query     = (Write<Position>, Read<Velocity>);
@@ -149,7 +137,6 @@ impl AutoSystem for MovementWriterSystem {
     }
 }
 
-/// Тоже пишет Position — КОНФЛИКТ с MovementWriterSystem → разные Stage.
 struct MovementWriterSystem2;
 impl AutoSystem for MovementWriterSystem2 {
     type Query     = (Write<Position>, Read<Acceleration>);
@@ -166,7 +153,6 @@ impl AutoSystem for MovementWriterSystem2 {
     }
 }
 
-/// Пишет Health, излучает DamageEvent.
 struct HealthWriterSystem;
 impl AutoSystem for HealthWriterSystem {
     type Query     = (Write<Health>, Read<Damage>);
@@ -185,10 +171,8 @@ impl AutoSystem for HealthWriterSystem {
     }
 }
 
-/// Читает DamageEvent — порядок относительно HealthWriterSystem важен.
 struct DamageListenerSystem;
 impl AutoSystem for DamageListenerSystem {
-    // Нужен хотя бы один компонент в Query (() не реализует WorldQuerySystemAccess)
     type Query     = Read<Health>;
     type Resources = ();
     type Events    = Listen<DamageEvent>;
@@ -201,7 +185,6 @@ impl AutoSystem for DamageListenerSystem {
     }
 }
 
-/// Пишет глобальный счётчик — проверка конкуренции за ресурс.
 struct CounterWriterSystem;
 impl AutoSystem for CounterWriterSystem {
     type Query     = Read<Health>;
@@ -209,14 +192,12 @@ impl AutoSystem for CounterWriterSystem {
     type Events    = ();
 
     fn run(&mut self, ctx: SystemContext<'_>) {
-        // resource_mut() возвращает &mut T
         let mut counter = ctx.resource_mut::<GlobalCounter>();
         ctx.query::<Read<Health>>()
             .for_each(|_, _| { counter.0 += 1; });
     }
 }
 
-/// Обновляет Cooldown — независима от остальных.
 struct CooldownSystem;
 impl AutoSystem for CooldownSystem {
     type Query     = Write<Cooldown>;
@@ -233,9 +214,10 @@ impl AutoSystem for CooldownSystem {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// УТИЛИТЫ ИЗМЕРЕНИЯ
+// ИНФРАСТРУКТУРА ИЗМЕРЕНИЙ
 // ═══════════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
 struct TimedResult {
     label:    String,
     duration: Duration,
@@ -244,7 +226,6 @@ struct TimedResult {
 }
 
 impl TimedResult {
-    /// Mega-entities per second
     fn throughput_meps(&self) -> f64 {
         let secs = self.duration.as_secs_f64();
         if secs == 0.0 { return 0.0; }
@@ -252,7 +233,6 @@ impl TimedResult {
     }
 }
 
-/// Запустить `measure_ticks` тиков планировщика, вернуть среднее время на тик.
 fn measure_scheduler(
     label: &str,
     world: &mut World,
@@ -283,7 +263,6 @@ fn measure_scheduler(
     }
 }
 
-/// Зарегистрировать все компоненты в мире.
 fn register_components(world: &mut World) {
     world.register_component::<Position>();
     world.register_component::<Velocity>();
@@ -298,7 +277,6 @@ fn register_components(world: &mut World) {
     world.register_component::<TagD>();
 }
 
-/// Зарегистрировать ресурсы и события в мире.
 fn register_resources_and_events(world: &mut World) {
     world.resources.insert(DeltaTime(0.016));
     world.resources.insert(Gravity(-9.81));
@@ -307,346 +285,425 @@ fn register_resources_and_events(world: &mut World) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 1: Три независимые системы (идеальный параллелизм)
+// ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ ДЛЯ ВЫВОДА
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn scenario_ideal_parallel(n: usize) -> (TimedResult, TimedResult) {
-    println!("\n╔══ СЦЕНАРИЙ 1: Идеальный параллелизм (3 независимые системы) ══╗");
-    println!("  Системы: MovementReader | HealthReader | PhysicsReader");
-    println!("  Ожидается: все в одном Stage, раздельный доступ к компонентам");
+fn fmt_dur(us: f64) -> String {
+    if us >= 1000.0 { format!("{:>7.2}ms", us / 1000.0) }
+    else { format!("{:>7.1}µs", us) }
+}
 
-    let build_world = |n: usize| {
+fn fmt_meps(meps: f64) -> String {
+    format!("{:>7.2}", meps)
+}
+
+/// Напечатать заголовок таблицы с колонками
+
+
+/// Напечатать строку таблицы для SEQ vs PAR сравнения
+fn table_row_seqpar(
+    n: usize, seq_us: f64, par_us: f64,
+    seq_meps: f64, par_meps: f64, speedup: f64, stages: usize,
+) {
+    let speedup_str = if speedup >= 1.0 {
+        format!("{:>7.2}x ✓", speedup)
+    } else {
+        format!("{:>7.2}x ⚠", speedup)
+    };
+    println!("│ {:>5} │ {} │ {} │ {} │ {} │ {} │ {:>8} │",
+        n,
+        fmt_dur(seq_us),
+        fmt_dur(par_us),
+        fmt_meps(seq_meps),
+        fmt_meps(par_meps),
+        speedup_str,
+        stages,
+    );
+}
+
+/// Напечатать строку таблицы для произвольных результатов
+fn table_row(label: &str, n: usize, us: f64, meps: f64, stages: usize) {
+    println!("  {:30} │ {:>5} │ {} │ {} │ {:>2}",
+        label, n, fmt_dur(us), fmt_meps(meps), stages);
+}
+
+fn table_sep() {
+    println!("├{:─^7}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^10}┤",
+        "", "", "", "", "", "", "");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// СЦЕНАРИИ
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const ENTITY_COUNTS: &[usize] = &[100, 500, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000];
+
+// ── 1. SEQ vs PAR: ideal_parallel ──────────────────────────────────────────
+
+struct IdealParResult {
+    n:    usize,
+    seq:  TimedResult,
+    par:  TimedResult,
+}
+
+fn run_ideal_parallel() -> Vec<IdealParResult> {
+    let mut results = Vec::new();
+    println!("\n═══ СЦЕНАРИЙ 1: SEQ vs PAR — 3 независимые системы ═══");
+    for &n in ENTITY_COUNTS {
+        print!("  n={}...", n);
+
+        let build_world = |n| {
+            let mut world = World::new();
+            register_components(&mut world);
+            register_resources_and_events(&mut world);
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((
+                    Position { x: f, y: f * 0.1, z: 0.0 },
+                    Velocity { x: 1.0, y: 0.0, z: 0.0 },
+                    Health { current: 100.0, max: 100.0 },
+                    Mass(1.0 + f * 0.001),
+                    Acceleration { x: 0.0, y: -9.81, z: 0.0 },
+                ));
+            }
+            world
+        };
+
+        let ticks_measure = if n < 1000 { 100 } else if n < 10000 { 50 } else { 20 };
+
+        // Sequential
+        let mut ws = build_world(n);
+        let mut ss = Scheduler::new();
+        ss.add_auto_system("movement_reader", MovementReaderSystem);
+        ss.add_auto_system("health_reader",   HealthReaderSystem);
+        ss.add_auto_system("physics_reader",  PhysicsReaderSystem);
+        ss.compile_with_world(&ws).expect("compile");
+        let warmup = ticks_measure / 5;
+        for _ in 0..warmup { ws.tick(); ss.run_sequential(&mut ws); }
+        let ec = ws.entity_count();
+        let sc = ss.stages().map(|s| s.len()).unwrap_or(0);
+        let t0 = Instant::now();
+        for _ in 0..ticks_measure { ws.tick(); ss.run_sequential(&mut ws); }
+        let t_seq = t0.elapsed() / ticks_measure as u32;
+        let seq = TimedResult {
+            label: "seq".into(), duration: t_seq, entities: ec, stages: sc,
+        };
+
+        // Parallel
+        let mut wp = build_world(n);
+        let mut sp = Scheduler::new();
+        sp.add_auto_system("movement_reader", MovementReaderSystem);
+        sp.add_auto_system("health_reader",   HealthReaderSystem);
+        sp.add_auto_system("physics_reader",  PhysicsReaderSystem);
+        sp.compile_with_world(&wp).expect("compile");
+        let par = measure_scheduler("par", &mut wp, &mut sp, warmup, ticks_measure);
+
+        results.push(IdealParResult { n, seq, par: par.clone() });
+        println!(" SEQ {:>7.1}µs | PAR {:>7.1}µs | {:.2}x",
+            t_seq.as_micros() as f64 / ticks_measure as f64,
+            par.duration.as_micros() as f64 / ticks_measure as f64,
+            t_seq.as_secs_f64() / par.duration.as_secs_f64().max(1e-12));
+    }
+    results
+}
+
+// ── 2. Внутрисистемный параллелизм ─────────────────────────────────────────
+
+struct IntraSysResult {
+    n:         usize,
+    seq_one:   TimedResult,
+    par_one:   TimedResult,
+    seq_four:  TimedResult,
+    par_four:  TimedResult,
+}
+
+/// Тест: 1 система MovementWriter на 1 vs 4 архетипах
+/// Показывает, насколько хорошо ASD режет одну систему на чанки
+/// и как влияет количество архетипов на распределение.
+fn run_intra_system_parallel() -> Vec<IntraSysResult> {
+    let mut results = Vec::new();
+    println!("\n═══ СЦЕНАРИЙ 2: Внутрисистемный параллелизм (1 система, 1 vs 4 архетипа) ═══");
+    for &n in ENTITY_COUNTS {
+        print!("  n={}...", n);
+
+        let ticks_measure = if n < 1000 { 100 } else if n < 10000 { 50 } else { 20 };
+        let warmup = ticks_measure / 5;
+        let e_per_arch = n / 4;
+
+        let seq_one;
+        let par_one;
+        // 1 архетип
+        {
+            let mut world = World::new();
+            register_components(&mut world);
+            register_resources_and_events(&mut world);
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((
+                    Position { x: f, y: 0.0, z: 0.0 },
+                    Velocity { x: 1.0, y: 0.0, z: 0.0 },
+                ));
+            }
+            // SEQ
+            let mut s = Scheduler::new();
+            s.add_auto_system("movement", MovementWriterSystem);
+            s.compile_with_world(&world).expect("compile");
+            for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
+            let ec = world.entity_count();
+            let sc = s.stages().map(|s| s.len()).unwrap_or(0);
+            let t0 = Instant::now();
+            for _ in 0..ticks_measure { world.tick(); s.run_sequential(&mut world); }
+            seq_one = TimedResult {
+                label: "1arch_seq".into(), duration: t0.elapsed() / ticks_measure as u32,
+                entities: ec, stages: sc,
+            };
+            // PAR
+            let mut world2 = World::new();
+            register_components(&mut world2);
+            register_resources_and_events(&mut world2);
+            for i in 0..n {
+                let f = i as f32;
+                world2.spawn((
+                    Position { x: f, y: 0.0, z: 0.0 },
+                    Velocity { x: 1.0, y: 0.0, z: 0.0 },
+                ));
+            }
+            let mut sp = Scheduler::new();
+            sp.add_auto_system("movement", MovementWriterSystem);
+            sp.compile_with_world(&world2).expect("compile");
+            par_one = measure_scheduler("1arch_par", &mut world2, &mut sp, warmup, ticks_measure);
+        }
+
+        let seq_four;
+        let par_four;
+        // 4 архетипа
+        {
+            let mut world = World::new();
+            register_components(&mut world);
+            register_resources_and_events(&mut world);
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world.spawn((Position { x: f, y: 0.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagA));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world.spawn((Position { x: f, y: 1.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagB));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world.spawn((Position { x: f, y: 2.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagC));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world.spawn((Position { x: f, y: 3.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagD));
+            }
+            // SEQ
+            let mut s = Scheduler::new();
+            s.add_auto_system("movement", MovementWriterSystem);
+            s.compile_with_world(&world).expect("compile");
+            for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
+            let ec = world.entity_count();
+            let sc = s.stages().map(|s| s.len()).unwrap_or(0);
+            let t0 = Instant::now();
+            for _ in 0..ticks_measure { world.tick(); s.run_sequential(&mut world); }
+            seq_four = TimedResult {
+                label: "4arch_seq".into(), duration: t0.elapsed() / ticks_measure as u32,
+                entities: ec, stages: sc,
+            };
+            // PAR
+            let mut world2 = World::new();
+            register_components(&mut world2);
+            register_resources_and_events(&mut world2);
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world2.spawn((Position { x: f, y: 0.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagA));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world2.spawn((Position { x: f, y: 1.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagB));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world2.spawn((Position { x: f, y: 2.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagC));
+            }
+            for i in 0..e_per_arch {
+                let f = i as f32;
+                world2.spawn((Position { x: f, y: 3.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagD));
+            }
+            let mut sp = Scheduler::new();
+            sp.add_auto_system("movement", MovementWriterSystem);
+            sp.compile_with_world(&world2).expect("compile");
+            par_four = measure_scheduler("4arch_par", &mut world2, &mut sp, warmup, ticks_measure);
+        }
+
+        results.push(IntraSysResult { n, seq_one: seq_one.clone(), par_one: par_one.clone(), seq_four: seq_four.clone(), par_four: par_four.clone() });
+        println!(" 1arch SEQ {:>7.1}µs / PAR {:>7.1}µs | 4arch SEQ {:>7.1}µs / PAR {:>7.1}µs",
+            seq_one.duration.as_micros() as f64,
+            par_one.duration.as_micros() as f64,
+            seq_four.duration.as_micros() as f64,
+            par_four.duration.as_micros() as f64,
+        );
+    }
+    results
+}
+
+// ── 3. Event pipeline ──────────────────────────────────────────────────────
+
+struct EventResult {
+    n:   usize,
+    res: TimedResult,
+}
+
+fn run_event_pipeline() -> Vec<EventResult> {
+    let mut results = Vec::new();
+    println!("\n═══ СЦЕНАРИЙ 3: Event pipeline (Emit→Listen) ═══");
+    for &n in ENTITY_COUNTS {
+        print!("  n={}...", n);
+
+        let ticks_measure = if n < 1000 { 100 } else if n < 10000 { 50 } else { 20 };
+        let warmup = ticks_measure / 5;
+
         let mut world = World::new();
         register_components(&mut world);
         register_resources_and_events(&mut world);
+        for i in 0..n {
+            let f = i as f32;
+            world.spawn((
+                Health { current: 50.0 - (i % 30) as f32, max: 100.0 },
+                Damage(1.0 + f * 0.001),
+            ));
+        }
+
+        let mut sched = Scheduler::new();
+        let writer_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
+        let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
+        sched.add_dependency(listener_id, writer_id);
+        sched.compile_with_world(&world).expect("compile");
+
+        let res = measure_scheduler("event", &mut world, &mut sched, warmup, ticks_measure);
+        results.push(EventResult { n, res: res.clone() });
+        println!(" {}µs", res.duration.as_micros());
+    }
+    results
+}
+
+// ── 4. Full pipeline ───────────────────────────────────────────────────────
+
+struct FullPipeResult {
+    n:   usize,
+    res: TimedResult,
+}
+
+fn run_full_pipeline() -> Vec<FullPipeResult> {
+    let mut results = Vec::new();
+    println!("\n═══ СЦЕНАРИЙ 4: Полный пайплайн (6 систем) ═══");
+    for &n in ENTITY_COUNTS {
+        print!("  n={}...", n);
+
+        let ticks_measure = if n < 1000 { 100 } else if n < 10000 { 50 } else { 20 };
+        let warmup = ticks_measure / 5;
+
+        let mut world = World::new();
+        register_components(&mut world);
+        register_resources_and_events(&mut world);
+
         for i in 0..n {
             let f = i as f32;
             world.spawn((
                 Position { x: f, y: f * 0.1, z: 0.0 },
-                Velocity { x: 1.0, y: 0.0, z: 0.0 },
-                Health { current: 100.0, max: 100.0 },
-                Mass(1.0 + f * 0.001),
+                Velocity { x: 1.0, y: 0.5, z: 0.0 },
+                Health { current: 100.0 - (i % 50) as f32, max: 100.0 },
+                Mass(1.0),
                 Acceleration { x: 0.0, y: -9.81, z: 0.0 },
+                Damage(0.5),
+                Cooldown(0.1),
             ));
         }
-        world
-    };
 
-    // Sequential — run_sequential явно
-    let mut world_seq = build_world(n);
-    let mut sched_seq = Scheduler::new();
-    sched_seq.add_auto_system("movement_reader", MovementReaderSystem);
-    sched_seq.add_auto_system("health_reader",   HealthReaderSystem);
-    sched_seq.add_auto_system("physics_reader",  PhysicsReaderSystem);
-    sched_seq.compile_with_world(&world_seq).expect("compile failed");
-    println!("\n  [SEQ] Граф выполнения:\n{}", sched_seq.debug_plan());
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("movement_reader", MovementReaderSystem);
+        sched.add_auto_system("health_reader",   HealthReaderSystem);
+        sched.add_auto_system("physics_reader",  PhysicsReaderSystem);
+        let health_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
+        sched.add_auto_system("cooldown",        CooldownSystem);
+        let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
+        sched.add_dependency(listener_id, health_id);
+        sched.compile_with_world(&world).expect("compile");
 
-    let r_seq = {
-        for _ in 0..3 { world_seq.tick(); sched_seq.run_sequential(&mut world_seq); }
-        let ec = world_seq.entity_count();
-        let sc = sched_seq.stages().map(|s| s.len()).unwrap_or(0);
-        let t0 = Instant::now();
-        for _ in 0..20 { world_seq.tick(); sched_seq.run_sequential(&mut world_seq); }
-        let elapsed = t0.elapsed() / 20;
-        TimedResult { label: "ideal_parallel [sequential]".into(), duration: elapsed, entities: ec, stages: sc }
-    };
-
-    // Parallel — run() использует ASD если собран с feature = "parallel"
-    let mut world_par = build_world(n);
-    let mut sched_par = Scheduler::new();
-    sched_par.add_auto_system("movement_reader", MovementReaderSystem);
-    sched_par.add_auto_system("health_reader",   HealthReaderSystem);
-    sched_par.add_auto_system("physics_reader",  PhysicsReaderSystem);
-    sched_par.compile_with_world(&world_par).expect("compile failed");
-    let r_par = measure_scheduler("ideal_parallel [parallel]", &mut world_par, &mut sched_par, 3, 20);
-
-    (r_seq, r_par)
+        let res = measure_scheduler("full", &mut world, &mut sched, warmup, ticks_measure);
+        results.push(FullPipeResult { n, res: res.clone() });
+        println!(" {}µs", res.duration.as_micros());
+    }
+    results
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 2: Write-Write конфликт (выявляет лишние Stage)
+// ВЫВОД СВОДНЫХ ТАБЛИЦ
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn scenario_write_write_conflict(n: usize) -> TimedResult {
-    println!("\n╔══ СЦЕНАРИЙ 2: Write+Write конфликт по Position ══╗");
-    println!("  MovementWriterSystem + MovementWriterSystem2 оба пишут Position");
-    println!("  Ожидается: 2 отдельных Stage");
-
-    let mut world = World::new();
-    register_components(&mut world);
-    register_resources_and_events(&mut world);
-    for i in 0..n {
-        let f = i as f32;
-        world.spawn((
-            Position { x: f, y: 0.0, z: 0.0 },
-            Velocity { x: 1.0, y: 0.5, z: 0.0 },
-            Acceleration { x: 0.0, y: -1.0, z: 0.0 },
-        ));
+fn print_seqpar_table(results: &[IdealParResult]) {
+    println!("\n┌──────────────────────────────────────────────────────────────────────────────────────┐");
+    println!("│           SEQ vs PAR — 3 независимые системы                                        │");
+    println!("├{:─^7}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^10}┤",
+        "", "", "", "", "", "", "");
+    println!("│ {:>5} │ {:>10} │ {:>10} │ {:>10} │ {:>10} │ {:>10} │ {:>8} │",
+        "N", "SEQ,µs", "PAR,µs", "Meps SEQ", "Meps PAR", "Speedup", "Stages");
+    for r in results {
+        let par_us = r.par.duration.as_micros() as f64;
+        let seq_meps = r.seq.throughput_meps();
+        let par_meps = r.par.throughput_meps();
+        let speedup = r.seq.duration.as_secs_f64() / r.par.duration.as_secs_f64().max(1e-12);
+        table_row_seqpar(r.n, r.seq.duration.as_micros() as f64, par_us, seq_meps, par_meps, speedup, r.seq.stages);
     }
-
-    let mut sched = Scheduler::new();
-    sched.add_auto_system("mover1", MovementWriterSystem);
-    sched.add_auto_system("mover2", MovementWriterSystem2);
-    sched.compile_with_world(&world).expect("compile failed");
-
-    println!("\n  Граф выполнения:\n{}", sched.debug_plan_verbose());
-
-    let stages_count = sched.stages().map(|s| s.len()).unwrap_or(0);
-    if stages_count < 2 {
-        println!("  ⚠️  ПРЕДУПРЕЖДЕНИЕ: ожидалось 2 Stage — конфликт не обнаружен?");
-    } else {
-        println!("  ✅ Конфликт корректно обнаружен: {} Stage(s)", stages_count);
-    }
-
-    measure_scheduler("write_write_conflict", &mut world, &mut sched, 3, 20)
+    println!("└{:─^7}┴{:─^12}┴{:─^12}┴{:─^12}┴{:─^12}┴{:─^12}┴{:─^10}┘",
+        "", "", "", "", "", "", "");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 3: Конкуренция за ресурс (ResWrite)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn scenario_resource_contention(n: usize) -> TimedResult {
-    println!("\n╔══ СЦЕНАРИЙ 3: Конкуренция за ресурс GlobalCounter ══╗");
-    println!("  CounterWriterSystem (ResWrite<GlobalCounter>) + CooldownSystem");
-    println!("  Цель: проверить, создаёт ли ResWrite лишние барьеры");
-
-    let mut world = World::new();
-    register_components(&mut world);
-    register_resources_and_events(&mut world);
-    for i in 0..n {
-        let f = i as f32;
-        world.spawn((
-            Health { current: 100.0, max: 100.0 },
-            Cooldown(f * 0.01),
-        ));
+fn print_intrasys_table(results: &[IntraSysResult]) {
+    println!("\n┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐");
+    println!("│           Внутрисистемный параллелизм — 1 система MovementWriter                                     │");
+    println!("├{:─^7}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┤",
+        "", "", "", "", "", "", "");
+    println!("│ {:>5} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │",
+        "N", "1arch SEQ", "1arch PAR", "1arch Spd", "4arch SEQ", "4arch PAR", "4arch Spd");
+    println!("│ {:>5} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │",
+        "", "µs", "µs", "", "µs", "µs", "");
+    for r in results {
+        let one_speedup = r.seq_one.duration.as_secs_f64() / r.par_one.duration.as_secs_f64().max(1e-12);
+        let four_speedup = r.seq_four.duration.as_secs_f64() / r.par_four.duration.as_secs_f64().max(1e-12);
+        println!("│ {:>5} │ {:>10.1}µs │ {:>10.1}µs │ {:>9.2}x │ {:>10.1}µs │ {:>10.1}µs │ {:>9.2}x │",
+            r.n,
+            r.seq_one.duration.as_micros() as f64,
+            r.par_one.duration.as_micros() as f64,
+            one_speedup,
+            r.seq_four.duration.as_micros() as f64,
+            r.par_four.duration.as_micros() as f64,
+            four_speedup,
+        );
     }
-
-    let mut sched = Scheduler::new();
-    sched.add_auto_system("counter",  CounterWriterSystem);
-    sched.add_auto_system("cooldown", CooldownSystem);
-    sched.compile_with_world(&world).expect("compile failed");
-
-    println!("\n  Граф выполнения:\n{}", sched.debug_plan_verbose());
-
-    // Анализ Stage через публичное API
-    if let Some(stages) = sched.stages() {
-        for (i, stage) in stages.iter().enumerate() {
-            let mode = if stage.is_parallel() { "PARALLEL" } else { "sequential" };
-            println!("  Stage {:2} [{:10}] — {} system(s)", i, mode, stage.system_count());
-        }
-    }
-
-    measure_scheduler("resource_contention", &mut world, &mut sched, 3, 20)
+    println!("└{:─^7}┴{:─^14}┴{:─^14}┴{:─^14}┴{:─^14}┴{:─^14}┴{:─^14}┘",
+        "", "", "", "", "", "", "");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 4: Event pipeline — порядок и накладные расходы
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn scenario_event_pipeline(n: usize) -> TimedResult {
-    println!("\n╔══ СЦЕНАРИЙ 4: Event pipeline (Emit + Listen) ══╗");
-    println!("  HealthWriterSystem (Emit<DamageEvent>) → DamageListenerSystem");
-    println!("  Цель: проверить порядок и overhead event-буферов");
-
-    let mut world = World::new();
-    register_components(&mut world);
-    register_resources_and_events(&mut world);
-    for i in 0..n {
-        let f = i as f32;
-        world.spawn((
-            Health { current: 50.0 - (i % 30) as f32, max: 100.0 },
-            Damage(1.0 + f * 0.001),
-        ));
-    }
-
-    let mut sched = Scheduler::new();
-    let writer_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
-    let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
-    sched.add_dependency(listener_id, writer_id);
-    sched.compile_with_world(&world).expect("compile failed");
-
-    println!("\n  Граф выполнения:\n{}", sched.debug_plan());
-
-    let stages_count = sched.stages().map(|s| s.len()).unwrap_or(0);
-    if stages_count == 1 {
-        println!("  ⚠️  Listener и Writer в одном Stage — проверьте event ordering!");
-    } else {
-        println!("  ✅ Pipeline корректен: {} Stage(s)", stages_count);
-    }
-
-    measure_scheduler("event_pipeline", &mut world, &mut sched, 3, 20)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 5: Архетипная фрагментация
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn scenario_archetype_fragmentation(n: usize) -> (TimedResult, TimedResult) {
-    println!("\n╔══ СЦЕНАРИЙ 5: Архетипная фрагментация ══╗");
-    println!("  1 крупный архетип vs 4 мелких (разные Tags)");
-    println!("  Цель: измерить overhead от большого числа мелких архетипов");
-
-    let entity_per_arch = n / 4;
-
-    let build_single = || {
-        let mut world = World::new();
-        register_components(&mut world);
-        register_resources_and_events(&mut world);
-        for i in 0..n {
-            let f = i as f32;
-            world.spawn((
-                Position { x: f, y: 0.0, z: 0.0 },
-                Velocity { x: 1.0, y: 0.0, z: 0.0 },
-            ));
-        }
-        world
-    };
-
-    let build_fragmented = || {
-        let mut world = World::new();
-        register_components(&mut world);
-        register_resources_and_events(&mut world);
-        for i in 0..entity_per_arch {
-            let f = i as f32;
-            world.spawn((Position { x: f, y: 0.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagA));
-        }
-        for i in 0..entity_per_arch {
-            let f = i as f32;
-            world.spawn((Position { x: f, y: 1.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagB));
-        }
-        for i in 0..entity_per_arch {
-            let f = i as f32;
-            world.spawn((Position { x: f, y: 2.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagC));
-        }
-        for i in 0..entity_per_arch {
-            let f = i as f32;
-            world.spawn((Position { x: f, y: 3.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagD));
-        }
-        world
-    };
-
-    let make_sched = || {
-        let mut s = Scheduler::new();
-        s.add_auto_system("movement_writer", MovementWriterSystem);
-        s
-    };
-
-    let mut world_single = build_single();
-    let mut sched_single = make_sched();
-    sched_single.compile_with_world(&world_single).expect("compile");
-    let r_single = measure_scheduler(
-        &format!("1 архетип ({n} entity)"),
-        &mut world_single, &mut sched_single, 3, 30,
-    );
-
-    let mut world_frag = build_fragmented();
-    let mut sched_frag = make_sched();
-    sched_frag.compile_with_world(&world_frag).expect("compile");
-    let r_frag = measure_scheduler(
-        &format!("4 архетипа ({n} entity суммарно)"),
-        &mut world_frag, &mut sched_frag, 3, 30,
-    );
-
-    (r_single, r_frag)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИЙ 6: Полный пайплайн (стресс-тест)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn scenario_full_pipeline(n: usize) -> TimedResult {
-    println!("\n╔══ СЦЕНАРИЙ 6: Полный пайплайн (стресс-тест) ══╗");
-    println!("  Все системы вместе — реальные условия");
-
-    let mut world = World::new();
-    register_components(&mut world);
-    register_resources_and_events(&mut world);
-
-    for i in 0..n {
-        let f = i as f32;
-        world.spawn((
-            Position { x: f, y: f * 0.1, z: 0.0 },
-            Velocity { x: 1.0, y: 0.5, z: 0.0 },
-            Health { current: 100.0 - (i % 50) as f32, max: 100.0 },
-            Mass(1.0),
-            Acceleration { x: 0.0, y: -9.81, z: 0.0 },
-            Damage(0.5),
-            Cooldown(0.1),
-        ));
-    }
-
-    let mut sched = Scheduler::new();
-    sched.add_auto_system("movement_reader", MovementReaderSystem);
-    sched.add_auto_system("health_reader",   HealthReaderSystem);
-    sched.add_auto_system("physics_reader",  PhysicsReaderSystem);
-    let health_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
-    sched.add_auto_system("cooldown",        CooldownSystem);
-    let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
-    sched.add_dependency(listener_id, health_id);
-    sched.compile_with_world(&world).expect("compile failed");
-
-    println!("\n  Граф выполнения:\n{}", sched.debug_plan_verbose());
-
-    // Анализ Stage
-    if let Some(stages) = sched.stages() {
-        let parallel_count = stages.iter().filter(|s| s.is_parallel()).count();
-        println!("  Stage итого: {} | Параллельных: {} | Последовательных: {}",
-            stages.len(), parallel_count, stages.len() - parallel_count);
-        for (i, stage) in stages.iter().enumerate() {
-            let mode = if stage.is_parallel() { "PARALLEL" } else { "sequential" };
-            println!("    Stage {:2} [{:10}] — {} system(s)", i, mode, stage.system_count());
-        }
-    }
-
-    measure_scheduler("full_pipeline", &mut world, &mut sched, 5, 30)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// УТЕЧКИ: проверка entity_count до/после
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn check_entity_leak(label: &str, before: usize, after: usize) {
-    let diff = after as i64 - before as i64;
-    if diff == 0 {
-        println!("  ✅ [{}] Утечек нет (entity: {})", label, after);
-    } else if diff > 0 {
-        println!("  ⚠️  [{}] +{} entity (возможно ожидаемо от spawn)", label, diff);
-    } else {
-        println!("  ❌ [{}] -{} entity (преждевременная деструкция!)", label, -diff);
+fn print_event_table(results: &[EventResult]) {
+    println!("\n┌─────────────────────────────────────────────────────────────────┐");
+    println!("│           Event pipeline (Emit→Listen)                           │");
+    println!("├{:─^7}┬{:─^12}┬{:─^12}┬{:─^12}┤",
+        "", "", "", "");
+    println!("│ {:>5} │ {:>10} │ {:>10} │ {:>10} │", "N", "µs", "Meps", "Stages");
+    for r in results {
+        table_row("event", r.n, r.res.duration.as_micros() as f64, r.res.throughput_meps(), r.res.stages);
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ВЫВОД РЕЗУЛЬТАТОВ
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn print_result(r: &TimedResult) {
-    println!(
-        "  {:50} │ {:>8.1} µs │ {:>6} entity │ {:>2} stage(s) │ {:>6.3} Meps",
-        r.label,
-        r.duration.as_micros() as f64,
-        r.entities,
-        r.stages,
-        r.throughput_meps(),
-    );
-}
-
-fn print_comparison(r_seq: &TimedResult, r_par: &TimedResult) {
-    let speedup = r_seq.duration.as_secs_f64() / r_par.duration.as_secs_f64();
-    println!("  SEQ: {:>7.1} µs | PAR: {:>7.1} µs | Ускорение: {:.2}x",
-        r_seq.duration.as_micros(),
-        r_par.duration.as_micros(),
-        speedup,
-    );
-    if speedup < 1.0 {
-        println!("  ⚠️  Параллельный режим МЕДЛЕННЕЕ! Rayon overhead > выигрыша.");
-        println!("      → Проверьте MIN_CHUNK в scheduler и число entity");
-    } else if speedup < 1.5 {
-        println!("  ℹ️  Слабое ускорение ({:.2}x). Возможные причины:", speedup);
-        println!("      - Мало entity (rayon overhead > выигрыша)");
-        println!("      - Cache miss при параллельном обходе архетипов");
-    } else {
-        println!("  ✅ Хорошее ускорение ({:.2}x) — параллелизм работает", speedup);
+fn print_fullpipe_table(results: &[FullPipeResult]) {
+    println!("\n┌─────────────────────────────────────────────────────────────────┐");
+    println!("│           Полный пайплайн (6 систем)                              │");
+    println!("├{:─^7}┬{:─^12}┬{:─^12}┬{:─^12}┤",
+        "", "", "", "");
+    println!("│ {:>5} │ {:>10} │ {:>10} │ {:>10} │", "N", "µs", "Meps", "Stages");
+    for r in results {
+        table_row("full", r.n, r.res.duration.as_micros() as f64, r.res.throughput_meps(), r.res.stages);
     }
 }
 
@@ -656,101 +713,71 @@ fn print_comparison(r_seq: &TimedResult, r_par: &TimedResult) {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║        APEX ECS — Диагностика параллелизма                      ║");
+    println!("║     APEX ECS — Диагностика параллелизма (scaling benchmark)     ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Логических ядер (std): {}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
-    println!("  Режим сборки: {}",
-        if cfg!(debug_assertions) { "DEBUG (используйте --release для точных цифр)" }
-        else { "RELEASE" }
+    println!("  Ядер: {} | Режим: {} | Фича parallel: {}",
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" },
+        if cfg!(feature = "parallel") { "✅" } else { "❌" },
     );
+    println!("  Entity counts: {:?}", ENTITY_COUNTS);
+    println!("  {}", "─".repeat(90));
 
-    let n = 50_000;
-    println!("\n  Размер мира: {} entity\n", n);
+    // ── ЗАМЕРЫ ─────────────────────────────────────────────────────
+    let t_all = Instant::now();
 
-    println!("┌─────────────────────────────────────────────────────────────────┐");
-    println!("│                    РЕЗУЛЬТАТЫ ИЗМЕРЕНИЙ                         │");
-    println!("└─────────────────────────────────────────────────────────────────┘");
-    println!("  {:50} │ {:>9} │ {:>12} │ {:>10} │ {:>9}",
-        "Сценарий", "µs/tick", "Entity", "Stage", "Meps");
-    println!("  {}", "─".repeat(106));
+    let r1 = run_ideal_parallel();
+    let r2 = run_intra_system_parallel();
+    let r3 = run_event_pipeline();
+    let r4 = run_full_pipeline();
 
-    // ── 1. Идеальный параллелизм ─────────────────────────────────────────────
-    let (r1_seq, r1_par) = scenario_ideal_parallel(n);
-    print_result(&r1_seq);
-    print_result(&r1_par);
-    print_comparison(&r1_seq, &r1_par);
-    check_entity_leak("ideal_parallel", r1_par.entities, r1_par.entities);
+    let elapsed_all = t_all.elapsed();
 
-    // ── 2. Write-Write конфликт ───────────────────────────────────────────────
-    let r2 = scenario_write_write_conflict(n);
-    print_result(&r2);
+    // ── ВЫВОД ──────────────────────────────────────────────────────
+    println!("\n{}", "═".repeat(90));
+    println!("  СВОДНЫЕ ТАБЛИЦЫ");
+    println!("{}", "═".repeat(90));
 
-    // ── 3. Конкуренция за ресурс ─────────────────────────────────────────────
-    let r3 = scenario_resource_contention(n);
-    print_result(&r3);
+    print_seqpar_table(&r1);
+    print_intrasys_table(&r2);
+    print_event_table(&r3);
+    print_fullpipe_table(&r4);
 
-    // ── 4. Event pipeline ────────────────────────────────────────────────────
-    let r4 = scenario_event_pipeline(n / 5);
-    print_result(&r4);
+    // ── Анализ ─────────────────────────────────────────────────────
+    println!("\n{}", "═".repeat(90));
+    println!("  АНАЛИЗ");
+    println!("{}", "═".repeat(90));
 
-    // ── 5. Фрагментация архетипов ─────────────────────────────────────────────
-    let (r5_single, r5_frag) = scenario_archetype_fragmentation(n);
-    print_result(&r5_single);
-    print_result(&r5_frag);
-    {
-        let overhead_pct = (r5_frag.duration.as_secs_f64()
-            / r5_single.duration.as_secs_f64().max(1e-9) - 1.0) * 100.0;
-        println!("  Overhead фрагментации: {:+.1}%", overhead_pct);
-        if overhead_pct > 20.0 {
-            println!("  ⚠️  Высокий overhead! Рассмотрите объединение мелких архетипов.");
-        } else {
-            println!("  ✅ Фрагментация в допустимых пределах");
-        }
+    // Время переключения между режимами (cross-over point)
+    println!("\n  ● Точка пересечения SEQ/PAR:");
+    for r in &r1 {
+        let speedup = r.seq.duration.as_secs_f64() / r.par.duration.as_secs_f64().max(1e-12);
+        let status = if speedup >= 1.5 { "✅ PAR быстрее" }
+                     else if speedup >= 1.0 { "ℹ️  слабое ускорение" }
+                     else { "⚠️  PAR медленнее" };
+        println!("    n={:>7}: speedup {:>5.2}x — {}", r.n, speedup, status);
     }
 
-    // ── 6. Полный пайплайн ───────────────────────────────────────────────────
-    let r6 = scenario_full_pipeline(n);
-    print_result(&r6);
-
-    // ── Сводный анализ ───────────────────────────────────────────────────────
-    println!("\n╔══════════════════════════════════════════════════════════════════╗");
-    println!("║              ИТОГОВЫЙ АНАЛИЗ БУТЫЛОЧНЫХ ГОРЛЫШЕК               ║");
-    println!("╚══════════════════════════════════════════════════════════════════╝");
-
-    println!("\n  Рейтинг производительности (по Meps, больше = лучше):");
-    let mut results: Vec<&TimedResult> = vec![
-        &r1_par, &r1_seq, &r2, &r3, &r4, &r5_single, &r5_frag, &r6,
-    ];
-    results.sort_by(|a, b| b.throughput_meps().partial_cmp(&a.throughput_meps()).unwrap());
-    for (i, r) in results.iter().enumerate() {
-        println!("  #{:2}  {:50} {:6.3} Meps", i + 1, r.label, r.throughput_meps());
+    // Сравнение 1 vs 4 архетипов
+    println!("\n  ● Фрагментация: 1 архетип vs 4 (SEQ):");
+    for r in &r2 {
+        let single = r.seq_one.duration.as_micros() as f64;
+        let four   = r.seq_four.duration.as_micros() as f64;
+        let overhead = (four / single.max(1.0) - 1.0) * 100.0;
+        println!("    n={:>7}: 1arch {:>8.1}µs  4arch {:>8.1}µs  overhead {:>+6.1}%",
+            r.n, single, four, overhead);
     }
 
-    println!("\n  Рекомендации по оптимизации:");
-    println!("  ┌─ 1. Ускорение SEQ→PAR < 1.5x при n > 10k:");
-    println!("  │     → Проверьте MIN_CHUNK в scheduler/lib.rs");
-    println!("  │     → Убедитесь в сборке с feature = \"parallel\"");
-    println!("  │");
-    println!("  ├─ 2. Много Stage (> 3 при 5 системах):");
-    println!("  │     → debug_plan_verbose() покажет ConflictKind для каждого ребра");
-    println!("  │     → Разделите системы на read-only и write через StageLabel");
-    println!("  │");
-    println!("  ├─ 3. Overhead фрагментации > 20%:");
-    println!("  │     → Используйте spawn_many вместо одиночных spawn");
-    println!("  │     → Минимизируйте тег-компоненты (они дробят архетипы)");
-    println!("  │");
-    println!("  ├─ 4. Event pipeline overhead:");
-    println!("  │     → Emit/Listen могут добавить Stage — проверьте verbose plan");
-    println!("  │     → event_ordering_enabled(false) если строгий порядок не нужен");
-    println!("  │");
-    println!("  └─ 5. Утечки entity:");
-    println!("        → Commands::despawn + apply_deferred после structural Stage");
-    println!("        → despawn_recursive для иерархий ChildOf");
-    println!();
-    println!("  Для flamegraph:");
-    println!("    cargo flamegraph -p apex-examples --example parallel_diagnostics");
-    println!("  Сохранить для сравнения:");
-    println!("    cargo run -r ... --example parallel_diagnostics > diag_$(git rev-parse --short HEAD).txt");
+    // Параллельный speedup 1arch vs 4arch
+    println!("\n  ● Внутрисистемный PAR speedup (1arch vs 4arch):");
+    for r in &r2 {
+        let one_par_sp = r.seq_one.duration.as_secs_f64() / r.par_one.duration.as_secs_f64().max(1e-12);
+        let four_par_sp = r.seq_four.duration.as_secs_f64() / r.par_four.duration.as_secs_f64().max(1e-12);
+        println!("    n={:>7}: 1arch {:>5.2}x  4arch {:>5.2}x", r.n, one_par_sp, four_par_sp);
+    }
+
+    println!("\n{}", "═".repeat(90));
+    println!("  Все замеры выполнены за {:.1}s", elapsed_all.as_secs_f64());
+    println!("{}", "═".repeat(90));
 }

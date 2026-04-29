@@ -110,6 +110,15 @@ impl<T> Events<T> {
         self.cursors.iter().filter(|c| c.is_some()).count()
     }
 
+    /// Предварительно выделить capacity для pending-буфера.
+    ///
+    /// Позволяет избежать многократных реаллокаций при массовой отправке событий.
+    /// Вызывать из системы перед `event_writer::send()` в цикле.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.pending.reserve(additional);
+    }
+
     /// Обновить буферы: переместить `pending` в `events`.
     ///
     /// Вызывается автоматически в `world.tick()`.
@@ -118,6 +127,10 @@ impl<T> Events<T> {
     /// старые события дописываются в конец нового буфера, чтобы
     /// отстающие читатели могли их догнать.
     pub fn update(&mut self) {
+        // Ранний выход: если оба буфера пусты — нечего свопать
+        if self.events.is_empty() && self.pending.is_empty() {
+            return;
+        }
         let all_read = self.all_readers_caught_up();
 
         if all_read {

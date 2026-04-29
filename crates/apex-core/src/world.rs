@@ -311,6 +311,14 @@ impl World {
         true
     }
 
+    /// Предварительно выделить capacity для событий указанного типа.
+    ///
+    /// Позволяет избежать многократных реаллокаций при массовой отправке
+    /// событий в одном тике. Вызывать перед циклом отправки.
+    pub fn event_reserve<T: Send + Sync + 'static>(&mut self, capacity: usize) {
+        self.events.get_or_register_mut::<T>().reserve(capacity);
+    }
+
     pub fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
     ) -> Option<*mut crate::events::Events<T>> {
