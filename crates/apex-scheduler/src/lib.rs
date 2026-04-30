@@ -274,18 +274,6 @@ pub struct SystemBuilder<'a> {
 
 impl<'a> SystemBuilder<'a> {
     pub fn id(self) -> SystemId { self.id }
-
-    /// Пометить что система использует `par_for_each` внутри себя.
-    /// Планировщик не будет дополнительно чанковать эту систему
-    /// через ASD (избегает oversubscribe rayon thread pool).
-    pub fn par_for_each_used(self) -> SystemId {
-        if let Some(sys) = self.scheduler.systems.iter_mut().find(|s| s.id == self.id) {
-            if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
-                access.uses_par_for_each = true;
-            }
-        }
-        self.id
-    }
 }
 
 // ── ExecutionPlan ──────────────────────────────────────────────
@@ -495,7 +483,7 @@ impl Scheduler {
     where
         S: AutoSystem + 'static,
     {
-        self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
+        self.add_auto_system_to_stage(name, system, self.default_stage_label.clone()).into()
     }
 
     /// Регистрировать AutoSystem в указанном этапе.
@@ -737,6 +725,19 @@ impl Scheduler {
     /// По умолчанию: `false` (без автоотключения).
     pub fn set_parallel_auto_disable(&mut self, enabled: bool) -> &mut Self {
         self.auto_disable_parallel = enabled;
+        self
+    }
+
+    /// Пометить AutoSystem (по SystemId) как использующую `par_for_each` внутри.
+    /// Планировщик не будет дополнительно чанковать эту систему через ASD.
+    pub fn par_for_each_used(&mut self, id: SystemId) -> &mut Self {
+        if let Some(sys) = self.system_indices.get(&id)
+            .and_then(|&idx| self.systems.get_mut(idx))
+        {
+            if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
+                access.uses_par_for_each = true;
+            }
+        }
         self
     }
 

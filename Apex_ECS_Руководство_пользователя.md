@@ -816,10 +816,10 @@ sched.add_par_access(
 );
 ```
 
-**Для `add_auto_system`** — через `SystemBuilder`:
+**Для `add_auto_system`** — через `Scheduler::par_for_each_used()`:
 ```rust
-sched.add_auto_system("heavy_physics", HeavyPhysSys)
-     .par_for_each_used();  // флаг на builder'е
+let id = sched.add_auto_system("heavy_physics", HeavyPhysSys);
+sched.par_for_each_used(id);  // пометить как использующую par_for_each
 ```
 
 > **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
@@ -1027,7 +1027,7 @@ fn run(&mut self, ctx: SystemContext<'_>) {
         .par_for_each(|_, (v, p)| {
             /* выполняется на нескольких потоках */
         });
-    // Для add_auto_system ставьте флаг: sched.add_auto_system("sys", S).par_for_each_used()
+    // Для add_auto_system: sched.par_for_each_used(id) после регистрации
     // Для add_par_access: access_desc!(...).par_for_each_used()
 
     // Thread-local Commands (начиная с v0.1.0):
@@ -1992,9 +1992,10 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 >     |ctx| { ctx.query::<(Read<A>, Write<B>)>().par_for_each(|_, (a, b)| { ... }); },
 > );
 > ```
-> Для `add_auto_system` — через `SystemBuilder` (метод доступен с v0.1.0):
+> Для `add_auto_system` — через `Scheduler::par_for_each_used(id)` (метод доступен с v0.1.0):
 > ```rust
-> sched.add_auto_system("heavy_sys", MyAutoSys).par_for_each_used();
+> let id = sched.add_auto_system("heavy_sys", MyAutoSys);
+> sched.par_for_each_used(id);
 > ```
 > Планировщик не будет дополнительно чанковать такую систему через ASD, избегая oversubscribe rayon thread pool.
 
@@ -2114,7 +2115,7 @@ impl SequentialSystem for ScriptedSystem {
 `par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
 - **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: трёхуровневый минимум (128/32/64) и верхний лимит 65536 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
-- **Флаг `.par_for_each_used()`** — для `add_par_access` через `access_desc!(...).par_for_each_used()`, для `add_auto_system` через `.par_for_each_used()` на builder'е:
+- **Флаг `.par_for_each_used()`** — для `add_par_access` через `access_desc!(...).par_for_each_used()`, для `add_auto_system` через `sched.par_for_each_used(id)` после регистрации.
 
 ```rust
 // Хорошо: CPU-bound, много entity
@@ -2456,7 +2457,7 @@ fn main() {
 | `set_parallel_min_entities(n)` | Минимальное total entity в Stage для PAR (по умолч. `0` — без ограничений) |
 | `set_parallel_auto_disable(bool)` | Автоотключение PAR по per-system entity count (по умолч. **`true`**) |
 | `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
-| `add_auto_system(name, sys).par_for_each_used()` | Добавить AutoSystem + пометить что внутренне использует `par_for_each` |
+| `par_for_each_used(id)` | Пометить систему (по `SystemId`) как использующую `par_for_each` внутри |
 | `system_access(id)` | Получить `&AccessDescriptor` системы по `SystemId` (для валидации) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |

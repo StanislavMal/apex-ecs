@@ -1297,8 +1297,8 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysParSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempParSys)
+            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys); s.par_for_each_used(id); },
         );
         bench_seq_par(
             &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1322,9 +1322,9 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysParSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempParSys),
-            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaParSys)
+            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("mana", HeavyManaParSys); s.par_for_each_used(id); },
         );
         bench_seq_par(
             &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
