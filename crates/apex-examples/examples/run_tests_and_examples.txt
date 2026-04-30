@@ -29,6 +29,8 @@ APEX ECS — Диагностика параллелизма:
 
 cargo run -p apex-examples --example parallel_diagnostics --release
 
+cargo run -p apex-examples --example parallel_diagnostics --release --features parallel
+
   Для flamegraph:
     cargo flamegraph -p apex-examples --example parallel_diagnostics
   Сохранить для сравнения:

@@ -274,6 +274,18 @@ pub struct SystemBuilder<'a> {
 
 impl<'a> SystemBuilder<'a> {
     pub fn id(self) -> SystemId { self.id }
+
+    /// Пометить что система использует `par_for_each` внутри себя.
+    /// Планировщик не будет дополнительно чанковать эту систему
+    /// через ASD (избегает oversubscribe rayon thread pool).
+    pub fn par_for_each_used(self) -> SystemId {
+        if let Some(sys) = self.scheduler.systems.iter_mut().find(|s| s.id == self.id) {
+            if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
+                access.uses_par_for_each = true;
+            }
+        }
+        self.id
+    }
 }
 
 // ── ExecutionPlan ──────────────────────────────────────────────
@@ -1399,6 +1411,9 @@ impl Scheduler {
             /// Система использует события (Emit/Listen) — чанкование
             /// небезопасно из-за data race на Events<T>::pending.
             has_events: bool,
+            /// Система использует par_for_each внутри — чанкование
+            /// не нужно (приведёт к oversubscribe rayon).
+            uses_par_for_each: bool,
         }
 
         let mut sys_infos: Vec<SysInfo> = Vec::new();
@@ -1422,8 +1437,12 @@ impl Scheduler {
                     .sum();
 
                 if entity_count > 0 {
-                    let has_events = self.systems[sys_idx].kind.access()
+                    let access = self.systems[sys_idx].kind.access();
+                    let has_events = access
                         .map(|a| !a.reads_event.is_empty() || !a.writes_event.is_empty())
+                        .unwrap_or(false);
+                    let uses_par_for_each = access
+                        .map(|a| a.uses_par_for_each)
                         .unwrap_or(false);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
@@ -1431,6 +1450,7 @@ impl Scheduler {
                         arch_indices,
                         entity_count,
                         has_events,
+                        uses_par_for_each,
                     });
                 } else {
                     // Система без entity (только ресурсы/события) — запускаем сразу
@@ -1469,10 +1489,11 @@ impl Scheduler {
             // Per-system scope для:
             //   a) Систем с малым entity_count (один чанк не даст parallelism)
             //   b) Систем с событиями (Emit/Listen) — Events<T> не thread-safe
+            //   c) Систем с par_for_each — избегаем oversubscribe rayon
             //
-            // Для систем с большим entity_count без событий — ASD разбивка
+            // Для систем с большим entity_count без ограничений — ASD разбивка
             // на чанки, распределённые по воркерам (row-level split).
-            if info.has_events || info.entity_count <= effective_chunk {
+            if info.has_events || info.uses_par_for_each || info.entity_count <= effective_chunk {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,

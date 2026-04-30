@@ -199,6 +199,10 @@ pub struct AccessDescriptor {
     /// Маска архетипов — заполняется планировщиком в compile().
     /// Определяет, какие архетипы нужны этой системе.
     pub archetype_mask: ArchetypeMask,
+    /// Флаг: система использует `par_for_each` внутри себя.
+    /// Планировщик не будет чанковать такую систему через ASD
+    /// (избегает oversubscribe rayon thread pool).
+    pub uses_par_for_each: bool,
 }
 
 impl AccessDescriptor {
@@ -224,6 +228,13 @@ impl AccessDescriptor {
         self
     }
 
+    /// Пометить что система использует `par_for_each` внутри себя.
+    /// Планировщик не будет дополнительно чанковать систему через ASD.
+    pub fn par_for_each_used(mut self) -> Self {
+        self.uses_par_for_each = true;
+        self
+    }
+
     /// Декларировать запись событий типа T.
     pub fn write_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
@@ -241,6 +252,8 @@ impl AccessDescriptor {
         // Маски сливаем битовым OR
         self.read_mask  = self.read_mask.or(&other.read_mask);
         self.write_mask = self.write_mask.or(&other.write_mask);
+        // Передаём флаг par_for_each
+        self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
         self
     }
 

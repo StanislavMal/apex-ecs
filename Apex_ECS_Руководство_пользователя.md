@@ -802,6 +802,26 @@ sched.add_par_access_to_stage(
 );
 ```
 
+**Система с внутренним `par_for_each`** — установите флаг `.par_for_each_used()` чтобы ASD не создавал дополнительных чанков (избегает oversubscribe rayon thread pool):
+
+**Для `add_par_access`** — через `AccessDescriptor`:
+```rust
+sched.add_par_access(
+    "heavy_physics",
+    access_desc!(write<Pos>, read<Vel>).par_for_each_used(),
+    |ctx| {
+        ctx.query::<(Read<Vel>, Write<Pos>)>()
+            .par_for_each(|_, (v, p)| { /* CPU-bound расчёты */ });
+    },
+);
+```
+
+**Для `add_auto_system`** — через `SystemBuilder`:
+```rust
+sched.add_auto_system("heavy_physics", HeavyPhysSys)
+     .par_for_each_used();  // флаг на builder'е
+```
+
 > **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
 > сокращающий `AccessDescriptor::new().read::<T>().write::<T>()`.
 
@@ -1007,6 +1027,8 @@ fn run(&mut self, ctx: SystemContext<'_>) {
         .par_for_each(|_, (v, p)| {
             /* выполняется на нескольких потоках */
         });
+    // Для add_auto_system ставьте флаг: sched.add_auto_system("sys", S).par_for_each_used()
+    // Для add_par_access: access_desc!(...).par_for_each_used()
 
     // Thread-local Commands (начиная с v0.1.0):
     ctx.commands().despawn(entity);
@@ -1963,6 +1985,19 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 });
 ```
 
+> **Флаг `.par_for_each_used()`:** Для `add_par_access` — через `AccessDescriptor`:
+> ```rust
+> sched.add_par_access("heavy_sys",
+>     access_desc!(read<A>, write<B>).par_for_each_used(),
+>     |ctx| { ctx.query::<(Read<A>, Write<B>)>().par_for_each(|_, (a, b)| { ... }); },
+> );
+> ```
+> Для `add_auto_system` — через `SystemBuilder` (метод доступен с v0.1.0):
+> ```rust
+> sched.add_auto_system("heavy_sys", MyAutoSys).par_for_each_used();
+> ```
+> Планировщик не будет дополнительно чанковать такую систему через ASD, избегая oversubscribe rayon thread pool.
+
 > **Настройка `MAX_CHUNK_SIZE`:** По умолчанию 65536. Можно изменить через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`. Увеличение уменьшает число задач для больших миров (меньше overhead), уменьшение — более равномерная загрузка ядер.
 
 > **Примечание:** Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
@@ -2079,6 +2114,7 @@ impl SequentialSystem for ScriptedSystem {
 `par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
 - **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: трёхуровневый минимум (128/32/64) и верхний лимит 65536 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
+- **Флаг `.par_for_each_used()`** — для `add_par_access` через `access_desc!(...).par_for_each_used()`, для `add_auto_system` через `.par_for_each_used()` на builder'е:
 
 ```rust
 // Хорошо: CPU-bound, много entity
@@ -2420,6 +2456,7 @@ fn main() {
 | `set_parallel_min_entities(n)` | Минимальное total entity в Stage для PAR (по умолч. `0` — без ограничений) |
 | `set_parallel_auto_disable(bool)` | Автоотключение PAR по per-system entity count (по умолч. **`true`**) |
 | `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
+| `add_auto_system(name, sys).par_for_each_used()` | Добавить AutoSystem + пометить что внутренне использует `par_for_each` |
 | `system_access(id)` | Получить `&AccessDescriptor` системы по `SystemId` (для валидации) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |

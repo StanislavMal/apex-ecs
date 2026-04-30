@@ -216,7 +216,30 @@ impl AutoSystem for CooldownSystem {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ИНФРАСТРУКТУРА ИЗМЕРЕНИЙ
+// ПРИМЕР: демонстрация флага par_for_each_used()
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Система, добавляемая через add_par_access с флагом .par_for_each_used().
+// Планировщик не будет чанковать её через ASD (избегает oversubscribe).
+// Используйте этот флаг когда ваша система внутренне вызывает par_for_each.
+
+fn register_par_for_each_demo(sched: &mut Scheduler) {
+    use apex_core::access_desc;
+    sched.add_par_access(
+        "demo_intra_par",
+        access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
+        |ctx| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>()
+                .par_for_each(|_, (vel, pos)| {
+                    pos.x += vel.x * 0.016;
+                    pos.y += vel.y * 0.016;
+                });
+        },
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// УТИЛИТЫ ИЗМЕРЕНИЯ
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
