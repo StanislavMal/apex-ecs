@@ -912,7 +912,10 @@ impl Scheduler {
             let mut level_by_label: FxHashMap<StageLabel, Vec<SystemId>> = FxHashMap::default();
             for &node in level {
                 if let Some(&sys_id) = self.dependency_graph.node_data(node) {
-                    if let Some(system) = self.systems.iter().find(|s| s.id == sys_id) {
+                    // O(1) lookup через system_indices вместо O(N) find()
+                    if let Some(system) = self.system_indices.get(&sys_id)
+                        .and_then(|&idx| self.systems.get(idx))
+                    {
                         level_by_label
                             .entry(system.stage_label.clone())
                             .or_default()
@@ -922,8 +925,8 @@ impl Scheduler {
             }
             for (label, ids) in level_by_label {
                 let all_parallel = ids.iter().all(|sid| {
-                    self.systems.iter()
-                        .find(|s| s.id == *sid)
+                    self.system_indices.get(sid)
+                        .and_then(|&idx| self.systems.get(idx))
                         .map(|s| s.kind.is_parallel())
                         .unwrap_or(false)
                 });
@@ -1820,7 +1823,9 @@ impl Scheduler {
                        else                           { "sequential" };
             out.push_str(&format!("Stage {} [{}] ({}) :\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
-                if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
+                if let Some(s) = self.system_indices.get(sys_id)
+                    .and_then(|&idx| self.systems.get(idx))
+                {
                     let kind_str = match &s.kind {
                         SystemKind::Parallel { access, .. } =>
                             format!("par | R:{} W:{}", access.reads.len(), access.writes.len()),
@@ -1868,7 +1873,9 @@ impl Scheduler {
                        else                           { "sequential" };
             out.push_str(&format!("Stage {} [{}] ({}):\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
-                if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
+                if let Some(s) = self.system_indices.get(sys_id)
+                    .and_then(|&idx| self.systems.get(idx))
+                {
                     match &s.kind {
                         SystemKind::Parallel { access, .. } => {
                             let reads: Vec<_>  = access.reads.iter()
@@ -1902,7 +1909,9 @@ impl Scheduler {
         if !self.system_archetype_indices.is_empty() {
             out.push_str("\n  ── SubWorld archetype mapping ──\n");
             for sys_id in plan.flat_order.iter() {
-                if let Some(s) = self.systems.iter().find(|s| s.id == *sys_id) {
+                if let Some(s) = self.system_indices.get(sys_id)
+                    .and_then(|&idx| self.systems.get(idx))
+                {
                     if let Some(indices) = self.system_archetype_indices.get(sys_id) {
                         out.push_str(&format!(
                             "  {}: {} archetypes [{}]\n",
