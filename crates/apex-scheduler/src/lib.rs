@@ -1782,6 +1782,22 @@ impl Scheduler {
         // Группируем системы по одинаковым наборам индексов архетипов
         // через Hash & Eq по содержимому &[usize] (без клонирования Vec).
         // Если в группе 2+ системы, распределяем строки архетипов между ними.
+        //
+        // Row-level split имеет смысл только для систем, которые
+        // выполняются в ОДНОМ all_parallel Stage — они работают
+        // параллельно и делят сущности без конфликтов.
+        // Системы из разных Stage выполняются последовательно
+        // и каждая должна видеть ВСЕ entity целиком.
+        let plan = self.execution_plan.as_ref().unwrap();
+        let mut sys_idx_to_stage_idx: FxHashMap<usize, usize> = FxHashMap::default();
+        for (stage_idx, stage) in plan.stages.iter().enumerate() {
+            for &sys_id in &stage.system_ids {
+                if let Some(&idx) = self.system_indices.get(&sys_id) {
+                    sys_idx_to_stage_idx.insert(idx, stage_idx);
+                }
+            }
+        }
+
         let num_threads = rayon::current_num_threads();
         let mut groups: FxHashMap<&[usize], Vec<usize>> = FxHashMap::default();
 
@@ -1798,6 +1814,26 @@ impl Scheduler {
             let group_size = sys_indices.len().min(num_threads);
             if group_size < 2 {
                 continue; // Только группы с реальным conflict (2+ системы)
+            }
+
+            // Row-level split только для систем одного all_parallel Stage.
+            // Системы из разных Stage выполняются последовательно —
+            // каждая должна видеть все entity, иначе симуляция ломается.
+            let stages: Vec<usize> = sys_indices
+                .iter()
+                .filter_map(|idx| sys_idx_to_stage_idx.get(idx).copied())
+                .collect();
+            let all_same_stage = stages
+                .first()
+                .map(|&first| stages.iter().all(|&s| s == first))
+                .unwrap_or(false);
+            let stage_is_parallel = stages
+                .first()
+                .map_or(false, |&stage_idx| {
+                    plan.stages.get(stage_idx).map_or(false, |s| s.all_parallel)
+                });
+            if !all_same_stage || !stage_is_parallel {
+                continue;
             }
 
             for &arch_idx in _sig.iter() {
