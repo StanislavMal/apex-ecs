@@ -1,5 +1,8 @@
 use std::cell::UnsafeCell;
 use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -20,7 +23,7 @@ use crate::{
 // ── QueryCache ─────────────────────────────────────────────────
 
 struct CacheEntry {
-    arch_indices: Vec<usize>,
+    arch_indices: Arc<[usize]>,
     version:      u32,
 }
 
@@ -35,76 +38,76 @@ impl std::borrow::Borrow<[ComponentId]> for QueryCacheKey {
 }
 
 pub(crate) struct QueryCache {
-    entries: UnsafeCell<FxHashMap<QueryCacheKey, CacheEntry>>,
-    version: u32,
+    entries: RwLock<FxHashMap<QueryCacheKey, CacheEntry>>,
+    version: AtomicU32,
 }
-
-unsafe impl Sync for QueryCache {}
 
 impl QueryCache {
     pub fn new() -> Self {
-        Self { entries: UnsafeCell::new(FxHashMap::default()), version: 0 }
+        Self {
+            entries: RwLock::new(FxHashMap::default()),
+            version: AtomicU32::new(0),
+        }
     }
 
-    pub unsafe fn get_or_compute(
+    pub fn get_or_compute(
         &self,
-        key:           &[ComponentId],
-        world_version: u32,
-        archetypes:    &[Archetype],
-        matches:       impl Fn(&Archetype) -> bool,
-    ) -> &[usize] {
-        // SAFETY: весь метод unsafe, caller гарантирует отсутствие других &self доступа.
-        // Управляем временем жизни заимствований через raw pointer, чтобы
-        // избежать конфликта mutable borrow'ов между hit-paths (get_mut) и miss-paths (insert).
-        let raw = self.entries.get();
+        key:        &[ComponentId],
+        archetypes: &[Archetype],
+        matches:    impl Fn(&Archetype) -> bool,
+    ) -> Arc<[usize]> {
+        let current_version = self.version.load(Ordering::Acquire);
 
-        // Hit path — lookup по &[ComponentId] через Borrow, zero-copy, без аллокации
-        // При hit или stale — немедленный return, borrow заканчивается.
+        // Hit path — zero-copy lookup через Borrow<[ComponentId]>
         {
-            let map = &mut *raw;
-            if let Some(entry) = map.get_mut(key) {
-                if entry.version == world_version {
-                    return &entry.arch_indices;
+            let map = self.entries.read().unwrap();
+            if let Some(entry) = map.get(key) {
+                if entry.version == current_version {
+                    return entry.arch_indices.clone();
                 }
-                // Cache stale — обновляем на месте, не создаём новую запись
-                entry.arch_indices = archetypes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, arch)| !arch.is_empty() && matches(arch))
-                    .map(|(i, _)| i)
-                    .collect();
-                entry.version = world_version;
-                return &entry.arch_indices;
             }
         }
 
-        // Miss — вставляем новую запись (аллокация QueryCacheKey только здесь).
-        // Используем сырой указатель, т.к. предыдущий &mut из `raw` уже не используется.
-        let query_key = QueryCacheKey(key.iter().copied().collect());
-        let arch_indices = archetypes
+        // Miss или stale — расчёт нового списка архетипов
+        let arch_indices: Arc<[usize]> = archetypes
             .iter()
             .enumerate()
             .filter(|(_, arch)| !arch.is_empty() && matches(arch))
             .map(|(i, _)| i)
-            .collect();
-        (*raw).insert(query_key, CacheEntry { arch_indices, version: world_version });
+            .collect::<Vec<usize>>()
+            .into();
 
-        // Возвращаем ссылку на вставленные данные через сырой указатель
-        &(*raw).get(key).unwrap().arch_indices
+        let mut map = self.entries.write().unwrap();
+        // Двойная проверка: другой поток мог вставить между read и write lock
+        if let Some(entry) = map.get(key) {
+            if entry.version == current_version {
+                return entry.arch_indices.clone();
+            }
+        }
+
+        let query_key = QueryCacheKey(key.iter().copied().collect());
+        map.insert(query_key, CacheEntry {
+            arch_indices: arch_indices.clone(),
+            version:      current_version,
+        });
+
+        arch_indices
     }
 
-    pub fn invalidate(&mut self) { self.version = self.version.wrapping_add(1); }
+    pub fn invalidate(&self) {
+        self.entries.write().unwrap().clear();
+        self.version.fetch_add(1, Ordering::Release);
+    }
 
     /// Инвалидировать только записи кеша, затрагивающие данный компонент.
-    /// Позволяет сохранить кеш для несвязанных запросов.
-    pub fn invalidate_for(&mut self, changed_cid: ComponentId) {
-        let map = unsafe { &mut *self.entries.get() };
-        // Удаляем только те ключи (списки компонентов запроса),
-        // которые содержат изменённый ComponentId.
-        map.retain(|key, _| !key.0.contains(&changed_cid));
+    pub fn invalidate_for(&self, changed_cid: ComponentId) {
+        self.entries.write().unwrap()
+            .retain(|key, _| !key.0.contains(&changed_cid));
     }
 
-    pub fn version(&self) -> u32 { self.version }
+    pub fn version(&self) -> u32 {
+        self.version.load(Ordering::Acquire)
+    }
 }
 
 // ── ArchetypeKey ───────────────────────────────────────────────
@@ -1063,14 +1066,13 @@ impl<'w> SystemContext<'w> {
     }
 
     #[inline]
-    pub fn query<Q: WorldQuery>(&self) -> crate::query::Query<'_, Q> {
-        // Используем SubWorld для ограничения архетипов и строк (row-level splits)
-        crate::query::Query::from_sub_world(&self.sub_worlds[0], Tick::ZERO)
+    pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+        CachedQuery::from_sub_world(&self.sub_worlds[0], Tick::ZERO)
     }
 
     #[inline]
-    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> crate::query::Query<'_, Q> {
-        crate::query::Query::from_sub_world(&self.sub_worlds[0], last_run)
+    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
+        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
     }
 
     #[inline]
@@ -1152,7 +1154,7 @@ impl<'w> ParallelWorld<'w> {
 
 pub struct CachedQuery<'w, Q: WorldQuery> {
     world:        &'w World,
-    arch_indices: &'w [usize],
+    arch_indices: Arc<[usize]>,
     last_run:     Tick,
     cached_ids:   Vec<ComponentId>,
     row_ranges:   &'w [(usize, usize, usize)],
@@ -1164,16 +1166,13 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
 
-        let version      = world.query_cache.version();
         let arch_indices = if ids.len() == Q::component_count() {
-            unsafe {
-                world.query_cache.get_or_compute(
-                    &ids, version, &world.archetypes,
-                    |arch| Q::matches_archetype(arch, &ids),
-                )
-            }
+            world.query_cache.get_or_compute(
+                &ids, &world.archetypes,
+                |arch| Q::matches_archetype(arch, &ids),
+            )
         } else {
-            &[]
+            Arc::new([])
         };
 
         Self {
@@ -1187,11 +1186,15 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     }
 
     /// Создать CachedQuery с ограничением на архетипы и строки из SubWorld.
+    ///
+    /// Не вызывает `get_or_compute` (thread-safe для параллельных систем).
+    /// Фильтрация по `Q::matches_archetype` происходит в `for_each`/`par_for_each`
+    /// — там `fetch_state` вызывается только для совпадающих архетипов.
     pub fn from_sub_world(sub: &SubWorld<'w>, last_run: Tick) -> Self {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(sub.world, &mut ids);
 
-        let arch_indices: &'w [usize] = sub.archetype_indices;
+        let arch_indices: Arc<[usize]> = sub.archetype_indices.into();
         let row_ranges: &'w [(usize, usize, usize)] = sub.row_ranges;
 
         Self {
@@ -1214,9 +1217,10 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         let ids = &self.cached_ids;
         if ids.len() != Q::component_count() { return; }
-        for &arch_idx in self.arch_indices {
+        for &arch_idx in self.arch_indices.as_ref() {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() { continue; }
+            if !Q::matches_archetype(arch, ids) { continue; }
             let state    = unsafe { Q::fetch_state(arch, ids, self.last_run) };
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
@@ -1243,11 +1247,13 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
         let num_threads = rayon::current_num_threads();
-        let ids = &self.cached_ids;
+
+        // ids — owned clone, как в Query::par_for_each (не ссылка на &self)
+        let ids = self.cached_ids.clone();
         if ids.len() != Q::component_count() { return; }
 
-        let world     = self.world;
-        let last_run  = self.last_run;
+        let world      = self.world;
+        let last_run   = self.last_run;
         let row_ranges = self.row_ranges;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges.iter()
@@ -1259,6 +1265,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 .iter()
                 .copied()
                 .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+                .filter(|&arch_idx| Q::matches_archetype(&world.archetypes[arch_idx], &ids))
                 .map(|arch_idx| {
                     let s = rr(arch_idx);
                     let effective_len = s.1.min(world.archetypes[arch_idx].len())
@@ -1273,8 +1280,8 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             let clamped_start = r_start + start;
             let clamped_end = (r_start + end).min(r_end);
             if clamped_start >= clamped_end { return; }
-            let arch     = &world.archetypes[arch_idx];
-            let state    = unsafe { Q::fetch_state(arch, ids, last_run) };
+            let arch     = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let state    = unsafe { Q::fetch_state(arch, &ids, last_run) };
             let entities = &arch.entities[clamped_start..clamped_end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = clamped_start + offset;
@@ -1297,6 +1304,111 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
     pub fn is_empty(&self) -> bool {
         self.arch_indices.iter().all(|&i| self.world.archetypes[i].is_empty())
+    }
+
+    /// Создать `Iterator` по (Entity, компонентам).
+    ///
+    /// В отличие от `for_each`, возвращает стандартный Rust-итератор.
+    /// `fetch_state` вызывается лениво — только при переходе на новый архетип.
+    #[inline]
+    pub fn iter(&self) -> CachedQueryIter<'w, Q> {
+        CachedQueryIter {
+            world:        self.world,
+            arch_indices: self.arch_indices.clone(),
+            cached_ids:   self.cached_ids.clone(),
+            last_run:     self.last_run,
+            row_ranges:   self.row_ranges,
+            arch_pos:     0,
+            row:          0,
+            row_end:      0,
+            entities:     std::ptr::null(),
+            state:        None,
+            _phantom:     std::marker::PhantomData,
+        }
+    }
+}
+
+/// Lazy-итератор для `CachedQuery`.
+///
+/// Вызывает `fetch_state` только при переходе на новый архетип,
+/// а не при создании — в отличие от `QueryIter`.
+pub struct CachedQueryIter<'w, Q: WorldQuery> {
+    world:        &'w World,
+    arch_indices: Arc<[usize]>,
+    cached_ids:   Vec<ComponentId>,
+    last_run:     Tick,
+    row_ranges:   &'w [(usize, usize, usize)],
+
+    arch_pos:     usize,
+    row:          usize,
+    row_end:      usize,
+    entities:     *const Entity,
+    state:        Option<Q::State>,
+    _phantom:     std::marker::PhantomData<Q>,
+}
+
+impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
+    type Item = (Entity, Q::Item<'w>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Пока нет активного архетипа или его строки закончились
+            while self.arch_pos < self.arch_indices.len() && self.row >= self.row_end {
+                self.advance_archetype();
+            }
+
+            if self.arch_pos >= self.arch_indices.len() {
+                return None;
+            }
+
+            let row = self.row;
+            self.row += 1;
+
+            let entity = unsafe { *self.entities.add(row) };
+            let item = unsafe { Q::fetch_item(*self.state.as_ref().unwrap(), row) };
+
+            if let Some(item) = item {
+                return Some((entity, item));
+            }
+        }
+    }
+}
+
+impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
+    fn advance_archetype(&mut self) {
+        self.arch_pos += 1;
+        self.state = None;
+
+        if self.arch_pos >= self.arch_indices.len() {
+            return;
+        }
+
+        let arch_idx = self.arch_indices[self.arch_pos];
+        let arch = &self.world.archetypes[arch_idx];
+
+        if arch.is_empty() {
+            self.row = 0;
+            self.row_end = 0;
+            return;
+        }
+
+        let (r_start, r_end) = self.row_ranges.iter()
+            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+            .unwrap_or((0, usize::MAX));
+        let end = r_end.min(arch.len());
+        let len = end.saturating_sub(r_start);
+
+        if len == 0 {
+            self.row = 0;
+            self.row_end = 0;
+            return;
+        }
+
+        self.state = Some(unsafe { Q::fetch_state(arch, &self.cached_ids, self.last_run) });
+        self.row = r_start;
+        self.row_end = end;
+        self.entities = arch.entities.as_ptr();
     }
 }
 

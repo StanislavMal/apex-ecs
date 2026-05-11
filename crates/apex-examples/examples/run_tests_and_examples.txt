@@ -20,8 +20,6 @@ cargo run -p apex-examples --example perf --release --features parallel
 
 cargo run -p apex-examples --example event_pipeline --release
 
-cargo bench --features bevy,legion,flecs > results.txt
-
 cargo clippy --workspace          
 
 
@@ -35,3 +33,12 @@ cargo run -p apex-examples --example parallel_diagnostics --release --features p
     cargo flamegraph -p apex-examples --example parallel_diagnostics
   Сохранить для сравнения:
     cargo run -r ... --example parallel_diagnostics > diag_$(git rev-parse --short HEAD).txt
+
+
+APEX ECS — тестирование с конкурентами:
+
+cargo bench --features bevy,legion,flecs > results.txt
+
+cargo bench -p apex-bench
+
+cargo bench -p apex-bench -- "heavy_compute|schedule"

@@ -1621,9 +1621,10 @@ impl Scheduler {
             .collect();
 
         // Pre-вычисляем SubWorld storage для sequential fallback
-        let const_world: &World = unsafe { &*(world as *mut World as *const World) };
+        let mut const_world: &World = unsafe { &*(world as *mut World as *const World) };
         self.prepare_sub_worlds(const_world);
         let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
+        let mut prev_arch_count = const_world.archetypes().len();
 
         // Создаём thread-local Commands для каждого потока rayon.
         // Каждый параллельный поток получает доступ к своему Commands
@@ -1659,6 +1660,17 @@ impl Scheduler {
                 // Применяем thread-локальные команды после sequential stage.
                 for cmds in &mut thread_commands {
                     cmds.apply(world);
+                }
+
+                // Если структурные изменения создали новые архетипы —
+                // обновляем SubWorld storage для следующих Stage
+                let cur = world.archetypes().len();
+                if cur != prev_arch_count {
+                    prev_arch_count = cur;
+                    const_world = unsafe { &*(world as *mut World as *const World) };
+                    self.compute_archetype_indices(const_world);
+                    self.sub_worlds_dirty = true;
+                    self.prepare_sub_worlds(const_world);
                 }
                 continue;
             }
@@ -1697,6 +1709,15 @@ impl Scheduler {
                 for cmds in &mut thread_commands {
                     cmds.apply(world);
                 }
+
+                let cur = world.archetypes().len();
+                if cur != prev_arch_count {
+                    prev_arch_count = cur;
+                    const_world = unsafe { &*(world as *mut World as *const World) };
+                    self.compute_archetype_indices(const_world);
+                    self.sub_worlds_dirty = true;
+                    self.prepare_sub_worlds(const_world);
+                }
                 continue;
             }
 
@@ -1706,6 +1727,15 @@ impl Scheduler {
             // Применяем thread-локальные команды после параллельного stage.
             for cmds in &mut thread_commands {
                 cmds.apply(world);
+            }
+
+            let cur = world.archetypes().len();
+            if cur != prev_arch_count {
+                prev_arch_count = cur;
+                const_world = unsafe { &*(world as *mut World as *const World) };
+                self.compute_archetype_indices(const_world);
+                self.sub_worlds_dirty = true;
+                self.prepare_sub_worlds(const_world);
             }
         }
     }

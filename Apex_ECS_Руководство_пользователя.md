@@ -360,7 +360,21 @@ world.query_typed::<Read<Position>>()
 // С change detection:
 world.query_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
     .for_each(|entity, (vel, pos)| { /* ... */ });
+
+// Стандартный Iterator через .iter():
+let far = world.query_typed::<Read<Position>>()
+    .iter()
+    .filter(|(_, pos)| pos.x > 100.0)
+    .count();
+
+// Параллельная итерация (feature = "parallel"):
+world.query_typed::<Read<Position>>()
+    .par_for_each(|_, pos| {
+        /* CPU-bound расчёты */
+    });
 ```
+
+> **Внутри систем (через `SystemContext`)** `ctx.query::<Q>()` использует `CachedQuery::from_sub_world` — ленивый `fetch_state` (вызывается в `for_each`, не при создании) и кеш архетипов через `get_or_compute`. Подробнее — в [разделе 6.6](#66-systemcontext).
 
 ### 4.4 `QueryBuilder` (динамический запрос)
 
@@ -994,7 +1008,8 @@ sched.enable_event_ordering(true);
 
 ```rust
 fn run(&mut self, ctx: SystemContext<'_>) {
-    // Query — единственный способ итерации:
+    // Query — использует CachedQuery с ленивым fetch_state
+    // (вызывается в for_each, не при создании):
     ctx.query::<(Read<Velocity>, Write<Position>)>()
         .for_each(|entity, (vel, pos)| { /* ... */ });
 
@@ -1870,6 +1885,10 @@ for each system:
 - Query уважает `row_ranges` SubWorld'а — безопасное чанкование внутри одного архетипа
 - Одиночные архетипы режутся на чанки без data race (раньше это было невозможно)
 
+> **Row-level splits (разбиение строк архетипа)** создаются только для систем,
+> находящихся в **одном `all_parallel` Stage**. Системы в разных Stage (последовательные)
+> всегда видят все entity своих архетипов — каждый SubWorld содержит полный набор строк.
+
 #### 13.1.3 Параметры настройки параллелизма
 
 | Метод | По умолчанию | Описание |
@@ -2491,7 +2510,8 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
-| `query::<Q>()` | CachedQuery по типу Q |
+| `query::<Q>()` | `CachedQuery` с ленивым `fetch_state` + кеш архетипов (scoped к SubWorld) |
+| `query_changed::<Q>(tick)` | То же с change detection |
 | `resource::<T>()` | Чтение ресурса (panic если нет) |
 | `resource_mut::<T>()` | Изменение ресурса |
 | `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |
