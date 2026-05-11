@@ -1,5 +1,4 @@
 use std::cell::UnsafeCell;
-use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -94,15 +93,16 @@ impl QueryCache {
         arch_indices
     }
 
+    /// Инвалидировать все записи кеша запросов.
+    ///
+    /// При вставке/удалении компонента архетипы entity меняются, что
+    /// делает недействительным любой кеш архетипов для любых запросов.
+    /// Частичная инвалидация (invalidate_for) ненадёжна: запрос (A, B)
+    /// мог закешировать архетип без C, а добавление C к entity меняет
+    /// её архетип, но кеш (A, B) не содержит C и не инвалидируется.
     pub fn invalidate(&self) {
         self.entries.write().unwrap().clear();
         self.version.fetch_add(1, Ordering::Release);
-    }
-
-    /// Инвалидировать только записи кеша, затрагивающие данный компонент.
-    pub fn invalidate_for(&self, changed_cid: ComponentId) {
-        self.entries.write().unwrap()
-            .retain(|key, _| !key.0.contains(&changed_cid));
     }
 
     pub fn version(&self) -> u32 {
@@ -189,6 +189,20 @@ impl World {
     pub fn entity_count(&self)    -> usize { self.entities.len() }
     pub fn archetype_count(&self) -> usize { self.archetypes.len() }
     pub fn resource_count(&self)  -> usize { self.resources.len() }
+
+    /// Удалить все сущности, сохранив ресурсы, зарегистрированные компоненты и события.
+    ///
+    /// Аналог `World::clear()` в Bevy. Полезно для перезапуска уровня или сброса симуляции.
+    /// После вызова `entity_count()` вернёт 0, но ресурсы и компоненты останутся.
+    pub fn clear_entities(&mut self) {
+        // Collect all entity IDs first to avoid borrow issues
+        let entities: Vec<Entity> = self.archetypes.iter()
+            .flat_map(|a| a.entities.iter().copied())
+            .collect();
+        for entity in entities {
+            self.despawn(entity);
+        }
+    }
 
     pub fn register_component<T: Component>(&mut self) -> ComponentId {
         self.registry.register::<T>()
@@ -399,7 +413,11 @@ impl World {
         // Порог: для 1 компонента per-entity loop быстрее, чем bulk copy.
         // Для 2+ компонентов bulk copy из первой строки выигрывает за счёт
         // устранения 10,000 вызовов make_bundle и 40,000 поисков в col_indices.
-        if col_indices.len() <= 1 {
+        // SAFETY: bulk-copy через copy_nonoverlapping допустим только для типов,
+        // не имеющих Drop (эквивалентно Copy). Для типов с Drop (String, Vec<T>, Arc<T>)
+        // используется per-entity цикл во избежание двойного освобождения.
+        let needs_drop = std::mem::needs_drop::<B>();
+        if col_indices.len() <= 1 || needs_drop {
             // Per-entity loop — старый подход, быстрее для малого числа компонентов.
             for (i, &entity) in entities.iter().enumerate() {
                 let row    = start_row + i;
@@ -512,7 +530,7 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
-        self.query_cache.invalidate_for(component_id);
+        self.query_cache.invalidate();
         let new_row     = self.move_entity(entity, location, new_arch_id);
         let tick        = self.current_tick;
         unsafe {
@@ -553,7 +571,7 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
-        self.query_cache.invalidate_for(component_id);
+        self.query_cache.invalidate();
         let new_row     = self.move_entity(entity, location, new_arch_id);
         unsafe {
             self.archetypes[new_arch_id.0 as usize]
@@ -578,7 +596,7 @@ impl World {
             location.archetype_id,
             component_id,
         );
-        self.query_cache.invalidate_for(component_id);
+        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
@@ -602,7 +620,7 @@ impl World {
             location.archetype_id,
             component_id,
         );
-        self.query_cache.invalidate_for(component_id);
+        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(entity, EntityLocation {
             archetype_id: new_arch_id,
@@ -690,6 +708,16 @@ impl World {
 
     #[inline]
     pub fn is_alive(&self, entity: Entity) -> bool { self.entities.is_alive(entity) }
+
+    /// Проверить, есть ли у сущности компонент `T`.
+    ///
+    /// O(1) после первого вызова для данного archetype (column_index кешируется).
+    #[inline]
+    pub fn has_component<T: Component>(&self, entity: Entity) -> bool {
+        let Some(cid) = self.registry.get_id::<T>() else { return false; };
+        let Some(loc) = self.entities.get_location(entity) else { return false; };
+        self.archetypes[loc.archetype_id.0 as usize].has_component(cid)
+    }
 
     // ── Query API ──────────────────────────────────────────────
 
@@ -980,31 +1008,6 @@ pub fn init_par_chunk_size_from_env() {
     }
 }
 
-/// Обёртка для хранения `Commands` в static c `UnsafeCell`.
-///
-/// # SAFETY
-/// `Commands` содержит `*mut u8` в `CommandArena` (owned pointer),
-/// что формально не `Send`/`Sync`. Однако заглушка используется
-/// **только** в single-thread контексте (sequential fallback или
-/// когда `deferred_cmds` is null), поэтому гонок быть не может.
-struct SyncCommands(UnsafeCell<Commands>);
-unsafe impl Send for SyncCommands {}
-unsafe impl Sync for SyncCommands {}
-
-/// Статическая заглушка для `Commands` когда `deferred_cmds` is null.
-/// Используется в `commands()` для безопасного возврата `&mut Commands`
-/// когда thread-local команды не были предоставлены (например, в sequential режиме).
-static DUMMY_COMMANDS: OnceLock<SyncCommands> = OnceLock::new();
-
-fn dummy_commands() -> &'static mut Commands {
-    let sc = DUMMY_COMMANDS.get_or_init(|| SyncCommands(UnsafeCell::new(Commands::new())));
-    // SAFETY: заглушка инициализируется один раз и используется только
-    // в single-thread контексте (sequential fallback или когда
-    // deferred_cmds is null). Никакой другой код не имеет доступа
-    // к этой памяти одновременно.
-    unsafe { &mut *sc.0.get() }
-}
-
 pub struct SystemContext<'w> {
     /// SubWorld'ы, которые видит эта система.
     /// Обычно один SubWorld, но может быть несколько если система
@@ -1012,8 +1015,11 @@ pub struct SystemContext<'w> {
     pub(crate) sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
     /// Thread-local команды. Указатель на `Vec<Commands>` из Scheduler.
     /// Каждый поток rayon имеет свой `Commands` по индексу `current_thread_index()`.
-    /// Если `null` — метод `commands()` возвращает заглушку.
-    pub(crate) deferred_cmds: *mut Vec<Commands>,
+    /// Если не предоставлен — используется `inline_cmds`.
+    pub(crate) deferred_cmds: Option<*mut Vec<Commands>>,
+    /// Локальный Commands для sequential систем или когда deferred_cmds не задан.
+    /// Используется вместо глобального статического `DUMMY_COMMANDS`.
+    pub(crate) inline_cmds: UnsafeCell<Commands>,
 }
 
 unsafe impl Send for SystemContext<'_> {}
@@ -1021,12 +1027,20 @@ unsafe impl Sync for SystemContext<'_> {}
 
 impl<'w> SystemContext<'w> {
     pub fn new(sub_worlds: &'w [crate::sub_world::SubWorld<'w>]) -> Self {
-        Self { sub_worlds, deferred_cmds: std::ptr::null_mut() }
+        Self {
+            sub_worlds,
+            deferred_cmds: None,
+            inline_cmds: UnsafeCell::new(Commands::new()),
+        }
     }
 
     /// Создаёт SystemContext из одного SubWorld (наиболее частый случай).
     pub fn from_sub_world(sub_world: &'w crate::sub_world::SubWorld<'w>) -> Self {
-        Self { sub_worlds: std::slice::from_ref(sub_world), deferred_cmds: std::ptr::null_mut() }
+        Self {
+            sub_worlds: std::slice::from_ref(sub_world),
+            deferred_cmds: None,
+            inline_cmds: UnsafeCell::new(Commands::new()),
+        }
     }
 
     /// Создать контекст с thread-local командами.
@@ -1034,29 +1048,33 @@ impl<'w> SystemContext<'w> {
         sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
         deferred_cmds: *mut Vec<Commands>,
     ) -> Self {
-        Self { sub_worlds, deferred_cmds }
+        Self {
+            sub_worlds,
+            deferred_cmds: Some(deferred_cmds),
+            inline_cmds: UnsafeCell::new(Commands::new()),
+        }
     }
 
     /// Получить `Commands` для текущего потока.
     /// Команды применяются планировщиком после завершения Stage.
-    ///
-    /// Если `deferred_cmds` is null (например, в sequential режиме),
-    /// возвращает статическую заглушку — вызов не паникует.
     #[inline]
     pub fn commands(&self) -> &mut Commands {
-        if self.deferred_cmds.is_null() {
-            return dummy_commands();
+        if let Some(deferred_cmds) = self.deferred_cmds {
+            #[cfg(feature = "parallel")]
+            unsafe {
+                let thread_idx = rayon::current_thread_index().unwrap_or(0);
+                let vec = &mut *deferred_cmds;
+                return &mut vec[thread_idx];
+            }
+            #[cfg(not(feature = "parallel"))]
+            unsafe {
+                let vec = &mut *deferred_cmds;
+                return &mut vec[0];
+            }
         }
-        #[cfg(feature = "parallel")]
-        unsafe {
-            let thread_idx = rayon::current_thread_index().unwrap_or(0);
-            let vec = &mut *self.deferred_cmds;
-            &mut vec[thread_idx]
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            dummy_commands()
-        }
+        // SAFETY: inline_cmds используется только когда deferred_cmds не задан
+        // (sequential режим). В этом случае доступ exclusive — один поток.
+        unsafe { &mut *self.inline_cmds.get() }
     }
 
     /// Получить World (для обратной совместимости).

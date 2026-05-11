@@ -70,10 +70,6 @@ impl<T> Events<T> {
     /// Возвращает [`EventCursor`], который нужно хранить и передавать
     /// при каждом вызове [`iter()`](Events::iter).
     pub fn add_reader(&mut self) -> EventCursor {
-        let id = self.next_cursor_id;
-        self.next_cursor_id += 1;
-
-        // O(1): переиспользуем освобождённый слот из free_list
         if let Some(cursor) = self.free_list.pop() {
             let idx = cursor.0 as usize;
             if idx < self.cursors.len() {
@@ -82,6 +78,8 @@ impl<T> Events<T> {
             return cursor;
         }
 
+        let id = self.next_cursor_id;
+        self.next_cursor_id += 1;
         self.cursors.push(Some(0));
         EventCursor(id)
     }
@@ -94,14 +92,18 @@ impl<T> Events<T> {
         let idx = reader_id.0 as usize;
         if idx < self.cursors.len() {
             self.cursors[idx] = None;
-            // O(1): сохраняем освобождённый ID для переиспользования
             self.free_list.push(reader_id);
         }
-        // Сжимаем хвост из None (только если free_list пуст, иначе слот может понадобиться)
-        if self.free_list.is_empty() {
-            while self.cursors.last().copied() == Some(None) {
-                self.cursors.pop();
+        // Compress tail of None cursors, but only those NOT in the free_list.
+        // Cursors in the free_list may be reissued — their slot indices
+        // must stay valid even after tail compression.
+        while self.cursors.last().copied() == Some(None) {
+            let last_idx = self.cursors.len() - 1;
+            let would_violate = self.free_list.iter().any(|c| c.0 as usize == last_idx);
+            if would_violate {
+                break;
             }
+            self.cursors.pop();
         }
     }
 
@@ -261,6 +263,7 @@ impl<T> Default for Events<T> {
 /// RAII-обёртка: при дропе автоматически продвигает курсор до конца буфера.
 ///
 /// Создаётся через [`Events::read`].
+#[must_use = "EventReadGuard advances cursor on drop; bind to a variable to read events"]
 pub struct EventReadGuard<'q, T> {
     queue:     &'q mut Events<T>,
     reader_id: EventCursor,
@@ -301,6 +304,7 @@ impl<T> Drop for EventReadGuard<'_, T> {
 }
 
 /// Обёртка для "посмотреть без продвижения".
+#[must_use = "PeekGuard prevents cursor advance; bind to variable to prevent accidental advance"]
 pub struct PeekGuard<'q, T>(EventReadGuard<'q, T>);
 
 impl<T> std::ops::Deref for PeekGuard<'_, T> {

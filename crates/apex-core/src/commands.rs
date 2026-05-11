@@ -26,6 +26,14 @@ impl CommandArena {
     }
 
     /// Разместить T в арене, вернуть offset в байтах.
+    ///
+    /// # SAFETY
+    /// При реаллокации существующие данные копируются через `copy_nonoverlapping`.
+    /// Это безопасно только если `T` тривиально перемещаемо (не имеет `Drop`,
+    /// ссылающегося на self). Для типов с Drop (String, Vec<T>) используйте
+    /// размещение на куче (например, `Box::new()`) вне арены.
+    /// На практике: `spawn` и `insert` передают данные в арену для последующего
+    /// чтения через `std::ptr::read` и дропа через function pointer.
     fn alloc<T>(&mut self, val: T) -> u32 {
         let align = mem::align_of::<T>();
         let size  = mem::size_of::<T>();

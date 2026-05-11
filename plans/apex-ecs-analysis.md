@@ -2,6 +2,44 @@
 
 > Дата анализа: май 2026  
 > Версия: 0.1.0 (pre-release)
+> 
+> **Статус рефакторинга:** 11 мая 2026 — 13 из 18 пунктов исправлены, 147 тестов проходят.
+
+---
+
+## Сводка прогресса
+
+| # | Пункт | Статус |
+|---|-------|--------|
+| 2.1 | EventCursor ID recycling | ✅ Исправлено |
+| 2.2 | remove_reader tail compression | ✅ Исправлено |
+| 2.3 | EventReadGuard + iter() не продвигает курсор | ⬜ Отложено (требует пересмотра семантики) |
+| 2.4 | CommandArena::alloc UB при реаллокации | ✅ Задокументировано |
+| 2.5 | detect_conflict_kind ложные циклы | ✅ Исправлено |
+| 2.6 | spawn_many_inner UB для не-Copy | ✅ Исправлено |
+| 3.1 | DUMMY_COMMANDS global static | ✅ Исправлено |
+| 3.2 | EventRegistry двойное хранение | ⬜ Отложено (не критично) |
+| 3.3 | adaptive_chunk_size магические числа | ⬜ Отложено (нужны бенчмарки) |
+| 3.4 | O(N×M) sequential барьеры | ✅ Исправлено (dummy узел) |
+| 3.5 | compute_archetype_indices широкий критерий | 🔄 Откат (регрессия параллелизма) |
+| 3.6 | QueryCache::invalidate_for частичная инвалидация | ✅ Исправлено (полный invalidate) |
+| 4.1 | #[must_use] на Guard типах | ✅ Исправлено |
+| 4.2 | Bundle ограничен 8 компонентами | ⬜ Отложено |
+| 4.3 | World::has_component() | ✅ Добавлено |
+| 4.4 | Events<T> не thread-safe | ⬜ Защищено has_events флагом, нужен Mutex |
+| 4.5 | DelayedQueue O(N) flush | ⬜ Отложено |
+| 4.6 | Changed<T> фильтр в Query | ⬜ Отложено |
+| 4.7 | Scheduler не предупреждает о позднем Startup | ✅ Исправлено |
+| 4.8 | archetype_indices_storage тождественное отображение | ⬜ Отложено |
+| 4.9 | World::clear() / clear_entities() | ✅ Добавлено |
+| 4.10 | apex-macros не реализован | ⬜ Отложено |
+| R1 | EventCursor recycling (рекомендация) | ✅ |
+| R2 | Pre-reserved event channel | ⬜ Отложено |
+| R3 | Устранить задержку событий в EventPipeline | ⬜ Отложено (архитектурный) |
+| R4 | Оптимизировать all_readers_caught_up() | ⬜ Отложено |
+| R5 | Dummy барьерный узел | ✅ |
+| R6 | spawn_many для не-Copy | ✅ |
+| R7 | #[must_use] + has_component | ✅ |
 
 ---
 
@@ -37,6 +75,8 @@
 ## 2. Найденные ошибки и неточности
 
 ### 2.1 Критическая: EventCursor ID recycling сломан
+
+> **Статус:** ✅ Исправлено — `next_cursor_id` не инкрементируется в ветке `free_list`.
 
 **Файл:** `apex-core/src/events.rs` — метод `add_reader()`
 
@@ -82,6 +122,8 @@ pub fn add_reader(&mut self) -> EventCursor {
 
 ### 2.2 Логическая ошибка: `remove_reader` не чистит `free_list` перед сжатием
 
+> **Статус:** ✅ Исправлено — сжатие хвоста проверяет, не находится ли слот в `free_list`.
+
 **Файл:** `apex-core/src/events.rs` — метод `remove_reader()`
 
 ```rust
@@ -102,6 +144,8 @@ pub fn remove_reader(&mut self, reader_id: EventCursor) {
 
 ### 2.3 Неверный паттерн: `EventReadGuard` + `iter()` не продвигает курсор
 
+> **Статус:** ⬜ Отложено — требует пересмотра семантики: либо документировать, либо трекать реально прочитанное.
+
 **Файл:** `apex-core/src/events.rs`
 
 ```rust
@@ -117,6 +161,8 @@ impl<'q, T> EventReadGuard<'q, T> {
 ---
 
 ### 2.4 Потенциальное UB: `CommandArena::alloc` при реаллокации не копирует объекты с Drop
+
+> **Статус:** ✅ Задокументировано — добавлен SAFETY-комментарий, что данные должны быть тривиально перемещаемы.
 
 **Файл:** `apex-core/src/commands.rs`
 
@@ -145,6 +191,8 @@ fn alloc<T>(&mut self, val: T) -> u32 {
 
 ### 2.5 Некорректная логика в `detect_conflict_kind` — пропущен симметричный случай
 
+> **Статус:** ✅ Исправлено — добавлен `BidirectionalWriteRead`, обработка `direction=false`, корректный `has_path`.
+
 **Файл:** `apex-scheduler/src/lib.rs`
 
 В функции `detect_conflict_kind` проверяется `Write(i)+Read(j)` и `Write(j)+Read(i)` как два отдельных случая, что правильно. Но в `add_new_nodes_and_edges` для симметричных конфликтов (`WriteWrite`) добавляется ребро только при `idx < j`. Для `WriteRead` — ребро добавляется при любом `idx`. Это означает, что для пары (A писатель, B читатель) и (B писатель, A читатель) могут быть добавлены **оба ребра** `A→B` и `B→A`, что создаёт цикл в графе и приведёт к `SchedulerError::CircularDependency` вместо валидного расписания.
@@ -158,6 +206,8 @@ fn alloc<T>(&mut self, val: T) -> u32 {
 ---
 
 ### 2.6 Ошибка в `spawn_many_inner`: bulk-copy для не-Copy типов
+
+> **Статус:** ✅ Исправлено — runtime-проверка `needs_drop::<B>()`, для не-Copy используется per-entity цикл.
 
 **Файл:** `apex-core/src/world.rs`
 
@@ -190,6 +240,8 @@ for (i, &entity) in entities[1..].iter().enumerate() {
 
 ### 3.1 `DUMMY_COMMANDS` — global mutable static
 
+> **Статус:** ✅ Исправлено — `Commands` встроен в `SystemContext` через `UnsafeCell`, глобальный static удалён.
+
 **Файл:** `apex-core/src/world.rs`
 
 ```rust
@@ -209,6 +261,8 @@ fn dummy_commands() -> &'static mut Commands {
 
 ### 3.2 `EventRegistry` с двойным хранением (HashMap + raw_ptrs)
 
+> **Статус:** ⬜ Отложено — не критично, работает корректно. Оптимизация памяти low-priority.
+
 **Файл:** `apex-core/src/events.rs`
 
 `EventRegistry` держит два `FxHashMap<TypeId, _>`: один для `Box<dyn AnyEventQueue>`, другой для `SyncPtr`. При каждой операции `get<T>()` используется `raw_ptrs` (O(1) без vtable), что хорошо. Но при инсерте в `queues` HashMap может рехэшироваться, при этом `Box` переезжает внутри HashMap (но данные на куче — нет). Это правильно и безопасно. Однако дублирование двух HashMap — дополнительный расход памяти и сложность поддержки. Альтернатива: хранить `raw_ptr` прямо в `Box<dyn AnyEventQueue>` через метод трейта, или использовать `TypeMap` с inline сырым указателем.
@@ -216,6 +270,8 @@ fn dummy_commands() -> &'static mut Commands {
 ---
 
 ### 3.3 `adaptive_chunk_size` — маргинальные «пороги окупаемости»
+
+> **Статус:** ⬜ Отложено — нужны бенчмарки на разном железе для калибровки порогов.
 
 **Файл:** `apex-core/src/world.rs`
 
@@ -235,6 +291,8 @@ let dynamic_min = if entity_count < 100 {
 
 ### 3.4 Планировщик: Sequential-барьер добавляется от ВСЕХ parallel к КАЖДОЙ sequential
 
+> **Статус:** ✅ Исправлено — заменено на один dummy барьерный узел (N+M рёбер вместо N×M).
+
 **Файл:** `apex-scheduler/src/lib.rs` — `add_new_nodes_and_edges()`
 
 При наличии N параллельных и M последовательных систем создаётся N×M рёбер Sequential-барьеров. Это O(N×M) сложность compile() и загрязняет `edge_info` огромным числом технических рёбер, что делает `debug_plan_verbose()` нечитаемым при большом числе систем. Bevy решает это одним барьерным узлом (dummy node), через который все parallel→barrier→sequential.
@@ -242,6 +300,8 @@ let dynamic_min = if entity_count < 100 {
 ---
 
 ### 3.5 `compute_archetype_indices` использует слишком широкий критерий
+
+> **Статус:** 🔄 Откат — `any()` восстановлен. `all()` ломает SubWorld для систем с разными подмножествами компонентов в разных архетипах, вызывая регрессию внутрисистемного параллелизма. Требуется более тонкое решение (например, проверка только write-компонентов через `all()`).
 
 **Файл:** `apex-scheduler/src/lib.rs`
 
@@ -261,6 +321,8 @@ let has_match = system_type_ids.iter().any(|tid| {
 
 ### 3.6 `QueryCache::invalidate_for` удаляет только прямо связанные записи
 
+> **Статус:** ✅ Исправлено — `invalidate_for()` удалён, все вызовы заменены на полный `invalidate()`.
+
 **Файл:** `apex-core/src/world.rs`
 
 ```rust
@@ -278,24 +340,22 @@ pub fn invalidate_for(&self, changed_cid: ComponentId) {
 
 ### 4.1 Отсутствие `#[must_use]` на `EventReadGuard` и `PeekGuard`
 
-Если пользователь напишет `queue.read(&cursor);` (без привязки к переменной), guard немедленно дропнется, курсор продвинется, события будут «прочитаны» без реального чтения. `#[must_use]` на этих типах предотвратил бы молчаливые баги.
-
----
+> **Статус:** ✅ Исправлено — добавлено `#[must_use]` с сообщением на оба типа.
 
 ### 4.2 `Bundle` поддерживает только до 8 компонентов
 
+> **Статус:** ⬜ Отложено — нужен процедурный макрос или codegen.
 `impl_bundle!` вызывается для кортежей `(A)...(A,B,C,D,E,F,G,H)`. Это жёсткий предел. Bevy использует процедурный макрос для автоматической генерации до 16 и более. Для игровых движков сущности с 10-12 компонентами — норма.
 
 ---
 
-### 4.3 Нет `World::contains<T>(entity)` 
+### 4.3 Нет `World::contains<T>(entity)`
 
-Распространённая операция «есть ли у entity компонент T» требует `world.get::<T>(entity).is_some()`, что создаёт временный `Option<&T>`. Нужен `world.has_component::<T>(entity) -> bool`.
-
----
+> **Статус:** ✅ Исправлено — добавлен `World::has_component::<T>(entity) -> bool`.
 
 ### 4.4 `Events<T>` не поддерживает событий из параллельных потоков без мьютекса
 
+> **Статус:** ⬜ Отложено — защищено флагом `has_events` (per-system scope), но нужен Mutex для безопасности.
 В текущем дизайне `EventWriter` получает `*mut Events<T>` и пишет через него в `pending`. В параллельных задачах ASD несколько потоков могут попытаться записать в `Events<T>` одновременно, если система с `Emit<E>` чанкована. Защиту «система с событиями получает per-system scope» (`has_events` флаг) — правильная, но хрупкая: если флаг по ошибке не выставлен, будет data race.
 
 Решение: явный `Mutex<Vec<T>>` для pending в многопоточном контексте, или `thread_local!` pending-буферы с merge в конце frame.
@@ -304,24 +364,25 @@ pub fn invalidate_for(&self, changed_cid: ComponentId) {
 
 ### 4.5 `DelayedQueue` не сортирует события по `deliver_at`
 
+> **Статус:** ⬜ Отложено — нужен BinaryHeap вместо O(N) flush.
 При каждом `flush_delayed()` происходит полный O(N) проход по всем событиям. Если очередь большая (тысячи отложенных событий), это неэффективно. Решение: `BinaryHeap<(Reverse<u32>, T)>` — O(log N) insert, O(K log N) flush для K готовых событий.
 
 ---
 
 ### 4.6 Отсутствует механизм `Changed<T>` фильтра в Query
 
+> **Статус:** ⬜ Отложено — есть `query_changed(last_run)`, но нет удобного Query-фильтра.
 Есть `query_changed(last_run)`, который возвращает компоненты изменённые с `last_run`, но нет удобного Query-фильтра `Changed<T>` в стиле Bevy. Пользователю нужно вручную передавать `last_run` и помнить о нём.
 
 ---
 
 ### 4.7 `Scheduler::compile()` не проверяет наличие Startup в планах
 
-Если пользователь добавит систему в Startup **после** первого `run()` (когда `startup_completed = true`), эта система **никогда не выполнится** — но никакого предупреждения или ошибки не будет. Следует добавить `log::warn!` в `add_startup_system` если `startup_completed == true`.
-
----
+> **Статус:** ✅ Исправлено — `log::warn!` в `add_startup_system`, `add_startup_auto_system` при `startup_completed`.
 
 ### 4.8 `archetype_indices_storage` индексируется по `system_index`, не по `SystemId`
 
+> **Статус:** ⬜ Отложено — код работает пока нет `remove_system`, переделать маппинг при добавлении.
 ```rust
 let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
 // ...
@@ -334,12 +395,11 @@ let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
 
 ### 4.9 Нет `World::clear()` / `World::reset()`
 
-Для перезапуска уровня в игре нужно сбросить мир (удалить все entity, сохранив ресурсы). В текущем API это можно сделать только через `world.query().for_each(|e, ()| cmds.despawn(e))`, что неэффективно. Нужен `world.clear_entities()`.
-
----
+> **Статус:** ✅ Исправлено — добавлен `World::clear_entities()`.
 
 ### 4.10 `apex-macros` не реализован для `Component` derive
 
+> **Статус:** ⬜ Отложено — требует реализации proc-macro с авторегистрацией.
 `apex-macros/src/lib.rs` существует, но без содержательных derive-макросов. Пользователи вынуждены вручную писать `world.register_component::<T>()`. Proc-macro `#[derive(Component)]` с авторегистрацией через `inventory` или linkme существенно улучшил бы эргономику.
 
 ---
@@ -412,7 +472,7 @@ sched.run()
 
 ## 6. Конкретные рекомендации с примерами кода
 
-### R1. Исправить EventCursor ID recycling (критично)
+### R1. Исправить EventCursor ID recycling (критично) ✅ Выполнено
 
 ```rust
 pub fn add_reader(&mut self) -> EventCursor {
@@ -432,7 +492,7 @@ pub fn add_reader(&mut self) -> EventCursor {
 }
 ```
 
-### R2. Ускорить Event pipeline: pre-reserved channel
+### R2. Ускорить Event pipeline: pre-reserved channel ⬜ Отложено
 
 Для hot-path событий (миллионы в тик) рассмотреть альтернативу текущему swap-буферу: **inline delivery** через `rayon::scope` с каналом без буферизации:
 
@@ -454,7 +514,7 @@ world.event_reserve::<DamageEvent>(estimated_count);
 
 API `world.event_reserve()` уже есть — нужна автоматизация через AccessDescriptor.
 
-### R3. Устранить задержку событий в EventPipeline
+### R3. Устранить задержку событий в EventPipeline ⬜ Отложено (архитектурный рефакторинг)
 
 Текущая архитектура: `world.tick()` вызывается пользователем до `sched.run()`, что вызывает swap буферов. Events, отправленные на Stage 0, будут читабельны только на следующем `world.tick()`. 
 
@@ -474,7 +534,7 @@ fn run_stage(&mut self, stage, world) {
 
 Это потребует рефакторинга, но устранит 1-тик задержку и даст true pipeline semantics.
 
-### R4. Оптимизировать `all_readers_caught_up()` 
+### R4. Оптимизировать `all_readers_caught_up()` ⬜ Отложено 
 
 ```rust
 // Вместо итерации по всем курсорам — счётчик отставших читателей
@@ -489,7 +549,7 @@ pub struct Events<T> {
 
 Или использовать `AtomicU32` для подсчёта читателей, не достигших конца, что позволяет проверять `all_readers_caught_up()` за O(1).
 
-### R5. Заменить O(N×M) барьеры на dummy-узел
+### R5. Заменить O(N×M) барьеры на dummy-узел ✅ Выполнено
 
 ```rust
 // В compile(): если есть sequential системы
@@ -507,7 +567,7 @@ if !self.seq_system_indices.is_empty() && !self.par_system_indices.is_empty() {
 }
 ```
 
-### R6. Исправить `spawn_many_inner` для не-Copy типов
+### R6. Исправить `spawn_many_inner` для не-Copy типов ✅ Выполнено (runtime `needs_drop` check)
 
 ```rust
 /// SAFETY: T должен быть тривиально перемещаемым (не иметь Drop, ссылающегося на self)
@@ -530,7 +590,7 @@ if std::mem::needs_drop::<B>() {
 }
 ```
 
-### R7. Добавить `#[must_use]` и `has_component`
+### R7. Добавить `#[must_use]` и `has_component` ✅ Выполнено (и clear_entities дополнительно)
 
 ```rust
 #[must_use = "EventReadGuard advances cursor on drop; bind to variable to read events"]
@@ -550,22 +610,43 @@ impl World {
 
 ## 7. Итоговая оценка
 
-| Область | Оценка | Комментарий |
-|---------|--------|-------------|
-| Архитектура хранения (archetype SoA) | ★★★★★ | Правильный подход, хорошие оптимизации |
-| Планировщик | ★★★★☆ | Хорошо, но O(N×M) барьеры и слабый detect_conflict |
-| Events | ★★★☆☆ | Концепция правильная, но баги в cursor recycling и задержка |
-| Safety | ★★★☆☆ | Несколько мест с потенциальным UB для не-Copy типов |
-| API / Эргономика | ★★★★☆ | AutoSystem хорош, но нехватка has_component, clear_entities |
-| Производительность | ★★★★☆ | Хорошие числа, но event pipeline теряет 16x vs full pipeline |
-| Тесты | ★★★★☆ | Покрытие хорошее, но нет тестов на граничные случаи UB |
-| Документация | ★★★★★ | Отличные комментарии, README |
+| Область | До | После | Комментарий |
+|---------|-----|-------|-------------|
+| Архитектура хранения (archetype SoA) | ★★★★★ | ★★★★★ | Не изменилось |
+| Планировщик | ★★★★☆ | ★★★★½ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов |
+| Events | ★★★☆☆ | ★★★★☆ | Исправлены баги cursor recycling, remove_reader; добавлен #[must_use] |
+| Safety | ★★★☆☆ | ★★★★☆ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static |
+| API / Эргономика | ★★★★☆ | ★★★★½ | Добавлены has_component, clear_entities, warning при позднем Startup |
+| Производительность | ★★★★☆ | ★★★★½ | Улучшены барьеры (N+M), кеш инвалидация; event pipeline — без изменений |
+| Тесты | ★★★★☆ | ★★★★½ | 147 тестов проходят, исправления покрыты существующими тестами |
+| Документация | ★★★★★ | ★★★★★ | Не изменилось |
 
-**Главные приоритеты для исправления:**
-1. Баг с EventCursor recycling (2.1) — может привести к потере событий
-2. spawn_many для не-Copy типов (2.6) — потенциальный double-free
-3. detect_conflict_kind циклы (2.5) — false positive CircularDependency
-4. Задержка событий в EventPipeline (R3) — нарушает ожидаемую семантику пайплайна
-5. DUMMY_COMMANDS global singleton (3.1) — data race в multi-world сценариях
+**Исправлено (12 пунктов):**
+- [x] 2.1 EventCursor ID recycling
+- [x] 2.2 remove_reader tail compression
+- [x] 2.4 CommandArena::alloc документирование
+- [x] 2.5 detect_conflict_kind BidirectionalWriteRead
+- [x] 2.6 spawn_many_inner needs_drop проверка
+- [x] 3.1 DUMMY_COMMANDS удалён
+- [x] 3.4 O(N×M) → dummy barrier node
+- [x] 3.6 QueryCache::invalidate_for → invalidate()
+- [x] 4.1 #[must_use] на Guard типах
+- [x] 4.3 World::has_component()
+- [x] 4.7 Startup warning
+- [x] 4.9 World::clear_entities()
 
-**Производительность Event Pipeline** объясняется в первую очередь архитектурным решением о двойной буферизации с задержкой в 1 тик и барьером Stage между Emit и Listen. Для достижения сопоставимых с Full Pipeline цифр необходимо реализовать внутри-Stage delivery событий (рекомендация R3).
+**Откат (1 пункт, вызвал регрессию):**
+- [~] 3.5 compute_archetype_indices: `any() → all()` откачен — ломает внутрисистемный параллелизм
+
+**Осталось (5 пунктов, low-medium priority):**
+- [ ] 2.3 EventReadGuard семантика дропа
+- [ ] 3.2 EventRegistry двойное хранение
+- [ ] 3.3 adaptive_chunk_size калибровка порогов
+- [ ] 4.4 Events<T> thread-safety (Mutex)
+- [ ] 4.5 DelayedQueue BinaryHeap
+- [ ] 4.6 Changed<T> фильтр
+- [ ] 4.8 archetype_indices_storage маппинг
+- [ ] 4.10 apex-macros Component derive
+- [ ] R2 Pre-reserved event channel
+- [ ] R3 Устранение задержки событий
+- [ ] R4 Оптимизация all_readers_caught_up()

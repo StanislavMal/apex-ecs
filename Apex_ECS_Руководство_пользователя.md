@@ -109,6 +109,9 @@ pub struct Entity {
 
 // Проверка жизни entity:
 world.is_alive(entity)   // -> bool
+
+// Проверка наличия компонента (начиная с v0.1.0, O(1)):
+world.has_component::<Position>(entity) // -> bool
 entity.index()           // -> u32
 entity.generation()      // -> u32
 ```
@@ -187,6 +190,9 @@ world.spawn_batch([
 
 // Уничтожение entity:
 world.despawn(player);
+
+// Удаление всех entity с сохранением ресурсов (начиная с v0.1.0):
+world.clear_entities();
 
 // Добавление/удаление компонентов:
 world.insert(entity, Health { current: 50.0, max: 100.0 });
@@ -540,6 +546,11 @@ let queue = world.events_mut::<DamageEvent>();
     }
 } // ← здесь cursor автоматически продвигается
 
+// ⚠️ Важно: всегда привязывайте результат .read() к переменной
+// (начиная с v0.1.0 — #[must_use] предотвращает случайный дроп):
+// queue.read(&reader_a);  // ← предупреждение компилятора!
+let guard = queue.read(&reader_a);  // ✓ правильно
+
 // Можно использовать Deref к срезу:
 let guard = queue.read(&reader_a);
 if !guard.is_empty() {
@@ -862,6 +873,8 @@ sched.add_system("despawn_dead", |world: &mut World| {
 > **Автоматическое упорядочивание (v0.1.0):** Планировщик сам:
 > - Группирует параллельные системы в более ранних топологических уровнях, а Sequential — в более поздних, независимо от порядка регистрации.
 > - Обеспечивает порядок событий: все `Emit<E>` выполняются до `Listen<E>` (разные Stage), несколько `Listen<E>` — параллельно.
+> - **Sequential барьеры используют один dummy-узел** (N+M рёбер вместо N×M) — результат тот же, но `debug_plan_verbose()` чище.
+> - **Предупреждение о позднем Startup:** начиная с v0.1.0, при вызове `add_startup_system`/`add_startup_auto_system` после завершения Startup-этапа — `log::warn!`.
 >
 > Регистрируйте системы в любом порядке — `compile()` выстроит оптимальную группировку. Явные `add_dependency()` по-прежнему работают и имеют приоритет над автоматическим порядком.
 
@@ -1051,7 +1064,7 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 }
 ```
 
-> **`ctx.commands()` (начиная с v0.1.0):** Возвращает `&mut Commands` для текущего потока. В параллельных системах каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. В последовательном режиме возвращается статическая заглушка. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
+> **`ctx.commands()` (начиная с v0.1.0):** Возвращает `&mut Commands` для текущего потока. В параллельных системах каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. В последовательном режиме используется локальный экземпляр, хранящийся внутри `SystemContext`. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
 
 ### 6.7 `EventPipelineBuilder`
 
@@ -1159,7 +1172,7 @@ world.add_relation_batch(subjects, ChildOf, parent);
 
 > **Производительность:** При создании иерархии 1000 объектов `add_relation_batch` выполняет 1 архетипный переход на группу вместо 1000 отдельных переходов. Используйте вместо цикла `add_relation()` при пакетном создании связей.
 
-### 8.2
+### 8.2 Пользовательские RelationKind
 
 ```rust
 // Создание своего типа связи:
@@ -1174,7 +1187,7 @@ impl RelationKind for Targets {
 world.add_relation(archer, Targets, goblin);
 ```
 
-### 8.3
+### 8.3 Query по Relations
 
 ```rust
 // Найти всех entity с ChildOf-связью к конкретному parent:
@@ -2106,6 +2119,7 @@ impl SequentialSystem for ScriptedSystem {
 - Используйте `spawn_many()` вместо цикла `spawn()` — один batch-аллокатор вместо N отдельных
 - `spawn_many_silent()` — то же что `spawn_many`, но без возврата `Vec<Entity>` — экономит heap-аллокацию
 - `spawn_batch()` — для спавна из итератора с разными типами бандлов (удобно в тестах/примерах)
+- **`spawn_many` и не-Copy компоненты:** начиная с v0.1.0, для бандлов, содержащих типы с Drop (String, Vec<T>, Arc<T>), `spawn_many` автоматически переключается на per-entity цикл, безопасный для некопируемых данных. Для `Copy`-бандлов используется bulk-copy — самый быстрый путь.
 - Определяйте компоненты для entity сразу при спавне — структурные изменения после спавна дороже
 
 ### 14.2 Query
@@ -2448,6 +2462,8 @@ fn main() {
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
 | `entity_count()` | Количество живых entity → `usize` |
 | `is_alive(entity)` | Проверить, жив ли entity → `bool` |
+| `has_component::<T>(entity)` | Проверить наличие компонента у entity (v0.1.0) → `bool` |
+| `clear_entities()` | Удалить все entity, сохранив ресурсы и события (v0.1.0) |
 | `current_tick()` | Текущий тик мира → `Tick` |
 | `register_template(name, tmpl)` | Зарегистрировать EntityTemplate по имени |
 | `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
@@ -2466,6 +2482,7 @@ fn main() {
 | `add_auto_system_to_stage(name, sys, label)` | Добавить AutoSystem в указанный этап |
 | `add_par_access_to_stage(name, access, f, label)` | Добавить параллельную систему-замыкание с access в указанный этап |
 | `add_startup_system(name, f)` | Добавить Sequential систему в Startup этап |
+| `add_startup_auto_system(name, sys)` | Добавить AutoSystem в Startup этап |
 | `add_dependency(a, b)` | `a` выполняется после `b` |
 | `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
 | `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |

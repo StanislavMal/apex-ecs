@@ -105,6 +105,12 @@ pub enum ConflictKind {
         writer_id: u32,
         reader_id: u32,
     },
+    /// Обе системы пишут в компоненты, которые другая читает
+    /// (A writes Pos that B reads, B writes Vel that A reads).
+    BidirectionalWriteRead {
+        a_name: String,
+        b_name: String,
+    },
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -122,6 +128,8 @@ impl std::fmt::Display for ConflictKind {
                 write!(f, "Event Write+Write conflict on `{}`", event_name),
             ConflictKind::EventWriteRead { event_name, .. } =>
                 write!(f, "Event Write+Read conflict on `{}`", event_name),
+            ConflictKind::BidirectionalWriteRead { a_name, b_name } =>
+                write!(f, "bidirectional Write+Read between `{}` and `{}`", a_name, b_name),
         }
     }
 }
@@ -474,7 +482,14 @@ impl Scheduler {
     where
         F: FnMut(&mut World) + Send + 'static,
     {
-        self.add_system_to_stage(name, func, StageLabel::Startup)
+        let name_str = name.into();
+        if self.startup_completed {
+            log::warn!(
+                "add_startup_system: `{}` added after Startup already completed — will never run",
+                name_str
+            );
+        }
+        self.add_system_to_stage(name_str, func, StageLabel::Startup)
     }
 
     /// Регистрировать AutoSystem.
@@ -522,7 +537,14 @@ impl Scheduler {
     where
         S: AutoSystem + 'static,
     {
-        self.add_auto_system_to_stage(name, system, StageLabel::Startup)
+        let name_str = name.into();
+        if self.startup_completed {
+            log::warn!(
+                "add_startup_auto_system: `{}` added after Startup already completed — will never run",
+                name_str
+            );
+        }
+        self.add_auto_system_to_stage(name_str, system, StageLabel::Startup)
     }
 
     /// Регистрировать ParSystem.
@@ -1052,7 +1074,10 @@ impl Scheduler {
 
             let mut indices = Vec::new();
             for (arch_idx, arch) in archetypes.iter().enumerate() {
-                // Проверяем, есть ли у архетипа хотя бы один компонент из списка системы
+                // Архетип подходит если содержит хотя бы один компонент из системы.
+                // Query сам отфильтрует неподходящие архетипы через matches_archetype,
+                // а слишком жёсткий критерий (all) ломает SubWorld для систем
+                // с разными подмножествами компонентов в разных архетипах.
                 let registry = world.registry();
                 let has_match = system_type_ids.iter().any(|tid| {
                     if let Some(cid) = registry.get_id_by_type(tid) {
@@ -1156,56 +1181,59 @@ impl Scheduler {
         }
 
         // ── 3. Sequential барьеры ──
-        // Всегда направляем parallel → sequential, чтобы группировать
-        // параллельные системы в более ранних топологических уровнях,
-        // а последовательные — в более поздних.
-        // Если явная зависимость противоречит (sequential должен быть раньше),
-        // has_path() предотвратит создание цикла.
-        for &idx in &systems_to_process {
-            let system = &self.systems[idx];
-            
-            if !system.kind.is_parallel() {
-                // Sequential система: барьеры от всех parallel → seq O(P)
-                for &par_idx in &self.par_system_indices {
-                    if par_idx == idx { continue; }
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&self.systems[par_idx].id),
-                         self.graph_nodes.get(&system.id))
+        // Используем один dummy barrier-узел вместо O(N×M) рёбер:
+        //   all parallel → barrier → all sequential
+        // Результат: N+M рёбер вместо N×M.
+        const BARRIER_ID: u32 = u32::MAX;
+        let barrier_sys_id = SystemId(BARRIER_ID);
+
+        if !self.seq_system_indices.is_empty() && !self.par_system_indices.is_empty() {
+            // Удаляем старый барьерный узел, если он был
+            if let Some(old_barrier) = self.graph_nodes.remove(&barrier_sys_id) {
+                self.dependency_graph.remove_node(old_barrier);
+                self.edge_set.retain(|&(a, b)| a != old_barrier && b != old_barrier);
+                self.edge_info.retain(|e| {
+                    e.from_id != barrier_sys_id && e.to_id != barrier_sys_id
+                });
+            }
+            // Добавляем новый барьерный узел
+            let barrier_node = self.dependency_graph.add_node(barrier_sys_id);
+            self.graph_nodes.insert(barrier_sys_id, barrier_node);
+
+            // Все parallel → barrier
+            for &par_idx in &self.par_system_indices {
+                let par_id = self.systems[par_idx].id;
+                if let Some(&par_node) = self.graph_nodes.get(&par_id) {
+                    if !self.has_edge_between(par_node, barrier_node)
+                        && (has_existing_edges && !self.dependency_graph.has_path(barrier_node, par_node)
+                            || !has_existing_edges)
                     {
-                        if !self.has_edge_between(from, to)
-                            && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                || !has_existing_edges)
-                        {
-                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                            self.edge_set.insert((from, to));
-                            self.edge_info.push(GraphEdgeInfo {
-                                from_id: self.systems[par_idx].id,
-                                to_id:   system.id,
-                                kind:    ConflictKind::SequentialBarrier,
-                            });
-                        }
+                        self.dependency_graph.add_edge(par_node, barrier_node, ConflictKind::SequentialBarrier);
+                        self.edge_set.insert((par_node, barrier_node));
+                        self.edge_info.push(GraphEdgeInfo {
+                            from_id: par_id,
+                            to_id:   barrier_sys_id,
+                            kind:    ConflictKind::SequentialBarrier,
+                        });
                     }
                 }
-            } else {
-                // Parallel система: барьеры от неё ко всем sequential O(S)
-                for &seq_idx in &self.seq_system_indices {
-                    if seq_idx == idx { continue; }
-                    if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&system.id),
-                         self.graph_nodes.get(&self.systems[seq_idx].id))
+            }
+
+            // Barrier → все sequential
+            for &seq_idx in &self.seq_system_indices {
+                let seq_id = self.systems[seq_idx].id;
+                if let Some(&seq_node) = self.graph_nodes.get(&seq_id) {
+                    if !self.has_edge_between(barrier_node, seq_node)
+                        && (has_existing_edges && !self.dependency_graph.has_path(seq_node, barrier_node)
+                            || !has_existing_edges)
                     {
-                        if !self.has_edge_between(from, to)
-                            && (has_existing_edges && !self.dependency_graph.has_path(to, from)
-                                || !has_existing_edges)
-                        {
-                            self.dependency_graph.add_edge(from, to, ConflictKind::SequentialBarrier);
-                            self.edge_set.insert((from, to));
-                            self.edge_info.push(GraphEdgeInfo {
-                                from_id: system.id,
-                                to_id:   self.systems[seq_idx].id,
-                                kind:    ConflictKind::SequentialBarrier,
-                            });
-                        }
+                        self.dependency_graph.add_edge(barrier_node, seq_node, ConflictKind::SequentialBarrier);
+                        self.edge_set.insert((barrier_node, seq_node));
+                        self.edge_info.push(GraphEdgeInfo {
+                            from_id: barrier_sys_id,
+                            to_id:   seq_id,
+                            kind:    ConflictKind::SequentialBarrier,
+                        });
                     }
                 }
             }
@@ -1232,37 +1260,79 @@ impl Scheduler {
                     &self.type_names,
                     self.event_ordering_enabled,
                 ) {
-                    // direction = true означает i→j
-                    if direction {
-                        // Для Write+Write и EventWriteWrite конфликтов добавляем ребро
-                        // только если idx < j чтобы избежать дублирования
-                        let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
-                            || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. });
-                        if is_symmetric && idx > j {
-                            continue;
+                    let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
+                        || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. })
+                        || matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
+                    let is_bidirectional = matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
+
+                    // For BidirectionalWriteRead we add edges in both directions
+                    // to create a real cycle that will be detected as CircularDependency.
+                    if is_bidirectional {
+                        if idx > j {
+                            continue; // process only once per pair
                         }
-                        
-                        if let (Some(&from), Some(&to)) =
+                        // Add A→B edge
+                        if let (Some(&from_a), Some(&to_a)) =
                             (self.graph_nodes.get(&system_i.id),
                              self.graph_nodes.get(&system_j.id))
                         {
-                            // Для symmetric конфликтов (WriteWrite, EventWriteWrite) has_path не нужен:
-                            // direction гарантирован idx < j, цикл невозможен.
-                            // Для asymmetric (WriteRead/EventWriteRead) ВСЕГДА проверяем has_path,
-                            // чтобы избежать циклов при первом compile (has_existing_edges = false).
-                            // BFS на первом compile дешёвый — граф ещё маленький.
-                            let need_cycle_check = !is_symmetric;
-                            if !self.has_edge_between(from, to)
-                                && (!need_cycle_check || !self.dependency_graph.has_path(to, from))
-                            {
-                                self.dependency_graph.add_edge(from, to, conflict_kind.clone());
-                                self.edge_set.insert((from, to));
+                            if !self.has_edge_between(from_a, to_a) {
+                                self.dependency_graph.add_edge(from_a, to_a, conflict_kind.clone());
+                                self.edge_set.insert((from_a, to_a));
                                 self.edge_info.push(GraphEdgeInfo {
                                     from_id: system_i.id,
                                     to_id:   system_j.id,
+                                    kind:    conflict_kind.clone(),
+                                });
+                            }
+                        }
+                        // Add B→A edge
+                        if let (Some(&from_b), Some(&to_b)) =
+                            (self.graph_nodes.get(&system_j.id),
+                             self.graph_nodes.get(&system_i.id))
+                        {
+                            if !self.has_edge_between(from_b, to_b) {
+                                self.dependency_graph.add_edge(from_b, to_b, conflict_kind.clone());
+                                self.edge_set.insert((from_b, to_b));
+                                self.edge_info.push(GraphEdgeInfo {
+                                    from_id: system_j.id,
+                                    to_id:   system_i.id,
                                     kind:    conflict_kind,
                                 });
                             }
+                        }
+                        continue;
+                    }
+
+                    // direction = true означает i→j, direction = false означает j→i
+                    let (from_idx, to_idx, from_id, to_id) = if direction {
+                        (idx, j, system_i.id, system_j.id)
+                    } else {
+                        if j > idx { // process only once per pair for WriteRead
+                            continue;
+                        }
+                        (j, idx, system_j.id, system_i.id)
+                    };
+
+                    if is_symmetric && from_idx > to_idx {
+                        continue;
+                    }
+
+                    if let (Some(&from), Some(&to)) =
+                        (self.graph_nodes.get(&from_id),
+                         self.graph_nodes.get(&to_id))
+                    {
+                        let need_cycle_check = !is_symmetric;
+                        if !self.has_edge_between(from, to)
+                            && (!need_cycle_check || !self.dependency_graph.has_path(to, from))
+                        {
+                            self.dependency_graph.add_edge(from, to, conflict_kind.clone());
+                            self.edge_set.insert((from, to));
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id,
+                                to_id,
+                                kind:    conflict_kind,
+                            });
                         }
                     }
                 }
@@ -2098,24 +2168,40 @@ fn detect_conflict_kind(
         }
     }
     // Write(i)+Read(j): i пишет то что j читает
-    for w in &ai.writes {
-        if aj.reads.contains(w) {
-            return Some((ConflictKind::WriteRead {
-                component_name: component_type_name(*w, type_names),
-                writer_id: id_i.0,
-                reader_id: id_j.0,
-            }, true)); // i→j (писатель → читатель)
-        }
-    }
+    let i_writes_j_reads = ai.writes.iter().any(|w| aj.reads.contains(w));
     // Write(j)+Read(i): j пишет то что i читает
-    for w in &aj.writes {
-        if ai.reads.contains(w) {
-            return Some((ConflictKind::WriteRead {
-                component_name: component_type_name(*w, type_names),
-                writer_id: id_j.0,
-                reader_id: id_i.0,
-            }, false)); // j→i
-        }
+    let j_writes_i_reads = aj.writes.iter().any(|w| ai.reads.contains(w));
+
+    if i_writes_j_reads && j_writes_i_reads {
+        // Bidirectional WriteRead: обе системы пишут в компоненты,
+        // которые читает другая. Это истинный циклический конфликт.
+        let a_name = format!("system_{}", id_i.0);
+        let b_name = format!("system_{}", id_j.0);
+        return Some((ConflictKind::BidirectionalWriteRead {
+            a_name,
+            b_name,
+        }, true)); // беззначимо — используем i→j
+    }
+
+    if i_writes_j_reads {
+        return Some((ConflictKind::WriteRead {
+            component_name: component_type_name(
+                *ai.writes.iter().find(|w| aj.reads.contains(w)).unwrap(),
+                type_names,
+            ),
+            writer_id: id_i.0,
+            reader_id: id_j.0,
+        }, true)); // i→j (писатель → читатель)
+    }
+    if j_writes_i_reads {
+        return Some((ConflictKind::WriteRead {
+            component_name: component_type_name(
+                *aj.writes.iter().find(|w| ai.reads.contains(w)).unwrap(),
+                type_names,
+            ),
+            writer_id: id_j.0,
+            reader_id: id_i.0,
+        }, false)); // j→i
     }
 
     // ── Event конфликты ─────────────────────────────────────────
