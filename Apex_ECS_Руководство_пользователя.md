@@ -728,6 +728,13 @@ Apex ECS предоставляет три уровня API для систем 
 > **Упорядочивание по событиям:** Если система A объявляет `type Events = Emit<CollisionEvent>`, а система B — `type Events = Listen<CollisionEvent>`, то планировщик автоматически гарантирует, что A выполнится до B (A → ребро в графе зависимостей → B). Два `Listen<E>` не конфликтуют и могут выполняться параллельно. Два `Emit<E>` — конфликтуют (порядок записи неопределён).
 >
 > Поведение можно отключить через [`enable_event_ordering(false)`](#651-управление-упорядочиванием-по-событиям) для обратной совместимости.
+>
+> **BidirectionalWriteRead:** Если система A пишет T (компонент, читаемый B), а B пишет U (компонент, читаемый A) — планировщик детектит взаимный конфликт чтения-записи. Без явного упорядочивания это приводит к ошибке `CircularDependency` с подсказкой. Для разрешения используйте одно из:
+> - `scheduler.chain(&["a", "b"])` — цепочка A → B
+> - `scheduler.before("a", "b")` — A до B
+> - `scheduler.after("b", "a")` — B после A
+> 
+> Явный порядок имеет приоритет над авто-детектом: при наличии `before`/`after`/`chain` рёбра, противоречащие указанному направлению, подавляются, и цикла не возникает.
 
 **Только компоненты:**
 
@@ -885,15 +892,23 @@ let mut sched = Scheduler::new();
 
 // Регистрация — порядок не важен, планировщик сам переупорядочит:
 sched.add_auto_system("physics",      PhysicsSystem);
-let damage_id  = sched.add_system("damage_apply", damage_apply).id();
+sched.add_auto_system("damage_apply", damage_apply);
 sched.add_auto_system("health_clamp", HealthClampSystem);
-let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
+sched.add_auto_system("despawn_dead", despawn_dead);
 sched.add_auto_system("movement",    MovementSystem);
-let stats_id   = sched.add_system("stats_update", stats_update).id();
+sched.add_auto_system("stats_update", stats_update);
 
-// Явные зависимости (опционально):
-sched.add_dependency(despawn_id, damage_id);  // despawn после damage
-sched.add_dependency(stats_id,   despawn_id); // stats после despawn
+// Явное упорядочивание (рекомендуется):
+sched.chain(&["damage_apply", "health_clamp", "despawn_dead", "stats_update"]).unwrap();
+// damage_apply → health_clamp → despawn_dead → stats_update
+
+// Точечное упорядочивание:
+sched.before("ai", "render").unwrap();   // ai до render
+sched.after("render", "input").unwrap(); // render после input
+
+// Низкоуровневое API (по SystemId):
+let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
+sched.add_dependency(stats_id, despawn_id); // stats после despawn
 
 // Компиляция — строит граф, проверяет циклы, группирует в Stage:
 sched.compile().expect("circular dependency detected");
@@ -996,6 +1011,49 @@ sched.configure_stages(vec![
 ```
 
 > **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `staged()` временно подменяет `default_stage_label` на время замыкания и восстанавливает предыдущее значение после выхода. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных.
+
+#### 6.4.2 Явное упорядочивание систем
+
+Планировщик автоматически строит рёбра на основе access-дескрипторов (`Read<T>`, `Write<T>`, etc.). Но когда две системы «пинг-понг» читают/пишут компоненты друг друга (гравитация читает Position и пишет Velocity, физика читает Velocity и пишет Position), возникает `BidirectionalWriteRead` — планировщик не может автоматически определить порядок и сигнализирует об ошибке.
+
+Для разрешения конфликтов используется явное упорядочивание, которое имеет **приоритет** над авто-детектом:
+
+```rust
+sched.add_auto_system("gravity", GravitySystem);
+sched.add_auto_system("physics", PhysicsSystem);
+
+// Способ 1: .chain() — цепочка систем (рекомендуется)
+sched.chain(&["gravity", "physics"]).unwrap();
+
+// Способ 2: .before() — «a до b»
+sched.before("gravity", "physics").unwrap();
+
+// Способ 3: .after() — «a после b»
+sched.after("physics", "gravity").unwrap();
+
+// Все три эквивалентны: gravity всегда выполняется до physics
+```
+
+**API явного упорядочивания:**
+
+| Метод | Пример | Семантика |
+|---|---|---|
+| `chain(names)` | `sched.chain(&["a", "b", "c"])` | Цепочка: a → b → c (основной способ) |
+| `before(name, name)` | `sched.before("a", "b")` | a выполняется до b |
+| `after(name, name)` | `sched.after("b", "a")` | b выполняется после a |
+| `add_dependency(id, id)` | `sched.add_dependency(b, a)` | Низкоуровневое API по `SystemId` |
+
+Все методы принимают строковые имена систем (те же, что передаются в `add_auto_system` / `add_system`). При отсутствии системы с указанным именем возвращается `SchedulerError::SystemNotFound`.
+
+**Как это работает:** при вызове `.before("a", "b")` планировщик сохраняет пару `(a, b)` во внутреннем множестве `explicit_orderings`. При обнаружении `BidirectionalWriteRead` между `a` и `b` на шаге построения графа — рёбра, противоречащие явному порядку, **подавляются** (не добавляются в граф). Цикл не возникает, системы выполняются в указанном порядке.
+
+**Сообщение об ошибке** при `BidirectionalWriteRead` без явного порядка:
+
+```
+grav <-> phys, phys <-> grav
+  Hint: resolve with scheduler.chain(&["a", "b"]),
+  scheduler.before("a", "b"), or scheduler.after("b", "a")
+```
 
 #### 6.5.1 Управление упорядочиванием по событиям
 
@@ -2483,7 +2541,10 @@ fn main() {
 | `add_par_access_to_stage(name, access, f, label)` | Добавить параллельную систему-замыкание с access в указанный этап |
 | `add_startup_system(name, f)` | Добавить Sequential систему в Startup этап |
 | `add_startup_auto_system(name, sys)` | Добавить AutoSystem в Startup этап |
-| `add_dependency(a, b)` | `a` выполняется после `b` |
+| `add_dependency(a, b)` | `a` выполняется после `b` (по `SystemId`) |
+| `chain(names)` | Цепочка систем: `chain(&["a","b","c"])` — каждая после предыдущей |
+| `before(a, b)` | `a` выполняется до `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
+| `after(a, b)` | `a` выполняется после `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
 | `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
 | `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |
 | `configure_stages(order)` | Задать порядок этапов (вместо порядка по приоритету) |

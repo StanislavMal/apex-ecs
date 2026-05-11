@@ -138,7 +138,7 @@ impl std::fmt::Display for ConflictKind {
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
-    #[error("Circular dependency between systems: {cycle_info}")]
+    #[error("{cycle_info}")]
     CircularDependency { cycle_info: String },
     #[error("System '{0}' not found")]
     SystemNotFound(String),
@@ -353,6 +353,9 @@ pub struct Scheduler {
     edge_info:        Vec<GraphEdgeInfo>,
     /// True если после последнего compile() добавлялись системы/зависимости.
     graph_dirty:      bool,
+    /// Пары систем с явным порядком (от add_dependency / .before / .after).
+    /// Edge направлен от «раньше» к «позже»: (a, b) означает a до b.
+    explicit_orderings: FxHashSet<(SystemId, SystemId)>,
 
     // ── Seq/Par индексы для O(P) sequential-барьеров ────────────
     /// Индексы sequential систем в self.systems.
@@ -424,6 +427,7 @@ impl Scheduler {
             edge_set:         FxHashSet::default(),
             edge_info:        Vec::new(),
             graph_dirty:      false,
+            explicit_orderings: FxHashSet::default(),
             seq_system_indices: Vec::new(),
             par_system_indices: Vec::new(),
             system_archetype_indices: FxHashMap::default(),
@@ -812,8 +816,58 @@ impl Scheduler {
     pub fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
             if !s.after.contains(&after_id) { s.after.push(after_id); }
+            self.explicit_orderings.insert((after_id, system));
             self.invalidate_plan();
         }
+    }
+
+    /// `a` выполняется до `b`. Эквивалентно `add_dependency(b, a)`.
+    ///
+    /// Явный порядок имеет приоритет над автоматически обнаруженными конфликтами
+    /// чтения-записи: если планировщик видит `BidirectionalWriteRead` между `a` и `b`,
+    /// ребро, противоречащее явному порядку, будет подавлено (цикла не будет).
+    ///
+    /// Системы указываются по именам, переданным в `add_auto_system` / `add_system`.
+    pub fn before(&mut self, a_name: &str, b_name: &str) -> Result<(), SchedulerError> {
+        let a_id = self.find_id_by_name(a_name)?;
+        let b_id = self.find_id_by_name(b_name)?;
+        self.add_dependency(b_id, a_id);
+        Ok(())
+    }
+
+    /// `a` выполняется после `b`. Эквивалентно `add_dependency(a, b)`.
+    ///
+    /// Явный порядок имеет приоритет над автоматически обнаруженными конфликтами
+    /// чтения-записи: если планировщик видит `BidirectionalWriteRead` между `a` и `b`,
+    /// ребро, противоречащее явному порядку, будет подавлено (цикла не будет).
+    ///
+    /// Системы указываются по именам, переданным в `add_auto_system` / `add_system`.
+    pub fn after(&mut self, a_name: &str, b_name: &str) -> Result<(), SchedulerError> {
+        let a_id = self.find_id_by_name(a_name)?;
+        let b_id = self.find_id_by_name(b_name)?;
+        self.add_dependency(a_id, b_id);
+        Ok(())
+    }
+
+    fn find_id_by_name(&self, name: &str) -> Result<SystemId, SchedulerError> {
+        self.systems
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.id)
+            .ok_or_else(|| SchedulerError::SystemNotFound(name.to_string()))
+    }
+
+    /// Цепочка систем: каждая запускается после предыдущей.
+    ///
+    /// `sched.chain(&["grav", "phys"])` — эквивалент `sched.before("grav", "phys")`.
+    ///
+    /// Для N имён создаёт N-1 зависимостей:
+    /// `names[0] → names[1] → ... → names[N-1]`.
+    pub fn chain(&mut self, names: &[&str]) -> Result<(), SchedulerError> {
+        for w in names.windows(2) {
+            self.before(w[0], w[1])?;
+        }
+        Ok(())
     }
 
     /// Установить пользовательский порядок StageLabel для compile().
@@ -1267,16 +1321,26 @@ impl Scheduler {
 
                     // For BidirectionalWriteRead we add edges in both directions
                     // to create a real cycle that will be detected as CircularDependency.
+                    // If the user has declared an explicit ordering (via add_dependency,
+                    // .before(), or .after()), we respect it: edges that contradict the
+                    // explicit direction are suppressed, preventing a false cycle.
                     if is_bidirectional {
                         if idx > j {
                             continue; // process only once per pair
                         }
-                        // Add A→B edge
+                        let explicit_fwd = self.explicit_orderings.contains(
+                            &(system_i.id, system_j.id)
+                        );
+                        let explicit_rev = self.explicit_orderings.contains(
+                            &(system_j.id, system_i.id)
+                        );
+
+                        // Add A→B edge — unless explicitly reversed
                         if let (Some(&from_a), Some(&to_a)) =
                             (self.graph_nodes.get(&system_i.id),
                              self.graph_nodes.get(&system_j.id))
                         {
-                            if !self.has_edge_between(from_a, to_a) {
+                            if !self.has_edge_between(from_a, to_a) && !explicit_rev {
                                 self.dependency_graph.add_edge(from_a, to_a, conflict_kind.clone());
                                 self.edge_set.insert((from_a, to_a));
                                 self.edge_info.push(GraphEdgeInfo {
@@ -1286,12 +1350,12 @@ impl Scheduler {
                                 });
                             }
                         }
-                        // Add B→A edge
+                        // Add B→A edge — unless explicitly reversed
                         if let (Some(&from_b), Some(&to_b)) =
                             (self.graph_nodes.get(&system_j.id),
                              self.graph_nodes.get(&system_i.id))
                         {
-                            if !self.has_edge_between(from_b, to_b) {
+                            if !self.has_edge_between(from_b, to_b) && !explicit_fwd {
                                 self.dependency_graph.add_edge(from_b, to_b, conflict_kind.clone());
                                 self.edge_set.insert((from_b, to_b));
                                 self.edge_info.push(GraphEdgeInfo {
@@ -1366,7 +1430,12 @@ impl Scheduler {
             "check add_dependency() calls for circular references".to_string()
         } else {
             pairs.dedup();
-            pairs.join(", ")
+            let mut msg = pairs.join(", ");
+            msg.push_str(
+                "\n  Hint: resolve with scheduler.chain(&[\"a\", \"b\"]), \
+                 scheduler.before(\"a\", \"b\"), or scheduler.after(\"b\", \"a\")"
+            );
+            msg
         }
     }
 
