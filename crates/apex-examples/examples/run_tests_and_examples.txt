@@ -39,6 +39,6 @@ APEX ECS — тестирование с конкурентами:
 
 cargo bench --features bevy,legion,flecs > results.txt
 
-cargo bench -p apex-bench
+cargo bench -p apex-bench > apex-benc.txt
 
 cargo bench -p apex-bench -- "heavy_compute|schedule"
