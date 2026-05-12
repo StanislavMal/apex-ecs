@@ -16,7 +16,7 @@ cargo run -p apex-examples --example stages --release --features parallel
 
 cargo run -p apex-examples --example basic --release --features parallel
 
-cargo run -p apex-examples --example perf --release --features parallel
+cargo run -p apex-examples --example perf --release --features parallel > perf.txt
 
 cargo run -p apex-examples --example event_pipeline --release
 
