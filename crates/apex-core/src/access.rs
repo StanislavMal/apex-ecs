@@ -203,6 +203,10 @@ pub struct AccessDescriptor {
     /// Планировщик не будет чанковать такую систему через ASD
     /// (избегает oversubscribe rayon thread pool).
     pub uses_par_for_each: bool,
+    /// Типы и зарезервированные capacity для event-буферов.
+    /// Планировщик вызывает `world.event_reserve::<T>(cap)` перед
+    /// выполнением системы, чтобы избежать реаллокаций в hot-пути send().
+    pub event_reserves: Vec<(TypeId, usize)>,
 }
 
 impl AccessDescriptor {
@@ -243,6 +247,17 @@ impl AccessDescriptor {
         self
     }
 
+    /// Зарезервировать capacity для event-буфера типа T.
+    ///
+    /// Избегает реаллокаций `Vec` при массовой отправке событий в цикле.
+    /// Планировщик вызывает `world.event_reserve::<T>(capacity)` перед
+    /// выполнением системы на основе этой декларации.
+    pub fn event_reserve<T: 'static>(mut self, capacity: usize) -> Self {
+        let tid = TypeId::of::<T>();
+        self.event_reserves.push((tid, capacity));
+        self
+    }
+
     pub fn merge(mut self, other: &AccessDescriptor) -> Self {
         // O(N+M) дедупликация через HashSet вместо O(N²) contains+push
         Self::dedup_push(&mut self.reads, &other.reads);
@@ -254,6 +269,14 @@ impl AccessDescriptor {
         self.write_mask = self.write_mask.or(&other.write_mask);
         // Передаём флаг par_for_each
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
+        // Сливаем резервирования событий (берём максимум по каждому типу)
+        for &(tid, cap) in &other.event_reserves {
+            if let Some(entry) = self.event_reserves.iter_mut().find(|(id, _)| *id == tid) {
+                entry.1 = entry.1.max(cap);
+            } else {
+                self.event_reserves.push((tid, cap));
+            }
+        }
         self
     }
 

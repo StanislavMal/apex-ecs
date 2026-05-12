@@ -762,6 +762,8 @@ pub trait AnyEventQueue: Any + Send + Sync {
     fn add_reader(&mut self) -> u32;
     /// Удалить читателя.
     fn remove_reader(&mut self, reader_id: u32);
+    /// Предварительно выделить capacity для pending-буфера.
+    fn reserve(&mut self, additional: usize);
 }
 
 impl<T: Send + Sync + 'static> AnyEventQueue for Events<T> {
@@ -792,127 +794,91 @@ impl<T: Send + Sync + 'static> AnyEventQueue for Events<T> {
     fn remove_reader(&mut self, reader_id: u32) {
         Events::remove_reader(self, EventCursor(reader_id));
     }
+
+    fn reserve(&mut self, additional: usize) {
+        Events::reserve(self, additional);
+    }
 }
 
 // ── EventRegistry ───────────────────────────────────────────────
 
-/// Wrapper around `*mut u8` that implements `Send + Sync`.
-///
-/// # Safety
-/// Указатель указывает на `Events<T>`, который живёт в `Box<dyn AnyEventQueue>`
-/// внутри `self.queues`. Box гарантирует, что данные на куче не перемещаются.
-/// `FxHashMap` может перемещать `Box` (указатель на кучу), но не данные внутри Box.
-/// Таким образом, указатель остаётся валидным на всё время жизни `EventRegistry`.
-#[derive(Clone, Copy)]
-struct SyncPtr(*mut u8);
-unsafe impl Send for SyncPtr {}
-unsafe impl Sync for SyncPtr {}
-
 /// Реестр очередей событий — карта `TypeId → Events<T>`.
-///
-/// Оптимизация: `raw_ptrs` хранит сырые указатели на `Events<T>`,
-/// что позволяет `get::<T>()` и `get_mut::<T>()` работать без `downcast_ref`
-/// (vtable call). Указатели валидны, т.к. `Box<dyn AnyEventQueue>` в `queues`
-/// не перемещает данные на куче при реаллокации HashMap.
 pub struct EventRegistry {
-    queues:   FxHashMap<TypeId, Box<dyn AnyEventQueue>>,
-    /// Zero-cost кеш для typed доступа: `TypeId → *mut Events<T>`.
-    /// Позволяет избежать `downcast_ref` в get::<T>().
-    /// SyncPtr — newtype с `unsafe impl Sync` для совместимости с `&World` в par_iter().
-    raw_ptrs: FxHashMap<TypeId, SyncPtr>,
+    queues: FxHashMap<TypeId, Box<dyn AnyEventQueue>>,
 }
 
 impl EventRegistry {
     pub fn new() -> Self {
-        Self {
-            queues:   FxHashMap::default(),
-            raw_ptrs: FxHashMap::default(),
-        }
+        Self { queues: FxHashMap::default() }
     }
 
     /// Зарегистрировать тип события.
-    ///
-    /// Создаёт новую `Events<T>`, если ещё не зарегистрирован.
-    /// Одновременно сохраняет raw pointer в `raw_ptrs` для zero-cost доступа.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
-        if !self.raw_ptrs.contains_key(&TypeId::of::<T>()) {
-            let boxed = Box::new(Events::<T>::new());
-            // Сохраняем указатель на данные Box (куча — не перемещается).
-            // Box::as_ref() даёт ссылку на данные внутри Box, которые находятся
-            // на куче и не изменят адрес при реаллокации HashMap.
-            let ptr = Box::as_ref(&boxed) as *const Events<T> as *mut u8;
-            self.raw_ptrs.insert(TypeId::of::<T>(), SyncPtr(ptr));
-            self.queues.insert(TypeId::of::<T>(), boxed);
+        if !self.queues.contains_key(&TypeId::of::<T>()) {
+            self.queues.insert(TypeId::of::<T>(), Box::new(Events::<T>::new()));
         }
     }
 
     /// Получить очередь событий по типу (паникует если не зарегистрирована).
-    /// O(1) через raw_ptrs — без vtable вызовов.
     #[track_caller]
     pub fn get<T: Send + Sync + 'static>(&self) -> &Events<T> {
-        unsafe {
-            let ptr = self.raw_ptrs.get(&TypeId::of::<T>())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Event `{}` not registered. Call world.add_event::<{0}>()",
-                        std::any::type_name::<T>()
-                    )
-                });
-            &*(ptr.0 as *const Events<T>)
-        }
+        self.queues.get(&TypeId::of::<T>())
+            .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
+            .unwrap_or_else(|| panic!(
+                "Event `{}` not registered. Call world.add_event::<{0}>()",
+                std::any::type_name::<T>()
+            ))
     }
 
     /// Мутабельный доступ к очереди (паникует если не зарегистрирована).
-    /// O(1) через raw_ptrs — без vtable вызовов.
     #[track_caller]
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
-        unsafe {
-            let ptr = self.raw_ptrs.get(&TypeId::of::<T>())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Event `{}` not registered. Call world.add_event::<{0}>()",
-                        std::any::type_name::<T>()
-                    )
-                });
-            &mut *(ptr.0 as *mut Events<T>)
-        }
+        self.queues.get_mut(&TypeId::of::<T>())
+            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
+            .unwrap_or_else(|| panic!(
+                "Event `{}` not registered. Call world.add_event::<{0}>()",
+                std::any::type_name::<T>()
+            ))
     }
 
     /// Попробовать получить очередь событий по типу.
-    /// O(1) через raw_ptrs — без vtable вызовов.
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&Events<T>> {
-        unsafe {
-            self.raw_ptrs.get(&TypeId::of::<T>())
-                .map(|ptr| &*(ptr.0 as *const Events<T>))
-        }
+        self.queues.get(&TypeId::of::<T>())
+            .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
     }
 
     /// Попробовать получить мутабельный доступ к очереди.
-    /// O(1) через raw_ptrs — без vtable вызовов.
     pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut Events<T>> {
-        unsafe {
-            self.raw_ptrs.get(&TypeId::of::<T>())
-                .map(|ptr| &mut *(ptr.0 as *mut Events<T>))
-        }
+        self.queues.get_mut(&TypeId::of::<T>())
+            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
     }
 
-    /// Получить мутабельный доступ к очереди, автоматически регистрируя
-    /// тип события, если он ещё не зарегистрирован.
-    /// O(1) через raw_ptrs — без vtable вызовов.
+    /// Получить мутабельный доступ к очереди, автоматически регистрируя тип.
     pub fn get_or_register_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
-        if !self.raw_ptrs.contains_key(&TypeId::of::<T>()) {
+        if !self.queues.contains_key(&TypeId::of::<T>()) {
             self.register::<T>();
         }
-        unsafe { &mut *(self.raw_ptrs[&TypeId::of::<T>()].0 as *mut Events<T>) }
+        self.queues.get_mut(&TypeId::of::<T>())
+            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
+            .unwrap()
     }
 
-    /// Raw pointer для EventWriter (zero-cost, без vtable).
+    /// Raw pointer для EventWriter.
     ///
     /// # Safety
-    /// Вызывающий гарантирует уникальный доступ.
+    /// Вызывающий гарантирует уникальный доступ. Данные на куче (Box)
+    /// не перемещаются при реаллокации HashMap.
     pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut Events<T>> {
-        self.raw_ptrs.get(&TypeId::of::<T>())
-            .map(|ptr| ptr.0 as *mut Events<T>)
+        let queue = self.queues.get(&TypeId::of::<T>())?;
+        let eref = queue.as_any().downcast_ref::<Events<T>>()?;
+        Some(eref as *const Events<T> as *mut Events<T>)
+    }
+
+    /// Предварительно выделить capacity для очереди событий по TypeId.
+    pub fn reserve_by_type(&mut self, type_id: TypeId, capacity: usize) {
+        if let Some(queue) = self.queues.get_mut(&type_id) {
+            queue.reserve(capacity);
+        }
     }
 
     /// Обновить все очереди (вызывается в конце тика).

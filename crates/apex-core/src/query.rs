@@ -326,20 +326,19 @@ pub struct Changed<T: Component>(std::marker::PhantomData<T>);
 
 #[derive(Clone, Copy)]
 pub struct ChangedState {
-    data:      *const u8,
-    ticks:     *const Tick,
-    last_run:  Tick,
-    item_size: usize,
+    ticks:    *const Tick,
+    last_run: Tick,
 }
 
 unsafe impl Send for ChangedState {}
 unsafe impl Sync for ChangedState {}
 
 impl<T: Component> WorldQuery for Changed<T> {
-    type Item<'w> = &'w T;
+    type Item<'w> = ();
     type State    = ChangedState;
 
     #[inline] fn component_count() -> usize { 1 }
+    #[inline] fn is_filter() -> bool { true }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
@@ -352,14 +351,14 @@ impl<T: Component> WorldQuery for Changed<T> {
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
-        ChangedState { data: col.data, ticks: col.ticks_ptr(), last_run, item_size: col.item_size }
+        ChangedState { ticks: col.ticks_ptr(), last_run }
     }
 
     #[inline(always)]
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
         let tick = *state.ticks.add(row);
         if tick.is_newer_than(state.last_run) {
-            Some(&*(state.data.add(row * state.item_size) as *const T))
+            Some(())
         } else {
             None
         }

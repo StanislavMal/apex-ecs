@@ -286,7 +286,7 @@ Query — основной способ итерации по компонент
 | `Write<T>` | Мутабельный (`&mut T`) | Запись компонента |
 | `With<T>` | Только фильтр | Entity должен иметь T |
 | `Without<T>` | Только фильтр | Entity не должен иметь T |
-| `Changed<T>` | Иммутабельный (`&T`) | Только изменённые с тика |
+| `Changed<T>` | Фильтр (не возвращает данные) | Только изменённые с тика; комбинируется с `Read<T>` |
 | `Maybe<T>` | Опциональный (`Option<&T>`) | Чтение, если компонент есть |
 | `MaybeWrite<T>` | Опциональный (`Option<&mut T>`) | Запись, если компонент есть |
 
@@ -319,13 +319,19 @@ Query::<(Read<Health>, With<Player>)>::new(&world)
 Query::<(Read<Position>, Without<Enemy>)>::new(&world)
     .for_each(|_, pos| { /* только не-Enemy */ });
 
-// Change detection:
+// Change detection (фильтр — Changed<T> не возвращает данные, только фильтрует):
 let last_tick = world.current_tick();
 // ... (следующий тик) ...
-Query::<Changed<Position>>::new_with_tick(&world, last_tick)
-    .for_each(|_, pos| {
-        println!("position changed: ({}, {})", pos.x, pos.y);
+// Changed<Position> в позиции фильтра — выбирает только изменённые entity:
+Query::<(Read<Position>, Read<Velocity>), Changed<Position>>::new_with_tick(&world, last_tick)
+    .for_each(|_, (pos, vel)| {
+        println!("moved: pos=({},{}), vel=({},{})", pos.x, pos.y, vel.x, vel.y);
     });
+
+// Changed<T> отдельно (без данных — только считать количество изменившихся):
+let changed_count = Query::<(Changed<Position>,)>::new_with_tick(&world, last_tick)
+    .iter()
+    .count();
 
 // Итератор (стандартный Iterator trait):
 let count = Query::<Read<Health>>::new(&world)
@@ -363,9 +369,17 @@ let count = Query::<Read<Health>>::new(&world)
 world.query_typed::<Read<Position>>()
     .for_each(|_, pos| { /* ... */ });
 
-// С change detection:
+// С change detection (Changed<T> как фильтр):
 world.query_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
-    .for_each(|entity, (vel, pos)| { /* ... */ });
+    .for_each(|entity, (vel, pos)| {
+        // Обрабатываются только entity с изменённым Position или Velocity
+    });
+
+// Changed<T> как фильтр в Query (возвращает (), не данные):
+world.query_changed::<(Read<Velocity>, Changed<Position>)>(last_tick)
+    .for_each(|_, (vel, ())| {
+        // vel только для изменившегося Position
+    });
 
 // Стандартный Iterator через .iter():
 let far = world.query_typed::<Read<Position>>()
@@ -638,7 +652,34 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `len(&self) -> usize` | Количество непрочитанных событий |
 | `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
 
-#### 5.2.7 Отложенная доставка через `DelayedQueue<T>`
+#### 5.2.7 Декларативное резервирование буфера через `AccessDescriptor`
+
+Для систем с массовой отправкой событий планировщик может автоматически предаллоцировать буфер `pending` перед запуском системы, избегая реаллокаций `Vec` в hot-пути `send()`. Достаточно указать ожидаемую ёмкость в `AccessDescriptor`:
+
+```rust
+// Для add_par_access — через access_desc!:
+sched.add_par_access(
+    "collision",
+    access_desc!(write_event::<DamageEvent>)
+        .event_reserve::<DamageEvent>(10000),   // ← предаллоцировать на 10000 событий
+    |ctx| { /* массовая отправка DamageEvent */ },
+);
+
+// Для add_auto_system — через ParSystem trait (ручная реализация):
+impl ParSystem for CollisionSystem {
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new()
+            .write_event::<DamageEvent>()
+            .event_reserve::<DamageEvent>(10000)
+    }
+}
+```
+
+Планировщик вызывает `world.event_reserve::<T>(capacity)` перед выполнением системы, что позволяет `EventWriter::send()` работать без аллокаций внутри цикла.
+
+> **Примечание:** `world.event_reserve::<T>(cap)` и `world.event_reserve_by_type(type_id, cap)` доступны и для ручного вызова вне планировщика.
+
+#### 5.2.8 Отложенная доставка через `DelayedQueue<T>`
 
 [`DelayedQueue<T>`](crates/apex-core/src/events.rs:636) — отдельная очередь для событий, которые должны быть доставлены с задержкой в N тиков. Внутри — `BinaryHeap` для O(log N) вставки и O(K log N) извлечения готовых. События с одинаковым `deliver_at` доставляются в порядке вставки (FIFO).
 
@@ -666,7 +707,7 @@ delayed.flush_delayed(world.current_tick().0, world.events_mut::<&str>());
 | `clear()` | Очистить очередь и сбросить sequence |
 | `reserve(n)` | Предаллоцировать память под N будущих событий |
 
-#### 5.2.8 Thread-safe отправка (`send_sync` / `send_batch_sync`)
+#### 5.2.9 Thread-safe отправка (`send_sync` / `send_batch_sync`)
 
 Для отправки событий из параллельных систем (где доступен только `&Events<T>`, а не `&mut Events<T>`) используйте методы `send_sync` и `send_batch_sync`. Они пишут во внутренний `Mutex<Vec<T>>`, который лениво инициализируется через `OnceLock` (нулевой overhead для однопоточных сценариев).
 
@@ -2571,11 +2612,12 @@ fn main() {
 | `send_event(event)` | Отправить событие (авторегистрация, не паникует) |
 | `try_send_event(event)` | Безопасная отправка события → `bool` (всегда true) |
 | `event_reserve::<T>(cap)` | Предаллоцировать буфер для событий типа T (избежать реаллокаций) |
+| `event_reserve_by_type(type_id, cap)` | То же по `TypeId` (для планировщика) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
 | `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
 | `tick()` | Переключить буферы событий, +1 тик |
 | `query_typed::<Q>()` | CachedQuery — кешированный запрос |
-| `query_changed::<Q>(tick)` | CachedQuery с change detection |
+| `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>` как фильтр в Q) |
 | `query_relation::<K, Q>(kind, target)` | Query по relation |
 | `query_wildcard::<K, Q>(kind)` | Query по relation (любой target) |
 | `add_relation(s, kind, t)` | Создать связь subject→target |
@@ -2640,6 +2682,19 @@ fn main() {
 | `EventPipelineBuilder::build(sched)` | Применить зависимости к планировщику |
 | `EventPipelineBuilder::build_validated(sched)` | Применить с проверкой ролей |
 
+### `AccessDescriptor` API (builder-методы)
+
+| Метод | Описание |
+|---|---|
+| `AccessDescriptor::new()` | Создать пустой дескриптор |
+| `.read::<T>()` | Декларировать чтение компонента T |
+| `.write::<T>()` | Декларировать запись компонента T |
+| `.read_event::<T>()` | Декларировать чтение событий T |
+| `.write_event::<T>()` | Декларировать запись событий T |
+| `.event_reserve::<T>(cap)` | Зарезервировать буфер на cap событий T (v0.1.0) |
+| `.par_for_each_used()` | Пометить, что система использует `par_for_each` внутри |
+| `.merge(&other)` | Слить с другим дескриптором (max по резервам) |
+
 ### `StageLabel` API
 
 | Метод | Описание |
@@ -2658,7 +2713,7 @@ fn main() {
 | Метод | Описание |
 |---|---|
 | `query::<Q>()` | `CachedQuery` с ленивым `fetch_state` + кеш архетипов (scoped к SubWorld) |
-| `query_changed::<Q>(tick)` | То же с change detection |
+| `query_changed::<Q>(tick)` | То же с change detection (Changed<T> как фильтр) |
 | `resource::<T>()` | Чтение ресурса (panic если нет) |
 | `resource_mut::<T>()` | Изменение ресурса |
 | `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |

@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::any::TypeId;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -335,6 +336,13 @@ impl World {
     /// событий в одном тике. Вызывать перед циклом отправки.
     pub fn event_reserve<T: Send + Sync + 'static>(&mut self, capacity: usize) {
         self.events.get_or_register_mut::<T>().reserve(capacity);
+    }
+
+    /// Зарезервировать capacity для событий по TypeId.
+    ///
+    /// Вызывается планировщиком на основе `AccessDescriptor::event_reserve()`.
+    pub fn event_reserve_by_type(&mut self, type_id: TypeId, capacity: usize) {
+        self.events.reserve_by_type(type_id, capacity);
     }
 
     pub fn event_queue_ptr<T: Send + Sync + 'static>(

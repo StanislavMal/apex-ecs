@@ -1486,6 +1486,15 @@ impl Scheduler {
             .flat_map(|s| s.system_ids.iter().copied())
             .collect();
 
+        // Pre-reserve event capacities based on AccessDescriptor declarations.
+        for system in &self.systems {
+            if let Some(access) = system.kind.access() {
+                for &(type_id, cap) in &access.event_reserves {
+                    world.event_reserve_by_type(type_id, cap);
+                }
+            }
+        }
+
         // Sequential системы получают &mut World, параллельные — SubWorld
         let all_indices: Vec<usize> = (0..world.archetypes().len()).collect();
         let sub_world = apex_core::SubWorld::new(
@@ -1759,10 +1768,19 @@ impl Scheduler {
             .map(|s| (s.system_ids.clone(), s.all_parallel))
             .collect();
 
+        // Pre-reserve event capacities based on AccessDescriptor declarations.
+        // Избегает реаллокаций Vec<T> при массовой отправке событий в цикле.
+        for system in &self.systems {
+            if let Some(access) = system.kind.access() {
+                for &(type_id, cap) in &access.event_reserves {
+                    world.event_reserve_by_type(type_id, cap);
+                }
+            }
+        }
+
         // Pre-вычисляем SubWorld storage для sequential fallback
         let mut const_world: &World = unsafe { &*(world as *mut World as *const World) };
         self.prepare_sub_worlds(const_world);
-        let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
         let mut prev_arch_count = const_world.archetypes().len();
 
         // Создаём thread-local Commands для каждого потока rayon.
@@ -1785,7 +1803,7 @@ impl Scheduler {
                 // Sequential fallback — используем make_sub_world
                 for &sys_id in stage_ids {
                     if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                        let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
+                        let sw = self.make_sub_world(sys_idx, const_world);
                         let system = &mut self.systems[sys_idx];
                         match &mut system.kind {
                             SystemKind::Sequential(f)           => f(world),
@@ -1838,7 +1856,7 @@ impl Scheduler {
             if should_fallback {
                 for &sys_id in stage_ids {
                     if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                        let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
+                        let sw = self.make_sub_world(sys_idx, const_world);
                         let system = &mut self.systems[sys_idx];
                         if let SystemKind::Parallel { system, .. } = &mut system.kind {
                             system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));

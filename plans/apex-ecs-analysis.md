@@ -3,7 +3,7 @@
 > Дата анализа: май 2026  
 > Версия: 0.1.0 (pre-release)
 > 
-> **Статус рефакторинга:** 12 мая 2026 — 15 из 22 пунктов исправлены, 1 откат, 147 тестов проходят.
+> **Статус рефакторинга:** 12 мая 2026 — 19 из 22 пунктов исправлены, 1 откат, 153 теста проходят.
 
 ---
 
@@ -18,7 +18,7 @@
 | 2.5 | detect_conflict_kind ложные циклы | ✅ Исправлено |
 | 2.6 | spawn_many_inner UB для не-Copy | ✅ Исправлено |
 | 3.1 | DUMMY_COMMANDS global static | ✅ Исправлено |
-| 3.2 | EventRegistry двойное хранение | ⬜ Отложено (не критично) |
+| 3.2 | EventRegistry двойное хранение | ✅ Исправлено (удалён raw_ptrs, downcast_ref) |
 | 3.3 | adaptive_chunk_size магические числа | ⬜ Отложено (нужны бенчмарки) |
 | 3.4 | O(N×M) sequential барьеры | ✅ Исправлено (dummy узел) |
 | 3.5 | compute_archetype_indices широкий критерий | 🔄 Откат (регрессия параллелизма) |
@@ -28,13 +28,13 @@
 | 4.3 | World::has_component() | ✅ Добавлено |
 | 4.4 | Events<T> не thread-safe | ✅ Исправлено (send_sync + OnceLock<Mutex<Vec<T>>>) |
 | 4.5 | DelayedQueue O(N) flush | ✅ Исправлено (BinaryHeap + sequence FIFO) |
-| 4.6 | Changed<T> фильтр в Query | ⬜ Отложено |
+| 4.6 | Changed<T> фильтр в Query | ✅ Исправлено (pure filter: Item = (), is_filter = true) |
 | 4.7 | Scheduler не предупреждает о позднем Startup | ✅ Исправлено |
-| 4.8 | archetype_indices_storage тождественное отображение | ⬜ Отложено |
+| 4.8 | archetype_indices_storage тождественное отображение | ✅ Исправлено (удалён system_to_storage) |
 | 4.9 | World::clear() / clear_entities() | ✅ Добавлено |
 | 4.10 | apex-macros не реализован | ⬜ Отложено |
 | R1 | EventCursor recycling (рекомендация) | ✅ |
-| R2 | Pre-reserved event channel | ⬜ Отложено |
+| R2 | Pre-reserved event channel | ✅ (AccessDescriptor::event_reserve + планировщик) |
 | R3 | Устранить задержку событий в EventPipeline | ⬜ Отложено (архитектурный) |
 | R4 | Оптимизировать all_readers_caught_up() | ⬜ Отложено |
 | R5 | Dummy барьерный узел | ✅ |
@@ -262,7 +262,7 @@ fn dummy_commands() -> &'static mut Commands {
 
 ### 3.2 `EventRegistry` с двойным хранением (HashMap + raw_ptrs)
 
-> **Статус:** ⬜ Отложено — не критично, работает корректно. Оптимизация памяти low-priority.
+> **Статус:** ✅ Исправлено — `raw_ptrs` и `SyncPtr` удалены, все доступы через `queues` + `downcast_ref`/`downcast_mut`.
 
 **Файл:** `apex-core/src/events.rs`
 
@@ -393,8 +393,7 @@ events.send_sync(DamageEvent { amount: 10 });
 
 ### 4.6 Отсутствует механизм `Changed<T>` фильтра в Query
 
-> **Статус:** ⬜ Отложено — есть `query_changed(last_run)`, но нет удобного Query-фильтра.
-Есть `query_changed(last_run)`, который возвращает компоненты изменённые с `last_run`, но нет удобного Query-фильтра `Changed<T>` в стиле Bevy. Пользователю нужно вручную передавать `last_run` и помнить о нём.
+> **Статус:** ✅ Исправлено — `Changed<T>` теперь pure filter: `Item = ()`, `is_filter = true`. Можно комбинировать с `Read<T>` без дублирования данных.
 
 ---
 
@@ -404,7 +403,7 @@ events.send_sync(DamageEvent { amount: 10 });
 
 ### 4.8 `archetype_indices_storage` индексируется по `system_index`, не по `SystemId`
 
-> **Статус:** ⬜ Отложено — код работает пока нет `remove_system`, переделать маппинг при добавлении.
+> **Статус:** ✅ Исправлено — `system_to_storage` identity mapping удалён, прямая индексация.
 ```rust
 let system_to_storage: Vec<usize> = (0..self.systems.len()).collect();
 // ...
@@ -514,7 +513,7 @@ pub fn add_reader(&mut self) -> EventCursor {
 }
 ```
 
-### R2. Ускорить Event pipeline: pre-reserved channel ⬜ Отложено
+### R2. Ускорить Event pipeline: pre-reserved channel ✅ Выполнено
 
 Для hot-path событий (миллионы в тик) рассмотреть альтернативу текущему swap-буферу: **inline delivery** через `rayon::scope` с каналом без буферизации:
 
@@ -527,14 +526,7 @@ pub struct Events<T> {
 }
 ```
 
-Для текущей архитектуры (без изменения системы буферизации): **зарезервировать capacity заранее**:
-
-```rust
-// В Scheduler::run() перед Stage с Emit
-world.event_reserve::<DamageEvent>(estimated_count);
-```
-
-API `world.event_reserve()` уже есть — нужна автоматизация через AccessDescriptor.
+**Реализованное решение:** Добавлен `AccessDescriptor::event_reserve::<T>(capacity)` — декларативное резервирование. Планировщик автоматически вызывает `world.event_reserve_by_type()` перед системами с write-event доступом. Добавлен `AnyEventQueue::reserve()`, `EventRegistry::reserve_by_type()`, `World::event_reserve_by_type()`.
 
 ### R3. Устранить задержку событий в EventPipeline ⬜ Отложено (архитектурный рефакторинг)
 
@@ -635,15 +627,15 @@ impl World {
 | Область | До | После | Комментарий |
 |---------|-----|-------|-------------|
 | Архитектура хранения (archetype SoA) | ★★★★★ | ★★★★★ | Не изменилось |
-| Планировщик | ★★★★☆ | ★★★★½ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов |
-| Events | ★★★☆☆ | ★★★★½ | Исправлены cursor recycling, remove_reader; добавлены read_partial, send_sync, PartialReadGuard; починен PeekGuard; DelayedQueue на BinaryHeap; UB в unsafe убран |
-| Safety | ★★★☆☆ | ★★★★½ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static; убран unsafe в get_or_init_sync (OnceLock) |
-| API / Эргономика | ★★★★☆ | ★★★★½ | Добавлены has_component, clear_entities, read_partial, send_sync, warning при позднем Startup |
-| Производительность | ★★★★☆ | ★★★★½ | Улучшены барьеры (N+M), кеш инвалидация; DelayedQueue — O(log N) send вместо O(N) flush; event pipeline — без изменений |
-| Тесты | ★★★★☆ | ★★★★½ | 147 тестов проходят, новые тесты покрывают send_sync, read_partial, DelayedQueue FIFO, BinaryHeap early stop |
-| Документация | ★★★★★ | ★★★★★ | Не изменилось |
+| Планировщик | ★★★★☆ | ★★★★½ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов; убран system_to_storage |
+| Events | ★★★☆☆ | ★★★★½ | Исправлены cursor recycling, remove_reader; добавлены read_partial, send_sync, PartialReadGuard; починен PeekGuard; DelayedQueue на BinaryHeap; убран дублирующий raw_ptrs; pre-reserved event channel |
+| Safety | ★★★☆☆ | ★★★★½ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static; убран unsafe SyncPtr (raw_ptrs) в EventRegistry |
+| API / Эргономика | ★★★★☆ | ★★★★★ | Добавлены: has_component, clear_entities, read_partial, send_sync, warning при позднем Startup, Changed<T> pure filter, event_reserve через AccessDescriptor |
+| Производительность | ★★★★☆ | ★★★★½ | Улучшены: барьеры (N+M), кеш инвалидация; DelayedQueue — O(log N); предварительное резервирование event-буферов планировщиком |
+| Тесты | ★★★★☆ | ★★★★½ | 153 теста проходят, покрывают send_sync, read_partial, DelayedQueue FIFO, BinaryHeap early stop |
+| Документация | ★★★★★ | ★★★★★ | Обновлены Apex_ECS_Руководство_пользователя.md и apex-ecs-analysis.md |
 
-**Исправлено (15 пунктов):**
+**Исправлено (19 пунктов):**
 - [x] 2.1 EventCursor ID recycling
 - [x] 2.2 remove_reader tail compression
 - [x] 2.3 EventReadGuard семантика дропа (read_partial + документация)
@@ -651,25 +643,25 @@ impl World {
 - [x] 2.5 detect_conflict_kind BidirectionalWriteRead
 - [x] 2.6 spawn_many_inner needs_drop проверка
 - [x] 3.1 DUMMY_COMMANDS удалён
+- [x] 3.2 EventRegistry — удалён raw_ptrs, заменён на downcast_ref
 - [x] 3.4 O(N×M) → dummy barrier node
 - [x] 3.6 QueryCache::invalidate_for → invalidate()
 - [x] 4.1 #[must_use] на Guard типах
 - [x] 4.3 World::has_component()
 - [x] 4.4 Events<T> thread-safety (send_sync + OnceLock<Mutex>)
 - [x] 4.5 DelayedQueue BinaryHeap + FIFO sequence
+- [x] 4.6 Changed<T> → pure filter: Item=(), is_filter=true
 - [x] 4.7 Startup warning
+- [x] 4.8 archetype_indices_storage — удалён system_to_storage identity mapping
 - [x] 4.9 World::clear_entities()
+- [x] R2 Pre-reserved event channel (AccessDescriptor::event_reserve + планировщик)
 
 **Откат (1 пункт, вызвал регрессию):**
 - [~] 3.5 compute_archetype_indices: `any() → all()` откачен — ломает внутрисистемный параллелизм
 
-**Осталось (6 пунктов, low-medium priority):**
-- [ ] 3.2 EventRegistry двойное хранение
+**Осталось (5 пунктов, low-medium priority):**
 - [ ] 3.3 adaptive_chunk_size калибровка порогов
 - [ ] 4.2 Bundle ограничен 8 компонентами
-- [ ] 4.6 Changed<T> фильтр
-- [ ] 4.8 archetype_indices_storage маппинг
 - [ ] 4.10 apex-macros Component derive
-- [ ] R2 Pre-reserved event channel
 - [ ] R3 Устранение задержки событий
 - [ ] R4 Оптимизация all_readers_caught_up()

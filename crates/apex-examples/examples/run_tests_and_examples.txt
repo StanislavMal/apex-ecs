@@ -37,7 +37,7 @@ cargo run -p apex-examples --example parallel_diagnostics --release --features p
 
 APEX ECS — тестирование с конкурентами:
 
-cargo bench --features bevy,legion,flecs > results.txt
+cargo bench --features bevy,legion > results.txt
 
 cargo bench -p apex-bench > apex-benc.txt
 
