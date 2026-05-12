@@ -18,7 +18,7 @@ pub mod world;
 pub use access::AccessDescriptor;
 pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
 pub use entity::Entity;
-pub use events::{Events, EventRegistry};
+pub use events::{Events, EventRegistry, EventCursor, DelayedQueue, PartialReadGuard, PeekGuard};
 pub use resources::Resources;
 pub use sub_world::SubWorld;
 pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext};
@@ -36,7 +36,7 @@ pub mod prelude {
     pub use crate::access::AccessDescriptor;
     pub use crate::component::{Component, Tick, Serializable};
     pub use crate::entity::Entity;
-    pub use crate::events::Events;
+    pub use crate::events::{Events, EventCursor, DelayedQueue, PartialReadGuard, PeekGuard};
     pub use crate::resources::Resources;
     pub use crate::world::{World, Bundle, CachedQuery, SystemContext};
     pub use crate::query::{Query, Read, Write, With, Without, Changed, Maybe, MaybeWrite, QueryBuilder, WorldQuery};

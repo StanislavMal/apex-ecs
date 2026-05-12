@@ -1,8 +1,11 @@
-//! Apex ECS — Maybe<T> + Event Auto-Registration
+//! Apex ECS — Maybe<T> + Events (read_partial, DelayedQueue, send_sync)
 //!
-//! Демонстрирует две новые возможности:
+//! Демонстрирует расширенные возможности событий:
 //! 1. **Maybe<T> / MaybeWrite<T>** — optional-компоненты в Query
 //! 2. **Авторегистрация событий** — send_event без add_event
+//! 3. **read_partial** — пакетное чтение без потери событий
+//! 4. **DelayedQueue** — отложенная доставка через BinaryHeap (FIFO)
+//! 5. **send_sync / send_batch_sync** — thread-safe отправка событий
 //!
 //! ```bash
 //! cargo run --example maybe_and_events
@@ -34,6 +37,9 @@ struct ScoreEvent(u32);
 
 #[derive(Clone, Copy, Debug)]
 struct CollisionEvent { entity: Entity, damage: f32 }
+
+#[derive(Clone, Copy, Debug)]
+struct PowerupEvent(u32);
 
 // ── main ────────────────────────────────────────────────────────
 
@@ -161,6 +167,102 @@ fn main() {
         println!("  ✓ world.try_resource<String>: None (ресурс не вставлен)");
     }
 
+    // ── Демо 6: read_partial — пакетное чтение без потери ─────
+
+    println!("\n--- 6. read_partial: пакетное чтение без потери событий ---");
+
+    // Используем низкоуровневый API (add_reader + read_partial)
+    world.add_event::<PowerupEvent>();
+    let cursor = world.events_mut::<PowerupEvent>().add_reader();
+
+    // Отправляем 7 событий, tick → они в буфере чтения
+    for i in 0..7 {
+        world.send_event(PowerupEvent(i));
+    }
+    world.tick();
+
+    let total = world.events::<PowerupEvent>().len_readable();
+    println!("  Событий в буфере: {}", total);
+
+    // Читаем по 3 за раз — курсор продвигается ровно на прочитанное
+    let mut processed = 0usize;
+    loop {
+        let guard = world.events_mut::<PowerupEvent>().read_partial(&cursor, 3);
+        if guard.is_empty() { break; }
+        for ev in guard.iter() {
+            print!(" {}", ev.0);
+        }
+        processed += guard.len();
+    } // guard дроп → курсор продвинут ровно на guard.len()
+    println!();
+    println!("  Прочитано: {} из {} (все обработаны, ни одно не потеряно)", processed, total);
+
+    // ── Демо 7: DelayedQueue — отложенная доставка ─────────────
+
+    println!("\n--- 7. DelayedQueue: отложенная доставка с FIFO-порядком ---");
+
+    world.add_event::<&str>();
+    let mut delayed = DelayedQueue::new();
+    let str_cursor = world.events_mut::<&str>().add_reader();
+
+    // Отправляем события с задержками
+    delayed.send_delayed("alpha",   1, 0);  // deliver_at = 1
+    delayed.send_delayed("beta",    1, 0);  // deliver_at = 1
+    delayed.send_delayed("gamma",   2, 0);  // deliver_at = 2
+    delayed.send_delayed("delta",   2, 0);  // deliver_at = 2
+    println!("  Отложено событий: {}", delayed.len());
+
+    // Тик 1 — доставляются только alpha, beta (FIFO между собой)
+    delayed.flush_delayed(1, world.events_mut::<&str>());
+    println!("  После flush(1): pending={}", world.events_mut::<&str>().len_pending());
+    world.tick();
+    {
+        let ev = world.events::<&str>().iter(&str_cursor);
+        println!("  Прочитано в тик 1: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
+        // alpha before beta (FIFO)
+        assert_eq!(ev[0], "alpha");
+        assert_eq!(ev[1], "beta");
+    }
+
+    // Тик 2 — доставляются gamma, delta
+    delayed.flush_delayed(2, world.events_mut::<&str>());
+    world.events_mut::<&str>().advance_reader_mut(&str_cursor);
+    world.tick();
+    {
+        let ev = world.events::<&str>().iter(&str_cursor);
+        println!("  Прочитано в тик 2: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
+        assert_eq!(ev[0], "gamma");
+        assert_eq!(ev[1], "delta");
+    }
+    println!("  DelayedQueue пуста: {}", delayed.is_empty());
+
+    // ── Демо 8: send_sync — thread-safe отправка ──────────────
+
+    println!("\n--- 8. send_sync: thread-safe отправка (через &self) ---");
+
+    world.add_event::<i32>();
+    let sync_cursor = world.events_mut::<i32>().add_reader();
+
+    // send_sync доступен через &Events<T> (без &mut)
+    let queue_ref: &Events<i32> = world.events::<i32>();
+    queue_ref.send_sync(100);
+    queue_ref.send_sync(200);
+    queue_ref.send_batch_sync(300..=302);
+
+    // После flush_sync данные в pending
+    world.events_mut::<i32>().flush_sync();
+    println!("  После flush_sync: pending={}", world.events_mut::<i32>().len_pending());
+
+    // После update доступны для чтения
+    world.tick();
+    {
+        let ev = world.events::<i32>().iter(&sync_cursor);
+        let vals: Vec<_> = ev.iter().copied().collect();
+        println!("  Прочитано: {:?}", vals);
+        assert_eq!(vals, vec![100, 200, 300, 301, 302]);
+    }
+    println!("  ✓ send_sync + send_batch_sync работают корректно");
+
     // ── Итог ────────────────────────────────────────────────────
 
     println!("\n=== ИТОГ ===");
@@ -169,6 +271,9 @@ fn main() {
     println!("✅ send_event — без add_event (авторегистрация)");
     println!("✅ try_send_event — всегда успешен");
     println!("✅ try_resource — безопасный доступ к ресурсам");
+    println!("✅ read_partial — пакетное чтение без потери событий");
+    println!("✅ DelayedQueue — отложенная доставка с BinaryHeap + FIFO");
+    println!("✅ send_sync / send_batch_sync — thread-safe отправка");
     println!();
     println!("  Пример завершён, entity: {}", world.entity_count());
 }

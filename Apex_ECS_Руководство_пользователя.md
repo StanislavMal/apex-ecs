@@ -500,7 +500,7 @@ for ev in reader.iter() {
 
 #### 5.2.2 Per-reader чтение (низкоуровневое)
 
-[`Events<T>`](crates/apex-core/src/events.rs:33) поддерживает произвольное количество независимых читателей, каждый со своим курсором [`EventCursor`](crates/apex-core/src/events.rs:365). Для типовых сценариев используйте [`EventReader`](#521-базовая-отправка-и-чтение-через-eventreader), а низкоуровневый API — для максимального контроля:
+[`Events<T>`](crates/apex-core/src/events.rs:63) поддерживает произвольное количество независимых читателей, каждый со своим курсором [`EventCursor`](crates/apex-core/src/events.rs:574). Для типовых сценариев используйте [`EventReader`](#521-базовая-отправка-и-чтение-через-eventreader), а низкоуровневый API — для максимального контроля:
 
 ```rust
 let queue = world.events_mut::<DamageEvent>();
@@ -558,9 +558,9 @@ if !guard.is_empty() {
 }
 ```
 
-#### 5.2.4 Просмотр без продвижения (`PeekGuard`)
+#### 5.2.4 Просмотр без продвижения (`PeekGuard`) и частичное чтение
 
-[`PeekGuard<T>`](crates/apex-core/src/events.rs:290) — обёртка над `EventReadGuard`, которая **не** продвигает курсор при Drop.
+[`PeekGuard<T>`](crates/apex-core/src/events.rs:544) — самостоятельная структура (не обёртка над `EventReadGuard`), которая **не** продвигает курсор при Drop. Создаётся через [`EventReadGuard::peek()`](crates/apex-core/src/events.rs:450):
 
 ```rust
 let queue = world.events_mut::<DamageEvent>();
@@ -569,6 +569,17 @@ let queue = world.events_mut::<DamageEvent>();
 let peek = queue.read(&reader_a).peek();  // -> PeekGuard<DamageEvent>
 println!("{} pending events", peek.len());
 // курсор не сдвинулся — следующий read() покажет те же события
+```
+
+[`read_partial(&cursor, max_count)`](crates/apex-core/src/events.rs:347) — прочитать не более N событий и продвинуть курсор ровно на прочитанное. В отличие от `read()` (drop → конец буфера), `read_partial` при дропе продвигает курсор на `guard.len()` — остальные события не теряются:
+
+```rust
+// Обрабатываем по 32 события за тик, не теряя остальные:
+while let guard = queue.read_partial(&reader_a, 32) {
+    if guard.is_empty() { break; }
+    for ev in guard.iter() { process(ev); }
+    // При дропе курсор продвинется ровно на guard.len()
+}
 ```
 
 #### 5.2.5 Пакетная отправка (`send_batch`)
@@ -594,12 +605,17 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 |-------|----------|
 | `send(event)` | Отправить одно событие в текущий тик |
 | `send_batch(events)` | Отправить пачку событий (любой `IntoIterator`) |
+| `send_sync(event)` | Thread-safe отправка из параллельных систем (через `&self`) |
+| `send_batch_sync(events)` | Thread-safe пакетная отправка (один lock на пачку) |
+| `flush_sync()` | Слить thread-safe буфер (`sync_pending`) в основной `pending` |
 | `reserve(n)` | Предаллоцировать `pending` буфер для N событий (избежать реаллокаций) |
 | `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
 | `remove_reader(reader_id)` | Удалить читателя |
 | `iter(reader_id) -> &[T]` | Непрочитанные события для reader (без продвижения курсора) |
-| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
+| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (весь буфер) |
+| `read_partial(reader_id, max_count) -> PartialReadGuard<T>` | Чтение с продвижением ровно на N событий |
 | `advance_reader_mut(reader_id)` | Ручное продвижение курсора до конца буфера |
+| `advance_reader_by(reader_id, count)` | Ручное продвижение курсора на N событий |
 | `len_pending() -> usize` | Количество событий в буфере записи |
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
 | `update()` | Переключить буферы (вызывается автоматически в `world.tick()`) |
@@ -621,6 +637,59 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
 | `len(&self) -> usize` | Количество непрочитанных событий |
 | `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
+
+#### 5.2.7 Отложенная доставка через `DelayedQueue<T>`
+
+[`DelayedQueue<T>`](crates/apex-core/src/events.rs:636) — отдельная очередь для событий, которые должны быть доставлены с задержкой в N тиков. Внутри — `BinaryHeap` для O(log N) вставки и O(K log N) извлечения готовых. События с одинаковым `deliver_at` доставляются в порядке вставки (FIFO).
+
+```rust
+use apex_core::prelude::*;
+
+let mut delayed = DelayedQueue::new();
+
+// Отправить событие с задержкой в тиках:
+delayed.send_delayed("boom", 3, world.current_tick().0);  // взрыв через 3 тика
+
+// Перенести готовые события в основную очередь:
+delayed.flush_delayed(world.current_tick().0, world.events_mut::<&str>());
+
+// события теперь в pending — станут доступны после world.tick()
+```
+
+| Метод | Описание |
+|-------|----------|
+| `new() -> Self` | Создать пустую очередь |
+| `send_delayed(event, delay, current_tick)` | Отправить с задержкой в N тиков (O(log N)) |
+| `flush_delayed(tick, &mut Events<T>)` | Извлечь все готовые события в `pending` (O(K log N)) |
+| `len() -> usize` | Количество отложенных событий |
+| `is_empty() -> bool` | Пуста ли очередь |
+| `clear()` | Очистить очередь и сбросить sequence |
+| `reserve(n)` | Предаллоцировать память под N будущих событий |
+
+#### 5.2.8 Thread-safe отправка (`send_sync` / `send_batch_sync`)
+
+Для отправки событий из параллельных систем (где доступен только `&Events<T>`, а не `&mut Events<T>`) используйте методы `send_sync` и `send_batch_sync`. Они пишут во внутренний `Mutex<Vec<T>>`, который лениво инициализируется через `OnceLock` (нулевой overhead для однопоточных сценариев).
+
+Содержимое `sync_pending` автоматически сливается в основной `pending` при вызове `update()` (т.е. при каждом `world.tick()`), либо вручную через `flush_sync()`.
+
+```rust
+let queue: &Events<DamageEvent> = world.events::<DamageEvent>();
+
+// Поштучная отправка — каждый вызов берёт lock:
+queue.send_sync(DamageEvent { target: e, amount: 10.0 });
+queue.send_sync(DamageEvent { target: e, amount: 20.0 });
+
+// Пакетная отправка — один lock на пачку:
+queue.send_batch_sync((0..100).map(|i| DamageEvent { target: e, amount: i as f32 }));
+```
+
+| Метод | Описание |
+|-------|----------|
+| `send_sync(&self, event)` | Thread-safe отправка одного события |
+| `send_batch_sync(&self, events)` | Thread-safe пакетная отправка (один lock) |
+| `flush_sync(&mut self)` | Слить `sync_pending` в основной `pending` |
+
+> **Примечание:** `update()` (вызывается `world.tick()`) автоматически вызывает `flush_sync()`. Ручной вызов нужен только если требуется прочитать события до следующего тика.
 
 ### 5.3 Event Pipeline — конвейерная обработка событий
 
@@ -1946,7 +2015,7 @@ for each system:
 
 - **Мало entity** → per-system scope (одна задача на систему, без overhead)
 - **Много entity** → чанки равномерно заполняют все ядра, даже если архетип один (row-level split)
-- **Событийные системы** (Emit/Listen) не чанкуются — Events<T> не thread-safe
+- **Событийные системы** (Emit/Listen) не чанкуются — для записи из параллельных систем используйте `send_sync` / `send_batch_sync`
 - Запуск через `rayon::scope` + `s.spawn(|_| ...)` (не `par_iter` — избегает двойного chunking Rayon)
 
 #### 13.1.2 Ключевое улучшение v0.1.0: Query через SubWorld

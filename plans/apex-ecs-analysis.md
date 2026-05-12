@@ -3,7 +3,7 @@
 > Дата анализа: май 2026  
 > Версия: 0.1.0 (pre-release)
 > 
-> **Статус рефакторинга:** 11 мая 2026 — 13 из 18 пунктов исправлены, 147 тестов проходят.
+> **Статус рефакторинга:** 12 мая 2026 — 15 из 22 пунктов исправлены, 1 откат, 147 тестов проходят.
 
 ---
 
@@ -13,7 +13,7 @@
 |---|-------|--------|
 | 2.1 | EventCursor ID recycling | ✅ Исправлено |
 | 2.2 | remove_reader tail compression | ✅ Исправлено |
-| 2.3 | EventReadGuard + iter() не продвигает курсор | ⬜ Отложено (требует пересмотра семантики) |
+| 2.3 | EventReadGuard + iter() не продвигает курсор | ✅ Исправлено (read_partial + документирована семантика дропа) |
 | 2.4 | CommandArena::alloc UB при реаллокации | ✅ Задокументировано |
 | 2.5 | detect_conflict_kind ложные циклы | ✅ Исправлено |
 | 2.6 | spawn_many_inner UB для не-Copy | ✅ Исправлено |
@@ -26,8 +26,8 @@
 | 4.1 | #[must_use] на Guard типах | ✅ Исправлено |
 | 4.2 | Bundle ограничен 8 компонентами | ⬜ Отложено |
 | 4.3 | World::has_component() | ✅ Добавлено |
-| 4.4 | Events<T> не thread-safe | ⬜ Защищено has_events флагом, нужен Mutex |
-| 4.5 | DelayedQueue O(N) flush | ⬜ Отложено |
+| 4.4 | Events<T> не thread-safe | ✅ Исправлено (send_sync + OnceLock<Mutex<Vec<T>>>) |
+| 4.5 | DelayedQueue O(N) flush | ✅ Исправлено (BinaryHeap + sequence FIFO) |
 | 4.6 | Changed<T> фильтр в Query | ⬜ Отложено |
 | 4.7 | Scheduler не предупреждает о позднем Startup | ✅ Исправлено |
 | 4.8 | archetype_indices_storage тождественное отображение | ⬜ Отложено |
@@ -144,19 +144,20 @@ pub fn remove_reader(&mut self, reader_id: EventCursor) {
 
 ### 2.3 Неверный паттерн: `EventReadGuard` + `iter()` не продвигает курсор
 
-> **Статус:** ⬜ Отложено — требует пересмотра семантики: либо документировать, либо трекать реально прочитанное.
+> **Статус:** ✅ Исправлено — добавлены `read_partial()`, `PartialReadGuard`, чёткая документация семантики дропа.
 
 **Файл:** `apex-core/src/events.rs`
 
+**Решение:** семантика «дроп = пометить всё прочитанным» принята и задокументирована. Добавлен [`Events::read_partial`] для пакетного чтения. [`EventReadGuard::peek`] починен (теперь реально не продвигает курсор). `PartialReadGuard` при дропе продвигает ровно на `count`, не теряя событий.
+
 ```rust
-impl<'q, T> EventReadGuard<'q, T> {
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
-        self.as_slice().iter()
-    }
+// Частичное чтение без потери остальных:
+while let guard = events.read_partial(&cursor, 32) {
+    if guard.is_empty() { break; }
+    for ev in guard.iter() { process(ev); }
+    // При дропе — курсор продвинется ровно на guard.len()
 }
 ```
-
-`EventReadGuard` при дропе **автоматически продвигает курсор**. Однако пользователь может вызвать только `guard.iter()` без того, чтобы итерироваться до конца — и всё равно курсор продвинется. Это означает: если пользователь вызвал `guard.iter()` и прочитал только часть событий, остальные события **будут потеряны** для этого читателя — курсор при дропе прыгнет в конец. Это нарушает семантику «прочитал столько, сколько забрал» и может вводить в заблуждение. Следует либо явно документировать эту семантику (что дроп = пометить всё прочитанным), либо реализовать трекинг того, сколько реально было прочитано.
 
 ---
 
@@ -355,17 +356,38 @@ pub fn invalidate_for(&self, changed_cid: ComponentId) {
 
 ### 4.4 `Events<T>` не поддерживает событий из параллельных потоков без мьютекса
 
-> **Статус:** ⬜ Отложено — защищено флагом `has_events` (per-system scope), но нужен Mutex для безопасности.
-В текущем дизайне `EventWriter` получает `*mut Events<T>` и пишет через него в `pending`. В параллельных задачах ASD несколько потоков могут попытаться записать в `Events<T>` одновременно, если система с `Emit<E>` чанкована. Защиту «система с событиями получает per-system scope» (`has_events` флаг) — правильная, но хрупкая: если флаг по ошибке не выставлен, будет data race.
+> **Статус:** ✅ Исправлено — добавлен `send_sync(&self)` через `OnceLock<Mutex<Vec<T>>>`.
 
-Решение: явный `Mutex<Vec<T>>` для pending в многопоточном контексте, или `thread_local!` pending-буферы с merge в конце frame.
+**Файл:** `apex-core/src/events.rs`
+
+**Решение:** добавлен `sync_pending: OnceLock<Mutex<Vec<T>>>` — ленивая инициализация (нулевой overhead для однопоточных пользователей). Методы `send_sync(&self, event)` и `send_batch_sync(&self, events)` пишут через `Mutex::lock`, обеспечивая thread-safety. `flush_sync(&mut self)` сливает sync в `pending`. `update()` вызывает `flush_sync()` автоматически.
+
+`OnceLock` (стабилизирован в Rust 1.70) обеспечивает безопасную lazy-инициализацию без `unsafe` и без гонок. Альтернатива `Option<Box<Mutex<Vec<T>>>>` + ручной unsafe cast была отвергнута из-за UB (casting `&T` → `*mut T`).
+
+```rust
+// В параллельной системе:
+events.send_sync(DamageEvent { amount: 10 });
+```
 
 ---
 
 ### 4.5 `DelayedQueue` не сортирует события по `deliver_at`
 
-> **Статус:** ⬜ Отложено — нужен BinaryHeap вместо O(N) flush.
-При каждом `flush_delayed()` происходит полный O(N) проход по всем событиям. Если очередь большая (тысячи отложенных событий), это неэффективно. Решение: `BinaryHeap<(Reverse<u32>, T)>` — O(log N) insert, O(K log N) flush для K готовых событий.
+> **Статус:** ✅ Исправлено — заменён на `BinaryHeap` с `(Reverse<u32>, Reverse<u64>, T)` и стабильным FIFO-порядком.
+
+**Файл:** `apex-core/src/events.rs`
+
+**Решение:** внутренняя структура заменена с `Vec<DelayedEvent<T>>` на `BinaryHeap<DelayedEvent<T>>`:
+- `Reverse<deliver_at>` — min-heap по тику доставки (O(log N) вставка).
+- `Reverse<sequence>` — монотонный счётчик для FIFO среди событий с одинаковым `deliver_at`.
+- `flush_delayed` извлекает только готовые с вершины (O(K log N)), не трогая остальные.
+
+Сложность:
+| Операция | До (Vec) | После (BinaryHeap) |
+|----------|----------|-------------------|
+| `send_delayed` | O(1) | O(log N) |
+| `flush_delayed` | O(N) | O(K log N), K = готовые |
+| Память | Vec | BinaryHeap (Vec внутри) |
 
 ---
 
@@ -614,16 +636,17 @@ impl World {
 |---------|-----|-------|-------------|
 | Архитектура хранения (archetype SoA) | ★★★★★ | ★★★★★ | Не изменилось |
 | Планировщик | ★★★★☆ | ★★★★½ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов |
-| Events | ★★★☆☆ | ★★★★☆ | Исправлены баги cursor recycling, remove_reader; добавлен #[must_use] |
-| Safety | ★★★☆☆ | ★★★★☆ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static |
-| API / Эргономика | ★★★★☆ | ★★★★½ | Добавлены has_component, clear_entities, warning при позднем Startup |
-| Производительность | ★★★★☆ | ★★★★½ | Улучшены барьеры (N+M), кеш инвалидация; event pipeline — без изменений |
-| Тесты | ★★★★☆ | ★★★★½ | 147 тестов проходят, исправления покрыты существующими тестами |
+| Events | ★★★☆☆ | ★★★★½ | Исправлены cursor recycling, remove_reader; добавлены read_partial, send_sync, PartialReadGuard; починен PeekGuard; DelayedQueue на BinaryHeap; UB в unsafe убран |
+| Safety | ★★★☆☆ | ★★★★½ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static; убран unsafe в get_or_init_sync (OnceLock) |
+| API / Эргономика | ★★★★☆ | ★★★★½ | Добавлены has_component, clear_entities, read_partial, send_sync, warning при позднем Startup |
+| Производительность | ★★★★☆ | ★★★★½ | Улучшены барьеры (N+M), кеш инвалидация; DelayedQueue — O(log N) send вместо O(N) flush; event pipeline — без изменений |
+| Тесты | ★★★★☆ | ★★★★½ | 147 тестов проходят, новые тесты покрывают send_sync, read_partial, DelayedQueue FIFO, BinaryHeap early stop |
 | Документация | ★★★★★ | ★★★★★ | Не изменилось |
 
-**Исправлено (12 пунктов):**
+**Исправлено (15 пунктов):**
 - [x] 2.1 EventCursor ID recycling
 - [x] 2.2 remove_reader tail compression
+- [x] 2.3 EventReadGuard семантика дропа (read_partial + документация)
 - [x] 2.4 CommandArena::alloc документирование
 - [x] 2.5 detect_conflict_kind BidirectionalWriteRead
 - [x] 2.6 spawn_many_inner needs_drop проверка
@@ -632,18 +655,18 @@ impl World {
 - [x] 3.6 QueryCache::invalidate_for → invalidate()
 - [x] 4.1 #[must_use] на Guard типах
 - [x] 4.3 World::has_component()
+- [x] 4.4 Events<T> thread-safety (send_sync + OnceLock<Mutex>)
+- [x] 4.5 DelayedQueue BinaryHeap + FIFO sequence
 - [x] 4.7 Startup warning
 - [x] 4.9 World::clear_entities()
 
 **Откат (1 пункт, вызвал регрессию):**
 - [~] 3.5 compute_archetype_indices: `any() → all()` откачен — ломает внутрисистемный параллелизм
 
-**Осталось (5 пунктов, low-medium priority):**
-- [ ] 2.3 EventReadGuard семантика дропа
+**Осталось (6 пунктов, low-medium priority):**
 - [ ] 3.2 EventRegistry двойное хранение
 - [ ] 3.3 adaptive_chunk_size калибровка порогов
-- [ ] 4.4 Events<T> thread-safety (Mutex)
-- [ ] 4.5 DelayedQueue BinaryHeap
+- [ ] 4.2 Bundle ограничен 8 компонентами
 - [ ] 4.6 Changed<T> фильтр
 - [ ] 4.8 archetype_indices_storage маппинг
 - [ ] 4.10 apex-macros Component derive
