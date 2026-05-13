@@ -701,6 +701,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 (a.arch_idx, effective_len)
             }),
             num_threads,
+            self.world.chunk_config(),
         );
 
         let last_run = self.last_run;

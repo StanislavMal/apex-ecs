@@ -1,5 +1,14 @@
 use std::any::TypeId;
 use rustc_hash::FxHashMap;
+use linkme::distributed_slice;
+
+/// Тип функции-регистратора: принимает мутабельный реестр, регистрирует компонент.
+pub type ComponentRegistrarFn = fn(&mut ComponentRegistry);
+
+/// Глобальный список всех авторегистраторов компонентов.
+/// Заполняется линкером из всех крейтов, использующих #[derive(Component)].
+#[distributed_slice]
+pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn] = [..];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ComponentId(pub u32);
@@ -187,6 +196,17 @@ impl ComponentRegistry {
             type_to_id: FxHashMap::default(),
             by_id:      FxHashMap::default(),
             next_id:    0,
+        }
+    }
+
+    /// Регистрирует все компоненты, объявленные через `#[derive(Component)]`.
+    /// Вызывается один раз при создании World.
+    ///
+    /// Работает через `linkme::distributed_slice` — линкер собирает
+    /// статические регистраторы из всех крейтов, использующих макрос.
+    pub fn register_all_auto(&mut self) {
+        for registrar in COMPONENT_REGISTRARS {
+            registrar(self);
         }
     }
 

@@ -18,6 +18,10 @@ thiserror.workspace   = true
 log.workspace         = true
 rayon = { workspace = true, optional = true }
 
+# Авторегистрация компонентов
+linkme.workspace = true
+apex-macros = { path = "../apex-macros" }
+
 # Сериализация — нужна для Serializable трейта и make_serde_fns
 serde      = { workspace = true }
 serde_json = { workspace = true }

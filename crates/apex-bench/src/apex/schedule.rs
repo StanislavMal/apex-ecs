@@ -1,13 +1,19 @@
 use apex_core::prelude::*;
+use apex_macros::Component;
 use apex_scheduler::{Scheduler, AutoSystem, SystemContext};
 
 // ---------------------------------------------------------------------------
 // Components for schedule benchmarks
 // ---------------------------------------------------------------------------
+#[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
+#[derive(Component, Clone, Copy)]
 pub struct B(pub f32);
+#[derive(Component, Clone, Copy)]
 pub struct C(pub f32);
+#[derive(Component, Clone, Copy)]
 pub struct D(pub f32);
+#[derive(Component, Clone, Copy)]
 pub struct E(pub f32);
 
 // ---------------------------------------------------------------------------
@@ -61,12 +67,6 @@ pub struct Schedule {
 impl Schedule {
     pub fn new() -> Self {
         let mut world = World::new();
-        world.register_component::<A>();
-        world.register_component::<B>();
-        world.register_component::<C>();
-        world.register_component::<D>();
-        world.register_component::<E>();
-
         // Group 1: A+B (10K)
         world.spawn_many(10_000, |_| (A(0.0), B(0.0)));
         // Group 2: A+B+C (10K)

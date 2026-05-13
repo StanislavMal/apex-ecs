@@ -167,6 +167,7 @@ impl<'w> SubWorld<'w> {
                 }
             }),
             num_threads,
+            self.world.chunk_config(),
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
@@ -225,6 +226,7 @@ impl<'w> SubWorld<'w> {
                 }
             }),
             num_threads,
+            self.world.chunk_config(),
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {

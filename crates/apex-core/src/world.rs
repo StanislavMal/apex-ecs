@@ -137,7 +137,7 @@ impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
 pub struct World {
     pub(crate) entities:             EntityAllocator,
     pub(crate) registry:             ComponentRegistry,
-    pub(crate) archetypes:           Vec<Archetype>,
+    pub archetypes:           Vec<Archetype>,
     pub(crate) archetype_index:      FxHashMap<ArchetypeKey, ArchetypeId>,
     /// Индекс компонент → список архетипов, содержащих этот компонент.
     /// Используется в Query::new_with_tick для O(1) поиска архетипов-кандидатов
@@ -156,10 +156,14 @@ pub struct World {
     pub(crate) write_hooks:     FxHashMap<ComponentId, fn(Entity, &mut World)>,
     /// Реестр именованных шаблонов (EntityTemplate).
     pub(crate) templates:       TemplateRegistry,
+    /// Конфигурация чанкования для параллельной итерации.
+    pub(crate) chunk_config:    ChunkConfig,
 }
 
 impl World {
     pub fn new() -> Self {
+        let mut registry = ComponentRegistry::new();
+        registry.register_all_auto();
         let mut world = Self {
             entities:        EntityAllocator::new(),
             registry:        ComponentRegistry::new(),
@@ -175,21 +179,43 @@ impl World {
             events:          EventRegistry::new(),
             write_hooks:     FxHashMap::default(),
             templates:       TemplateRegistry::new(),
+            chunk_config:    ChunkConfig::default(),
         };
         world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
         world.archetype_index.insert(ArchetypeKey(SmallVec::new()), ArchetypeId::EMPTY);
         world
     }
 
+    /// Продвигает глобальный tick. **Не делает flush событий** — это ответственность Scheduler.
+    /// Для использования без Scheduler вызывайте [`flush_all_events()`](Self::flush_all_events) вручную.
     pub fn tick(&mut self) {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
-        self.events.update_all();
+    }
+
+    /// Flush конкретных типов событий (по TypeId). Используется Scheduler для per-Stage flush.
+    pub fn flush_events_by_type(&mut self, type_ids: &[std::any::TypeId]) {
+        self.events.flush_by_type_id(type_ids);
+    }
+
+    /// Flush всех событий. Используется при работе без Scheduler.
+    pub fn flush_all_events(&mut self) {
+        self.events.flush_all();
     }
 
     pub fn current_tick(&self)    -> Tick  { self.current_tick }
     pub fn entity_count(&self)    -> usize { self.entities.len() }
     pub fn archetype_count(&self) -> usize { self.archetypes.len() }
     pub fn resource_count(&self)  -> usize { self.resources.len() }
+
+    /// Получить текущую конфигурацию чанкования.
+    #[inline]
+    pub fn chunk_config(&self) -> &ChunkConfig { &self.chunk_config }
+
+    /// Установить конфигурацию чанкования.
+    #[inline]
+    pub fn set_chunk_config(&mut self, config: ChunkConfig) {
+        self.chunk_config = config;
+    }
 
     /// Удалить все сущности, сохранив ресурсы, зарегистрированные компоненты и события.
     ///
@@ -219,6 +245,9 @@ impl World {
     }
 
     pub fn registry(&self) -> &ComponentRegistry { &self.registry }
+
+    /// Мутабельный доступ к реестру компонентов.
+    pub fn registry_mut(&mut self) -> &mut ComponentRegistry { &mut self.registry }
 
     pub fn archetypes(&self) -> &[Archetype] { &self.archetypes }
 
@@ -424,7 +453,7 @@ impl World {
         // SAFETY: bulk-copy через copy_nonoverlapping допустим только для типов,
         // не имеющих Drop (эквивалентно Copy). Для типов с Drop (String, Vec<T>, Arc<T>)
         // используется per-entity цикл во избежание двойного освобождения.
-        let needs_drop = std::mem::needs_drop::<B>();
+        let needs_drop = B::needs_drop();
         if col_indices.len() <= 1 || needs_drop {
             // Per-entity loop — старый подход, быстрее для малого числа компонентов.
             for (i, &entity) in entities.iter().enumerate() {
@@ -955,49 +984,82 @@ pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 // Оставляем только для обратной совместимости, если нужно.
 
 pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
-/// Вычислить адаптивный размер чанка на основе количества entity.
+
+/// Конфигурация стратегии параллельного чанкования.
 ///
-/// Формула: `entity_count / num_threads` (1 чанк на поток),
-/// но не более абсолютного потолка (по умолчанию 65536, или из `PAR_CHUNK_SIZE`).
-/// Для малых миров динамически увеличивается минимальный размер чанка.
-/// num_threads — количество потоков rayon (передаётся из вызывающего кода).
+/// Определяет, как [`adaptive_chunk_size`] разбивает entity на чанки
+/// для параллельной итерации (`par_for_each`).
 ///
-/// **Runtime-адаптация:** для малых нагрузок (< 100 entities) динамически
-/// увеличиваем минимальный размер чанка до 128, чтобы избежать оверхеда
-/// rayon на микро-задачах. Для средних (100–1000) — 32. Для больших — 64.
-pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize) -> usize {
+/// Передаётся через `World::set_chunk_config()`. Если не задана явно,
+/// используется [`ChunkConfig::default()`].
+///
+/// # Пример
+///
+/// ```ignore
+/// let config = ChunkConfig {
+///     min_entities_per_thread: 32,
+///     max_chunk_size: 8192,
+///     auto_serial_fallback: true,
+/// };
+/// world.set_chunk_config(config);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ChunkConfig {
+    /// Минимальное число entity на поток, ниже которого параллелизм не выгоден.
+    /// Для 8 потоков с `min = 16` миры до 128 entity идут в один чанк (serial).
+    ///
+    /// Default: 16.
+    pub min_entities_per_thread: usize,
+
+    /// Динамический минимум размера чанка — защита от микро-задач rayon.
+    /// Если вычисленный размер чанка меньше этого значения — поднимается до него.
+    ///
+    /// Default: 128/32/64 (зависит от размера мира, как до рефакторинга).
+    pub dynamic_min_chunk: usize,
+
+    /// Максимальный размер чанка (ограничитель роста при огромных мирах).
+    ///
+    /// Default: 65536 (или из `PAR_CHUNK_SIZE`, если задан).
+    pub max_chunk_size: usize,
+
+    /// Если `true` — всегда использовать один чанк для `N < min_entities_per_thread * threads`.
+    /// Если `false` — всегда разбивать на `threads` чанков (даже мелких).
+    ///
+    /// Default: `true`.
+    pub auto_serial_fallback: bool,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        let max_from_env = {
+            let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+            if user > 0 { user } else { DEFAULT_MAX_CHUNK_SIZE }
+        };
+        Self {
+            min_entities_per_thread: 16,
+            dynamic_min_chunk: 64,
+            max_chunk_size: max_from_env,
+            auto_serial_fallback: true,
+        }
+    }
+}
+
+/// Вычислить адаптивный размер чанка на основе количества entity и конфигурации.
+///
+/// Логика (с учётом dynamic_min_chunk для предотвращения микро-задач rayon):
+/// 1. Если `auto_serial_fallback` и `entity_count < min_entities_per_thread * thread_count` — один чанк (serial).
+/// 2. Иначе — `ceil(entity_count / thread_count)`, зажато в `[dynamic_min_chunk, max_chunk_size]`.
+pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &ChunkConfig) -> usize {
+    if entity_count == 0 {
+        return 1;
+    }
     let n = num_threads.max(1);
-
-    // 1. Базовый размер: поровну на каждый поток
-    let mut chunk = entity_count / n;
-
-    // 2. Абсолютный потолок: берём из PAR_CHUNK_SIZE (если задан и >0),
-    //    иначе DEFAULT_MAX_CHUNK_SIZE (65536).
-    let absolute_max = {
-        let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-        if user > 0 { user } else { DEFAULT_MAX_CHUNK_SIZE }
-    };
-    if chunk > absolute_max {
-        chunk = absolute_max;
+    let serial_threshold = config.min_entities_per_thread.saturating_mul(n);
+    if config.auto_serial_fallback && entity_count < serial_threshold {
+        return entity_count;
     }
-
-    // 3. Динамический минимум — чтобы не плодить микро-задачи
-    let dynamic_min = if entity_count < 100 {
-        128
-    } else if entity_count < 1000 {
-        32
-    } else {
-        // Для крупных миров — не меньше 64, но если world очень большой,
-        // не стоит опускаться ниже absolute_max/256 (эвристика).
-        // Пока оставим 64.
-        64
-    };
-    if chunk < dynamic_min {
-        chunk = dynamic_min;
-    }
-
-    // 4. Не больше entity_count (если dynamic_min перекрывает)
-    chunk.min(entity_count)
+    let raw = (entity_count + n - 1) / n;
+    raw.clamp(config.dynamic_min_chunk, config.max_chunk_size).min(entity_count)
 }
 
 /// Установить размер чанка для par_for_each.
@@ -1299,6 +1361,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                     (arch_idx, effective_len)
                 }),
             num_threads,
+            world.chunk_config(),
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
@@ -1459,6 +1522,14 @@ pub trait Bundle: Sized {
     ) {
         self.write_into(world, archetype_id, row, tick);
     }
+
+    /// Возвращает true, если хотя бы один компонент Bundle имеет Drop (нужно для spawn_many).
+    ///
+    /// Для типов с Drop bulk-copy через `copy_nonoverlapping` небезопасен,
+    /// используется per-entity цикл.
+    fn needs_drop() -> bool {
+        false
+    }
 }
 
 macro_rules! impl_bundle {
@@ -1544,6 +1615,10 @@ macro_rules! impl_bundle {
                     }
                 )+
             }
+
+            fn needs_drop() -> bool {
+                false $( || std::mem::needs_drop::<$T>() )+
+            }
         }
     };
 }
@@ -1565,6 +1640,10 @@ impl Bundle for () {
 
     fn write_into(self, _world: &mut World, _archetype_id: ArchetypeId, _row: usize, _tick: Tick) {
         // ()
+    }
+
+    fn needs_drop() -> bool {
+        false
     }
 }
 
@@ -1758,54 +1837,83 @@ mod tests {
 
     #[test]
     fn adaptive_chunk_size_small_world() {
-        // < 100 entities: dynamic_min = 128, но chunk не может быть > entity_count
-        assert_eq!(adaptive_chunk_size(50, 8), 50);   // 50/8=6, min(128,50)=50
-        assert_eq!(adaptive_chunk_size(50, 4), 50);   // 50/4=12, min(128,50)=50
-        assert_eq!(adaptive_chunk_size(1, 8), 1);     // 1/8=0,  min(128,1)=1
-        assert_eq!(adaptive_chunk_size(99, 8), 99);   // 99/8=12, min(128,99)=99
+        let cfg = ChunkConfig::default();
+        // entity_count < min_per_thread * threads → serial fallback (one chunk = entity_count)
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50);   // 50 < 16*8=128 → serial
+        assert_eq!(adaptive_chunk_size(50, 4, &cfg), 50);   // 50 < 16*4=64 → serial
+        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1);     // 1 < 128 → serial
+        assert_eq!(adaptive_chunk_size(99, 8, &cfg), 99);   // 99 < 128 → serial
     }
 
     #[test]
     fn adaptive_chunk_size_medium_world() {
-        // 100..1000 entities: dynamic_min = 32
-        assert_eq!(adaptive_chunk_size(200, 8), 32);   // 200/8=25 < 32 → 32
-        assert_eq!(adaptive_chunk_size(500, 8), 62);   // 500/8=62 >= 32 → 62
-        assert_eq!(adaptive_chunk_size(100, 8), 32);   // 100/8=12 < 32 → 32
+        let cfg = ChunkConfig::default();
+        // entity_count >= threshold → ceil(ec / threads), clamped to [dynamic_min_chunk=64, max]
+        assert_eq!(adaptive_chunk_size(200, 8, &cfg), 64);   // ceil(200/8)=25 < 64 → 64
+        assert_eq!(adaptive_chunk_size(500, 8, &cfg), 64);   // ceil(500/8)=63 < 64 → 64
+        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 100);  // 100 < 128 → serial
     }
 
     #[test]
     fn adaptive_chunk_size_large_world() {
-        // >= 1000 entities: dynamic_min = 64
-        assert_eq!(adaptive_chunk_size(1000, 8), 125);   // 1000/8=125 >= 64 → 125
-        assert_eq!(adaptive_chunk_size(10000, 8), 1250); // 10000/8=1250 → 1250
+        let cfg = ChunkConfig::default();
+        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125);   // ceil(1000/8) = 125
+        assert_eq!(adaptive_chunk_size(10000, 8, &cfg), 1250); // ceil(10000/8) = 1250
     }
 
     #[test]
     fn adaptive_chunk_size_single_thread() {
-        // num_threads = 1 → chunk = entity_count (или dynamic_min, если entity_count мал)
-        assert_eq!(adaptive_chunk_size(50, 1), 50);   // 50/1=50, min(128,50)=50
-        assert_eq!(adaptive_chunk_size(200, 1), 200); // 200 >= 32 → 200
-        assert_eq!(adaptive_chunk_size(1000, 1), 1000); // 1000 >= 64 → 1000
+        let cfg = ChunkConfig::default();
+        assert_eq!(adaptive_chunk_size(50, 1, &cfg), 50);     // ceil(50/1)=50
+        assert_eq!(adaptive_chunk_size(200, 1, &cfg), 200);   // ceil(200/1)=200
+        assert_eq!(adaptive_chunk_size(1000, 1, &cfg), 1000); // ceil(1000/1)=1000
     }
 
     #[test]
     fn adaptive_chunk_size_max_cap() {
-        // chunk не превышает DEFAULT_MAX_CHUNK_SIZE (65536)
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1), DEFAULT_MAX_CHUNK_SIZE);
-        // 8 threads, вдвое больше max: 131072/8=16384 <= 65536 → cap не срабатывает
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8), 16384);
+        let cfg = ChunkConfig::default();
+        // ceil(131072/1) = 131072, capped to max_chunk_size = 65536
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1, &cfg), DEFAULT_MAX_CHUNK_SIZE);
+        // 8 threads, ceil(131072/8) = 16384, no clamp
+        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8, &cfg), 16384);
     }
 
     #[test]
     fn adaptive_chunk_size_transition_points() {
-        // entity_count=99 (<100) → dynamic_min=128, но capped entity_count
-        assert_eq!(adaptive_chunk_size(99, 8), 99);   // min(128,99)=99
-        // entity_count=100 (>=100) → dynamic_min=32
-        assert_eq!(adaptive_chunk_size(100, 8), 32);  // 100/8=12 < 32 → 32
+        let cfg = ChunkConfig::default();
+        // 99 < 128 (16*8) → serial
+        assert_eq!(adaptive_chunk_size(99, 8, &cfg), 99);
+        // 100 < 128 → serial
+        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 100);
+        // 999 >= 128 → ceil(999/8) = 125
+        assert_eq!(adaptive_chunk_size(999, 8, &cfg), 125);
+        // 1000 >= 128 → ceil(1000/8) = 125
+        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125);
+    }
 
-        // entity_count=999 → dynamic_min=32
-        assert_eq!(adaptive_chunk_size(999, 8), 124); // 999/8=124 >= 32 → 124
-        // entity_count=1000 → dynamic_min=64
-        assert_eq!(adaptive_chunk_size(1000, 8), 125); // 1000/8=125 >= 64 → 125
+    #[test]
+    fn chunk_config_no_serial_fallback() {
+        let cfg = ChunkConfig {
+            min_entities_per_thread: 16,
+            dynamic_min_chunk: 1,
+            max_chunk_size: 4096,
+            auto_serial_fallback: false,
+        };
+        // auto_serial_fallback = false → always split into threads chunks
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 7);   // ceil(50/8) = 7
+        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1);    // ceil(1/8) = 1
+    }
+
+    #[test]
+    fn chunk_config_custom_thresholds() {
+        let cfg = ChunkConfig {
+            min_entities_per_thread: 8,
+            dynamic_min_chunk: 1,
+            max_chunk_size: 8192,
+            auto_serial_fallback: true,
+        };
+        // 8 * 8 = 64 threshold
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50);   // 50 < 64 → serial
+        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 13);  // 100 >= 64 → ceil(100/8)=13
     }
 }

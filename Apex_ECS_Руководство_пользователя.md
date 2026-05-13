@@ -48,7 +48,7 @@
 | `apex-graph` | Граф зависимостей: топологическая сортировка, обнаружение циклов |
 | `apex-serialization` | Сериализация мира: WorldSnapshot, snapshot/restore, PrefabManifest, PrefabLoader |
 | `apex-hot-reload` | Горячая перезагрузка: FileWatcher, HotReloadPlugin, PrefabPlugin |
-| `apex-macros` | Процедурные макросы: `#[derive(Scriptable)]` для интеграции с Rhai-скриптингом |
+| `apex-macros` | Процедурные макросы: `#[derive(Component)]` (авторегистрация), `#[derive(Bundle)]` (бандлы без ограничения полей), `#[derive(Scriptable)]` для интеграции с Rhai-скриптингом |
 | `apex-scripting` | Rhai-скриптинг: ScriptEngine, регистрация компонентов/ресурсов/событий, хот-релоад `.rhai`-скриптов |
 | `apex-isolated` | Изолированные ECS-миры: IsolatedWorld, WorldBridge, CloneableBridge |
 
@@ -120,33 +120,36 @@ entity.generation()      // -> u32
 
 ### 2.2 Component
 
-Компонент — это чистые данные без логики. Любой тип, реализующий `Send + Sync + 'static`, автоматически является компонентом.
+Компонент — это чистые данные без логики. Трейт `Component` реализуется автоматически для любого типа
+с `Send + Sync + 'static` (blanket impl). `#[derive(Component)]` добавляет только авторегистрацию —
+ручной `register_component()` не нужен.
 
 ```rust
-// Компонент — просто struct с данными:
-#[derive(Clone, Copy, Debug)]
+use apex_core::prelude::*;
+// `Component` derive доступен из prelude (ре-экспорт из apex_macros).
+// Альтернативно: `use apex_macros::Component;`
+
+// Авторегистрация через #[derive(Component)] — не нужен ручной register_component():
+#[derive(Component, Clone, Copy, Debug)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy)]
-struct Velocity { x: f32, y: f32 }
+// Для сериализации нужен register_component_serde:
+#[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
+struct SaveablePos { x: f32, y: f32 }
+// ... world.register_component_serde::<SaveablePos>(); // ← всё ещё нужен
 
-#[derive(Clone, Copy)]
-struct Health { current: f32, max: f32 }
-
-// Маркерный компонент (ZST — zero-sized type):
-struct Player;
-struct Enemy;
-
-// Регистрация без сериализации:
+// Ручная регистрация (если не используется derive):
 world.register_component::<Position>();
 
-// Регистрация с сериализацией (требует Serialize + Deserialize):
-#[derive(Serialize, Deserialize)]
-struct Position { x: f32, y: f32 }
+// Регистрация с сериализацией:
 world.register_component_serde::<Position>();
 ```
 
-> **Для Rhai-скриптинга** компоненты дополнительно помечаются `#[derive(Scriptable)]` из крейта `apex-macros`. Это автоматически реализует трейты `ScriptableField` для полей и `ScriptableRegistrar` для структуры, позволяя читать/писать компоненты из `.rhai`-скриптов. Подробнее — в разделе [Rhai Scripting](#17-rhai-scripting).
+> **Авторегистрация (v0.1.0):** `#[derive(Component)]` генерирует статический регистратор через `linkme::distributed_slice`. При создании `World::new()` вызывается `ComponentRegistry::register_all_auto()` — все зарегистрированные компоненты готовы к использованию без ручных вызовов. Трейт `Component` реализуется blanket impl для `T: Send + Sync + 'static`.
+>
+> **Сериализация:** `#[derive(Component)]` даёт только базовую регистрацию (без serde-функций). Для компонентов с `Serialize + Deserialize` по-прежнему вызывайте `world.register_component_serde::<T>()` — метод идемпотентен и только добавляет сериализацию.
+>
+> **`linkme`:** Ре-экспортирован через `apex_core::linkme` — не нужно добавлять в `Cargo.toml` отдельно. Ручной вызов `world.register_component::<T>()` остаётся рабочим для динамических компонентов (скриптинг, hot-reload).
 
 ### 2.3 World
 
@@ -157,17 +160,35 @@ use apex_core::prelude::*;
 
 let mut world = World::new();
 
-// Регистрация компонентов
-world.register_component::<Position>();
-world.register_component::<Velocity>();
-world.register_component::<Health>();
+// Компоненты с #[derive(Component)] регистрируются автоматически
+// (иначе — вручную: world.register_component::<Position>())
 
-// Создание entity с набором компонентов (Bundle):
+// Создание entity с набором компонентов — кортеж (Bundle):
 let player = world.spawn((
     Position { x: 0.0, y: 0.0 },
     Velocity { x: 1.0, y: 0.0 },
     Health { current: 100.0, max: 100.0 },
 ));
+
+// #[derive(Bundle)] — именованный бандл (любое число полей, не ограничен 8).
+// Доступен через apex_core::prelude::* или use apex_macros::Bundle:
+#[derive(Bundle)]
+struct PlayerBundle {
+    pos: Position,
+    vel: Velocity,
+    hp: Health,
+    armor: Armor,
+    team: Team,
+    inventory: Inventory,
+}
+let player = world.spawn(PlayerBundle {
+    pos: Position { x: 0.0, y: 0.0 },
+    vel: Velocity { x: 1.0, y: 0.0 },
+    hp: Health { current: 100.0, max: 100.0 },
+    armor: Armor { value: 10.0 },
+    team: Team::Red,
+    inventory: Inventory::default(),
+});
 
 // Пустая entity:
 let marker = world.spawn(());
@@ -460,9 +481,11 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 ### 5.2 Events
 
-События используют двойную буферизацию: `current` (текущий тик, буфер `pending`) и `previous` (прошлый тик, буфер `events`). Вызов `world.tick()` переключает буферы.
+События используют двойную буферизацию: `pending` (куда пишут в текущем тике) и `events` (доступно для чтения, данные предыдущего тика).
 
-Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:33). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
+> **Важно (v0.1.0):** `world.tick()` теперь **только инкрементирует счётчик тика** и не переключает буферы событий. Flush событий выполняет Scheduler после каждого Stage автоматически. При использовании `World` без `Scheduler` нужно вручную вызывать `world.flush_all_events()` после `world.tick()`.
+
+Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:63). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
 
 > **Авторегистрация (v0.1.0):** `world.send_event::<T>()` и `world.try_send_event::<T>()` автоматически регистрируют тип события, если он ещё не был зарегистрирован. Явный вызов `world.add_event::<T>()` больше не требуется для отправки. `EventReader::new()` по-прежнему требует предварительной регистрации через `add_event` или `send_event`.
 
@@ -503,14 +526,18 @@ for ev in reader.iter() {
     }
 } // ← курсор автоматически продвинут
 
-// Переключение буферов (вызывать раз в кадр):
+// Переключение буферов — при использовании Scheduler flush происходит автоматически.
+// Без Scheduler: вызывать world.flush_all_events() после world.tick().
 world.tick();
+world.flush_all_events();   // ← только если НЕ используется Scheduler
 
-// После tick() курсор показывает новые события из предыдущего тика:
+// После flush события из pending стали доступны для чтения:
 for ev in reader.iter() {
     println!("new tick: {:?}", ev);
 }
 ```
+
+> **При использовании Scheduler:** `sched.run(&mut world)` автоматически флашит события после каждого Stage — ручной вызов `flush_all_events()` не нужен. События, отправленные на Stage N, видны на Stage N+1 того же кадра.
 
 #### 5.2.2 Per-reader чтение (низкоуровневое)
 
@@ -632,7 +659,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `advance_reader_by(reader_id, count)` | Ручное продвижение курсора на N событий |
 | `len_pending() -> usize` | Количество событий в буфере записи |
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
-| `update()` | Переключить буферы (вызывается автоматически в `world.tick()`) |
+| `update()` | Переключить буферы: pending → events. Вызывается Scheduler'ом после каждого Stage, либо вручную через `world.flush_all_events()` |
 
 **`EventWriter<T>`** (доступен через `ctx.event_writer::<T>()`):
 
@@ -694,7 +721,7 @@ delayed.send_delayed("boom", 3, world.current_tick().0);  // взрыв чере
 // Перенести готовые события в основную очередь:
 delayed.flush_delayed(world.current_tick().0, world.events_mut::<&str>());
 
-// события теперь в pending — станут доступны после world.tick()
+// события теперь в pending — станут доступны после flush_all_events() (или Scheduler.run())
 ```
 
 | Метод | Описание |
@@ -730,7 +757,7 @@ queue.send_batch_sync((0..100).map(|i| DamageEvent { target: e, amount: i as f32
 | `send_batch_sync(&self, events)` | Thread-safe пакетная отправка (один lock) |
 | `flush_sync(&mut self)` | Слить `sync_pending` в основной `pending` |
 
-> **Примечание:** `update()` (вызывается `world.tick()`) автоматически вызывает `flush_sync()`. Ручной вызов нужен только если требуется прочитать события до следующего тика.
+> **Примечание:** `update()` вызывается Scheduler'ом после каждого Stage (или через `world.flush_all_events()`). Ручной вызов `flush_sync()` нужен только если требуется прочитать события до следующего flush.
 
 ### 5.3 Event Pipeline — конвейерная обработка событий
 
@@ -803,18 +830,20 @@ if let Err(errors) = result {
 
 #### 5.3.5 Особенности double-buffered events
 
-Конвейер управляет **порядком выполнения**, а не потоком данных. Двойная буферизация событий означает, что `event_writer` пишет в текущий буфер, а `event_reader` читает из предыдущего. Поэтому:
+Конвейер управляет **порядком выполнения**, а не потоком данных. Начиная с v0.1.0, flush событий происходит после каждого Stage (через `world.flush_events_by_type()`), что означает: события, отправленные на Stage N, видны на Stage N+1 **того же кадра** (без задержки в 1 тик).
 
+При этом:
 - Трансформер может модифицировать **компоненты** — изменения видны консьюмерам того же кадра
-- Трансформер может перевыпускать события — консьюмеры увидят их **на следующем кадре**
+- Трансформер может перевыпускать события — консьюмеры **следующего Stage** увидят их в том же кадре
 - Два `consumed_by` без компонентных конфликтов выполняются параллельно
 
 ```text
-Кадр N:    Collision пишет → буфер A
-Кадр N+1:  tick → буфер A → prev. Armor читает ← prev. Health читает ← prev.
-           Armor пишет в Health (компонент) Health видит изменения (тот же кадр)
-           Armor пишет событие → буфер B
-Кадр N+2:  tick → буфер B → prev. Sound читает ← Armor-события
+Кадр N:
+  Stage 0 (Collision): Emit<Damage> → pending
+  flush → DamageEvent в events
+  Stage 1 (Armor):     Listen<Damage> + Emit<Damage_reduced> → pending
+  flush → Damage_reduced в events
+  Stage 2 (Health, Sound): Listen<Damage> + Listen<Damage_reduced> → чтение из events
 ```
 
 ---
@@ -1006,6 +1035,13 @@ sched.add_auto_system("damage_apply", damage_apply);
 sched.add_auto_system("health_clamp", HealthClampSystem);
 sched.add_auto_system("despawn_dead", despawn_dead);
 sched.add_auto_system("movement",    MovementSystem);
+
+// Компиляция расписания:
+sched.compile().unwrap();
+
+// Игровой цикл (v0.1.0 — tick() только инкрементирует, flush в sched.run()):
+world.tick();
+sched.run(&mut world);   // ← автоматически флашит события после каждого Stage
 sched.add_auto_system("stats_update", stats_update);
 
 // Явное упорядочивание (рекомендуется):

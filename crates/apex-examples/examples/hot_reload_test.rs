@@ -531,8 +531,9 @@ fn run() {
     engine.set_active("emit").expect("set_active emit");
     engine.run(0.016, &mut world);
 
-    // tick() перемещает pending → events, делая события доступными через курсор
+    // tick() инкрементирует тик, flush_all_events() перемещает pending → events
     world.tick();
+    world.flush_all_events();
 
     // Проверяем что событие дошло (читаем через курсор)
     let count = world.events::<PlayerDied>().iter(&event_cursor).len();

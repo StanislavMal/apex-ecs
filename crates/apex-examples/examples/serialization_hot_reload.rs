@@ -10,6 +10,7 @@
 //! - Entity remapping после restore
 //! cargo run --example serialization_hot_reload --release
 use apex_core::prelude::*;
+use apex_macros::Component;
 use apex_serialization::{SaveFormat, WorldDiff, WorldSerializer};
 use apex_hot_reload::HotReloadPlugin;
 
@@ -17,19 +18,20 @@ use serde::{Deserialize, Serialize};
 
 // ── Компоненты ─────────────────────────────────────────────────
 //
-// Serializable = Component + Serialize + Deserialize
-// Достаточно добавить derive — регистрация через register_component_serde::<T>()
+// Component provide basic registration; register_component_serde adds serialization.
+// Both are needed for serializable components.
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
 struct Velocity { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
 struct Health { current: f32, max: f32 }
 
 // Non-serializable — runtime данные, не сохраняются
+#[derive(Component)]
 struct RenderHandle(u64);
 
 // ── Конфиг (hot reload target) ─────────────────────────────────
@@ -48,9 +50,6 @@ fn main() {
     // ── 1. Настройка мира ──────────────────────────────────────
 
     let mut world = World::new();
-
-    // Регистрируем компоненты БЕЗ сериализации — runtime only
-    world.register_component::<RenderHandle>();
 
     // Регистрируем компоненты С сериализацией — попадут в снэпшот
     world.register_component_serde::<Position>();
@@ -169,7 +168,6 @@ fn main() {
     // ── 4. Serialization: restore ──────────────────────────────
 
     let mut world2 = World::new();
-    world2.register_component::<RenderHandle>();
     world2.register_component_serde::<Position>();
     world2.register_component_serde::<Velocity>();
     world2.register_component_serde::<Health>();

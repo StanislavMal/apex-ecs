@@ -20,20 +20,21 @@
 //! cargo run -p apex-examples --example event_pipeline --release
 
 use apex_core::prelude::*;
+use apex_macros::Component;
 use apex_scheduler::Scheduler;
 
 // ── Компоненты ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Collider;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Health {
     current: f32,
     max: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Armor(f32);
 
 // ── Событие ────────────────────────────────────────────────────
@@ -151,9 +152,6 @@ fn main() {
               поэтому изменения видны HealthSystem в том же кадре.\n");
 
     let mut world = World::new();
-    world.register_component::<Collider>();
-    world.register_component::<Health>();
-    world.register_component::<Armor>();
     world.add_event::<DamageEvent>();
 
     // Два персонажа: игрок с бронёй, враг без брони

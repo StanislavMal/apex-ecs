@@ -17,3 +17,6 @@ smallvec.workspace    = true
 thiserror.workspace   = true
 log.workspace         = true
 rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+apex-macros = { path = "../apex-macros" }

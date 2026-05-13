@@ -6,9 +6,11 @@
 //!   `pending` (куда пишут в текущем тике) и `events` (доступно для чтения).
 //! - [`EventCursor`] — лёгкий дескриптор читателя. Каждый читатель
 //!   регистрирует свой курсор и двигает его по мере чтения.
-//! - После вызова [`update()`](Events::update) (в конце тика) буферы
-//!   меняются местами: `pending` → `events`, а старые события из `events`
+//! - После вызова [`update()`](Events::update) буферы меняются местами:
+//!   `pending` → `events`, а старые события из `events`
 //!   удаляются (если все читатели их прочитали).
+//! - `update()` вызывается Scheduler'ом после каждого Stage
+//!   или вручную через [`World::flush_all_events`].
 //! - [`EntityEvent<T>`] — событие, адресованное конкретной сущности.
 //! - [`DelayedQueue<T>`] — отложенная доставка событий через N тиков.
 //!   Реализована через `BinaryHeap` для O(log N) вставки и O(K log N) flush.
@@ -75,6 +77,10 @@ pub struct Events<T> {
     next_cursor_id: u32,
     /// Список освобождённых EventCursor ID для O(1) переиспользования.
     free_list: Vec<EventCursor>,
+    /// Число активных читателей, у которых позиция курсора < events.len().
+    /// Инвариант: lagging_count == cursors.iter().flatten().filter(|&&p| p < events.len()).count()
+    /// Используется для O(1) проверки в `all_readers_caught_up()`.
+    lagging_count: u32,
 }
 
 impl<T> Events<T> {
@@ -86,6 +92,7 @@ impl<T> Events<T> {
             cursors: Vec::new(),
             next_cursor_id: 0,
             free_list: Vec::new(),
+            lagging_count: 0,
         }
     }
 
@@ -158,12 +165,20 @@ impl<T> Events<T> {
             if idx < self.cursors.len() {
                 self.cursors[idx] = Some(0);
             }
+            if !self.events.is_empty() {
+                self.lagging_count += 1;
+            }
+            self.assert_lagging_invariant();
             return cursor;
         }
 
         let id = self.next_cursor_id;
         self.next_cursor_id += 1;
         self.cursors.push(Some(0));
+        if !self.events.is_empty() {
+            self.lagging_count += 1;
+        }
+        self.assert_lagging_invariant();
         EventCursor(id)
     }
 
@@ -174,6 +189,11 @@ impl<T> Events<T> {
     pub fn remove_reader(&mut self, reader_id: EventCursor) {
         let idx = reader_id.0 as usize;
         if idx < self.cursors.len() {
+            if let Some(pos) = self.cursors[idx] {
+                if (pos as usize) < self.events.len() {
+                    self.lagging_count = self.lagging_count.saturating_sub(1);
+                }
+            }
             self.cursors[idx] = None;
             self.free_list.push(reader_id);
         }
@@ -188,6 +208,7 @@ impl<T> Events<T> {
             }
             self.cursors.pop();
         }
+        self.assert_lagging_invariant();
     }
 
     /// Количество активных читателей.
@@ -206,7 +227,7 @@ impl<T> Events<T> {
 
     /// Обновить буферы: переместить `pending` в `events`.
     ///
-    /// Вызывается автоматически в `world.tick()`.
+    /// Вызывается Scheduler'ом после каждого Stage или вручную через [`World::flush_all_events`].
     /// Если все читатели прочитали предыдущие события, буфер `events`
     /// очищается перед загрузкой нового. Если не все читатели догнали —
     /// старые события дописываются в конец нового буфера, чтобы
@@ -219,6 +240,7 @@ impl<T> Events<T> {
 
         // Ранний выход: если оба буфера пусты — нечего свопать
         if self.events.is_empty() && self.pending.is_empty() {
+            self.assert_lagging_invariant();
             return;
         }
         let all_read = self.all_readers_caught_up();
@@ -258,6 +280,15 @@ impl<T> Events<T> {
             // чтобы следующий tick не аллоцировал с нуля
             self.pending.reserve(pending_cap.min(256));
         }
+
+        // Пересчитываем lagging_count для нового состояния событий
+        let new_event_len = self.events.len() as u32;
+        self.lagging_count = self.cursors.iter()
+            .flatten()
+            .filter(|&&pos| pos < new_event_len)
+            .count() as u32;
+
+        self.assert_lagging_invariant();
     }
 
     /// Итерация по непрочитанным событиям из буфера `events`.
@@ -280,8 +311,13 @@ impl<T> Events<T> {
     #[inline]
     pub fn advance_reader_mut(&mut self, reader_id: &EventCursor) {
         let idx = reader_id.0 as usize;
+        let event_len = self.events.len() as u32;
         if let Some(Some(pos)) = self.cursors.get_mut(idx) {
-            *pos = self.events.len() as u32;
+            let old_pos = *pos;
+            if old_pos < event_len {
+                self.lagging_count = self.lagging_count.saturating_sub(1);
+            }
+            *pos = event_len;
         }
     }
 
@@ -292,9 +328,14 @@ impl<T> Events<T> {
     #[inline]
     pub fn advance_reader_by(&mut self, reader_id: &EventCursor, count: usize) {
         let idx = reader_id.0 as usize;
+        let event_len = self.events.len() as u32;
         if let Some(Some(pos)) = self.cursors.get_mut(idx) {
-            let new_pos = (*pos as usize).saturating_add(count).min(self.events.len());
-            *pos = new_pos as u32;
+            let old_pos = *pos;
+            let new_pos = (old_pos as usize).saturating_add(count).min(self.events.len()) as u32;
+            if old_pos < event_len && new_pos >= event_len {
+                self.lagging_count = self.lagging_count.saturating_sub(1);
+            }
+            *pos = new_pos;
         }
     }
 
@@ -392,14 +433,29 @@ impl<T> Events<T> {
                 *pos = 0;
             }
         }
+        self.lagging_count = 0;
     }
 
+    /// Debug-assertion: проверяет инвариант lagging_count.
+    #[cfg(debug_assertions)]
+    fn assert_lagging_invariant(&self) {
+        let event_len = self.events.len() as u32;
+        let actual = self.cursors.iter()
+            .flatten()
+            .filter(|&&pos| pos < event_len)
+            .count() as u32;
+        assert_eq!(
+            self.lagging_count, actual,
+            "lagging_count invariant violated: stored={}, actual={}",
+            self.lagging_count, actual
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn assert_lagging_invariant(&self) {}
+
     fn all_readers_caught_up(&self) -> bool {
-        let total = self.events.len() as u32;
-        self.cursors.iter().all(|c| match c {
-            Some(pos) => *pos >= total,
-            None => true, // удалённые читатели не учитываем
-        })
+        self.lagging_count == 0
     }
 }
 
@@ -888,6 +944,27 @@ impl EventRegistry {
         }
     }
 
+    /// Flush конкретных типов событий (по TypeId).
+    /// Используется Scheduler для per-Stage flush.
+    pub fn flush_by_type_id(&mut self, type_ids: &[TypeId]) {
+        for tid in type_ids {
+            if let Some(queue) = self.queues.get_mut(tid) {
+                queue.update();
+            }
+        }
+    }
+
+    /// Flush всех очередей событий.
+    /// Используется при работе без Scheduler.
+    pub fn flush_all(&mut self) {
+        self.update_all();
+    }
+
+    /// Получить мутабельный доступ к очереди по TypeId.
+    pub fn get_mut_by_typeid(&mut self, type_id: TypeId) -> Option<&mut dyn AnyEventQueue> {
+        self.queues.get_mut(&type_id).map(|q| &mut **q)
+    }
+
     /// Проверить, зарегистрирован ли тип события.
     pub fn is_registered<T: Send + Sync + 'static>(&self) -> bool {
         self.queues.contains_key(&TypeId::of::<T>())
@@ -1259,6 +1336,7 @@ mod tests {
         world.send_event("auto-registered".to_string());
 
         world.tick();
+        world.flush_all_events();
         let queue = world.events::<String>();
         assert_eq!(queue.len_readable(), 1, "Событие должно быть доступно после tick()");
     }
@@ -1270,6 +1348,7 @@ mod tests {
         let mut world = World::new();
         assert!(world.try_send_event(42u32), "try_send_event должен вернуть true");
         world.tick();
+        world.flush_all_events();
         let queue = world.events::<u32>();
         assert_eq!(queue.len_readable(), 1);
     }

@@ -117,6 +117,21 @@ impl Column {
         self.len += 1;
     }
 
+    /// Записать типизированное значение в колонку по заданной строке и инкрементировать `len`.
+    ///
+    /// Используется derive-макросом [`#[derive(Bundle)]`](apex_macros::Bundle) для записи
+    /// компонентов в архетип.
+    ///
+    /// # Safety
+    /// Вызывающий гарантирует что `T` соответствует `self.component_id`,
+    /// а `row == self.len` (запись всегда в конец колонки).
+    #[inline]
+    pub unsafe fn write_typed_at<T>(&mut self, value: T, row: usize, tick: Tick) {
+        debug_assert!(row == self.len, "write_typed_at: row {} != len {}", row, self.len);
+        self.push(&value as *const T as *const u8, tick);
+        std::mem::forget(value);
+    }
+
     /// Записать элемент в уже существующую строку, обновить тик
     pub unsafe fn write_at(&mut self, row: usize, src: *const u8, tick: Tick) {
         if self.item_size > 0 {
@@ -266,8 +281,8 @@ impl Drop for Column {
 pub struct Archetype {
     pub id: ArchetypeId,
     pub component_ids: SmallVec<[ComponentId; 8]>,
-    pub(crate) columns: Vec<Column>,
-    pub(crate) entities: Vec<Entity>,
+    pub columns: Vec<Column>,
+    pub entities: Vec<Entity>,
     column_map: FxHashMap<ComponentId, usize>,
     pub add_edges: FxHashMap<ComponentId, ArchetypeId>,
     pub remove_edges: FxHashMap<ComponentId, ArchetypeId>,

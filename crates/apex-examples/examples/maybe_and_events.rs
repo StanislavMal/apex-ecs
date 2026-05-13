@@ -126,8 +126,9 @@ fn main() {
     assert!(world.try_send_event(ScoreEvent(200)));
     println!("  ✓ try_send_event — всегда true");
 
-    // Читаем события (world.tick() продвигает буферы)
+    // Читаем события (world.tick() инкрементирует тик, flush_all_events() продвигает буферы)
     world.tick();
+    world.flush_all_events();
 
     // Доступ к событиям — как обычно
     let score_events = world.events::<ScoreEvent>();
@@ -180,6 +181,7 @@ fn main() {
         world.send_event(PowerupEvent(i));
     }
     world.tick();
+    world.flush_all_events();
 
     let total = world.events::<PowerupEvent>().len_readable();
     println!("  Событий в буфере: {}", total);
@@ -216,6 +218,7 @@ fn main() {
     delayed.flush_delayed(1, world.events_mut::<&str>());
     println!("  После flush(1): pending={}", world.events_mut::<&str>().len_pending());
     world.tick();
+    world.flush_all_events();
     {
         let ev = world.events::<&str>().iter(&str_cursor);
         println!("  Прочитано в тик 1: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
@@ -228,6 +231,7 @@ fn main() {
     delayed.flush_delayed(2, world.events_mut::<&str>());
     world.events_mut::<&str>().advance_reader_mut(&str_cursor);
     world.tick();
+    world.flush_all_events();
     {
         let ev = world.events::<&str>().iter(&str_cursor);
         println!("  Прочитано в тик 2: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
@@ -253,8 +257,9 @@ fn main() {
     world.events_mut::<i32>().flush_sync();
     println!("  После flush_sync: pending={}", world.events_mut::<i32>().len_pending());
 
-    // После update доступны для чтения
+    // После flush доступны для чтения
     world.tick();
+    world.flush_all_events();
     {
         let ev = world.events::<i32>().iter(&sync_cursor);
         let vals: Vec<_> = ev.iter().copied().collect();

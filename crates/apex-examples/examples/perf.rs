@@ -5,18 +5,19 @@
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
 use apex_core::access_desc;
+use apex_macros::Component;
 use apex_scheduler::{Scheduler, SystemId};
 
 // ── Компоненты ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy)] struct Position    { x: f32, y: f32, z: f32 }
-#[derive(Clone, Copy)] struct Velocity    { x: f32, y: f32, z: f32 }
-#[derive(Clone, Copy)] struct Health      { current: f32, max: f32  }
-#[derive(Clone, Copy)] struct Mass(f32);
-#[derive(Clone, Copy)] struct Player;
-#[derive(Clone, Copy)] struct Enemy;
-#[derive(Clone, Copy)] struct Temperature(f32);
-#[derive(Clone, Copy)] struct Mana        { current: f32, max: f32  }
+#[derive(Component, Clone, Copy)] struct Position    { x: f32, y: f32, z: f32 }
+#[derive(Component, Clone, Copy)] struct Velocity    { x: f32, y: f32, z: f32 }
+#[derive(Component, Clone, Copy)] struct Health      { current: f32, max: f32  }
+#[derive(Component, Clone, Copy)] struct Mass(f32);
+#[derive(Component, Clone, Copy)] struct Player;
+#[derive(Component, Clone, Copy)] struct Enemy;
+#[derive(Component, Clone, Copy)] struct Temperature(f32);
+#[derive(Component, Clone, Copy)] struct Mana        { current: f32, max: f32  }
 
 #[derive(Clone, Copy)] struct PhysicsConfig  { gravity: f32, dt: f32 }
 #[derive(Clone, Copy, Default)]
@@ -124,9 +125,6 @@ where
 
 fn make_world_3comp(n: usize) -> World {
     let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
     world.spawn_many_silent(n, |i| {
         let f = i as f32;
         (
@@ -149,11 +147,6 @@ fn make_world_3comp_with_entities(n: usize) -> (World, Vec<Entity>) {
 
 fn make_world_5comp(n: usize) -> World {
     let mut world = World::new();
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world.register_component::<Temperature>();
-    world.register_component::<Mana>();
     world.spawn_many_silent(n, |i| {
         let f = i as f32;
         (
@@ -301,9 +294,9 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Position>();
-            world.register_component::<Velocity>();
-            world.register_component::<Health>();
+
+
+
             for i in 0..n * 1000 {
                 let f = i as f32;
                 world.spawn((
@@ -322,9 +315,9 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Position>();
-            world.register_component::<Velocity>();
-            world.register_component::<Health>();
+
+
+
             let v = world.spawn_many(n * 1000, |i| {
                 let f = i as f32;
                 (
@@ -344,9 +337,9 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Position>();
-            world.register_component::<Velocity>();
-            world.register_component::<Health>();
+
+
+
             world.spawn_many_silent(n * 1000, |i| {
                 let f = i as f32;
                 (
@@ -365,7 +358,7 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Position>();
+
             world.spawn_many_silent(n * 1000, |i| {
                 (Position { x: i as f32, y: 0.0, z: 0.0 },)
             });
@@ -379,10 +372,10 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Position>();
-            world.register_component::<Velocity>();
-            world.register_component::<Health>();
-            world.register_component::<Mass>();
+
+
+
+
             world.spawn_many_silent(n * 1000, |i| {
                 let f = i as f32;
                 (
@@ -402,7 +395,7 @@ fn bench_batch_allocator(n: usize) {
         || (),
         |()| {
             let mut world = World::new();
-            world.register_component::<Player>();
+
             world.spawn_many_silent(n * 1000, |_| (Player,));
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
@@ -423,7 +416,7 @@ fn bench_has_relation(n: usize) {
         let parent_count = n * 100;
         let children_per = 8usize;
         let mut world    = World::new();
-        world.register_component::<Position>();
+
 
         let parents: Vec<Entity> = (0..parent_count)
             .map(|i| world.spawn((Position { x: i as f32, y: 0.0, z: 0.0 },)))
@@ -857,6 +850,7 @@ fn bench_events(n: usize) {
                 world.send_event(DamageEvent { target_id: i as u32, amount: 10.0 });
             }
             world.tick();
+            world.flush_all_events();
             let mut sum = 0.0f32;
             for ev in world.events::<DamageEvent>().iter(&cursor) { sum += ev.amount; }
             std::hint::black_box(sum);
@@ -877,27 +871,11 @@ fn bench_events(n: usize) {
                 world.send_event(DamageEvent { target_id: i as u32, amount: 5.0 });
             }
             world.tick();
+            world.flush_all_events();
             let mut sum = 0.0f32;
             for ev in world.events::<DamageEvent>().iter(&cursor) { sum += ev.amount; }
             std::hint::black_box(sum);
             (n * 1000) as u64
-        },
-    );
-
-    bench_with_setup(
-        &format!("send_batch            ({n}k)"),
-        || {
-            let mut w = World::new();
-            w.add_event::<CollisionEvent>();
-            w
-        },
-        |mut world: World| {
-            world.events_mut::<CollisionEvent>().send_batch(
-                (0..n * 1000).map(|i| CollisionEvent { a: i as u32, b: (i + 1) as u32 })
-            );
-            let len = world.events::<CollisionEvent>().len_pending();
-            std::hint::black_box(len);
-            len as u64
         },
     );
 }
@@ -956,7 +934,7 @@ fn bench_query(n: usize) {
         || {
             // Мир с Player-entity — чтобы архетип существовал, но был отдельным
             let mut world = make_world_3comp(n * 1000);
-            world.register_component::<Player>();
+
             // Добавляем несколько Player-entity в отдельный архетип
             // (не совпадающий с запросом Read<Position> + With<Player>
             //  потому что у них нет Position)
@@ -990,9 +968,9 @@ fn bench_structural(n: usize) {
         || {
             // setup: спавн без Mass
             let mut world = World::new();
-            world.register_component::<Position>();
-            world.register_component::<Velocity>();
-            world.register_component::<Mass>();
+
+
+
             let mut entities = Vec::with_capacity(n * 1000);
             for i in 0..n * 1000 {
                 let e = world.spawn((
@@ -1134,10 +1112,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     let make_isolated_world = |n: usize| {
         let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Velocity>();
-        world.register_component::<Temperature>();
-        world.register_component::<Mana>();
+
+
+
+
 
         // Архетип A: только Pos + Vel (для HeavyPhysSys)
         world.spawn_many_silent(n, |i| {
@@ -1353,18 +1331,18 @@ fn bench_parallel_scheduler(n: usize) {
     println!("\n  --- Максимальный межсистемный параллелизм: 12 систем × 1 компонент ---");
 
     // ── 12 уникальных компонентов ─────────────────────────────
-    struct C0(f32);
-    struct C1(f32);
-    struct C2(f32);
-    struct C3(f32);
-    struct C4(f32);
-    struct C5(f32);
-    struct C6(f32);
-    struct C7(f32);
-    struct C8(f32);
-    struct C9(f32);
-    struct C10(f32);
-    struct C11(f32);
+    #[derive(Component, Clone, Copy)] struct C0(f32);
+    #[derive(Component, Clone, Copy)] struct C1(f32);
+    #[derive(Component, Clone, Copy)] struct C2(f32);
+    #[derive(Component, Clone, Copy)] struct C3(f32);
+    #[derive(Component, Clone, Copy)] struct C4(f32);
+    #[derive(Component, Clone, Copy)] struct C5(f32);
+    #[derive(Component, Clone, Copy)] struct C6(f32);
+    #[derive(Component, Clone, Copy)] struct C7(f32);
+    #[derive(Component, Clone, Copy)] struct C8(f32);
+    #[derive(Component, Clone, Copy)] struct C9(f32);
+    #[derive(Component, Clone, Copy)] struct C10(f32);
+    #[derive(Component, Clone, Copy)] struct C11(f32);
 
     // ── 12 систем, каждая пишет в свой компонент ──────────────
     macro_rules! make_solo_sys {
@@ -1399,18 +1377,18 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Мир с 12 архетипами, по одному компоненту в каждом ────
     let make_12arch_world = |n: usize| {
         let mut world = World::new();
-        world.register_component::<C0>();
-        world.register_component::<C1>();
-        world.register_component::<C2>();
-        world.register_component::<C3>();
-        world.register_component::<C4>();
-        world.register_component::<C5>();
-        world.register_component::<C6>();
-        world.register_component::<C7>();
-        world.register_component::<C8>();
-        world.register_component::<C9>();
-        world.register_component::<C10>();
-        world.register_component::<C11>();
+
+
+
+
+
+
+
+
+
+
+
+
 
         world.spawn_many_silent(n, |i| (C0(i as f32),));
         world.spawn_many_silent(n, |i| (C1(i as f32),));
@@ -1557,12 +1535,12 @@ fn bench_intra_system_parallel(n: usize) {
     let make_multiarch = || {
         let quarter = n * 25;
         let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Velocity>();
-        world.register_component::<Health>();
-        world.register_component::<Mass>();
-        world.register_component::<Player>();
-        world.register_component::<Enemy>();
+
+
+
+
+
+
 
         world.spawn_many_silent(quarter, |i| {
             let f = i as f32;

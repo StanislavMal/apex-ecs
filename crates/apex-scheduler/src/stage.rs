@@ -1,4 +1,5 @@
 use crate::SystemId;
+use std::any::TypeId;
 use std::fmt;
 
 /// Метка этапа выполнения (Bevy-подобные именованные фазы).
@@ -89,11 +90,14 @@ pub struct Stage {
     /// True если все системы этого Stage — ParSystem без конфликтов.
     /// False если хотя бы одна Sequential система присутствует.
     pub(crate) all_parallel: bool,
+    /// TypeId событий, которые системы этого Stage могут писать (emit).
+    /// После выполнения Stage вызывается per-Stage flush именно этих типов.
+    pub(crate) emit_event_types: Vec<TypeId>,
 }
 
 impl Stage {
     pub fn new(label: StageLabel, system_ids: Vec<SystemId>, all_parallel: bool) -> Self {
-        Self { label, system_ids, all_parallel }
+        Self { label, system_ids, all_parallel, emit_event_types: Vec::new() }
     }
 
     /// Можно ли запускать системы этого Stage параллельно?

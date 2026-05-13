@@ -16,7 +16,8 @@ pub mod transform;
 pub mod world;
 
 pub use access::AccessDescriptor;
-pub use component::{Component, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
+pub use apex_macros::Component;
+pub use component::{Component as ComponentTrait, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
 pub use entity::Entity;
 pub use events::{Events, EventRegistry, EventCursor, DelayedQueue, PartialReadGuard, PeekGuard};
 pub use resources::Resources;
@@ -25,6 +26,7 @@ pub use world::{World, Bundle, CachedQuery, ParallelWorld, SystemContext};
 pub use query::{Query, Read, Write, With, Without, Changed, Maybe, MaybeWrite, WorldQuery};
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns};
+pub use linkme;  // re-exported for #[derive(Component)] macro
 pub use system_param::{
     Res, ResMut, EventReader, EventWriter,
     ResRead, ResWrite, Listen, Emit,
@@ -34,7 +36,7 @@ pub use system_param::{
 
 pub mod prelude {
     pub use crate::access::AccessDescriptor;
-    pub use crate::component::{Component, Tick, Serializable};
+    pub use crate::component::{Component as ComponentTrait, Tick, Serializable};
     pub use crate::entity::Entity;
     pub use crate::events::{Events, EventCursor, DelayedQueue, PartialReadGuard, PeekGuard};
     pub use crate::resources::Resources;
@@ -49,4 +51,5 @@ pub mod prelude {
     };
     pub use crate::template::{TemplateParams, EntityTemplate, TemplateParam};
     pub use crate::impl_entity_template;
+    pub use crate::Component;
 }

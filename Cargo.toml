@@ -55,6 +55,9 @@ crossbeam-channel = "0.5"
 # Скриптинг — однопоточный Rhai (без "sync" feature, используем Rc<RefCell>)
 rhai = { version = "1.19", features = ["serde", "sync"] }
 
+# Авторегистрация компонентов через distributed slice
+linkme = "0.3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

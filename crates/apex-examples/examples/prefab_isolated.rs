@@ -316,8 +316,9 @@ fn main() {
     // sync_bridge_cloneable применяет все накопленные сообщения
     sync_bridge_cloneable(&mut world);
 
-    // world.tick() продвигает очереди событий
+    // world.tick() инкрементирует тик, flush_all_events() продвигает очереди событий
     world.tick();
+    world.flush_all_events();
 
     // ── 8. Hierarchy export ─────────────────────────────────────────
 

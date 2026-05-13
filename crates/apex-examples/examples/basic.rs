@@ -12,17 +12,18 @@
 
 use apex_core::prelude::*;
 use apex_core::access_desc;
+use apex_macros::Component;
 use apex_scheduler::{Scheduler, StageLabel};
 
 // ── Компоненты ────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)] struct Position  { x: f32, y: f32 }
-#[derive(Clone, Copy, Debug)] struct Velocity  { x: f32, y: f32 }
-#[derive(Clone, Copy, Debug)] struct Health    { current: f32, max: f32 }
-#[derive(Clone, Copy, Debug)] struct Mass(f32);
-#[derive(Clone, Copy, Debug)] struct Player;
-#[derive(Clone, Copy, Debug)] struct Enemy;
-#[derive(Clone, Copy, Debug)] struct Name(pub &'static str);
+#[derive(Component, Clone, Copy, Debug)] struct Position  { x: f32, y: f32 }
+#[derive(Component, Clone, Copy, Debug)] struct Velocity  { x: f32, y: f32 }
+#[derive(Component, Clone, Copy, Debug)] struct Health    { current: f32, max: f32 }
+#[derive(Component, Clone, Copy, Debug)] struct Mass(f32);
+#[derive(Component, Clone, Copy, Debug)] struct Player;
+#[derive(Component, Clone, Copy, Debug)] struct Enemy;
+#[derive(Component, Clone, Copy, Debug)] struct Name(pub &'static str);
 
 // ── Ресурсы ───────────────────────────────────────────────────
 
@@ -225,14 +226,6 @@ fn main() {
     println!("=== Apex ECS — Basic Example (with Stages) ===\n");
 
     let mut world = World::new();
-
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world.register_component::<Mass>();
-    world.register_component::<Player>();
-    world.register_component::<Enemy>();
-    world.register_component::<Name>();
 
     // ── Scheduler with Stages ────────────────────────────────
     println!("=== Scheduler with Stages ===\n");

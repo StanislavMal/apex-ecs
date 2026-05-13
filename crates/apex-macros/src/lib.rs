@@ -1,5 +1,32 @@
 //! apex-macros — процедурные макросы для Apex ECS.
 //!
+//! # `#[derive(Component)]`
+//!
+//! Добавляет статический регистратор через `linkme::distributed_slice`,
+//! вызываемый при создании `World::new()`. Трейт `Component` реализуется
+//! автоматически (blanket impl).
+//!
+//! ```ignore
+//! #[derive(Component, Debug, Clone)]
+//! struct Position { x: f32, y: f32 }
+//! ```
+//!
+//! # `#[derive(Bundle)]`
+//!
+//! Реализует трейт `Bundle` для struct с именованными полями.
+//! Поддерживает произвольное число полей (без ограничения в 8 компонентов).
+//!
+//! ```ignore
+//! #[derive(Bundle)]
+//! struct PlayerBundle {
+//!     pos: Position,
+//!     vel: Velocity,
+//!     hp: Health,
+//!     team: Team,
+//!     // ... до 16+ полей
+//! }
+//! ```
+//!
 //! # `#[derive(Scriptable)]`
 //!
 //! Генерирует реализацию трейта `ScriptableRegistrar` для struct с именованными полями.
@@ -9,7 +36,6 @@
 //! struct Position { x: f32, y: f32 }
 //! ```
 //!
-//! Генерируется:
 //! - `ScriptableRegistrar::to_dynamic(&self)` — struct → rhai::Map
 //! - `ScriptableRegistrar::from_dynamic(d)` — rhai::Map → struct (Option)
 //! - `ScriptableRegistrar::register_rhai_type(engine)` — конструктор `Position(x, y)` в Rhai
@@ -20,6 +46,122 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{parse_macro_input, DeriveInput, Data, Fields, Type};
+
+// ── Component derive ────────────────────────────────────────────
+
+/// `#[derive(Component)]` — авторегистрация через `linkme::distributed_slice`.
+///
+/// Генерирует статический регистратор в `COMPONENT_REGISTRARS`, вызываемый
+/// при `World::new()`. Трейт `Component` реализуется автоматически через
+/// blanket impl для `T: Send + Sync + 'static`.
+#[proc_macro_derive(Component)]
+pub fn derive_component(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    let registrar_ident = quote::format_ident!("__COMPONENT_REGISTRAR_{}", name);
+
+    let expanded = quote! {
+        #[allow(non_upper_case_globals)]
+        #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
+        #[linkme(crate = ::apex_core::linkme)]
+        static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
+            |registry: &mut ::apex_core::component::ComponentRegistry| {
+                registry.get_or_register::<#name>();
+            };
+    };
+    expanded.into()
+}
+
+// ── Bundle derive ───────────────────────────────────────────────
+
+/// `#[derive(Bundle)]` — реализует трейт `Bundle` для struct.
+///
+/// Поддерживает struct с именованными полями и произвольное число компонентов
+/// (в отличие от `impl_bundle!`, который ограничен 8).
+#[proc_macro_derive(Bundle)]
+pub fn derive_bundle(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+
+    let fields: Vec<&syn::Field> = match &input.data {
+        Data::Struct(s) => match &s.fields {
+            Fields::Named(n) => n.named.iter().collect(),
+            Fields::Unnamed(u) => u.unnamed.iter().collect(),
+            Fields::Unit => vec![],
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                name,
+                "#[derive(Bundle)] supports only structs",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    let field_count = fields.len();
+
+    let field_accessors: Vec<TokenStream2> = fields.iter().enumerate().map(|(i, f)| {
+        if let Some(ident) = &f.ident {
+            quote! { self.#ident }
+        } else {
+            let idx = syn::Index::from(i);
+            quote! { self.#idx }
+        }
+    }).collect();
+
+    let field_types: Vec<&syn::Type> = fields.iter().map(|f| &f.ty).collect();
+
+    let expanded = quote! {
+        impl ::apex_core::Bundle for #name {
+            fn component_ids(
+                &self,
+                registry: &mut ::apex_core::ComponentRegistry,
+            ) -> ::smallvec::SmallVec<[::apex_core::ComponentId; 8]> {
+                let mut ids: ::smallvec::SmallVec<[::apex_core::ComponentId; 8]> =
+                    ::smallvec::smallvec![
+                        #( registry.get_or_register::<#field_types>() ),*
+                    ];
+                ids.sort_unstable();
+                ids
+            }
+
+            fn write_into(
+                self,
+                world: &mut ::apex_core::World,
+                archetype_id: ::apex_core::ArchetypeId,
+                row: usize,
+                tick: ::apex_core::Tick,
+            ) {
+                let arch_idx = archetype_id.as_usize();
+                let arch = &mut world.archetypes[arch_idx];
+                let mut col_idx = 0usize;
+                #(
+                    {
+                        let cid = world.registry_mut().get_or_register::<#field_types>();
+                        if let Some(ci) = arch.column_index(cid) {
+                            unsafe {
+                                arch.columns[ci].write_typed_at(
+                                    #field_accessors,
+                                    row + col_idx,
+                                    tick,
+                                );
+                            }
+                        }
+                        col_idx += 1;
+                    }
+                )*
+            }
+
+            fn needs_drop() -> bool {
+                false #( || ::std::mem::needs_drop::<#field_types>() )*
+            }
+        }
+    };
+    expanded.into()
+}
+
+// ── Scriptable derive ───────────────────────────────────────────
 
 #[proc_macro_derive(Scriptable)]
 pub fn derive_scriptable(input: TokenStream) -> TokenStream {
@@ -35,7 +177,6 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
     let type_name = ident.to_string();
 
     match &input.data {
-        // ── Struct с именованными полями ────────────────────────
         Data::Struct(s) => match &s.fields {
             Fields::Named(f) => expand_named_struct(ident, &type_name, &f.named),
             Fields::Unnamed(f) => expand_tuple_struct(ident, &type_name, &f.unnamed),
@@ -45,9 +186,7 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
             )),
         },
 
-        // ── C-like enum (варианты без данных) ───────────────────
         Data::Enum(e) => {
-            // Проверяем, что все варианты без полей
             for variant in &e.variants {
                 if !variant.fields.is_empty() {
                     return Err(syn::Error::new_spanned(

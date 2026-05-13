@@ -14,37 +14,38 @@
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
+use apex_macros::Component;
 use apex_scheduler::{Scheduler, AutoSystem, ResRead, ResWrite, Listen, Emit};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОМПОНЕНТЫ
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Position { x: f32, y: f32, z: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Velocity { x: f32, y: f32, z: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Health { current: f32, max: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Mass(f32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Acceleration { x: f32, y: f32, z: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Damage(f32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Cooldown(f32);
 
-#[derive(Clone, Copy, Debug)] struct TagA;
-#[derive(Clone, Copy, Debug)] struct TagB;
-#[derive(Clone, Copy, Debug)] struct TagC;
-#[derive(Clone, Copy, Debug)] struct TagD;
+#[derive(Component, Clone, Copy, Debug)] struct TagA;
+#[derive(Component, Clone, Copy, Debug)] struct TagB;
+#[derive(Component, Clone, Copy, Debug)] struct TagC;
+#[derive(Component, Clone, Copy, Debug)] struct TagD;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // РЕСУРСЫ
@@ -288,20 +289,6 @@ fn measure_scheduler(
     }
 }
 
-fn register_components(world: &mut World) {
-    world.register_component::<Position>();
-    world.register_component::<Velocity>();
-    world.register_component::<Health>();
-    world.register_component::<Mass>();
-    world.register_component::<Acceleration>();
-    world.register_component::<Damage>();
-    world.register_component::<Cooldown>();
-    world.register_component::<TagA>();
-    world.register_component::<TagB>();
-    world.register_component::<TagC>();
-    world.register_component::<TagD>();
-}
-
 fn register_resources_and_events(world: &mut World) {
     world.resources.insert(DeltaTime(0.016));
     world.resources.insert(Gravity(-9.81));
@@ -379,7 +366,6 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
 
         let build_world = |n| {
             let mut world = World::new();
-            register_components(&mut world);
             register_resources_and_events(&mut world);
             for i in 0..n {
                 let f = i as f32;
@@ -460,7 +446,6 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
         // 1 архетип
         {
             let mut world = World::new();
-            register_components(&mut world);
             register_resources_and_events(&mut world);
             for i in 0..n {
                 let f = i as f32;
@@ -484,7 +469,6 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             };
             // PAR
             let mut world2 = World::new();
-            register_components(&mut world2);
             register_resources_and_events(&mut world2);
             for i in 0..n {
                 let f = i as f32;
@@ -504,7 +488,6 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
         // 4 архетипа
         {
             let mut world = World::new();
-            register_components(&mut world);
             register_resources_and_events(&mut world);
             for i in 0..e_per_arch {
                 let f = i as f32;
@@ -537,7 +520,6 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             };
             // PAR
             let mut world2 = World::new();
-            register_components(&mut world2);
             register_resources_and_events(&mut world2);
             for i in 0..e_per_arch {
                 let f = i as f32;
@@ -589,7 +571,7 @@ fn run_event_pipeline() -> Vec<EventResult> {
         let warmup = ticks_measure / 5;
 
         let mut world = World::new();
-        register_components(&mut world);
+
         register_resources_and_events(&mut world);
         for i in 0..n {
             let f = i as f32;
@@ -629,7 +611,7 @@ fn run_full_pipeline() -> Vec<FullPipeResult> {
         let warmup = ticks_measure / 5;
 
         let mut world = World::new();
-        register_components(&mut world);
+
         register_resources_and_events(&mut world);
 
         for i in 0..n {

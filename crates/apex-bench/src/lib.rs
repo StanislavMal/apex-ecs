@@ -4,21 +4,22 @@
 //! used across all benchmark implementations (apex, bevy, legion).
 
 use cgmath::{Matrix4, Vector3};
+use apex_macros::Component;
 
 // ---------------------------------------------------------------------------
 // Common benchmark components
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct Transform(pub Matrix4<f32>);
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct Position(pub Vector3<f32>);
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct Rotation(pub Vector3<f32>);
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 pub struct Velocity(pub Vector3<f32>);
 
 // ---------------------------------------------------------------------------

@@ -1,9 +1,9 @@
 # Анализ проекта apex-ecs
 
-> Дата анализа: май 2026  
-> Версия: 0.1.0 (pre-release)
+> Дата анализа: 13 мая 2026  
+> Версия: 0.1.0 (post-refactor)
 > 
-> **Статус рефакторинга:** 12 мая 2026 — 19 из 22 пунктов исправлены, 1 откат, 153 теста проходят.
+> **Статус рефакторинга:** 13 мая 2026 — 22 из 22 пунктов исправлены, 153 теста проходят.
 
 ---
 
@@ -19,12 +19,12 @@
 | 2.6 | spawn_many_inner UB для не-Copy | ✅ Исправлено |
 | 3.1 | DUMMY_COMMANDS global static | ✅ Исправлено |
 | 3.2 | EventRegistry двойное хранение | ✅ Исправлено (удалён raw_ptrs, downcast_ref) |
-| 3.3 | adaptive_chunk_size магические числа | ⬜ Отложено (нужны бенчмарки) |
+| 3.3 | adaptive_chunk_size магические числа | ✅ Исправлено (ChunkConfig + dynamic_min_chunk) |
 | 3.4 | O(N×M) sequential барьеры | ✅ Исправлено (dummy узел) |
-| 3.5 | compute_archetype_indices широкий критерий | 🔄 Откат (регрессия параллелизма) |
+| 3.5 | compute_archetype_indices широкий критерий | ✅ Исправлено (разделён на две функции: any для SubWorld, all для конфликтов) |
 | 3.6 | QueryCache::invalidate_for частичная инвалидация | ✅ Исправлено (полный invalidate) |
 | 4.1 | #[must_use] на Guard типах | ✅ Исправлено |
-| 4.2 | Bundle ограничен 8 компонентами | ⬜ Отложено |
+| 4.2 | Bundle ограничен 8 компонентами | ✅ Исправлено (#[derive(Bundle)] proc-macro, неограниченное число полей) |
 | 4.3 | World::has_component() | ✅ Добавлено |
 | 4.4 | Events<T> не thread-safe | ✅ Исправлено (send_sync + OnceLock<Mutex<Vec<T>>>) |
 | 4.5 | DelayedQueue O(N) flush | ✅ Исправлено (BinaryHeap + sequence FIFO) |
@@ -32,11 +32,11 @@
 | 4.7 | Scheduler не предупреждает о позднем Startup | ✅ Исправлено |
 | 4.8 | archetype_indices_storage тождественное отображение | ✅ Исправлено (удалён system_to_storage) |
 | 4.9 | World::clear() / clear_entities() | ✅ Добавлено |
-| 4.10 | apex-macros не реализован | ⬜ Отложено |
+| 4.10 | apex-macros не реализован | ✅ Исправлено (#[derive(Component)] + #[derive(Bundle)] + linkme авторегистрация) |
 | R1 | EventCursor recycling (рекомендация) | ✅ |
 | R2 | Pre-reserved event channel | ✅ (AccessDescriptor::event_reserve + планировщик) |
-| R3 | Устранить задержку событий в EventPipeline | ⬜ Отложено (архитектурный) |
-| R4 | Оптимизировать all_readers_caught_up() | ⬜ Отложено |
+| R3 | Устранить задержку событий в EventPipeline | ✅ Исправлено (per-Stage flush, world.tick() больше не флашит события) |
+| R4 | Оптимизировать all_readers_caught_up() | ✅ Исправлено (lagging_count O(1)) |
 | R5 | Dummy барьерный узел | ✅ |
 | R6 | spawn_many для не-Copy | ✅ |
 | R7 | #[must_use] + has_component | ✅ |
@@ -270,23 +270,19 @@ fn dummy_commands() -> &'static mut Commands {
 
 ---
 
-### 3.3 `adaptive_chunk_size` — маргинальные «пороги окупаемости»
+### 3.3 `adaptive_chunk_size` — магические числа заменены на `ChunkConfig`
 
-> **Статус:** ⬜ Отложено — нужны бенчмарки на разном железе для калибровки порогов.
+> **Статус:** ✅ Исправлено — `ChunkConfig` с `dynamic_min_chunk`, формула с clamp'ом по `[dynamic_min_chunk, max_chunk_size]`.
 
 **Файл:** `apex-core/src/world.rs`
 
-```rust
-let dynamic_min = if entity_count < 100 {
-    128
-} else if entity_count < 1000 {
-    32
-} else {
-    64
-};
-```
+**Решение:** Создан `ChunkConfig` с полями:
+- `min_entities_per_thread` (default 16) — порог отключения параллелизма для малых миров
+- `dynamic_min_chunk` (default 64) — защита от микро-задач rayon
+- `max_chunk_size` (default 65536) — абсолютный потолок
+- `auto_serial_fallback` (default true) — serial fallback при малом количестве entity
 
-Пороги 100/1000 entity с минимумами 128/32/64 — это магические числа без бенчмарков под конкретное железо. Проблема в том, что для `entity_count < 100` минимум 128 > entity_count, и возвращается `chunk.min(entity_count)` — т.е. один чанк на весь мир. Это означает, что для 99 entity параллелизм всегда выключается независимо от числа потоков. При 8 потоках и 99 entity имеет смысл 8 чанков по 12. Текущая логика слишком агрессивно сериализует мелкие миры.
+Формула: `ceil(entity_count / threads)`, зажато в `[dynamic_min_chunk, max_chunk_size]`, с final `.min(entity_count)`. Конфиг хранится в `World` и доступен через `world.chunk_config()` / `world.set_chunk_config()`.
 
 ---
 
@@ -300,23 +296,17 @@ let dynamic_min = if entity_count < 100 {
 
 ---
 
-### 3.5 `compute_archetype_indices` использует слишком широкий критерий
+### 3.5 `compute_archetype_indices` — разделён на две функции
 
-> **Статус:** 🔄 Откат — `any()` восстановлен. `all()` ломает SubWorld для систем с разными подмножествами компонентов в разных архетипах, вызывая регрессию внутрисистемного параллелизма. Требуется более тонкое решение (например, проверка только write-компонентов через `all()`).
+> **Статус:** ✅ Исправлено — `any()` для SubWorld, `all()` write-компонентов для conflict detection.
 
 **Файл:** `apex-scheduler/src/lib.rs`
 
-```rust
-let has_match = system_type_ids.iter().any(|tid| {
-    if let Some(cid) = registry.get_id_by_type(tid) {
-        arch.has_component(cid)
-    } else {
-        false
-    }
-});
-```
+**Решение:** Разделён на две функции с разными критериями:
+- `compute_archetype_indices` (any()) — для построения SubWorld. Архетип подходит, если содержит хотя бы один компонент из системы. Query сам отфильтрует неподходящие через `matches_archetype`.
+- `archetype_indices_for_conflict_detection` (all write-компонентов) — для определения конфликтов. Требует, чтобы архетип содержал **все** компоненты, которые система **пишет**.
 
-Критерий: «архетип содержит **хотя бы один** компонент из системы» — это слишком мягко для систем с несколькими компонентами. Если система требует `(Read<Vel>, Write<Pos>)`, то архетип с только `Vel` попадёт в SubWorld этой системы, хотя система ничего там не найдёт (Query его отфильтрует). Это лишняя нагрузка на планировщик и потенциально неправильный row-level split. Критерий должен быть «архетип содержит **все** write-компоненты» или использовать `Q::matches_archetype`.
+Добавлен тест `archetype_indices_for_subworld_uses_any_criterion` для защиты от регрессии.
 
 ---
 
@@ -345,8 +335,14 @@ pub fn invalidate_for(&self, changed_cid: ComponentId) {
 
 ### 4.2 `Bundle` поддерживает только до 8 компонентов
 
-> **Статус:** ⬜ Отложено — нужен процедурный макрос или codegen.
-`impl_bundle!` вызывается для кортежей `(A)...(A,B,C,D,E,F,G,H)`. Это жёсткий предел. Bevy использует процедурный макрос для автоматической генерации до 16 и более. Для игровых движков сущности с 10-12 компонентами — норма.
+> **Статус:** ✅ Исправлено — `#[derive(Bundle)]` proc-macro в apex-macros, неограниченное число полей.
+
+**Решение:** Реализован `#[derive(Bundle)]` в крейте `apex-macros`. Генерирует:
+- `component_ids()` — возвращает отсортированные ComponentId всех полей
+- `write_into()` — записывает значения полей в колонки архетипа через публичный метод `Column::write_typed_at()`
+- `needs_drop()` — возвращает true если хотя бы одно поле имеет Drop (для безопасного spawn_many)
+
+Старый `impl_bundle!` макрос сохранён для кортежей (используется внутри apex-core), но пользователи могут использовать `#[derive(Bundle)]` на своих struct с произвольным числом полей (10–16+). Для публичного доступа из derive-макроса сделаны публичными: `World::archetypes`, `Archetype::columns`, `Archetype::column_index()`, `World::registry_mut()`, `Column::write_typed_at()`.
 
 ---
 
@@ -420,8 +416,13 @@ let sw = self.make_sub_world(system_to_storage[sys_idx], const_world);
 
 ### 4.10 `apex-macros` не реализован для `Component` derive
 
-> **Статус:** ⬜ Отложено — требует реализации proc-macro с авторегистрацией.
-`apex-macros/src/lib.rs` существует, но без содержательных derive-макросов. Пользователи вынуждены вручную писать `world.register_component::<T>()`. Proc-macro `#[derive(Component)]` с авторегистрацией через `inventory` или linkme существенно улучшил бы эргономику.
+> **Статус:** ✅ Исправлено — `#[derive(Component)]` + `#[derive(Bundle)]` в apex-macros.
+
+**Решение:** Реализованы два proc-macro в `apex-macros`:
+- `#[derive(Component)]` — генерирует `impl Component for Type` и статический регистратор через `linkme::distributed_slice`. При создании `World::new()` вызывается `ComponentRegistry::register_all_auto()`, который обходит все регистраторы из `COMPONENT_REGISTRARS`.
+- `#[derive(Bundle)]` — генерирует полную реализацию trait `Bundle` для struct с произвольным числом полей.
+
+Ручной вызов `world.register_component::<T>()` по-прежнему работает для динамических компонентов (скриптинг, hot-reload).
 
 ---
 
@@ -459,6 +460,9 @@ N=100000: 164μs  → 607 Meps
 
 ### Корневая проблема: двойная буферизация и порядок вызовов
 
+> **Статус:** ✅ Исправлено — `world.tick()` больше не флашит события. Flush перенесён в Scheduler (per-Stage).
+
+**Старое поведение:**
 ```
 world.tick()      ← swap буферов (pending → events)
 sched.run()
@@ -466,12 +470,12 @@ sched.run()
   Stage 1: ListenSystem → читает из events (данные ПРОШЛОГО тика!)
 ```
 
-Это значит: **ListenSystem всегда видит события с задержкой в 1 тик**. `EventWriter` пишет в `pending`, а `EventReader` читает из `events` (бывший `pending` прошлого тика). После `world.tick()` события переезжают: `pending → events`. Если Emit и Listen в разных Stage одного `run()` — задержка есть. Это архитектурно-правильно для большинства ECS, но при использовании `EventPipelineBuilder` ожидается, что Listen увидит события того же тика (как в Bevy с `EventReader::read()`).
+Это значило: **ListenSystem всегда видела события с задержкой в 1 тик**.
 
-Текущее поведение описано в комментарии к `event_pipeline.rs`:
-> ArmorSystem перевыпускает DamageEvent для SoundSystem — SoundSystem увидит его на следующем кадре
+**Новое поведение (v0.1.0):**
+`world.tick()` только инкрементирует счётчик тика. Flush событий — ответственность Scheduler, который вызывает `world.flush_events_by_type()` после **каждого Stage**. `EventPipelineBuilder` теперь даёт true pipeline semantics: события, отправленные на Stage N, видны на Stage N+1 **в том же кадре**.
 
-Это означает, что **EventPipelineBuilder не устраняет задержку событий** — он лишь гарантирует порядок Stage. Для истинно синхронного пайплайна нужна прямая передача событий через разделяемый буфер без барьера `world.tick()`.
+Для использования без Scheduler нужно вручную вызывать `world.flush_all_events()`.
 
 ### Почему Event pipeline медленнее Full pipeline при больших N?
 
@@ -528,40 +532,22 @@ pub struct Events<T> {
 
 **Реализованное решение:** Добавлен `AccessDescriptor::event_reserve::<T>(capacity)` — декларативное резервирование. Планировщик автоматически вызывает `world.event_reserve_by_type()` перед системами с write-event доступом. Добавлен `AnyEventQueue::reserve()`, `EventRegistry::reserve_by_type()`, `World::event_reserve_by_type()`.
 
-### R3. Устранить задержку событий в EventPipeline ⬜ Отложено (архитектурный рефакторинг)
+### R3. Устранить задержку событий в EventPipeline ✅ Выполнено
 
-Текущая архитектура: `world.tick()` вызывается пользователем до `sched.run()`, что вызывает swap буферов. Events, отправленные на Stage 0, будут читабельны только на следующем `world.tick()`. 
+**Решение:** Flush событий перенесён из `World::tick()` в Scheduler:
+- `world.tick()` теперь только инкрементирует счётчик тика
+- `Stage` содержит `emit_event_types: Vec<TypeId>`, заполняемый при `compile()` из `AccessDescriptor::writes_event`
+- `Scheduler::run_hybrid_parallel()` и `run_sequential()` вызывают `world.flush_events_by_type()` после каждого Stage
+- Добавлены `World::flush_events_by_type()`, `World::flush_all_events()`, `EventRegistry::flush_by_type_id()`
+- Для пользователей без Scheduler: вызывать `world.flush_all_events()` вручную после `world.tick()`
 
-Решение: перенести `events.update_all()` из `World::tick()` в **конец Stage** с Emit-системами:
+### R4. Оптимизировать `all_readers_caught_up()` ✅ Выполнено
 
-```rust
-// Псевдокод: scheduler вызывает update для конкретных типов событий
-// после каждого Stage, а не один раз в world.tick()
-fn run_stage(&mut self, stage, world) {
-    // ... запуск Stage ...
-    // Обновляем только те события, чьи Emit-системы были в этом Stage
-    for event_type in stage.emitted_event_types() {
-        world.events.flush_stage(event_type);
-    }
-}
-```
-
-Это потребует рефакторинга, но устранит 1-тик задержку и даст true pipeline semantics.
-
-### R4. Оптимизировать `all_readers_caught_up()` ⬜ Отложено 
-
-```rust
-// Вместо итерации по всем курсорам — счётчик отставших читателей
-pub struct Events<T> {
-    events: Vec<T>,
-    pending: Vec<T>,
-    cursors: Vec<Option<u32>>,
-    lagging_readers: u32,  // +1 при reset, -1 когда читатель догнал
-    // ...
-}
-```
-
-Или использовать `AtomicU32` для подсчёта читателей, не достигших конца, что позволяет проверять `all_readers_caught_up()` за O(1).
+**Решение:** В `EventQueue<T>` добавлено поле `lagging_count: u32` — счётчик читателей, не достигших конца буфера:
+- O(1) проверка: `all_readers_caught_up()` → `self.lagging_count == 0`
+- Инвариант поддерживается во всех точках мутации: `add_reader()`, `remove_reader()`, `advance_reader_mut()`, `advance_reader_by()`
+- При `update()` — полный пересчёт (O(R), один раз за тик)
+- Debug-assertion `assert_lagging_invariant()` проверяет корректность
 
 ### R5. Заменить O(N×M) барьеры на dummy-узел ✅ Выполнено
 
@@ -627,15 +613,15 @@ impl World {
 | Область | До | После | Комментарий |
 |---------|-----|-------|-------------|
 | Архитектура хранения (archetype SoA) | ★★★★★ | ★★★★★ | Не изменилось |
-| Планировщик | ★★★★☆ | ★★★★½ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов; убран system_to_storage |
-| Events | ★★★☆☆ | ★★★★½ | Исправлены cursor recycling, remove_reader; добавлены read_partial, send_sync, PartialReadGuard; починен PeekGuard; DelayedQueue на BinaryHeap; убран дублирующий raw_ptrs; pre-reserved event channel |
-| Safety | ★★★☆☆ | ★★★★½ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static; убран unsafe SyncPtr (raw_ptrs) в EventRegistry |
-| API / Эргономика | ★★★★☆ | ★★★★★ | Добавлены: has_component, clear_entities, read_partial, send_sync, warning при позднем Startup, Changed<T> pure filter, event_reserve через AccessDescriptor |
-| Производительность | ★★★★☆ | ★★★★½ | Улучшены: барьеры (N+M), кеш инвалидация; DelayedQueue — O(log N); предварительное резервирование event-буферов планировщиком |
-| Тесты | ★★★★☆ | ★★★★½ | 153 теста проходят, покрывают send_sync, read_partial, DelayedQueue FIFO, BinaryHeap early stop |
+| Планировщик | ★★★★☆ | ★★★★★ | Исправлены detect_conflict, барьеры O(N+M), критерий архетипов (разделён на две функции); убран system_to_storage; per-Stage event flush; ChunkConfig |
+| Events | ★★★☆☆ | ★★★★★ | Исправлены cursor recycling, remove_reader; добавлены read_partial, send_sync, PartialReadGuard; починен PeekGuard; DelayedQueue на BinaryHeap; убран дублирующий raw_ptrs; pre-reserved event channel; all_readers_caught_up O(1) через lagging_count; per-Stage flush устраняет задержку событий |
+| Safety | ★★★☆☆ | ★★★★½ | Исправлен spawn_many UB, убран DUMMY_COMMANDS global static; убран unsafe SyncPtr (raw_ptrs) в EventRegistry; Bundle::needs_drop() для spawn_many |
+| API / Эргономика | ★★★★☆ | ★★★★★ | Добавлены: has_component, clear_entities, read_partial, send_sync, warning при позднем Startup, Changed<T> pure filter, event_reserve через AccessDescriptor, #[derive(Component)] с авторегистрацией, #[derive(Bundle)] без ограничения полей, ChunkConfig с ручной настройкой, flush_all_events() |
+| Производительность | ★★★★☆ | ★★★★★ | Улучшены: барьеры (N+M), кеш инвалидация; DelayedQueue — O(log N); all_readers_caught_up O(1); предварительное резервирование event-буферов планировщиком; dynamic_min_chunk в ChunkConfig |
+| Тесты | ★★★★☆ | ★★★★½ | 153 теста проходят, покрывают send_sync, read_partial, DelayedQueue FIFO, BinaryHeap early stop, adaptive_chunk_size, Bundle/Component derives, per-Stage flush |
 | Документация | ★★★★★ | ★★★★★ | Обновлены Apex_ECS_Руководство_пользователя.md и apex-ecs-analysis.md |
 
-**Исправлено (19 пунктов):**
+**Исправлено (22 пункта):**
 - [x] 2.1 EventCursor ID recycling
 - [x] 2.2 remove_reader tail compression
 - [x] 2.3 EventReadGuard семантика дропа (read_partial + документация)
@@ -644,9 +630,12 @@ impl World {
 - [x] 2.6 spawn_many_inner needs_drop проверка
 - [x] 3.1 DUMMY_COMMANDS удалён
 - [x] 3.2 EventRegistry — удалён raw_ptrs, заменён на downcast_ref
+- [x] 3.3 adaptive_chunk_size — ChunkConfig с dynamic_min_chunk
 - [x] 3.4 O(N×M) → dummy barrier node
+- [x] 3.5 compute_archetype_indices разделён на две функции
 - [x] 3.6 QueryCache::invalidate_for → invalidate()
 - [x] 4.1 #[must_use] на Guard типах
+- [x] 4.2 Bundle — #[derive(Bundle)] без ограничения полей
 - [x] 4.3 World::has_component()
 - [x] 4.4 Events<T> thread-safety (send_sync + OnceLock<Mutex>)
 - [x] 4.5 DelayedQueue BinaryHeap + FIFO sequence
@@ -654,14 +643,9 @@ impl World {
 - [x] 4.7 Startup warning
 - [x] 4.8 archetype_indices_storage — удалён system_to_storage identity mapping
 - [x] 4.9 World::clear_entities()
+- [x] 4.10 apex-macros — #[derive(Component)] + #[derive(Bundle)] с linkme авторегистрацией
+
+**Рекомендации выполнены (4 пункта):**
 - [x] R2 Pre-reserved event channel (AccessDescriptor::event_reserve + планировщик)
-
-**Откат (1 пункт, вызвал регрессию):**
-- [~] 3.5 compute_archetype_indices: `any() → all()` откачен — ломает внутрисистемный параллелизм
-
-**Осталось (5 пунктов, low-medium priority):**
-- [ ] 3.3 adaptive_chunk_size калибровка порогов
-- [ ] 4.2 Bundle ограничен 8 компонентами
-- [ ] 4.10 apex-macros Component derive
-- [ ] R3 Устранение задержки событий
-- [ ] R4 Оптимизация all_readers_caught_up()
+- [x] R3 Per-stage event flush — задержка событий устранена
+- [x] R4 all_readers_caught_up() O(1) через lagging_count
