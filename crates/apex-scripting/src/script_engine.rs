@@ -40,10 +40,7 @@ use std::{
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use rhai::{Dynamic, Engine, AST};
 
-use apex_core::{
-    component::ComponentId,
-    world::World,
-};
+use apex_core::world::World;
 
 use crate::{
     context::{ComponentBinding, ScriptContext, SpawnRequest},
@@ -56,6 +53,7 @@ use crate::{
 
 struct CompiledScript {
     ast:  AST,
+    #[allow(dead_code)]
     path: PathBuf,
 }
 

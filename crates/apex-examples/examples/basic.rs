@@ -31,6 +31,7 @@ use apex_scheduler::{Scheduler, StageLabel};
 struct PhysicsConfig { gravity: f32, dt: f32 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct DeltaTime(f32);
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -122,7 +123,7 @@ impl AutoSystem for MovementSystem {
 
 fn damage_apply(world: &mut World) {
     use apex_core::system_param::EventReader;
-    let mut reader = EventReader::new(world.events_mut::<DamageEvent>());
+    let reader = EventReader::new(world.events_mut::<DamageEvent>());
     let events: Vec<DamageEvent> = reader.iter().to_vec();
 
     let mut deaths = Vec::new();
@@ -139,7 +140,7 @@ fn damage_apply(world: &mut World) {
 
 fn despawn_dead(world: &mut World) {
     use apex_core::system_param::EventReader;
-    let mut reader = EventReader::new(world.events_mut::<DeathEvent>());
+    let reader = EventReader::new(world.events_mut::<DeathEvent>());
     let deaths: Vec<DeathEvent> = reader.iter().to_vec();
 
     if deaths.is_empty() { return; }
@@ -355,7 +356,7 @@ fn main() {
     }
 
     // add_relation_batch — одна операция вместо 100 поштучных add_relation
-    let before = world.entity_count();
+    let _before = world.entity_count();
     world.add_relation_batch(&children, ChildOf, parent);
     println!(
         "add_relation_batch: {} children → parent={} (entities: {})",

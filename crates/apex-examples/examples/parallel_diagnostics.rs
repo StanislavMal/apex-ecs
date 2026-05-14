@@ -28,12 +28,14 @@ struct Position { x: f32, y: f32, z: f32 }
 struct Velocity { x: f32, y: f32, z: f32 }
 
 #[derive(Component, Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct Health { current: f32, max: f32 }
 
 #[derive(Component, Clone, Copy, Debug)]
 struct Mass(f32);
 
 #[derive(Component, Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct Acceleration { x: f32, y: f32, z: f32 }
 
 #[derive(Component, Clone, Copy, Debug)]
@@ -58,6 +60,7 @@ struct DeltaTime(f32);
 struct Gravity(f32);
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct GlobalCounter(u64);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -65,6 +68,7 @@ struct GlobalCounter(u64);
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct DamageEvent { target: Entity, amount: f32 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -138,6 +142,7 @@ impl AutoSystem for MovementWriterSystem {
     }
 }
 
+#[allow(dead_code)]
 struct MovementWriterSystem2;
 impl AutoSystem for MovementWriterSystem2 {
     type Query     = (Write<Position>, Read<Acceleration>);
@@ -188,6 +193,7 @@ impl AutoSystem for DamageListenerSystem {
     }
 }
 
+#[allow(dead_code)]
 struct CounterWriterSystem;
 impl AutoSystem for CounterWriterSystem {
     type Query     = Read<Health>;
@@ -224,6 +230,7 @@ impl AutoSystem for CooldownSystem {
 // Планировщик не будет чанковать её через ASD (избегает oversubscribe).
 // Используйте этот флаг когда ваша система внутренне вызывает par_for_each.
 
+#[allow(dead_code)]
 fn register_par_for_each_demo(sched: &mut Scheduler) {
     use apex_core::access_desc;
     sched.add_par_access(
@@ -244,6 +251,7 @@ fn register_par_for_each_demo(sched: &mut Scheduler) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
+#[allow(dead_code)]
 struct TimedResult {
     label:    String,
     duration: Duration,
@@ -339,6 +347,7 @@ fn table_row(label: &str, n: usize, us: f64, meps: f64, stages: usize) {
         label, n, fmt_dur(us), fmt_meps(meps), stages);
 }
 
+#[allow(dead_code)]
 fn table_sep() {
     println!("├{:─^7}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^12}┼{:─^10}┤",
         "", "", "", "", "", "", "");

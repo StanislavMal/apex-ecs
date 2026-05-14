@@ -57,10 +57,8 @@
 use std::marker::PhantomData;
 use crate::{
     access::AccessDescriptor,
-    entity::Entity,
     events::{EventCursor, Events, EventReadGuard},
-    query::{Query, WorldQuery},
-    world::World,
+    query::WorldQuery,
 };
 
 // ── Res / ResMut ───────────────────────────────────────────────

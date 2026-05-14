@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 /// Apex ECS — Performance Benchmark (corrected v2)
 /// cargo run -p apex-examples --example perf --release
 /// cargo run -p apex-examples --example perf --release --features parallel

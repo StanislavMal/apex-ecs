@@ -180,6 +180,7 @@ impl RelationStorage {
         }
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         match self {
             Self::Sparse(sv) => sv.len(),
@@ -213,6 +214,7 @@ impl SubjectEntry {
     }
 
     #[cold]
+    #[allow(dead_code)]
     fn has_kind_slow(&self, kind_idx: u32) -> bool {
         self.storage.contains_kind(kind_idx)
     }
@@ -653,6 +655,7 @@ impl RelationKind for Likes {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(unused_imports)]
     use crate::prelude::*;
 
     use crate::component::Component;

@@ -32,6 +32,7 @@ struct Health { current: f32, max: f32 }
 
 // Non-serializable — runtime данные, не сохраняются
 #[derive(Component)]
+#[allow(dead_code)]
 struct RenderHandle(u64);
 
 // ── Конфиг (hot reload target) ─────────────────────────────────

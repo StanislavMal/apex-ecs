@@ -435,6 +435,7 @@ mod tests {
     fn template_parent_relation() {
         use crate::relations::ChildOf;
 
+        #[allow(dead_code)]
         struct ChildTemplate;
 
         impl EntityTemplate for ChildTemplate {

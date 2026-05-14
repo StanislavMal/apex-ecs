@@ -1,4 +1,7 @@
-use crate::world::{adaptive_chunk_size, ChunkConfig};
+
+#[cfg(feature = "parallel")]
+use crate::world::{ChunkConfig, adaptive_chunk_size};
+#[cfg(feature = "parallel")]
 use smallvec::SmallVec;
 
 /// Вычислить список чанков `(arch_idx, start, end)` для параллельной итерации.

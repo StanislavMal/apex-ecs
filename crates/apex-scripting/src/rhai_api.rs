@@ -20,7 +20,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rhai::{Dynamic, Engine, EvalAltResult};
+use rhai::{Dynamic, Engine};
 
 use crate::{
     context::ScriptContext,

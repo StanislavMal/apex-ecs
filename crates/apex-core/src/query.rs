@@ -463,6 +463,7 @@ pub(crate) struct ArchState<S> {
 pub struct Query<'w, Q: WorldQuery> {
     world:      &'w World,
     archetypes: Vec<ArchState<Q::State>>,
+    #[allow(dead_code)]
     last_run:   Tick,
     /// Ограничения строк для row-level splits.
     /// Если не пусто — итерация ограничена `(arch_idx, start, end)`.
@@ -648,6 +649,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     /// Consuming итератор — для использования в ParamQuery.
+    #[allow(dead_code)]
     pub(crate) fn into_iter_owned(self) -> QueryIterOwned<'w, Q> {
         QueryIterOwned { query: self, arch_cursor: 0, row_cursor: 0 }
     }
@@ -1018,7 +1020,7 @@ mod tests {
         struct D(u32);
         impl Component for D {}
 
-        let e1 = world.spawn((A, C(1)));
+        let _e1 = world.spawn((A, C(1)));
         let _e2 = world.spawn((B, D(2)));
 
         // (Maybe<A>, Maybe<C>) — все entity

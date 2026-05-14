@@ -9,14 +9,14 @@ use smallvec::SmallVec;
 use crate::{
     archetype::{Archetype, ArchetypeId},
     commands::Commands,
-    component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick, Serializable},
+    component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{EntityAllocator, EntityLocation, Entity},
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
     resources::Resources,
     sub_world::SubWorld,
-    system_param::{Res, ResMut, EventReader, EventWriter, WorldQuerySystemAccess},
+    system_param::{Res, ResMut, EventReader, EventWriter},
     template::TemplateRegistry,
 };
 
@@ -106,6 +106,7 @@ impl QueryCache {
         self.version.fetch_add(1, Ordering::Release);
     }
 
+    #[allow(dead_code)]
     pub fn version(&self) -> u32 {
         self.version.load(Ordering::Acquire)
     }
@@ -116,7 +117,7 @@ impl QueryCache {
 /// Ключ для archetype_index — хэшируется без heap-аллокации.
 /// Внутри хранит компоненты inline до 12 штук через SmallVec.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct ArchetypeKey(SmallVec<[ComponentId; 12]>);
+pub(crate) struct ArchetypeKey(SmallVec<[ComponentId; 12]>);
 
 impl From<&[ComponentId]> for ArchetypeKey {
     fn from(ids: &[ComponentId]) -> Self {
@@ -881,19 +882,17 @@ impl World {
         }
 
         // Исправляем location для вытесненной entity (swap_remove)
-        unsafe {
-            let from_last = self.archetypes[from_idx].entities.len() - 1;
-            if from_row != from_last {
-                let displaced = self.archetypes[from_idx].entities[from_last];
-                self.archetypes[from_idx].entities.swap(from_row, from_last);
-                self.archetypes[from_idx].entities.pop();
-                self.entities.set_location(displaced, EntityLocation {
-                    archetype_id: from_location.archetype_id,
-                    row:          from_row as u32,
-                });
-            } else {
-                self.archetypes[from_idx].entities.pop();
-            }
+        let from_last = self.archetypes[from_idx].entities.len() - 1;
+        if from_row != from_last {
+            let displaced = self.archetypes[from_idx].entities[from_last];
+            self.archetypes[from_idx].entities.swap(from_row, from_last);
+            self.archetypes[from_idx].entities.pop();
+            self.entities.set_location(displaced, EntityLocation {
+                archetype_id: from_location.archetype_id,
+                row:          from_row as u32,
+            });
+        } else {
+            self.archetypes[from_idx].entities.pop();
         }
 
         to_row as u32
@@ -1986,7 +1985,7 @@ mod tests {
 
     // ── Bundle composition tests ─────────────────────────────────
 
-    use crate::query::Read;
+    
 
     #[derive(Debug, PartialEq)]
     struct Pos { x: f32, y: f32 }

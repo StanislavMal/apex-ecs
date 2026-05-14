@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     time::Duration,
 };
 

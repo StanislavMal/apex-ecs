@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn isolated_world_independent() {
         let mut main_world = World::new();
-        let mut iso = IsolatedWorld::new();
+        let iso = IsolatedWorld::new();
 
         // Спавним сущность в основном мире
         main_world.spawn(());

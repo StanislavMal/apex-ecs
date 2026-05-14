@@ -24,13 +24,13 @@
 
 use std::{
     collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use apex_core::entity::Entity;
 use apex_core::relations::ChildOf;
 use apex_core::world::World;
-use apex_serialization::prefab::{PrefabError, PrefabLoader, PrefabManifest};
+use apex_serialization::prefab::{PrefabLoader, PrefabManifest};
 
 use crate::asset_registry::{AssetChange, AssetId, AssetRegistry};
 use crate::plugin::HotReloadError;
@@ -320,7 +320,7 @@ impl Default for PrefabPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    
 
     #[test]
     fn prefab_plugin_new_is_empty() {

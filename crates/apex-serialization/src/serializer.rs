@@ -605,7 +605,7 @@ mod tests {
     use super::*;
     use apex_core::prelude::*;
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    
 
     #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
     struct Position { x: f32, y: f32 }
@@ -614,6 +614,7 @@ mod tests {
     struct Health { current: f32, max: f32 }
 
     #[derive(Component)]
+    #[allow(dead_code)]
     struct RenderHandle(u64);
 
     fn setup_world() -> World {
@@ -741,7 +742,7 @@ mod tests {
 
     #[test]
     fn write_read_file() {
-        use std::io::Write;
+        
         let world = setup_world();
         let snap = WorldSerializer::snapshot(&world).unwrap();
 
@@ -792,7 +793,7 @@ mod tests {
 
     #[test]
     fn diff_byte_level_delta_modified_component() {
-        use apex_core::component::ComponentId;
+        
 
         let mut world = setup_world();
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
@@ -827,7 +828,7 @@ mod tests {
 
     #[test]
     fn diff_unchanged_component_excluded() {
-        let mut world = setup_world();
+        let world = setup_world();
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
         // Ничего не меняем — diff должен быть пустым (все компоненты совпадают)
@@ -838,7 +839,7 @@ mod tests {
 
     #[test]
     fn restore_with_migration() {
-        let mut world = setup_world();
+        let world = setup_world();
         let mut snap = WorldSerializer::snapshot(&world).unwrap();
 
         // Симулируем старую версию

@@ -100,6 +100,7 @@ pub(crate) struct ComponentState {
     col_idx:   usize,
     type_name: String,
     write:     bool,
+    #[allow(dead_code)]
     comp_id:   ComponentId,
 }
 

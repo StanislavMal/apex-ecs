@@ -521,7 +521,7 @@ fn run() {
     world.register_scriptable_event::<PlayerDied>(&mut engine);
 
     // Добавляем курсор для чтения событий
-    let mut event_cursor = world.events_mut::<PlayerDied>().add_reader();
+    let event_cursor = world.events_mut::<PlayerDied>().add_reader();
 
     engine.load_script_str("emit", r#"
 fn run() {

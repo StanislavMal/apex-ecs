@@ -29,7 +29,7 @@ use apex_core::{
 
 use crate::field::PrimitiveInfo;
 use crate::iterators::{ArchState, QueryDesc};
-use crate::registrar::{ResourceBinding, EventBinding, ScriptableRegistrar};
+use crate::registrar::{ResourceBinding, EventBinding};
 
 // ── ComponentBinding ───────────────────────────────────────────
 
@@ -282,6 +282,7 @@ impl ScriptContext {
     }
 
     /// Найти binding ресурса по имени типа.
+    #[allow(dead_code)]
     pub(crate) fn resource_binding(&self, name: &str) -> Option<&ResourceBinding> {
         self.resource_bindings.get(name)
     }
@@ -294,6 +295,7 @@ impl ScriptContext {
     }
 
     /// Найти binding события по имени типа.
+    #[allow(dead_code)]
     pub(crate) fn event_binding(&self, name: &str) -> Option<&EventBinding> {
         self.event_bindings.get(name)
     }

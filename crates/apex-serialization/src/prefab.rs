@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use apex_core::{
-    component::{ComponentId, Tick},
     entity::Entity,
     relations::ChildOf,
     template::TemplateParams,

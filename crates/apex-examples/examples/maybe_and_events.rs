@@ -37,6 +37,7 @@ struct Enemy;
 struct ScoreEvent(u32);
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct CollisionEvent { entity: Entity, damage: f32 }
 
 #[derive(Clone, Copy, Debug)]

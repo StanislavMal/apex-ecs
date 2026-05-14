@@ -61,11 +61,12 @@ use thunderdome::Index;
 use apex_core::{
     AccessDescriptor,
     archetype::Archetype,
-    commands::Commands,
     component::ComponentRegistry,
     world::World,
     system_param::WorldQuerySystemAccess,
 };
+#[cfg(feature = "parallel")]
+use apex_core::commands::Commands;
 
 pub use stage::{Stage, StageLabel};
 pub use apex_core::system_param::{AutoSystem, ResourceAccessList, EventAccessList, ResRead, ResWrite, Listen, Emit};
@@ -152,6 +153,7 @@ pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
 // ── SendPtr ────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct SendPtr<T>(*mut T);
 
 // SAFETY: использование строго ограничено run_hybrid_parallel где
@@ -163,8 +165,10 @@ impl<T> Copy for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     #[inline]
+    #[allow(dead_code)]
     unsafe fn as_mut(&self) -> &mut T { &mut *self.0 }
     #[inline]
+    #[allow(dead_code)]
     unsafe fn as_ref(&self) -> &T { &*self.0 }
 }
 
@@ -176,6 +180,7 @@ impl<T> SendPtr<T> {
 ///
 /// Если `chunk_ranges` пуст — задача обрабатывает все entity системы
 /// (весь SubWorld без ограничений).
+#[allow(dead_code)]
 struct AsdTask {
     /// Указатель на SystemDescriptor
     ptr: SendPtr<SystemDescriptor>,
@@ -198,8 +203,10 @@ unsafe impl Sync for AsdTask {}
 ///
 /// Внутренний механизм — используйте `AutoSystem` для публичного API.
 pub(crate) trait ParSystem: Send + Sync {
+    #[allow(dead_code)]
     fn access() -> AccessDescriptor where Self: Sized;
     fn run(&mut self, ctx: SystemContext<'_>);
+    #[allow(dead_code)]
     fn name() -> &'static str where Self: Sized { std::any::type_name::<Self>() }
 }
 
@@ -233,6 +240,7 @@ impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
 
 struct FnParSystem {
     func:   Box<dyn FnMut(SystemContext<'_>) + Send + Sync>,
+    #[allow(dead_code)]
     access: AccessDescriptor,
 }
 
@@ -277,6 +285,7 @@ struct SystemDescriptor {
 // ── SystemBuilder ──────────────────────────────────────────────
 
 pub struct SystemBuilder<'a> {
+    #[allow(dead_code)]
     scheduler: &'a mut Scheduler,
     id:        SystemId,
 }
@@ -329,6 +338,7 @@ pub struct Scheduler {
     // ── Конфигурация параллелизма ───────────────────────────────
     /// Минимальное количество систем в Stage для параллельного выполнения
     /// Если систем меньше этого значения — выполняется последовательно
+    #[allow(dead_code)]
     parallel_threshold: usize,
 
     /// Минимальное количество entity в Stage для параллельного выполнения.
@@ -554,6 +564,7 @@ impl Scheduler {
 
     /// Регистрировать ParSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
+    #[allow(dead_code)]
     pub(crate) fn add_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
@@ -563,6 +574,7 @@ impl Scheduler {
     }
 
     /// Регистрировать ParSystem в указанном этапе.
+    #[allow(dead_code)]
     pub(crate) fn add_par_system_to_stage<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
@@ -588,6 +600,7 @@ impl Scheduler {
     }
 
     /// Регистрировать ParSystem в Startup этапе.
+    #[allow(dead_code)]
     pub(crate) fn add_startup_par_system<S: ParSystem + 'static>(
         &mut self,
         name:   impl Into<String>,
@@ -770,6 +783,7 @@ impl Scheduler {
 
     /// Эвристика: минимальное количество entity на одну систему для окупаемости
     /// параллелизма (rayon overhead < выигрыш).
+    #[allow(dead_code)]
     fn min_entities_for_parallelism(num_systems: usize) -> usize {
         if num_systems >= 2 {
             3000  // Больше систем → лучше амортизация rayon overhead
@@ -2624,6 +2638,7 @@ mod tests {
 
     #[test]
     fn sequential_ordering() {
+        #[allow(dead_code)]
         struct MovementSystem;
         impl ParSystem for MovementSystem {
             fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
@@ -3261,7 +3276,7 @@ mod tests {
         // не должны создавать CircularDependency.
         // Проверяем, что any()-критерий в compute_archetype_indices
         // и BidirectionalWriteRead в detect_conflict_kind работают корректно.
-        let mut world = World::new();
+        let _world = World::new();
 
 
 

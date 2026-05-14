@@ -175,7 +175,7 @@ impl<'w> SubWorld<'w> {
             let entities = arch.entities();
             // Если есть row_ranges для этого arch_idx, дополнительно ограничиваем
             let effective_start = start;
-            let effective_end = if let Some((rr_s, rr_e)) = self.arch_row_range(arch_idx) {
+            let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
                 end.min(rr_e)
             } else {
                 end
@@ -233,7 +233,7 @@ impl<'w> SubWorld<'w> {
             let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
             let entities = arch.entities();
             let effective_start = start;
-            let effective_end = if let Some((rr_s, rr_e)) = self.arch_row_range(arch_idx) {
+            let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
                 end.min(rr_e)
             } else {
                 end
