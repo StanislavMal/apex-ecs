@@ -34,6 +34,7 @@
 - **Архетипное хранилище компонентов (SoA layout)** — данные одного типа хранятся рядом в памяти, что максимизирует использование CPU-кеша
 - **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon с адаптивным отключением для малых миров
 - **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>` работают без overhead
+- **Композиция Bundle** — вложенные `#[derive(Bundle)]`, кортежи Bundle до 12 элементов, одиночные компоненты напрямую в `spawn()`
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи закодированы как компоненты
 - **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
@@ -48,7 +49,7 @@
 | `apex-graph` | Граф зависимостей: топологическая сортировка, обнаружение циклов |
 | `apex-serialization` | Сериализация мира: WorldSnapshot, snapshot/restore, PrefabManifest, PrefabLoader |
 | `apex-hot-reload` | Горячая перезагрузка: FileWatcher, HotReloadPlugin, PrefabPlugin |
-| `apex-macros` | Процедурные макросы: `#[derive(Component)]` (авторегистрация), `#[derive(Bundle)]` (бандлы без ограничения полей), `#[derive(Scriptable)]` для интеграции с Rhai-скриптингом |
+| `apex-macros` | Процедурные макросы: `#[derive(Component)]` (реализация трейта + авторегистрация), `#[derive(Bundle)]` (бандлы с поддержкой вложенности), `#[derive(Scriptable)]` для интеграции с Rhai-скриптингом |
 | `apex-scripting` | Rhai-скриптинг: ScriptEngine, регистрация компонентов/ресурсов/событий, хот-релоад `.rhai`-скриптов |
 | `apex-isolated` | Изолированные ECS-миры: IsolatedWorld, WorldBridge, CloneableBridge |
 
@@ -120,16 +121,19 @@ entity.generation()      // -> u32
 
 ### 2.2 Component
 
-Компонент — это чистые данные без логики. Трейт `Component` реализуется автоматически для любого типа
-с `Send + Sync + 'static` (blanket impl). `#[derive(Component)]` добавляет только авторегистрацию —
-ручной `register_component()` не нужен.
+Компонент — это чистые данные без логики. Трейт `Component` (маркерный: `Send + Sync + 'static`)
+**обязательно требует явной реализации** — через `#[derive(Component)]` или manual `impl Component for Type {}`.
+
+`#[derive(Component)]` генерирует:
+- `impl Component for Type {}` — реализацию трейта
+- статический регистратор через `linkme::distributed_slice` для авторегистрации при `World::new()`
 
 ```rust
 use apex_core::prelude::*;
 // `Component` derive доступен из prelude (ре-экспорт из apex_macros).
 // Альтернативно: `use apex_macros::Component;`
 
-// Авторегистрация через #[derive(Component)] — не нужен ручной register_component():
+// #[derive(Component)] генерирует impl Component + авторегистрацию:
 #[derive(Component, Clone, Copy, Debug)]
 struct Position { x: f32, y: f32 }
 
@@ -138,18 +142,23 @@ struct Position { x: f32, y: f32 }
 struct SaveablePos { x: f32, y: f32 }
 // ... world.register_component_serde::<SaveablePos>(); // ← всё ещё нужен
 
-// Ручная регистрация (если не используется derive):
-world.register_component::<Position>();
+// Ручная реализация (если не используется derive):
+impl Component for MyDynamicType {}
+world.register_component::<MyDynamicType>();
 
 // Регистрация с сериализацией:
 world.register_component_serde::<Position>();
 ```
 
-> **Авторегистрация (v0.1.0):** `#[derive(Component)]` генерирует статический регистратор через `linkme::distributed_slice`. При создании `World::new()` вызывается `ComponentRegistry::register_all_auto()` — все зарегистрированные компоненты готовы к использованию без ручных вызовов. Трейт `Component` реализуется blanket impl для `T: Send + Sync + 'static`.
+> **Авторегистрация:** `#[derive(Component)]` генерирует статический регистратор через `linkme::distributed_slice`. При создании `World::new()` вызывается `ComponentRegistry::register_all_auto()` — все зарегистрированные компоненты готовы к использованию без ручных вызовов.
 >
-> **Сериализация:** `#[derive(Component)]` даёт только базовую регистрацию (без serde-функций). Для компонентов с `Serialize + Deserialize` по-прежнему вызывайте `world.register_component_serde::<T>()` — метод идемпотентен и только добавляет сериализацию.
+> **Важно:** Blanket impl `impl<T: Send + Sync + 'static> Component for T` **убран**. Каждый тип должен явно реализовать `Component` (через `#[derive(Component)]` или manual `impl`). Это необходимо для корректной работы рекурсивной композиции Bundle (кортежи не должны наследовать `Component`).
+>
+> **Сериализация:** `#[derive(Component)]` даёт только базовую реализацию трейта (без serde-функций). Для компонентов с `Serialize + Deserialize` по-прежнему вызывайте `world.register_component_serde::<T>()` — метод идемпотентен и только добавляет сериализацию.
 >
 > **`linkme`:** Ре-экспортирован через `apex_core::linkme` — не нужно добавлять в `Cargo.toml` отдельно. Ручной вызов `world.register_component::<T>()` остаётся рабочим для динамических компонентов (скриптинг, hot-reload).
+>
+> **Внешние типы (`cgmath::Matrix4<f32>`):** Для использования внешних типов как компонентов, включите feature-флаг `cgmath` в `apex-core` — он предоставляет `impl Component for cgmath::Matrix4<f32>`.
 
 ### 2.3 World
 
@@ -170,8 +179,15 @@ let player = world.spawn((
     Health { current: 100.0, max: 100.0 },
 ));
 
-// #[derive(Bundle)] — именованный бандл (любое число полей, не ограничен 8).
-// Доступен через apex_core::prelude::* или use apex_macros::Bundle:
+// Одиночный компонент — работает напрямую (blanket impl: Component → Bundle):
+let marker = world.spawn(Position { x: 100.0, y: 100.0 });
+
+// Пустая entity:
+let empty = world.spawn(());
+
+// ── Именованные Bundle — #[derive(Bundle)] ─────────────────
+
+// Плоский бандл (любое число полей):
 #[derive(Bundle)]
 struct PlayerBundle {
     pos: Position,
@@ -190,8 +206,41 @@ let player = world.spawn(PlayerBundle {
     inventory: Inventory::default(),
 });
 
-// Пустая entity:
-let marker = world.spawn(());
+// ── Вложенные Bundle (композиция) ─────────────────────────
+
+// Один Bundle может содержать другой Bundle как поле:
+#[derive(Bundle)]
+struct PlayerBase {
+    pos: Position,
+    hp:  Health,
+}
+
+#[derive(Bundle)]
+struct ArmedPlayer {
+    base:   PlayerBase,  // ← вложенный Bundle (рекурсивно разворачивается)
+    weapon: Weapon,
+    armor:  Armor,
+}
+
+let warrior = world.spawn(ArmedPlayer {
+    base: PlayerBase {
+        pos: Position { x: 10.0, y: 20.0 },
+        hp:  Health { current: 100.0, max: 100.0 },
+    },
+    weapon: Weapon { name: "Меч", damage: 25.0 },
+    armor:  Armor(50.0),
+});
+// Множество компонентов: [Position, Health, Weapon, Armor]
+
+// ── Кортежи Bundle ────────────────────────────────────────
+
+// Bundle-структура + одиночный компонент + ещё один компонент:
+world.spawn((
+    PlayerBase { pos: Position { x: 0.0, y: 0.0 }, hp: Health { current: 100.0, max: 100.0 } },
+    Speed(5.0),
+    Team(2),
+));
+// Поддерживается до 12 элементов в кортеже
 
 // Добавление компонента после создания через EntityRef:
 world.entity(player).insert(Armor { value: 10.0 });
@@ -212,7 +261,7 @@ world.spawn_batch([
 // Уничтожение entity:
 world.despawn(player);
 
-// Удаление всех entity с сохранением ресурсов (начиная с v0.1.0):
+// Удаление всех entity с сохранением ресурсов:
 world.clear_entities();
 
 // Добавление/удаление компонентов:
@@ -2627,8 +2676,8 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
-| `spawn(bundle)` | Создать entity с набором компонентов (принимает Bundle; `spawn(())` для пустой entity) |
-| `spawn_many(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (возвращает Vec) |
+| `spawn(bundle)` | Создать entity с набором компонентов (принимает Bundle; `spawn(())` для пустой entity; одиночный компонент — напрямую; кортеж `(A, B)` до 12 элементов; `#[derive(Bundle)]` с вложенностью) |
+| `spawn_many(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (возвращает Vec; bulk-copy для 2+ компонентов без Drop) |
 | `spawn_many_silent(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (без возврата Vec) |
 | `spawn_batch(iter)` | Спавн из итератора бандлов (разные типы) |
 | `entity(entity)` | Получить `EntityRef` для операций над entity (insert, remove, despawn, get, add_relation и т.д.) |
