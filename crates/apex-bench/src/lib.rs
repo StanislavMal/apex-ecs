@@ -10,6 +10,7 @@ use apex_macros::Component;
 // Common benchmark components
 // ---------------------------------------------------------------------------
 
+#[repr(transparent)]
 #[derive(Component, Clone, Copy)]
 pub struct Transform(pub Matrix4<f32>);
 

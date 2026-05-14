@@ -607,12 +607,13 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
 
-    #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
     struct Position { x: f32, y: f32 }
 
-    #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+    #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
     struct Health { current: f32, max: f32 }
 
+    #[derive(Component)]
     struct RenderHandle(u64);
 
     fn setup_world() -> World {

@@ -12,22 +12,23 @@
 //! ```
 
 use apex_core::prelude::*;
+use apex_macros::Component;
 
 // ── Компоненты ─────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Health { current: f32, max: f32 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Speed(f32);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Player;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct Enemy;
 
 // ── События (без derive Serialize — для send_action_event не нужно) ──

@@ -871,8 +871,12 @@ mod tests {
     use super::*;
     use crate::world::World;
 
+    use crate::component::Component;
+
     struct A;
+    impl Component for A {}
     struct B;
+    impl Component for B {}
 
     #[test]
     fn without_exclude_mask_works() {
@@ -1009,8 +1013,10 @@ mod tests {
 
         #[derive(Debug, PartialEq)]
         struct C(u32);
+        impl Component for C {}
         #[derive(Debug, PartialEq)]
         struct D(u32);
+        impl Component for D {}
 
         let e1 = world.spawn((A, C(1)));
         let _e2 = world.spawn((B, D(2)));

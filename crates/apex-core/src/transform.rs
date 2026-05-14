@@ -52,6 +52,8 @@ pub struct LocalTransform {
     pub scale:       Vec3,
 }
 
+impl crate::component::Component for LocalTransform {}
+
 impl LocalTransform {
     /// Единичная трансформация (zero translation, identity rotation, unit scale).
     pub const IDENTITY: Self = Self {
@@ -101,6 +103,8 @@ impl Default for LocalTransform {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlobalTransform(pub Mat4);
 
+impl crate::component::Component for GlobalTransform {}
+
 impl GlobalTransform {
     pub const IDENTITY: Self = Self(Mat4::IDENTITY);
 
@@ -125,6 +129,8 @@ impl Default for GlobalTransform {
 /// Снимается системой `propagate_transforms` после пересчёта.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransformDirty;
+
+impl crate::component::Component for TransformDirty {}
 
 // ── Система Propagation ─────────────────────────────────────────
 

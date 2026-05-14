@@ -16,8 +16,10 @@ pub mod transform;
 pub mod world;
 
 pub use access::AccessDescriptor;
+pub use archetype::{ArchetypeId};
 pub use apex_macros::Component;
-pub use component::{Component as ComponentTrait, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
+pub use apex_macros::Bundle as BundleDerive;
+pub use component::{Component as ComponentTrait, ComponentId, ComponentRegistry, Tick, Serializable, ComponentSerdeFns, make_serde_fns, make_serde_fns_json};
 pub use entity::Entity;
 pub use events::{Events, EventRegistry, EventCursor, DelayedQueue, PartialReadGuard, PeekGuard};
 pub use resources::Resources;
@@ -27,6 +29,7 @@ pub use query::{Query, Read, Write, With, Without, Changed, Maybe, MaybeWrite, W
 pub use commands::Commands;
 pub use relations::{RelationKind, ChildOf, Owns};
 pub use linkme;  // re-exported for #[derive(Component)] macro
+pub use smallvec;  // re-exported for #[derive(Bundle)] macro
 pub use system_param::{
     Res, ResMut, EventReader, EventWriter,
     ResRead, ResWrite, Listen, Emit,
@@ -52,4 +55,5 @@ pub mod prelude {
     pub use crate::template::{TemplateParams, EntityTemplate, TemplateParam};
     pub use crate::impl_entity_template;
     pub use crate::Component;
+    pub use crate::BundleDerive as Bundle;
 }

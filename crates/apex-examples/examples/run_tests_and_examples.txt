@@ -1,5 +1,7 @@
 cargo test --workspace
 
+cargo run -p apex-examples --example bundle_composition
+
 cargo run -p apex-examples --example hot_reload_test
 
 cargo run --example prefab_isolated
@@ -36,6 +38,7 @@ cargo run -p apex-examples --example parallel_diagnostics --release --features p
 
 
 APEX ECS — тестирование с конкурентами:
+Remove-Item -Recurse -Force target/criterion
 
 cargo bench --features bevy,legion > results.txt
 

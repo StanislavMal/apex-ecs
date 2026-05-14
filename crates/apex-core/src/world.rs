@@ -166,7 +166,7 @@ impl World {
         registry.register_all_auto();
         let mut world = Self {
             entities:        EntityAllocator::new(),
-            registry:        ComponentRegistry::new(),
+            registry,
             archetypes:      Vec::new(),
             archetype_index:      FxHashMap::default(),
             component_arch_index: FxHashMap::default(),
@@ -520,8 +520,8 @@ impl World {
     /// ```rust
     /// # use apex_core::prelude::*;
     /// # let mut world = World::new();
-    /// # struct Health(f32);
-    /// # struct Armor(f32);
+    /// # #[derive(Component)] struct Health(f32);
+    /// # #[derive(Component)] struct Armor(f32);
     /// world.spawn_batch([
     ///     (Health(100.0), Armor(10.0)),
     ///     (Health(50.0),  Armor(5.0)),
@@ -1505,12 +1505,21 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
 
 pub trait Bundle: Sized {
     fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]>;
+
+    /// Записать ComponentId'ы напрямую в `out` — без создания промежуточных SmallVec.
+    fn push_component_ids(&self, registry: &mut ComponentRegistry, out: &mut SmallVec<[ComponentId; 8]>) {
+        out.extend(self.component_ids(registry));
+    }
+
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
+
+    /// Количество компонентов в этом Bundle (статически, для разбивки col_indices).
+    fn component_count() -> usize;
 
     /// Пакетная запись компонентов с предвычисленными column indices.
     ///
-    /// По умолчанию вызывает `write_into`. Переопределяется в макросе `impl_bundle`
-    /// для оптимизации: использует переданные `col_indices` вместо повторного
+    /// По умолчанию вызывает `write_into`. Переопределяется для оптимизации:
+    /// использует переданные `col_indices` вместо повторного
     /// вызова `get_or_register` и `column_index` для каждой entity.
     fn write_into_batch(
         self,
@@ -1532,18 +1541,108 @@ pub trait Bundle: Sized {
     }
 }
 
+// ── Blanket impl: любой Component является Bundle (из одного компонента) ──
+
+impl<T: Component> Bundle for T {
+    #[inline(always)]
+    fn component_count() -> usize {
+        1
+    }
+
+    #[inline(always)]
+    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
+        smallvec::smallvec![registry.get_or_register::<T>()]
+    }
+
+    #[inline(always)]
+    fn push_component_ids(&self, registry: &mut ComponentRegistry, out: &mut SmallVec<[ComponentId; 8]>) {
+        out.push(registry.get_or_register::<T>());
+    }
+
+    #[inline(always)]
+    fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick) {
+        let cid = world.registry.get_or_register::<T>();
+        if let Some(ci) = world.archetypes[archetype_id.0 as usize].column_index(cid) {
+            unsafe {
+                let col = &mut world.archetypes[archetype_id.0 as usize].columns[ci];
+                if col.item_size > 0 {
+                    if col.len >= col.capacity {
+                        col.grow();
+                    }
+                    let dst = col.get_ptr(row);
+                    std::ptr::copy_nonoverlapping(
+                        &self as *const T as *const u8,
+                        dst,
+                        col.item_size,
+                    );
+                }
+                col.change_ticks.push(tick);
+                col.len += 1;
+            }
+        }
+        std::mem::forget(self);
+    }
+
+    #[inline(always)]
+    fn write_into_batch(
+        self,
+        world: &mut World,
+        archetype_id: ArchetypeId,
+        row: usize,
+        tick: Tick,
+        col_indices: &[usize],
+    ) {
+        let col_idx = col_indices[0];
+        unsafe {
+            let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
+            if col.item_size > 0 {
+                if col.len >= col.capacity {
+                    col.grow();
+                }
+                let dst = col.get_ptr(row);
+                std::ptr::copy_nonoverlapping(
+                    &self as *const T as *const u8,
+                    dst,
+                    col.item_size,
+                );
+            }
+            col.change_ticks.push(tick);
+            col.len += 1;
+        }
+        std::mem::forget(self);
+    }
+
+    #[inline(always)]
+    fn needs_drop() -> bool {
+        std::mem::needs_drop::<T>()
+    }
+}
+
+// ── Рекурсивный impl_bundle! для кортежей Bundle ──
+//
+// Элементы кортежа — любые Bundle (компоненты, другие Bundle-структуры, кортежи).
+// Число аритетей — 12 (как Bevy).
+
 macro_rules! impl_bundle {
     ($($T:ident),+) => {
         #[allow(non_snake_case)]
-        impl<$($T: Component),+> Bundle for ($($T,)+) {
+        impl<$($T: Bundle),+> Bundle for ($($T,)+) {
+            #[inline]
+            fn component_count() -> usize {
+                0usize $( + $T::component_count() )+
+            }
+
+            #[inline]
             fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-                let mut ids: SmallVec<[ComponentId; 8]> = smallvec::smallvec![
-                    $( registry.get_or_register::<$T>() ),+
-                ];
+                let mut ids = smallvec::SmallVec::<[ComponentId; 8]>::new();
+                #[allow(non_snake_case)]
+                let ($($T,)+) = self;
+                $( $T.push_component_ids(registry, &mut ids); )+
                 ids.sort_unstable();
                 ids
             }
 
+            #[inline]
             fn write_into(
                 self,
                 world:        &mut World,
@@ -1551,34 +1650,12 @@ macro_rules! impl_bundle {
                 row:          usize,
                 tick:         Tick,
             ) {
+                #[allow(non_snake_case)]
                 let ($($T,)+) = self;
-                $(
-                    {
-                        let cid = world.registry.get_or_register::<$T>();
-                        if let Some(col_idx) = world.archetypes[archetype_id.0 as usize]
-                            .column_index(cid)
-                        {
-                            unsafe {
-                                let col = &mut world.archetypes[archetype_id.0 as usize]
-                                    .columns[col_idx];
-                                if col.item_size > 0 {
-                                    if col.len >= col.capacity { col.grow(); }
-                                    let dst = col.get_ptr(row);
-                                    std::ptr::copy_nonoverlapping(
-                                        &$T as *const $T as *const u8,
-                                        dst,
-                                        col.item_size,
-                                    );
-                                }
-                                col.change_ticks.push(tick);
-                                col.len += 1;
-                            }
-                        }
-                        std::mem::forget($T);
-                    }
-                )+
+                $( $T.write_into(world, archetype_id, row, tick); )+
             }
 
+            #[inline]
             fn write_into_batch(
                 self,
                 world:        &mut World,
@@ -1587,37 +1664,19 @@ macro_rules! impl_bundle {
                 tick:         Tick,
                 col_indices:  &[usize],
             ) {
+                #[allow(non_snake_case)]
                 let ($($T,)+) = self;
-                #[allow(unused_assignments)]
-                let mut i = 0;
+                let mut _offset = 0usize;
                 $(
-                    {
-                        // Прямой позиционный доступ — col_indices[i] уже вычислен
-                        // в spawn_many_inner, устраняет O(K) поиск через find()
-                        let col_idx = col_indices[i];
-                        i += 1;
-                        unsafe {
-                            let col = &mut world.archetypes[archetype_id.0 as usize]
-                                .columns[col_idx];
-                            if col.item_size > 0 {
-                                if col.len >= col.capacity { col.grow(); }
-                                let dst = col.get_ptr(row);
-                                std::ptr::copy_nonoverlapping(
-                                    &$T as *const $T as *const u8,
-                                    dst,
-                                    col.item_size,
-                                );
-                            }
-                            col.change_ticks.push(tick);
-                            col.len += 1;
-                        }
-                        std::mem::forget($T);
-                    }
+                    let _cnt = $T::component_count();
+                    $T.write_into_batch(world, archetype_id, row, tick, &col_indices[_offset.._offset + _cnt]);
+                    _offset += _cnt;
                 )+
             }
 
+            #[inline]
             fn needs_drop() -> bool {
-                false $( || std::mem::needs_drop::<$T>() )+
+                false $( || $T::needs_drop() )+
             }
         }
     };
@@ -1631,9 +1690,17 @@ impl_bundle!(A, B, C, D, E);
 impl_bundle!(A, B, C, D, E, F);
 impl_bundle!(A, B, C, D, E, F, G);
 impl_bundle!(A, B, C, D, E, F, G, H);
+impl_bundle!(A, B, C, D, E, F, G, H, I);
+impl_bundle!(A, B, C, D, E, F, G, H, I, J);
+impl_bundle!(A, B, C, D, E, F, G, H, I, J, K);
+impl_bundle!(A, B, C, D, E, F, G, H, I, J, K, L);
 // ── impl Bundle for () ────────────────────────────────────────
 
 impl Bundle for () {
+    fn component_count() -> usize {
+        0
+    }
+
     fn component_ids(&self, _registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
         SmallVec::new()
     }
@@ -1915,5 +1982,199 @@ mod tests {
         // 8 * 8 = 64 threshold
         assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50);   // 50 < 64 → serial
         assert_eq!(adaptive_chunk_size(100, 8, &cfg), 13);  // 100 >= 64 → ceil(100/8)=13
+    }
+
+    // ── Bundle composition tests ─────────────────────────────────
+
+    use crate::query::Read;
+
+    #[derive(Debug, PartialEq)]
+    struct Pos { x: f32, y: f32 }
+    impl crate::component::Component for Pos {}
+
+    #[derive(Debug, PartialEq)]
+    struct Vel { x: f32, y: f32 }
+    impl crate::component::Component for Vel {}
+
+    #[derive(Debug, PartialEq)]
+    struct Hp(f32);
+    impl crate::component::Component for Hp {}
+
+    #[derive(Debug, PartialEq)]
+    struct Armor(f32);
+    impl crate::component::Component for Armor {}
+
+    #[derive(Debug, PartialEq)]
+    struct Team(u8);
+    impl crate::component::Component for Team {}
+
+    // Вложенные Bundle — ручная реализация (proc-макросы не работают внутри apex-core)
+    struct PlayerBase {
+        pos: Pos,
+        hp:  Hp,
+    }
+
+    impl crate::Bundle for PlayerBase {
+        fn component_count() -> usize {
+            2
+        }
+
+        fn component_ids(&self, registry: &mut crate::ComponentRegistry) -> SmallVec<[crate::ComponentId; 8]> {
+            let mut ids = SmallVec::new();
+            crate::Bundle::push_component_ids(&self.pos, registry, &mut ids);
+            crate::Bundle::push_component_ids(&self.hp, registry, &mut ids);
+            ids.sort_unstable();
+            ids
+        }
+
+        fn write_into(self, world: &mut crate::World, archetype_id: crate::ArchetypeId, row: usize, tick: crate::Tick) {
+            crate::Bundle::write_into(self.pos, world, archetype_id, row, tick);
+            crate::Bundle::write_into(self.hp, world, archetype_id, row, tick);
+        }
+
+        fn needs_drop() -> bool {
+            false || <Pos as crate::Bundle>::needs_drop() || <Hp as crate::Bundle>::needs_drop()
+        }
+    }
+
+    struct ArmedPlayer {
+        base:   PlayerBase,
+        weapon: Vel,
+        armor:  Armor,
+    }
+
+    impl crate::Bundle for ArmedPlayer {
+        fn component_count() -> usize {
+            4
+        }
+
+        fn component_ids(&self, registry: &mut crate::ComponentRegistry) -> SmallVec<[crate::ComponentId; 8]> {
+            let mut ids = SmallVec::new();
+            crate::Bundle::push_component_ids(&self.base, registry, &mut ids);
+            crate::Bundle::push_component_ids(&self.weapon, registry, &mut ids);
+            crate::Bundle::push_component_ids(&self.armor, registry, &mut ids);
+            ids.sort_unstable();
+            ids
+        }
+
+        fn write_into(self, world: &mut crate::World, archetype_id: crate::ArchetypeId, row: usize, tick: crate::Tick) {
+            crate::Bundle::write_into(self.base, world, archetype_id, row, tick);
+            crate::Bundle::write_into(self.weapon, world, archetype_id, row, tick);
+            crate::Bundle::write_into(self.armor, world, archetype_id, row, tick);
+        }
+
+        fn needs_drop() -> bool {
+            false
+                || <PlayerBase as crate::Bundle>::needs_drop()
+                || <Vel as crate::Bundle>::needs_drop()
+                || <Armor as crate::Bundle>::needs_drop()
+        }
+    }
+
+    #[test]
+    fn bundle_nested_struct_spawn() {
+        let mut world = World::new();
+        let e = world.spawn(ArmedPlayer {
+            base: PlayerBase {
+                pos: Pos { x: 10.0, y: 20.0 },
+                hp:  Hp(100.0),
+            },
+            weapon: Vel { x: 1.0, y: 0.5 },
+            armor:  Armor(50.0),
+        });
+
+        // Все компоненты на месте
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 10.0, y: 20.0 }));
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(100.0)));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { x: 1.0, y: 0.5 }));
+        assert_eq!(world.get::<Armor>(e), Some(&Armor(50.0)));
+        assert!(world.get::<Team>(e).is_none());
+    }
+
+    #[test]
+    fn bundle_tuple_of_bundles_spawn() {
+        let mut world = World::new();
+        let e = world.spawn((
+            PlayerBase { pos: Pos { x: 1.0, y: 2.0 }, hp: Hp(75.0) },
+            Vel { x: 3.0, y: 4.0 },
+            Team(1),
+        ));
+
+        // Кортеж из Bundle-структуры + компонентов работает
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(75.0)));
+        assert_eq!(world.get::<Vel>(e), Some(&Vel { x: 3.0, y: 4.0 }));
+        assert_eq!(world.get::<Team>(e), Some(&Team(1)));
+        assert!(world.get::<Armor>(e).is_none());
+    }
+
+    #[test]
+    fn bundle_single_component_direct_spawn() {
+        let mut world = World::new();
+        // Компонент напрямую в spawn (blanket impl<T: Component> Bundle for T)
+        let e = world.spawn(Pos { x: 5.0, y: 6.0 });
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 5.0, y: 6.0 }));
+    }
+
+    #[test]
+    fn bundle_mixed_tuple_of_components_and_bundles() {
+        let mut world = World::new();
+        // Смесь: одиночные компоненты + Bundle-структура + ещё компонент
+        let e = world.spawn((
+            Hp(200.0),
+            PlayerBase { pos: Pos { x: 7.0, y: 8.0 }, hp: Hp(80.0) },
+            Armor(30.0),
+            Team(2),
+        ));
+
+        assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 7.0, y: 8.0 }));
+        // У Hp двусмысленность: один в кортеже отдельно, другой внутри PlayerBase
+        // Колонка одна — побеждает последний записанный (PlayerBase.hp = 80).
+        // Проверяем что все компоненты присутствуют
+        assert!(world.get::<Hp>(e).is_some());
+        assert_eq!(world.get::<Armor>(e), Some(&Armor(30.0)));
+        assert_eq!(world.get::<Team>(e), Some(&Team(2)));
+    }
+
+    #[test]
+    fn bundle_spawn_many_with_bundle_struct() {
+        let mut world = World::new();
+        // spawn_many работает с вложенными Bundle (bulk-copy при needs_drop() == false)
+        let entities = world.spawn_many(10, |_| ArmedPlayer {
+            base: PlayerBase {
+                pos: Pos { x: 50.0, y: 50.0 },
+                hp:  Hp(100.0),
+            },
+            weapon: Vel { x: 0.1, y: 0.0 },
+            armor:  Armor(10.0),
+        });
+
+        assert_eq!(entities.len(), 10);
+        // Проверяем через прямой get, не через query
+        for &e in &entities {
+            assert!(world.get::<Pos>(e).is_some(), "Entity {:?} missing Pos", e);
+            assert!(world.get::<Hp>(e).is_some(), "Entity {:?} missing Hp", e);
+            assert!(world.get::<Vel>(e).is_some(), "Entity {:?} missing Vel", e);
+            assert!(world.get::<Armor>(e).is_some(), "Entity {:?} missing Armor", e);
+        }
+    }
+
+    #[test]
+    fn bundle_spawn_batch_heterogeneous_bundles() {
+        let mut world = World::new();
+        // Разные способы spawn в одном тесте
+        let boss = world.spawn(ArmedPlayer {
+            base: PlayerBase { pos: Pos { x: 1.0, y: 1.0 }, hp: Hp(50.0) },
+            weapon: Vel { x: 0.0, y: 0.0 },
+            armor: Armor(10.0),
+        });
+        let minion = world.spawn((Pos { x: 2.0, y: 2.0 }, Hp(25.0), Team(3)));
+        let empty = world.spawn(());
+
+        assert!(world.has_component::<Pos>(boss));
+        assert_eq!(world.get::<Armor>(boss), Some(&Armor(10.0)));
+        assert!(world.has_component::<Pos>(minion));
+        assert_eq!(world.get::<Team>(minion), Some(&Team(3)));
+        assert!(!world.has_component::<Pos>(empty));
     }
 }

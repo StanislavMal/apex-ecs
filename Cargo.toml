@@ -55,6 +55,9 @@ crossbeam-channel = "0.5"
 # Скриптинг — однопоточный Rhai (без "sync" feature, используем Rc<RefCell>)
 rhai = { version = "1.19", features = ["serde", "sync"] }
 
+# Внешний impl Component для cgmath::Matrix4<f32> (опционально)
+cgmath = "0.18"
+
 # Авторегистрация компонентов через distributed slice
 linkme = "0.3"
 

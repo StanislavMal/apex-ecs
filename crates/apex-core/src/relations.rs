@@ -655,8 +655,11 @@ mod tests {
     use super::*;
     use crate::prelude::*;
 
+    use crate::component::Component;
+    
     #[derive(Clone, Copy, Debug, PartialEq)]
     struct Position { x: f32, y: f32 }
+    impl Component for Position {}
 
     #[test]
     fn add_has_remove_relation() {

@@ -273,12 +273,16 @@ mod tests {
     use super::*;
     use crate::World;
 
+    use crate::component::Component;
+
     struct Position {
         x: f32,
         y: f32,
     }
+    impl Component for Position {}
 
     struct Label(String);
+    impl Component for Label {}
 
     // ── Marker-типы для типизированных параметров ────────────────
 
@@ -385,6 +389,7 @@ mod tests {
     #[test]
     fn template_macro_works() {
         struct MyTemplate { value: i32 }
+        impl Component for MyTemplate {}
 
         impl_entity_template!(MyTemplate, |this, world, params| {
             let val = params.get::<ParamVal>().copied().unwrap_or(this.value);

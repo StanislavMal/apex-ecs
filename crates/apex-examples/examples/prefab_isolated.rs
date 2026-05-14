@@ -20,6 +20,7 @@
 use apex_core::prelude::*;
 use apex_core::access_desc;
 use apex_isolated::{CloneableBridge, IsolatedWorld, sync_bridge_cloneable};
+use apex_macros::Component;
 use apex_serialization::prefab::PrefabLoader;
 use apex_serialization::WorldSerializer;
 
@@ -31,28 +32,28 @@ use std::sync::Arc;
 // Компоненты
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Position {
     x: f32,
     y: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Health {
     current: f32,
     max: f32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Damage {
     amount: f32,
 }
 
 // Маркеры — кто есть кто
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Enemy;
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Player;
 
 // ═══════════════════════════════════════════════════════════════════════════

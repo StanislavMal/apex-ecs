@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["apex"]
-apex = ["apex-core/parallel"]
+apex = ["apex-core/parallel", "apex-core/cgmath"]
 flecs = []
 bevy = ["dep:bevy_ecs"]
 legion = ["dep:legion"]

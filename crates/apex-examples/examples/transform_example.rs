@@ -221,5 +221,5 @@ fn count_dirty(world: &World) -> usize {
 
 // ── Компонент для отладки ────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Component, Clone, Copy, Debug)]
 struct DebugName(&'static str);

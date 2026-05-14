@@ -87,7 +87,9 @@ pub struct ComponentInfo {
 // ── Component trait ────────────────────────────────────────────
 
 pub trait Component: Send + Sync + 'static {}
-impl<T: Send + Sync + 'static> Component for T {}
+
+#[cfg(feature = "cgmath")]
+impl Component for cgmath::Matrix4<f32> {}
 
 /// Маркер: компонент можно сериализовать/десериализовать.
 ///

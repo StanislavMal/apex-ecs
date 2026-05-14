@@ -24,29 +24,29 @@ use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 //   - Vec<T> → rhai::Array, HashMap<String, V> → rhai::Map
 //   - C-like enum → i64
 
-#[derive(Clone, Copy, Debug, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Velocity { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Health { current: f32, max: f32 }
 
 // Компонент с Vec<String> — конвертируется в rhai::Array
-#[derive(Clone, Debug, Scriptable)]
+#[derive(Component, Clone, Debug, Scriptable)]
 struct Tags {
     list: Vec<String>,
 }
 
 // Компонент с HashMap<String, f32> — конвертируется в rhai::Map
-#[derive(Clone, Debug, Scriptable)]
+#[derive(Component, Clone, Debug, Scriptable)]
 struct Stats {
     values: HashMap<String, f32>,
 }
 
 // C-like enum — конвертируется в i64, константы TileKind_Floor и т.д.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
 enum TileKind { Floor, Wall, Water }
 
 // ── Скрипт ────────────────────────────────────────────────────────────────

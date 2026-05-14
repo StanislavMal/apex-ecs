@@ -646,8 +646,8 @@ impl Scheduler {
     /// # use apex_core::access_desc;
     /// # use apex_scheduler::{Scheduler, StageLabel};
     /// # let mut sched = Scheduler::new();
-    /// # struct Pos { x: f32, y: f32 }
-    /// # struct Vel { x: f32, y: f32 }
+    /// # #[derive(Component)] struct Pos { x: f32, y: f32 }
+    /// # #[derive(Component)] struct Vel { x: f32, y: f32 }
     /// sched.add_par_access(
     ///     "physics",
     ///     access_desc!(read<Vel>, write<Pos>),
@@ -947,7 +947,9 @@ impl Scheduler {
     /// Можно вызвать вручную перед `compile()`, если нужны реальные имена
     /// в `debug_plan_verbose()`.
     pub fn populate_type_names(&mut self, registry: &ComponentRegistry) {
-        self.type_names.clear();
+        if !self.type_names.is_empty() {
+            return; // Уже заполнены — все миры имеют одинаковые компоненты
+        }
         for info in registry.iter() {
             self.type_names.insert(info.type_id, info.name);
         }

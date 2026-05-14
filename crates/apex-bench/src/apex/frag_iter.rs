@@ -1,8 +1,10 @@
 use apex_core::prelude::*;
+use apex_macros::Component;
 
 macro_rules! declare_markers {
     ($($name:ident),*) => {
         $(
+            #[derive(Component)]
             pub struct $name(pub f32);
         )*
     }
@@ -13,10 +15,11 @@ declare_markers!(
     N, O, P, Q, R, S, T, U, V, W, X, Y, Z
 );
 
+#[derive(Component)]
 pub struct Data(pub f32);
 
 // FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом
-// World хранится как owned, query_typed() создаётся на каждой итерации
+// CachedQuery кешируется через QueryCache внутри query_typed()
 pub struct FragIter {
     world: World,
 }

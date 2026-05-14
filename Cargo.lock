@@ -104,6 +104,7 @@ dependencies = [
  "apex-macros",
  "bincode",
  "bitvec",
+ "cgmath",
  "glam",
  "linkme",
  "log",

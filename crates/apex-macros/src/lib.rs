@@ -2,9 +2,8 @@
 //!
 //! # `#[derive(Component)]`
 //!
-//! Добавляет статический регистратор через `linkme::distributed_slice`,
-//! вызываемый при создании `World::new()`. Трейт `Component` реализуется
-//! автоматически (blanket impl).
+//! Реализует трейт `Component` и добавляет статический регистратор через
+//! `linkme::distributed_slice`, вызываемый при создании `World::new()`.
 //!
 //! ```ignore
 //! #[derive(Component, Debug, Clone)]
@@ -14,17 +13,25 @@
 //! # `#[derive(Bundle)]`
 //!
 //! Реализует трейт `Bundle` для struct с именованными полями.
-//! Поддерживает произвольное число полей (без ограничения в 8 компонентов).
+//! Поддерживает произвольное число полей (без ограничения в 8 компонентов)
+//! и вложенные Bundle (поля-под-Bundle рекурсивно разворачиваются).
 //!
 //! ```ignore
 //! #[derive(Bundle)]
-//! struct PlayerBundle {
+//! struct PlayerBase {
 //!     pos: Position,
-//!     vel: Velocity,
 //!     hp: Health,
-//!     team: Team,
-//!     // ... до 16+ полей
 //! }
+//!
+//! #[derive(Bundle)]
+//! struct ArmedPlayer {
+//!     base: PlayerBase,   // <— вложенный Bundle
+//!     weapon: Weapon,
+//!     armor: Armor,
+//! }
+//!
+//! // Кортежи Bundle тоже работают:
+//! world.spawn((PlayerBase { pos, hp }, Weapon { .. }));
 //! ```
 //!
 //! # `#[derive(Scriptable)]`
@@ -49,11 +56,12 @@ use syn::{parse_macro_input, DeriveInput, Data, Fields, Type};
 
 // ── Component derive ────────────────────────────────────────────
 
-/// `#[derive(Component)]` — авторегистрация через `linkme::distributed_slice`.
+/// `#[derive(Component)]` — авторегистрация через `linkme::distributed_slice`
+/// и реализация трейта `Component`.
 ///
-/// Генерирует статический регистратор в `COMPONENT_REGISTRARS`, вызываемый
-/// при `World::new()`. Трейт `Component` реализуется автоматически через
-/// blanket impl для `T: Send + Sync + 'static`.
+/// Генерирует:
+/// - `impl Component for Type {}` (трейт с границами `Send + Sync + 'static`)
+/// - статический регистратор в `COMPONENT_REGISTRARS`, вызываемый при `World::new()`
 #[proc_macro_derive(Component)]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -61,6 +69,8 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
     let registrar_ident = quote::format_ident!("__COMPONENT_REGISTRAR_{}", name);
 
     let expanded = quote! {
+        impl ::apex_core::component::Component for #name {}
+
         #[allow(non_upper_case_globals)]
         #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
         #[linkme(crate = ::apex_core::linkme)]
@@ -77,7 +87,12 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
 /// `#[derive(Bundle)]` — реализует трейт `Bundle` для struct.
 ///
 /// Поддерживает struct с именованными полями и произвольное число компонентов
-/// (в отличие от `impl_bundle!`, который ограничен 8).
+/// (в отличие от `impl_bundle!`, который ограничен 12).
+///
+/// Поля могут быть:
+/// - компонентами (любой тип с `Component` — автоматически является Bundle)
+/// - другими Bundle-структурами (вложенность, рекурсивное разворачивание)
+/// - кортежами Bundle
 #[proc_macro_derive(Bundle)]
 pub fn derive_bundle(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -99,8 +114,6 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
         }
     };
 
-    let field_count = fields.len();
-
     let field_accessors: Vec<TokenStream2> = fields.iter().enumerate().map(|(i, f)| {
         if let Some(ident) = &f.ident {
             quote! { self.#ident }
@@ -114,14 +127,19 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl ::apex_core::Bundle for #name {
+            fn component_count() -> usize {
+                0usize #( + <#field_types as ::apex_core::Bundle>::component_count() )*
+            }
+
             fn component_ids(
                 &self,
                 registry: &mut ::apex_core::ComponentRegistry,
-            ) -> ::smallvec::SmallVec<[::apex_core::ComponentId; 8]> {
-                let mut ids: ::smallvec::SmallVec<[::apex_core::ComponentId; 8]> =
-                    ::smallvec::smallvec![
-                        #( registry.get_or_register::<#field_types>() ),*
-                    ];
+            ) -> ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> {
+                let mut ids: ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> =
+                    ::apex_core::smallvec::SmallVec::new();
+                #(
+                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, &mut ids);
+                )*
                 ids.sort_unstable();
                 ids
             }
@@ -133,28 +151,13 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
                 row: usize,
                 tick: ::apex_core::Tick,
             ) {
-                let arch_idx = archetype_id.as_usize();
-                let arch = &mut world.archetypes[arch_idx];
-                let mut col_idx = 0usize;
                 #(
-                    {
-                        let cid = world.registry_mut().get_or_register::<#field_types>();
-                        if let Some(ci) = arch.column_index(cid) {
-                            unsafe {
-                                arch.columns[ci].write_typed_at(
-                                    #field_accessors,
-                                    row + col_idx,
-                                    tick,
-                                );
-                            }
-                        }
-                        col_idx += 1;
-                    }
+                    ::apex_core::Bundle::write_into(#field_accessors, world, archetype_id, row, tick);
                 )*
             }
 
             fn needs_drop() -> bool {
-                false #( || ::std::mem::needs_drop::<#field_types>() )*
+                false #( || <#field_types as ::apex_core::Bundle>::needs_drop() )*
             }
         }
     };

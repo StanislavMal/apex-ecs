@@ -22,13 +22,13 @@ use std::time::Duration;
 
 // ── Компоненты для теста ──────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Scriptable)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Scriptable)]
 struct Velocity { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Scriptable)]
+#[derive(Component, Clone, Copy, Debug, PartialEq, Scriptable)]
 struct Health { current: f32, max: f32 }
 
 // ── Вспомогательные функции ──────────────────────────────────────

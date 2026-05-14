@@ -6,6 +6,7 @@ edition.workspace = true
 [features]
 default  = []
 parallel = ["dep:rayon"]
+cgmath = ["dep:cgmath"]
 
 [dependencies]
 apex-graph = { path = "../apex-graph" }
@@ -29,3 +30,4 @@ bincode    = { workspace = true }
 
 # Математика для трансформаций
 glam = { workspace = true }
+cgmath = { workspace = true, optional = true }
