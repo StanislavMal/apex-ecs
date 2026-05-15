@@ -147,10 +147,12 @@ fn main() {
     // send_event уже зарегистрировал тип
     use apex_core::system_param::EventReader;
 
-    let reader = EventReader::new(world.events_mut::<ScoreEvent>());
-    println!("  Score событий для чтения: {}", reader.len());
-    for ev in reader.iter() {
-        println!("    Score: {}", ev.0);
+    {
+        let reader = EventReader::new(world.events_mut::<ScoreEvent>());
+        println!("  Score событий для чтения: {}", reader.len());
+        for ev in reader.iter() {
+            println!("    Score: {}", ev.0);
+        }
     }
 
     // ── Демо 5: try_resource ────────────────────────────────────

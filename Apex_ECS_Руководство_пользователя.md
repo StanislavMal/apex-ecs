@@ -76,6 +76,9 @@ parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 
 **Вариант B — git-зависимость (потребитель):**
 
+> ⚠️ **Внимание:** `latest-revision-hash` — это **заглушка**. Замените её на реальный хеш
+> коммита из репозитория (узнать: `git ls-remote https://github.com/StanislavMal/apex-ecs HEAD`).
+
 ```toml
 [dependencies]
 apex-core          = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
@@ -85,12 +88,11 @@ apex-hot-reload    = { git = "https://github.com/StanislavMal/apex-ecs", rev = "
 apex-macros        = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
 apex-scripting     = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
 apex-isolated      = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
-
-[features]
-parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 ```
 
-> **Минимальная версия Rust:** 2021 Edition. Функция `parallel` требует включения соответствующего feature-флага — без неё планировщик работает в последовательном режиме.
+> **Минимальная версия Rust:** 2021 Edition. Функция `parallel` включает Rayon для параллельного
+> выполнения Stage. Без этого флага планировщик работает в последовательном режиме — per-stage
+> flush событий работает в **обоих** режимах.
 
 ---
 
@@ -532,7 +534,7 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 События используют двойную буферизацию: `pending` (куда пишут в текущем тике) и `events` (доступно для чтения, данные предыдущего тика).
 
-> **Важно (v0.1.0):** `world.tick()` теперь **только инкрементирует счётчик тика** и не переключает буферы событий. Flush событий выполняет Scheduler после каждого Stage автоматически. При использовании `World` без `Scheduler` нужно вручную вызывать `world.flush_all_events()` после `world.tick()`.
+> **Важно (v0.1.0):** `world.tick()` теперь **только инкрементирует счётчик тика** и не переключает буферы событий. Flush событий выполняет Scheduler после каждого Stage автоматически (в **sequential и parallel режимах**). При использовании `World` без `Scheduler` нужно вручную вызывать `world.flush_all_events()` после `world.tick()`.
 
 Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:63). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
 
@@ -541,6 +543,17 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 #### 5.2.1 Базовая отправка и чтение через `EventReader`
 
 Для чтения событий используется [`EventReader<T>`](crates/apex-core/src/system_param.rs:110) с per-reader курсором. `EventReader::new()` безопасно создаёт читателя, автоматически регистрируя его через `add_reader()`.
+
+**Два способа создать EventReader:**
+- `EventReader::new(world.events_mut::<T>())` — низкоуровневый
+- `world.event_reader::<T>()` — convenience-метод на `World` (рекомендуется, зеркало `ctx.event_reader()`)
+
+> **Важно:** [`iter()`](crates/apex-core/src/events.rs:294) **не продвигает** курсор — события
+> будут повторно видны при следующем вызове. Для однократного чтения используйте
+> [`read()`](crates/apex-core/src/system_param.rs:137) (RAII-автопродвижение при `Drop`).
+> При уничтожении `EventReader` его курсор автоматически удаляется из очереди событий
+> (через `remove_reader()` в `Drop`), что предотвращает утечку и позволяет корректно
+> очищать буфер.
 
 ```rust
 #[derive(Clone, Copy)]
@@ -708,7 +721,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `advance_reader_by(reader_id, count)` | Ручное продвижение курсора на N событий |
 | `len_pending() -> usize` | Количество событий в буфере записи |
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
-| `update()` | Переключить буферы: pending → events. Вызывается Scheduler'ом после каждого Stage, либо вручную через `world.flush_all_events()` |
+| `update()` | Переключить буферы: pending → events. Вызывается Scheduler'ом после каждого Stage (sequential и parallel), либо вручную через `world.flush_all_events()` |
 
 **`EventWriter<T>`** (доступен через `ctx.event_writer::<T>()`):
 
@@ -723,10 +736,11 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | Метод | Описание |
 |-------|----------|
 | `new(events: &mut Events<T>) -> Self` | Создать читателя (авто-регистрация через `add_reader()`) |
-| `iter(&self) -> &[T]` | Непрочитанные события в виде среза (без продвижения) |
-| `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop |
+| `iter(&self) -> &[T]` | Непрочитанные события в виде среза (без продвижения курсора) |
+| `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (рекомендуется) |
 | `len(&self) -> usize` | Количество непрочитанных событий |
 | `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
+| `Drop` | Автоматически вызывает `remove_reader()` — предотвращает утечку курсоров |
 
 #### 5.2.7 Декларативное резервирование буфера через `AccessDescriptor`
 
@@ -907,6 +921,7 @@ Apex ECS предоставляет три уровня API для систем 
 
 > **Как это работает:** `AutoSystem` анализирует:
 > - `type Query = (Read<A>, Write<B>, ...)` → access к компонентам
+> - `type Query = ()` → **пустой запрос** (системе не нужны компоненты)
 > - `type Resources = ResRead<C>` → read access к ресурсу `C`
 > - `type Resources = ResWrite<D>` → write access к ресурсу `D`
 > - `type Events = Listen<E>` → `read_event` access к событию `E`
@@ -2752,7 +2767,9 @@ fn main() {
 | `event_reserve_by_type(type_id, cap)` | То же по `TypeId` (для планировщика) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
 | `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
-| `tick()` | Переключить буферы событий, +1 тик |
+| `event_reader::<T>()` | Создать `EventReader<T>` (рекомендуется, зеркало `ctx.event_reader()`) |
+| `event_writer::<T>()` | Создать `EventWriter<T>` |
+| `tick()` | Инкрементировать счётчик тика (flush событий — Scheduler) |
 | `query_typed::<Q>()` | CachedQuery — кешированный запрос |
 | `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>` как фильтр в Q) |
 | `query_relation::<K, Q>(kind, target)` | Query по relation |

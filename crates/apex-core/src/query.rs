@@ -442,6 +442,29 @@ macro_rules! impl_world_query_tuple {
     };
 }
 
+// ── () — пустой запрос (для AutoSystem без компонентного доступа) ─
+
+impl WorldQuery for () {
+    type Item<'w> = ();
+    type State = ();
+
+    fn component_count() -> usize { 0 }
+
+    fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+
+    fn matches_archetype(_arch: &Archetype, _ids: &[ComponentId]) -> bool { true }
+
+    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {}
+
+    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> { Some(()) }
+}
+
+impl WorldQuerySystemAccess for () {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+}
+
 impl_world_query_tuple!((A, 0), (B, 1));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3));

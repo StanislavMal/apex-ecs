@@ -381,6 +381,30 @@ impl World {
         self.events.get_raw_ptr::<T>()
     }
 
+    /// Создать читатель событий с per-reader курсором.
+    ///
+    /// Аналог `EventReader::new(world.events_mut::<T>())`.
+    #[inline]
+    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+        unsafe {
+            let ptr = self.event_queue_ptr::<T>()
+                .expect("event_reader: event type not registered");
+            EventReader::new(&mut *ptr)
+        }
+    }
+
+    /// Создать писатель событий.
+    ///
+    /// Аналог `EventWriter::from_ptr(...)`.
+    #[inline]
+    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+        unsafe {
+            let ptr = self.event_queue_ptr::<T>()
+                .expect("event_writer: event type not registered");
+            EventWriter::from_ptr(ptr)
+        }
+    }
+
     // ── Spawn ──────────────────────────────────────────────────
 
     /// Создать entity из Bundle.

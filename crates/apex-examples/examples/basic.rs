@@ -123,8 +123,10 @@ impl AutoSystem for MovementSystem {
 
 fn damage_apply(world: &mut World) {
     use apex_core::system_param::EventReader;
-    let reader = EventReader::new(world.events_mut::<DamageEvent>());
-    let events: Vec<DamageEvent> = reader.iter().to_vec();
+    let events: Vec<DamageEvent> = {
+        let reader = EventReader::new(world.events_mut::<DamageEvent>());
+        reader.iter().to_vec()
+    };
 
     let mut deaths = Vec::new();
     for ev in &events {
@@ -140,8 +142,10 @@ fn damage_apply(world: &mut World) {
 
 fn despawn_dead(world: &mut World) {
     use apex_core::system_param::EventReader;
-    let reader = EventReader::new(world.events_mut::<DeathEvent>());
-    let deaths: Vec<DeathEvent> = reader.iter().to_vec();
+    let deaths: Vec<DeathEvent> = {
+        let reader = EventReader::new(world.events_mut::<DeathEvent>());
+        reader.iter().to_vec()
+    };
 
     if deaths.is_empty() { return; }
 

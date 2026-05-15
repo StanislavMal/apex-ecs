@@ -1547,16 +1547,6 @@ impl Scheduler {
 
         let plan = self.execution_plan.as_ref().unwrap();
 
-        let order: Vec<SystemId> = plan.stages.iter()
-            .filter(|stage| {
-                if stage.label == StageLabel::Startup && self.startup_completed {
-                    return false;
-                }
-                true
-            })
-            .flat_map(|s| s.system_ids.iter().copied())
-            .collect();
-
         for system in &self.systems {
             if let Some(access) = system.kind.access() {
                 for &(type_id, cap) in &access.event_reserves {
@@ -1568,19 +1558,29 @@ impl Scheduler {
         let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
         let sub_world = apex_core::SubWorld::new(w, &all_indices);
 
-        for sys_id in order {
-            if let Some(index) = self.system_indices.get(&sys_id) {
-                let system = &mut self.systems[*index];
-                match &mut system.kind {
-                    SystemKind::Sequential(f) => f(w),
-                    SystemKind::Parallel { system, .. } => {
-                        system.run(SystemContext::from_sub_world(&sub_world));
+        for stage in &plan.stages {
+            if stage.label == StageLabel::Startup && self.startup_completed {
+                continue;
+            }
+
+            for &sys_id in &stage.system_ids {
+                if let Some(&index) = self.system_indices.get(&sys_id) {
+                    let system = &mut self.systems[index];
+                    match &mut system.kind {
+                        SystemKind::Sequential(f) => f(w),
+                        SystemKind::Parallel { system, .. } => {
+                            system.run(SystemContext::from_sub_world(&sub_world));
+                        }
                     }
                 }
             }
+
+            // Per-stage flush — делает события доступными для следующего этапа
+            if !stage.emit_event_types.is_empty() {
+                w.flush_events_by_type(&stage.emit_event_types);
+            }
         }
 
-        w.flush_all_events();
         self.startup_completed = true;
     }
 

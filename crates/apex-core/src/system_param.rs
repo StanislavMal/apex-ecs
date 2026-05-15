@@ -150,6 +150,15 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
     }
 }
 
+impl<T: Send + Sync + 'static> Drop for EventReader<'_, T> {
+    fn drop(&mut self) {
+        unsafe {
+            let events = self.ptr as *mut Events<T>;
+            (*events).remove_reader(self.cursor);
+        }
+    }
+}
+
 /// Отправитель событий — мутабельный доступ к Events.
 pub struct EventWriter<'w, T: Send + Sync + 'static> {
     ptr: *mut Events<T>,
