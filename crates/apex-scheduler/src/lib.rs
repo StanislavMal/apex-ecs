@@ -528,9 +528,12 @@ impl Scheduler {
     {
         let id     = SystemId(self.next_id);
         self.next_id += 1;
-        let access = S::Query::system_access()
+        let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses());
+        if S::NEEDS_WHOLE_WORLD {
+            access.needs_whole_world = true;
+        }
         let adapter = AutoSystemAdapter { inner: system };
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
@@ -1525,57 +1528,51 @@ impl Scheduler {
         self.compute_archetype_indices(world);
 
         #[cfg(feature = "parallel")]
-        self.run_hybrid_parallel(world);
+        self.run_hybrid_parallel(world as *mut World);
 
         #[cfg(not(feature = "parallel"))]
-        self.run_sequential(world);
+        self.run_sequential(world as *mut World);
 
         // После первого run() Startup больше не выполняется
         self.startup_completed = true;
     }
 
     /// Последовательное выполнение — для тестов и non-parallel builds.
-    pub fn run_sequential(&mut self, world: &mut World) {
-        // Заполняем реестр имён компонентов для диагностики конфликтов
-        self.populate_type_names(world.registry());
+    pub fn run_sequential(&mut self, world_ptr: *mut World) {
+        let w = unsafe { &mut *world_ptr };
+        self.populate_type_names(w.registry());
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
 
         let plan = self.execution_plan.as_ref().unwrap();
 
-        // Фильтруем Startup системы если этап уже был выполнен
         let order: Vec<SystemId> = plan.stages.iter()
             .filter(|stage| {
                 if stage.label == StageLabel::Startup && self.startup_completed {
-                    return false; // пропускаем Startup
+                    return false;
                 }
                 true
             })
             .flat_map(|s| s.system_ids.iter().copied())
             .collect();
 
-        // Pre-reserve event capacities based on AccessDescriptor declarations.
         for system in &self.systems {
             if let Some(access) = system.kind.access() {
                 for &(type_id, cap) in &access.event_reserves {
-                    world.event_reserve_by_type(type_id, cap);
+                    w.event_reserve_by_type(type_id, cap);
                 }
             }
         }
 
-        // Sequential системы получают &mut World, параллельные — SubWorld
-        let all_indices: Vec<usize> = (0..world.archetypes().len()).collect();
-        let sub_world = apex_core::SubWorld::new(
-            unsafe { &*(world as *mut World as *const World) },
-            &all_indices,
-        );
+        let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
+        let sub_world = apex_core::SubWorld::new(w, &all_indices);
 
         for sys_id in order {
             if let Some(index) = self.system_indices.get(&sys_id) {
                 let system = &mut self.systems[*index];
                 match &mut system.kind {
-                    SystemKind::Sequential(f) => f(world),
+                    SystemKind::Sequential(f) => f(w),
                     SystemKind::Parallel { system, .. } => {
                         system.run(SystemContext::from_sub_world(&sub_world));
                     }
@@ -1583,10 +1580,7 @@ impl Scheduler {
             }
         }
 
-        // Flush всех событий после выполнения всех систем
-        world.flush_all_events();
-
-        // После первого выполнения Startup больше не запускается
+        w.flush_all_events();
         self.startup_completed = true;
     }
 
@@ -1629,12 +1623,9 @@ impl Scheduler {
             ptr: SendPtr<SystemDescriptor>,
             arch_indices: Vec<usize>,
             entity_count: usize,
-            /// Система использует события (Emit/Listen) — чанкование
-            /// небезопасно из-за data race на Events<T>::pending.
             has_events: bool,
-            /// Система использует par_for_each внутри — чанкование
-            /// не нужно (приведёт к oversubscribe rayon).
             uses_par_for_each: bool,
+            needs_whole_world: bool,
         }
 
         let mut sys_infos: Vec<SysInfo> = Vec::new();
@@ -1665,6 +1656,9 @@ impl Scheduler {
                     let uses_par_for_each = access
                         .map(|a| a.uses_par_for_each)
                         .unwrap_or(false);
+                    let needs_whole_world = access
+                        .map(|a| a.needs_whole_world)
+                        .unwrap_or(false);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
@@ -1672,6 +1666,7 @@ impl Scheduler {
                         entity_count,
                         has_events,
                         uses_par_for_each,
+                        needs_whole_world,
                     });
                 } else {
                     // Система без entity (только ресурсы/события) — запускаем сразу
@@ -1707,13 +1702,11 @@ impl Scheduler {
 
         for info in &sys_infos {
             // Per-system scope для:
-            //   a) Систем с малым entity_count (один чанк не даст parallelism)
-            //   b) Систем с событиями (Emit/Listen) — Events<T> не thread-safe
+            //   a) Систем с малым entity_count
+            //   b) Систем с событиями (Emit/Listen)
             //   c) Систем с par_for_each — избегаем oversubscribe rayon
-            //
-            // Для систем с большим entity_count без ограничений — ASD разбивка
-            // на чанки, распределённые по воркерам (row-level split).
-            if info.has_events || info.uses_par_for_each || info.entity_count <= effective_chunk {
+            //   d) Систем с needs_whole_world — глобальный доступ
+            if info.has_events || info.uses_par_for_each || info.needs_whole_world || info.entity_count <= effective_chunk {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
@@ -1825,9 +1818,8 @@ impl Scheduler {
     /// смешанные выполняются последовательно через `make_sub_world`.
     ///
     #[cfg(feature = "parallel")]
-    fn run_hybrid_parallel(&mut self, world: &mut World) {
+    fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
-        // Фильтруем Startup если уже выполнен
         let stages: Vec<(Vec<SystemId>, bool, Vec<TypeId>)> = plan.stages
             .iter()
             .filter(|stage| {
@@ -1839,76 +1831,69 @@ impl Scheduler {
             .map(|s| (s.system_ids.clone(), s.all_parallel, s.emit_event_types.clone()))
             .collect();
 
-        // Pre-reserve event capacities based on AccessDescriptor declarations.
-        // Избегает реаллокаций Vec<T> при массовой отправке событий в цикле.
-        for system in &self.systems {
-            if let Some(access) = system.kind.access() {
-                for &(type_id, cap) in &access.event_reserves {
-                    world.event_reserve_by_type(type_id, cap);
+        {
+            let w = unsafe { &mut *world_ptr };
+            for system in &self.systems {
+                if let Some(access) = system.kind.access() {
+                    for &(type_id, cap) in &access.event_reserves {
+                        w.event_reserve_by_type(type_id, cap);
+                    }
                 }
             }
         }
 
-        // Pre-вычисляем SubWorld storage для sequential fallback
-        let mut const_world: &World = unsafe { &*(world as *mut World as *const World) };
-        self.prepare_sub_worlds(const_world);
-        let mut prev_arch_count = const_world.archetypes().len();
+        let const_ptr = world_ptr as *const World;
+        {
+            let w = unsafe { &*const_ptr };
+            self.prepare_sub_worlds(w);
+        }
+        let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
-        // Создаём thread-local Commands для каждого потока rayon.
-        // Каждый параллельный поток получает доступ к своему Commands
-        // через current_thread_index(). После завершения Stage команды применяются.
         let num_threads = rayon::current_num_threads();
         let mut thread_commands: Vec<Commands> = (0..num_threads)
             .map(|_| Commands::new())
             .collect();
-        // SAFETY: cmds_ptr — usize из &mut thread_commands, жив до конца этой функции.
-        // Все обращения к нему синхронизированы: каждый поток пишет только в свой индекс.
         let cmds_ptr: usize = &mut thread_commands as *mut Vec<Commands> as usize;
 
-        // Копируем длины архетипов в owned Vec, чтобы не удерживать
-        // immutable borrow на world (нужен для f(world) и cmds.apply(world) ниже)
-        let arch_lengths: Vec<usize> = world.archetypes().iter().map(|a| a.len()).collect();
+        let arch_lengths: Vec<usize> = unsafe { &*const_ptr }.archetypes().iter().map(|a| a.len()).collect();
 
         for (stage_ids, all_parallel, emit_event_types) in &stages {
             if !*all_parallel {
-                // Sequential fallback — используем make_sub_world
-                for &sys_id in stage_ids {
-                    if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                        let sw = self.make_sub_world(sys_idx, const_world);
-                        let system = &mut self.systems[sys_idx];
-                        match &mut system.kind {
-                            SystemKind::Sequential(f)           => f(world),
-                            SystemKind::Parallel { system, .. } => {
-                                // SAFETY: cmds_ptr корректен, thread_commands жив.
-                                system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                {
+                    let w = unsafe { &*const_ptr };
+                    for &sys_id in stage_ids {
+                        if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                            let sw = self.make_sub_world(sys_idx, w);
+                            let system = &mut self.systems[sys_idx];
+                            match &mut system.kind {
+                                SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
+                                SystemKind::Parallel { system, .. } => {
+                                    system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                                }
                             }
                         }
                     }
                 }
-                // Применяем thread-локальные команды после sequential stage.
-                for cmds in &mut thread_commands {
-                    cmds.apply(world);
+                {
+                    let w = unsafe { &mut *world_ptr };
+                    for cmds in &mut thread_commands { cmds.apply(w); }
                 }
-
-                // Если структурные изменения создали новые архетипы —
-                // обновляем SubWorld storage для следующих Stage
-                let cur = world.archetypes().len();
-                if cur != prev_arch_count {
-                    prev_arch_count = cur;
-                    const_world = unsafe { &*(world as *mut World as *const World) };
-                    self.compute_archetype_indices(const_world);
-                    self.sub_worlds_dirty = true;
-                    self.prepare_sub_worlds(const_world);
+                {
+                    let w = unsafe { &*const_ptr };
+                    let cur = w.archetypes().len();
+                    if cur != prev_arch_count {
+                        prev_arch_count = cur;
+                        self.compute_archetype_indices(w);
+                        self.sub_worlds_dirty = true;
+                        self.prepare_sub_worlds(w);
+                    }
                 }
-                // Per-stage event flush
                 if !emit_event_types.is_empty() {
-                    world.flush_events_by_type(emit_event_types);
+                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
                 continue;
             }
 
-            // Проверяем пороги параллельности: если entity в Stage меньше
-            // порога — выполняем последовательно (rayon overhead > выигрыш).
             let should_fallback = if self.parallel_min_entities > 0 || self.auto_disable_parallel {
                 let stage_entity_count: usize = stage_ids.iter()
                     .filter_map(|&sys_id| self.system_archetype_indices.get(&sys_id))
@@ -1929,54 +1914,56 @@ impl Scheduler {
             };
 
             if should_fallback {
-                for &sys_id in stage_ids {
-                    if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                        let sw = self.make_sub_world(sys_idx, const_world);
-                        let system = &mut self.systems[sys_idx];
-                        if let SystemKind::Parallel { system, .. } = &mut system.kind {
-                            system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                {
+                    let w = unsafe { &*const_ptr };
+                    for &sys_id in stage_ids {
+                        if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                            let sw = self.make_sub_world(sys_idx, w);
+                            let system = &mut self.systems[sys_idx];
+                            if let SystemKind::Parallel { system, .. } = &mut system.kind {
+                                system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                            }
                         }
                     }
                 }
-                for cmds in &mut thread_commands {
-                    cmds.apply(world);
+                {
+                    let w = unsafe { &mut *world_ptr };
+                    for cmds in &mut thread_commands { cmds.apply(w); }
                 }
-
-                let cur = world.archetypes().len();
-                if cur != prev_arch_count {
-                    prev_arch_count = cur;
-                    const_world = unsafe { &*(world as *mut World as *const World) };
-                    self.compute_archetype_indices(const_world);
-                    self.sub_worlds_dirty = true;
-                    self.prepare_sub_worlds(const_world);
+                {
+                    let w = unsafe { &*const_ptr };
+                    let cur = w.archetypes().len();
+                    if cur != prev_arch_count {
+                        prev_arch_count = cur;
+                        self.compute_archetype_indices(w);
+                        self.sub_worlds_dirty = true;
+                        self.prepare_sub_worlds(w);
+                    }
                 }
-                // Per-stage event flush
                 if !emit_event_types.is_empty() {
-                    world.flush_events_by_type(emit_event_types);
+                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
                 continue;
             }
 
-            // ASD параллелизм: динамическое распределение чанков
-            self.run_stage_parallel(stage_ids, const_world, cmds_ptr);
+            self.run_stage_parallel(stage_ids, unsafe { &*const_ptr }, cmds_ptr);
 
-            // Применяем thread-локальные команды после параллельного stage.
-            for cmds in &mut thread_commands {
-                cmds.apply(world);
+            {
+                let w = unsafe { &mut *world_ptr };
+                for cmds in &mut thread_commands { cmds.apply(w); }
             }
-
-            let cur = world.archetypes().len();
-            if cur != prev_arch_count {
-                prev_arch_count = cur;
-                const_world = unsafe { &*(world as *mut World as *const World) };
-                self.compute_archetype_indices(const_world);
-                self.sub_worlds_dirty = true;
-                self.prepare_sub_worlds(const_world);
+            {
+                let w = unsafe { &*const_ptr };
+                let cur = w.archetypes().len();
+                if cur != prev_arch_count {
+                    prev_arch_count = cur;
+                    self.compute_archetype_indices(w);
+                    self.sub_worlds_dirty = true;
+                    self.prepare_sub_worlds(w);
+                }
             }
-
-            // Per-stage event flush
             if !emit_event_types.is_empty() {
-                world.flush_events_by_type(emit_event_types);
+                unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
         }
     }
@@ -1984,24 +1971,12 @@ impl Scheduler {
     /// Создать SubWorld для системы на основе предвычисленных archetype_indices
     /// и row_ranges (5.7).
     ///
-    /// Использует `archetype_indices_storage` и `row_ranges_storage` для owned
-    /// хранения данных, что позволяет избежать `Box::leak`. Storage заполняется
-    /// заранее в `prepare_sub_worlds()`.
-    ///
-    /// # SAFETY
-    /// - `storage_idx` должен быть валидным индексом в `archetype_indices_storage`
-    ///   и `row_ranges_storage`
-    /// - Storage не должен изменяться, пока SubWorld жив
+    /// SubWorld хранит сырые указатели на данные из Scheduler storage,
+    /// безопасность гарантируется тем что storage не мутирует пока живы SubWorld.
     #[cfg(feature = "parallel")]
     fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
-        let arch_indices: &'w [usize] = unsafe {
-            let vec = &self.archetype_indices_storage[storage_idx];
-            std::slice::from_raw_parts(vec.as_ptr(), vec.len())
-        };
-        let ranges: &'w [(usize, usize, usize)] = unsafe {
-            let vec = &self.row_ranges_storage[storage_idx];
-            std::slice::from_raw_parts(vec.as_ptr(), vec.len())
-        };
+        let arch_indices = &self.archetype_indices_storage[storage_idx];
+        let ranges = &self.row_ranges_storage[storage_idx];
         if ranges.is_empty() {
             apex_core::SubWorld::new(world, arch_indices)
         } else {

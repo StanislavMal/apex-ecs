@@ -479,9 +479,9 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     ///
     /// Использует `sub.archetype_indices` для фильтрации архетипов
     /// и `sub.row_ranges` для ограничения строк (row-level splits).
-    pub fn from_sub_world(sub: &SubWorld<'w>, last_run: Tick) -> Self {
-        let mut q = Self::new_within_archetypes(sub.world, sub.archetype_indices, last_run);
-        q.row_ranges = sub.row_ranges;
+    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+        let mut q = Self::new_within_archetypes(sub.world(), sub.archetype_indices(), last_run);
+        q.row_ranges = sub.row_ranges();
         q
     }
 

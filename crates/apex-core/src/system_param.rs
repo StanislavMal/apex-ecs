@@ -385,18 +385,18 @@ pub trait AutoSystem: Send + Sync {
     type Query: WorldQuery + WorldQuerySystemAccess;
 
     /// Ресурсы, которые нужны системе.
-    ///
-    /// Используй `()` если ресурсы не нужны (обратная совместимость).
     type Resources: ResourceAccessList;
 
     /// События, которые система читает или пишет.
-    ///
-    /// Используй `()` если события не нужны (обратная совместимость).
     type Events: EventAccessList;
+
+    /// Системе нужны ВСЕ entity (глобальный доступ).
+    /// ASD-чанкование запрещено, система всегда получает полный SubWorld.
+    /// По умолчанию `false`.
+    const NEEDS_WHOLE_WORLD: bool = false;
 
     fn run(&mut self, ctx: crate::world::SystemContext<'_>);
 
-    /// Имя системы для диагностики и `debug_plan()`.
     fn name() -> &'static str where Self: Sized {
         std::any::type_name::<Self>()
     }

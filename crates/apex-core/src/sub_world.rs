@@ -21,75 +21,123 @@ use crate::{
 /// - Разные SubWorld для разных систем в одном Stage не пересекаются по архетипам
 ///   (проверено compile() через AccessDescriptor).
 /// - Structural changes запрещены во время выполнения систем.
+///
+/// # Storage
+/// `world`, `archetype_indices` и `row_ranges` хранятся как сырые указатели,
+/// чтобы избежать UB продления lifetime и исключить конфликт `&World`/`&mut World`
+/// при параллельном выполнении.
 pub struct SubWorld<'w> {
-    /// Ссылка на оригинальный World (нужна для доступа к entity, registry, relations, resources)
-    pub(crate) world: &'w World,
-    /// Индексы архетипов, которые входят в этот SubWorld
-    pub(crate) archetype_indices: &'w [usize],
+    /// Сырой указатель на World. Всегда валиден пока SubWorld существует.
+    world: *const World,
+    /// Индексы архетипов, которые входят в этот SubWorld (сырой fat-указатель)
+    archetype_indices: *const [usize],
     /// Опциональные ограничения строк для row-level splits.
-    /// Каждый элемент: `(arch_idx, start, end)` — если arch_idx есть в `archetype_indices`,
-    /// то итерация по нему ограничивается строками `[start, end)`.
-    /// Если пусто — ограничений нет (все строки всех архетипов).
-    pub(crate) row_ranges: &'w [(usize, usize, usize)],
+    row_ranges: *const [(usize, usize, usize)],
+    #[allow(dead_code)]
+    _phantom: std::marker::PhantomData<&'w ()>,
 }
 
 impl<'w> SubWorld<'w> {
     #[inline]
-    pub fn new(world: &'w World, archetype_indices: &'w [usize]) -> Self {
+    pub fn new(world: &World, archetype_indices: &[usize]) -> Self {
         Self {
-            world,
-            archetype_indices,
-            row_ranges: &[],
+            world: world as *const World,
+            archetype_indices: archetype_indices as *const [usize],
+            row_ranges: std::ptr::slice_from_raw_parts(
+                std::ptr::null::<(usize, usize, usize)>(),
+                0,
+            ),
+            _phantom: std::marker::PhantomData,
         }
     }
 
     /// Создать SubWorld с row-level range ограничениями.
     ///
     /// # Safety
-    /// Переданные срезы `archetype_indices` и `row_ranges` должны жить
-    /// не меньше самого SubWorld. Внутренне lifetimes продлеваются через
-    /// transmute, так как SubWorld не экспортирует эти ссылки наружу.
+    /// Переданные срезы должны жить не меньше самого SubWorld.
+    /// SubWorld хранит сырые указатели на данные.
     #[inline]
     pub fn with_ranges(
-        world: &'w World,
+        world: &World,
         archetype_indices: &[usize],
         row_ranges: &[(usize, usize, usize)],
     ) -> Self {
-        unsafe {
-            Self {
-                world,
-                archetype_indices: std::mem::transmute::<&[usize], &'w [usize]>(archetype_indices),
-                row_ranges: std::mem::transmute::<&[(usize, usize, usize)], &'w [(usize, usize, usize)]>(row_ranges),
-            }
+        Self {
+            world: world as *const World,
+            archetype_indices: archetype_indices as *const [usize],
+            row_ranges: row_ranges as *const [(usize, usize, usize)],
+            _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Получить ссылку на World.
+    #[inline]
+    fn world_ref(&self) -> &World {
+        unsafe { &*self.world }
+    }
+
+    /// Вернуть срез индексов архетипов.
+    #[inline]
+    fn archetype_indices_slice(&self) -> &[usize] {
+        if self.archetype_indices.is_null() {
+            return &[];
+        }
+        unsafe { &*self.archetype_indices }
+    }
+
+    /// Вернуть срез row_ranges.
+    #[inline]
+    fn row_ranges_slice(&self) -> &[(usize, usize, usize)] {
+        if self.row_ranges.is_null() {
+            return &[];
+        }
+        unsafe { &*self.row_ranges }
+    }
+
+    // ── Public API ──────────────────────────────
+
+    #[inline]
+    pub fn world(&self) -> &World {
+        self.world_ref()
+    }
+
+    #[inline]
+    pub fn archetype_indices(&self) -> &[usize] {
+        self.archetype_indices_slice()
+    }
+
+    #[inline]
+    pub fn row_ranges(&self) -> &[(usize, usize, usize)] {
+        self.row_ranges_slice()
     }
 
     /// Количество архетипов в этом SubWorld.
     #[inline]
     pub fn archetype_count(&self) -> usize {
-        self.archetype_indices.len()
+        self.archetype_indices_slice().len()
     }
 
     /// Общее количество entity во всех архетипах этого SubWorld.
     pub fn entity_count(&self) -> usize {
-        self.archetype_indices
+        let w = self.world_ref();
+        self.archetype_indices_slice()
             .iter()
-            .map(|&idx| unsafe { (&*self.world.archetype_ptr(idx)).len() })
+            .map(|&idx| unsafe { (&*w.archetype_ptr(idx)).len() })
             .sum()
     }
 
-    // ── Resource API ────────────────────────────────────────────
+    // ── Resource API ────────────────────────────
 
     #[inline]
     pub fn resource<T: Send + Sync + 'static>(&self) -> Res<'_, T> {
-        Res(self.world.resource::<T>())
+        Res(self.world_ref().resource::<T>())
     }
 
     #[inline]
     pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
             let ptr = self
-                .world
+                .world_ref()
                 .resources
                 .get_raw_ptr::<T>()
                 .expect("resource_mut: resource not found");
@@ -97,12 +145,12 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    // ── Event API ───────────────────────────────────────────────
+    // ── Event API ───────────────────────────────
 
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
-            let ptr = self.world.event_queue_ptr::<T>()
+            let ptr = self.world_ref().event_queue_ptr::<T>()
                 .expect("event_reader: event type not registered");
             EventReader::new(&mut *ptr)
         }
@@ -111,29 +159,27 @@ impl<'w> SubWorld<'w> {
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
-            let ptr = self.world.event_queue_ptr::<T>()
+            let ptr = self.world_ref().event_queue_ptr::<T>()
                 .expect("event_writer: event queue not found");
             EventWriter::from_ptr(ptr)
         }
     }
 
-    // ── Row-level parallel API (3.2) ─────────────────────────────
+    // ── Row-level parallel API ──────────────────
 
-    /// Вернуть диапазон строк для архетипа `arch_idx`, если есть row_ranges.
     #[inline]
     fn arch_row_range(&self, arch_idx: usize) -> Option<(usize, usize)> {
-        self.row_ranges.iter().find_map(|&(a, s, e)| {
+        self.row_ranges_slice().iter().find_map(|&(a, s, e)| {
             if a == arch_idx { Some((s, e)) } else { None }
         })
     }
 
     /// Последовательная итерация по всем entity в этом SubWorld.
-    ///
-    /// Если заданы row_ranges — итерация ограничена указанными диапазонами.
     #[inline]
     pub fn for_each_entity<F: FnMut(Entity)>(&self, mut f: F) {
-        for &arch_idx in self.archetype_indices {
-            let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+        let w = self.world_ref();
+        for &arch_idx in self.archetype_indices_slice() {
+            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
             if let Some((start, end)) = self.arch_row_range(arch_idx) {
                 for row in start..end.min(entities.len()) {
@@ -148,17 +194,16 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Параллельная итерация по всем entity в этом SubWorld.
-    ///
-    /// Если заданы row_ranges — итерация ограничена указанными диапазонами.
     #[cfg(feature = "parallel")]
     pub fn par_for_each_entity<F: Fn(Entity) + Send + Sync>(&self, f: F) {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
 
         let num_threads = rayon::current_num_threads();
+        let w = self.world_ref();
         let chunks = compute_par_chunks(
-            self.archetype_indices.iter().map(|&arch_idx| {
-                let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+            self.archetype_indices_slice().iter().map(|&arch_idx| {
+                let arch = unsafe { &*w.archetype_ptr(arch_idx) };
                 if let Some((start, end)) = self.arch_row_range(arch_idx) {
                     let len = end.min(arch.len()).saturating_sub(start);
                     (arch_idx, len)
@@ -167,32 +212,30 @@ impl<'w> SubWorld<'w> {
                 }
             }),
             num_threads,
-            self.world.chunk_config(),
+            w.chunk_config(),
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+            let w = self.world_ref();
+            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
-            // Если есть row_ranges для этого arch_idx, дополнительно ограничиваем
-            let effective_start = start;
             let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
                 end.min(rr_e)
             } else {
                 end
             };
-            for row in effective_start..effective_end {
+            for row in start..effective_end {
                 f(entities[row]);
             }
         });
     }
 
     /// Последовательная итерация по строкам архетипов SubWorld.
-    ///
-    /// Если заданы row_ranges — итерация ограничена указанными диапазонами.
     #[inline]
     pub fn for_each_row<F: FnMut(Entity, usize)>(&self, mut f: F) {
-        for &arch_idx in self.archetype_indices {
-            let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+        let w = self.world_ref();
+        for &arch_idx in self.archetype_indices_slice() {
+            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
             if let Some((start, end)) = self.arch_row_range(arch_idx) {
                 for row in start..end.min(arch.len()) {
@@ -207,17 +250,16 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Параллельная итерация по строкам архетипов SubWorld.
-    ///
-    /// Если заданы row_ranges — итерация ограничена указанными диапазонами.
     #[cfg(feature = "parallel")]
     pub fn par_for_each_row<F: Fn(Entity, usize) + Send + Sync>(&self, f: F) {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
 
         let num_threads = rayon::current_num_threads();
+        let w = self.world_ref();
         let chunks = compute_par_chunks(
-            self.archetype_indices.iter().map(|&arch_idx| {
-                let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+            self.archetype_indices_slice().iter().map(|&arch_idx| {
+                let arch = unsafe { &*w.archetype_ptr(arch_idx) };
                 if let Some((start, end)) = self.arch_row_range(arch_idx) {
                     let len = end.min(arch.len()).saturating_sub(start);
                     (arch_idx, len)
@@ -226,19 +268,19 @@ impl<'w> SubWorld<'w> {
                 }
             }),
             num_threads,
-            self.world.chunk_config(),
+            w.chunk_config(),
         );
 
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let arch = unsafe { &*self.world.archetype_ptr(arch_idx) };
+            let w = self.world_ref();
+            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
-            let effective_start = start;
             let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
                 end.min(rr_e)
             } else {
                 end
             };
-            for row in effective_start..effective_end {
+            for row in start..effective_end {
                 f(entities[row], row);
             }
         });

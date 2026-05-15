@@ -981,6 +981,55 @@ impl AutoSystem for PhysicsSystem {
 sched.add_auto_system("physics", PhysicsSystem);
 ```
 
+#### 6.1.1 Глобальный доступ (`NEEDS_WHOLE_WORLD`)
+
+Некоторым системам нужен доступ **ко всем entity** мира — например, гравитация (сбор позиций всех тел) или построение пространственных структур. Такие системы несовместимы с ASD-чанкованием — если планировщик разрежет систему на чанки, каждый чанк увидит лишь часть entity и логика сломается.
+
+```rust
+struct OrbitalSystem;
+
+impl AutoSystem for OrbitalSystem {
+    type Query = (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>);
+    type Resources = ResRead<SpaceSettings>;
+    type Events = ();
+
+    /// Гравитация собирает позиции ВСЕХ тел — ASD-чанкование запрещено.
+    const NEEDS_WHOLE_WORLD: bool = true;
+
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        let q = ctx.query::<Self::Query>();
+
+        // Фаза 1: собираем глобальные данные (все entity)
+        let mut bodies: Vec<(Entity, Position, f32)> = Vec::new();
+        q.for_each(|entity, (pos, _, mass, _)| {
+            bodies.push((entity, *pos, mass.0));
+        });
+
+        // Фаза 2: применяем гравитацию
+        q.for_each(|_, (pos, vel, mass, orbits)| {
+            // ... расчёт сил через bodies ...
+        });
+    }
+}
+
+sched.add_auto_system("grav", OrbitalSystem);
+// ↑ NEEDS_WHOLE_WORLD выставляется автоматически — ASD-чанкование запрещено.
+```
+
+**Что происходит:** система получает полный SubWorld (все entity), ASD не чанкует. Внутрисистемный `par_for_each` при этом остаётся доступен.
+
+**Для `add_par_access`** — через `.whole_world()`:
+
+```rust
+sched.add_par_access(
+    "grav",
+    access_desc!(write<Velocity>, read<Position>).whole_world(),
+    |ctx| { /* глобальный доступ */ },
+);
+```
+
+> **Когда включать:** система собирает данные ВСЕХ entity (гравитация, BVH, статистика). **Когда НЕ включать:** каждый entity обрабатывается независимо (физика, рендер) — ASD безопасен.
+
 ### 6.2 Параллельная система-замыкание (`add_par` / `add_par_access`)
 
 Для быстрых прототипов и простых систем можно использовать замыкания вместо
@@ -2154,6 +2203,9 @@ for each system:
 > **Row-level splits (разбиение строк архетипа)** создаются только для систем,
 > находящихся в **одном `all_parallel` Stage**. Системы в разных Stage (последовательные)
 > всегда видят все entity своих архетипов — каждый SubWorld содержит полный набор строк.
+>
+> **Системы с глобальным доступом:** `const NEEDS_WHOLE_WORLD = true` (или `.whole_world()`
+> в `add_par_access`) запрещает ASD-чанкование. Подробнее: [раздел 6.1.1](#611-глобальный-доступ-needs_whole_world).
 
 #### 13.1.3 Параметры настройки параллелизма
 
@@ -2778,6 +2830,7 @@ fn main() {
 | `.write_event::<T>()` | Декларировать запись событий T |
 | `.event_reserve::<T>(cap)` | Зарезервировать буфер на cap событий T (v0.1.0) |
 | `.par_for_each_used()` | Пометить, что система использует `par_for_each` внутри |
+| `.whole_world()` | Пометить, что системе нужен глобальный доступ ко всем entity (ASD-чанкование запрещено) |
 | `.merge(&other)` | Слить с другим дескриптором (max по резервам) |
 
 ### `StageLabel` API

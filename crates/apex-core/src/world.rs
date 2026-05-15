@@ -1149,7 +1149,7 @@ impl<'w> SystemContext<'w> {
     /// Получить World (для обратной совместимости).
     /// Используется для query, resource, event доступа.
     fn world(&self) -> &'w World {
-        self.sub_worlds[0].world
+        self.sub_worlds[0].world()
     }
 
     #[inline]
@@ -1277,15 +1277,15 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// Не вызывает `get_or_compute` (thread-safe для параллельных систем).
     /// Фильтрация по `Q::matches_archetype` происходит в `for_each`/`par_for_each`
     /// — там `fetch_state` вызывается только для совпадающих архетипов.
-    pub fn from_sub_world(sub: &SubWorld<'w>, last_run: Tick) -> Self {
+    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
         let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(sub.world, &mut ids);
+        Q::fill_ids(sub.world(), &mut ids);
 
-        let arch_indices: Arc<[usize]> = sub.archetype_indices.into();
-        let row_ranges: &'w [(usize, usize, usize)] = sub.row_ranges;
+        let arch_indices: Arc<[usize]> = sub.archetype_indices().into();
+        let row_ranges: &'w [(usize, usize, usize)] = sub.row_ranges();
 
         Self {
-            world: sub.world,
+            world: sub.world(),
             arch_indices,
             last_run,
             cached_ids: ids,

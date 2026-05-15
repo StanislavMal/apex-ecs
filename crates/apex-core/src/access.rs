@@ -203,6 +203,9 @@ pub struct AccessDescriptor {
     /// Планировщик не будет чанковать такую систему через ASD
     /// (избегает oversubscribe rayon thread pool).
     pub uses_par_for_each: bool,
+    /// Флаг: системе нужны ВСЕ entity (глобальный доступ).
+    /// ASD-чанкование запрещено — система всегда получает полный SubWorld.
+    pub needs_whole_world: bool,
     /// Типы и зарезервированные capacity для event-буферов.
     /// Планировщик вызывает `world.event_reserve::<T>(cap)` перед
     /// выполнением системы, чтобы избежать реаллокаций в hot-пути send().
@@ -239,6 +242,13 @@ impl AccessDescriptor {
         self
     }
 
+    /// Пометить что системе нужен доступ ко ВСЕМ entity (глобальный доступ).
+    /// Планировщик не будет чанковать систему через ASD.
+    pub fn whole_world(mut self) -> Self {
+        self.needs_whole_world = true;
+        self
+    }
+
     /// Декларировать запись событий типа T.
     pub fn write_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
@@ -269,6 +279,7 @@ impl AccessDescriptor {
         self.write_mask = self.write_mask.or(&other.write_mask);
         // Передаём флаг par_for_each
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
+        self.needs_whole_world = self.needs_whole_world || other.needs_whole_world;
         // Сливаем резервирования событий (берём максимум по каждому типу)
         for &(tid, cap) in &other.event_reserves {
             if let Some(entry) = self.event_reserves.iter_mut().find(|(id, _)| *id == tid) {
