@@ -490,6 +490,53 @@ end
     }
 
     // ═══════════════════════════════════════════════════════
+    // ТЕСТ 13: Auto-commit (без явного commit())
+    // ═══════════════════════════════════════════════════════
+
+    println!("--- Тест 13: auto-commit ---");
+
+    // Включаем авто-commit — commit(entity) вызывается автоматически
+    engine.set_auto_commit(true);
+
+    write_script(&script_path, r#"
+function run()
+    local dt = delta_time()
+    for entity in query({"Read:Velocity", "Write:Position"}) do
+        entity.position.x = entity.position.x + entity.velocity.x * dt
+        entity.position.y = entity.position.y + entity.velocity.y * dt
+        -- commit(entity) НЕ вызываем — авто-commit сам запишет
+    end
+end
+"#);
+
+    let before = {
+        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        q.iter().next().map(|(_, (p, _))| *p)
+    };
+
+    std::thread::sleep(Duration::from_millis(200));
+    engine.poll_hot_reload();
+    engine.run(0.5, &mut world);
+    world.tick();
+
+    let after = {
+        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        q.iter().next().map(|(_, (p, _))| *p)
+    };
+
+    match (before, after) {
+        (Some(b), Some(a)) if a.x > b.x => {
+            println!("  OK: auto-commit работает (x: {} -> {})\n", b.x, a.x);
+        }
+        _ => {
+            println!("  FAIL: auto-commit не сработал\n");
+            all_ok = false;
+        }
+    }
+
+    engine.set_auto_commit(false);
+
+    // ═══════════════════════════════════════════════════════
     // ИТОГ
     // ═══════════════════════════════════════════════════════
 

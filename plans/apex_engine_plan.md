@@ -24,7 +24,7 @@
 | **Templates** | `template.rs` | ✅ Готово | EntityTemplate trait, TemplateParams по TypeId, impl_entity_template! макрос, интегрирован в Commands |
 | **Serialization** | `serialization/` | ✅ Хорошо | PrefabManifest (JSON), PrefabLoader с кешем, overrides, иерархия через ChildOf, snapshot |
 | **Hot-Reload** | `hot-reload/` | ✅ Хорошо | FileWatcher (notify), HotReloadPlugin, JsonConfigLoader, PrefabPlugin с reapply_asset/reapply_all, debounce |
-| **Scripting (Rhai)** | `scripting/` | ✅ Рабочий прототип | ScriptContext, #[derive(Scriptable)], query/spawn/despawn/resources/events из Rhai, zero-copy для примитивов, change ticks при Write, hot-reload .rhai файлов |
+| **Scripting (Lua)** | `scripting/` | ✅ Готово | ScriptEngine на mlua (Lua 5.4), ScriptableRegistrar, #[derive(Scriptable)], query/spawn/despawn/resources/events, commit/auto-commit, With/Without фильтры, sandbox _ENV, hot-reload .lua, inspect(), log_levels, Read-protection metatable |
 | **SubWorld / Isolated** | `sub_world.rs`, `isolated/` | ✅ Готово | Изолированные миры для тестов и параллелизма |
 | **Graph** | `graph/` | ✅ Готово | DAG, топосорт — используется планировщиком |
 | **Transform** | `transform.rs` | ✅ Есть | Базовый трансформ |
@@ -39,12 +39,12 @@
 4. **Relations a-la Flecs** — встроены в ядро, а не надстройка; SubjectIndex с kind_mask, wildcard query, cascade delete — это уровень выше Bevy/Unity
 5. **EntityTemplate + PrefabManifest** — два уровня шаблонов (программный + файловый), уже интегрированы с Commands и hot-reload
 6. **PrefabPlugin.reapply_asset()** — пересоздание entity при изменении файла без перезапуска
-7. **Scripting с change ticks** — изменения из Rhai скриптов корректно видны Changed<T> — это редкость в embedded scripting системах
+7. **Scripting с change ticks** — изменения из Lua скриптов корректно видны Changed<T>; auto-commit, sandbox _ENV, With/Without фильтры — уровень выше типичных embedded scripting систем
 
 ### Известные ограничения
 
 1. **ComponentMask ограничен 256 компонентами** — для движка с материалами, светом, UI, физикой это может стать потолком. Нужно расширить до 512 заранее
-2. **Rhai однопоточный** — ScriptEngine нельзя использовать в ParSystem; для горячих путей нужно дополнение (Lua/WASM)
+2. **Lua однопоточный** — ScriptEngine нельзя использовать в ParSystem; ScriptEngine не Send (Rc<RefCell<>>)
 3. **QueryCache инвалидируется целиком** при любом структурном изменении — приемлемо сейчас, но потребует внимания при > 1000 архетипов
 4. **PrefabManifest::spawn** с TemplateParams — обратный маппинг TypeId→name не реализован, overrides через params не работают (есть TODO в коде)
 5. **Transform** базовый — нет иерархической пропагации GlobalTransform
@@ -75,7 +75,7 @@
 ### Godot — что взять
 - Hot-reload скриптов (уже есть в apex-scripting + apex-hot-reload)
 - Сигналы = EventPipeline (уже есть)
-- Простой скриптовый язык (Rhai работает, нужно улучшить эргономику)
+- Простой скриптовый язык (Lua работает через mlua, нужно улучшить эргономику)
 
 ---
 
@@ -292,18 +292,29 @@ BatchingSystem           — группировка по материалу дл
 - [ ] **Переиспользовать Relations** — `ChildOf` для иерархии UI-нод (бесплатно)
 - [ ] Hot-reload UI-скинов через `HotReloadPlugin` (уже есть)
 
-### Фаза 9 — Улучшение скриптинга (2–3 недели)
+### Фаза 9 — Улучшение скриптинга (1–2 недели)
 
 **apex-scripting** — доработка существующего.
 
-Rhai уже работает. Основные улучшения:
+**Уже сделано (миграция Rhai → Lua v0.1):**
 
-- [ ] **Lua через `mlua`** — дополнительный backend для горячих путей (Lua 5.4 ≈ 10× быстрее Rhai)
-- [ ] Единый `ScriptComponent { path: String, engine: ScriptEngineKind }` — выбор Rhai vs Lua на уровне файла
-- [ ] Lua API зеркалит Rhai: `query()`, `spawn_entity()`, `despawn()`, `read_resource()`, `write_resource()`, `emit_event()`
-- [ ] **Починить TemplateParams в PrefabManifest** (из Фазы 0) — это разблокирует instantiate с overrides из скриптов
-- [ ] WASM-скрипты через `wasmtime` — для сложной логики с возможностью sandbox (опционально, позже)
-- [ ] Sandbox: скрипты не имеют доступа к FS/сети напрямую — уже частично реализовано в архитектуре
+- [x] **Lua 5.4 через `mlua`** — миграция с Rhai завершена, 16 API-функций
+- [x] `#[derive(Scriptable)]` — named struct, tuple struct, unit struct (маркеры), C-like enum
+- [x] `query({"Read:X", "Write:Y", "With:Z", "Without:W"})` — 4 режима доступа + кэш запросов
+- [x] `commit(entity)` + `engine.set_auto_commit(true)` — явный и авто-режим
+- [x] `spawn_entity`, `despawn`, `read_resource`, `write_resource`, `emit_event`
+- [x] Sandbox `_ENV` — изоляция скриптов (только разрешённые функции)
+- [x] Read-компонент `__newindex` metatable — предупреждает о попытке модификации
+- [x] `inspect(table)`, `log_debug/warn/error` — отладка и логирование
+- [x] Hot-reload `.lua` файлов с debounce 50ms
+- [x] 13 автоматических тестов, покрывающих весь API
+
+**Что осталось:**
+
+- [ ] **WASM-скрипты через `wasmtime`** — для сложной логики с sandbox (опционально)
+- [ ] **Сквозные ID для `spawn_entity`** — сейчас spawn отложенный, индекс не возвращается; нужен механизм временных ID с маппингом после apply
+- [ ] **`EntityTemplate` + `PrefabManifest` из Lua** — вызов `world.spawn_from_template("Orc")` из скриптов
+- [ ] **Несколько ScriptEngine в одном World** — каждый со своим Lua VM, независимые скрипты для разных подсистем
 
 ### Фаза 10 — Редактор (4–8 недель)
 
@@ -323,7 +334,7 @@ App::new()
 - [ ] **Asset browser** — файловый браузер с превью; переиспользует `AssetRegistry`
 - [ ] **Play / Pause / Stop** — fork world state → run → restore; `World::snapshot()` уже есть в `apex-serialization`!
 - [ ] **Gizmo** — стрелки Transform, bounding boxes — отдельный RenderPass
-- [ ] **Console** — вывод `log::`, Rhai REPL (ScriptEngine уже Send через Mutex)
+- [ ] **Console** — вывод `log::`, Lua REPL (ScriptEngine уже работает)
 - [ ] **Prefab editing** — открыть `.prefab.json` как отдельную сцену; `PrefabPlugin.reapply_asset()` уже есть
 - [ ] **Live hot-reload в Play mode** — `HotReloadPlugin.apply_changes()` вызывается каждый кадр (уже архитектурно готово)
 
@@ -343,7 +354,7 @@ App::new()
 | Asset watching | `HotReloadPlugin` + `FileWatcher` + `AssetRegistry` |
 | Программные шаблоны | `EntityTemplate` + `TemplateParams` + `Commands::spawn_template()` |
 | Файловые шаблоны | `PrefabManifest` + `PrefabLoader` |
-| Скриптинг | `ScriptEngine` + `#[derive(Scriptable)]` + hot-reload .rhai |
+| Скриптинг | `ScriptEngine` + `#[derive(Scriptable)]` + hot-reload .lua |
 | Граф задач | `apex-graph` DAG — использовать для RenderGraph |
 | Изолированные миры | `apex-isolated` — для редактора и тестов |
 
@@ -380,7 +391,7 @@ App::new()
 | Async | `tokio` | Asset loading |
 | Физика | `rapier3d` | Лучшая Rust физика |
 | Звук | `kira` | Async, production-ready |
-| Scripting | `rhai` (есть) + `mlua` | Два backends |
+| Scripting | `mlua` (Lua 5.4) | Миграция с Rhai завершена |
 | UI layout | `taffy` | flexbox |
 | Редактор | `egui` | Простая интеграция с wgpu |
 | Окно | `winit` | Стандарт |
@@ -403,7 +414,7 @@ App::new()
 
 - **Починка PrefabManifest::spawn с TemplateParams** (Фаза 0) — в коде есть TODO, это реальный баг
 - **ActionMap** (Фаза 2) — именованные действия вместо raw keycodes; это важнее чем кажется
-- **Lua backend через mlua** (Фаза 9) — Rhai медленнее Lua; нужен второй backend для горячих путей
+- **Lua backend через mlua** (Фаза 9) — миграция с Rhai завершена; осталась полировка и WASM-опция
 - **Явное переиспользование apex-graph для RenderGraph** — DAG уже написан
 - **Sandbox для скриптов** (Фаза 9) — уже частично реализован, нужно довести
 
@@ -422,7 +433,7 @@ App::new()
 | Время загрузки сцены средней сложности | < 500ms |
 | Холодная сборка всего `apex-engine/` | < 90 секунд |
 | Горячая пересборка после изменения одной системы | < 5 секунд |
-| Время hot-reload .rhai скрипта | < 50ms (уже реализован debounce 50ms) |
+| Время hot-reload .lua скрипта | < 50ms (debounce 50ms реализован) |
 | Платформы | Windows, Linux, macOS, WebAssembly |
 | Покрытие тестами `apex-core` | > 80% |
 
@@ -465,8 +476,8 @@ rapier3d    = "0.21"
 # Звук
 kira        = "0.9"
 
-# Скриптинг (rhai уже есть)
-mlua        = { version = "0.9", features = ["lua54", "async"] }
+# Скриптинг
+mlua        = { version = "0.10", features = ["lua54", "vendored"] }
 
 # UI
 egui        = "0.28"
@@ -485,7 +496,6 @@ rustc-hash  = "1.1"
 smallvec    = "1.11"
 rayon       = "1.8"
 serde       = { version = "1", features = ["derive"] }
-rhai        = { version = "1", features = ["sync"] }
 notify      = "6"
 thunderdome = "*"
 thiserror   = "*"

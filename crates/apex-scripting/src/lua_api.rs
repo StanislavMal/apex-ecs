@@ -24,6 +24,8 @@ pub fn register_globals(lua: &mlua::Lua) -> mlua::Result<()> {
     register_resource_api(lua)?;
     register_event_api(lua)?;
     register_log(lua)?;
+    register_log_levels(lua)?;
+    register_inspect(lua)?;
 
     lua.load("math = require('math'); string = require('string'); table = require('table')")
         .exec()?;
@@ -189,4 +191,80 @@ fn register_event_api(lua: &mlua::Lua) -> mlua::Result<()> {
         let result = ctx.borrow_mut().emit_event(lua, static_name, value);
         result
     })?)
+}
+
+// ── log_debug / log_warn / log_error ──────────────────────────
+
+fn register_log_levels(lua: &mlua::Lua) -> mlua::Result<()> {
+    lua.globals().set("log_debug", lua.create_function(|_, msg: String| {
+        log::debug!("[script] {}", msg);
+        Ok(())
+    })?)?;
+    lua.globals().set("log_warn", lua.create_function(|_, msg: String| {
+        log::warn!("[script] {}", msg);
+        Ok(())
+    })?)?;
+    lua.globals().set("log_error", lua.create_function(|_, msg: String| {
+        log::error!("[script] {}", msg);
+        Ok(())
+    })?)
+}
+
+// ── inspect(table) ────────────────────────────────────────────
+
+fn register_inspect(lua: &mlua::Lua) -> mlua::Result<()> {
+    lua.globals().set("inspect", lua.create_function(|lua, val: mlua::Value| {
+        Ok(inspect_value(lua, &val, 0))
+    })?)
+}
+
+fn inspect_value(lua: &mlua::Lua, val: &mlua::Value, depth: usize) -> String {
+    if depth > 4 {
+        return "{...}".to_string();
+    }
+    match val {
+        mlua::Value::Nil => "nil".to_string(),
+        mlua::Value::Boolean(b) => b.to_string(),
+        mlua::Value::Integer(i) => i.to_string(),
+        mlua::Value::Number(n) => format!("{:.4}", n).trim_end_matches('0')
+            .trim_end_matches('.').to_string(),
+        mlua::Value::String(s) => {
+            let s = s.to_string_lossy();
+            format!("\"{}\"", s)
+        }
+        mlua::Value::Table(t) => {
+            let mut parts = Vec::new();
+            let indent = "  ".repeat(depth + 1);
+
+            // Array part (индексы 1..N)
+            let len = t.raw_len();
+            for i in 1..=len {
+                if let Ok(v) = t.get::<mlua::Value>(i) {
+                    parts.push(inspect_value(lua, &v, depth + 1));
+                }
+            }
+            // Hash part (строковые ключи)
+            for pair in t.clone().pairs::<String, mlua::Value>() {
+                if let Ok((k, v)) = pair {
+                    if k == "_meta" { continue; }
+                    let val_str = inspect_value(lua, &v, depth + 1);
+                    parts.push(format!("{} = {}", k, val_str));
+                }
+            }
+
+            if parts.is_empty() {
+                "{}".to_string()
+            } else if parts.len() <= 4 && parts.iter().all(|p| !p.contains('=')) {
+                // Компактный массив
+                format!("{{ {} }}", parts.join(", "))
+            } else {
+                let inner = parts.iter()
+                    .map(|p| format!("{}{}", if p.contains('=') { &indent } else { &indent }, p))
+                    .collect::<Vec<_>>()
+                    .join(",\n");
+                format!("{{\n{}\n{}}}", inner, "  ".repeat(depth))
+            }
+        }
+        _ => "<userdata>".to_string(),
+    }
 }

@@ -99,6 +99,8 @@ struct IterState {
     arch_states: Vec<ArchState>,
     arch_cursor: usize,
     row_cursor:  usize,
+    /// (arch_idx, row, entity_table) — для авто-commit на следующей итерации
+    pending:     Option<(usize, usize, mlua::Table)>,
 }
 
 // ── Построение arch states ─────────────────────────────────────
@@ -226,7 +228,23 @@ pub(crate) fn build_entity_table(
         };
 
         let key = comp.type_name.to_lowercase();
-        t.set(key, val)?;
+        t.set(key.clone(), val)?;
+
+        // Для Read-компонентов: ставим __newindex для предупреждения о модификации
+        if matches!(comp.mode, QueryMode::Read) {
+            if let Ok(sub_table) = t.get::<mlua::Table>(key.as_str()) {
+                let mt = lua.create_table()?;
+                let type_name = comp.type_name.clone();
+                mt.set("__newindex", lua.create_function(move |_, (_t, field, _val): (mlua::Table, String, mlua::Value)| {
+                    log::warn!(
+                        "[script] попытка изменить Read-компонент '{}' (поле '{}') — используй Write:{}",
+                        type_name, field, type_name
+                    );
+                    Ok(())
+                })?)?;
+                sub_table.set_metatable(Some(mt));
+            }
+        }
     }
 
     Ok(t)
@@ -243,7 +261,7 @@ pub(crate) fn commit_entity_table(
     let meta: mlua::Table = match entity_table.get("_meta") {
         Ok(m) => m,
         Err(_) => {
-            log::warn!("commit: no _meta in entity table");
+            log::warn!("commit: таблица не из query (нет _meta), пропущена");
             return Ok(());
         }
     };
@@ -298,10 +316,22 @@ pub(crate) fn create_query_iter_fn(
         arch_states,
         arch_cursor: 0,
         row_cursor:  0,
+        pending:     None,
     }));
 
     lua.create_function(move |lua, ()| {
         let mut st = state.borrow_mut();
+
+        // Авто-commit предыдущей entity (если включён)
+        if let Some((_arch_idx, _row, ref table)) = st.pending.take() {
+            let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
+                .ok_or_else(|| mlua::Error::runtime("no ScriptContext in Lua app data"))?;
+            let ctx_ref = ctx.borrow();
+            if ctx_ref.auto_commit {
+                let world = ctx_ref.world_ref();
+                commit_entity_table(lua, world, &ctx_ref, table)?;
+            }
+        }
 
         loop {
             let arch_state = match st.arch_states.get(st.arch_cursor) {
@@ -333,6 +363,9 @@ pub(crate) fn create_query_iter_fn(
                 row,
                 &components,
             )?;
+
+            // Сохраняем для авто-commit на следующем вызове
+            st.pending = Some((arch_idx, row, table.clone()));
 
             return Ok(mlua::Value::Table(table));
         }

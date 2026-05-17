@@ -141,7 +141,8 @@ impl ScriptEngine {
         // API-функции
         for name in &["delta_time", "entity_count", "query", "commit",
                       "spawn_entity", "despawn", "read_resource", "write_resource",
-                      "emit_event", "log", "print"] {
+                      "emit_event", "log", "print", "log_debug", "log_warn", "log_error",
+                      "inspect"] {
             if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
                 env.set(*name, val)?;
             }
@@ -600,6 +601,13 @@ impl ScriptEngine {
 
     pub fn has_scripts(&self) -> bool {
         !self.scripts.is_empty()
+    }
+
+    /// Включить/выключить авто-commit в query-итераторах.
+    /// Когда включено, `commit(entity)` вызывается автоматически при переходе
+    /// к следующей entity в цикле `for entity in query(...) do ... end`.
+    pub fn set_auto_commit(&mut self, enabled: bool) {
+        self.ctx.borrow_mut().auto_commit = enabled;
     }
 }
 

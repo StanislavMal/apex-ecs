@@ -145,6 +145,7 @@ fn main() {
     println!("Начальное количество entity: {}", world.entity_count());
 
     // Загружаем встроенный скрипт
+    engine.set_auto_commit(true);
     engine.load_script_str("game", GAME_SCRIPT)
         .expect("ошибка компиляции скрипта");
 

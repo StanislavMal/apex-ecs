@@ -3046,15 +3046,31 @@ end
 | Функция | Сигнатура | Описание |
 |---|---|---|
 | `delta_time()` | `→ number` | Текущий dt, переданный в `run()` |
-| `entity_count()` | `→ integer` | Количество entity в мире (кэшированное на начало кадра) |
+| `entity_count()` | `→ integer` | Количество entity в мире (снэпшот на начало `run()`) |
 | `query(descs)` | `→ iterator` | Итерация по компонентам. Возвращает Lua-итератор для `for-in` |
 | `commit(entity)` | — | Записать изменения Write-компонентов обратно в ECS |
-| `spawn_entity(components)` | — | Создать entity с компонентами (отложенно) |
+| `spawn_entity(components)` | — | Создать entity с компонентами (отложенно, **не возвращает индекс**) |
 | `despawn(entity_idx)` | — | Уничтожить entity по индексу |
 | `read_resource("TypeName")` | `→ table` | Прочитать ресурс (Lua таблица) |
 | `write_resource("TypeName", value)` | — | Записать ресурс (отложенно) |
 | `emit_event("TypeName", value)` | — | Отправить событие (отложенно) |
-| `log(message)` / `print(message)` | — | Логирование в `log::info!` |
+| `log(msg)`/`print(msg)` | — | Логирование в `log::info!` |
+| `log_debug(msg)` | — | Логирование в `log::debug!` |
+| `log_warn(msg)` | — | Логирование в `log::warn!` |
+| `log_error(msg)` | — | Логирование в `log::error!` |
+| `inspect(table)` | `→ string` | Рекурсивная сериализация таблицы в читаемую строку |
+
+> **spawn_entity не возвращает индекс:** создание entity отложено до конца `run()`.
+> Нельзя сделать `local e = spawn_entity({...})` и тут же `despawn(e)`.
+> Для удаления используйте `despawn(entity.entity)` из query-итерации.
+>
+> **Авто-commit:** `engine.set_auto_commit(true)` включает автоматический вызов
+> `commit(entity)` при переходе к следующей entity в `for-in` цикле —
+> не нужно писать `commit(entity)` явно.
+>
+> **Read-компоненты защищены:** попытка изменить Read-компонент
+> (`entity.position.x = 5` при `Read:Position`) выводит предупреждение в лог
+> и не применяется.
 
 ### 17.3 Формат query-дескрипторов
 

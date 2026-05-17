@@ -102,6 +102,9 @@ pub struct ScriptContext {
     /// при повторных query() с теми же дескрипторами.
     /// Инвалидируется при каждом новом запуске скрипта (в set_world_ptr).
     pub(crate) query_cache: HashMap<Vec<String>, Vec<crate::iterators::ArchState>>,
+
+    /// Автоматически вызывать commit(entity) при переходе к следующей entity в query-итераторе
+    pub auto_commit: bool,
 }
 
 impl ScriptContext {
@@ -118,6 +121,7 @@ impl ScriptContext {
             deferred_events:         Vec::new(),
             entity_count_cache:      0,
             query_cache:             HashMap::new(),
+            auto_commit:             false,
         }
     }
 
