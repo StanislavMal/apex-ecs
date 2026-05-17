@@ -38,6 +38,7 @@
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи закодированы как компоненты
 - **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
+- **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
 - **Batch API** — `spawn_many` создаёт тысячи entity за один проход
 > **Версия 0.1.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
 ### 1.2 Структура крейтов
@@ -2992,6 +2993,12 @@ struct Gravity(f32);  // ресурс (кортеж-структ)
 #[derive(Clone, Scriptable)]
 struct CollisionEvent { entity: Entity, damage: f32 }  // событие
 
+#[derive(Component, Clone, Scriptable)]
+struct Player;  // unit struct маркер — фильтр With<T>/Without<T>
+
+#[derive(Component, Clone, Scriptable)]
+struct Enemy;   // unit struct маркер
+
 fn main() {
     let mut world = World::new();
 
@@ -3006,10 +3013,21 @@ fn main() {
     engine.load_script_str("game", r#"
 function run()
     local dt = delta_time()
+    -- Движение всех entity с Velocity + Position
     for entity in query({"Read:Velocity", "Write:Position"}) do
         entity.position.x = entity.position.x + entity.velocity.x * dt
         entity.position.y = entity.position.y + entity.velocity.y * dt
         commit(entity)
+    end
+    -- Только игроки (с маркером Player)
+    for entity in query({"Read:Health", "With:Player"}) do
+        if entity.health.current < 50 then
+            -- логика для раненых игроков
+        end
+    end
+    -- Только не-Enemy
+    for entity in query({"Read:Position", "Without:Enemy"}) do
+        -- логика для дружественных entity
     end
 end
     "#).unwrap();
@@ -3041,14 +3059,19 @@ end
 ### 17.3 Формат query-дескрипторов
 
 ```lua
--- query({"Read:ComponentName", "Write:ComponentName"})
--- Read  — иммутабельное чтение
--- Write — мутабельное чтение (требует commit(entity))
+-- query({"Mode:TypeName", ...})
+-- Read    — иммутабельное чтение (значение доступно в entity таблице)
+-- Write   — мутабельное чтение (требует commit(entity))
+-- With    — фильтр: entity должен иметь компонент (значение НЕ возвращается)
+-- Without — фильтр: entity НЕ должен иметь компонент
 
 -- Примеры:
-query({"Read:Position"})                          -- только чтение
-query({"Read:Velocity", "Write:Position"})         -- чтение + запись
-query({"Read:Health", "Read:Position"})            -- множественное чтение
+query({"Read:Position"})                                -- только чтение
+query({"Read:Velocity", "Write:Position"})               -- чтение + запись
+query({"Read:Health", "Read:Position"})                  -- множественное чтение
+query({"Read:Position", "With:Player"})                  -- только entity с Player
+query({"Read:Position", "Without:Enemy"})                -- все кроме Enemy
+query({"Read:Pos", "Write:Vel", "With:Player", "Without:Dead"})  -- комбинированный
 ```
 
 **Синтаксис:** Lua-таблица строк в формате `"Mode:TypeName"`. Без префикса — `Read` по умолчанию.
@@ -3072,6 +3095,12 @@ end
 -- Для кортеж-структур (newtype):
 --   struct Gravity(f32)
 --   entity.gravity._value  -- доступ к значению
+
+-- Для unit struct (маркеров):
+--   struct Player;
+--   struct Enemy;
+--   Используются только как With<T>/Without<T> фильтры
+--   В entity таблице НЕ возвращаются
 ```
 
 ### 17.5 Работа с ресурсами и событиями
@@ -3179,13 +3208,20 @@ loop {
 | `HashMap<String, V>` | `table` (ассоциативный массив) |
 | Named struct | `table` с полями (через `#[derive(Scriptable)]`) |
 | Tuple struct (1 поле) | `{ _value = ... }` (таблица-обёртка) |
+| Unit struct (маркер) | `true` (boolean); фильтр через `With<T>`/`Without<T>` |
 | C-like enum | `table`-неймспейс: `TileKind.Floor = 0`, `TileKind.Wall = 1` |
 
 > **Конструкторы:** Для каждого типа, помеченного `#[derive(Scriptable)]`,
 > в Lua регистрируется таблица-конструктор: `Position.new(x, y) → { x = ..., y = ... }`.
+> Для unit struct (маркеров) — пустая таблица, используется только в `With<T>`/`Without<T>`.
 >
 > **C-like enum:** Константы доступны как поля таблицы: `TileKind.Floor` (без скобок).
 > `#[derive(Scriptable)]` для enum генерирует таблицу `TileKind = { Floor = 0, Wall = 1, ... }`.
+>
+> **Sandbox изоляция:** Каждый скрипт выполняется в изолированном окружении `_ENV`.
+> Доступны только: стандартные библиотеки Lua (`math`, `string`, `table`, ...),
+> API-функции (`delta_time`, `query`, `commit`, ...) и конструкторы зарегистрированных типов.
+> Глобальное окружение Lua недоступно из скриптов.
 
 ### 17.7.1 Ручная реализация `ScriptableRegistrar`
 

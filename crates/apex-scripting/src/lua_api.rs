@@ -63,7 +63,7 @@ fn register_query(lua: &mlua::Lua) -> mlua::Result<()> {
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
 
         let cache_key: Vec<String> = parsed.iter()
-            .map(|d| format!("{}:{}", if d.write { "w" } else { "r" }, d.type_name))
+            .map(|d| format!("{:?}:{}", d.mode, d.type_name))
             .collect();
 
         let arch_states = {

@@ -186,10 +186,7 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
         Data::Struct(s) => match &s.fields {
             Fields::Named(f) => expand_named_struct(ident, &type_name, &f.named),
             Fields::Unnamed(f) => expand_tuple_struct(ident, &type_name, &f.unnamed),
-            Fields::Unit => Err(syn::Error::new_spanned(
-                ident,
-                "#[derive(Scriptable)] не поддерживает struct без полей",
-            )),
+            Fields::Unit => expand_unit_struct(ident, &type_name),
         },
 
         Data::Enum(e) => {
@@ -444,6 +441,47 @@ fn expand_tuple_struct(
             }
         })
     }
+}
+
+/// Unit struct (маркер) → boolean true + регистрация как empty table
+fn expand_unit_struct(
+    ident: &syn::Ident,
+    type_name: &str,
+) -> syn::Result<TokenStream2> {
+    Ok(quote! {
+        impl ::apex_scripting::ScriptableRegistrar for #ident {
+            fn type_name_str() -> &'static str { #type_name }
+            fn field_names() -> &'static [&'static str] { &[] }
+
+            fn to_lua(&self, _lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                Ok(mlua::Value::Boolean(true))
+            }
+
+            fn from_lua(_val: &mlua::Value) -> ::std::option::Option<Self> {
+                ::std::option::Option::Some(Self)
+            }
+
+            fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+                let t = lua.create_table()?;
+                lua.globals().set(#type_name, t)
+            }
+        }
+
+        impl mlua::IntoLua for #ident {
+            fn into_lua(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::to_lua(&self, lua)
+            }
+        }
+
+        impl mlua::FromLua for #ident {
+            fn from_lua(value: mlua::Value, _lua: &mlua::Lua) -> mlua::Result<Self> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::from_lua(&value)
+                    .ok_or_else(|| mlua::Error::runtime(
+                        ::std::format!("cannot convert Lua value to {}", #type_name)
+                    ))
+            }
+        }
+    })
 }
 
 /// C-like enum → таблица-неймспейс в Lua

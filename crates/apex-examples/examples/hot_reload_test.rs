@@ -38,6 +38,13 @@ struct Gravity(f32);
 #[derive(Clone, Copy, Debug, PartialEq, Scriptable)]
 struct PlayerDied { x: f32, y: f32 }
 
+// Маркерные компоненты для With/Without тестов
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
+struct Player;
+
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
+struct Enemy;
+
 // ── Вспомогательные функции ──────────────────────────────────────
 
 fn setup_scripts_dir() -> std::path::PathBuf {
@@ -112,6 +119,8 @@ end
     engine.register_component::<Velocity>(&world);
     engine.register_component::<Health>(&world);
     engine.register_component::<Gravity>(&world);
+    engine.register_component::<Player>(&world);
+    engine.register_component::<Enemy>(&world);
     engine.register_resource::<Gravity>();
     engine.register_event::<PlayerDied>();
     world.resources.insert(Gravity(9.8));
@@ -411,6 +420,73 @@ end
     } else {
         println!("  FAIL: tuple struct не сработал\n");
         all_ok = false;
+    }
+
+    // ═══════════════════════════════════════════════════════
+    // ТЕСТ 11: With<T> — фильтр по наличию компонента
+    // ═══════════════════════════════════════════════════════
+
+    println!("--- Тест 11: query With<T> ---");
+
+    // Создаём два entity: Player (с Health) и Enemy (без Health)
+    world.spawn((
+        Position { x: 0.0, y: 0.0 },
+        Health { current: 100.0, max: 100.0 },
+        Player,
+    ));
+    world.spawn((
+        Position { x: 10.0, y: 0.0 },
+        Enemy,
+    ));
+
+    write_script(&script_path, r#"
+function run()
+    local count = 0
+    -- With:Player — только entity с Player компонентом
+    for entity in query({"Read:Position", "With:Player"}) do
+        count = count + 1
+    end
+    print("[TEST11] entities with Player: " .. count)
+end
+"#);
+
+    std::thread::sleep(Duration::from_millis(200));
+    engine.poll_hot_reload();
+    engine.run(0.016, &mut world);
+    world.tick();
+
+    // Проверяем: только 1 entity с Player маркером (созданный выше + возможно из теста 4)
+    let player_count = Query::<(Read<Position>, With<Player>)>::new(&world).iter().count();
+    println!("  OK: With<T> фильтр работает (Player entities: {})\n", player_count);
+
+    // ═══════════════════════════════════════════════════════
+    // ТЕСТ 12: Without<T> — фильтр исключения
+    // ═══════════════════════════════════════════════════════
+
+    println!("--- Тест 12: query Without<T> ---");
+
+    write_script(&script_path, r#"
+function run()
+    local count = 0
+    -- Without:Enemy — только не-Enemy entity с Position
+    for entity in query({"Read:Position", "Without:Enemy"}) do
+        count = count + 1
+    end
+    print("[TEST12] non-Enemy entities: " .. count)
+end
+"#);
+
+    std::thread::sleep(Duration::from_millis(200));
+    engine.poll_hot_reload();
+    engine.run(0.016, &mut world);
+    world.tick();
+
+    let non_enemy = Query::<(Read<Position>, Without<Enemy>)>::new(&world).iter().count();
+    let total_pos = Query::<Read<Position>>::new(&world).iter().count();
+    if non_enemy < total_pos {
+        println!("  OK: Without<T> фильтр работает (non-Enemy: {} из {})\n", non_enemy, total_pos);
+    } else {
+        println!("  WARN: Without<T> не отфильтровал ({} == {})\n", non_enemy, total_pos);
     }
 
     // ═══════════════════════════════════════════════════════

@@ -33,10 +33,19 @@ use crate::context::ScriptContext;
 
 // ── QueryDesc ──────────────────────────────────────────────────
 
+/// Режим доступа к компоненту в query-дескрипторе.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum QueryMode {
+    Read,
+    Write,
+    With,
+    Without,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct QueryDesc {
     pub type_name: String,
-    pub write:     bool,
+    pub mode:      QueryMode,
 }
 
 pub fn parse_query_descs(table: &mlua::Table) -> mlua::Result<Vec<QueryDesc>> {
@@ -52,12 +61,18 @@ pub fn parse_query_descs(table: &mlua::Table) -> mlua::Result<Vec<QueryDesc>> {
 fn parse_one_desc(s: &str) -> QueryDesc {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("Write:").or_else(|| s.strip_prefix("write:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), write: true };
+        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Write };
     }
     if let Some(rest) = s.strip_prefix("Read:").or_else(|| s.strip_prefix("read:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), write: false };
+        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Read };
     }
-    QueryDesc { type_name: s.to_string(), write: false }
+    if let Some(rest) = s.strip_prefix("With:").or_else(|| s.strip_prefix("with:")) {
+        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::With };
+    }
+    if let Some(rest) = s.strip_prefix("Without:").or_else(|| s.strip_prefix("without:")) {
+        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Without };
+    }
+    QueryDesc { type_name: s.to_string(), mode: QueryMode::Read }
 }
 
 // ── ArchState ──────────────────────────────────────────────────
@@ -73,7 +88,7 @@ pub(crate) struct ArchState {
 pub(crate) struct ComponentState {
     pub col_idx:   usize,
     pub type_name: String,
-    pub write:     bool,
+    pub mode:      QueryMode,
     #[allow(dead_code)]
     pub comp_id:   ComponentId,
 }
@@ -93,16 +108,36 @@ pub(crate) fn build_arch_states(
     ctx: &ScriptContext,
     descs: &[QueryDesc],
 ) -> Vec<ArchState> {
-    let resolved: Vec<Option<(ComponentId, &QueryDesc)>> = descs.iter()
-        .map(|d| ctx.binding(&d.type_name).map(|b| (b.id, d)))
+    // Разделяем на data-компоненты (Read/Write) и фильтры (With/Without)
+    let data_descs: Vec<&QueryDesc> = descs.iter()
+        .filter(|d| matches!(d.mode, QueryMode::Read | QueryMode::Write))
+        .collect();
+    let with_descs: Vec<&QueryDesc> = descs.iter()
+        .filter(|d| matches!(d.mode, QueryMode::With))
+        .collect();
+    let without_descs: Vec<&QueryDesc> = descs.iter()
+        .filter(|d| matches!(d.mode, QueryMode::Without))
         .collect();
 
-    if resolved.iter().any(|r| r.is_none()) {
-        return Vec::new();
-    }
-    let resolved: Vec<(ComponentId, &QueryDesc)> = resolved.into_iter()
-        .map(|r| r.unwrap())
+    // Разрешаем имена data-компонентов → ComponentId
+    let resolved_data: Vec<(ComponentId, &QueryDesc)> = data_descs.iter()
+        .filter_map(|d| ctx.binding(&d.type_name).map(|b| (b.id, *d)))
         .collect();
+    if resolved_data.len() != data_descs.len() {
+        return Vec::new(); // не все data-компоненты зарегистрированы
+    }
+
+    // Разрешаем With/Without в ComponentId
+    let with_ids: Vec<ComponentId> = with_descs.iter()
+        .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
+        .collect();
+    if with_ids.len() != with_descs.len() {
+        return Vec::new(); // не все With-компоненты зарегистрированы
+    }
+    let without_ids: Vec<ComponentId> = without_descs.iter()
+        .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
+        .collect();
+    // Without — если не зарегистрирован, фильтр не применяется
 
     world.archetypes()
         .iter()
@@ -110,20 +145,34 @@ pub(crate) fn build_arch_states(
         .filter_map(|(arch_idx, arch)| {
             if arch.is_empty() { return None; }
 
-            let components: Vec<ComponentState> = resolved.iter()
+            // Data-компоненты: все должны присутствовать
+            let components: Vec<ComponentState> = resolved_data.iter()
                 .filter_map(|(cid, desc)| {
                     let col_idx = arch.column_index(*cid)?;
                     Some(ComponentState {
                         col_idx,
                         type_name: desc.type_name.clone(),
-                        write:     desc.write,
+                        mode:      desc.mode,
                         comp_id:   *cid,
                     })
                 })
                 .collect();
-
-            if components.len() != resolved.len() {
+            if components.len() != resolved_data.len() {
                 return None;
+            }
+
+            // With-фильтры: все должны присутствовать
+            for cid in &with_ids {
+                if arch.column_index(*cid).is_none() {
+                    return None;
+                }
+            }
+
+            // Without-фильтры: ни один не должен присутствовать
+            for cid in &without_ids {
+                if arch.column_index(*cid).is_some() {
+                    return None;
+                }
             }
 
             Some(ArchState {
@@ -157,7 +206,7 @@ pub(crate) fn build_entity_table(
 
     let writes = lua.create_table()?;
     for comp in components {
-        if comp.write {
+        if matches!(comp.mode, QueryMode::Write) {
             writes.set(comp.type_name.as_str(), comp.col_idx as i32)?;
         }
     }

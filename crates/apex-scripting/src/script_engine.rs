@@ -40,6 +40,8 @@ use crate::{
 
 struct CompiledScript {
     chunk_key: mlua::RegistryKey,
+    /// Sandbox-окружение (_ENV) для изоляции скрипта
+    env_key:   mlua::RegistryKey,
     #[allow(dead_code)]
     path: PathBuf,
 }
@@ -60,6 +62,7 @@ pub struct ScriptEngine {
     watch_rx:       Option<mpsc::Receiver<notify::Result<Event>>>,
     last_reload:    HashMap<String, Instant>,
     spawn_appliers: HashMap<String, SpawnApplierFn>,
+    registered_components: Vec<String>,
 }
 
 impl ScriptEngine {
@@ -86,6 +89,7 @@ impl ScriptEngine {
             watch_rx:       None,
             last_reload:    HashMap::new(),
             spawn_appliers: HashMap::new(),
+            registered_components: Vec::new(),
         }
     }
 
@@ -117,6 +121,40 @@ impl ScriptEngine {
 
         this.script_dir = Some(script_dir.to_path_buf());
         this
+    }
+
+    // ── Sandbox ─────────────────────────────────────────────────
+
+    /// Создать изолированное окружение для скрипта.
+    /// Включает стандартные библиотеки Lua, API-функции и конструкторы компонентов.
+    fn make_sandbox_env(&self) -> mlua::Result<mlua::Table> {
+        let env = self.lua.create_table()?;
+
+        // Стандартные библиотеки
+        for name in &["math", "string", "table", "ipairs", "pairs", "next",
+                      "select", "tonumber", "tostring", "type", "unpack"] {
+            if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
+                env.set(*name, val)?;
+            }
+        }
+
+        // API-функции
+        for name in &["delta_time", "entity_count", "query", "commit",
+                      "spawn_entity", "despawn", "read_resource", "write_resource",
+                      "emit_event", "log", "print"] {
+            if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
+                env.set(*name, val)?;
+            }
+        }
+
+        // Конструкторы компонентов (Position.new, Velocity.new, ...)
+        for name in &self.registered_components {
+            if let Ok(val) = self.lua.globals().get::<mlua::Value>(name.as_str()) {
+                env.set(name.as_str(), val)?;
+            }
+        }
+
+        Ok(env)
     }
 
     // ── Регистрация компонентов ────────────────────────────────
@@ -161,6 +199,8 @@ impl ScriptEngine {
         if let Err(e) = T::register_lua_type(&self.lua) {
             log::error!("ScriptEngine: ошибка регистрации {}: {}", T::type_name_str(), e);
         }
+
+        self.registered_components.push(T::type_name_str().to_string());
 
         let type_name_lower = T::type_name_str().to_lowercase();
         self.spawn_appliers.insert(
@@ -216,6 +256,7 @@ impl ScriptEngine {
         if let Err(e) = T::register_lua_type(&self.lua) {
             log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
         }
+        self.registered_components.push(T::type_name_str().to_string());
         log::debug!("ScriptEngine: зарегистрирован ресурс '{}'", T::type_name_str());
     }
 
@@ -245,6 +286,7 @@ impl ScriptEngine {
         if let Err(e) = T::register_lua_type(&self.lua) {
             log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
         }
+        self.registered_components.push(T::type_name_str().to_string());
         log::debug!("ScriptEngine: зарегистрировано событие '{}'", T::type_name_str());
     }
 
@@ -271,9 +313,9 @@ impl ScriptEngine {
                 .to_string();
 
             match self.compile_file(&path) {
-                Ok(chunk_key) => {
+                Ok((chunk_key, env_key)) => {
                     log::info!("ScriptEngine: загружен скрипт '{}'", name);
-                    self.scripts.insert(name.clone(), CompiledScript { chunk_key, path });
+                    self.scripts.insert(name.clone(), CompiledScript { chunk_key, env_key, path });
                     if first_name.is_none() {
                         first_name = Some(name);
                     }
@@ -297,8 +339,18 @@ impl ScriptEngine {
     pub fn load_script_str(&mut self, name: impl Into<String>, code: &str) -> Result<(), ScriptError> {
         let name = name.into();
 
+        let env = self.make_sandbox_env()
+            .map_err(|e| ScriptError::compile(&name, e))?;
+        let env_key = self.lua.create_registry_value(mlua::Value::Table(env))
+            .map_err(|e| ScriptError::runtime(&name, e))?;
+
+        // Пересоздаём env из registry — set_environment забирает владение
+        let env: mlua::Table = self.lua.registry_value(&env_key)
+            .map_err(|e| ScriptError::runtime(&name, e))?;
+
         let chunk = self.lua.load(code)
             .set_name(&name)
+            .set_environment(env)
             .into_function()
             .map_err(|e| ScriptError::compile(&name, e))?;
 
@@ -307,6 +359,7 @@ impl ScriptEngine {
 
         self.scripts.insert(name.clone(), CompiledScript {
             chunk_key,
+            env_key,
             path: PathBuf::from(format!("<{}>", name)),
         });
 
@@ -350,24 +403,28 @@ impl ScriptEngine {
                 }
             };
 
-            // Сначала выполняем чанк — он определяет функции внутри
+            // Выполняем чанк — определяет функции в sandbox _ENV
             if let Err(e) = chunk.call::<()>(()) {
                 log::error!("ScriptEngine: ошибка выполнения '{}': {}", self.active_script, e);
             }
 
-            // Затем вызываем функцию run(), если она определена
-            let run_result: mlua::Result<mlua::Value> = self.lua.globals()
-                .get::<mlua::Function>("run")
-                .and_then(|f| f.call(()));
-
-            match run_result {
-                Ok(_) => {}
+            // Вызываем run() из sandbox-окружения
+            let env: mlua::Table = match self.lua.registry_value(&script.env_key) {
+                Ok(t) => t,
                 Err(e) => {
-                    // run() не определена или ошибка — это нормально
-                    log::debug!(
-                        "ScriptEngine: run() не найдена или ошибка в '{}': {}",
-                        self.active_script, e
-                    );
+                    log::error!("ScriptEngine: не удалось получить sandbox '{}': {}", self.active_script, e);
+                    self.ctx.borrow_mut().clear_world_ptr();
+                    return;
+                }
+            };
+            match env.get::<mlua::Function>("run") {
+                Ok(run_fn) => {
+                    if let Err(e) = run_fn.call::<()>(()) {
+                        log::error!("ScriptEngine: ошибка в run() '{}': {}", self.active_script, e);
+                    }
+                }
+                Err(_) => {
+                    // run() не определена — скрипт без функции, только top-level код (уже выполнен)
                 }
             }
         } else {
@@ -495,8 +552,8 @@ impl ScriptEngine {
         }
 
         match self.compile_file(path) {
-            Ok(chunk_key) => {
-                self.scripts.insert(name, CompiledScript { chunk_key, path: path.to_path_buf() });
+            Ok((chunk_key, env_key)) => {
+                self.scripts.insert(name, CompiledScript { chunk_key, env_key, path: path.to_path_buf() });
             }
             Err(e) => {
                 log::error!("ScriptEngine: ошибка перекомпиляции '{}': {}", name, e);
@@ -506,7 +563,7 @@ impl ScriptEngine {
 
     // ── Вспомогательные ───────────────────────────────────────
 
-    fn compile_file(&self, path: &Path) -> Result<mlua::RegistryKey, ScriptError> {
+    fn compile_file(&self, path: &Path) -> Result<(mlua::RegistryKey, mlua::RegistryKey), ScriptError> {
         let code = std::fs::read_to_string(path)
             .map_err(|e| ScriptError::io(path.to_string_lossy(), e))?;
 
@@ -514,13 +571,23 @@ impl ScriptEngine {
             .and_then(|s| s.to_str())
             .unwrap_or("?");
 
+        let env = self.make_sandbox_env()
+            .map_err(|e| ScriptError::compile(name, e))?;
+        let env_key = self.lua.create_registry_value(mlua::Value::Table(env))
+            .map_err(|e| ScriptError::runtime(name, e))?;
+        let env: mlua::Table = self.lua.registry_value(&env_key)
+            .map_err(|e| ScriptError::runtime(name, e))?;
+
         let chunk = self.lua.load(&code)
             .set_name(name)
+            .set_environment(env)
             .into_function()
             .map_err(|e| ScriptError::compile(name, e))?;
 
-        self.lua.create_registry_value(chunk)
-            .map_err(|e| ScriptError::runtime(name, e))
+        let chunk_key = self.lua.create_registry_value(chunk)
+            .map_err(|e| ScriptError::runtime(name, e))?;
+
+        Ok((chunk_key, env_key))
     }
 
     pub fn script_names(&self) -> impl Iterator<Item = &str> {
