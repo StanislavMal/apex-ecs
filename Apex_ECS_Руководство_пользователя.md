@@ -22,7 +22,7 @@
 14. [Советы по производительности](#14-советы-по-производительности)
 15. [Полный пример](#15-полный-пример)
 16. [Быстрый справочник](#16-быстрый-справочник)
-17. [Rhai Scripting](#17-rhai-scripting)
+17. [Lua Scripting](#17-lua-scripting)
 ---
 
 ## 1. Введение
@@ -49,8 +49,8 @@
 | `apex-graph` | Граф зависимостей: топологическая сортировка, обнаружение циклов |
 | `apex-serialization` | Сериализация мира: WorldSnapshot, snapshot/restore, PrefabManifest, PrefabLoader |
 | `apex-hot-reload` | Горячая перезагрузка: FileWatcher, HotReloadPlugin, PrefabPlugin |
-| `apex-macros` | Процедурные макросы: `#[derive(Component)]` (реализация трейта + авторегистрация), `#[derive(Bundle)]` (бандлы с поддержкой вложенности), `#[derive(Scriptable)]` для интеграции с Rhai-скриптингом |
-| `apex-scripting` | Rhai-скриптинг: ScriptEngine, регистрация компонентов/ресурсов/событий, хот-релоад `.rhai`-скриптов |
+| `apex-macros` | Процедурные макросы: `#[derive(Component)]` (реализация трейта + авторегистрация), `#[derive(Bundle)]` (бандлы с поддержкой вложенности), `#[derive(Scriptable)]` для интеграции с Lua-скриптингом |
+| `apex-scripting` | Lua-скриптинг: ScriptEngine, регистрация компонентов/ресурсов/событий, хот-релоад `.lua`-скриптов |
 | `apex-isolated` | Изолированные ECS-миры: IsolatedWorld, WorldBridge, CloneableBridge |
 
 ### 1.3 Установка
@@ -1843,7 +1843,7 @@ let hierarchy = WorldSerializer::hierarchy_to_prefab(&world, root).unwrap();
 Apex ECS поддерживает три вида горячей перезагрузки:
 
 - **JSON-конфиги** — через `apex-hot-reload` (ресурсы мира)
-- **Rhai-скрипты** — через `apex-scripting` (игровая логика)
+- **Lua-скрипты** — через `apex-scripting` (игровая логика)
 - **Prefab-файлы** — через `PrefabPlugin` (entity и иерархии)
 
 ### 11.1 Hot Reload конфигураций (JSON)
@@ -1933,9 +1933,9 @@ hot.watch_config_with_loader(
 );
 ```
 
-### 11.2 Hot Reload Rhai-скриптов
+### 11.2 Hot Reload Lua-скриптов
 
-`apex-scripting` поддерживает горячую перезагрузку `.rhai`-файлов. При изменении файла на диске скрипт автоматически перекомпилируется и применяется в следующем кадре.
+`apex-scripting` поддерживает горячую перезагрузку `.lua`-файлов. При изменении файла на диске скрипт автоматически перекомпилируется и применяется в следующем кадре.
 
 ```rust
 use apex_scripting::ScriptEngine;
@@ -1951,7 +1951,7 @@ loop {
 }
 ```
 
-Подробнее — в разделе [Rhai Scripting](#17-rhai-scripting).
+Подробнее — в разделе [Lua Scripting](#17-lua-scripting).
 
 ### 11.3 Hot Reload префабов (PrefabPlugin)
 
@@ -2403,11 +2403,11 @@ cmds.apply(world);
 ```
 Подробнее о `Commands` — в [разделе 7](#7-commands-и-deferredqueue).
 
-#### Rhai-скриптинг
+#### Lua-скриптинг
 
-`ScriptEngine` использует `Arc<Mutex<>>` (вместо `Rc<RefCell<>>`) и реализует трейт `Send`. Это позволяет безопасно передавать `ScriptEngine` между потоками при условии внешней синхронизации (например, через `Mutex<ScriptEngine>`).
+`ScriptEngine` использует `Rc<RefCell<>>` и **не** реализует `Send`. Скрипты выполняются в главном потоке через `engine.run(dt, &mut world)`. Для использования внутри планировщика — поместите вызов в `Sequential`-систему.
 
-> **⚠️ Внутренне Rhai остаётся однопоточным.** `ScriptEngine::run()` выполняет скрипт последовательно, без параллелизма. Замена `Rc<RefCell<>>` на `Arc<Mutex<>>` даёт возможность **владения** `ScriptEngine` из другого потока (например, в `Sequential` системе шедулера), но не делает выполнение скрипта многопоточным.
+> **⚠️ Lua-скриптинг однопоточный.** `ScriptEngine::run()` выполняет скрипт последовательно, без параллелизма. `ScriptEngine` не `Send` — он привязан к потоку, в котором создан.
 
 **В `Sequential` системах (рекомендуемый способ):**
 ```rust
@@ -2419,16 +2419,9 @@ impl SequentialSystem for ScriptedSystem {
 }
 ```
 
-**В параллельной системе (`AutoSystem`/`add_par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте (доступен только `SystemContext`):
+**В параллельной системе (`AutoSystem`/`add_par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте.
 
-```rust
-// ❌ НЕПРАВИЛЬНО: engine.run() требует &mut World
-// impl AutoSystem for ScriptedMovement { ... }
-//   self.engine.run(0.016, ctx.world_mut()); // &mut World не существует в SystemContext
-// }
-```
-
-Подробнее — в [разделе 17](#17-rhai-scripting).
+Подробнее — в [разделе 17](#17-lua-scripting).
 
 ---
 
@@ -2662,39 +2655,32 @@ fn main() {
 }
 ```
 
-> **Вариант с Rhai-скриптингом:** Тот же пример, но логика движения вынесена в `.rhai`-скрипт:
+> **Вариант с Lua-скриптингом:** Тот же пример, но логика движения вынесена в `.lua`-скрипт:
 >
 > ```rust
-> use apex_scripting::ScriptEngine;
+> use apex_scripting::{ScriptEngine, WorldScriptingExt};
 > use apex_macros::Scriptable;
 >
-> // Компоненты — добавляем Scriptable для доступа из Rhai
-> #[derive(Clone, Scriptable)]
+> // Компоненты — добавляем Scriptable для доступа из Lua
+> #[derive(Component, Clone, Scriptable)]
 > struct Position { x: f32, y: f32 }
 >
-> #[derive(Clone, Scriptable)]
+> #[derive(Component, Clone, Scriptable)]
 > struct Velocity { x: f32, y: f32 }
 >
-> #[derive(Clone, Scriptable)]
+> #[derive(Component, Clone, Scriptable)]
 > struct Health { current: f32, max: f32 }
 >
-> #[derive(Clone, Scriptable)]
+> #[derive(Component, Clone, Scriptable)]
 > struct Player;
 >
-> #[derive(Clone, Scriptable)]
+> #[derive(Component, Clone, Scriptable)]
 > struct DeltaTime(f32);
 >
 > fn main() {
 >     let mut world = World::new();
 >
->     world.register_component::<Position>();
->     world.register_component::<Velocity>();
->     world.register_component::<Health>();
->     world.register_component::<Player>();
->     world.insert_resource(DeltaTime(0.016));
->
->     // Настройка ScriptEngine — используем WorldScriptingExt
->     use apex_scripting::WorldScriptingExt;
+>     // Настройка ScriptEngine — используем WorldScriptingExt (один вызов)
 >     let mut engine = ScriptEngine::new();
 >     world.register_scriptable::<Position>(&mut engine);
 >     world.register_scriptable::<Velocity>(&mut engine);
@@ -2703,11 +2689,14 @@ fn main() {
 >     world.register_scriptable_resource::<DeltaTime>(&mut engine);
 >
 >     engine.load_script_str("move", r#"
->         let dt = delta_time();
->         for entity in query([Read(Velocity), Write(Position)]) {
->             entity.pos.x += entity.vel.x * dt;
->             entity.pos.y += entity.vel.y * dt;
->         }
+> function run()
+>     local dt = delta_time()
+>     for entity in query({"Read:Velocity", "Write:Position"}) do
+>         entity.position.x = entity.position.x + entity.velocity.x * dt
+>         entity.position.y = entity.position.y + entity.velocity.y * dt
+>         commit(entity)
+>     end
+> end
 >     "#).unwrap();
 >     engine.set_active("move").unwrap();
 >
@@ -2961,55 +2950,52 @@ fn main() {
 | Метод | Описание |
 |---|---|
 | `new()` | Создать ScriptEngine |
-| `with_dir(path)` | Создать ScriptEngine с файловым watcher для `.rhai` |
-| `register_component::<T>(&world)` | Зарегистрировать компонент для доступа из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
-| `register_resource::<T>()` | Зарегистрировать ресурс для доступа из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
-| `register_event::<T>()` | Зарегистрировать событие для отправки из Rhai (низкоуровневый; рекомендуется `WorldScriptingExt`) |
+| `with_dir(path)` | Создать ScriptEngine с файловым watcher для `.lua` |
+| `register_component::<T>(&world)` | Зарегистрировать компонент для доступа из Lua (низкоуровневый; рекомендуется `WorldScriptingExt`) |
+| `register_resource::<T>()` | Зарегистрировать ресурс для доступа из Lua (низкоуровневый; рекомендуется `WorldScriptingExt`) |
+| `register_event::<T>()` | Зарегистрировать событие для отправки из Lua (низкоуровневый; рекомендуется `WorldScriptingExt`) |
 | `load_script_str(name, code)` | Загрузить скрипт из строки |
-| `load_scripts()` | Загрузить все `.rhai`-файлы из директории |
+| `load_scripts()` | Загрузить все `.lua`-файлы из директории |
 | `set_active(name)` | Установить активный скрипт |
 | `run(dt, &mut world)` | Выполнить активный скрипт |
-| `poll_hot_reload()` | Проверить изменения `.rhai`-файлов на диске |
+| `poll_hot_reload()` | Проверить изменения `.lua`-файлов на диске |
 
 ---
 
-## 17. Rhai Scripting
+## 17. Lua Scripting
 
-`apex-scripting` интегрирует скриптовый язык **Rhai** в Apex ECS. Скрипты можно использовать для описания игровой логики, прототипирования и хот-релоада поведения без перекомпиляции Rust.
+`apex-scripting` интегрирует скриптовый язык **Lua 5.4** (через крейт `mlua`) в Apex ECS. Скрипты можно использовать для описания игровой логики, прототипирования и хот-релоада поведения без перекомпиляции Rust.
 
-**Назначение — непроизводительные элементы.** Rhai-скриптинг однопоточный
-внутренне (скрипты выполняются последовательно), и не может выполняться
-в параллельных системах (`AutoSystem`/`add_par_access`). Однако сам `ScriptEngine` теперь
-реализует `Send` и может быть передан в другой поток для выполнения
-в `Sequential`-системе шедулера. Он идеален для
-событийно-ориентированной логики (диалоги, квесты, триггеры), тюнинга
-параметров и быстрого прототипирования. Для CPU-bound обработки тысяч
-сущностей оставайтесь на чистых Rust-системах (`AutoSystem`).
+**Назначение — непроизводительные элементы.** Lua-скриптинг однопоточный внутренне
+(скрипты выполняются последовательно) и не может выполняться в параллельных
+системах (`AutoSystem`/`add_par_access`). `ScriptEngine` привязан к потоку создания
+(не `Send`). Он идеален для событийно-ориентированной логики (диалоги, квесты,
+триггеры), тюнинга параметров и быстрого прототипирования. Для CPU-bound обработки
+тысяч сущностей оставайтесь на чистых Rust-системах (`AutoSystem`).
 
 ### 17.1 Быстрый старт
 
 ```rust
-use apex_scripting::ScriptEngine;
+use apex_scripting::{ScriptEngine, WorldScriptingExt};
 use apex_macros::Scriptable;
 
 // 1. Пометить компоненты, ресурсы и события
-#[derive(Clone, Scriptable)]
+#[derive(Component, Clone, Scriptable)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Scriptable)]
+#[derive(Component, Clone, Scriptable)]
 struct Velocity { x: f32, y: f32 }
 
 #[derive(Clone, Scriptable)]
-struct Gravity(f32);  // ресурс
+struct Gravity(f32);  // ресурс (кортеж-структ)
 
 #[derive(Clone, Scriptable)]
-struct CollisionEvent { entity: Entity }  // событие
+struct CollisionEvent { entity: Entity, damage: f32 }  // событие
 
 fn main() {
     let mut world = World::new();
 
-    // 2. Настроить движок (используем WorldScriptingExt — один вызов вместо двух)
-    use apex_scripting::WorldScriptingExt;
+    // 2. Настроить движок (WorldScriptingExt — один вызов для компонентов)
     let mut engine = ScriptEngine::new();
     world.register_scriptable::<Position>(&mut engine);
     world.register_scriptable::<Velocity>(&mut engine);
@@ -3018,12 +3004,15 @@ fn main() {
 
     // 3. Загрузить скрипт
     engine.load_script_str("game", r#"
-        let dt = delta_time();
-        for entity in query([Read(Velocity), Write(Position)]) {
-            entity.pos.x += entity.vel.x * dt;
-            entity.pos.y += entity.vel.y * dt;
-        }
-    ").unwrap();
+function run()
+    local dt = delta_time()
+    for entity in query({"Read:Velocity", "Write:Position"}) do
+        entity.position.x = entity.position.x + entity.velocity.x * dt
+        entity.position.y = entity.position.y + entity.velocity.y * dt
+        commit(entity)
+    end
+end
+    "#).unwrap();
     engine.set_active("game").unwrap();
 
     // 4. Game loop
@@ -3034,103 +3023,96 @@ fn main() {
 }
 ```
 
-### 17.2 Глобальные функции Rhai
+### 17.2 Глобальные функции Lua
 
 | Функция | Сигнатура | Описание |
 |---|---|---|
-| `delta_time` | `|| → f64` | Текущий dt, переданный в `run()` |
-| `entity_count` | `|| → i64` | Количество entity в мире |
-| `query` | `\|[QueryDesc]\| → Iterator` | Итерация по компонентам |
-| `spawn` | `\|[ComponentValue]\| → Entity` | Создать entity с компонентами |
-| `despawn` | `\|Entity\|` | Уничтожить entity |
-| `read_resource` | `\|type_name\| → Dynamic` | Прочитать ресурс (Rhai Map) |
-| `write_resource` | `\|type_name, value\|` | Записать ресурс |
-| `emit_event` | `\|type_name, value\|` | Отправить событие |
-| `log` | `\|level, message\|` | Логирование (trace/debug/info/warn/error) |
+| `delta_time()` | `→ number` | Текущий dt, переданный в `run()` |
+| `entity_count()` | `→ integer` | Количество entity в мире (кэшированное на начало кадра) |
+| `query(descs)` | `→ iterator` | Итерация по компонентам. Возвращает Lua-итератор для `for-in` |
+| `commit(entity)` | — | Записать изменения Write-компонентов обратно в ECS |
+| `spawn_entity(components)` | — | Создать entity с компонентами (отложенно) |
+| `despawn(entity_idx)` | — | Уничтожить entity по индексу |
+| `read_resource("TypeName")` | `→ table` | Прочитать ресурс (Lua таблица) |
+| `write_resource("TypeName", value)` | — | Записать ресурс (отложенно) |
+| `emit_event("TypeName", value)` | — | Отправить событие (отложенно) |
+| `log(message)` / `print(message)` | — | Логирование в `log::info!` |
 
 ### 17.3 Формат query-дескрипторов
 
-```rust
-// query([Read(ComponentName), Write(ComponentName), With(Marker), Without(Exclude)])
-// Read — иммутабельное чтение
-// Write — мутабельное чтение
-// With — фильтр наличия компонента
-// Without — фильтр отсутствия компонента
+```lua
+-- query({"Read:ComponentName", "Write:ComponentName"})
+-- Read  — иммутабельное чтение
+-- Write — мутабельное чтение (требует commit(entity))
 
-// Примеры:
-query([Read(Position)])                              // только чтение
-query([Read(Velocity), Write(Position)])              // чтение + запись
-query([Read(Health), With(Player)])                   // фильтр по маркеру
-query([Read(Position), Without(Enemy)])               // исключение
-query([Read(Transform), Read(Health), Write(Velocity)]) // множественные компоненты
+-- Примеры:
+query({"Read:Position"})                          -- только чтение
+query({"Read:Velocity", "Write:Position"})         -- чтение + запись
+query({"Read:Health", "Read:Position"})            -- множественное чтение
 ```
+
+**Синтаксис:** Lua-таблица строк в формате `"Mode:TypeName"`. Без префикса — `Read` по умолчанию.
 
 ### 17.4 Структура элемента query
 
-Каждый элемент итератора `query()` — это Rhai Map с полями компонентов, именованными по **snake_case** имени типа:
+Каждый элемент итератора `query()` — это Lua-таблица с полями компонентов, именованными **lowercase** имени типа:
 
-```rust
-// Для компонентов:
-//   struct Velocity { x: f32, y: f32 }
-//   struct Position { x: f32, y: f32 }
-// Поля в Rhai:
-//   entity.vel.x, entity.vel.y, entity.pos.x, entity.pos.y
+```lua
+-- Для компонентов:
+--   struct Velocity { x: f32, y: f32 }
+--   struct Position { x: f32, y: f32 }
+-- Поля в Lua:
+for entity in query({"Read:Velocity", "Write:Position"}) do
+    entity.velocity.x, entity.velocity.y   -- чтение Velocity
+    entity.position.x, entity.position.y   -- чтение/запись Position
+    entity.entity                          -- индекс entity (integer)
+    commit(entity)                         -- записать изменения Position
+end
 
-// Для компонентов-кортежей (ZST или newtype):
-//   struct Gravity(f32);
-//   entity.gravity.0
-
-// Для маркерных компонентов (ZST без полей):
-//   struct Player;
-//   entity.player  // → true (есть компонент)
+-- Для кортеж-структур (newtype):
+--   struct Gravity(f32)
+--   entity.gravity._value  -- доступ к значению
 ```
 
 ### 17.5 Работа с ресурсами и событиями
 
-```rust
-// Запись ресурса:
-write_resource("Gravity", 9.8);
+```lua
+-- Запись ресурса:
+write_resource("Gravity", Gravity.new(1.62))
 
-// Чтение ресурса (возвращает Rhai Map):
-let g = read_resource("Gravity");
-log("info", `gravity value: ${g.0}`);
+-- Чтение ресурса (возвращает Lua таблицу):
+local g = read_resource("Gravity")
+if g._value > 0 then
+    -- используем g._value для newtype-структур
+end
 
-// Отправка события:
-emit_event("CollisionEvent", #{ entity: entity_id });
-
-// Внутренняя архитектура: все write_resource и emit_event
-// буферизуются во время выполнения скрипта и применяются
-// после завершения скрипта — это предотвращает RefCell double-borrow
-// при вызове внутри query()-итерации.
+-- Отправка события:
+emit_event("CollisionEvent", CollisionEvent.new(entity_id, 25.0))
 ```
 
-### 17.5.1 Кэширование запросов в Rhai
+> **Внутренняя архитектура:** `write_resource` и `emit_event` буферизуются во
+> время выполнения скрипта (через `RegistryKey`) и применяются после завершения
+> скрипта — это предотвращает двойной borrow при вызове внутри `query()`-итерации.
 
-Начиная с v0.1.0, повторные вызовы `query()` из Rhai-скрипта с теми же дескрипторами автоматически кэшируются. Это устраняет повторное сканирование всех архетипов при каждом кадре.
+### 17.5.1 Кэширование запросов
 
-```rust
-// Первый вызов — полное сканирование архетипов:
-let entities = query([Read(Velocity), Write(Position)]);
-// Второй вызов с теми же дескрипторами — из кэша (значительно быстрее):
-let entities = query([Read(Velocity), Write(Position)]);
+Повторные вызовы `query()` с теми же дескрипторами автоматически кэшируются.
+Кэш инвалидируется при каждом новом запуске скрипта (`set_world_ptr`).
+
+```lua
+-- Первый вызов — полное сканирование архетипов:
+for entity in query({"Read:Velocity", "Write:Position"}) do ... end
+-- Второй вызов с теми же дескрипторами — из кэша (быстрее):
+for entity in query({"Read:Velocity", "Write:Position"}) do ... end
 ```
-
-> **Как это работает:** `ScriptContext` хранит `query_cache: HashMap<Vec<QueryDesc>, Vec<ArchState>>`. Кэш инвалидируется при каждом новом запуске скрипта. Если состав архетипов не менялся между кадрами — повторный `query()` возвращает закэшированный результат без сканирования мира.
 
 ### 17.5.2 Change Detection после записи компонентов
 
-При модификации компонентов из Rhai-скриптов (через `Write<T>` в query) change ticks корректно обновляются. Это значит, что `Changed<T>` в последующих Rust-системах видит изменения, сделанные скриптами.
+При модификации компонентов через `commit(entity)` change ticks корректно обновляются.
+Это значит, что `Changed<T>` в последующих Rust-системах видит изменения, сделанные скриптами.
 
-```rust
-// Rhai-скрипт изменяет компонент:
-for entity in query([Write(Position)]) {
-    entity.pos.x += 1.0;
-}
-
-// После engine.run(), Rust-система с Changed<Position> увидит это изменение
-```
-
-> **Внутреннее устройство:** В `flush_writes()` при записи компонента вызывается `arch.set_change_tick(row, component_id, world.current_tick())`. Без этого изменения из скриптов не триггерили бы `Changed<T>`.
+> **Внутреннее устройство:** В `commit_entity_table()` при записи компонента
+> вызывается `arch.set_change_tick(row, component_id, world.current_tick())`.
 
 ### 17.5.3 Обработка ошибок
 
@@ -3146,10 +3128,10 @@ engine.run(0.016, &mut world);
 
 | Вариант | Описание |
 |---|---|
-| `ScriptError::Compile` | Ошибка компиляции — синтаксис, неверные типы, неизвестные функции |
-| `ScriptError::Runtime` | Ошибка выполнения — деление на ноль, неверный тип Dynamic, паника в кастомной функции |
+| `ScriptError::Compile` | Ошибка компиляции — синтаксис Lua, неверные типы |
+| `ScriptError::Runtime` | Ошибка выполнения — неверный тип, паника в функции |
 | `ScriptError::NotFound` | Скрипт с указанным именем не найден |
-| `ScriptError::Io` | Ошибка чтения .rhai-файла с диска |
+| `ScriptError::Io` | Ошибка чтения `.lua`-файла с диска |
 | `ScriptError::Watcher` | Ошибка файлового наблюдателя (hot-reload) |
 | `ScriptError::NoScriptDir` | Директория скриптов не задана |
 
@@ -3163,12 +3145,12 @@ match engine.load_script_str("game", code) {
 }
 ```
 
-При хот-релоаде неудачная перекомпиляция **не заменяет** старый AST —
-предыдущая рабочая версия скрипта продолжает использоваться.
+При хот-релоаде неудачная перекомпиляция **не заменяет** старый скрипт —
+предыдущая рабочая версия продолжает использоваться.
 
 ### 17.6 Хот-релоад скриптов
 
-`ScriptEngine` поддерживает горячую перезагрузку `.rhai`-файлов из директории:
+`ScriptEngine` поддерживает горячую перезагрузку `.lua`-файлов из директории:
 
 ```rust
 // Следить за директорией scripts/:
@@ -3182,103 +3164,78 @@ loop {
 }
 ```
 
-При изменении `.rhai`-файла движок автоматически перекомпилирует и применяет новый скрипт. Если компиляция не удалась — старое поведение сохраняется, ошибка пишется в лог.
+При изменении `.lua`-файла движок автоматически перекомпилирует и применяет новый скрипт.
+Если компиляция не удалась — старое поведение сохраняется, ошибка пишется в лог.
 
 ### 17.7 Поддерживаемые типы полей
 
-| Rust тип | В Rhai |
+| Rust тип | В Lua |
 |---|---|
-| `f32`, `f64` | `f64` (число с плавающей точкой) |
-| `i32`, `i64` | `i64` (целое) |
-| `u32`, `u64` | `i64` (целое, беззнаковые конвертируются) |
-| `usize` | `i64` |
-| `bool` | `bool` |
+| `f32`, `f64` | `number` |
+| `i32`, `i64`, `u32`, `u64`, `usize` | `integer` / `number` |
+| `bool` | `boolean` |
 | `String` | `string` |
-| `&'static str` | `string` |
-| `(A, B)` | `[a, b]` (массив из 2 элементов) |
-| `(A, B, C)` | `[a, b, c]` (массив из 3 элементов) |
-| `Option<T>` | `null` или значение типа `T` |
-| `Vec<T>` | `Array` (массив значений типа `T`) |
-| `HashMap<String, V>` | `Map` (ассоциативный массив строк → V) |
-| `enum` (C-like) | `i64` (целочисленный дискриминант; только для вариантов без данных) |
+| `Vec<T>` | `table` (последовательность) |
+| `HashMap<String, V>` | `table` (ассоциативный массив) |
+| Named struct | `table` с полями (через `#[derive(Scriptable)]`) |
+| Tuple struct (1 поле) | `{ _value = ... }` (таблица-обёртка) |
+| C-like enum | `table`-неймспейс: `TileKind.Floor = 0`, `TileKind.Wall = 1` |
 
-> **⚠️ C-like enum константы:** Константы C-like enum (`TileKind_Floor`, `TileKind_Wall`) регистрируются как **функции** Rhai. В скрипте обязательно используйте `TileKind_Floor()` **со скобками**. Без скобок (`TileKind_Floor`) Rhai интерпретирует имя как переменную и выдаст ошибку `Variable not found`.
-
-> **💡 snake_case в spawn_entity:** Ключи в `spawn_entity(#{...})` могут быть как в snake_case (`tile_kind`), так и в PascalCase (`TileKind`). Движок нормализует оба варианта. Это удобно для многословных имён: `my_component: MyComponent(...)`.
-
-> **✅ Vec<T> и HashMap<String, V>** полностью поддерживаются `#[derive(Scriptable)]` — как для именованных полей структур, так и для tuple-структур. Никакого ручного кода не требуется. Макрос автоматически использует `ScriptableField for Vec<T>` и `ScriptableField for HashMap<String, V>`.
-
-> **`Send` + однопоточное выполнение:** `ScriptEngine` использует `Arc<Mutex<>>`
-> (вместо `Rc<RefCell<>>`) благодаря включению фичи `"sync"` в крейт `rhai`.
-> Это делает `ScriptEngine: Send` — его можно передать в другой поток.
-> **Не используйте `ScriptEngine` в параллельных системах (`AutoSystem`/`add_par_access`)** — `run()` требует `&mut World`,
-> что несовместимо с параллельным доступом. Скриптинг предназначен для
-> последовательного выполнения в `Sequential`-системах шедулера или в главном
-> цикле. Внутренне Rhai остаётся однопоточным — скрипты выполняются
-> последовательно.
+> **Конструкторы:** Для каждого типа, помеченного `#[derive(Scriptable)]`,
+> в Lua регистрируется таблица-конструктор: `Position.new(x, y) → { x = ..., y = ... }`.
+>
+> **C-like enum:** Константы доступны как поля таблицы: `TileKind.Floor` (без скобок).
+> `#[derive(Scriptable)]` для enum генерирует таблицу `TileKind = { Floor = 0, Wall = 1, ... }`.
 
 ### 17.7.1 Ручная реализация `ScriptableRegistrar`
 
-`#[derive(Scriptable)]` генерирует реализацию `ScriptableRegistrar` для структур с
-поддерживаемыми типами полей (см. таблицу 17.7). Если ваш компонент содержит
-нестандартные типы, требующие специальной логики конвертации, реализуйте трейт
-вручную:
+`#[derive(Scriptable)]` генерирует реализацию `ScriptableRegistrar` для структур
+с поддерживаемыми типами полей (см. таблицу 17.7). Если ваш компонент содержит
+нестандартные типы, требующие специальной логики конвертации, реализуйте трейт вручную:
 
 ```rust
-use rhai::{Dynamic, Engine, Map};
+use mlua::{Lua, Value};
 use apex_scripting::ScriptableRegistrar;
 
 struct Health { current: f32, max: f32 }
 
 impl ScriptableRegistrar for Health {
     fn type_name_str() -> &'static str { "Health" }
-
     fn field_names() -> &'static [&'static str] { &["current", "max"] }
 
-    fn to_dynamic(&self) -> Dynamic {
-        let mut map = Map::new();
-        map.insert("current".into(), Dynamic::from_float(self.current as f64));
-        map.insert("max".into(),     Dynamic::from_float(self.max as f64));
-        Dynamic::from_map(map)
+    fn to_lua(&self, lua: &Lua) -> mlua::Result<Value> {
+        let t = lua.create_table()?;
+        t.set("current", self.current)?;
+        t.set("max", self.max)?;
+        Ok(Value::Table(t))
     }
 
-    fn from_dynamic(d: &Dynamic) -> Option<Self> {
-        let map = d.read_lock::<Map>()?;
+    fn from_lua(val: &Value) -> Option<Self> {
+        let t = val.as_table()?;
         Some(Self {
-            current: map.get("current")?.as_float().ok()? as f32,
-            max:     map.get("max")?.as_float().ok()? as f32,
+            current: t.get("current").ok()?,
+            max:     t.get("max").ok()?,
         })
     }
 
-    fn register_rhai_type(engine: &mut Engine) {
-        engine.register_fn("Health", |current: f64, max: f64| -> Dynamic {
-            let mut map = Map::new();
-            map.insert("current".into(), Dynamic::from_float(current));
-            map.insert("max".into(),     Dynamic::from_float(max));
-            Dynamic::from_map(map)
-        });
+    fn register_lua_type(lua: &Lua) -> mlua::Result<()> {
+        let t = lua.create_table()?;
+        t.set("new", lua.create_function(|lua, (current, max): (f32, f32)| {
+            let t = lua.create_table()?;
+            t.set("current", current)?;
+            t.set("max", max)?;
+            Ok(t)
+        })?)?;
+        lua.globals().set("Health", t)
     }
 }
 ```
 
-> **💡 Параметры `Dynamic` для Vec/Map:** Если ваш конструктор принимает `Vec<T>` или `HashMap<String, V>`, используйте параметры `Dynamic` вместо типизированных:
-> ```rust
-> fn register_rhai_type(engine: &mut Engine) {
->     engine.register_fn("Tags", |list: rhai::Dynamic| -> rhai::Dynamic {
->         let mut map = rhai::Map::new();
->         map.insert("list".into(), list);
->         rhai::Dynamic::from_map(map)
->     });
-> }
-> ```
-> Причина: Rhai передаёт `Array`/`Map` как `Dynamic`, и если объявить параметр как `Vec<String>`, Rhai не сможет автоматически конвертировать.
-
 **Когда нужна ручная реализация:**
 - Enum с данными (варианты с полями) — макрос поддерживает только C-like enum
-- Нестандартная логика конвертации: например, `HashMap` с ключами не-`String`, вложенные структуры с особым форматом
+- Нестандартная логика конвертации
 - Компонент из внешнего крейта, к которому нельзя добавить `#[derive(Scriptable)]`
-- Нужна кастомная валидация при конвертации `Dynamic → T`
-- Тип имеет внешние зависимости, не реализующие `ScriptableRegistrar`
+- Нужна кастомная валидация при конвертации `Value → T`
 
 ### 17.8 Публичное API apex-core для скриптинга
 
@@ -3290,10 +3247,8 @@ impl ScriptableRegistrar for Health {
 | `world.archetypes()` | Список архетипов для итерации |
 | `world.insert_resource(value)` | Вставить ресурс |
 | `world.try_resource::<T>()` | Безопасное чтение ресурса |
-| `world.try_resource_mut::<T>()` | Безопасное мутабельное чтение |
 | `world.try_send_event(event)` | Безопасная отправка события |
-| `world.events_mut::<T>()` | Мутабельный доступ к очереди событий |
-| `world.resource_raw_ptr::<T>()` | Raw pointer для скриптинга |
+| `world.entity_allocator()` | Доступ к аллокатору entity (поиск по индексу) |
 
 ---
 

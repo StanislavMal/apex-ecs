@@ -1,7 +1,7 @@
 //! `ScriptableRegistrar` — трейт, реализуемый через `#[derive(Scriptable)]`.
 //!
-//! Обеспечивает двустороннее преобразование компонента в/из `rhai::Dynamic`
-//! и регистрацию конструктора в Rhai Engine.
+//! Обеспечивает двустороннее преобразование компонента в/из `mlua::Value`
+//! и регистрацию конструктора в Lua.
 //!
 //! Также содержит `ResourceBinding` — для доступа к глобальным ресурсам из скриптов.
 //!
@@ -15,99 +15,86 @@
 //!
 //!     fn field_names() -> &'static [&'static str] { &["current", "max"] }
 //!
-//!     fn to_dynamic(&self) -> Dynamic {
-//!         let mut map = rhai::Map::new();
-//!         map.insert("current".into(), Dynamic::from_float(self.current as f64));
-//!         map.insert("max".into(),     Dynamic::from_float(self.max as f64));
-//!         Dynamic::from_map(map)
+//!     fn to_lua<'lua>(&self, lua: &'lua mlua::Lua) -> mlua::Result<mlua::Value<'lua>> {
+//!         let t = lua.create_table()?;
+//!         t.set("current", self.current)?;
+//!         t.set("max", self.max)?;
+//!         Ok(mlua::Value::Table(t))
 //!     }
 //!
-//!     fn from_dynamic(d: &Dynamic) -> Option<Self> {
-//!         let lock = d.read_lock::<rhai::Map>()?;
-//!         let current = lock.get("current")?.as_float().ok()? as f32;
-//!         let max     = lock.get("max")?.as_float().ok()? as f32;
+//!     fn from_lua(val: &mlua::Value) -> Option<Self> {
+//!         let t = val.as_table()?;
+//!         let current = t.get::<f32>("current").ok()?;
+//!         let max     = t.get::<f32>("max").ok()?;
 //!         Some(Self { current, max })
 //!     }
 //!
-//!     fn register_rhai_type(engine: &mut Engine) {
-//!         engine.register_fn("Health", |current: f64, max: f64| -> Dynamic {
-//!             let mut map = rhai::Map::new();
-//!             map.insert("current".into(), Dynamic::from_float(current));
-//!             map.insert("max".into(),     Dynamic::from_float(max));
-//!             Dynamic::from_map(map)
-//!         });
+//!     fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+//!         let t = lua.create_table()?;
+//!         t.set("new", lua.create_function(|lua, (current, max): (f32, f32)| {
+//!             let t = lua.create_table()?;
+//!             t.set("current", current)?;
+//!             t.set("max", max)?;
+//!             Ok(t)
+//!         })?)?;
+//!         lua.globals().set("Health", t)
 //!     }
 //! }
 //! ```
 
-use rhai::{Dynamic, Engine};
-use crate::field::PrimitiveInfo;
-
-/// Трейт для компонентов, доступных из Rhai-скриптов.
+/// Трейт для компонентов, доступных из Lua-скриптов.
 ///
 /// Генерируется автоматически через `#[derive(Scriptable)]`.
 /// Можно реализовать вручную для нестандартных типов.
 pub trait ScriptableRegistrar: Sized + 'static {
-    /// Строковое имя типа — используется как ключ в Map внутри query-итератора.
+    /// Строковое имя типа — используется как ключ в таблице внутри query-итератора.
     fn type_name_str() -> &'static str;
 
     /// Имена полей структуры — для документации и отладки.
     fn field_names() -> &'static [&'static str];
 
-    /// Конвертировать значение компонента в Rhai Dynamic Map.
-    ///
-    /// Результат — `rhai::Map` с ключами = именам полей.
-    fn to_dynamic(&self) -> Dynamic;
+    /// Конвертировать значение компонента в mlua::Value (обычно Table).
+    fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value>;
 
-    /// Восстановить компонент из Rhai Dynamic.
+    /// Восстановить компонент из mlua::Value.
     ///
-    /// Возвращает `None` если Dynamic не является Map или поля отсутствуют/имеют
+    /// Возвращает `None` если Value не является Table или поля отсутствуют/имеют
     /// неверный тип. Это штатная ситуация при работе со скриптами.
-    fn from_dynamic(d: &Dynamic) -> Option<Self>;
+    fn from_lua(val: &mlua::Value) -> Option<Self>;
 
-    /// Зарегистрировать конструктор в Rhai Engine.
+    /// Зарегистрировать конструктор типа в глобалах Lua.
     ///
-    /// Регистрирует функцию с именем типа (например, `Position(x, y)`)
-    /// которая возвращает Dynamic Map с полями компонента.
+    /// Например: `Position.new(x, y)`, `TileKind.Floor = 0`
     ///
     /// Вызывается один раз при `ScriptEngine::register_component::<T>()`.
-    fn register_rhai_type(engine: &mut Engine);
-
-    /// Возвращает информацию о примитивном типе, если компонент
-    /// является простой обёрткой над одним примитивным полем.
-    ///
-    /// Если вернуть `Some(...)`, то `build_item()` будет читать значение
-    /// напрямую из Column без создания Dynamic Map, что сокращает аллокации.
-    ///
-    /// По умолчанию — `None` (структурный тип, читается через Map).
-    fn primitive_info() -> Option<PrimitiveInfo> {
-        None
-    }
+    fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()>;
 }
 
 // ── ResourceBinding ─────────────────────────────────────────────
 
-/// Информация о ресурсе, зарегистрированном для доступа из Rhai-скриптов.
+/// Информация о ресурсе, зарегистрированном для доступа из Lua-скриптов.
 ///
 /// Аналогичен `ComponentBinding`, но для глобальных ресурсов (`World.resources`).
+#[derive(Clone)]
 pub struct ResourceBinding {
     /// Строковое имя типа ресурса.
     pub name: &'static str,
-    /// Прочитать ресурс из `&World` → Dynamic.
-    /// Возвращает `None` если ресурс не найден.
-    pub read:   fn(&apex_core::World) -> Option<Dynamic>,
-    /// Записать ресурс в `&mut World` из Dynamic.
+    /// Прочитать ресурс из `&World` → mlua::Value.
+    /// Принимает Lua чтобы создавать таблицы.
+    pub read:   fn(&mlua::Lua, &apex_core::World) -> mlua::Result<mlua::Value>,
+    /// Записать ресурс в `&mut World` из mlua::Value.
     /// Возвращает `false` если тип неверен.
-    pub write:  fn(&mut apex_core::World, &Dynamic) -> bool,
+    pub write:  fn(&mlua::Value, &mut apex_core::World) -> bool,
 }
 
 // ── EventBinding ────────────────────────────────────────────────
 
-/// Информация о событии, зарегистрированном для отправки из Rhai-скриптов.
+/// Информация о событии, зарегистрированном для отправки из Lua-скриптов.
+#[derive(Clone)]
 pub struct EventBinding {
     /// Строковое имя типа события.
     pub name: &'static str,
-    /// Отправить событие в `&mut World` (принимает Dynamic, конвертирует в T).
+    /// Отправить событие в `&mut World` (принимает mlua::Value, конвертирует в T).
     /// Возвращает `false` если событие не зарегистрировано или тип неверен.
-    pub emit: fn(&mut apex_core::World, &Dynamic) -> bool,
+    pub emit: fn(&mlua::Value, &mut apex_core::World) -> bool,
 }

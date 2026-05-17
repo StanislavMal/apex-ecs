@@ -1,13 +1,13 @@
-//! apex-scripting — интеграция Rhai-скриптинга с Apex ECS.
+//! apex-scripting — интеграция Lua-скриптинга с Apex ECS.
 //!
 //! # Архитектура
 //!
 //! ```text
 //! ScriptEngine
-//!   ├── rhai::Engine         — компилятор/исполнитель скриптов
-//!   ├── ScriptContext        — мост World ↔ Rhai (Arc<Mutex<>>)
-//!   ├── HashMap<name, AST>   — скомпилированные скрипты
-//!   └── FileWatcher          — хот-релоад .rhai файлов
+//!   ├── mlua::Lua             — Lua 5.4 VM
+//!   ├── ScriptContext         — мост World ↔ Lua (Rc<RefCell<>>)
+//!   ├── HashMap<name, RegistryKey> — скомпилированные скрипты
+//!   └── FileWatcher           — хот-релоад .lua файлов
 //!
 //! ScriptContext
 //!   ├── delta_time: f32
@@ -35,7 +35,7 @@
 //! engine.register_component::<Position>(&world);
 //! engine.register_component::<Velocity>(&world);
 //!
-//! // Загрузка .rhai файлов
+//! // Загрузка .lua файлов
 //! engine.load_scripts().expect("ошибка загрузки скриптов");
 //!
 //! // Game loop
@@ -46,36 +46,38 @@
 //! }
 //! ```
 //!
-//! # Пример скрипта (scripts/game.rhai)
+//! # Пример скрипта (scripts/game.lua)
 //!
-//! ```rhai
-//! fn run() {
-//!     let dt = delta_time();
+//! ```lua
+//! function run()
+//!     local dt = delta_time()
 //!
-//!     for entity in query(["Read:Position", "Write:Velocity"]) {
-//!         entity.velocity.x *= 0.99;
-//!         entity.velocity.y *= 0.99;
-//!         entity.position.x += entity.velocity.x * dt;
-//!         entity.position.y += entity.velocity.y * dt;
-//!     }
+//!     for entity in query({"Read:Position", "Write:Velocity"}) do
+//!         entity.velocity.x = entity.velocity.x * 0.99
+//!         entity.velocity.y = entity.velocity.y * 0.99
+//!         entity.position.x = entity.position.x + entity.velocity.x * dt
+//!         entity.position.y = entity.position.y + entity.velocity.y * dt
+//!         commit(entity)
+//!     end
 //!
-//!     if entity_count() < 10 {
-//!         spawn_entity(#{ position: Position(0.0, 0.0), velocity: Velocity(1.0, 0.5) });
-//!     }
-//! }
+//!     if entity_count() < 10 then
+//!         spawn_entity({
+//!             position = Position.new(0.0, 0.0),
+//!             velocity = Velocity.new(1.0, 0.5),
+//!         })
+//!     end
+//! end
 //! ```
 
 pub mod context;
 pub mod error;
-pub mod field;
 pub mod iterators;
+pub mod lua_api;
 pub mod registrar;
-pub mod rhai_api;
 pub mod script_engine;
 
 pub use context::ScriptContext;
 pub use error::ScriptError;
-pub use field::ScriptableField;
 pub use registrar::ScriptableRegistrar;
 pub use script_engine::ScriptEngine;
 
@@ -123,7 +125,6 @@ impl WorldScriptingExt for World {
     where
         T: ScriptableRegistrar + Send + Sync + 'static,
     {
-        // Ресурс уже вставлен пользователем через world.resources.insert(...)
         engine.register_resource::<T>();
     }
 

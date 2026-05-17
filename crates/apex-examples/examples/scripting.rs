@@ -1,4 +1,4 @@
-//! apex-examples: Rhai scripting integration
+//! apex-examples: Lua scripting integration
 //!
 //! Демонстрирует:
 //! - `#[derive(Scriptable)]` — регистрация компонентов для скриптов
@@ -18,11 +18,11 @@ use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 // ── Компоненты ─────────────────────────────────────────────────────────────
 //
 // #[derive(Scriptable)] генерирует ScriptableRegistrar:
-//   - Position(x, y) конструктор в Rhai
-//   - query(["Read:Position"]) распознаёт компонент
-//   - entity.position.x читается/пишется через Dynamic Map
-//   - Vec<T> → rhai::Array, HashMap<String, V> → rhai::Map
-//   - C-like enum → i64
+//   - Position.new(x, y) конструктор в Lua
+//   - query({"Read:Position"}) распознаёт компонент
+//   - entity.position.x читается/пишется через Lua таблицу
+//   - Vec<T> → Lua таблица, HashMap<String, V> → Lua таблица
+//   - C-like enum → таблица-неймспейс (TileKind.Floor = 0)
 
 #[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Position { x: f32, y: f32 }
@@ -33,78 +33,80 @@ struct Velocity { x: f32, y: f32 }
 #[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Health { current: f32, max: f32 }
 
-// Компонент с Vec<String> — конвертируется в rhai::Array
+// Компонент с Vec<String> — конвертируется в Lua таблицу
 #[derive(Component, Clone, Debug, Scriptable)]
 struct Tags {
     list: Vec<String>,
 }
 
-// Компонент с HashMap<String, f32> — конвертируется в rhai::Map
+// Компонент с HashMap<String, f32> — конвертируется в Lua таблицу
 #[derive(Component, Clone, Debug, Scriptable)]
 struct Stats {
     values: HashMap<String, f32>,
 }
 
-// C-like enum — конвертируется в i64, константы TileKind_Floor и т.д.
+// C-like enum — конвертируется в Lua таблицу-неймспейс
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
 enum TileKind { Floor, Wall, Water }
 
 // ── Скрипт ────────────────────────────────────────────────────────────────
 
 const GAME_SCRIPT: &str = r#"
-fn run() {
-    let dt = delta_time();
+function run()
+    local dt = delta_time()
 
-    // Движение: Position += Velocity * dt
-    for entity in query(["Read:Velocity", "Write:Position"]) {
-        entity.position.x += entity.velocity.x * dt;
-        entity.position.y += entity.velocity.y * dt;
-    }
+    -- Движение: Position += Velocity * dt
+    for entity in query({"Read:Velocity", "Write:Position"}) do
+        entity.position.x = entity.position.x + entity.velocity.x * dt
+        entity.position.y = entity.position.y + entity.velocity.y * dt
+        commit(entity)
+    end
 
-    // Урон по HP
-    for entity in query(["Write:Health"]) {
-        entity.health.current -= 0.5 * dt;
-    }
+    -- Урон по HP
+    for entity in query({"Write:Health"}) do
+        entity.health.current = entity.health.current - 0.5 * dt
+        commit(entity)
+    end
 
-    // Чтение Vec<String> (rhai::Array) из компонента Tags
-    for entity in query(["Read:Tags"]) {
-        print(`Entity ${entity.entity} tags: ${entity.tags.list}`);
-    }
+    -- Чтение Vec<String> из компонента Tags
+    for entity in query({"Read:Tags"}) do
+        print("Entity " .. entity.entity .. " tags: " .. tostring(entity.tags.list))
+    end
 
-    // Чтение HashMap<String, f32> (rhai::Map) из компонента Stats
-    for entity in query(["Read:Stats"]) {
-        if entity.stats.values["hp"] > 50.0 {
-            print(`Entity ${entity.entity} has high HP`);
-        }
-    }
+    -- Чтение HashMap<String, f32> из компонента Stats
+    for entity in query({"Read:Stats"}) do
+        if entity.stats.values["hp"] > 50.0 then
+            print("Entity " .. entity.entity .. " has high HP")
+        end
+    end
 
-    // Сравнение C-like enum (TileKind = i64)
-    for entity in query(["Read:TileKind"]) {
-        if entity.tile_kind == TileKind_Wall() {
-            print(`Entity ${entity.entity} is a wall`);
-        }
-    }
+    -- Сравнение C-like enum (TileKind = таблица-неймспейс)
+    for entity in query({"Read:TileKind"}) do
+        if entity.tilekind == TileKind.Wall then
+            print("Entity " .. entity.entity .. " is a wall")
+        end
+    end
 
-    // Спавн если мало entity
-    if entity_count() < 5 {
-        spawn_entity(#{
-            position: Position(0.0, 0.0),
-            velocity: Velocity(1.0, 0.5),
-            health:   Health(100.0, 100.0),
-            tags:     Tags(["enemy", "boss"]),
-            stats:    Stats(#{ "hp": 100.0, "mp": 50.0 }),
-            tile_kind: TileKind_Floor(),
-        });
-        print(`Spawned entity, total: ${entity_count()}`);
-    }
+    -- Спавн если мало entity
+    if entity_count() < 5 then
+        spawn_entity({
+            position = Position.new(0.0, 0.0),
+            velocity = Velocity.new(1.0, 0.5),
+            health   = Health.new(100.0, 100.0),
+            tags     = Tags.new({"enemy", "boss"}),
+            stats    = Stats.new({ hp = 100.0, mp = 50.0 }),
+            tilekind = TileKind.Floor,
+        })
+        print("Spawned entity, total: " .. entity_count())
+    end
 
-    // Деспавн мёртвых
-    for entity in query(["Read:Health"]) {
-        if entity.health.current <= 0.0 {
-            despawn(entity.entity);
-        }
-    }
-}
+    -- Деспавн мёртвых
+    for entity in query({"Read:Health"}) do
+        if entity.health.current <= 0.0 then
+            despawn(entity.entity)
+        end
+    end
+end
 "#;
 
 fn main() {
@@ -113,7 +115,7 @@ fn main() {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    println!("=== Apex ECS — Rhai Scripting ===\n");
+    println!("=== Apex ECS — Lua Scripting ===\n");
 
     // ── Мир + ScriptEngine ──────────────────────────────────────
 
@@ -171,11 +173,11 @@ fn main() {
     //
     //   loop {
     //       engine.poll_hot_reload();          // проверяет изменения файлов
-    //       engine.run(dt, &mut world);        // выполняет fn run()
+    //       engine.run(dt, &mut world);        // выполняет function run()
     //       world.tick();
     //   }
     //
-    // При сохранении .rhai файла в редакторе — скрипт перезагружается
+    // При сохранении .lua файла в редакторе — скрипт перезагружается
     // автоматически без перезапуска игры.
 
     println!("\n=== Завершено ===");

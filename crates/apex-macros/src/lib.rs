@@ -43,11 +43,14 @@
 //! struct Position { x: f32, y: f32 }
 //! ```
 //!
-//! - `ScriptableRegistrar::to_dynamic(&self)` — struct → rhai::Map
-//! - `ScriptableRegistrar::from_dynamic(d)` — rhai::Map → struct (Option)
-//! - `ScriptableRegistrar::register_rhai_type(engine)` — конструктор `Position(x, y)` в Rhai
+//! - `ScriptableRegistrar::to_lua(&self, lua)` — struct → mlua::Table
+//! - `ScriptableRegistrar::from_lua(val)` — mlua::Table → struct (Option)
+//! - `ScriptableRegistrar::register_lua_type(lua)` — конструктор `Position.new(x, y)` в Lua
 //! - `ScriptableRegistrar::field_names()` — список имён полей
 //! - `ScriptableRegistrar::type_name_str()` — имя типа как &'static str
+//!
+//! Также генерирует `IntoLua` и `FromLua` для типа,
+//! чтобы поля компонента могли использоваться с `table.set()` напрямую.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -208,7 +211,7 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
     }
 }
 
-/// Struct с именованными полями → rhai::Map
+/// Struct с именованными полями → mlua::Table
 fn expand_named_struct(
     ident: &syn::Ident,
     type_name: &str,
@@ -228,71 +231,80 @@ fn expand_named_struct(
 
     let n_fields = field_idents.len();
 
-    let to_dynamic_stmts = field_idents.iter().zip(field_names.iter()).map(|(fi, fn_)| {
+    let to_lua_stmts = field_idents.iter().zip(field_names.iter()).map(|(fi, fn_)| {
         quote! {
-            map.insert(
-                #fn_.into(),
-                <_ as apex_scripting::ScriptableField>::to_dynamic(&self.#fi),
-            );
+            t.set(#fn_, self.#fi.clone())?;
         }
     });
 
-    let from_dynamic_stmts = field_idents.iter()
+    let from_lua_stmts = field_idents.iter()
         .zip(field_names.iter())
         .zip(field_types.iter())
         .map(|((fi, fn_), ft)| {
             quote! {
-                let #fi: #ft = {
-                    let v = map.get(#fn_)?;
-                    <#ft as apex_scripting::ScriptableField>::from_dynamic(v)?
-                };
+                let #fi: #ft = t.get(#fn_).ok()?;
             }
         });
 
-    let struct_fields   = field_idents.iter().map(|fi| quote! { #fi });
+    let struct_fields = field_idents.iter().map(|fi| quote! { #fi });
     let field_names_arr = field_names.iter().map(|n| quote! { #n });
 
-    // Параметры Dynamic для register_fn: arg_0: Dynamic, arg_1: Dynamic, ...
+    // Параметры для конструктора Lua: (f0, f1, ...): (Type0, Type1, ...)
     let reg_arg_names: Vec<syn::Ident> = (0..n_fields)
-        .map(|i| syn::Ident::new(&format!("arg_{}", i), proc_macro2::Span::call_site()))
+        .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
         .collect();
-    let reg_params = reg_arg_names.iter().map(|a| quote! { #a: rhai::Dynamic });
     let reg_inserts = reg_arg_names.iter().zip(field_names.iter()).map(|(a, fn_)| {
         quote! {
-            map.insert(#fn_.into(), #a);
+            t.set(#fn_, #a)?;
         }
     });
 
     Ok(quote! {
-        impl apex_scripting::ScriptableRegistrar for #ident {
+        impl ::apex_scripting::ScriptableRegistrar for #ident {
             fn type_name_str() -> &'static str { #type_name }
             fn field_names() -> &'static [&'static str] { &[#(#field_names_arr),*] }
 
-            fn to_dynamic(&self) -> rhai::Dynamic {
-                let mut map = rhai::Map::new();
-                #(#to_dynamic_stmts)*
-                rhai::Dynamic::from_map(map)
+            fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                let t = lua.create_table()?;
+                #(#to_lua_stmts)*
+                Ok(mlua::Value::Table(t))
             }
 
-            fn from_dynamic(d: &rhai::Dynamic) -> ::std::option::Option<Self> {
-                let lock = d.read_lock::<rhai::Map>()?;
-                let map: &rhai::Map = &*lock;
-                #(#from_dynamic_stmts)*
+            fn from_lua(val: &mlua::Value) -> ::std::option::Option<Self> {
+                let t = val.as_table()?;
+                #(#from_lua_stmts)*
                 ::std::option::Option::Some(Self { #(#struct_fields),* })
             }
 
-            fn register_rhai_type(engine: &mut rhai::Engine) {
-                engine.register_fn(#type_name, |#(#reg_params),*| -> rhai::Dynamic {
-                    let mut map = rhai::Map::new();
+            fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+                let t = lua.create_table()?;
+                t.set("new", lua.create_function(|lua, (#(#reg_arg_names),*): (#(#field_types),*)| {
+                    let t = lua.create_table()?;
                     #(#reg_inserts)*
-                    rhai::Dynamic::from_map(map)
-                });
+                    Ok(t)
+                })?)?;
+                lua.globals().set(#type_name, t)
+            }
+        }
+
+        impl mlua::IntoLua for #ident {
+            fn into_lua(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::to_lua(&self, lua)
+            }
+        }
+
+        impl mlua::FromLua for #ident {
+            fn from_lua(value: mlua::Value, _lua: &mlua::Lua) -> mlua::Result<Self> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::from_lua(&value)
+                    .ok_or_else(|| mlua::Error::runtime(
+                        ::std::format!("cannot convert Lua value to {}", #type_name)
+                    ))
             }
         }
     })
 }
 
-/// Tuple struct (например `struct Gravity(f32)`) → scalar или Array
+/// Tuple struct (например `struct Gravity(f32)`) → scalar
 fn expand_tuple_struct(
     ident: &syn::Ident,
     type_name: &str,
@@ -310,45 +322,66 @@ fn expand_tuple_struct(
     let field_types: Vec<&Type> = unnamed_fields.iter().map(|f| &f.ty).collect();
 
     if field_count == 1 {
-        // Одиночное поле → скалярное значение (не Map)
+        // Одиночное поле → таблица { _value = ... } (консистентно с конструктором)
         let ft = &field_types[0];
         Ok(quote! {
-            impl apex_scripting::ScriptableRegistrar for #ident {
+            impl ::apex_scripting::ScriptableRegistrar for #ident {
                 fn type_name_str() -> &'static str { #type_name }
                 fn field_names() -> &'static [&'static str] { &["0"] }
 
-                fn to_dynamic(&self) -> rhai::Dynamic {
-                    <#ft as apex_scripting::ScriptableField>::to_dynamic(&self.0)
+                fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                    let t = lua.create_table()?;
+                    t.set("_value", self.0.clone())?;
+                    Ok(mlua::Value::Table(t))
                 }
 
-                fn from_dynamic(d: &rhai::Dynamic) -> ::std::option::Option<Self> {
-                    let v = <#ft as apex_scripting::ScriptableField>::from_dynamic(d)?;
-                    ::std::option::Option::Some(Self(v))
+                fn from_lua(val: &mlua::Value) -> ::std::option::Option<Self> {
+                    let t = val.as_table()?;
+                    let inner: #ft = t.get("_value").ok()?;
+                    ::std::option::Option::Some(Self(inner))
                 }
 
-                fn register_rhai_type(engine: &mut rhai::Engine) {
-                    engine.register_fn(#type_name, |a: rhai::Dynamic| -> rhai::Dynamic { a });
+                fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+                    let t = lua.create_table()?;
+                    t.set("new", lua.create_function(|lua, v: #ft| {
+                        let t = lua.create_table()?;
+                        t.set("_value", v)?;
+                        Ok(t)
+                    })?)?;
+                    lua.globals().set(#type_name, t)
+                }
+            }
+
+            impl mlua::IntoLua for #ident {
+                fn into_lua(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                    <Self as ::apex_scripting::ScriptableRegistrar>::to_lua(&self, lua)
+                }
+            }
+
+            impl mlua::FromLua for #ident {
+                fn from_lua(value: mlua::Value, _lua: &mlua::Lua) -> mlua::Result<Self> {
+                    <Self as ::apex_scripting::ScriptableRegistrar>::from_lua(&value)
+                        .ok_or_else(|| mlua::Error::runtime(
+                            ::std::format!("cannot convert Lua value to {}", #type_name)
+                        ))
                 }
             }
         })
     } else {
-        // Несколько полей → rhai::Array
-        let to_dynamic_stmts = (0..field_count).map(|i| {
+        // Несколько полей → таблица с позиционными ключами
+        let to_lua_stmts = (0..field_count).map(|i| {
             let fi = syn::Index::from(i);
-            let ft = field_types[i];
+            let key = i.to_string();
             quote! {
-                arr.push(<#ft as apex_scripting::ScriptableField>::to_dynamic(&self.#fi));
+                t.set(#key, self.#fi.clone())?;
             }
         });
 
-        let from_dynamic_stmts = (0..field_count).map(|i| {
+        let from_lua_stmts = (0..field_count).zip(field_types.iter()).map(|(i, ft)| {
             let fi = syn::Index::from(i);
-            let ft = field_types[i];
+            let key = i.to_string();
             quote! {
-                let #fi: #ft = {
-                    let v = arr.get(#i)?;
-                    <#ft as apex_scripting::ScriptableField>::from_dynamic(v)?
-                };
+                let #fi: #ft = t.get(#key).ok()?;
             }
         });
 
@@ -358,89 +391,124 @@ fn expand_tuple_struct(
         });
 
         let reg_arg_names: Vec<syn::Ident> = (0..field_count)
-            .map(|i| syn::Ident::new(&format!("arg_{}", i), proc_macro2::Span::call_site()))
+            .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
             .collect();
-        let reg_params = reg_arg_names.iter().map(|a| quote! { #a: rhai::Dynamic });
-        let reg_inserts = reg_arg_names.iter().map(|a| {
+        let reg_inserts = reg_arg_names.iter().enumerate().map(|(i, a)| {
+            let key = i.to_string();
             quote! {
-                arr.push(#a);
+                t.set(#key, #a)?;
             }
         });
 
         Ok(quote! {
-            impl apex_scripting::ScriptableRegistrar for #ident {
+            impl ::apex_scripting::ScriptableRegistrar for #ident {
                 fn type_name_str() -> &'static str { #type_name }
-                fn field_names() -> &'static [&'static str] { &[#(#field_types),*] }
+                fn field_names() -> &'static [&'static str] { &[#(::std::stringify!(#field_types)),*] }
 
-                fn to_dynamic(&self) -> rhai::Dynamic {
-                    let mut arr = rhai::Array::new();
-                    #(#to_dynamic_stmts)*
-                    rhai::Dynamic::from_array(arr)
+                fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                    let t = lua.create_table()?;
+                    #(#to_lua_stmts)*
+                    Ok(mlua::Value::Table(t))
                 }
 
-                fn from_dynamic(d: &rhai::Dynamic) -> ::std::option::Option<Self> {
-                    let lock = d.read_lock::<rhai::Array>()?;
-                    let arr: &rhai::Array = &*lock;
-                    #(#from_dynamic_stmts)*
+                fn from_lua(val: &mlua::Value) -> ::std::option::Option<Self> {
+                    let t = val.as_table()?;
+                    #(#from_lua_stmts)*
                     ::std::option::Option::Some(Self(#(#struct_fields),*))
                 }
 
-                fn register_rhai_type(engine: &mut rhai::Engine) {
-                    engine.register_fn(#type_name, |#(#reg_params),*| -> rhai::Dynamic {
-                        let mut arr = rhai::Array::new();
+                fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+                    let t = lua.create_table()?;
+                t.set("new", lua.create_function(|lua, (#(#reg_arg_names),*): (#(#field_types),*)| {
+                        let t = lua.create_table()?;
                         #(#reg_inserts)*
-                        rhai::Dynamic::from_array(arr)
-                    });
+                        Ok(t)
+                    })?)?;
+                    lua.globals().set(#type_name, t)
+                }
+            }
+
+            impl mlua::IntoLua for #ident {
+                fn into_lua(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                    <Self as ::apex_scripting::ScriptableRegistrar>::to_lua(&self, lua)
+                }
+            }
+
+            impl mlua::FromLua for #ident {
+                fn from_lua(value: mlua::Value, _lua: &mlua::Lua) -> mlua::Result<Self> {
+                    <Self as ::apex_scripting::ScriptableRegistrar>::from_lua(&value)
+                        .ok_or_else(|| mlua::Error::runtime(
+                            ::std::format!("cannot convert Lua value to {}", #type_name)
+                        ))
                 }
             }
         })
     }
 }
 
-/// C-like enum → конвертация в i64
+/// C-like enum → таблица-неймспейс в Lua
+///
+/// ```lua
+/// -- Генерируется: TileKind = { Floor = 0, Wall = 1, Water = 2 }
+/// TileKind.Floor  -- число 0
+/// ```
 fn expand_c_like_enum(
     ident: &syn::Ident,
     type_name: &str,
     variants: &syn::punctuated::Punctuated<syn::Variant, syn::token::Comma>,
 ) -> syn::Result<TokenStream2> {
     let variant_idents: Vec<&syn::Ident> = variants.iter().map(|v| &v.ident).collect();
+    let variant_names: Vec<String> = variant_idents.iter().map(|v| v.to_string()).collect();
 
-    // Собираем match-ветки вида: 0 => Some(Self::Floor), 1 => Some(Self::Wall), ...
-    // Используем i64 значения, чтобы тип совпадал с d.as_int() -> Option<i64>
-    let from_dynamic_arms: Vec<TokenStream2> = variant_idents.iter().enumerate().map(|(i, v)| {
+    let from_lua_arms: Vec<TokenStream2> = variant_idents.iter().enumerate().map(|(i, v)| {
         let vi = i as i64;
         quote! { #vi => ::std::option::Option::Some(Self::#v) }
     }).collect();
 
-    // Регистрируем константные функции: TileKind_Floor, TileKind_Wall, ...
-    let reg_fns: Vec<TokenStream2> = variant_idents.iter().enumerate().map(|(i, v)| {
-        let vi = i as i64;
-        let fn_name = format!("{}_{}", type_name, v.to_string());
+    let reg_entries: Vec<TokenStream2> = variant_names.iter().enumerate().map(|(i, n)| {
+        let vi = i as i32;
         quote! {
-            engine.register_fn(#fn_name, || -> rhai::Dynamic { rhai::Dynamic::from_int(#vi) });
+            t.set(#n, #vi)?;
         }
     }).collect();
 
     Ok(quote! {
-        impl apex_scripting::ScriptableRegistrar for #ident {
+        impl ::apex_scripting::ScriptableRegistrar for #ident {
             fn type_name_str() -> &'static str { #type_name }
 
             fn field_names() -> &'static [&'static str] { &[] }
 
-            fn to_dynamic(&self) -> rhai::Dynamic {
-                rhai::Dynamic::from_int(*self as i64)
+            fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                Ok(mlua::Value::Integer(*self as i32 as mlua::Integer))
             }
 
-            fn from_dynamic(d: &rhai::Dynamic) -> ::std::option::Option<Self> {
-                let val: i64 = d.as_int().ok()?;
-                match val {
-                    #(#from_dynamic_arms),*,
+            fn from_lua(val: &mlua::Value) -> ::std::option::Option<Self> {
+                let v: i32 = val.as_i32()?;
+                match v as i64 {
+                    #(#from_lua_arms),*,
                     _ => ::std::option::Option::None,
                 }
             }
 
-            fn register_rhai_type(engine: &mut rhai::Engine) {
-                #(#reg_fns)*
+            fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
+                let t = lua.create_table()?;
+                #(#reg_entries)*
+                lua.globals().set(#type_name, t)
+            }
+        }
+
+        impl mlua::IntoLua for #ident {
+            fn into_lua(self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::to_lua(&self, lua)
+            }
+        }
+
+        impl mlua::FromLua for #ident {
+            fn from_lua(value: mlua::Value, _lua: &mlua::Lua) -> mlua::Result<Self> {
+                <Self as ::apex_scripting::ScriptableRegistrar>::from_lua(&value)
+                    .ok_or_else(|| mlua::Error::runtime(
+                        ::std::format!("cannot convert Lua value to {}", #type_name)
+                    ))
             }
         }
     })

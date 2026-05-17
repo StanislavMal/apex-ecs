@@ -1,11 +1,12 @@
-//! `ScriptEngine` — центральная точка управления Rhai-скриптингом.
+//! `ScriptEngine` — центральная точка управления Lua-скриптингом.
 //!
 //! # Жизненный цикл
 //!
 //! ```text
-//! ScriptEngine::new(script_dir)
-//!   └── build_api(&world)         ← регистрирует компоненты и глобальные функции
-//!       └── load_scripts()        ← компилирует все .rhai файлы
+//! ScriptEngine::new()
+//!   └── lua.globals().set(...)    ← регистрация API функций
+//!   └── register_component::<T>() ← регистрация компонентов
+//!       └── load_scripts()        ← компилирует все .lua файлы
 //!
 //! // Game loop:
 //! loop {
@@ -14,31 +15,17 @@
 //!     world.tick();
 //! }
 //! ```
-//!
-//! # Хот-релоад
-//!
-//! При изменении `.rhai` файла:
-//! 1. `poll_hot_reload()` обнаруживает изменение через `notify`
-//! 2. Перечитывает и перекомпилирует файл
-//! 3. Атомарно заменяет AST в `HashMap` (следующий `run()` использует новый)
-//!
-//! # Spawn из скрипта
-//!
-//! Spawn реализован через `SpawnRequest` + `DeferredSpawnQueue`:
-//! - Скрипт вызывает `spawn(#{ position: Position(0.0, 0.0) })`
-//! - `SpawnRequest` накапливается в `ScriptContext.spawn_requests`
-//! - После завершения скрипта `apply_deferred_spawns()` применяет их к миру
-//! - Это исключает UB от мутации мира внутри query-итератора
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Mutex},
+    rc::Rc,
+    sync::mpsc,
     time::{Duration, Instant},
 };
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use rhai::{Dynamic, Engine, AST};
 
 use apex_core::world::World;
 
@@ -46,67 +33,51 @@ use crate::{
     context::{ComponentBinding, ScriptContext, SpawnRequest},
     error::ScriptError,
     registrar::{EventBinding, ResourceBinding, ScriptableRegistrar},
-    rhai_api,
+    lua_api,
 };
 
 // ── CompiledScript ─────────────────────────────────────────────
 
 struct CompiledScript {
-    ast:  AST,
+    chunk_key: mlua::RegistryKey,
     #[allow(dead_code)]
     path: PathBuf,
 }
 
 // ── SpawnApplier ───────────────────────────────────────────────
 
-/// Функция применения одного SpawnRequest к миру.
-///
-/// Хранится в движке и позволяет применять spawn без статической типизации.
-/// Каждый вызов `register_component::<T>()` добавляет обработчик для T.
-type SpawnApplierFn = Box<dyn Fn(&str, &rhai::Dynamic, apex_core::Entity, &mut World)>;
+type SpawnApplierFn = Box<dyn Fn(&str, &mlua::Value, apex_core::Entity, &mut World)>;
 
 // ── ScriptEngine ───────────────────────────────────────────────
 
-/// Управление Rhai-скриптами: компиляция, выполнение, хот-релоад.
 pub struct ScriptEngine {
-    engine:         Engine,
-    ctx:            Arc<Mutex<ScriptContext>>,
+    lua:            mlua::Lua,
+    ctx:            Rc<RefCell<ScriptContext>>,
     scripts:        HashMap<String, CompiledScript>,
     active_script:  String,
     script_dir:     Option<PathBuf>,
     watcher:        Option<Box<dyn Watcher>>,
     watch_rx:       Option<mpsc::Receiver<notify::Result<Event>>>,
-    /// Для debounce хот-релоада: имя_скрипта → время последней перезагрузки
     last_reload:    HashMap<String, Instant>,
-    /// Обработчики spawn: type_name → fn(dynamic, entity, world)
     spawn_appliers: HashMap<String, SpawnApplierFn>,
-    /// Накопленные spawn-запросы (перемещаются из ctx после run)
-    spawn_queue:    Vec<SpawnRequest>,
 }
 
 impl ScriptEngine {
     // ── Конструктор ────────────────────────────────────────────
 
-    /// Создать ScriptEngine без директории скриптов.
-    ///
-    /// Использование: `engine.load_script_str("main", code)` для
-    /// встроенных скриптов (тесты, конфиги в памяти).
     pub fn new() -> Self {
-        let ctx = Arc::new(Mutex::new(ScriptContext::new()));
+        let lua = mlua::Lua::new();
 
-        let mut engine = Engine::new();
+        let ctx = Rc::new(RefCell::new(ScriptContext::new()));
 
-        // Ограничения безопасности — для игрового скриптинга
-        engine.set_max_expr_depths(64, 32);
-        engine.set_max_call_levels(32);
-        engine.set_max_operations(u64::MAX); // без ограничения операций в игре
+        if let Err(e) = lua_api::register_globals(&lua) {
+            log::error!("ScriptEngine: ошибка регистрации Lua API: {}", e);
+        }
 
-        // Регистрируем глобальные API-функции
-        rhai_api::register_globals(&mut engine, Arc::clone(&ctx));
-        rhai_api::register_log(&mut engine);
+        lua.set_app_data(ctx.clone());
 
         Self {
-            engine,
+            lua,
             ctx,
             scripts:        HashMap::new(),
             active_script:  String::new(),
@@ -115,14 +86,9 @@ impl ScriptEngine {
             watch_rx:       None,
             last_reload:    HashMap::new(),
             spawn_appliers: HashMap::new(),
-            spawn_queue:    Vec::new(),
         }
     }
 
-    /// Создать ScriptEngine с директорией скриптов и файловым наблюдателем.
-    ///
-    /// При создании запускает `notify::Watcher` на `script_dir`.
-    /// Ошибки наблюдателя логируются, но не паникуют — хот-релоад опционален.
     pub fn with_dir(script_dir: &Path) -> Self {
         let mut this = Self::new();
 
@@ -155,27 +121,10 @@ impl ScriptEngine {
 
     // ── Регистрация компонентов ────────────────────────────────
 
-    /// Зарегистрировать компонент T для доступа из скриптов.
-    ///
-    /// Необходимо: T должен реализовывать `ScriptableRegistrar` (через `#[derive(Scriptable)]`).
-    /// `world` используется для получения `ComponentId`.
-    ///
-    /// После регистрации:
-    /// - Конструктор `TypeName(args...)` доступен в Rhai
-    /// - `query(["Read:TypeName", ...])` распознаёт компонент
-    /// - `spawn(#{ type_name: TypeName(...) })` может создавать entity с T
-    ///
-    /// # Пример
-    ///
-    /// ```ignore
-    /// world.register_component::<Position>();
-    /// engine.register_component::<Position>(&world);
-    /// ```
     pub fn register_component<T>(&mut self, world: &World)
     where
         T: ScriptableRegistrar + apex_core::component::Component,
     {
-        // 1. Получаем ComponentId из реестра мира
         let comp_id = match world.registry().get_id::<T>() {
             Some(id) => id,
             None => {
@@ -189,62 +138,48 @@ impl ScriptEngine {
             }
         };
 
-        // 2. Строим binding с type-erased read/write функциями
         let binding = ComponentBinding {
             name: T::type_name_str(),
             id:   comp_id,
-            read: |ptr: *const u8| -> rhai::Dynamic {
-                // SAFETY: вызывающий (RhaiQueryIter::build_item) гарантирует
-                // что ptr указывает на живой T в Column.
+            read: |ptr: *const u8, lua: &mlua::Lua| -> mlua::Result<mlua::Value> {
                 let val = unsafe { &*(ptr as *const T) };
-                val.to_dynamic()
+                val.to_lua(lua)
             },
-            write: |ptr: *mut u8, dynamic: &rhai::Dynamic| -> bool {
-                // SAFETY: вызывающий (RhaiQueryIter::flush_writes) гарантирует
-                // что ptr указывает на живой T в Column.
-                if let Some(new_val) = T::from_dynamic(dynamic) {
+            write: |ptr: *mut u8, value: &mlua::Value| -> bool {
+                if let Some(new_val) = T::from_lua(value) {
                     unsafe { *(ptr as *mut T) = new_val; }
                     true
                 } else {
-                    log::warn!(
-                        "flush_writes: не удалось конвертировать Dynamic в {}",
-                        T::type_name_str()
-                    );
+                    log::warn!("commit: не удалось конвертировать Lua value в {}", T::type_name_str());
                     false
                 }
             },
-            primitive_info: T::primitive_info(),
         };
 
-        self.ctx.lock().unwrap().add_binding(binding);
+        self.ctx.borrow_mut().add_binding(binding);
 
-        // 3. Регистрируем конструктор в Rhai Engine (Position(x, y) → Dynamic)
-        T::register_rhai_type(&mut self.engine);
+        if let Err(e) = T::register_lua_type(&self.lua) {
+            log::error!("ScriptEngine: ошибка регистрации {}: {}", T::type_name_str(), e);
+        }
 
-        // 4. Регистрируем spawn-обработчик для T
         let type_name_lower = T::type_name_str().to_lowercase();
         self.spawn_appliers.insert(
             type_name_lower.clone(),
-            Box::new(move |_key: &str, dynamic: &rhai::Dynamic, entity: apex_core::Entity, world: &mut World| {
-                if let Some(component) = T::from_dynamic(dynamic) {
+            Box::new(move |_key: &str, val: &mlua::Value, entity: apex_core::Entity, world: &mut World| {
+                if let Some(component) = T::from_lua(val) {
                     world.insert(entity, component);
                 } else {
-                    log::warn!(
-                        "spawn: не удалось конвертировать Dynamic в {} для entity {:?}",
-                        T::type_name_str(),
-                        entity
-                    );
+                    log::warn!("spawn: не удалось конвертировать Lua value в {}", T::type_name_str());
                 }
             }),
         );
 
-        // Также регистрируем по точному имени типа (без lowercase)
         let exact_name = T::type_name_str().to_string();
         if exact_name.to_lowercase() != exact_name {
             self.spawn_appliers.insert(
                 exact_name,
-                Box::new(move |_key: &str, dynamic: &rhai::Dynamic, entity: apex_core::Entity, world: &mut World| {
-                    if let Some(component) = T::from_dynamic(dynamic) {
+                Box::new(move |_key: &str, val: &mlua::Value, entity: apex_core::Entity, world: &mut World| {
+                    if let Some(component) = T::from_lua(val) {
                         world.insert(entity, component);
                     }
                 }),
@@ -256,96 +191,65 @@ impl ScriptEngine {
 
     // ── Регистрация ресурсов ───────────────────────────────────
 
-    /// Зарегистрировать ресурс T для доступа из скриптов.
-    ///
-    /// После регистрации:
-    /// - `read_resource("TypeName")` возвращает Dynamic Map с полями
-    /// - `write_resource("TypeName", value)` записывает ресурс
-    ///
-    /// # Пример
-    ///
-    /// ```ignore
-    /// world.resources.insert(Gravity(9.8));
-    /// engine.register_resource::<Gravity>();
-    /// ```
     pub fn register_resource<T>(&mut self)
     where
         T: ScriptableRegistrar + Send + Sync,
     {
         let binding = ResourceBinding {
             name: T::type_name_str(),
-            read: |world: &World| -> Option<Dynamic> {
-                let res = world.resources.try_get::<T>()?;
-                Some(res.to_dynamic())
+            read: |lua: &mlua::Lua, world: &World| -> mlua::Result<mlua::Value> {
+                let res = world.resources.try_get::<T>()
+                    .ok_or_else(|| mlua::Error::runtime(format!("resource '{}' not found", T::type_name_str())))?;
+                res.to_lua(lua)
             },
-            write: |world: &mut World, value: &Dynamic| -> bool {
-                if let Some(new_val) = T::from_dynamic(value) {
+            write: |value: &mlua::Value, world: &mut World| -> bool {
+                if let Some(new_val) = T::from_lua(value) {
                     world.resources.insert(new_val);
                     true
                 } else {
-                    log::warn!(
-                        "write_resource: не удалось конвертировать Dynamic в {}",
-                        T::type_name_str()
-                    );
+                    log::warn!("write_resource: не удалось конвертировать Lua value в {}", T::type_name_str());
                     false
                 }
             },
         };
-        self.ctx.lock().unwrap().add_resource_binding(binding);
+        self.ctx.borrow_mut().add_resource_binding(binding);
+        if let Err(e) = T::register_lua_type(&self.lua) {
+            log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
+        }
         log::debug!("ScriptEngine: зарегистрирован ресурс '{}'", T::type_name_str());
     }
 
     // ── Регистрация событий ────────────────────────────────────
 
-    /// Зарегистрировать событие T для отправки из скриптов.
-    ///
-    /// После регистрации:
-    /// - `emit_event("TypeName", value)` отправляет событие
-    ///
-    /// # Пример
-    ///
-    /// ```ignore
-    /// world.add_event::<PlayerDied>();
-    /// engine.register_event::<PlayerDied>();
-    /// ```
     pub fn register_event<T>(&mut self)
     where
         T: ScriptableRegistrar + Send + Sync,
     {
         let binding = EventBinding {
             name: T::type_name_str(),
-            emit: |world: &mut World, value: &Dynamic| -> bool {
-                if let Some(event) = T::from_dynamic(value) {
+            emit: |value: &mlua::Value, world: &mut World| -> bool {
+                if let Some(event) = T::from_lua(value) {
                     if world.try_send_event(event) {
                         true
                     } else {
-                        log::warn!(
-                            "emit_event: событие '{}' не зарегистрировано в world (вызовите world.add_event::<{}>())",
-                            T::type_name_str(),
-                            T::type_name_str(),
-                        );
+                        log::warn!("emit_event: событие '{}' не зарегистрировано в world", T::type_name_str());
                         false
                     }
                 } else {
-                    log::warn!(
-                        "emit_event: не удалось конвертировать Dynamic в {}",
-                        T::type_name_str()
-                    );
+                    log::warn!("emit_event: не удалось конвертировать Lua value в {}", T::type_name_str());
                     false
                 }
             },
         };
-        self.ctx.lock().unwrap().add_event_binding(binding);
+        self.ctx.borrow_mut().add_event_binding(binding);
+        if let Err(e) = T::register_lua_type(&self.lua) {
+            log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
+        }
         log::debug!("ScriptEngine: зарегистрировано событие '{}'", T::type_name_str());
     }
 
     // ── Загрузка скриптов ──────────────────────────────────────
 
-    /// Загрузить и скомпилировать все `.rhai` файлы из директории скриптов.
-    ///
-    /// Первый найденный файл становится активным скриптом.
-    /// При ошибке компиляции — возвращает `ScriptError::Compile`, остальные файлы
-    /// продолжают загружаться.
     pub fn load_scripts(&mut self) -> Result<(), ScriptError> {
         let script_dir = self.script_dir.clone().ok_or(ScriptError::NoScriptDir)?;
 
@@ -356,7 +260,7 @@ impl ScriptEngine {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+            if path.extension().and_then(|e| e.to_str()) != Some("lua") {
                 continue;
             }
 
@@ -367,9 +271,9 @@ impl ScriptEngine {
                 .to_string();
 
             match self.compile_file(&path) {
-                Ok(ast) => {
+                Ok(chunk_key) => {
                     log::info!("ScriptEngine: загружен скрипт '{}'", name);
-                    self.scripts.insert(name.clone(), CompiledScript { ast, path });
+                    self.scripts.insert(name.clone(), CompiledScript { chunk_key, path });
                     if first_name.is_none() {
                         first_name = Some(name);
                     }
@@ -390,14 +294,19 @@ impl ScriptEngine {
         Ok(())
     }
 
-    /// Загрузить скрипт из строки (для тестов и встроенных скриптов).
     pub fn load_script_str(&mut self, name: impl Into<String>, code: &str) -> Result<(), ScriptError> {
         let name = name.into();
-        let ast = self.engine.compile(code)
+
+        let chunk = self.lua.load(code)
+            .set_name(&name)
+            .into_function()
             .map_err(|e| ScriptError::compile(&name, e))?;
 
+        let chunk_key = self.lua.create_registry_value(chunk)
+            .map_err(|e| ScriptError::runtime(&name, e))?;
+
         self.scripts.insert(name.clone(), CompiledScript {
-            ast,
+            chunk_key,
             path: PathBuf::from(format!("<{}>", name)),
         });
 
@@ -408,7 +317,6 @@ impl ScriptEngine {
         Ok(())
     }
 
-    /// Установить активный скрипт (по имени без расширения).
     pub fn set_active(&mut self, name: impl Into<String>) -> Result<(), ScriptError> {
         let name = name.into();
         if self.scripts.contains_key(&name) {
@@ -421,95 +329,69 @@ impl ScriptEngine {
 
     // ── Выполнение ─────────────────────────────────────────────
 
-    /// Выполнить активный скрипт за один кадр.
-    ///
-    /// # Порядок выполнения
-    ///
-    /// 1. Устанавливает `world_ptr` и `delta_time` в контекст
-    /// 2. Вызывает `fn run()` скрипта
-    /// 3. Сбрасывает `world_ptr` (исключает use-after-free)
-    /// 4. Применяет отложенные команды (despawn из скрипта)
-    /// 5. Применяет накопленные spawn-запросы
-    ///
-    /// Ошибки выполнения логируются и не паникуют (игра не должна падать).
     pub fn run(&mut self, dt: f32, world: &mut World) {
         if self.active_script.is_empty() {
             return;
         }
 
-        // Устанавливаем контекст
         {
-            let mut ctx = self.ctx.lock().unwrap();
+            let mut ctx = self.ctx.borrow_mut();
             ctx.delta_time = dt;
-            // SAFETY: world живёт всё время выполнения этого метода.
-            // clear_world_ptr() вызывается до любого возврата.
             unsafe { ctx.set_world_ptr(world); }
         }
 
-        // Выполняем скрипт
-        let result = if let Some(script) = self.scripts.get(&self.active_script) {
-            // Пытаемся вызвать fn run(). Если её нет — выполняем весь скрипт.
-            // iter_fn_def приватный, поэтому используем call_fn и проверяем ошибку.
-            let call_result = self.engine.call_fn::<()>(
-                &mut rhai::Scope::new(),
-                &script.ast,
-                "run",
-                (),
-            );
-            match call_result {
-                Ok(()) => Ok(()),
+        if let Some(script) = self.scripts.get(&self.active_script) {
+            let chunk: mlua::Function = match self.lua.registry_value(&script.chunk_key) {
+                Ok(f) => f,
                 Err(e) => {
-                    // Если функция не найдена — выполняем весь AST
-                    if matches!(e.as_ref(), rhai::EvalAltResult::ErrorFunctionNotFound(fn_name, _) if fn_name == "run") {
-                        self.engine.eval_ast::<()>(&script.ast)
-                            .map_err(|e| ScriptError::runtime(&self.active_script, e))
-                    } else {
-                        Err(ScriptError::runtime(&self.active_script, e))
-                    }
+                    log::error!("ScriptEngine: не удалось получить chunk '{}': {}", self.active_script, e);
+                    self.ctx.borrow_mut().clear_world_ptr();
+                    return;
+                }
+            };
+
+            // Сначала выполняем чанк — он определяет функции внутри
+            if let Err(e) = chunk.call::<()>(()) {
+                log::error!("ScriptEngine: ошибка выполнения '{}': {}", self.active_script, e);
+            }
+
+            // Затем вызываем функцию run(), если она определена
+            let run_result: mlua::Result<mlua::Value> = self.lua.globals()
+                .get::<mlua::Function>("run")
+                .and_then(|f| f.call(()));
+
+            match run_result {
+                Ok(_) => {}
+                Err(e) => {
+                    // run() не определена или ошибка — это нормально
+                    log::debug!(
+                        "ScriptEngine: run() не найдена или ошибка в '{}': {}",
+                        self.active_script, e
+                    );
                 }
             }
         } else {
             log::warn!("ScriptEngine::run: активный скрипт '{}' не найден", self.active_script);
+            self.ctx.borrow_mut().clear_world_ptr();
             return;
-        };
-
-        if let Err(e) = result {
-            log::error!("ScriptEngine: ошибка выполнения: {}", e);
         }
 
-        // Применяем отложенные despawn-команды
-        // (spawn-запросы обрабатываются отдельно через apply_spawn_queue)
-        // ВАЖНО: apply_deferred вызывается ДО clear_world_ptr, т.к. внутри
-        // использует world_mut() который требует world_ptr.
-        self.ctx.lock().unwrap().apply_deferred();
+        self.ctx.borrow_mut().apply_deferred();
 
-        // Применяем отложенные записи ресурсов и отправки событий
-        // (буферизированы чтобы избежать RefCell double-borrow при вызове
-        // write_resource/emit_event внутри query()-итерации)
-        self.ctx.lock().unwrap().apply_deferred_resources_and_events();
-
-        // Сбрасываем world_ptr после применения всех deferred-команд
-        self.ctx.lock().unwrap().clear_world_ptr();
-
-        // Перемещаем spawn-запросы из ScriptContext.deferred_spawns в self.spawn_queue
         {
-            let ctx = self.ctx.lock().unwrap();
-            let spawns = std::mem::take(&mut *ctx.deferred_spawns.lock().unwrap());
-            self.spawn_queue.extend(spawns);
+            let mut ctx = self.ctx.borrow_mut();
+            ctx.apply_deferred_resources_and_events(&self.lua);
         }
 
-        // Применяем накопленные spawn-запросы
-        // (извлекаем из ctx чтобы не держать borrow во время apply)
+        self.ctx.borrow_mut().clear_world_ptr();
+
         self.apply_spawn_queue(world);
     }
 
-    /// Применить накопленные spawn-запросы к миру.
     fn apply_spawn_queue(&mut self, world: &mut World) {
-        // Drain из ctx
         let requests: Vec<SpawnRequest> = {
-            // SpawnRequest'ы помещаются в spawn_queue через специальный механизм.
-            // Пока он не реализован полностью — spawn через Commands будет работать.
-            std::mem::take(&mut self.spawn_queue)
+            let mut ctx = self.ctx.borrow_mut();
+            std::mem::take(&mut ctx.deferred_spawns)
         };
 
         for req in requests {
@@ -518,21 +400,30 @@ impl ScriptEngine {
                 continue;
             }
 
-            // Создаём entity и добавляем компоненты по одному
             let entity = world.spawn(());
-            for (key, dynamic) in &req.components {
-                let key_lower = key.to_lowercase();
-                // Также пробуем без подчёркиваний, чтобы tile_kind → tilekind → TileKind
-                let key_no_underscore: String = key_lower.chars()
-                    .filter(|c| *c != '_')
-                    .collect();
-                // Ищем обработчик: lower → no_underscore → оригинал → lower без underscore
-                let applier = self.spawn_appliers.get(&key_lower)
-                    .or_else(|| self.spawn_appliers.get(&key_no_underscore))
-                    .or_else(|| self.spawn_appliers.get(key.as_str()));
 
+            let appliers: Vec<(String, Option<&SpawnApplierFn>)> = req.components.iter()
+                .map(|(key, _)| {
+                    let key_lower = key.to_lowercase();
+                    let key_no_underscore: String = key_lower.chars().filter(|c| *c != '_').collect();
+                    let applier = self.spawn_appliers.get(&key_lower)
+                        .or_else(|| self.spawn_appliers.get(&key_no_underscore))
+                        .or_else(|| self.spawn_appliers.get(key.as_str()));
+                    (key.clone(), applier)
+                })
+                .collect();
+
+            for ((key, reg_key), (_, applier)) in req.components.into_iter().zip(appliers.iter()) {
                 if let Some(applier) = applier {
-                    applier(key, dynamic, entity, world);
+                    let val: mlua::Value = match self.lua.registry_value(&reg_key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::warn!("spawn: не удалось извлечь значение для '{}': {}", key, e);
+                            continue;
+                        }
+                    };
+                    applier(&key, &val, entity, world);
+                    let _ = self.lua.remove_registry_value(reg_key);
                 } else {
                     log::warn!("spawn: нет обработчика для компонента '{}'", key);
                 }
@@ -542,23 +433,18 @@ impl ScriptEngine {
 
     // ── Хот-релоад ─────────────────────────────────────────────
 
-    /// Проверить изменения файлов и перекомпилировать при необходимости.
-    ///
-    /// Вызывай каждый кадр перед `run()`.
-    /// Не блокирует — использует неблокирующий `try_recv`.
     pub fn poll_hot_reload(&mut self) {
         let rx = match &self.watch_rx {
             Some(rx) => rx,
             None     => return,
         };
 
-        // Собираем все ожидающие события (без блокировки)
         let mut changed_paths: Vec<PathBuf> = Vec::new();
 
         loop {
             match rx.try_recv() {
                 Ok(Ok(event)) => {
-                    if is_rhai_modify_event(&event) {
+                    if is_lua_modify_event(&event) {
                         changed_paths.extend(event.paths);
                     }
                 }
@@ -573,7 +459,6 @@ impl ScriptEngine {
             }
         }
 
-        // Дедупликация путей (один файл может прийти несколько раз)
         changed_paths.sort();
         changed_paths.dedup();
 
@@ -586,7 +471,6 @@ impl ScriptEngine {
                 None    => continue,
             };
 
-            // DEBOUNCE: если файл перезагружался менее 50ms назад — пропускаем
             if let Some(last) = self.last_reload.get(&name) {
                 if now.duration_since(*last) < debounce {
                     continue;
@@ -605,47 +489,48 @@ impl ScriptEngine {
         };
 
         if !self.scripts.contains_key(&name) {
-            // Новый файл — загружаем
             log::info!("ScriptEngine: новый скрипт '{}'", name);
         } else {
             log::info!("ScriptEngine: перезагрузка скрипта '{}'", name);
         }
 
         match self.compile_file(path) {
-            Ok(ast) => {
-                self.scripts.insert(name, CompiledScript { ast, path: path.to_path_buf() });
+            Ok(chunk_key) => {
+                self.scripts.insert(name, CompiledScript { chunk_key, path: path.to_path_buf() });
             }
             Err(e) => {
                 log::error!("ScriptEngine: ошибка перекомпиляции '{}': {}", name, e);
-                // Оставляем старую версию — не заменяем при ошибке
             }
         }
     }
 
     // ── Вспомогательные ───────────────────────────────────────
 
-    fn compile_file(&self, path: &Path) -> Result<AST, ScriptError> {
+    fn compile_file(&self, path: &Path) -> Result<mlua::RegistryKey, ScriptError> {
         let code = std::fs::read_to_string(path)
             .map_err(|e| ScriptError::io(path.to_string_lossy(), e))?;
 
-        self.engine.compile(&code)
-            .map_err(|e| ScriptError::compile(
-                path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
-                e,
-            ))
+        let name = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("?");
+
+        let chunk = self.lua.load(&code)
+            .set_name(name)
+            .into_function()
+            .map_err(|e| ScriptError::compile(name, e))?;
+
+        self.lua.create_registry_value(chunk)
+            .map_err(|e| ScriptError::runtime(name, e))
     }
 
-    /// Список загруженных скриптов.
     pub fn script_names(&self) -> impl Iterator<Item = &str> {
         self.scripts.keys().map(|s| s.as_str())
     }
 
-    /// Имя активного скрипта.
     pub fn active_script(&self) -> &str {
         &self.active_script
     }
 
-    /// Есть ли хотя бы один загруженный скрипт.
     pub fn has_scripts(&self) -> bool {
         !self.scripts.is_empty()
     }
@@ -657,11 +542,11 @@ impl Default for ScriptEngine {
 
 // ── Вспомогательные функции ────────────────────────────────────
 
-fn is_rhai_modify_event(event: &Event) -> bool {
+fn is_lua_modify_event(event: &Event) -> bool {
     match event.kind {
         EventKind::Modify(_) | EventKind::Create(_) => {
             event.paths.iter().any(|p| {
-                p.extension().and_then(|e| e.to_str()) == Some("rhai")
+                p.extension().and_then(|e| e.to_str()) == Some("lua")
             })
         }
         _ => false,

@@ -1,301 +1,102 @@
-//! Rhai-совместимые итераторы для `query()` и `reader()`.
+//! Lua-совместимые итераторы для `query()`.
 //!
 //! # Дизайн query-итератора
 //!
-//! Каждый элемент итератора — `rhai::Dynamic::from_map(Map)` со структурой:
+//! Каждый элемент итератора — Lua таблица со структурой:
 //! ```text
 //! {
-//!     "entity":    <entity_index: i64>,
-//!     "Position":  #{ x: 1.0, y: 2.0 },
-//!     "Velocity":  #{ x: 0.5, y: 0.0 },
+//!     entity = 42,
+//!     position = { x = 1.0, y = 2.0 },   -- Read/Write компоненты (lowercase ключи)
+//!     velocity = { x = 0.5, y = 0.0 },
+//!     _meta = { arch = 0, row = 3, writes = { position = 1, velocity = 2 } }
 //! }
 //! ```
 //!
-//! После скрипта, если были Write-компоненты, `flush_writes()` записывает
-//! изменённые Dynamic-значения обратно в Column через binding.write.
+//! `commit(entity)` читает `_meta` чтобы найти колонки архетипа
+//! и записывает изменённые значения обратно в ECS.
 //!
 //! # Формат дескрипторов
 //!
-//! `query(["Read:Position", "Write:Velocity"])` — массив строк вида `"Mode:TypeName"`.
+//! `query({"Read:Position", "Write:Velocity"})` — таблица строк.
 //! Парсится в `QueryDesc` в `parse_query_descs()`.
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use apex_core::{
     component::ComponentId,
     entity::Entity,
     world::World,
 };
-use rhai::Dynamic;
 
 use crate::context::ScriptContext;
 
 // ── QueryDesc ──────────────────────────────────────────────────
 
-/// Разобранный дескриптор одного компонента в запросе.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct QueryDesc {
-    /// Имя типа компонента
     pub type_name: String,
-    /// true = Write (мутабельный), false = Read
     pub write:     bool,
 }
 
-/// Разобрать массив строк вида `["Read:Position", "Write:Velocity"]` в `Vec<QueryDesc>`.
-///
-/// Поддерживаемые форматы:
-/// - `"Read:Position"` / `"Write:Position"` — явный режим
-/// - `"Position"` — Read по умолчанию
-/// - `"Read<Position>"` / `"Write<Position>"` — альтернативный синтаксис
-pub fn parse_query_descs(arr: &rhai::Array) -> Vec<QueryDesc> {
-    arr.iter()
-        .filter_map(|d| {
-            let s = d.clone().into_string().ok()?;
-            parse_one_desc(&s)
-        })
-        .collect()
+pub fn parse_query_descs(table: &mlua::Table) -> mlua::Result<Vec<QueryDesc>> {
+    let mut descs = Vec::new();
+    let len = table.raw_len();
+    for i in 1..=len {
+        let val: String = table.get(i)?;
+        descs.push(parse_one_desc(&val));
+    }
+    Ok(descs)
 }
 
-fn parse_one_desc(s: &str) -> Option<QueryDesc> {
+fn parse_one_desc(s: &str) -> QueryDesc {
     let s = s.trim();
-
-    // Формат "Read:TypeName" или "Write:TypeName"
     if let Some(rest) = s.strip_prefix("Write:").or_else(|| s.strip_prefix("write:")) {
-        return Some(QueryDesc { type_name: rest.trim().to_string(), write: true });
+        return QueryDesc { type_name: rest.trim().to_string(), write: true };
     }
     if let Some(rest) = s.strip_prefix("Read:").or_else(|| s.strip_prefix("read:")) {
-        return Some(QueryDesc { type_name: rest.trim().to_string(), write: false });
+        return QueryDesc { type_name: rest.trim().to_string(), write: false };
     }
-
-    // Формат "Write<TypeName>" или "Read<TypeName>"
-    if let Some(rest) = s.strip_prefix("Write<").or_else(|| s.strip_prefix("write<")) {
-        let name = rest.trim_end_matches('>').trim().to_string();
-        return Some(QueryDesc { type_name: name, write: true });
-    }
-    if let Some(rest) = s.strip_prefix("Read<").or_else(|| s.strip_prefix("read<")) {
-        let name = rest.trim_end_matches('>').trim().to_string();
-        return Some(QueryDesc { type_name: name, write: false });
-    }
-
-    // Без префикса — Read по умолчанию
-    Some(QueryDesc { type_name: s.to_string(), write: false })
+    QueryDesc { type_name: s.to_string(), write: false }
 }
 
 // ── ArchState ──────────────────────────────────────────────────
 
-/// Состояние одного архетипа в query-итераторе.
 #[derive(Clone)]
 pub(crate) struct ArchState {
-    /// Индекс архетипа в `world.archetypes`
-    arch_idx: usize,
-    /// Количество entity в архетипе
-    len: usize,
-    /// Binding info для каждого запрошенного компонента
-    /// (component_id, type_name, is_write, col_index_in_arch)
-    components: Vec<ComponentState>,
+    pub arch_idx: usize,
+    pub len: usize,
+    pub components: Vec<ComponentState>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ComponentState {
-    col_idx:   usize,
-    type_name: String,
-    write:     bool,
+    pub col_idx:   usize,
+    pub type_name: String,
+    pub write:     bool,
     #[allow(dead_code)]
-    comp_id:   ComponentId,
+    pub comp_id:   ComponentId,
 }
 
-// ── RhaiQueryIter ──────────────────────────────────────────────
+// ── QueryIteratorState ─────────────────────────────────────────
 
-/// Rhai-совместимый итератор результатов `query()`.
-///
-/// Регистрируется через `engine.register_iterator::<RhaiQueryIter>()`.
-#[derive(Clone)]
-pub struct RhaiQueryIter {
-    ctx:             Arc<Mutex<ScriptContext>>,
-    arch_states:     Vec<ArchState>,
-    arch_cursor:     usize,
-    row_cursor:      usize,
-    /// Накопленные Write-изменения: (arch_idx, row, type_name, Dynamic)
-    /// Сбрасываются в Column после завершения итерации через flush_writes()
-    pending_writes:  Vec<(usize, usize, String, Dynamic)>,
+struct IterState {
+    arch_states: Vec<ArchState>,
+    arch_cursor: usize,
+    row_cursor:  usize,
 }
 
-impl RhaiQueryIter {
-    /// Создать итератор для заданного набора дескрипторов.
-    ///
-    /// Перебирает все архетипы мира и отбирает те, которые содержат
-    /// ВСЕ запрошенные компоненты.
-    pub fn new(ctx: Arc<Mutex<ScriptContext>>, descs: Vec<QueryDesc>) -> Self {
-        let arch_states = {
-            let ctx_ref = ctx.lock().unwrap();
-            let world   = ctx_ref.world_ref();
+// ── Построение arch states ─────────────────────────────────────
 
-            // Проверяем кэш запросов в ScriptContext
-            let mut cache = ctx_ref.query_cache.write().unwrap();
-            if let Some(cached) = cache.get(&descs) {
-                cached.clone()
-            } else {
-                let states = build_arch_states(world, &ctx_ref, &descs);
-                cache.insert(descs, states.clone());
-                states
-            }
-        };
-
-        Self {
-            ctx,
-            arch_states,
-            arch_cursor:    0,
-            row_cursor:     0,
-            pending_writes: Vec::new(),
-        }
-    }
-
-    /// Применить все накопленные Write-изменения обратно в Column.
-    ///
-    /// Вызывается автоматически при Drop итератора или явно из `rhai_api`.
-    pub fn flush_writes(&mut self) {
-        if self.pending_writes.is_empty() {
-            return;
-        }
-
-        let ctx_ref = self.ctx.lock().unwrap();
-        // SAFETY: итератор завершён (flush_writes вызывается в Drop или
-        // после исчерпания итератора), никаких shared borrow на Column нет.
-        let world_ref = ctx_ref.world_ref();
-        let world_ptr = world_ref as *const World;
-
-        for (arch_idx, row, type_name, dynamic) in self.pending_writes.drain(..) {
-            let binding = match ctx_ref.binding(&type_name) {
-                Some(b) => b,
-                None    => continue,
-            };
-
-            // SAFETY: arch_idx и row валидны — получены из того же world.
-            unsafe {
-                let world = world_ptr.as_ref().unwrap_unchecked();
-                let arch  = &world.archetypes()[arch_idx];
-                if let Some(col_idx) = arch.column_index(binding.id) {
-                    // Получаем указатель на данные в колонке
-                    let col = &world.archetypes()[arch_idx].columns_raw()[col_idx];
-                    let ptr = col.get_raw_ptr(row) as *mut u8;
-
-                    // Zero-copy write path для примитивных компонентов
-                    if let Some(prim_info) = &binding.primitive_info {
-                        prim_info.write_raw(ptr, &dynamic);
-                    } else {
-                        (binding.write)(ptr, &dynamic);
-                    }
-
-                    // Обновляем change tick для корректной работы change detection
-                    arch.set_change_tick(row, binding.id, world.current_tick());
-                }
-            }
-        }
-    }
-}
-
-impl Drop for RhaiQueryIter {
-    fn drop(&mut self) {
-        self.flush_writes();
-    }
-}
-
-// ── Iterator impl ──────────────────────────────────────────────
-
-impl Iterator for RhaiQueryIter {
-    type Item = Dynamic;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Клонируем arch_state чтобы избежать borrow conflict
-            // между immutable borrow (arch_state) и mutable borrow (self.build_item)
-            let arch_state = self.arch_states.get(self.arch_cursor)?;
-            let arch_idx   = arch_state.arch_idx;
-            let len        = arch_state.len;
-            let components = arch_state.components.clone();
-
-            if self.row_cursor >= len {
-                self.arch_cursor += 1;
-                self.row_cursor  = 0;
-                continue;
-            }
-
-            let row = self.row_cursor;
-            self.row_cursor += 1;
-
-            let item = self.build_item(arch_idx, &components, row);
-            return Some(item);
-        }
-    }
-}
-
-// ── Построение элементов ───────────────────────────────────────
-
-impl RhaiQueryIter {
-    fn build_item(&mut self, arch_idx: usize, components: &[ComponentState], row: usize) -> Dynamic {
-        let ctx_ref  = self.ctx.lock().unwrap();
-        let world    = ctx_ref.world_ref();
-        let arch     = &world.archetypes()[arch_idx];
-
-        let mut map = rhai::Map::new();
-
-        // Entity index как i64
-        let entity: Entity = arch.entities()[row];
-        map.insert("entity".into(), Dynamic::from_int(entity.index() as rhai::INT));
-
-        for comp in components {
-            let binding = match ctx_ref.binding(&comp.type_name) {
-                Some(b) => b,
-                None    => continue,
-            };
-
-            // Zero-copy path: если компонент примитивный, читаем напрямую из Column
-            // без создания Dynamic Map (экономит аллокацию на каждый entity).
-            let dynamic = if let Some(prim_info) = &binding.primitive_info {
-                unsafe {
-                    let col = &arch.columns_raw()[comp.col_idx];
-                    let ptr = col.get_raw_ptr(row);
-                    prim_info.read_raw(ptr)
-                }
-            } else {
-                // SAFETY: col_idx и row валидны в пределах этого arch
-                unsafe {
-                    let col = &arch.columns_raw()[comp.col_idx];
-                    let ptr = col.get_raw_ptr(row);
-                    (binding.read)(ptr)
-                }
-            };
-
-            // Для Write-компонентов запоминаем arch_idx и row чтобы flush мог найти колонку
-            if comp.write {
-                // Помещаем clone в map, оригинал в pending_writes
-                let clone = dynamic.clone();
-                self.pending_writes.push((arch_idx, row, comp.type_name.clone(), dynamic));
-                map.insert(
-                    comp.type_name.to_lowercase().into(),
-                    clone,
-                );
-            } else {
-                map.insert(
-                    comp.type_name.to_lowercase().into(),
-                    dynamic,
-                );
-            }
-        }
-
-        Dynamic::from_map(map)
-    }
-}
-
-// ── Вспомогательные функции ────────────────────────────────────
-
-fn build_arch_states(world: &World, ctx: &ScriptContext, descs: &[QueryDesc]) -> Vec<ArchState> {
-    // Разрешаем имена типов → ComponentId через binding реестр
+pub(crate) fn build_arch_states(
+    world: &World,
+    ctx: &ScriptContext,
+    descs: &[QueryDesc],
+) -> Vec<ArchState> {
     let resolved: Vec<Option<(ComponentId, &QueryDesc)>> = descs.iter()
         .map(|d| ctx.binding(&d.type_name).map(|b| (b.id, d)))
         .collect();
 
-    // Если хотя бы одно имя не разрешено — возвращаем пустой итератор
     if resolved.iter().any(|r| r.is_none()) {
         return Vec::new();
     }
@@ -309,7 +110,6 @@ fn build_arch_states(world: &World, ctx: &ScriptContext, descs: &[QueryDesc]) ->
         .filter_map(|(arch_idx, arch)| {
             if arch.is_empty() { return None; }
 
-            // Архетип должен содержать ВСЕ запрошенные компоненты
             let components: Vec<ComponentState> = resolved.iter()
                 .filter_map(|(cid, desc)| {
                     let col_idx = arch.column_index(*cid)?;
@@ -333,4 +133,159 @@ fn build_arch_states(world: &World, ctx: &ScriptContext, descs: &[QueryDesc]) ->
             })
         })
         .collect()
+}
+
+// ── Построение entity таблицы ──────────────────────────────────
+
+pub(crate) fn build_entity_table(
+    lua: &mlua::Lua,
+    world: &World,
+    ctx: &ScriptContext,
+    arch_idx: usize,
+    row: usize,
+    components: &[ComponentState],
+) -> mlua::Result<mlua::Table> {
+    let arch = &world.archetypes()[arch_idx];
+    let entity: Entity = arch.entities()[row];
+
+    let t = lua.create_table()?;
+    t.set("entity", entity.index() as i32)?;
+
+    let meta = lua.create_table()?;
+    meta.set("arch", arch_idx as i32)?;
+    meta.set("row", row as i32)?;
+
+    let writes = lua.create_table()?;
+    for comp in components {
+        if comp.write {
+            writes.set(comp.type_name.as_str(), comp.col_idx as i32)?;
+        }
+    }
+    meta.set("writes", writes)?;
+    t.set("_meta", meta)?;
+
+    for comp in components {
+        let binding = match ctx.binding(&comp.type_name) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        let val = unsafe {
+            let col = &arch.columns_raw()[comp.col_idx];
+            let ptr = col.get_raw_ptr(row);
+            (binding.read)(ptr, lua)?
+        };
+
+        let key = comp.type_name.to_lowercase();
+        t.set(key, val)?;
+    }
+
+    Ok(t)
+}
+
+// ── commit(entity_table) ───────────────────────────────────────
+
+pub(crate) fn commit_entity_table(
+    _lua: &mlua::Lua,
+    world: &World,
+    ctx: &ScriptContext,
+    entity_table: &mlua::Table,
+) -> mlua::Result<()> {
+    let meta: mlua::Table = match entity_table.get("_meta") {
+        Ok(m) => m,
+        Err(_) => {
+            log::warn!("commit: no _meta in entity table");
+            return Ok(());
+        }
+    };
+
+    let arch_idx: i32 = meta.get("arch")?;
+    let row: i32 = meta.get("row")?;
+    let writes: mlua::Table = meta.get("writes")?;
+
+    let world_ptr = world as *const World;
+
+    for pair in writes.clone().pairs::<String, i32>() {
+        let (type_name, col_idx): (String, i32) = pair?;
+        log::debug!("commit: writing component '{type_name}' col={col_idx}");
+
+        let binding = match ctx.binding(&type_name) {
+            Some(b) => b,
+            None => {
+                log::warn!("commit: no binding for '{}'", type_name);
+                continue;
+            }
+        };
+
+        let key = type_name.to_lowercase();
+        let val: mlua::Value = match entity_table.get::<mlua::Value>(key.as_str()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("commit: cannot get '{key}' from entity table: {e}");
+                continue;
+            }
+        };
+
+        unsafe {
+            let w = world_ptr.as_ref().unwrap_unchecked();
+            let arch = &w.archetypes()[arch_idx as usize];
+            let col = &arch.columns_raw()[col_idx as usize];
+            let ptr = col.get_raw_ptr(row as usize) as *mut u8;
+            (binding.write)(ptr, &val);
+            arch.set_change_tick(row as usize, binding.id, w.current_tick());
+        }
+    }
+
+    Ok(())
+}
+
+// ── Создание Lua iterator factory ──────────────────────────────
+
+pub(crate) fn create_query_iter_fn(
+    lua: &mlua::Lua,
+    arch_states: Vec<ArchState>,
+) -> mlua::Result<mlua::Function> {
+    let state = Rc::new(RefCell::new(IterState {
+        arch_states,
+        arch_cursor: 0,
+        row_cursor:  0,
+    }));
+
+    lua.create_function(move |lua, ()| {
+        let mut st = state.borrow_mut();
+
+        loop {
+            let arch_state = match st.arch_states.get(st.arch_cursor) {
+                Some(s) => s.clone(),
+                None => return Ok(mlua::Value::Nil),
+            };
+
+            if st.row_cursor >= arch_state.len {
+                st.arch_cursor += 1;
+                st.row_cursor  = 0;
+                continue;
+            }
+
+            let arch_idx   = arch_state.arch_idx;
+            let row        = st.row_cursor;
+            let components = arch_state.components;
+            st.row_cursor += 1;
+
+            let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
+                .ok_or_else(|| mlua::Error::runtime("no ScriptContext in Lua app data"))?;
+            let ctx_ref = ctx.borrow();
+            let world = ctx_ref.world_ref();
+
+            let table = build_entity_table(
+                lua,
+                world,
+                &ctx_ref,
+                arch_idx,
+                row,
+                &components,
+            )?;
+
+            return Ok(mlua::Value::Table(table));
+        }
+    })
 }
