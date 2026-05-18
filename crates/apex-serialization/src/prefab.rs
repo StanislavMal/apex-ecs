@@ -243,13 +243,21 @@ impl Default for PrefabLoader {
 
 impl apex_core::template::EntityTemplate for PrefabManifest {
     fn spawn(&self, world: &mut World, params: &apex_core::template::TemplateParams) -> Entity {
-        // Создаём временный PrefabLoader для instantiate
         let loader = PrefabLoader::new();
-        // Пытаемся преобразовать params в overrides
-        let overrides: Vec<PrefabComponent> = Vec::new(); // params → overrides (сложно без type_id → name)
-        // Поскольку мы не можем легко преобразовать TemplateParams в PrefabComponent
-        // (нужен обратный маппинг TypeId → имя), используем instantiate без overrides,
-        // но передаём params для проброса в кастомные компоненты.
+
+        // Преобразуем TemplateParams в overrides.
+        // TemplateParam с component_type_name() преобразуются в PrefabComponent
+        // и подменяют компоненты с совпадающим type_name.
+        let overrides: Vec<PrefabComponent> = params.json_overrides_iter()
+            .map(|(name, json)| PrefabComponent {
+                type_name: name.to_string(),
+                value: json.clone(),
+            })
+            .collect();
+
+        // NOTE: дочерние префабы из self.children не будут найдены
+        // если они не были загружены в этот loader. Это известное ограничение —
+        // EntityTemplate::spawn() не имеет доступа к оригинальному PrefabLoader.
         loader.instantiate(world, self, &overrides, None, Some(params))
             .expect("PrefabManifest::spawn failed")
     }

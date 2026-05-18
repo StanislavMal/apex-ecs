@@ -6,6 +6,8 @@ use std::fmt;
 ///
 /// Этапы выполняются строго последовательно: все системы этапа N
 /// завершаются до начала этапа N+1.
+///
+/// Стандартный порядок: Startup → First → PreUpdate → FixedUpdate → Update → PostUpdate → Last
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StageLabel {
     /// Однократный запуск при первом `run()`.
@@ -14,7 +16,10 @@ pub enum StageLabel {
     First,
     /// Обработка ввода, получение данных извне.
     PreUpdate,
-    /// Основная игровая логика (движение, AI, физика).
+    /// Фиксированный временной шаг (физика, детерминированная логика).
+    /// Выполняется с гарантированным фиксированным dt (например 60 Hz).
+    FixedUpdate,
+    /// Основная игровая логика (движение, AI).
     Update,
     /// Пост-обработка: трансформации, коллизии, эффекты.
     PostUpdate,
@@ -43,6 +48,7 @@ impl StageLabel {
             StageLabel::Startup,
             StageLabel::First,
             StageLabel::PreUpdate,
+            StageLabel::FixedUpdate,
             StageLabel::Update,
             StageLabel::PostUpdate,
             StageLabel::Last,
@@ -52,13 +58,14 @@ impl StageLabel {
     /// Приоритет этапа для сортировки (меньше = раньше).
     pub fn priority(&self) -> u8 {
         match self {
-            StageLabel::Startup   => 0,
-            StageLabel::First     => 1,
-            StageLabel::PreUpdate => 2,
-            StageLabel::Update    => 3,
-            StageLabel::PostUpdate => 4,
-            StageLabel::Last      => 5,
-            StageLabel::Custom(_) => 6,
+            StageLabel::Startup    => 0,
+            StageLabel::First      => 1,
+            StageLabel::PreUpdate  => 2,
+            StageLabel::FixedUpdate => 3,
+            StageLabel::Update     => 4,
+            StageLabel::PostUpdate  => 5,
+            StageLabel::Last       => 6,
+            StageLabel::Custom(_)  => 7,
         }
     }
 }
@@ -66,12 +73,13 @@ impl StageLabel {
 impl fmt::Display for StageLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StageLabel::Startup   => write!(f, "Startup"),
-            StageLabel::First     => write!(f, "First"),
-            StageLabel::PreUpdate => write!(f, "PreUpdate"),
-            StageLabel::Update    => write!(f, "Update"),
-            StageLabel::PostUpdate => write!(f, "PostUpdate"),
-            StageLabel::Last      => write!(f, "Last"),
+            StageLabel::Startup    => write!(f, "Startup"),
+            StageLabel::First      => write!(f, "First"),
+            StageLabel::PreUpdate  => write!(f, "PreUpdate"),
+            StageLabel::FixedUpdate => write!(f, "FixedUpdate"),
+            StageLabel::Update     => write!(f, "Update"),
+            StageLabel::PostUpdate  => write!(f, "PostUpdate"),
+            StageLabel::Last       => write!(f, "Last"),
             StageLabel::Custom(name) => write!(f, "Custom({})", name),
         }
     }

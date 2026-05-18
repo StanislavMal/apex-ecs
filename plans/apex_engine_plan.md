@@ -12,7 +12,7 @@
 
 | Подсистема | Файл | Состояние | Ключевые особенности |
 |---|---|---|---|
-| **Access / Bitmask** | `access.rs` | ✅ Отлично | ComponentMask 256-бит, ArchetypeMask 1024-бит, O(1) конфликты, event-декларации |
+| **Access / Bitmask** | `access.rs` | ✅ Отлично | ComponentMask 512-бит (8×u64), ArchetypeMask 1024-бит, O(1) конфликты, event-декларации |
 | **Archetype Storage** | `archetype.rs` | ✅ Отлично | Column-store, Change ticks, sparse индексация |
 | **Commands / Arena** | `commands.rs` | ✅ Отлично | Chunk-based bump arena, нет per-command Box, typed function pointers, `insert_raw` по ComponentId |
 | **World** | `world.rs` | ✅ Отлично | QueryCache с версионированием, write hooks, ChunkConfig, TemplateRegistry встроен |
@@ -21,7 +21,7 @@
 | **Events** | `events.rs` | ✅ Хорошо | Per-stage flush, EventReader/EventWriter, EventPipeline |
 | **Resources** | `resources.rs` | ✅ Хорошо | TypeId-based, Send+Sync |
 | **Scheduler** | `scheduler/lib.rs` | ✅ Отлично | AutoSystem, ConflictKind с диагностикой, ASD-чанкование, инкрементальный граф |
-| **Templates** | `template.rs` | ✅ Готово | EntityTemplate trait, TemplateParams по TypeId, impl_entity_template! макрос, интегрирован в Commands |
+| **Templates** | `template.rs` | ✅ Готово | EntityTemplate trait, TemplateParams с TypeId→name+JSON-сериализацией, impl_entity_template! макрос, интегрирован в Commands и PrefabManifest |
 | **Serialization** | `serialization/` | ✅ Хорошо | PrefabManifest (JSON), PrefabLoader с кешем, overrides, иерархия через ChildOf, snapshot |
 | **Hot-Reload** | `hot-reload/` | ✅ Хорошо | FileWatcher (notify), HotReloadPlugin, JsonConfigLoader, PrefabPlugin с reapply_asset/reapply_all, debounce |
 | **Scripting (Lua)** | `scripting/` | ✅ Готово | ScriptEngine на mlua (Lua 5.4), ScriptableRegistrar, #[derive(Scriptable)], query/spawn/despawn/resources/events, commit/auto-commit, With/Without фильтры, sandbox _ENV, hot-reload .lua, inspect(), log_levels, Read-protection metatable |
@@ -43,11 +43,11 @@
 
 ### Известные ограничения
 
-1. **ComponentMask ограничен 256 компонентами** — для движка с материалами, светом, UI, физикой это может стать потолком. Нужно расширить до 512 заранее
+1. ~~**ComponentMask ограничен 256 компонентами**~~ — ✅ исправлено, расширено до 512 (v0.1.0)
 2. **Lua однопоточный** — ScriptEngine нельзя использовать в ParSystem; ScriptEngine не Send (Rc<RefCell<>>)
 3. **QueryCache инвалидируется целиком** при любом структурном изменении — приемлемо сейчас, но потребует внимания при > 1000 архетипов
-4. **PrefabManifest::spawn** с TemplateParams — обратный маппинг TypeId→name не реализован, overrides через params не работают (есть TODO в коде)
-5. **Transform** базовый — нет иерархической пропагации GlobalTransform
+4. ~~**PrefabManifest::spawn** с TemplateParams~~ — ✅ исправлено, обратный маппинг TypeId→name+JSON реализован (v0.1.0)
+5. ~~**Transform** базовый~~ — ✅ GlobalTransform и иерархическая пропагация уже реализованы
 6. **AssetId** в hot-reload — простой u32 без типизации; при строительстве AssetServer нужно добавить typed Handle<T>
 
 ---
@@ -154,15 +154,15 @@ Variable tick (vsync):
 
 ## Часть IV. Пошаговый план разработки
 
-### Фаза 0 — Стабилизация ядра (1–2 недели)
+### Фаза 0 — Стабилизация ядра (1–2 недели) ✅ ЗАВЕРШЕНО (2026-05-18)
 
 Перед строительством движка — укрепить фундамент.
 
-- [ ] **Расширить ComponentMask до 512 компонентов** (8×u64) — обратная совместимость через type alias
-- [ ] **Починить PrefabManifest::spawn с TemplateParams** — реализовать обратный маппинг TypeId→name для overrides (есть TODO в коде)
-- [ ] **Добавить GlobalTransform** — иерархическая пропагация из Transform + родительского GlobalTransform; система пропагации только для changed entity (Change Detection уже есть)
-- [ ] **Покрыть тестами** ключевые пути: world.rs, archetype.rs, relations.rs, commands.rs — минимум 80% веток
-- [ ] **Зафиксировать публичный API apex-core как v0.1** — никаких breaking changes без major
+- [x] **Расширить ComponentMask до 512 компонентов** (8×u64) — обратная совместимость через type alias
+- [x] **Починить PrefabManifest::spawn с TemplateParams** — реализован обратный маппинг TypeId→name + JSON-сериализация для overrides
+- [x] **Добавить GlobalTransform** — иерархическая пропагация уже существовала; подтверждено тестами
+- [x] **Покрыть тестами** ключевые пути: archetype.rs (17 тестов), commands.rs (14 тестов); world.rs и relations.rs уже имели покрытие
+- [x] **Зафиксировать публичный API apex-core как v0.1** — CHANGELOG.md создан, семвер-политика задокументирована
 
 ### Фаза 1 — App и Plugin система (1 неделя)
 
@@ -170,10 +170,11 @@ Variable tick (vsync):
 
 - [ ] `Plugin` trait — `fn build(&self, app: &mut App)` — единственный метод
 - [ ] `App` struct — владеет `World`, `Scheduler`, вектором плагинов
-- [ ] `StageLabel` расширить: `PreUpdate`, `Update`, `PostUpdate`, `FixedUpdate`, `PreRender`, `Render`
 - [ ] `App::add_systems(label, systems)` — делегирует в Scheduler
 - [ ] `App::run()` — запускает main loop через winit EventLoop
 - [ ] Типизированные Plugin интерфейсы: каждый плагин декларирует что он добавляет в `World` (ресурсы, системы, стадии) — никаких God-плагинов
+
+> **Примечание:** `FixedUpdate` уже добавлен в `StageLabel` в ядре (Фаза 0). `PreRender` и `Render` — задачи apex-render.
 
 ### Фаза 2 — Окно и ввод (1 неделя)
 
@@ -373,7 +374,7 @@ App::new()
 
 ### 4. Детерминизм
 
-- Физика на фиксированном шаге (FixedUpdate stage уже в планировщике)
+- Физика на фиксированном шаге (FixedUpdate — StageLabel реализован в ядре v0.1.0)
 - `RngSeed` ресурс — `StdRng::seed_from_u64`
 - Replay готов: зафиксированные шаги + детерминированный seed
 

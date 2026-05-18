@@ -1270,7 +1270,7 @@ sched.configure_stages(vec![
 // Результат: input → sim (physics + ai параллельно) → render
 ```
 
-> **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `staged()` временно подменяет `default_stage_label` на время замыкания и восстанавливает предыдущее значение после выхода. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных.
+> **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, FixedUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `staged()` временно подменяет `default_stage_label` на время замыкания и восстанавливает предыдущее значение после выхода. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных.
 
 #### 6.4.2 Явное упорядочивание систем
 
@@ -1587,6 +1587,31 @@ let params = TemplateParams::new()
 let boss = world.spawn_from_template("Monster", &params)
     .expect("template not found");
 ```
+
+#### 9.3.1 Автоматические overrides для PrefabManifest
+
+Начиная с v0.1.0, параметры автоматически преобразуются в overrides компонентов при спавне через `PrefabManifest`. Для этого `TemplateParam` должен объявить полное имя типа компонента через `component_type_name()`:
+
+```rust
+struct MonsterHealth;
+impl TemplateParam for MonsterHealth {
+    type Value = f32;
+    fn component_type_name() -> &'static str {
+        "my_game::Health"  // ← должно совпадать с type_name в PrefabComponent
+    }
+}
+
+// Параметр автоматически становится override'ом:
+let params = TemplateParams::new()
+    .set::<MonsterHealth>(200.0f32);
+
+// PrefabManifest::spawn() применит overrides:
+world.spawn_from_template("MonsterPrefab", &params);
+```
+
+Значение сериализуется в JSON в момент `set::<P>()` и хранится в `TemplateParams` до спавна. Параметры без `component_type_name()` (по умолчанию `""`) игнорируются для overrides, но по-прежнему доступны через `get::<P>()`.
+
+Метод `json_overrides_iter()` возвращает итератор пар `(&str, &serde_json::Value)` — готовые PrefabComponent-переопределения.
 
 ### 9.4 Спавн через `Commands`
 
@@ -2849,9 +2874,12 @@ fn main() {
 | `StageLabel::Startup` | Однократный запуск при первом `run()` |
 | `StageLabel::First` | Выполняется до всех остальных |
 | `StageLabel::PreUpdate` | Обработка ввода |
+| `StageLabel::FixedUpdate` | Фиксированный временной шаг (физика, детерминированная логика, 60 Hz) |
 | `StageLabel::PostUpdate` | Пост-обработка (трансформации, коллизии) |
 | `StageLabel::Last` | Финальная обработка, статистика |
 | `StageLabel::Custom("name")` | Пользовательский этап |
+| `StageLabel::standard_order()` | Стандартный порядок: Startup→First→PreUpdate→FixedUpdate→Update→PostUpdate→Last |
+| `StageLabel::priority()` | Числовой приоритет (меньше = раньше) |
 
 ### SystemContext API (раздел 6.6)
 
@@ -2891,7 +2919,10 @@ fn main() {
 | `EntityTemplate::parent()` | Опционально: вернуть Entity родителя |
 | `TemplateParams::new()` | Создать пустые параметры |
 | `TemplateParams::set::<P>(value)` | Установить значение типизированного параметра |
+| `TemplateParams::get::<P>()` | Получить значение параметра |
+| `TemplateParams::json_overrides_iter()` | Итератор пар `(type_name, serde_json::Value)` для PrefabManifest overrides |
 | `TemplateParam` | Трейт для типизированного параметра (`type Value = ...`) |
+| `TemplateParam::component_type_name()` | Полное имя типа компонента (для auto-override в PrefabManifest) |
 | `impl_entity_template!(T, name)` | Макрос: зарегистрировать тип как шаблон |
 
 ### Prefab API

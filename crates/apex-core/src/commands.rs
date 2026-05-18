@@ -319,3 +319,277 @@ impl Drop for Commands {
 impl Default for Commands {
     fn default() -> Self { Self::new() }
 }
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::{Component};
+    use crate::entity::Entity;
+
+    #[derive(Clone, Copy)]
+    struct Pos(f32);
+    impl Component for Pos {}
+
+    #[derive(Clone, Copy)]
+    struct Vel(f32);
+    impl Component for Vel {}
+
+    // ── Basic commands ─────────────────────────────────────────
+
+    #[test]
+    fn commands_spawn_entity() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+
+        cmds.spawn((Pos(1.0),));
+        assert_eq!(cmds.len(), 1);
+        cmds.apply(&mut world);
+        assert_eq!(cmds.len(), 0);
+
+        // Проверяем что entity создался с компонентом
+        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let mut count = 0;
+        query.for_each(|_, pos| {
+            count += 1;
+            assert_eq!(pos.0, 1.0);
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn commands_insert_and_remove_component() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Vel(5.0));
+        cmds.apply(&mut world);
+
+        let vel = world.get::<Vel>(entity).unwrap();
+        assert_eq!(vel.0, 5.0);
+
+        cmds.remove::<Vel>(entity);
+        cmds.apply(&mut world);
+        assert!(world.get::<Vel>(entity).is_none());
+    }
+
+    #[test]
+    fn commands_despawn_entity() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        cmds.despawn(entity);
+        cmds.apply(&mut world);
+
+        assert!(world.get::<Pos>(entity).is_none());
+    }
+
+    #[test]
+    fn commands_insert_raw_and_remove_raw() {
+        let mut world = World::new();
+        world.register_component::<Vel>();
+        let vel_id = world.registry().get_id::<Vel>().unwrap();
+
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        // insert_raw с сырыми байтами
+        let vel_val: Vel = Vel(7.0);
+        let data = unsafe {
+            let ptr = &vel_val as *const Vel as *const u8;
+            std::slice::from_raw_parts(ptr, std::mem::size_of::<Vel>()).to_vec()
+        };
+        let tick = world.current_tick();
+        cmds.insert_raw(entity, vel_id, data, tick);
+        cmds.apply(&mut world);
+
+        let vel = world.get::<Vel>(entity).unwrap();
+        assert_eq!(vel.0, 7.0);
+
+        cmds.remove_raw(entity, vel_id);
+        cmds.apply(&mut world);
+        assert!(world.get::<Vel>(entity).is_none());
+    }
+
+    #[test]
+    fn commands_apply_clears_queue() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+
+        cmds.spawn((Pos(0.0),));
+        cmds.spawn((Pos(1.0),));
+        assert_eq!(cmds.len(), 2);
+
+        cmds.apply(&mut world);
+        assert_eq!(cmds.len(), 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn commands_clear_drops_without_apply() {
+        let mut cmds = Commands::new();
+        cmds.spawn((Pos(1.0),));
+        cmds.spawn((Pos(2.0),));
+        assert_eq!(cmds.len(), 2);
+
+        cmds.clear();
+        assert_eq!(cmds.len(), 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn commands_spawn_from_template() {
+        use crate::template::{EntityTemplate, TemplateParams};
+        use crate::entity::Entity;
+
+        #[derive(Clone)]
+        struct TestTemplate;
+        impl Component for TestTemplate {}
+
+        impl EntityTemplate for TestTemplate {
+            fn spawn(&self, world: &mut World, _params: &TemplateParams) -> Entity {
+                world.spawn((Pos(99.0),))
+            }
+        }
+
+        let mut world = World::new();
+        world.register_template("test", TestTemplate);
+
+        let mut cmds = Commands::new();
+        cmds.spawn_template("test");
+        cmds.apply(&mut world);
+
+        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let mut count = 0;
+        query.for_each(|_, pos| {
+            count += 1;
+            assert_eq!(pos.0, 99.0);
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn commands_spawn_from_template_with_params() {
+        use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
+        use crate::query::Read;
+
+        struct ParamVal;
+        impl TemplateParam for ParamVal { type Value = f32; }
+
+        struct ParamTemplate { default: f32 }
+        impl Component for ParamTemplate {}
+
+        impl EntityTemplate for ParamTemplate {
+            fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity {
+                let val = params.get::<ParamVal>().copied().unwrap_or(self.default);
+                world.spawn((Pos(val),))
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        world.register_template("param_test", ParamTemplate { default: 5.0 });
+
+        let mut cmds = Commands::new();
+        cmds.spawn_from_template("param_test", TemplateParams::new().set::<ParamVal>(42.0f32));
+        cmds.apply(&mut world);
+
+        let query = crate::query::Query::<Read<Pos>>::new(&world);
+        let mut found = None;
+        query.for_each(|_, pos| found = Some(pos.0));
+        assert_eq!(found, Some(42.0));
+    }
+
+    // ── Edge cases ─────────────────────────────────────────────
+
+    #[test]
+    fn commands_custom_add_fn() {
+        let mut world = World::new();
+
+        let mut cmds = Commands::new();
+        cmds.add(|w| {
+            w.insert_resource(Pos(100.0));
+        });
+        cmds.apply(&mut world);
+
+        let res = world.resource::<Pos>();
+        assert_eq!(res.0, 100.0);
+    }
+
+    #[test]
+    fn commands_empty_apply_noop() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.apply(&mut world); // не должно паниковать
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn commands_with_capacity() {
+        let cmds = Commands::with_capacity(1000);
+        assert_eq!(cmds.len(), 0);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn commands_multiple_spawns() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+
+        for i in 0..100 {
+            cmds.spawn((Pos(i as f32),));
+        }
+        cmds.apply(&mut world);
+
+        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let mut values: Vec<f32> = Vec::new();
+        query.for_each(|_, pos| values.push(pos.0));
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(values.len(), 100);
+        assert_eq!(values[0], 0.0);
+        assert_eq!(values[99], 99.0);
+    }
+
+    #[test]
+    fn commands_arena_reuse() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+
+        // Первый цикл: spawn много entity
+        for _ in 0..10 {
+            cmds.spawn((Pos(1.0),));
+        }
+        cmds.apply(&mut world);
+        assert_eq!(cmds.len(), 0);
+
+        // Второй цикл: arena уже выделена, переиспользуется без аллокаций
+        for _ in 0..10 {
+            cmds.spawn((Pos(2.0),));
+        }
+        cmds.apply(&mut world);
+        assert_eq!(cmds.len(), 0);
+
+        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let count = query.iter().count();
+        assert_eq!(count, 20);
+    }
+
+    #[test]
+    fn commands_preserves_tick() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+
+        let entity = world.spawn((Pos(0.0),));
+        let _tick_before = world.current_tick();
+
+        // Делаем несколько изменений
+        cmds.insert(entity, Vel(5.0));
+        cmds.apply(&mut world);
+
+        let vel = world.get::<Vel>(entity).unwrap();
+        assert_eq!(vel.0, 5.0);
+    }
+}

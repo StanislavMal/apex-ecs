@@ -1,77 +1,75 @@
 use std::any::TypeId;
 
-/// Битовая маска компонентов — до 256 компонентов.
+/// Битовая маска компонентов — до 512 компонентов (8 × u64 = 512 бит).
 ///
 /// Заменяет `Vec<TypeId>` в AccessDescriptor для O(1) операций:
 /// - `contains` → бит-проверка vs O(N) linear scan
 /// - `conflicts_with` → битовый AND vs двойной linear scan
 /// - `merge` → битовый OR vs dedup loop
+///
+/// Размер 64 байта = одна кэш-линия на x86-64, что минимизирует промахи.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ComponentMask {
-    bits: [u64; 4], // 4 × 64 = 256 бит
+    bits: [u64; 8], // 8 × 64 = 512 бит
 }
 
 impl ComponentMask {
-    pub const EMPTY: Self = Self { bits: [0u64; 4] };
+    pub const EMPTY: Self = Self { bits: [0u64; 8] };
 
     const MASK_64: u64 = 0x3F; // маска для idx % 64
 
     #[inline]
-    fn word_idx(idx: u8) -> usize {
+    fn word_idx(idx: u16) -> usize {
         (idx >> 6) as usize // idx / 64
     }
 
     #[inline]
-    fn bit_idx(idx: u8) -> u64 {
+    fn bit_idx(idx: u16) -> u64 {
         1u64 << (idx as u64 & Self::MASK_64)
     }
 
     #[inline]
-    pub fn set(&mut self, idx: u8) {
+    pub fn set(&mut self, idx: u16) {
         self.bits[Self::word_idx(idx)] |= Self::bit_idx(idx);
     }
 
     #[inline]
-    pub fn get(&self, idx: u8) -> bool {
+    pub fn get(&self, idx: u16) -> bool {
         self.bits[Self::word_idx(idx)] & Self::bit_idx(idx) != 0
     }
 
     #[inline]
     pub fn and(&self, other: &Self) -> Self {
-        Self {
-            bits: [
-                self.bits[0] & other.bits[0],
-                self.bits[1] & other.bits[1],
-                self.bits[2] & other.bits[2],
-                self.bits[3] & other.bits[3],
-            ],
+        let mut bits = [0u64; 8];
+        for i in 0..8 {
+            bits[i] = self.bits[i] & other.bits[i];
         }
+        Self { bits }
     }
 
     #[inline]
     pub fn or(&self, other: &Self) -> Self {
-        Self {
-            bits: [
-                self.bits[0] | other.bits[0],
-                self.bits[1] | other.bits[1],
-                self.bits[2] | other.bits[2],
-                self.bits[3] | other.bits[3],
-            ],
+        let mut bits = [0u64; 8];
+        for i in 0..8 {
+            bits[i] = self.bits[i] | other.bits[i];
         }
+        Self { bits }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bits[0] == 0 && self.bits[1] == 0 && self.bits[2] == 0 && self.bits[3] == 0
+        self.bits.iter().all(|&b| b == 0)
     }
 
     /// Пересекается ли маска с другой?
     #[inline]
     pub fn overlaps(&self, other: &Self) -> bool {
-        (self.bits[0] & other.bits[0]) != 0
-            || (self.bits[1] & other.bits[1]) != 0
-            || (self.bits[2] & other.bits[2]) != 0
-            || (self.bits[3] & other.bits[3]) != 0
+        for i in 0..8 {
+            if self.bits[i] & other.bits[i] != 0 {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -295,7 +293,7 @@ impl AccessDescriptor {
     ///
     /// Вызывается планировщиком один раз после регистрации всех компонентов.
     /// После этого `conflicts_with_fast` даёт O(1) проверку.
-    pub fn assign_masks(&mut self, type_to_idx: &std::collections::HashMap<TypeId, u8>) {
+    pub fn assign_masks(&mut self, type_to_idx: &std::collections::HashMap<TypeId, u16>) {
         self.read_mask  = ComponentMask::EMPTY;
         self.write_mask = ComponentMask::EMPTY;
         for tid in &self.reads  {

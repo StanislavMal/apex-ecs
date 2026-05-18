@@ -52,6 +52,7 @@ use crate::{
     relations::ChildOf,
     world::World,
 };
+use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
@@ -61,6 +62,9 @@ use std::collections::HashMap;
 ///
 /// Каждый параметр идентифицируется типом-маркером, реализующим `TemplateParam`.
 /// Это позволяет использовать `TypeId` в качестве ключа вместо строк.
+///
+/// Чтобы параметр автоматически преобразовывался в overrides для PrefabManifest,
+/// переопределите [`component_type_name()`](TemplateParam::component_type_name).
 ///
 /// # Пример
 ///
@@ -74,7 +78,24 @@ use std::collections::HashMap;
 /// ```
 pub trait TemplateParam: Send + Sync + 'static {
     /// Тип значения параметра.
-    type Value: Send + Sync + 'static;
+    type Value: Send + Sync + 'static + Serialize;
+
+    /// Полное имя типа компонента, которым управляет этот параметр.
+    ///
+    /// Переопределите этот метод чтобы включить автоматическое преобразование
+    /// параметров в overrides при спавне через `PrefabManifest`.
+    ///
+    /// # Пример
+    /// ```ignore
+    /// struct MonsterHealth;
+    /// impl TemplateParam for MonsterHealth {
+    ///     type Value = f32;
+    ///     fn component_type_name() -> &'static str { "my_crate::Health" }
+    /// }
+    /// ```
+    fn component_type_name() -> &'static str {
+        ""
+    }
 }
 
 // ── TemplateParams ───────────────────────────────────────────────
@@ -84,17 +105,33 @@ pub trait TemplateParam: Send + Sync + 'static {
 /// Хранит `HashMap<TypeId, Box<dyn Any + Send + Sync>>`. Доступ через
 /// [`set::<P>()`](TemplateParams::set) и [`get::<P>()`](TemplateParams::get)
 /// по типу-маркеру `P: TemplateParam`.
+///
+/// Также хранит обратный маппинг TypeId → имя типа компонента
+/// и предсериализованные JSON-значения для автоматического
+/// преобразования в overrides при спавне через `PrefabManifest`.
 #[derive(Default)]
 pub struct TemplateParams {
     params: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    /// TypeId → имя типа компонента (для PrefabManifest overrides)
+    type_names: HashMap<TypeId, String>,
+    /// TypeId → предсериализованное JSON-значение
+    json_overrides: HashMap<TypeId, serde_json::Value>,
 }
 
 impl TemplateParams {
     pub fn new() -> Self {
-        Self { params: HashMap::default() }
+        Self {
+            params: HashMap::default(),
+            type_names: HashMap::default(),
+            json_overrides: HashMap::default(),
+        }
     }
 
     /// Установить параметр по типу-маркеру.
+    ///
+    /// Если [`TemplateParam::component_type_name()`] переопределён,
+    /// значение сериализуется в JSON и сохраняется для автоматического
+    /// преобразования в overrides при спавне через `PrefabManifest`.
     ///
     /// # Пример
     /// ```ignore
@@ -106,7 +143,15 @@ impl TemplateParams {
     ///     .set::<NameParam>("Elite Monster".to_string());
     /// ```
     pub fn set<P: TemplateParam>(mut self, value: P::Value) -> Self {
-        self.params.insert(TypeId::of::<P>(), Box::new(value));
+        let type_id = TypeId::of::<P>();
+        let name = P::component_type_name();
+        if !name.is_empty() {
+            self.type_names.insert(type_id, name.to_string());
+            if let Ok(json) = serde_json::to_value(&value) {
+                self.json_overrides.insert(type_id, json);
+            }
+        }
+        self.params.insert(type_id, Box::new(value));
         self
     }
 
@@ -120,6 +165,21 @@ impl TemplateParams {
     /// Есть ли переопределения?
     pub fn is_empty(&self) -> bool {
         self.params.is_empty()
+    }
+
+    /// Итератор по всем парам (component_type_name, JSON-значение) для override-ов.
+    ///
+    /// Используется `PrefabManifest::spawn()` для автоматического
+    /// преобразования параметров в overrides компонентов.
+    pub fn json_overrides_iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.type_names.iter().filter_map(|(tid, name)| {
+            self.json_overrides.get(tid).map(|json| (name.as_str(), json))
+        })
+    }
+
+    /// Есть ли хотя бы один override с именем типа компонента?
+    pub fn has_json_overrides(&self) -> bool {
+        !self.json_overrides.is_empty()
     }
 }
 

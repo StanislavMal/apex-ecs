@@ -432,3 +432,297 @@ pub fn archetype_chunks(arch: &Archetype, chunk_size: usize) -> impl Iterator<It
         }
     })
 }
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::{ComponentId, ComponentInfo, Tick};
+    use smallvec::SmallVec;
+
+    unsafe fn noop_drop(_ptr: *mut u8) {}
+
+    fn make_info(id: u32) -> ComponentInfo {
+        ComponentInfo {
+            id: ComponentId(id),
+            name: "test",
+            type_id: std::any::TypeId::of::<f32>(),
+            size: std::mem::size_of::<f32>(),
+            align: std::mem::align_of::<f32>(),
+            drop_fn: noop_drop,
+            serde: None,
+        }
+    }
+
+    // ── Column tests ──────────────────────────────────────────
+
+    #[test]
+    fn column_push_and_get() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+        assert_eq!(col.len, 0);
+        assert_eq!(col.capacity, 0);
+
+        let val: f32 = 42.0;
+        unsafe {
+            col.push(&val as *const f32 as *const u8, Tick(1));
+        }
+        assert_eq!(col.len, 1);
+        assert!(col.capacity >= 1);
+        assert_eq!(col.change_ticks.len(), 1);
+
+        unsafe {
+            let stored: &f32 = col.get::<f32>(0);
+            assert_eq!(*stored, 42.0);
+        }
+    }
+
+    #[test]
+    fn column_push_many_grows_capacity() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+        let n = 200;
+
+        for i in 0..n {
+            let val: f32 = i as f32;
+            unsafe { col.push(&val as *const f32 as *const u8, Tick(i as u32)); }
+        }
+        assert_eq!(col.len, n);
+        assert!(col.capacity >= n);
+        assert_eq!(col.change_ticks.len(), n);
+
+        for i in 0..n {
+            unsafe {
+                let stored: &f32 = col.get::<f32>(i as usize);
+                assert_eq!(*stored, i as f32);
+            }
+            assert_eq!(col.get_tick(i as usize).0, i as u32);
+        }
+    }
+
+    #[test]
+    fn column_write_at_existing_row() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+
+        unsafe {
+            col.push(&(1.0_f32) as *const f32 as *const u8, Tick(1));
+            col.push(&(2.0_f32) as *const f32 as *const u8, Tick(1));
+        }
+
+        unsafe {
+            col.write_at(0, &(99.0_f32) as *const f32 as *const u8, Tick(100));
+        }
+
+        unsafe {
+            assert_eq!(*col.get::<f32>(0), 99.0);
+            assert_eq!(*col.get::<f32>(1), 2.0);
+        }
+        assert_eq!(col.get_tick(0).0, 100);
+    }
+
+    #[test]
+    fn column_swap_remove_no_drop() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+
+        for i in 0..5 {
+            let val: f32 = i as f32;
+            unsafe { col.push(&val as *const f32 as *const u8, Tick(i as u32)); }
+        }
+
+        unsafe { col.swap_remove_no_drop(1); }
+        assert_eq!(col.len, 4);
+        // Последний элемент (4.0) перемещён на место удалённого (1)
+        unsafe {
+            assert_eq!(*col.get::<f32>(0), 0.0);
+            assert_eq!(*col.get::<f32>(1), 4.0);
+            assert_eq!(*col.get::<f32>(2), 2.0);
+            assert_eq!(*col.get::<f32>(3), 3.0);
+        }
+    }
+
+    #[test]
+    fn column_swap_remove_last_noop() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+
+        unsafe {
+            col.push(&(5.0_f32) as *const f32 as *const u8, Tick(1));
+        }
+        assert_eq!(col.len, 1);
+
+        unsafe { col.swap_remove_no_drop(0); }
+        assert_eq!(col.len, 0);
+    }
+
+    #[test]
+    fn column_reserve_pre_allocation() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+        col.reserve(100);
+        assert!(col.capacity >= 100);
+        assert_eq!(col.len, 0);
+    }
+
+    #[test]
+    fn column_change_tick_tracking() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+
+        unsafe {
+            col.push(&(1.0_f32) as *const f32 as *const u8, Tick(10));
+            col.push(&(2.0_f32) as *const f32 as *const u8, Tick(20));
+        }
+
+        assert_eq!(col.get_tick(0).0, 10);
+        assert_eq!(col.get_tick(1).0, 20);
+
+        unsafe {
+            col.write_at(0, &(3.0_f32) as *const f32 as *const u8, Tick(30));
+        }
+        assert_eq!(col.get_tick(0).0, 30);
+    }
+
+    #[test]
+    fn column_zero_sized_type() {
+        let info = ComponentInfo {
+            id: ComponentId(99),
+            name: "zst",
+            type_id: std::any::TypeId::of::<()>(),
+            size: 0,
+            align: 1,
+            drop_fn: noop_drop,
+            serde: None,
+        };
+        let mut col = Column::new(&info);
+        unsafe {
+            col.push(std::ptr::NonNull::<()>::dangling().as_ptr() as *const u8, Tick(1));
+        }
+        assert_eq!(col.len, 1);
+    }
+
+    // ── Archetype tests ───────────────────────────────────────
+
+    fn make_arch(id: u32, component_ids: &[u32]) -> Archetype {
+        let ids: SmallVec<[ComponentId; 8]> = component_ids.iter().map(|&i| ComponentId(i)).collect();
+        let infos: Vec<ComponentInfo> = component_ids.iter().map(|&i| make_info(i)).collect();
+        let info_refs: Vec<&ComponentInfo> = infos.iter().collect();
+        Archetype::new(ArchetypeId(id), ids, &info_refs)
+    }
+
+    fn make_entity(index: u32, generation: u32) -> Entity {
+        Entity { index, generation }
+    }
+
+    #[test]
+    fn archetype_allocate_row() {
+        let mut arch = make_arch(0, &[0, 1]);
+        let entity = make_entity(0, 100);
+        let row = unsafe { arch.allocate_row(entity) };
+        assert_eq!(row, 0);
+        assert_eq!(arch.len(), 1);
+    }
+
+    #[test]
+    fn archetype_write_and_read_component() {
+        let mut arch = make_arch(0, &[0]);
+        let entity = make_entity(0, 1);
+        unsafe { arch.allocate_row(entity); }
+
+        let val: f32 = 3.14;
+        unsafe {
+            arch.write_component(0, ComponentId(0), &val as *const f32 as *const u8, Tick(1));
+        }
+
+        unsafe {
+            let stored: &f32 = arch.get_component::<f32>(0, ComponentId(0)).unwrap();
+            assert_eq!(*stored, 3.14);
+        }
+    }
+
+    #[test]
+    fn archetype_remove_row() {
+        let mut arch = make_arch(0, &[0]);
+        let e1 = make_entity(0, 1);
+        let e2 = make_entity(0, 2);
+
+        unsafe {
+            arch.allocate_row(e1);
+            arch.write_component(0, ComponentId(0), &(1.0_f32) as *const f32 as *const u8, Tick(1));
+            arch.allocate_row(e2);
+            arch.write_component(1, ComponentId(0), &(2.0_f32) as *const f32 as *const u8, Tick(1));
+        }
+        assert_eq!(arch.len(), 2);
+
+        let swapped = unsafe { arch.remove_row(0) };
+        assert_eq!(arch.len(), 1);
+        assert_eq!(swapped, Some(e2)); // последний переехал на место 0
+    }
+
+    #[test]
+    fn archetype_has_component() {
+        let arch = make_arch(0, &[0, 1]);
+        assert!(arch.has_component(ComponentId(0)));
+        assert!(arch.has_component(ComponentId(1)));
+        assert!(!arch.has_component(ComponentId(2)));
+    }
+
+    #[test]
+    fn archetype_column_index() {
+        let arch = make_arch(0, &[0, 1, 2]);
+        assert_eq!(arch.column_index(ComponentId(0)), Some(0));
+        assert_eq!(arch.column_index(ComponentId(1)), Some(1));
+        assert_eq!(arch.column_index(ComponentId(2)), Some(2));
+        assert_eq!(arch.column_index(ComponentId(3)), None);
+    }
+
+    #[test]
+    fn archetype_edges() {
+        let mut arch = make_arch(0, &[0]);
+        arch.add_edges.insert(ComponentId(1), ArchetypeId(3));
+        arch.remove_edges.insert(ComponentId(0), ArchetypeId(7));
+
+        assert_eq!(arch.add_edges.get(&ComponentId(1)), Some(&ArchetypeId(3)));
+        assert_eq!(arch.remove_edges.get(&ComponentId(0)), Some(&ArchetypeId(7)));
+    }
+
+    // ── ArchetypeChunk tests ──────────────────────────────────
+
+    #[test]
+    fn chunk_exact_size() {
+        let mut arch = make_arch(0, &[0]);
+        for i in 0..10 {
+            unsafe { arch.allocate_row(make_entity(0, i)); }
+        }
+        let chunks: Vec<_> = archetype_chunks(&arch, 5).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].entities.len(), 5);
+        assert_eq!(chunks[0].start_row, 0);
+        assert_eq!(chunks[1].entities.len(), 5);
+        assert_eq!(chunks[1].start_row, 5);
+    }
+
+    #[test]
+    fn chunk_uneven() {
+        let mut arch = make_arch(0, &[0]);
+        for i in 0..7 {
+            unsafe { arch.allocate_row(make_entity(0, i)); }
+        }
+        let chunks: Vec<_> = archetype_chunks(&arch, 3).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].entities.len(), 3);
+        assert_eq!(chunks[1].entities.len(), 3);
+        assert_eq!(chunks[2].entities.len(), 1);
+    }
+
+    #[test]
+    fn column_view_access() {
+        let arch = make_arch(0, &[0, 1]);
+        let views: Vec<_> = arch.columns().collect();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id(), ComponentId(0));
+        assert_eq!(views[1].id(), ComponentId(1));
+    }
+}
