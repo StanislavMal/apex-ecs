@@ -1,6 +1,6 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
-use apex_scheduler::{Scheduler, AutoSystem, SystemContext};
+use apex_scheduler::Scheduler;
 
 // ---------------------------------------------------------------------------
 // Components for schedule benchmarks
@@ -17,40 +17,34 @@ pub struct D(pub f32);
 pub struct E(pub f32);
 
 // ---------------------------------------------------------------------------
-// AutoSystem implementations
+// AutoSystem implementations (system! macro)
 // ---------------------------------------------------------------------------
-struct SysAB;
-struct SysCD;
-struct SysCE;
 
-impl AutoSystem for SysAB {
-    type Query = (Write<A>, Write<B>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each(|_, (a, b)| {
+system! {
+    fn sys_ab(
+        q: (Write<A>, Write<B>),
+    ) {
+        q.for_each(|_, (a, b)| {
             std::mem::swap(&mut a.0, &mut b.0);
         });
     }
 }
 
-impl AutoSystem for SysCD {
-    type Query = (Write<C>, Write<D>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each(|_, (c, d)| {
+system! {
+    fn sys_cd(
+        q: (Write<C>, Write<D>),
+    ) {
+        q.for_each(|_, (c, d)| {
             std::mem::swap(&mut c.0, &mut d.0);
         });
     }
 }
 
-impl AutoSystem for SysCE {
-    type Query = (Write<C>, Write<E>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each(|_, (c, e)| {
+system! {
+    fn sys_ce(
+        q: (Write<C>, Write<E>),
+    ) {
+        q.for_each(|_, (c, e)| {
             std::mem::swap(&mut c.0, &mut e.0);
         });
     }
@@ -77,9 +71,9 @@ impl Schedule {
         world.spawn_many(10_000, |_| (A(0.0), B(0.0), C(0.0), E(0.0)));
 
         let mut scheduler = Scheduler::new();
-        scheduler.add_auto_system("SysAB", SysAB);
-        scheduler.add_auto_system("SysCD", SysCD);
-        scheduler.add_auto_system("SysCE", SysCE);
+        scheduler.add_auto_system("SysAB", sys_ab);
+        scheduler.add_auto_system("SysCD", sys_cd);
+        scheduler.add_auto_system("SysCE", sys_ce);
         scheduler.compile().unwrap();
 
         Self { world, scheduler }
