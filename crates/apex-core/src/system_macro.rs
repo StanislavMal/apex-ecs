@@ -377,3 +377,292 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens:tt )* ], @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
     } => { $crate::__sys_compile_error! { $($rest)* } };
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// sequential_system! — sequential systems with &mut World access
+// ═══════════════════════════════════════════════════════════════════
+
+#[macro_export]
+macro_rules! sequential_system {
+    // ── Variant A: stateless ──
+    {
+        fn $fn_name:ident(
+            $($params:tt)*
+        ) {
+            $($body:tt)*
+        }
+    } => {
+        $crate::__seq_system_impl! {
+            @fn_name: $fn_name,
+            @world: world,
+            @before: [],
+            @after: [],
+            @params: [ $($params)* ],
+            @body: { $($body)* },
+        }
+    };
+
+    // ── Variant B: with state ──
+    {
+        struct $struct_name:ident {
+            $( $field:ident : $fty:ty = $default:expr ),* $(,)?
+        }
+        fn run(
+            $slf:ident : &mut Self,
+            $($params:tt)*
+        ) {
+            $($body:tt)*
+        }
+    } => {
+        struct $struct_name { $( $field: $fty ),* }
+
+        impl Default for $struct_name {
+            fn default() -> Self { Self { $( $field: $default ),* } }
+        }
+
+        impl $struct_name {
+            #[allow(unused_mut)]
+            pub fn into_system(self) -> impl FnMut(&mut $crate::world::World) + Send + 'static {
+                let mut __state = self;
+                move |world: &mut $crate::world::World| {
+                    let $slf = &mut __state;
+                    { $( $body )* }
+                }
+            }
+        }
+    };
+}
+
+// ── Sequential impl helper ───────────────────────────────────────
+
+#[doc(hidden)] #[macro_export]
+macro_rules! __seq_system_impl {
+    // Base case
+    {
+        @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [], @body: { $( $body:tt )* },
+    } => {
+        fn $fn_name($world: &mut $crate::world::World) {
+            $( $before )*
+            $( $body )*
+            $( $after )*
+        }
+    };
+
+    // ═══ With trailing comma ═══
+
+    // world: &mut World — capture name as @world (caller hygiene)
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut World , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $pname,
+        @before: [ $( $before )* ], @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // ctx: Ctx — reborrow &World
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Ctx , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &$crate::world::World = &$world; ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // WholeWorld — noop for sequential
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : WholeWorld , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* ], @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Query tuple
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : ( $( $qty:tt )* ) , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $crate::world::CachedQuery::<( $( $qty )* )>::new($world, $crate::component::Tick::ZERO); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Event reader
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & [ $ev:ty ] , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $world.event_reader::<$ev>(); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Event writer
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut Vec < $ev:ty > , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let mut $pname = $world.event_writer::<$ev>(); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Resource write
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut $ty:ty , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &mut $ty = $world.resource_mut::<$ty>(); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Resource read
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & $ty:ty , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &$ty = $world.resource::<$ty>(); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Commands — user calls cmd.apply(world) manually
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Cmd , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let mut $pname = $crate::Commands::new(); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // Bare type query
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : $qty:ty , $( $rest:tt )* ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $crate::world::CachedQuery::<$qty>::new($world, $crate::component::Tick::ZERO); ],
+        @after: [ $( $after )* ],
+        @params: [ $( $rest )* ], @body: { $( $body )* },
+    }};
+
+    // ═══ Without trailing comma (last param) ═══
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut World ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $pname,
+        @before: [ $( $before )* ], @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Ctx ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &$crate::world::World = &$world; ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : WholeWorld ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* ], @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : ( $( $qty:tt )* ) ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $crate::world::CachedQuery::<( $( $qty )* )>::new($world, $crate::component::Tick::ZERO); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & [ $ev:ty ] ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $world.event_reader::<$ev>(); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut Vec < $ev:ty > ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let mut $pname = $world.event_writer::<$ev>(); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & mut $ty:ty ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &mut $ty = $world.resource_mut::<$ty>(); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : & $ty:ty ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname: &$ty = $world.resource::<$ty>(); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Cmd ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let mut $pname = $crate::Commands::new(); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : $qty:ty ],
+        @body: { $( $body:tt )* },
+    } => { $crate::__seq_system_impl! { @fn_name: $fn_name, @world: $world,
+        @before: [ $( $before )* let $pname = $crate::world::CachedQuery::<$qty>::new($world, $crate::component::Tick::ZERO); ],
+        @after: [ $( $after )* ],
+        @params: [], @body: { $( $body )* },
+    }};
+
+    // Catch-all
+    { @fn_name: $fn_name:ident, @world: $world:ident,
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $($rest:tt)+ ], @body: { $( $body:tt )* },
+    } => { $crate::__sys_compile_error! { $($rest)* } };
+}

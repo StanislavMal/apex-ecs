@@ -58,4 +58,5 @@ pub mod prelude {
     pub use crate::Component;
     pub use crate::BundleDerive as Bundle;
     pub use crate::system;
+    pub use crate::sequential_system;
 }

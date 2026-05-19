@@ -6,7 +6,7 @@
 >
 > **Принцип:** macro_rules!, не proc-macro. Никаких новых зависимостей.
 >
-> **Статус:** ✅ Фазы 1-3 завершены. Полный охват API AutoSystem.
+> **Статус:** ✅ Все фазы завершены. `system!` + `sequential_system!` покрывают весь API.
 
 ---
 
@@ -18,7 +18,7 @@
 |---|----------|-----|--------|
 | 1 | Default `type Events = ()` в трейте | `system_param.rs` | ❌ Отменено (unstable) |
 | 1b | 1-element tuple impl для WorldQuery, ResourceAccessList, EventAccessList | `query.rs:468`, `system_param.rs:262,315` | ✅ |
-| 2 | `system!` макрос (macro_rules!) — Variant A + B | `system_macro.rs` (~530 строк) | ✅ |
+| 2 | `system!` макрос — Variant A + B | `system_macro.rs` (~380 строк) | ✅ |
 | 3 | `ctx: Ctx` — прямой доступ к SystemContext | `system_macro.rs` | ✅ |
 | 4 | `__whole: WholeWorld` — NEEDS_WHOLE_WORLD | `system_macro.rs` | ✅ |
 | 5 | Event writer: `EventWriter::send()` вместо buffer+flush | `system_macro.rs` | ✅ |
@@ -27,16 +27,20 @@
 | 8 | Реэкспорт в `lib.rs` + prelude | `apex-core/src/lib.rs`, `apex-app/src/lib.rs` | ✅ |
 | 9 | Relations: Commands (`add_relation`, `remove_relation`, `add_relation_batch`) | `commands.rs` | ✅ |
 | 10 | Relations: SystemContext (`query_relation`, `query_wildcard`, `children_of`, `has_relation`, `get_relation_target`) | `world.rs` | ✅ |
-| 11 | Обновление `minimal.rs` — все системы на `system!` | `apex-input/examples/minimal.rs` | ✅ |
+| 11 | `App::add_sequential_system()` | `app.rs` | ✅ |
+| 12 | `sequential_system!` — Variant A + B | `system_macro.rs` (~290 строк) | ✅ |
+| 13 | Обновление `minimal.rs` — `system!` + `sequential_system!` | `apex-input/examples/minimal.rs` | ✅ |
 
 ### Метрики приёмки
 
 - ✅ `cargo test -p apex-core` — 106 тестов
 - ✅ `cargo test -p apex-app` — 19 тестов
-- ✅ `cargo build --example minimal` — 9 систем (5 рабочих + 4 compile-check)
-- ✅ Variant A (stateless) — query, resources, events, commands, ctx, wholeworld
-- ✅ Variant B (stateful) — struct + Default + `s: &mut Self`
-- ✅ Multiple `&mut Vec<E>` — через `EventWriter::send()`
+- ✅ `cargo build --example minimal` — 11 систем (5 рабочих + 6 compile-check)
+- ✅ `system!` Variant A — query, resources, events, commands, ctx, wholeworld
+- ✅ `system!` Variant B — struct + Default + `s: &mut Self` + `impl AutoSystem`
+- ✅ `sequential_system!` Variant A — `&mut World` + все параметры из `system!`
+- ✅ `sequential_system!` Variant B — struct + Default + `into_system() -> impl FnMut`
+- ✅ Multiple `Emit<E>` — через `EventWriter::send()`
 - ✅ Relations — read via `ctx: Ctx`, write via `cmd: Cmd`
 
 ---
@@ -47,7 +51,7 @@
 
 **Причина:** `associated_type_defaults` — unstable feature (#29661) на stable Rust 1.94.0.
 
-**Решение:** макрос всегда генерирует `type Events = (...)` явно. Для пустого случая — `type Events = ()`.
+**Решение:** макрос всегда генерирует `type Events = (...)` явно.
 
 ### 2.2 Именование структур
 
@@ -55,29 +59,39 @@
 |------|------|
 | `fn movement(...)` → `struct MovementSystem` | `fn movement_system(...)` → `struct movement_system` |
 
-**Причина:** macro_rules! не может преобразовывать snake_case → CamelCase. Имя функции = имя структуры. Атрибут `#[allow(non_camel_case_types)]` подавляет warning.
+**Причина:** macro_rules! не может snake_case → CamelCase. `#[allow(non_camel_case_types)]` подавляет warning.
 
 ### 2.3 Variant B: `s: &mut Self` вместо `self: &mut Self`
 
-**Причина:** `self` — keyword, не захватывается как `$slf:ident`. Пользователь выбирает ЛЮБОЕ имя (например `s`, `state`). Макрос генерирует `let s = &mut *self;` в начале `fn run`.
+**Причина:** `self` — keyword, не захватывается как `$slf:ident`. Пользователь выбирает ЛЮБОЕ имя.
 
 ### 2.4 Event reader: `EventReader<T>` вместо `&[E]`
 
-Фактический API `EventReader` не совпал с предположениями плана. Биндинг: `let events = ctx.event_reader::<E>();`, пользователь вызывает `.iter()`.
+Фактический API EventReader не совпал с предположениями. Биндинг: `let ev = ctx.event_reader::<E>();`, вызов `.iter()`.
 
 ### 2.5 Event writer: `EventWriter::send()` вместо buffer+flush
 
-Исходный план: `Vec<E>` buffer + flush. Факт: прямой `EventWriter` с `.send()`. Это устранило проблему уникальных имён буферов и поддержало несколько эмиттеров без ограничений.
+Устранило проблему уникальных имён буферов. Несколько эмиттеров без ограничений.
 
-### 2.6 Hygiene: `ctx` и `s` передаются как metavariables
+### 2.6 Hygiene: metavariables для `ctx`, `world`, `s`
 
-Для обхода hygiene-проблем в рекурсивных macro_rules!:
-- `ctx` передаётся как `$ctx:ident` через все уровни рекурсии
-- `s` (state accessor) передаётся как `@slf: [ $slf ]` через accumulator
+- `ctx` передаётся как `$ctx:ident` через рекурсию `__system_impl!`
+- `world` передаётся как `@world` accumulator (из захваченного `$pname:ident : &mut World`)
+- `s` (state accessor) передаётся как `@slf: [ $slf ]`
+
+### 2.7 `sequential_system!` использует `SystemFn = Box<dyn FnMut(&mut World) + Send>`
+
+Оказалось, что в движке уже есть тип sequential систем — `SystemFn` в scheduler `lib.rs:152`.
+Не нужен новый трейт. Variant B генерирует `into_system() -> impl FnMut`, захватывая состояние в замыкание.
+
+### 2.8 `cmd: Cmd` в sequential — ручной apply
+
+В parallel системах Commands применяются планировщиком после stage. В sequential — пользователь
+вызывает `cmd.apply(world)` вручную, когда готов. Это даёт контроль над порядком и временем жизни borrow'ей.
 
 ---
 
-## 3. Текущий синтаксис `system!` (актуальный)
+## 3. Текущий синтаксис `system!`
 
 ### Вариант А — без состояния
 
@@ -92,29 +106,7 @@ system! {
         }
     }
 }
-// Использование: app.add_system(Update, movement_system);
-```
-
-### Вариант А — с полным набором параметров
-
-```rust
-system! {
-    fn full_featured(
-        q: (Read<Position>, Write<Velocity>),
-        keys: &Input<KeyCode>,           // resource read
-        exit: &mut Exit,                 // resource write
-        events: &[CollisionEvent],       // event reader
-        out: &mut Vec<DamageEvent>,      // event writer (.send())
-        cmd: Cmd,                        // commands (spawn, insert, relations)
-        ctx: Ctx,                        // SystemContext (entity_count, relations)
-        __whole: WholeWorld,             // NEEDS_WHOLE_WORLD = true
-    ) {
-        // ctx.entity_count() — доступен
-        // ctx.children_of(ChildOf, parent) — relations read
-        // cmd.add_relation(e, ChildOf, p) — relations write
-        // out.send(DamageEvent { ... }) — event emit
-    }
-}
+// Регистрация: app.add_system(Update, movement_system);
 ```
 
 ### Вариант Б — с состоянием
@@ -125,11 +117,7 @@ system! {
         wave: u32 = 1,
         enemies_spawned: u32 = 0,
     }
-    fn run(
-        s: &mut Self,
-        cmd: Cmd,
-        ctx: Ctx,
-    ) {
+    fn run(s: &mut Self, cmd: Cmd, ctx: Ctx) {
         if s.wave <= 5 {
             cmd.spawn((Enemy, Position::default()));
             s.enemies_spawned += 1;
@@ -137,10 +125,10 @@ system! {
     }
 }
 // Генерирует: struct + impl Default + impl AutoSystem
-// Использование: app.add_system(Update, WaveSpawner::default());
+// Регистрация: app.add_system(Update, WaveSpawner::default());
 ```
 
-### Полная таблица параметров
+### Полная таблица параметров `system!`
 
 | Параметр | Associated type | Let-биндинг |
 |----------|----------------|-------------|
@@ -153,59 +141,119 @@ system! {
 | `name: Cmd` | *(none)* | `let name: &mut Commands = ctx.commands();` |
 | `name: Ctx` | *(none)* | `let name: &SystemContext = &ctx;` |
 | `__whole: WholeWorld` | `const NEEDS_WHOLE_WORLD = true` | *(none)* |
-| В Relations: `ctx.children_of(R, parent)`, `ctx.has_relation(...)`, etc. | |
-| В Relations: `cmd.add_relation(e, R, t)`, `cmd.remove_relation(e, R, t)` | |
 
 ---
 
-## 4. Relations API
+## 4. `sequential_system!` — актуальный синтаксис
 
-Доступны через `ctx: Ctx` (чтение) и `cmd: Cmd` (запись). Новых параметров макроса не потребовалось.
-
-### Чтение (SystemContext)
+### Вариант А — без состояния
 
 ```rust
-system! {
-    fn parent_system(ctx: Ctx) {
-        // Все дети parent'а
-        for child in ctx.children_of(ChildOf, root) { ... }
-
-        // Запрос с компонентами
-        let iter = ctx.query_relation::<ChildOf, Read<Position>>(ChildOf, parent);
-        for (entity, pos) in iter { ... }
-
-        // Wildcard — все entity с любым ChildOf
-        let iter = ctx.query_wildcard::<ChildOf, Read<Health>>(ChildOf);
-
-        // Проверки
-        if ctx.has_relation(subject, Owns, target) { ... }
-        if let Some(parent) = ctx.get_relation_target(entity, ChildOf) { ... }
+sequential_system! {
+    fn cleanup(
+        world: &mut World,       // → параметр функции (&mut World)
+        events: &[DeathEvent],   // → world.event_reader::<DeathEvent>()
+        config: &CleanupConfig,  // → world.resource::<CleanupConfig>()
+        cmd: Cmd,                // → let mut cmd = Commands::new();
+    ) {
+        for ev in events.iter() {
+            if config.active { cmd.despawn(ev.entity); }
+        }
+        cmd.apply(world);        // ручной apply
     }
 }
+// Генерирует: fn cleanup(world: &mut World) { ... }
+// Регистрация: app.add_sequential_system(PostUpdate, "cleanup", cleanup);
+```
+
+### Вариант Б — с состоянием
+
+```rust
+sequential_system! {
+    struct LuaRunner {
+        engine: ScriptEngine = ScriptEngine::with_dir("scripts/"),
+    }
+    fn run(
+        s: &mut Self,
+        world: &mut World,
+        dt: &Time,
+    ) {
+        s.engine.run(dt, world);
+    }
+}
+// Генерирует: struct + impl Default + fn into_system(self) -> impl FnMut(&mut World) + Send
+// Регистрация:
+//   let system = LuaRunner::default().into_system();
+//   app.scheduler_mut().add_system("lua", system);
+```
+
+### Таблица параметров `sequential_system!`
+
+| Параметр | Let-биндинг | Примечание |
+|----------|-------------|-----------|
+| `world: &mut World` | параметр функции (не биндинг) | эксклюзивный доступ к миру |
+| `q: (Read<A>, Write<B>)` | `let q = CachedQuery::new(&world, Tick::ZERO);` | |
+| `q: Read<A>` (bare) | `let q = CachedQuery::new(&world, Tick::ZERO);` | |
+| `name: &T` | `let name: &T = world.resource::<T>();` | |
+| `name: &mut T` | `let name: &mut T = world.resource_mut::<T>();` | |
+| `name: &[E]` | `let name = world.event_reader::<E>();` | |
+| `name: &mut Vec<E>` | `let mut name = world.event_writer::<E>();` | `.send()` |
+| `name: Cmd` | `let mut name = Commands::new();` | **ручной** `cmd.apply(world);` |
+| `name: Ctx` | `let name: &World = &world;` | все read-only методы World |
+| `__whole: WholeWorld` | *(none)* | бессмысленно для sequential |
+
+### Ключевые отличия от `system!`
+
+| | `system!` (parallel) | `sequential_system!` |
+|---|---|---|
+| Контекст | `SystemContext<'_>` | `&mut World` |
+| Trait | `AutoSystem` | нет (просто функция или замыкание) |
+| Associated types | `type Query`, `type Resources`, `type Events` | нет |
+| Регистрация | `App::add_system(label, system)` | `App::add_sequential_system(label, name, func)` |
+| `cmd: Cmd` | `&mut Commands` (авто-apply после stage) | `Commands` (ручной `cmd.apply(world)`) |
+| `ctx: Ctx` | `&SystemContext<'_>` | `&World` |
+| Параллельность | Да (ASD-чанкование) | Нет (строго последовательно) |
+
+---
+
+## 5. Relations API
+
+Доступны через `ctx: Ctx` и `cmd: Cmd` в обоих макросах.
+
+### Чтение (SystemContext / World)
+
+```rust
+// В system!: через ctx: Ctx
+ctx.children_of(ChildOf, root)
+ctx.query_relation::<ChildOf, Read<Position>>(ChildOf, parent)
+ctx.query_wildcard::<ChildOf, Read<Health>>(ChildOf)
+ctx.has_relation(subject, Owns, target)
+ctx.get_relation_target(entity, ChildOf)
+
+// В sequential_system!: через ctx: Ctx (даёт &World)
+// — все те же методы, т.к. они определены на World
 ```
 
 ### Запись (Commands)
 
 ```rust
-system! {
-    fn link_system(cmd: Cmd) {
-        cmd.add_relation(entity, ChildOf, parent);
-        cmd.remove_relation(entity, Owns, target);
-        cmd.add_relation_batch(vec![e1, e2, e3], ChildOf, root);
-    }
-}
+cmd.add_relation(entity, ChildOf, parent);
+cmd.remove_relation(entity, Owns, target);
+cmd.add_relation_batch(vec![e1, e2, e3], ChildOf, root);
 ```
 
-### Реализация
+### Реализация Commands
 
-| Метод Commands | Тип команды | Аллокация |
-|---------------|-------------|-----------|
+| Метод | Тип команды | Аллокация |
+|-------|------------|-----------|
 | `add_relation` | `Command::AddRelation` (function pointer) | Нет |
 | `remove_relation` | `Command::RemoveRelation` (function pointer) | Нет |
 | `add_relation_batch` | `Command::Apply(Box<dyn FnOnce>)` (замыкание) | Box |
 
-| Метод SystemContext | Что возвращает |
-|--------------------|---------------|
+### Реализация SystemContext
+
+| Метод | Возвращает |
+|-------|-----------|
 | `query_relation<R, Q>(kind, target)` | `RelationIter<Q>` |
 | `query_wildcard<R, Q>(kind)` | `RelationIter<Q>` |
 | `children_of<R>(kind, parent)` | `impl Iterator<Item = Entity>` |
@@ -214,110 +262,12 @@ system! {
 
 ---
 
-## 5. `sequential_system!` — проект
-
-### Мотивация
-
-`system!` даёт параллельную систему с `SystemContext` и `Commands`. Но есть сценарии,
-где нужен эксклюзивный `&mut World`:
-- **Lua-скриптинг** — движку нужен полный доступ к миру
-- **`despawn_recursive`** — рекурсивное удаление требует `&mut World`
-- **Массовые structural changes** — перестройка архетипов вне ASD-чанков
-- **Hot-reload / сериализация** — операции над всем миром целиком
-
-### Предлагаемый синтаксис
-
-**Вариант А — без состояния:**
-```rust
-sequential_system! {
-    fn cleanup(
-        world: &mut World,
-        events: &[DeathEvent],
-        config: &CleanupConfig,
-    ) {
-        for ev in events.iter() {
-            if config.despawn_on_death {
-                world.despawn_recursive(ChildOf, ev.entity);
-            }
-        }
-    }
-}
-```
-
-**Вариант Б — с состоянием (для Lua и кешей):**
-```rust
-sequential_system! {
-    struct LuaRunner {
-        engine: ScriptEngine = ScriptEngine::with_dir("scripts/"),
-    }
-
-    fn run(
-        s: &mut Self,
-        world: &mut World,
-        dt: &Time,
-    ) {
-        s.engine.run(dt, world);
-        s.engine.poll_hot_reload();
-    }
-}
-```
-
-### Что генерируется
-
-В отличие от `system!`:
-- **Нет associated types** — не нужно `type Query`, `type Resources`, `type Events`
-- **Нет AutoSystem** — генерируется обычная функция `fn name(&mut World)`
-- **`world: &mut World`** — распознаётся как особый параметр, маппится на параметр функции
-- Ресурсы/события — биндятся через `world.resource::<T>()`, `world.event_reader::<E>()` и т.д.
-- Для Variant Б: структура + `impl Default`, метод `run(&mut self, world: &mut World)`
-
-### Что нужно для реализации
-
-**1. Добавить convenience-методы в `World`** (аналогично `SystemContext`):
-```rust
-impl World {
-    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> { ... }
-    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> { ... }
-    // resource() и resource_mut() уже есть, но возвращают &T / &mut T,
-    // а SystemContext возвращает Res<T> / ResMut<T>
-}
-```
-
-**2. `sequential_system!` macro_rules!** (~300 строк):
-- Переиспользует парсинг параметров из `system!`
-- `world: &mut World` → функция получает `world: &mut World`
-- `name: &T` → `let name: &T = world.resource::<T>();`
-- `name: &mut T` → `let name: &mut T = world.resource_mut::<T>();`
-- `name: &[E]` → `let name = world.event_reader::<E>();`
-- `name: &mut Vec<E>` → `let mut name = world.event_writer::<E>();`
-- `name: Cmd` → `let mut name = Commands::new();` + `name.apply(world);` в конце
-- `s: &mut Self` (Variant B) → `let s = &mut *self;`
-
-**3. Для Variant Б с состоянием — нужно продумать:**
-Где хранится состояние между вызовами? Варианты:
-- **A: Resource** — `world.resource_mut::<LuaRunner>()` — макрос генерирует код, который достаёт состояние из ресурса
-- **B: Замыкание** — генерируется `move |world: &mut World| { let s = &mut state; ... }`, где state захвачен
-- **C: Trait SequentialSystem** — аналог AutoSystem: `trait SequentialSystem { fn run(&mut self, world: &mut World); }`
-
-**Рекомендация:** начать с Variant A (stateless) — он покрывает `despawn_recursive` и cleanup. Variant Б отложить до проработки хранения состояния.
-
-### Метрики приёмки (для V1, stateless)
-
-- [ ] `sequential_system!` с 0, 1, 2, 3 параметрами компилируется
-- [ ] `world: &mut World` + `events: &[E]` + `config: &T` — полный пример
-- [ ] Сгенерированная функция имеет сигнатуру `fn name(&mut World)`
-- [ ] `cmd: Cmd` — auto-apply в конце функции
-- [ ] 106 тестов не сломаны
-
----
-
 ## 6. Что осталось на будущее
 
 | Задача | Приоритет | Оценка |
 |--------|-----------|--------|
-| `sequential_system!` — Variant A (stateless) | High | 2-3h |
-| `sequential_system!` — Variant B (stateful) | Medium | 2-3h (нужно решить где хранить состояние) |
+| Обновление остальных примеров (basic, event_pipeline, perf, stages) | Low | 30min |
+| Документирование макросов в rustdoc | Low | 30min |
 | Default `type Events` в трейте | Low | Ждать stable Rust |
 | CamelCase-именование структур | Low | Ждать paste или proc-macro |
-| Обновление остальных примеров (basic, event_pipeline, perf) | Low | 30min |
-| Документирование макроса в rustdoc | Low | 30min |
+| `App::add_sequential_system` для Variant B (сейчас через scheduler напрямую) | Low | 30min |
