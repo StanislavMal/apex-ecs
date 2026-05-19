@@ -65,7 +65,6 @@ use apex_core::{
     world::World,
     system_param::WorldQuerySystemAccess,
 };
-#[cfg(feature = "parallel")]
 use apex_core::commands::Commands;
 
 pub use stage::{Stage, StageLabel};
@@ -762,10 +761,15 @@ impl Scheduler {
     ///
     /// Когда включено, движок вычисляет среднее количество entity на одну
     /// систему в Stage и отключает параллелизм, если порог не достигнут:
-    ///   - multi-system (2+): min 3000 entity/system
-    ///   - single-system (1): min 15000 entity/system
+    ///   - 3+ систем:   min 15 000 entity/system
+    ///   - 2 системы:   min 25 000 entity/system
+    ///   - 1 система:   min 80 000 entity/system
     ///
-    /// По умолчанию: `false` (без автоотключения).
+    /// Пороги подобраны эмпирически (parallel_diagnostics benchmark, 12 ядер).
+    /// «Valley of death» (PAR в 2-3x медленнее SEQ) — 5 000–50 000 entity
+    /// в зависимости от числа систем.
+    ///
+    /// По умолчанию: `true` (автоотключение включено).
     pub fn set_parallel_auto_disable(&mut self, enabled: bool) -> &mut Self {
         self.auto_disable_parallel = enabled;
         self
@@ -786,12 +790,18 @@ impl Scheduler {
 
     /// Эвристика: минимальное количество entity на одну систему для окупаемости
     /// параллелизма (rayon overhead < выигрыш).
+    ///
+    /// Пороги определены эмпирически через `parallel_diagnostics` scaling benchmark
+    /// (12 ядер, release). «Valley of death» (PAR медленнее SEQ в 2-3x) находится
+    /// в диапазоне 5,000-10,000 entity для multi-system и до 50,000 для single-system.
     #[allow(dead_code)]
     fn min_entities_for_parallelism(num_systems: usize) -> usize {
-        if num_systems >= 2 {
-            3000  // Больше систем → лучше амортизация rayon overhead
+        if num_systems >= 3 {
+            15_000 // 3+ систем — амортизация rayon overhead на 25K+ entity
+        } else if num_systems >= 2 {
+            25_000 // 2 системы — пересечение PAR/SEQ около 25K
         } else {
-            15000 // Одна система — только row-level chunking, overhead выше
+            80_000 // 1 система — только row-level chunking, пересечение ~100K
         }
     }
 
@@ -1514,7 +1524,7 @@ impl Scheduler {
     // ── Выполнение ─────────────────────────────────────────────
 
     /// Запустить одну итерацию планировщика.
-    /// С feature = "parallel" — параллельный путь через Rayon.
+    /// Использует Rayon для параллельного выполнения.
     ///
     /// Startup этап выполняется только при первом вызове `run()`.
     pub fn run(&mut self, world: &mut World) {
@@ -1527,11 +1537,7 @@ impl Scheduler {
         // Вычисляем маппинг систем → архетипы для SubWorld.
         self.compute_archetype_indices(world);
 
-        #[cfg(feature = "parallel")]
         self.run_hybrid_parallel(world as *mut World);
-
-        #[cfg(not(feature = "parallel"))]
-        self.run_sequential(world as *mut World);
 
         // После первого run() Startup больше не выполняется
         self.startup_completed = true;
@@ -1613,7 +1619,6 @@ impl Scheduler {
     /// к разным системам безопасен. SubWorld создаётся локально внутри spawn
     /// с ограничением `(arch_idx, start, end)`, что гарантирует что
     /// разные задачи НЕ пересекаются по данным одного архетипа.
-    #[cfg(feature = "parallel")]
     fn run_stage_parallel(&mut self, stage_ids: &[SystemId], world: &World, cmds_ptr: usize) {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
@@ -1817,7 +1822,6 @@ impl Scheduler {
     /// [`run_stage_parallel`] (ASD). Stage с sequential системами или
     /// смешанные выполняются последовательно через `make_sub_world`.
     ///
-    #[cfg(feature = "parallel")]
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
         let stages: Vec<(Vec<SystemId>, bool, Vec<TypeId>)> = plan.stages
@@ -1861,31 +1865,18 @@ impl Scheduler {
             if !*all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
+                    let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
+                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                            let sw = self.make_sub_world(sys_idx, w);
                             let system = &mut self.systems[sys_idx];
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                                    system.run(SystemContext::from_sub_world(&sub_world));
                                 }
                             }
                         }
-                    }
-                }
-                {
-                    let w = unsafe { &mut *world_ptr };
-                    for cmds in &mut thread_commands { cmds.apply(w); }
-                }
-                {
-                    let w = unsafe { &*const_ptr };
-                    let cur = w.archetypes().len();
-                    if cur != prev_arch_count {
-                        prev_arch_count = cur;
-                        self.compute_archetype_indices(w);
-                        self.sub_worlds_dirty = true;
-                        self.prepare_sub_worlds(w);
                     }
                 }
                 if !emit_event_types.is_empty() {
@@ -1916,28 +1907,18 @@ impl Scheduler {
             if should_fallback {
                 {
                     let w = unsafe { &*const_ptr };
+                    let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
+                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                            let sw = self.make_sub_world(sys_idx, w);
                             let system = &mut self.systems[sys_idx];
-                            if let SystemKind::Parallel { system, .. } = &mut system.kind {
-                                system.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                            match &mut system.kind {
+                                SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
+                                SystemKind::Parallel { system, .. } => {
+                                    system.run(SystemContext::from_sub_world(&sub_world));
+                                }
                             }
                         }
-                    }
-                }
-                {
-                    let w = unsafe { &mut *world_ptr };
-                    for cmds in &mut thread_commands { cmds.apply(w); }
-                }
-                {
-                    let w = unsafe { &*const_ptr };
-                    let cur = w.archetypes().len();
-                    if cur != prev_arch_count {
-                        prev_arch_count = cur;
-                        self.compute_archetype_indices(w);
-                        self.sub_worlds_dirty = true;
-                        self.prepare_sub_worlds(w);
                     }
                 }
                 if !emit_event_types.is_empty() {
@@ -1973,7 +1954,7 @@ impl Scheduler {
     ///
     /// SubWorld хранит сырые указатели на данные из Scheduler storage,
     /// безопасность гарантируется тем что storage не мутирует пока живы SubWorld.
-    #[cfg(feature = "parallel")]
+    #[allow(dead_code)]
     fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
         let arch_indices = &self.archetype_indices_storage[storage_idx];
         let ranges = &self.row_ranges_storage[storage_idx];
@@ -1997,7 +1978,6 @@ impl Scheduler {
     ///
     /// Использует `sub_worlds_dirty` для кеширования: если данные не изменились
     /// с прошлого вызова, пересоздание storage пропускается.
-    #[cfg(feature = "parallel")]
     fn prepare_sub_worlds(&mut self, world: &World) {
         // Если данные не изменились — пропускаем клонирование
         if !self.sub_worlds_dirty {
@@ -2733,7 +2713,6 @@ mod tests {
     }
 
     /// Параллельное выполнение: обе AutoSystem применяют изменения.
-    #[cfg(feature = "parallel")]
     #[test]
     fn parallel_auto_systems_correctness() {
         let mut sched = Scheduler::new();

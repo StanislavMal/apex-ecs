@@ -2,7 +2,7 @@
 //!
 //! Запуск:
 //!   cargo run -p apex-examples --example parallel_diagnostics --release
-//!   cargo run -p apex-examples --example parallel_diagnostics --release --features parallel
+//!   cargo run -p apex-examples --example parallel_diagnostics --release
 //!
 //! Что тестируется:
 //!   1. SEQ vs PAR — scaling по entity count
@@ -694,10 +694,9 @@ fn main() {
     println!("║     APEX ECS — Диагностика параллелизма (scaling benchmark)     ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Ядер: {} | Режим: {} | Фича parallel: {}",
+    println!("  Ядер: {} | Режим: {} | Фича parallel: ✅",
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" },
-        if cfg!(feature = "parallel") { "✅" } else { "❌" },
     );
     println!("  Entity counts: {:?}", ENTITY_COUNTS);
     println!("  {}", "─".repeat(90));

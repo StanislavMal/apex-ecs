@@ -1,7 +1,4 @@
-
-#[cfg(feature = "parallel")]
 use crate::world::{ChunkConfig, adaptive_chunk_size};
-#[cfg(feature = "parallel")]
 use smallvec::SmallVec;
 
 /// Вычислить список чанков `(arch_idx, start, end)` для параллельной итерации.
@@ -13,7 +10,6 @@ use smallvec::SmallVec;
 ///
 /// Использует [`adaptive_chunk_size`] для вычисления оптимального размера чанка.
 /// Эта функция является общей для `Query::par_for_each*` и `CachedQuery::par_for_each*`.
-#[cfg(feature = "parallel")]
 pub(crate) fn compute_par_chunks<I>(
     archetype_lens: I,
     num_threads: usize,

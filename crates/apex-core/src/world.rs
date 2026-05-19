@@ -1153,16 +1153,10 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn commands(&self) -> &mut Commands {
         if let Some(deferred_cmds) = self.deferred_cmds {
-            #[cfg(feature = "parallel")]
             unsafe {
                 let thread_idx = rayon::current_thread_index().unwrap_or(0);
                 let vec = &mut *deferred_cmds;
                 return &mut vec[thread_idx];
-            }
-            #[cfg(not(feature = "parallel"))]
-            unsafe {
-                let vec = &mut *deferred_cmds;
-                return &mut vec[0];
             }
         }
         // SAFETY: inline_cmds используется только когда deferred_cmds не задан
@@ -1394,8 +1388,6 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     }
 
     /// Параллельная итерация.
-    /// Работает только с `feature = "parallel"`.
-    #[cfg(feature = "parallel")]
     pub fn par_for_each<F>(&self, f: F)
     where
         Q: Send,
@@ -1448,12 +1440,6 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 }
             }
         });
-    }
-
-    /// Параллельная итерация по (Entity, компонентам) — fallback для sequential.
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, f: F) {
-        self.for_each(f);
     }
 
     pub fn len(&self) -> usize {

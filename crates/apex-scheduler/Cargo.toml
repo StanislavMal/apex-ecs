@@ -5,7 +5,6 @@ edition.workspace = true
 
 [features]
 default  = []
-parallel = ["dep:rayon", "apex-core/parallel"]
 
 [dependencies]
 apex-core  = { path = "../apex-core" }
@@ -16,7 +15,7 @@ rustc-hash.workspace  = true
 smallvec.workspace    = true
 thiserror.workspace   = true
 log.workspace         = true
-rayon = { workspace = true, optional = true }
+rayon.workspace = true
 
 [dev-dependencies]
 apex-macros = { path = "../apex-macros" }

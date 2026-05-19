@@ -13,7 +13,7 @@
 //! Дополнительно: sequential-системы можно регистрировать вперемешку
 //! с parallel — планировщик сам выстроит правильный порядок.
 //!
-//! cargo run -p apex-examples --example stages --release --features parallel
+//! cargo run -p apex-examples --example stages --release
 //! cargo test --workspace
 //!
 //! Ожидаемый вывод:

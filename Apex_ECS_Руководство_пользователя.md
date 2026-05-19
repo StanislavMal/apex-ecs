@@ -70,9 +70,6 @@ apex-macros        = { path = "path/to/apex-ecs/crates/apex-macros" }
 apex-scripting     = { path = "path/to/apex-ecs/crates/apex-scripting" }
 apex-isolated      = { path = "path/to/apex-ecs/crates/apex-isolated" }
 
-# Для параллельного режима:
-[features]
-parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
 ```
 
 **Вариант B — git-зависимость (потребитель):**
@@ -91,9 +88,10 @@ apex-scripting     = { git = "https://github.com/StanislavMal/apex-ecs", rev = "
 apex-isolated      = { git = "https://github.com/StanislavMal/apex-ecs", rev = "latest-revision-hash" }
 ```
 
-> **Минимальная версия Rust:** 2021 Edition. Функция `parallel` включает Rayon для параллельного
-> выполнения Stage. Без этого флага планировщик работает в последовательном режиме — per-stage
-> flush событий работает в **обоих** режимах.
+> **Минимальная версия Rust:** 2021 Edition. Rayon всегда скомпилирован — параллелизм доступен
+> без feature-флагов. Автоотключатель (15000/25000/80000 entity/system) защищает малые миры
+> от параллельного оверхеда. Для жёсткого sequential:
+> `scheduler.set_parallel_auto_disable(false).set_parallel_min_entities(usize::MAX)`.
 
 ---
 
@@ -460,7 +458,7 @@ let far = world.query_typed::<Read<Position>>()
     .filter(|(_, pos)| pos.x > 100.0)
     .count();
 
-// Параллельная итерация (feature = "parallel"):
+// Параллельная итерация (rayon всегда доступен):
 world.query_typed::<Read<Position>>()
     .par_for_each(|_, pos| {
         /* CPU-bound расчёты */
@@ -748,25 +746,29 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 Для систем с массовой отправкой событий планировщик может автоматически предаллоцировать буфер `pending` перед запуском системы, избегая реаллокаций `Vec` в hot-пути `send()`. Достаточно указать ожидаемую ёмкость в `AccessDescriptor`:
 
 ```rust
+// Для system! — резервируем через writer.reserve() прямо в теле:
+system! {
+    fn collision_system(
+        q: Read<Collider>,
+        writer: &mut Vec<DamageEvent>,
+    ) {
+        writer.reserve(10000);  // предаллоцировать буфер под 10000 событий
+        for (entity, _) in q.iter() {
+            writer.send(DamageEvent { target: entity, amount: 25.0 });
+        }
+    }
+}
+
 // Для add_par_access — через access_desc!:
 sched.add_par_access(
     "collision",
     access_desc!(write_event::<DamageEvent>)
-        .event_reserve::<DamageEvent>(10000),   // ← предаллоцировать на 10000 событий
+        .event_reserve::<DamageEvent>(10000),
     |ctx| { /* массовая отправка DamageEvent */ },
 );
-
-// Для add_auto_system — через ParSystem trait (ручная реализация):
-impl ParSystem for CollisionSystem {
-    fn access() -> AccessDescriptor {
-        AccessDescriptor::new()
-            .write_event::<DamageEvent>()
-            .event_reserve::<DamageEvent>(10000)
-    }
-}
 ```
 
-Планировщик вызывает `world.event_reserve::<T>(capacity)` перед выполнением системы, что позволяет `EventWriter::send()` работать без аллокаций внутри цикла.
+Планировщик вызывает `world.event_reserve::<T>(capacity)` перед выполнением системы, что позволяет `EventWriter::send()` работать без аллокаций внутри цикла. В `system!` макросе можно вызвать `writer.reserve()` напрямую.
 
 > **Примечание:** `world.event_reserve::<T>(cap)` и `world.event_reserve_by_type(type_id, cap)` доступны и для ручного вызова вне планировщика.
 
@@ -1105,61 +1107,68 @@ sequential_system! {
 > 
 > Явный порядок имеет приоритет над авто-детектом: при наличии `before`/`after`/`chain` рёбра, противоречащие указанному направлению, подавляются, и цикла не возникает.
 
-**Только компоненты:**
+**Только компоненты** (для понимания устройства; рекомендуемый способ — макрос `system!`):
 
 ```rust
-use apex_scheduler::Scheduler;
-use apex_core::prelude::*;
-
+// Ручная реализация (для понимания):
 struct MovementSystem;
-
 impl AutoSystem for MovementSystem {
     type Query = (Read<Velocity>, Write<Position>);
     type Resources = ();
     type Events = ();
+    fn run(&mut self, ctx: SystemContext<'_>) { ... }
+}
 
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>()
-            .for_each(|_, (vel, pos)| {
-                pos.x += vel.x * 0.016;
-                pos.y += vel.y * 0.016;
-            });
+// Рекомендуемый способ — макрос system!:
+system! {
+    fn movement_system(
+        q: (Read<Velocity>, Write<Position>),
+    ) {
+        for (_, (vel, pos)) in q.iter() {
+            pos.x += vel.x * 0.016;
+            pos.y += vel.y * 0.016;
+        }
     }
 }
 
 let mut sched = Scheduler::new();
-sched.add_auto_system("movement", MovementSystem);
+sched.add_auto_system("movement", movement_system);
 ```
 
-**Компоненты + ресурсы + события:**
+**Компоненты + ресурсы + события** (ручная реализация и макрос):
 
 ```rust
+// Ручная реализация:
 struct PhysicsSystem;
-
 impl AutoSystem for PhysicsSystem {
     type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
     type Resources = ResRead<PhysicsConfig>;
     type Events    = Emit<CollisionEvent>;
-
     fn run(&mut self, ctx: SystemContext<'_>) {
         let cfg = ctx.resource::<PhysicsConfig>();
-        let dt = cfg.dt;
-        let g = cfg.gravity;
         let mut writer = ctx.event_writer::<CollisionEvent>();
-
-        ctx.query::<Self::Query>()
-            .for_each(|entity, (mass, vel, pos)| {
-                vel.y -= g * mass.0 * dt;
-                pos.x += vel.x * dt;
-                pos.y += vel.y * dt;
-                if pos.y < 0.0 {
-                    writer.send(CollisionEvent { entity });
-                }
-            });
+        ctx.query::<Self::Query>().for_each(|entity, (mass, vel, pos)| {
+            vel.y -= cfg.gravity * mass.0 * cfg.dt;
+            if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
+        });
     }
 }
 
-sched.add_auto_system("physics", PhysicsSystem);
+// Рекомендуемый способ — макрос system!:
+system! {
+    fn physics_system(
+        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+        cfg: &PhysicsConfig,
+        writer: &mut Vec<CollisionEvent>,
+    ) {
+        for (entity, (mass, vel, pos)) in q.iter() {
+            vel.y -= cfg.gravity * mass.0 * cfg.dt;
+            if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
+        }
+    }
+}
+
+sched.add_auto_system("physics", physics_system);
 ```
 
 #### 6.1.1 Глобальный доступ (`NEEDS_WHOLE_WORLD`)
@@ -1167,25 +1176,28 @@ sched.add_auto_system("physics", PhysicsSystem);
 Некоторым системам нужен доступ **ко всем entity** мира — например, гравитация (сбор позиций всех тел) или построение пространственных структур. Такие системы несовместимы с ASD-чанкованием — если планировщик разрежет систему на чанки, каждый чанк увидит лишь часть entity и логика сломается.
 
 ```rust
+// Ручная реализация:
 struct OrbitalSystem;
-
 impl AutoSystem for OrbitalSystem {
     type Query = (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>);
     type Resources = ResRead<SpaceSettings>;
     type Events = ();
-
     /// Гравитация собирает позиции ВСЕХ тел — ASD-чанкование запрещено.
     const NEEDS_WHOLE_WORLD: bool = true;
+    fn run(&mut self, ctx: SystemContext<'_>) { ... }
+}
 
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let q = ctx.query::<Self::Query>();
-
+// Рекомендуемый способ — макрос system! с __whole:
+system! {
+    fn orbital_system(
+        q: (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>),
+        __whole: WholeWorld,
+    ) {
         // Фаза 1: собираем глобальные данные (все entity)
         let mut bodies: Vec<(Entity, Position, f32)> = Vec::new();
         q.for_each(|entity, (pos, _, mass, _)| {
             bodies.push((entity, *pos, mass.0));
         });
-
         // Фаза 2: применяем гравитацию
         q.for_each(|_, (pos, vel, mass, orbits)| {
             // ... расчёт сил через bodies ...
@@ -1193,8 +1205,8 @@ impl AutoSystem for OrbitalSystem {
     }
 }
 
-sched.add_auto_system("grav", OrbitalSystem);
-// ↑ NEEDS_WHOLE_WORLD выставляется автоматически — ASD-чанкование запрещено.
+sched.add_auto_system("grav", orbital_system);
+// ↑ NEEDS_WHOLE_WORLD выставляется макросом автоматически.
 ```
 
 **Что происходит:** система получает полный SubWorld (все entity), ASD не чанкует. Внутрисистемный `par_for_each` при этом остаётся доступен.
@@ -1346,7 +1358,7 @@ println!("{}", sched.debug_plan());
 // Последовательный запуск:
 sched.run_sequential(&mut world);
 
-// Параллельный запуск (feature = "parallel"):
+// Параллельный запуск:
 sched.run(&mut world);
 ```
 
@@ -1535,7 +1547,7 @@ fn run(&mut self, ctx: SystemContext<'_>) {
     // Количество entity:
     ctx.entity_count() // -> usize
 
-    // Параллельная итерация (feature = "parallel"):
+    // Параллельная итерация (rayon всегда доступен):
     ctx.query::<(Read<Vel>, Write<Pos>)>()
         .par_for_each(|_, (v, p)| {
             /* выполняется на нескольких потоках */
@@ -2433,17 +2445,11 @@ iso_bridge.apply_incoming(iso.world_mut());
 
 ### 13.1 Параллельный запуск систем
 
-Планировщик автоматически группирует совместимые параллельные системы в одну Stage и запускает их параллельно через Rayon. Используется алгоритм **ASD (Adaptive Scope Distribution)** — адаптивное распределение чанков по worker'ам.
-
-```toml
-# Включение параллелизма (Cargo.toml):
-[features]
-parallel = ["apex-core/parallel", "apex-scheduler/parallel"]
-```
+Планировщик автоматически группирует совместимые параллельные системы в одну Stage и запускает их параллельно через Rayon. Используется алгоритм **ASD (Adaptive Scope Distribution)** — адаптивное распределение чанков по worker'ам. Rayon всегда скомпилирован, feature-флаг не требуется.
 
 ```bash
-# Запуск:
-cargo run --features parallel
+# Запуск (параллелизм включён по умолчанию):
+cargo run --release
 ```
 
 #### 13.1.1 Как работает ASD (Adaptive Scope Distribution)
@@ -2553,43 +2559,15 @@ chunk = min(chunk, entity_count)
 ```
 
 ```rust
-impl AutoSystem for PhysicsSystem {
-    type Query = (Read<Mass>, Write<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>()
-            .par_for_each(|_, (mass, vel, pos)| {
-                vel.y -= 9.8 * mass.0 * 0.016;
-                pos.x += vel.x * 0.016;
-                pos.y += vel.y * 0.016;
-            });
-    }
-}
-```
-chunk = entity_count / max(num_threads, 1)
-# Абсолютный максимум — пользовательская настройка или 16384
-if chunk > MAX_CHUNK_SIZE → chunk = MAX_CHUNK_SIZE
-# Динамический минимум:
-if   entity_count < 100   → min = 128   # очень мало entity → крупные чанки
-elif entity_count < 1000  → min = 32    # средний размер → умеренное дробление
-else                      → min = 64    # много entity → баланс
-if chunk < min → chunk = min
-chunk = min(chunk, entity_count)
-```
-
-```rust
-impl AutoSystem for PhysicsSystem {
-    type Query = (Read<Mass>, Write<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>()
-            .par_for_each(|_, (mass, vel, pos)| {
-                vel.y -= 9.8 * mass.0 * 0.016;
-                pos.x += vel.x * 0.016;
-                pos.y += vel.y * 0.016;
-            });
+system! {
+    fn physics_system(
+        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+    ) {
+        q.par_for_each(|_, (mass, vel, pos)| {
+            vel.y -= 9.8 * mass.0 * 0.016;
+            pos.x += vel.x * 0.016;
+            pos.y += vel.y * 0.016;
+        });
     }
 }
 
@@ -2632,7 +2610,7 @@ sub_world.for_each_row(|_row| {
     // доступ к компонентам через SubWorld
 });
 
-// Параллельная итерация (feature = "parallel"):
+// Параллельная итерация (rayon всегда доступен):
 sub_world.par_for_each_entity(|entity| {
     /* выполняется на нескольких потоках */
 });
@@ -2673,12 +2651,21 @@ cmds.apply(world);
 
 **В `Sequential` системах (рекомендуемый способ):**
 ```rust
-// ✅ ПРАВИЛЬНО: ScriptEngine как Sequential система
-impl SequentialSystem for ScriptedSystem {
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        self.engine.run(0.016, ctx.world_mut());
+// ✅ ПРАВИЛЬНО: ScriptEngine через sequential_system! Variant B
+sequential_system! {
+    struct ScriptedSystem {
+        engine: ScriptEngine = ScriptEngine::with_dir("scripts/"),
+    }
+    fn run(
+        s: &mut Self,
+        world: &mut World,
+        dt: &Time,
+    ) {
+        s.engine.run(dt.0, world);
     }
 }
+// Регистрация:
+app.add_sequential_system(PostUpdate, "lua", ScriptedSystem::default().into_system());
 ```
 
 **В параллельной системе (`AutoSystem`/`add_par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте.
@@ -2713,7 +2700,7 @@ impl SequentialSystem for ScriptedSystem {
 
 - **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential. Явные `add_dependency()` имеют приоритет.
 - Один `compile()` при старте, потом только `run()` — повторный `compile()` при `graph_dirty=false` возвращается мгновенно (~0µs)
-- Автоотключение PAR (`set_parallel_auto_disable(true)` по умолчанию) защищает от деградации на малых мирах
+- Автоотключение PAR (`set_parallel_auto_disable(true)` по умолчанию, пороги 15K/25K/80K entity/system) защищает от деградации на малых мирах
 - Чем больше параллельных систем без конфликтов — тем лучше масштабируется на N ядер
 - `par_for_each` (внутрисистемный) эффективнее межсистемного параллелизма для CPU-bound нагрузок
 - **Event ordering:** Если порядок `Emit<E>` / `Listen<E>` не критичен, отключите его через `sched.enable_event_ordering(false)` — это уберёт лишние барьеры и увеличит параллелизм.
@@ -2751,7 +2738,7 @@ codegen-units = 1
 
 ```bash
 # Запуск с параллелизмом:
-cargo run --release --features parallel
+cargo run --release
 ```
 
 ### 14.7 Эталонные метрики производительности
@@ -2760,29 +2747,49 @@ cargo run --release --features parallel
 
 | Операция | Throughput | Масштабирование |
 |----------|:----------:|:---------------:|
-| `spawn_many_silent` (1 comp) | **62 M ops/s** | 🟢 O(N) |
-| `spawn_many_silent` (4 comp) | **28 M ops/s** | 🟢 O(N) |
-| `Query::for_each` (без entity) | **132 M ops/s** | 🟢 O(N) |
-| `Query<(Read<Vel>, Write<Pos>)>` | **135 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each` (без entity) | **133 M ops/s** | 🟢 O(N) |
-| insert component | **12.3 M ops/s** | 🟢 O(N) |
-| despawn | **50 M ops/s** | 🟢 O(N) |
-| resource read | **230 M ops/s** | 🟢 O(1) |
-| resource write | **385 M ops/s** | 🟢 O(1) |
-| event send → tick → EventReader | **107 M ops/s** | 🟢 O(N) |
-| event send_batch (100) | **6097 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (1 comp) | **65 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (4 comp) | **32 M ops/s** | 🟢 O(N) |
+| `Query::for_each` | **149 M ops/s** | 🟢 O(N) |
+| `Query<(Read<Vel>, Write<Pos>)>` | **148 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each` | **158 M ops/s** | 🟢 O(N) |
+| insert component | **13.9 M ops/s** | 🟢 O(N) |
+| despawn | **50.8 M ops/s** | 🟢 O(N) |
+| resource read | **381 M ops/s** | 🟢 O(1) |
+| resource write | **378 M ops/s** | 🟢 O(1) |
+| event send → tick → EventReader | **117 M ops/s** | 🟢 O(N) |
+| Commands::despawn + apply | **37.9 M ops/s** | 🟢 O(N) |
 
 **Параллельное ускорение (speedup = seq/par, 12 потоков):**
 
-| Сценарий | 100k | 200k | Комментарий |
-|----------|:----:|:----:|-------------|
-| 3 независимые read-only системы | 3.5x | **4.4x** | 🟢 Растёт с N |
-| 1 система MovementWriter (1 arch) | 2.2x | **2.5x** | 🟢 Row-level split |
-| 1 система MovementWriter (4 arch) | 2.2x | **2.6x** | 🟢 Фикс сужения arch_indices |
-| `par_for_each` CPU-bound (atan2+cos) | 1.9x | — | 🟢 Одиночная система |
-| Solo 12 систем | 4.7x | — | 🟡 Насыщение ~8 потоков |
+| Сценарий | 25K | 50K | 100K | 200K | Комментарий |
+|----------|:---:|:---:|:----:|:----:|-------------|
+| 3 независимые read-only системы | 1.4x | **2.4x** | **3.9x** | **4.5x** | 🟢 Отлично масштабируется |
+| 1 система MovementWriter (1 arch) | 1.1x | 1.0x | **2.2x** | **2.5x** | 🟢 Row-level split |
+| 1 система MovementWriter (4 arch) | 0.9x | 1.0x | **2.7x** | **2.5x** | 🟢 Фрагментация помогает |
+| 12 solo-систем, 12 архетипов | — | — | **4.5x** | — | 🟡 Насыщение ~8 потоков |
+| CPU-bound par_for_each | — | — | **4.7x** | — | 🟢 Внутрисистемный |
+| Event pipeline (Emit→Listen, 2 системы) | 746 M/s | 686 M/s | 401 M/s | 571 M/s | 🟢 **Production-ready** |
+| Полный пайплайн (6 систем) | 444 M/s | 553 M/s | 692 M/s | 770 M/s | 🟢 **Production-ready** |
 
-> **Ключевые улучшения v0.1.0:** `MIN_CHUNK=4096` заменён на `adaptive_chunk_size(64..65536)`, `Query` маршрутизируется через `SubWorld` с поддержкой `row_ranges`, добавлено автоотключение PAR для малых миров, сужение `arch_indices` для чанков, идемпотентный `compile()`. Внутрисистемный parallel корректно работает для single-archetype. Автоотключение защищает от запуска PAR на < 3000 entity/system.
+**Event pipeline — стабильный throughput (M ops/s):**
+
+| N entity | 5K | 10K | 25K | 50K | 100K | 200K |
+|----------|:--:|:---:|:---:|:---:|:----:|:----:|
+| Emit→Listen (2 системы) | 725 | 623 | 746 | 686 | 401 | 571 |
+| Полный пайплайн (6 систем) | 354 | 371 | 444 | 553 | 692 | 770 |
+
+> **Вывод:** Event pipeline готов к production. Throughput стабилен на всём диапазоне (350–770 M ops/s), overhead минимален даже при 6 системах. Pipeline из 6 систем на 200K entity достигает **770 M ops/s** — выше чем одиночная Emit→Listen пара, благодаря лучшему распределению работы по ядрам.
+
+**Автоотключение PAR — эмпирические пороги:**
+
+| Систем | Порог (entity/system) | Обоснование |
+|--------|:---------------------:|-------------|
+| 3+ систем | 15 000 | PAR выгоден с ~25K, при 10K — наравне с SEQ |
+| 2 системы | 25 000 | Пересечение PAR/SEQ около 25K |
+| 1 система | 80 000 | Пересечение ~100K, при 50K PAR всё ещё 0.98× |
+
+> **«Valley of death»:** PAR в 2-3× медленнее SEQ при 5 000–50 000 entity в зависимости от числа систем.
+> Для малых миров автоотключатель переводит stage на sequential.
 
 ### 14.8 Применённые оптимизации
 
@@ -2833,20 +2840,28 @@ struct DeltaTime(f32);
 #[derive(Clone, Copy)]
 struct DeathEvent { entity: Entity }
 
-struct MovementSystem;
+system! {
+    fn movement_system(
+        q: (Read<Velocity>, Write<Position>),
+        dt: &DeltaTime,
+    ) {
+        for (_, (vel, pos)) in q.iter() {
+            pos.x += vel.x * dt.0;
+            pos.y += vel.y * dt.0;
+        }
+    }
+}
 
-impl AutoSystem for MovementSystem {
-    type Query = (Read<Velocity>, Write<Position>);
-    type Resources = ResRead<DeltaTime>;
-    type Events = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let dt = ctx.resource::<DeltaTime>().0;
-        ctx.query::<Self::Query>()
-            .for_each(|_, (vel, pos)| {
-                pos.x += vel.x * dt;
-                pos.y += vel.y * dt;
-            });
+sequential_system! {
+    fn cleanup_dead(
+        world: &mut World,
+        cmd: Cmd,
+    ) {
+        let q = CachedQuery::<Read<Health>>::new(world, Tick::ZERO);
+        for (e, hp) in q.iter() {
+            if hp.current <= 0.0 { cmd.despawn(e); }
+        }
+        cmd.apply(world);
     }
 }
 
@@ -2880,17 +2895,11 @@ fn main() {
 
     // Группировка систем по этапам через StageLabel::tag() + staged():
     sched.staged(StageLabel::tag("sim"), |s| {
-        s.add_auto_system("movement", MovementSystem);
+        s.add_auto_system("movement", movement_system);
     });
 
     sched.staged(StageLabel::tag("cleanup"), |s| {
-        s.add_system("cleanup", |world: &mut World| {
-            let mut cmds = Commands::new();
-            Query::<Read<Health>>::new(world).for_each(|e, hp| {
-                if hp.current <= 0.0 { cmds.despawn(e); }
-            });
-            cmds.apply(world);
-        });
+        s.add_system("cleanup", cleanup_dead);
     });
 
     // sim → cleanup → остальные

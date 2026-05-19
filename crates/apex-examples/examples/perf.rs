@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 /// Apex ECS — Performance Benchmark (corrected v2)
 /// cargo run -p apex-examples --example perf --release
-/// cargo run -p apex-examples --example perf --release --features parallel
+/// cargo run -p apex-examples --example perf --release
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
@@ -1006,7 +1006,6 @@ fn bench_structural(n: usize) {
 
 // ── 9. Параллельный планировщик ────────────────────────────────
 
-#[cfg(feature = "parallel")]
 fn bench_parallel_scheduler(n: usize) {
     println!(
         "\n── Parallel Scheduler — frame time (rayon threads: {}) ─────────",
@@ -1502,14 +1501,8 @@ fn bench_parallel_scheduler(n: usize) {
     }
 }
 
-#[cfg(not(feature = "parallel"))]
-fn bench_parallel_scheduler(_n: usize) {
-    println!("\n── Parallel Scheduler: --features parallel не включён ──────────────────────────");
-}
-
 // ── 10. Intra-system параллелизм ───────────────────────────────
 
-#[cfg(feature = "parallel")]
 fn bench_intra_system_parallel(n: usize) {
     println!("\n── Intra-system Parallelism — par_for_each ────────────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
@@ -1657,11 +1650,6 @@ fn bench_intra_system_parallel(n: usize) {
     println!("  Note: speedup при CPU-bound и кол-во entity >> PAR_CHUNK_SIZE(4096)");
 }
 
-#[cfg(not(feature = "parallel"))]
-fn bench_intra_system_parallel(_n: usize) {
-    println!("\n── Intra-system Parallelism: --features parallel не включён ────────────────────");
-}
-
 // ── main ───────────────────────────────────────────────────────
 
 fn main() {
@@ -1673,10 +1661,7 @@ fn main() {
         if cfg!(debug_assertions) { "DEBUG ⚠  (запускайте с --release)" }
         else                      { "RELEASE ✓" }
     );
-    #[cfg(feature = "parallel")]
     println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
-    #[cfg(not(feature = "parallel"))]
-    println!("Mode:  sequential  (--features parallel для rayon)");
     let par_chunk_val = apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
     if par_chunk_val == 0 {
         println!("PAR_CHUNK_SIZE: auto (DEFAULT_MAX_CHUNK_SIZE={}) (задай APEX_PAR_CHUNK_SIZE для переопределения)",

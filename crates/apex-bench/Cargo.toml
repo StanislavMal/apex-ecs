@@ -5,11 +5,10 @@ edition.workspace = true
 
 [features]
 default = ["apex"]
-apex = ["apex-core/parallel", "apex-core/cgmath"]
+apex = ["apex-core/cgmath"]
 flecs = []
 bevy = ["dep:bevy_ecs"]
 legion = ["dep:legion"]
-parallel = ["apex-core/parallel"]
 
 [dependencies]
 cgmath = "0.18"

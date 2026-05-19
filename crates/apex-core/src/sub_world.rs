@@ -194,7 +194,6 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Параллельная итерация по всем entity в этом SubWorld.
-    #[cfg(feature = "parallel")]
     pub fn par_for_each_entity<F: Fn(Entity) + Send + Sync>(&self, f: F) {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
@@ -250,7 +249,6 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Параллельная итерация по строкам архетипов SubWorld.
-    #[cfg(feature = "parallel")]
     pub fn par_for_each_row<F: Fn(Entity, usize) + Send + Sync>(&self, f: F) {
         use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;

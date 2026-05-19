@@ -7,8 +7,6 @@ use crate::{
     system_param::WorldQuerySystemAccess,
     world::World,
 };
-
-#[cfg(feature = "parallel")]
 use crate::par_utils::compute_par_chunks;
 
 // ── WorldQuery ─────────────────────────────────────────────────
@@ -696,7 +694,6 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     /// Параллельная итерация.
-    #[cfg(feature = "parallel")]
     pub fn par_for_each<F>(&self, f: F)
     where
         Q: Send,
@@ -748,15 +745,6 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 }
             }
         });
-    }
-
-    #[cfg(not(feature = "parallel"))]
-    pub fn par_for_each<F>(&self, f: F)
-    where
-        Q: WorldQuery,
-        F: FnMut(Entity, Q::Item<'_>),
-    {
-        self.for_each(f);
     }
 
     pub fn len(&self) -> usize {

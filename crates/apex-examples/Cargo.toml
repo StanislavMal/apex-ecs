@@ -19,8 +19,4 @@ serde_json         = "1.0"
 glam               = { workspace = true }
 log                = { workspace = true }
 env_logger         = "0.11"
-rayon = { workspace = true, optional = true }
-
-[features]
-default  = []
-parallel = ["dep:rayon", "apex-core/parallel", "apex-scheduler/parallel"]
+rayon              = { workspace = true }

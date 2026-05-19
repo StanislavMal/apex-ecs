@@ -5,7 +5,6 @@ edition.workspace = true
 
 [features]
 default  = []
-parallel = ["dep:rayon"]
 cgmath = ["dep:cgmath"]
 
 [dependencies]
@@ -17,7 +16,7 @@ thunderdome.workspace = true
 bitvec.workspace      = true
 thiserror.workspace   = true
 log.workspace         = true
-rayon = { workspace = true, optional = true }
+rayon.workspace = true
 
 # Авторегистрация компонентов
 linkme.workspace = true
