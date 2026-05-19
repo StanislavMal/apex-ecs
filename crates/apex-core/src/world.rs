@@ -1246,6 +1246,52 @@ impl<'w> SystemContext<'w> {
     // или ctx.query::<Q>().par_for_each(...)
 }
 
+// ── Relations API on SystemContext ─────────────────────────────────
+
+impl<'w> SystemContext<'w> {
+    /// Запрос по relation: найти все entity с relation `R` к `target`,
+    /// у которых также есть компоненты `Q`.
+    #[inline]
+    pub fn query_relation<R: crate::relations::RelationKind, Q: WorldQuery>(
+        &self, _kind: R, target: Entity,
+    ) -> crate::relations::RelationIter<'_, Q> {
+        self.world().query_relation::<R, Q>(_kind, target)
+    }
+
+    /// Wildcard-запрос: найти все entity с любым relation вида `R`,
+    /// у которых также есть компоненты `Q`.
+    #[inline]
+    pub fn query_wildcard<R: crate::relations::RelationKind, Q: WorldQuery>(
+        &self, _kind: R,
+    ) -> crate::relations::RelationIter<'_, Q> {
+        self.world().query_wildcard::<R, Q>(_kind)
+    }
+
+    /// Все entity, связанные relation `R` с `parent`.
+    #[inline]
+    pub fn children_of<R: crate::relations::RelationKind>(
+        &self, _kind: R, parent: Entity,
+    ) -> impl Iterator<Item = Entity> + '_ {
+        self.world().children_of(_kind, parent)
+    }
+
+    /// Проверить наличие relation `R` между `subject` и `target`.
+    #[inline]
+    pub fn has_relation<R: crate::relations::RelationKind>(
+        &self, subject: Entity, _kind: R, target: Entity,
+    ) -> bool {
+        self.world().has_relation(subject, _kind, target)
+    }
+
+    /// Найти target entity, с которым `subject` связан relation `R`.
+    #[inline]
+    pub fn get_relation_target<R: crate::relations::RelationKind>(
+        &self, subject: Entity, _kind: R,
+    ) -> Option<Entity> {
+        self.world().get_relation_target(subject, _kind)
+    }
+}
+
 // ── ParallelWorld ──────────────────────────────────────────────
 
 pub struct ParallelWorld<'w> {

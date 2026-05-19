@@ -1,6 +1,7 @@
 use crate::{
     component::{Component, ComponentId, Tick},
     entity::Entity,
+    relations::RelationKind,
     template::TemplateParams,
     world::{Bundle, World},
 };
@@ -86,6 +87,8 @@ type SpawnApply   = unsafe fn(*mut u8, &mut World);
 type InsertApply  = unsafe fn(*mut u8, &mut World, Entity);
 type RemoveApply  = unsafe fn(Entity, &mut World);
 type DropFn       = unsafe fn(*mut u8);
+type AddRelationApply    = fn(&mut World, Entity, Entity);
+type RemoveRelationApply = fn(&mut World, Entity, Entity);
 
 // ── Typed command enum ───────────────────────────────────────────
 //
@@ -118,6 +121,10 @@ enum Command {
     SpawnFromTemplate { name: String, params: TemplateParams },
     /// Произвольная команда — Box<dyn FnOnce>
     Apply(Box<dyn FnOnce(&mut World) + Send>),
+    /// AddRelation — typed, через function pointer
+    AddRelation { subject: Entity, target: Entity, apply: AddRelationApply },
+    /// RemoveRelation — typed, через function pointer
+    RemoveRelation { subject: Entity, target: Entity, apply: RemoveRelationApply },
 }
 
 /// Очередь команд — буферизует structural changes для применения после итерации.
@@ -226,6 +233,46 @@ impl Commands {
         self.queue.push(Command::Apply(Box::new(f)));
     }
 
+    /// Добавить relation между subject и target.
+    ///
+    /// Выполняется отложенно при `apply()` — безопасно в параллельных системах.
+    pub fn add_relation<R: RelationKind>(
+        &mut self, subject: Entity, _kind: R, target: Entity,
+    ) {
+        fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
+            // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
+            let kind: R = unsafe { std::mem::zeroed() };
+            world.add_relation(subject, kind, target);
+        }
+        self.queue.push(Command::AddRelation { subject, target, apply: apply::<R> });
+    }
+
+    /// Удалить relation между subject и target.
+    ///
+    /// Выполняется отложенно при `apply()`.
+    pub fn remove_relation<R: RelationKind>(
+        &mut self, subject: Entity, _kind: R, target: Entity,
+    ) {
+        fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
+            // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
+            let kind: R = unsafe { std::mem::zeroed() };
+            world.remove_relation(subject, kind, target);
+        }
+        self.queue.push(Command::RemoveRelation { subject, target, apply: apply::<R> });
+    }
+
+    /// Массовое добавление relation от множества subject'ов к одному target.
+    ///
+    /// Оптимизировано через `World::add_relation_batch`.
+    pub fn add_relation_batch<R: RelationKind + Send + 'static>(
+        &mut self, subjects: Vec<Entity>, _kind: R, target: Entity,
+    ) {
+        self.add(move |world| {
+            let kind: R = unsafe { std::mem::zeroed() };
+            world.add_relation_batch(&subjects, kind, target);
+        });
+    }
+
     /// Создать entity из зарегистрированного шаблона с параметрами.
     ///
     /// # Пример
@@ -273,6 +320,8 @@ impl Commands {
                 Command::Despawn(entity)           => { world.despawn(entity); }
                 Command::SpawnFromTemplate { name, params } => { world.spawn_from_template(&name, &params); }
                 Command::Apply(f)                  => { f(world); }
+                Command::AddRelation { subject, target, apply } => { apply(world, subject, target); }
+                Command::RemoveRelation { subject, target, apply } => { apply(world, subject, target); }
             }
         }
         self.arena.reset();
@@ -291,6 +340,8 @@ impl Commands {
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
                 Command::InsertRaw { .. } => {}
+                Command::AddRelation { .. } => {}
+                Command::RemoveRelation { .. } => {}
                 _ => {}
             }
         }
@@ -309,6 +360,8 @@ impl Drop for Commands {
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
                 Command::InsertRaw { .. } => {}
+                Command::AddRelation { .. } => {}
+                Command::RemoveRelation { .. } => {}
                 _ => {}
             }
         }
