@@ -914,21 +914,186 @@ if let Err(errors) = result {
 
 ## 6. Системы и планировщик
 
-Apex ECS предоставляет три уровня API для систем — от простого к гибкому.
+Apex ECS предоставляет **два макроса** для объявления систем и три уровня API.
 
-### 6.1 `AutoSystem` (рекомендуется)
+### 6.1 `system!` макрос (рекомендуется)
 
-`AutoSystem` автоматически выводит `AccessDescriptor` из трёх источников: типа Query, типа Resources и типа Events. Это исключает класс ошибок, где разработчик забыл задекларировать компонент, ресурс или событие.
+`system!` макрос автоматически генерирует `struct` + `impl AutoSystem`, сокращая boilerplate с 8-10 строк до 2-6. Доступен через `use apex_core::system;` или `apex_core::prelude::*`.
 
-> **Как это работает:** `AutoSystem` анализирует:
-> - `type Query = (Read<A>, Write<B>, ...)` → access к компонентам
-> - `type Query = ()` → **пустой запрос** (системе не нужны компоненты)
-> - `type Resources = ResRead<C>` → read access к ресурсу `C`
-> - `type Resources = ResWrite<D>` → write access к ресурсу `D`
-> - `type Events = Listen<E>` → `read_event` access к событию `E`
-> - `type Events = Emit<F>` → `write_event` access к событию `F`
-> - Кортежи из `ResRead`/`ResWrite`/`Listen`/`Emit` также поддерживаются
+> **Как это работает:** макрос анализирует типы параметров:
+> - `q: (Read<A>, Write<B>)` → `type Query = (...)`
+> - `name: &T` → `type Resources += ResRead<T>`
+> - `name: &mut T` → `type Resources += ResWrite<T>`
+> - `name: &[E]` → `type Events += Listen<E>`
+> - `name: &mut Vec<E>` → `type Events += Emit<E>`
+> - `name: Cmd` → биндинг на `ctx.commands()`
+> - `name: Ctx` → биндинг на `&ctx` (SystemContext)
+> - `__whole: WholeWorld` → `const NEEDS_WHOLE_WORLD = true`
 >
+> Планировщик автоматически выводит `AccessDescriptor` из этих типов. Для событий: `Emit<E>` → `Listen<E>` гарантирует порядок.
+
+#### Вариант А — без состояния (unit struct)
+
+```rust
+use apex_core::system;
+use apex_core::prelude::*;
+
+system! {
+    fn movement_system(
+        q: (Read<Velocity>, Write<Position>),
+        keys: &Input<KeyCode>,
+    ) {
+        for (_, (vel, pos)) in q.iter() {
+            if keys.pressed(KeyCode::A) { pos.x -= vel.x; }
+        }
+    }
+}
+// Генерирует: struct movement_system; impl AutoSystem for movement_system { ... }
+// Регистрация: app.add_system(Update, movement_system);
+```
+
+#### Вариант А — полный набор параметров
+
+```rust
+system! {
+    fn full_featured(
+        q: (Read<Position>, Write<Velocity>),   // query
+        keys: &Input<KeyCode>,                   // resource read
+        exit: &mut Exit,                         // resource write
+        events: &[CollisionEvent],               // event reader
+        out: &mut Vec<DamageEvent>,              // event writer (.send())
+        cmd: Cmd,                                // commands
+        ctx: Ctx,                                // SystemContext
+        __whole: WholeWorld,                     // NEEDS_WHOLE_WORLD
+    ) {
+        out.send(DamageEvent { target: e, amount: 10.0 });
+        cmd.despawn(e);
+        log::info!("Entities: {}", ctx.entity_count());
+    }
+}
+```
+
+#### Вариант Б — с состоянием
+
+```rust
+system! {
+    struct WaveSpawner {
+        wave: u32 = 1,
+        enemies_spawned: u32 = 0,
+    }
+
+    fn run(
+        s: &mut Self,       // state accessor (любое имя)
+        cmd: Cmd,
+        dt: &Time,
+    ) {
+        if s.wave <= 5 {
+            cmd.spawn((Enemy, Position::default()));
+            s.enemies_spawned += 1;
+        }
+    }
+}
+// Генерирует: struct WaveSpawner + impl Default + impl AutoSystem
+// Регистрация: app.add_system(Update, WaveSpawner::default());
+```
+
+#### Полная таблица параметров `system!`
+
+| Параметр | Associated type | Let-биндинг |
+|----------|----------------|-------------|
+| `q: (Read<A>, Write<B>)` | `type Query = (Read<A>, Write<B>)` | `let q = ctx.query::<Self::Query>();` |
+| `q: Read<A>` (bare) | `type Query = (Read<A>)` | `let q = ctx.query::<Self::Query>();` |
+| `name: &T` | `ResRead<T>` | `let name: &T = &*ctx.resource::<T>();` |
+| `name: &mut T` | `ResWrite<T>` | `let name: &mut T = &mut *ctx.resource_mut::<T>();` |
+| `name: &[E]` | `Listen<E>` | `let name = ctx.event_reader::<E>();` |
+| `name: &mut Vec<E>` | `Emit<E>` | `let mut name = ctx.event_writer::<E>();` (`.send()`) |
+| `name: Cmd` | *(none)* | `let name: &mut Commands = ctx.commands();` |
+| `name: Ctx` | *(none)* | `let name: &SystemContext = &ctx;` |
+| `__whole: WholeWorld` | `const NEEDS_WHOLE_WORLD = true` | *(none)* |
+
+При нераспознанном параметре макрос выдаёт `compile_error!` с подсказкой.
+
+### 6.2 `sequential_system!` макрос
+
+`sequential_system!` — аналог `system!` для систем с эксклюзивным `&mut World`.
+Генерирует функцию `fn name(&mut World)` (не `AutoSystem`). Доступен через `use apex_core::sequential_system;`.
+
+**Когда нужен:**
+- `despawn_recursive` — рекурсивное удаление
+- Массовые structural changes — перестройка архетипов
+- Lua-скриптинг — движку нужен полный доступ
+- Hot-reload / сериализация
+
+**Ключевые отличия от `system!`:**
+- Нет associated types (`Query`, `Resources`, `Events`)
+- Нет `AutoSystem` — генерируется простая функция
+- `world: &mut World` — эксклюзивный доступ
+- `cmd: Cmd` — пользователь вызывает `cmd.apply(world)` **вручную**
+- `ctx: Ctx` — даёт `&World` (все read-only методы)
+- Регистрация: `app.add_sequential_system(label, "name", func)`
+
+#### Вариант А — без состояния
+
+```rust
+use apex_core::sequential_system;
+
+sequential_system! {
+    fn cleanup(
+        world: &mut World,       // → параметр функции
+        events: &[DeathEvent],   // → world.event_reader::<DeathEvent>()
+        config: &CleanupConfig,  // → world.resource::<CleanupConfig>()
+        cmd: Cmd,                // → let mut cmd = Commands::new();
+    ) {
+        for ev in events.iter() {
+            if config.active { cmd.despawn(ev.entity); }
+        }
+        cmd.apply(world);        // ← ручной apply
+    }
+}
+// Генерирует: fn cleanup(world: &mut World) { ... }
+// Регистрация: app.add_sequential_system(PostUpdate, "cleanup", cleanup);
+```
+
+#### Вариант Б — с состоянием
+
+```rust
+sequential_system! {
+    struct LuaRunner {
+        engine: ScriptEngine = ScriptEngine::with_dir("scripts/"),
+    }
+
+    fn run(
+        s: &mut Self,
+        world: &mut World,
+        dt: &Time,
+    ) {
+        s.engine.run(dt, world);
+    }
+}
+// Генерирует: struct + impl Default + fn into_system(self) -> impl FnMut(&mut World)
+// Регистрация:
+//   let system = LuaRunner::default().into_system();
+//   app.scheduler_mut().add_system("lua", system);
+```
+
+#### Таблица параметров `sequential_system!`
+
+| Параметр | Let-биндинг |
+|----------|-------------|
+| `world: &mut World` | параметр функции (не биндинг) |
+| `q: (Read<A>, Write<B>)` | `let q = CachedQuery::new(&world, Tick::ZERO);` |
+| `q: Read<A>` (bare) | `let q = CachedQuery::new(&world, Tick::ZERO);` |
+| `name: &T` | `let name: &T = world.resource::<T>();` |
+| `name: &mut T` | `let name: &mut T = world.resource_mut::<T>();` |
+| `name: &[E]` | `let name = world.event_reader::<E>();` |
+| `name: &mut Vec<E>` | `let mut name = world.event_writer::<E>();` (`.send()`) |
+| `name: Cmd` | `let mut name = Commands::new();` (ручной `cmd.apply(world);`) |
+| `name: Ctx` | `let name: &World = &world;` |
+| `__whole: WholeWorld` | *(none, бессмысленно для sequential)* |
+
+### 6.3 `AutoSystem` — ручная реализация (для понимания)
+
+`AutoSystem` — трейт для параллельных систем. `system!` макрос генерирует его автоматически; ниже показана ручная реализация для понимания механики.
 > **Упорядочивание по событиям:** Если система A объявляет `type Events = Emit<CollisionEvent>`, а система B — `type Events = Listen<CollisionEvent>`, то планировщик автоматически гарантирует, что A выполнится до B (A → ребро в графе зависимостей → B). Два `Listen<E>` не конфликтуют и могут выполняться параллельно. Два `Emit<E>` — конфликтуют (порядок записи неопределён).
 >
 > Поведение можно отключить через [`enable_event_ordering(false)`](#651-управление-упорядочиванием-по-событиям) для обратной совместимости.
@@ -1046,7 +1211,7 @@ sched.add_par_access(
 
 > **Когда включать:** система собирает данные ВСЕХ entity (гравитация, BVH, статистика). **Когда НЕ включать:** каждый entity обрабатывается независимо (физика, рендер) — ASD безопасен.
 
-### 6.2 Параллельная система-замыкание (`add_par` / `add_par_access`)
+### 6.4 Параллельная система-замыкание (`add_par` / `add_par_access`)
 
 Для быстрых прототипов и простых систем можно использовать замыкания вместо
 отдельного `struct` + `impl AutoSystem`.
@@ -1110,7 +1275,9 @@ sched.par_for_each_used(id);  // пометить как использующу�
 > **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
 > сокращающий `AccessDescriptor::new().read::<T>().write::<T>()`.
 
-### 6.3 Sequential система
+### 6.5 Sequential система (вручную)
+
+> **Рекомендуется:** использовать [`sequential_system!`](#62-sequential_system-макрос) макрос. Ниже — ручной способ для понимания.
 
 Sequential система получает `&mut World` и выполняется строго одна в своём Stage — используется для structural changes (spawn/despawn).
 
@@ -1138,7 +1305,7 @@ sched.add_system("despawn_dead", |world: &mut World| {
 >
 > Регистрируйте системы в любом порядке — `compile()` выстроит оптимальную группировку. Явные `add_dependency()` по-прежнему работают и имеют приоритет над автоматическим порядком.
 
-### 6.4 Компиляция и запуск планировщика
+### 6.6 Компиляция и запуск планировщика
 
 ```rust
 let mut sched = Scheduler::new();
@@ -1333,7 +1500,7 @@ sched.enable_event_ordering(true);
 
 > **Важно:** `enable_event_ordering(false)` не влияет на компонентные и ресурсные конфликты — только на событийные (`Emit<E>` / `Listen<E>`). После вызова метода планировщик автоматически перекомпилирует граф при следующем `compile()`.
 
-### 6.6 `SystemContext`
+### 6.7 `SystemContext`
 
 `SystemContext` — read-only view на мир, доступный внутри системы. Предоставляет доступ к Query, ресурсам и событиям.
 
@@ -1429,11 +1596,18 @@ Query::<(Read<Health>, Read<Position>)>::new(&world)
 cmds.apply(&mut world);
 
 // Все поддерживаемые операции:
-cmds.despawn(entity);
 cmds.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.0 }));
+cmds.despawn(entity);
 cmds.insert(entity, NewComponent { value: 42 });
 cmds.remove::<OldComponent>(entity);
-cmds.add(|world: &mut World| { /* произвольная команда */ });
+
+// Relations:
+cmds.add_relation(entity, ChildOf, parent);
+cmds.remove_relation(entity, Owns, target);
+cmds.add_relation_batch(vec![e1, e2, e3], ChildOf, root);
+
+// Произвольная команда:
+cmds.add(|world: &mut World| { world.insert_resource(MyRes(42)); });
 ```
 
 > **Совет:** `Commands::with_capacity(n)` — предаллоцирует буфер для `n` команд. Используйте, когда заранее знаете примерное количество команд.
@@ -1518,6 +1692,68 @@ for (entity, hp) in world.query_wildcard::<ChildOf, Read<Health>>(ChildOf) {
     println!("entity with parent: {:?}", entity);
 }
 ```
+
+### 8.4 Relations через `system!` макрос
+
+Внутри `system!` Relations доступны через параметры `ctx: Ctx` (чтение) и `cmd: Cmd` (запись):
+
+```rust
+system! {
+    fn parent_system(
+        ctx: Ctx,
+        cmd: Cmd,
+        q: (Write<Position>,),
+    ) {
+        // Чтение:
+        for child in ctx.children_of(ChildOf, root) {
+            if ctx.has_relation(child, Owns, root) {
+                cmd.remove_relation(child, Owns, root);
+            }
+        }
+        // Запрос с компонентами:
+        let iter = ctx.query_relation::<ChildOf, Read<Position>>(ChildOf, parent);
+        for (entity, pos) in iter { /* ... */ }
+
+        // Запись:
+        cmd.add_relation(entity, ChildOf, parent);
+    }
+}
+```
+
+В `sequential_system!` — те же методы через `ctx: Ctx` (даёт `&World`):
+
+```rust
+sequential_system! {
+    fn cleanup_orphans(world: &mut World, ctx: Ctx) {
+        // ctx: &World — все read-only методы:
+        for child in ctx.children_of(ChildOf, root) {
+            if !ctx.has_relation(child, Owns, root) {
+                world.despawn_recursive(ChildOf, child);
+            }
+        }
+    }
+}
+```
+
+### 8.5 Чтение Relations через SystemContext / World
+
+Методы доступны как на `SystemContext` (через `ctx: Ctx` в `system!`), так и на `World`:
+
+| Метод | Возвращает | Описание |
+|-------|-----------|----------|
+| `query_relation<R, Q>(kind, target)` | `RelationIter<Q>` | Entity с relation R к target + компоненты Q |
+| `query_wildcard<R, Q>(kind)` | `RelationIter<Q>` | Entity с любым relation R + компоненты Q |
+| `children_of<R>(kind, parent)` | `impl Iterator<Item = Entity>` | Все субъекты relation R к parent |
+| `has_relation<R>(subject, kind, target)` | `bool` | Проверка наличия связи |
+| `get_relation_target<R>(subject, kind)` | `Option<Entity>` | Найти target для subject |
+
+### 8.6 Запись Relations через Commands
+
+| Метод Commands | Тип команды | Аллокация |
+|---------------|-------------|-----------|
+| `add_relation(subject, kind, target)` | Function pointer | Нет |
+| `remove_relation(subject, kind, target)` | Function pointer | Нет |
+| `add_relation_batch(subjects, kind, target)` | Замыкание (Box) | Box |
 
 ---
 
@@ -2881,7 +3117,32 @@ fn main() {
 | `StageLabel::standard_order()` | Стандартный порядок: Startup→First→PreUpdate→FixedUpdate→Update→PostUpdate→Last |
 | `StageLabel::priority()` | Числовой приоритет (меньше = раньше) |
 
-### SystemContext API (раздел 6.6)
+### `App` API
+
+| Метод | Описание |
+|---|---|
+| `add_plugin(plugin)` | Добавить плагин (вызывает `Plugin::build()`) |
+| `add_system(label, system)` | Зарегистрировать `AutoSystem` (parallel) |
+| `add_systems(label, tuple)` | Зарегистрировать кортеж AutoSystem (2-12) |
+| `add_startup_system(system)` | Зарегистрировать AutoSystem в Startup |
+| `add_sequential_system(label, name, func)` | Зарегистрировать sequential `FnMut(&mut World)` |
+| `configure_stages(order)` | Порядок этапов |
+| `world()` / `world_mut()` | Доступ к World |
+| `scheduler_mut()` | Доступ к Scheduler |
+| `update()` | Один кадр (tick + flush + run) |
+| `run()` / `run_headless()` | Главный цикл |
+
+### Макросы `system!` и `sequential_system!` (раздел 6)
+
+**`system!`** — генерирует `impl AutoSystem`. Параметры:
+`q: (Read<A>, Write<B>)`, `q: Read<A>`, `name: &T`, `name: &mut T`,
+`name: &[E]`, `name: &mut Vec<E>`, `name: Cmd`, `name: Ctx`,
+`__whole: WholeWorld`. + Variant B (struct с полями).
+
+**`sequential_system!`** — генерирует `fn(&mut World)`. Те же параметры, кроме:
+`world: &mut World` (обязателен), `cmd` — ручной `cmd.apply(world);`.
+
+### SystemContext API (раздел 6.7)
 
 | Метод | Описание |
 |---|---|
@@ -2895,6 +3156,11 @@ fn main() {
 | `event_writer::<T>()` | Запись событий |
 | `entity_count()` | Количество entity |
 | **`commands()`** | Thread-local Commands (v0.1.0) |
+| `query_relation::<R, Q>(kind, target)` | Query по relation R к target + компоненты Q |
+| `query_wildcard::<R, Q>(kind)` | Query по relation R (любой target) + компоненты Q |
+| `children_of::<R>(kind, parent)` | Итератор по дочерним entity |
+| `has_relation::<R>(subject, kind, target)` | Проверить наличие связи |
+| `get_relation_target::<R>(subject, kind)` | Получить target связи → `Option<Entity>` |
 
 ### Commands API
 
@@ -2909,6 +3175,9 @@ fn main() {
 | `add(fn)` | Произвольная команда `\|world: &mut World\|` |
 | `spawn_template(name)` | Создать entity из шаблона (без параметров) |
 | `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
+| `add_relation(subject, kind, target)` | Добавить relation (отложенно, без аллокации) |
+| `remove_relation(subject, kind, target)` | Удалить relation (отложенно, без аллокации) |
+| `add_relation_batch(subjects, kind, target)` | Массовое добавление relation |
 | `apply(&mut world)` | Применить все буферизованные команды |
 
 ### EntityTemplate API
