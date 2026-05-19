@@ -465,6 +465,7 @@ impl WorldQuerySystemAccess for () {
     }
 }
 
+impl_world_query_tuple!((A, 0));
 impl_world_query_tuple!((A, 0), (B, 1));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3));

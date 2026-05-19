@@ -259,6 +259,7 @@ macro_rules! impl_resource_access_list_tuple {
     };
 }
 
+impl_resource_access_list_tuple!(A);
 impl_resource_access_list_tuple!(A, B);
 impl_resource_access_list_tuple!(A, B, C);
 impl_resource_access_list_tuple!(A, B, C, D);
@@ -312,6 +313,7 @@ macro_rules! impl_event_access_list_tuple {
     };
 }
 
+impl_event_access_list_tuple!(A);
 impl_event_access_list_tuple!(A, B);
 impl_event_access_list_tuple!(A, B, C);
 impl_event_access_list_tuple!(A, B, C, D);

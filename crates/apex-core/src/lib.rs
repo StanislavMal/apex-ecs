@@ -10,6 +10,7 @@ pub mod relations;
 pub mod resources;
 pub mod storage;
 pub mod sub_world;
+pub mod system_macro;
 pub mod system_param;
 pub mod template;
 pub mod transform;
@@ -56,4 +57,5 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::Component;
     pub use crate::BundleDerive as Bundle;
+    pub use crate::system;
 }
