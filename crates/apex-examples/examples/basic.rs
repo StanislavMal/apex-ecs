@@ -11,7 +11,7 @@
 //! cargo test --workspace
 
 use apex_core::prelude::*;
-use apex_core::access_desc;
+
 use apex_macros::Component;
 use apex_scheduler::{Scheduler, StageLabel};
 
@@ -47,71 +47,53 @@ struct DeathEvent { entity: Entity }
 
 // ── AutoSystem: Physics ────────────────────────────────────────
 
-struct PhysicsSystem;
-
-impl AutoSystem for PhysicsSystem {
-    type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
-    type Resources = (ResRead<PhysicsConfig>, ResRead<DeltaTime>);
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let cfg  = ctx.resource::<PhysicsConfig>();
-        let dt   = cfg.dt;
-        let g    = cfg.gravity;
-
-        let count = ctx.query::<Self::Query>().len();
-
-        ctx.query::<Self::Query>().for_each(
-            |_, (mass, vel, pos)| {
-                vel.y  -= g * mass.0 * dt;
-                pos.x  += vel.x * dt;
-                pos.y  += vel.y * dt;
-            }
-        );
-
+system! {
+    fn physics_system(
+        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+        cfg: &PhysicsConfig,
+        _dt: &DeltaTime,
+    ) {
+        let dt = cfg.dt;
+        let g = cfg.gravity;
+        let count = q.len();
+        q.for_each(|_, (mass, vel, pos)| {
+            vel.y -= g * mass.0 * dt;
+            pos.x += vel.x * dt;
+            pos.y += vel.y * dt;
+        });
         println!("  [PhysicsSystem] {} entities", count);
     }
 }
 
 // ── AutoSystem: HealthClamp ────────────────────────────────────
 
-struct HealthClampSystem;
-
-impl AutoSystem for HealthClampSystem {
-    type Query = Write<Health>;
-    type Resources = ();
-    type Events = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        // Используем thread-local Commands (ctx.commands()) для отложенных
-        // структурных изменений из параллельной системы.
-        // Команды будут применены автоматически после завершения run().
+system! {
+    fn health_clamp_system(
+        q: Write<Health>,
+        cmd: Cmd,
+    ) {
         let mut dead_entities: Vec<Entity> = Vec::new();
-        ctx.query::<Write<Health>>().for_each(|entity, hp| {
+        q.for_each(|entity, hp| {
             hp.current = hp.current.clamp(0.0, hp.max);
             if hp.current <= 0.0 {
                 dead_entities.push(entity);
             }
         });
         for e in &dead_entities {
-            ctx.commands().despawn(*e);
+            cmd.despawn(*e);
         }
-        println!("  [HealthClampSystem] clamped={} dead={}", 0, dead_entities.len());
+        println!("  [HealthClampSystem] dead={}", dead_entities.len());
     }
 }
 
-// ── AutoSystem: Movement (новый типобезопасный API) ───────────
+// ── AutoSystem: Movement ──────────────────────────────────────
 
-struct MovementSystem;
-
-impl AutoSystem for MovementSystem {
-    type Query = (Read<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let count = ctx.query::<Self::Query>().len();
-        ctx.query::<Self::Query>().for_each(|_, (vel, pos)| {
+system! {
+    fn movement_system(
+        q: (Read<Velocity>, Write<Position>),
+    ) {
+        let count = q.len();
+        q.for_each(|_, (vel, pos)| {
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -121,108 +103,143 @@ impl AutoSystem for MovementSystem {
 
 // ── Sequential системы ────────────────────────────────────────
 
-fn damage_apply(world: &mut World) {
-    use apex_core::system_param::EventReader;
-    let events: Vec<DamageEvent> = {
-        let reader = EventReader::new(world.events_mut::<DamageEvent>());
-        reader.iter().to_vec()
-    };
+sequential_system! {
+    fn damage_apply(
+        world: &mut World,
+    ) {
+        let events: Vec<DamageEvent> = {
+            let reader = world.event_reader::<DamageEvent>();
+            reader.iter().to_vec()
+        };
 
-    let mut deaths = Vec::new();
-    for ev in &events {
-        if let Some(hp) = world.get_mut::<Health>(ev.target) {
-            hp.current -= ev.amount;
-            if hp.current <= 0.0 { deaths.push(ev.target); }
+        let mut deaths = Vec::new();
+        for ev in &events {
+            if let Some(hp) = world.get_mut::<Health>(ev.target) {
+                hp.current -= ev.amount;
+                if hp.current <= 0.0 { deaths.push(ev.target); }
+            }
         }
+
+        println!("  [damage_apply] events={} deaths={}", events.len(), deaths.len());
+        for entity in deaths { world.send_event(DeathEvent { entity }); }
     }
-
-    println!("  [damage_apply] events={} deaths={}", events.len(), deaths.len());
-    for entity in deaths { world.send_event(DeathEvent { entity }); }
 }
 
-fn despawn_dead(world: &mut World) {
-    use apex_core::system_param::EventReader;
-    let deaths: Vec<DeathEvent> = {
-        let reader = EventReader::new(world.events_mut::<DeathEvent>());
-        reader.iter().to_vec()
-    };
+sequential_system! {
+    fn despawn_dead(
+        world: &mut World,
+    ) {
+        let deaths: Vec<DeathEvent> = {
+            let reader = world.event_reader::<DeathEvent>();
+            reader.iter().to_vec()
+        };
 
-    if deaths.is_empty() { return; }
+        if deaths.is_empty() { return; }
 
-    let mut cmds = Commands::with_capacity(deaths.len());
-    for ev in &deaths { cmds.despawn(ev.entity); }
-    let count = cmds.len();
-    cmds.apply(world);
-    println!("  [despawn_dead] despawned={}", count);
+        let mut cmds = Commands::with_capacity(deaths.len());
+        for ev in &deaths { cmds.despawn(ev.entity); }
+        let count = cmds.len();
+        cmds.apply(world);
+        println!("  [despawn_dead] despawned={}", count);
+    }
 }
 
-fn stats_update(world: &mut World) {
-    let entities = world.entity_count();
-    let stats    = world.resource_mut::<FrameStats>();
-    stats.frame += 1;
-    stats.total_entities_processed += entities;
-    println!("  [stats_update] frame={} entities={}", stats.frame, entities);
+sequential_system! {
+    fn stats_update(
+        world: &mut World,
+    ) {
+        let entities = world.entity_count();
+        let stats = world.resource_mut::<FrameStats>();
+        stats.frame += 1;
+        stats.total_entities_processed += entities;
+        println!("  [stats_update] frame={} entities={}", stats.frame, stats.total_entities_processed);
+    }
 }
 
 // ── Startup-системы ──────────────────────────────────────────
 // Выполняются один раз при первом run().
 
-fn init_resources(world: &mut World) {
-    world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
-    world.insert_resource(DeltaTime(0.016));
-    world.insert_resource(FrameStats::default());
+sequential_system! {
+    fn init_resources(
+        world: &mut World,
+    ) {
+        world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
+        world.insert_resource(DeltaTime(0.016));
+        world.insert_resource(FrameStats::default());
 
-    world.add_event::<DamageEvent>();
-    world.add_event::<DeathEvent>();
+        world.add_event::<DamageEvent>();
+        world.add_event::<DeathEvent>();
 
-    println!("  [Startup] init_resources: PhysicsConfig, DeltaTime, FrameStats, events");
+        println!("  [Startup] init_resources: PhysicsConfig, DeltaTime, FrameStats, events");
+    }
 }
 
-fn spawn_player(world: &mut World) {
-    world.spawn((
-        Position { x: 0.0,  y: 10.0 },
-        Velocity { x: 1.0,  y: 0.0  },
-        Health   { current: 100.0, max: 100.0 },
-        Mass(80.0),
-        Player,
-        Name("Hero"),
-    ));
+sequential_system! {
+    fn spawn_player(
+        world: &mut World,
+    ) {
+        world.spawn((
+            Position { x: 0.0,  y: 10.0 },
+            Velocity { x: 1.0,  y: 0.0  },
+            Health   { current: 100.0, max: 100.0 },
+            Mass(80.0),
+            Player,
+            Name("Hero"),
+        ));
 
-    world.spawn((
-        Position { x: 20.0, y:  5.0 },
-        Velocity { x: -0.5, y:  0.0 },
-        Health   { current: 30.0, max: 30.0 },
-        Mass(60.0),
-        Name("Goblin"),
-    ));
+        world.spawn((
+            Position { x: 20.0, y:  5.0 },
+            Velocity { x: -0.5, y:  0.0 },
+            Health   { current: 30.0, max: 30.0 },
+            Mass(60.0),
+            Name("Goblin"),
+        ));
 
-    world.spawn((
-        Position { x: -5.0, y: 3.0 },
-        Velocity { x:  0.3, y: 0.0 },
-        Health   { current: 75.0, max: 75.0 },
-        Mass(120.0),
-        Name("Orc"),
-    ));
+        world.spawn((
+            Position { x: -5.0, y: 3.0 },
+            Velocity { x:  0.3, y: 0.0 },
+            Health   { current: 75.0, max: 75.0 },
+            Mass(120.0),
+            Name("Orc"),
+        ));
 
-    // Batch spawn
-    world.spawn_many_silent(500, |i| (
-        Position { x: i as f32 * 0.5, y: 0.0 },
-        Velocity { x: 0.1, y: 0.0 },
-        Health   { current: 50.0, max: 50.0 },
-        Mass(70.0),
-        Enemy,
-    ));
+        // Batch spawn
+        world.spawn_many_silent(500, |i| (
+            Position { x: i as f32 * 0.5, y: 0.0 },
+            Velocity { x: 0.1, y: 0.0 },
+            Health   { current: 50.0, max: 50.0 },
+            Mass(70.0),
+            Enemy,
+        ));
 
-    world.spawn_many_silent(200, |i| (
-        Position { x: -(i as f32), y: 2.0 },
-        Velocity { x: 0.0, y: 0.0 },
-        Health   { current: 20.0, max: 20.0 },
-        Mass(30.0),
-        Enemy,
-    ));
+        world.spawn_many_silent(200, |i| (
+            Position { x: -(i as f32), y: 2.0 },
+            Velocity { x: 0.0, y: 0.0 },
+            Health   { current: 20.0, max: 20.0 },
+            Mass(30.0),
+            Enemy,
+        ));
 
-    println!("  [Startup] spawn_player: entities={}, archetypes={}",
-        world.entity_count(), world.archetype_count());
+        println!("  [Startup] spawn_player: entities={}, archetypes={}",
+            world.entity_count(), world.archetype_count());
+    }
+}
+
+// ── AutoSystem: Enemy AI ─────────────────────────────────────
+
+system! {
+    fn enemy_ai_system(
+        q: (Read<Enemy>, Write<Velocity>),
+    ) {
+        let count = q.len();
+        q.for_each(|_, (_, vel)| {
+            vel.x *= 0.99;
+            vel.y *= 0.99;
+        });
+        if count > 0 {
+            println!("  [enemy_ai] updated {} enemies", count);
+        }
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────
@@ -246,29 +263,15 @@ fn main() {
     // ╔══════════════════════════════════════════════════════════╗
     // ║  PreUpdate — AutoSystem (автовывод доступа)            ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_auto_system_to_stage("movement", MovementSystem, StageLabel::PreUpdate);
+    sched.add_auto_system_to_stage("movement", movement_system, StageLabel::PreUpdate);
     println!("  [Stage:PreUpdate] MovementSystem зарегистрирован как AutoSystem");
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  Update — ParSystem + FnParSystem (параллельные)       ║
+    // ║  Update — AutoSystem (параллельные)                    ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_auto_system_to_stage("physics",      PhysicsSystem,      StageLabel::Update);
-    sched.add_auto_system_to_stage("health_clamp", HealthClampSystem,  StageLabel::Update);
-    sched.add_par_access_to_stage(
-        "enemy_ai",
-        access_desc!(read<Enemy>, write<Velocity>),
-        |ctx| {
-            let count = ctx.query::<(Read<Enemy>, Write<Velocity>)>().len();
-            ctx.query::<(Read<Enemy>, Write<Velocity>)>().for_each(|_, (_, vel)| {
-                vel.x *= 0.99; // трение
-                vel.y *= 0.99;
-            });
-            if count > 0 {
-                println!("  [enemy_ai] updated {} enemies", count);
-            }
-        },
-        StageLabel::Update,
-    );
+    sched.add_auto_system_to_stage("physics",      physics_system,      StageLabel::Update);
+    sched.add_auto_system_to_stage("health_clamp", health_clamp_system, StageLabel::Update);
+    sched.add_auto_system_to_stage("enemy_ai",     enemy_ai_system,     StageLabel::Update);
 
     // ╔══════════════════════════════════════════════════════════╗
     // ║  PostUpdate — Sequential системы                        ║

@@ -163,13 +163,11 @@ fn make_world_5comp(n: usize) -> World {
 
 // ── Системы ────────────────────────────────────────────────────
 
-struct MoveSys;
-impl AutoSystem for MoveSys {
-    type Query = (Read<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
+system! {
+    fn move_sys(
+        q: (Read<Velocity>, Write<Position>),
+    ) {
+        q.for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
             p.z += v.z * 0.016;
@@ -177,49 +175,41 @@ impl AutoSystem for MoveSys {
     }
 }
 
-struct HpSys;
-impl AutoSystem for HpSys {
-    type Query = Write<Health>;
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Health>>().for_each(|_, hp| {
+system! {
+    fn hp_sys(
+        q: Write<Health>,
+    ) {
+        q.for_each(|_, hp| {
             hp.current = hp.current.min(hp.max).max(0.0);
         });
     }
 }
 
-struct TempSys;
-impl AutoSystem for TempSys {
-    type Query = Write<Temperature>;
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Temperature>>().for_each(|_, t| {
+system! {
+    fn temp_sys(
+        q: Write<Temperature>,
+    ) {
+        q.for_each(|_, t| {
             t.0 += (20.0 - t.0) * 0.001;
         });
     }
 }
 
-struct ManaSys;
-impl AutoSystem for ManaSys {
-    type Query = Write<Mana>;
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Mana>>().for_each(|_, m| {
+system! {
+    fn mana_sys(
+        q: Write<Mana>,
+    ) {
+        q.for_each(|_, m| {
             m.current = (m.current + 0.2).min(m.max);
         });
     }
 }
 
-struct HeavyPhysSys;
-impl AutoSystem for HeavyPhysSys {
-    type Query = (Write<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<(Write<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
+system! {
+    fn heavy_phys_sys(
+        q: (Write<Velocity>, Write<Position>),
+    ) {
+        q.for_each(|_, (v, p)| {
             let dt    = 0.016f32;
             let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
             let angle = speed.atan2(1.0);
@@ -235,13 +225,11 @@ impl AutoSystem for HeavyPhysSys {
     }
 }
 
-struct HeavyTempSys;
-impl AutoSystem for HeavyTempSys {
-    type Query = Write<Temperature>;
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Temperature>>().for_each(|_, t| {
+system! {
+    fn heavy_temp_sys(
+        q: Write<Temperature>,
+    ) {
+        q.for_each(|_, t| {
             let ambient = 20.0f32;
             let diff    = t.0 - ambient;
             let rate    = (diff * 0.1).tanh() * 0.05;
@@ -254,13 +242,11 @@ impl AutoSystem for HeavyTempSys {
     }
 }
 
-struct HeavyManaSys;
-impl AutoSystem for HeavyManaSys {
-    type Query = Write<Mana>;
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Write<Mana>>().for_each(|_, m| {
+system! {
+    fn heavy_mana_sys(
+        q: Write<Mana>,
+    ) {
+        q.for_each(|_, m| {
             let ratio = m.current / m.max;
             let regen = (1.0 - ratio).sqrt() * 0.5;
             m.current = (m.current + regen).min(m.max);
@@ -271,13 +257,11 @@ impl AutoSystem for HeavyManaSys {
     }
 }
 
-struct AutoMoveSys;
-impl AutoSystem for AutoMoveSys {
-    type Query = (Read<Velocity>, Write<Position>);
-    type Resources = ();
-    type Events = ();
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        ctx.query::<Self::Query>().for_each(|_, (v, p)| {
+system! {
+    fn auto_move_sys(
+        q: (Read<Velocity>, Write<Position>),
+    ) {
+        q.for_each(|_, (v, p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
         });
@@ -511,14 +495,14 @@ fn bench_scheduler_throughput(n: usize) {
 
     sched_bench!(
         &format!("1 AutoSystem: movement      ({n}k)"),
-        { let mut s = Scheduler::new(); s.add_auto_system("move", MoveSys); s },
+        { let mut s = Scheduler::new(); s.add_auto_system("move", move_sys); s },
         make_world_3comp(n * 1000)
     );
 
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("move", MoveSys);
-        sched.add_auto_system("hp",   HpSys);
+        sched.add_auto_system("move", move_sys);
+        sched.add_auto_system("hp",   hp_sys);
         sched.compile().unwrap();
         let stages = sched.stages().unwrap().len();
         debug_assert_eq!(stages, 1, "ожидаем 1 Stage без конфликтов");
@@ -579,17 +563,17 @@ fn bench_scheduler_throughput(n: usize) {
 
     sched_bench!(
         &format!("1 AutoSystem               ({n}k)"),
-        { let mut s = Scheduler::new(); s.add_auto_system("auto", AutoMoveSys); s },
+        { let mut s = Scheduler::new(); s.add_auto_system("auto", auto_move_sys); s },
         make_world_3comp(n * 1000)
     );
 
     // Debug plan
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("physics",  MoveSys);
-        sched.add_auto_system("hp_clamp", HpSys);
+        sched.add_auto_system("physics",  move_sys);
+        sched.add_auto_system("hp_clamp", hp_sys);
         sched.add_system("commands", |_| {});
-        sched.add_auto_system("ai", MoveSys);
+        sched.add_auto_system("ai", move_sys);
         sched.compile().unwrap();
         println!("  Mixed pipeline plan:\n{}", sched.debug_plan());
     }
@@ -1069,8 +1053,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("move", MoveSys),
-            |s: &mut Scheduler| s.add_auto_system("hp",   HpSys)
+            |s: &mut Scheduler| s.add_auto_system("move", move_sys),
+            |s: &mut Scheduler| s.add_auto_system("hp",   hp_sys)
         );
         bench_seq_par(
             &format!("2 лёгких системы ({n}k)  Move+Hp"),
@@ -1082,10 +1066,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("move", MoveSys),
-            |s: &mut Scheduler| s.add_auto_system("hp",   HpSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", TempSys),
-            |s: &mut Scheduler| s.add_auto_system("mana", ManaSys)
+            |s: &mut Scheduler| s.add_auto_system("move", move_sys),
+            |s: &mut Scheduler| s.add_auto_system("hp",   hp_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", temp_sys),
+            |s: &mut Scheduler| s.add_auto_system("mana", mana_sys)
         );
         // Проверяем 1 Stage
         debug_assert_eq!(seq.stages().unwrap().len(), 1);
@@ -1102,9 +1086,9 @@ fn bench_parallel_scheduler(n: usize) {
     // Ключевое исправление: каждая система работает со СВОИМ архетипом.
     // Это устраняет false sharing кеш-линий между системами.
     //
-    // Архетип A: Pos + Vel         → HeavyPhysSys (write Pos, write Vel)
-    // Архетип B: Temp              → HeavyTempSys (write Temp)
-    // Архетип C: Mana              → HeavyManaSys (write Mana)
+    // Архетип A: Pos + Vel         → heavy_phys_sys (write Pos, write Vel)
+    // Архетип B: Temp              → heavy_temp_sys (write Temp)
+    // Архетип C: Mana              → heavy_mana_sys (write Mana)
     //
     // Системы не пересекаются ни по компонентам, ни по памяти.
 
@@ -1118,7 +1102,7 @@ fn bench_parallel_scheduler(n: usize) {
 
 
 
-        // Архетип A: только Pos + Vel (для HeavyPhysSys)
+        // Архетип A: только Pos + Vel (для heavy_phys_sys)
         world.spawn_many_silent(n, |i| {
             let f = i as f32;
             (
@@ -1126,11 +1110,11 @@ fn bench_parallel_scheduler(n: usize) {
                 Velocity { x: 1.0, y: 0.5, z: 0.0 },
             )
         });
-        // Архетип B: только Temp (для HeavyTempSys)
+        // Архетип B: только Temp (для heavy_temp_sys)
         world.spawn_many_silent(n, |i| {
             (Temperature(20.0 + i as f32 * 0.001),)
         });
-        // Архетип C: только Mana (для HeavyManaSys)
+        // Архетип C: только Mana (для heavy_mana_sys)
         world.spawn_many_silent(n, |i| {
             (Mana { current: i as f32 % 100.0, max: 100.0 },)
         });
@@ -1139,8 +1123,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
         );
         bench_seq_par(
             &format!("2 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1152,9 +1136,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
+            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
         );
         bench_seq_par(
             &format!("3 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1173,8 +1157,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
         );
         bench_seq_par(
             &format!("2 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1186,9 +1170,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
+            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
         );
         bench_seq_par(
             &format!("3 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1205,7 +1189,7 @@ fn bench_parallel_scheduler(n: usize) {
     // в межсистемном режиме.
     //
     // Системы: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
-    // vs HeavyPhysSys (for_each) + HeavyTempSys (for_each)
+    // vs heavy_phys_sys (for_each) + heavy_temp_sys (for_each)
     //
     // в то время как for_each использует только 1 ядро на систему.
 
@@ -1272,8 +1256,8 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
             |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
@@ -1296,9 +1280,9 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", HeavyPhysSys),
-            |s: &mut Scheduler| s.add_auto_system("temp", HeavyTempSys),
-            |s: &mut Scheduler| s.add_auto_system("mana", HeavyManaSys)
+            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
+            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
+            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
             |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
@@ -1348,13 +1332,11 @@ fn bench_parallel_scheduler(n: usize) {
     // ── 12 систем, каждая пишет в свой компонент ──────────────
     macro_rules! make_solo_sys {
         ($name:ident, $comp:ty) => {
-            struct $name;
-            impl AutoSystem for $name {
-                type Query = Write<$comp>;
-                type Resources = ();
-                type Events = ();
-                fn run(&mut self, ctx: SystemContext<'_>) {
-                    ctx.query::<Write<$comp>>().for_each(|_, c| {
+            system! {
+                fn $name(
+                    q: Write<$comp>,
+                ) {
+                    q.for_each(|_, c| {
                         c.0 = (c.0 * 1.01 + 0.5).sin();
                     });
                 }
@@ -1486,11 +1468,11 @@ fn bench_parallel_scheduler(n: usize) {
     {
         let build_sched = || {
             let mut s = Scheduler::new();
-            s.add_auto_system("p1", MoveSys);
-            s.add_auto_system("h1", HpSys);
+            s.add_auto_system("p1", move_sys);
+            s.add_auto_system("h1", hp_sys);
             s.add_system("barrier", |_: &mut World| {});
-            s.add_auto_system("p2", MoveSys);
-            s.add_auto_system("h2", HpSys);
+            s.add_auto_system("p2", move_sys);
+            s.add_auto_system("h2", hp_sys);
             s.compile().unwrap();
             s
         };
@@ -1507,13 +1489,13 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Debug plan ────────────────────────────────────────────
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("move", MoveSys);
-        sched.add_auto_system("hp",   HpSys);
-        sched.add_auto_system("temp", TempSys);
-        sched.add_auto_system("mana", ManaSys);
+        sched.add_auto_system("move", move_sys);
+        sched.add_auto_system("hp",   hp_sys);
+        sched.add_auto_system("temp", temp_sys);
+        sched.add_auto_system("mana", mana_sys);
         sched.add_system("commands", |_| {});
-        sched.add_auto_system("move2", MoveSys);
-        sched.add_auto_system("hp2",   HpSys);
+        sched.add_auto_system("move2", move_sys);
+        sched.add_auto_system("hp2",   hp_sys);
         let test_world = make_world_5comp(n * 1000);
         sched.compile_with_world(&test_world).unwrap();
         println!("\n  Pipeline plan:\n{}", sched.debug_plan());

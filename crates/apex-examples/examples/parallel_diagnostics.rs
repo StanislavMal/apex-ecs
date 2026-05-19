@@ -15,7 +15,7 @@
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
 use apex_macros::Component;
-use apex_scheduler::{Scheduler, AutoSystem, ResRead, ResWrite, Listen, Emit};
+use apex_scheduler::Scheduler;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОМПОНЕНТЫ
@@ -75,150 +75,112 @@ struct DamageEvent { target: Entity, amount: f32 }
 // СИСТЕМЫ
 // ═══════════════════════════════════════════════════════════════════════════════
 
-struct MovementReaderSystem;
-impl AutoSystem for MovementReaderSystem {
-    type Query     = (Read<Position>, Read<Velocity>);
-    type Resources = ResRead<DeltaTime>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let dt = ctx.resource::<DeltaTime>().0;
+system! {
+    fn movement_reader_system(
+        q: (Read<Position>, Read<Velocity>),
+        dt: &DeltaTime,
+    ) {
         let mut sum = 0.0f32;
-        ctx.query::<(Read<Position>, Read<Velocity>)>()
-            .for_each(|_, (pos, vel)| {
-                sum += pos.x + vel.x * dt.0;
-            });
+        q.for_each(|_, (pos, vel)| {
+            sum += pos.x + vel.x * dt.0;
+        });
         std::hint::black_box(sum);
     }
 }
 
-struct HealthReaderSystem;
-impl AutoSystem for HealthReaderSystem {
-    type Query     = Read<Health>;
-    type Resources = ();
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
+system! {
+    fn health_reader_system(
+        q: Read<Health>,
+    ) {
         let mut dead = 0u32;
-        ctx.query::<Read<Health>>()
-            .for_each(|_, hp| {
-                if hp.current <= 0.0 { dead += 1; }
-            });
+        q.for_each(|_, hp| {
+            if hp.current <= 0.0 { dead += 1; }
+        });
         std::hint::black_box(dead);
     }
 }
 
-struct PhysicsReaderSystem;
-impl AutoSystem for PhysicsReaderSystem {
-    type Query     = (Read<Mass>, Read<Acceleration>);
-    type Resources = ResRead<Gravity>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let g = ctx.resource::<Gravity>().0;
+system! {
+    fn physics_reader_system(
+        q: (Read<Mass>, Read<Acceleration>),
+        g: &Gravity,
+    ) {
         let mut force_sum = 0.0f32;
-        ctx.query::<(Read<Mass>, Read<Acceleration>)>()
-            .for_each(|_, (m, a)| {
-                force_sum += m.0 * (a.y + g.0);
-            });
+        q.for_each(|_, (m, a)| {
+            force_sum += m.0 * (a.y + g.0);
+        });
         std::hint::black_box(force_sum);
     }
 }
 
-struct MovementWriterSystem;
-impl AutoSystem for MovementWriterSystem {
-    type Query     = (Write<Position>, Read<Velocity>);
-    type Resources = ResRead<DeltaTime>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let dt = ctx.resource::<DeltaTime>().0;
-        ctx.query::<(Write<Position>, Read<Velocity>)>()
-            .for_each(|_, (pos, vel)| {
-                pos.x += vel.x * dt.0;
-                pos.y += vel.y * dt.0;
-                pos.z += vel.z * dt.0;
-            });
+system! {
+    fn movement_writer_system(
+        q: (Write<Position>, Read<Velocity>),
+        dt: &DeltaTime,
+    ) {
+        q.for_each(|_, (pos, vel)| {
+            pos.x += vel.x * dt.0;
+            pos.y += vel.y * dt.0;
+            pos.z += vel.z * dt.0;
+        });
     }
 }
 
-#[allow(dead_code)]
-struct MovementWriterSystem2;
-impl AutoSystem for MovementWriterSystem2 {
-    type Query     = (Write<Position>, Read<Acceleration>);
-    type Resources = ResRead<DeltaTime>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let dt = ctx.resource::<DeltaTime>().0;
-        ctx.query::<(Write<Position>, Read<Acceleration>)>()
-            .for_each(|_, (pos, acc)| {
-                pos.x += acc.x * dt.0 * dt.0 * 0.5;
-                pos.y += acc.y * dt.0 * dt.0 * 0.5;
-            });
+system! {
+    fn movement_writer_system2(
+        q: (Write<Position>, Read<Acceleration>),
+        dt: &DeltaTime,
+    ) {
+        q.for_each(|_, (pos, acc)| {
+            pos.x += acc.x * dt.0 * dt.0 * 0.5;
+            pos.y += acc.y * dt.0 * dt.0 * 0.5;
+        });
     }
 }
 
-struct HealthWriterSystem;
-impl AutoSystem for HealthWriterSystem {
-    type Query     = (Write<Health>, Read<Damage>);
-    type Resources = ();
-    type Events    = Emit<DamageEvent>;
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let n = ctx.entity_count();
-        let mut writer = ctx.event_writer::<DamageEvent>();
-        // Предварительно резервируем capacity — избегаем реаллокаций при массовой отправке
+system! {
+    fn health_writer_system(
+        q: (Write<Health>, Read<Damage>),
+        writer: &mut Vec<DamageEvent>,
+    ) {
+        let n = q.len();
         writer.reserve(n / 10 + 1);
-        ctx.query::<(Write<Health>, Read<Damage>)>()
-            .for_each(|entity, (hp, dmg)| {
-                hp.current -= dmg.0;
-                if hp.current < 0.0 {
-                    writer.send(DamageEvent { target: entity, amount: dmg.0 });
-                }
-            });
+        q.for_each(|entity, (hp, dmg)| {
+            hp.current -= dmg.0;
+            if hp.current < 0.0 {
+                writer.send(DamageEvent { target: entity, amount: dmg.0 });
+            }
+        });
     }
 }
 
-struct DamageListenerSystem;
-impl AutoSystem for DamageListenerSystem {
-    type Query     = Read<Health>;
-    type Resources = ();
-    type Events    = Listen<DamageEvent>;
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let mut reader = ctx.event_reader::<DamageEvent>();
-        let count = reader.read().len() as u32;
+system! {
+    fn damage_listener_system(
+        q: Read<Health>,
+        reader: &[DamageEvent],
+    ) {
+        let count = reader.iter().len() as u32;
         std::hint::black_box(count);
     }
 }
 
-#[allow(dead_code)]
-struct CounterWriterSystem;
-impl AutoSystem for CounterWriterSystem {
-    type Query     = Read<Health>;
-    type Resources = ResWrite<GlobalCounter>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let mut counter = ctx.resource_mut::<GlobalCounter>();
-        ctx.query::<Read<Health>>()
-            .for_each(|_, _| { counter.0 += 1; });
+system! {
+    fn counter_writer_system(
+        q: Read<Health>,
+        counter: &mut GlobalCounter,
+    ) {
+        q.for_each(|_, _| { counter.0 += 1; });
     }
 }
 
-struct CooldownSystem;
-impl AutoSystem for CooldownSystem {
-    type Query     = Write<Cooldown>;
-    type Resources = ResRead<DeltaTime>;
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let dt = ctx.resource::<DeltaTime>().0;
-        ctx.query::<Write<Cooldown>>()
-            .for_each(|_, cd| {
-                if cd.0 > 0.0 { cd.0 -= dt.0; }
-            });
+system! {
+    fn cooldown_system(
+        q: Write<Cooldown>,
+        dt: &DeltaTime,
+    ) {
+        q.for_each(|_, cd| {
+            if cd.0 > 0.0 { cd.0 -= dt.0; }
+        });
     }
 }
 
@@ -394,9 +356,9 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
         // Sequential
         let mut ws = build_world(n);
         let mut ss = Scheduler::new();
-        ss.add_auto_system("movement_reader", MovementReaderSystem);
-        ss.add_auto_system("health_reader",   HealthReaderSystem);
-        ss.add_auto_system("physics_reader",  PhysicsReaderSystem);
+        ss.add_auto_system("movement_reader", movement_reader_system);
+        ss.add_auto_system("health_reader",   health_reader_system);
+        ss.add_auto_system("physics_reader",  physics_reader_system);
         ss.compile_with_world(&ws).expect("compile");
         let warmup = ticks_measure / 5;
         for _ in 0..warmup { ws.tick(); ss.run_sequential(&mut ws); }
@@ -412,9 +374,9 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
         // Parallel
         let mut wp = build_world(n);
         let mut sp = Scheduler::new();
-        sp.add_auto_system("movement_reader", MovementReaderSystem);
-        sp.add_auto_system("health_reader",   HealthReaderSystem);
-        sp.add_auto_system("physics_reader",  PhysicsReaderSystem);
+        sp.add_auto_system("movement_reader", movement_reader_system);
+        sp.add_auto_system("health_reader",   health_reader_system);
+        sp.add_auto_system("physics_reader",  physics_reader_system);
         sp.compile_with_world(&wp).expect("compile");
         let par = measure_scheduler("par", &mut wp, &mut sp, warmup, ticks_measure);
 
@@ -465,7 +427,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             }
             // SEQ
             let mut s = Scheduler::new();
-            s.add_auto_system("movement", MovementWriterSystem);
+            s.add_auto_system("movement", movement_writer_system);
             s.compile_with_world(&world).expect("compile");
             for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
             let ec = world.entity_count();
@@ -487,7 +449,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
                 ));
             }
             let mut sp = Scheduler::new();
-            sp.add_auto_system("movement", MovementWriterSystem);
+            sp.add_auto_system("movement", movement_writer_system);
             sp.compile_with_world(&world2).expect("compile");
             par_one = measure_scheduler("1arch_par", &mut world2, &mut sp, warmup, ticks_measure);
         }
@@ -516,7 +478,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             }
             // SEQ
             let mut s = Scheduler::new();
-            s.add_auto_system("movement", MovementWriterSystem);
+            s.add_auto_system("movement", movement_writer_system);
             s.compile_with_world(&world).expect("compile");
             for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
             let ec = world.entity_count();
@@ -547,7 +509,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
                 world2.spawn((Position { x: f, y: 3.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagD));
             }
             let mut sp = Scheduler::new();
-            sp.add_auto_system("movement", MovementWriterSystem);
+            sp.add_auto_system("movement", movement_writer_system);
             sp.compile_with_world(&world2).expect("compile");
             par_four = measure_scheduler("4arch_par", &mut world2, &mut sp, warmup, ticks_measure);
         }
@@ -591,8 +553,8 @@ fn run_event_pipeline() -> Vec<EventResult> {
         }
 
         let mut sched = Scheduler::new();
-        let writer_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
-        let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
+        let writer_id   = sched.add_auto_system("health_writer",   health_writer_system);
+        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system);
         sched.add_dependency(listener_id, writer_id);
         sched.compile_with_world(&world).expect("compile");
 
@@ -637,12 +599,12 @@ fn run_full_pipeline() -> Vec<FullPipeResult> {
         }
 
         let mut sched = Scheduler::new();
-        sched.add_auto_system("movement_reader", MovementReaderSystem);
-        sched.add_auto_system("health_reader",   HealthReaderSystem);
-        sched.add_auto_system("physics_reader",  PhysicsReaderSystem);
-        let health_id   = sched.add_auto_system("health_writer",   HealthWriterSystem);
-        sched.add_auto_system("cooldown",        CooldownSystem);
-        let listener_id = sched.add_auto_system("damage_listener", DamageListenerSystem);
+        sched.add_auto_system("movement_reader", movement_reader_system);
+        sched.add_auto_system("health_reader",   health_reader_system);
+        sched.add_auto_system("physics_reader",  physics_reader_system);
+        let health_id   = sched.add_auto_system("health_writer",   health_writer_system);
+        sched.add_auto_system("cooldown",        cooldown_system);
+        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system);
         sched.add_dependency(listener_id, health_id);
         sched.compile_with_world(&world).expect("compile");
 

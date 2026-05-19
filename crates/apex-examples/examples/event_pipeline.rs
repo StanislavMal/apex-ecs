@@ -49,17 +49,13 @@ struct DamageEvent {
 
 // ── Producer: CollisionSystem ──────────────────────────────────
 
-struct CollisionSystem;
-
-impl AutoSystem for CollisionSystem {
-    type Query     = Read<Collider>;
-    type Resources = ();
-    type Events    = Emit<DamageEvent>;
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let mut writer = ctx.event_writer::<DamageEvent>();
-        let count = ctx.query::<Read<Collider>>().len();
-        for (entity, _) in ctx.query::<Read<Collider>>().iter() {
+system! {
+    fn collision_system(
+        q: Read<Collider>,
+        writer: &mut Vec<DamageEvent>,
+    ) {
+        let count = q.len();
+        for (entity, _) in q.iter() {
             writer.send(DamageEvent { target: entity, amount: 25.0 });
         }
         println!("  [CollisionSystem] emitted {}x DamageEvent(25.0)", count);
@@ -70,24 +66,19 @@ impl AutoSystem for CollisionSystem {
 // Читает DamageEvent, МОДИФИЦИРУЕТ Health (компонент), перевыпускает
 // модифицированное событие для следующих этапов.
 
-struct ArmorSystem;
-
-impl AutoSystem for ArmorSystem {
-    type Query     = (Read<Armor>, Write<Health>);
-    type Resources = ();
-    type Events    = (Listen<DamageEvent>, Emit<DamageEvent>);
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let reader = ctx.event_reader::<DamageEvent>();
-        let mut writer = ctx.event_writer::<DamageEvent>();
+system! {
+    fn armor_system(
+        q: (Read<Armor>, Write<Health>),
+        reader: &[DamageEvent],
+        writer: &mut Vec<DamageEvent>,
+    ) {
         let mut count = 0usize;
 
         for ev in reader.iter() {
             count += 1;
 
-            // Находим конкретную entity из события и применяем урон только ей
             let mut reduced = ev.amount;
-            ctx.query::<(Read<Armor>, Write<Health>)>().for_each(|entity, (armor, hp)| {
+            q.for_each(|entity, (armor, hp)| {
                 if entity == ev.target {
                     let reduction = (armor.0 / (armor.0 + 100.0)).min(0.8);
                     reduced = ev.amount * (1.0 - reduction);
@@ -98,7 +89,7 @@ impl AutoSystem for ArmorSystem {
             writer.send(DamageEvent { target: ev.target, amount: reduced });
             println!("  [ArmorSystem]  entity={:?} dmg={:.1} armor={:.0} → reduced={:.1}",
                 ev.target, ev.amount,
-                ctx.query::<(Read<Armor>, Write<Health>)>().iter()
+                q.iter()
                     .find(|(e, _)| *e == ev.target)
                     .map(|(_, (a, _))| a.0)
                     .unwrap_or(0.0),
@@ -113,15 +104,11 @@ impl AutoSystem for ArmorSystem {
 // ── Consumer: HealthSystem ─────────────────────────────────────
 // Просто читает Health — видит изменения ArmorSystem того же кадра.
 
-struct HealthSystem;
-
-impl AutoSystem for HealthSystem {
-    type Query     = Read<Health>;
-    type Resources = ();
-    type Events    = ();
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        for (entity, hp) in ctx.query::<Read<Health>>().iter() {
+system! {
+    fn health_system(
+        q: Read<Health>,
+    ) {
+        for (entity, hp) in q.iter() {
             println!("  [HealthSystem] entity={:?} HP={:.1}/{}", entity, hp.current, hp.max);
         }
     }
@@ -129,15 +116,11 @@ impl AutoSystem for HealthSystem {
 
 // ── Consumer: SoundSystem ──────────────────────────────────────
 
-struct SoundSystem;
-
-impl AutoSystem for SoundSystem {
-    type Query     = Read<Collider>;
-    type Resources = ();
-    type Events    = Listen<DamageEvent>;
-
-    fn run(&mut self, ctx: SystemContext<'_>) {
-        let reader = ctx.event_reader::<DamageEvent>();
+system! {
+    fn sound_system(
+        q: Read<Collider>,
+        reader: &[DamageEvent],
+    ) {
         let events: Vec<_> = reader.iter().to_vec();
         if !events.is_empty() {
             println!("  [SoundSystem]  {} sounds (first amount={:.1})", events.len(), events[0].amount);
@@ -164,10 +147,10 @@ fn main() {
 
     let mut sched = Scheduler::new();
 
-    let collision_id = sched.add_auto_system("collision", CollisionSystem);
-    let armor_id     = sched.add_auto_system("armor",     ArmorSystem);
-    let health_id    = sched.add_auto_system("health",    HealthSystem);
-    let sound_id     = sched.add_auto_system("sound",     SoundSystem);
+    let collision_id = sched.add_auto_system("collision", collision_system);
+    let armor_id     = sched.add_auto_system("armor",     armor_system);
+    let health_id    = sched.add_auto_system("health",    health_system);
+    let sound_id     = sched.add_auto_system("sound",     sound_system);
 
     // Конвейер событий: явный порядок выполнения
     Scheduler::event_pipeline::<DamageEvent>()
