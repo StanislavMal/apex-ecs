@@ -1694,7 +1694,7 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
         let arch_idx = self.arch_indices[self.arch_pos];
         let arch = &self.world.archetypes[arch_idx];
 
-        if arch.is_empty() {
+        if arch.is_empty() || !Q::matches_archetype(arch, &self.cached_ids) {
             self.row = 0;
             self.row_end = 0;
             return;

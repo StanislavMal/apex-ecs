@@ -12,6 +12,7 @@
 4. [Query API](#4-query-api)
 5. [Ресурсы и события](#5-ресурсы-и-события)
 6. [Системы и планировщик](#6-системы-и-планировщик)
+   - [6.8 `SystemParam` — типобезопасные параметры систем](#68-systemparam--типобезопасные-параметры-систем)
 7. [Commands](#7-commands)
 8. [Relations (связи между entity)](#8-relations-связи-между-entity)
 9. [EntityTemplate](#9-entitytemplate)
@@ -1584,6 +1585,121 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 - `Consumer` → зависит от последнего Producer/Transformer барьера, НО не от других Consumer — они параллельны
 
 **Полный пример:** `cargo run -p apex-examples --example event_pipeline --release`
+
+---
+
+### 6.8 `SystemParam` — типобезопасные параметры систем
+
+`SystemParam` — трейт для **типобезопасного извлечения параметров** из `SystemContext`. Позволяет объявить, какие ресурсы/запросы/события нужны системе, **без ручного вызова** `ctx.resource::<T>()`, `ctx.query::<Q>()`, `ctx.event_reader::<E>()`.
+
+**Зачем:** устраняет бойлерплейт в sequential системах и упрощает портирование Bevy-рендера (где `RenderCommand::Param: SystemParam`).
+
+#### Базовое использование
+
+```rust
+use apex_core::prelude::*;
+
+// Ручной стиль (было):
+fn old_style(ctx: &SystemContext<'_>) {
+    let dt = ctx.resource::<DeltaTime>();
+    let q = ctx.query::<(Read<Vel>, Write<Pos>)>();
+    let events = ctx.event_reader::<CollisionEvent>();
+    // ... используем dt, q, events
+}
+
+// SystemParam-стиль (стало):
+type MyParams = (
+    ResRead<DeltaTime>,                            // → Res<'_, DeltaTime>
+    QueryParam<(Read<Vel>, Write<Pos>)>,           // → CachedQuery<'_, (Read<Vel>, Write<Pos>)>
+    Listen<CollisionEvent>,                        // → EventReader<'_, CollisionEvent>
+);
+
+fn new_style(ctx: &SystemContext<'_>) {
+    let (dt, q, events) = MyParams::fetch(ctx);
+    // или через convenience-метод:
+    let (dt, q, events) = ctx.fetch::<MyParams>();
+    // ... используем dt, q, events
+}
+```
+
+#### Маркеры параметров
+
+| Маркер | Что возвращает `fetch()` | Аналог |
+|--------|--------------------------|--------|
+| `ResRead<T>` | `Res<'w, T>` (иммутабельная ссылка) | `ctx.resource::<T>()` |
+| `ResWrite<T>` | `ResMut<'w, T>` (мутабельная ссылка) | `ctx.resource_mut::<T>()` |
+| `Listen<E>` | `EventReader<'w, E>` (чтение событий) | `ctx.event_reader::<E>()` |
+| `Emit<E>` | `EventWriter<'w, E>` (отправка событий) | `ctx.event_writer::<E>()` |
+| `QueryParam<Q>` | `CachedQuery<'w, Q>` (запрос компонентов) | `ctx.query::<Q>()` |
+| `CommandsParam` | `&'w mut Commands` (структурные изменения) | `ctx.commands()` |
+
+#### Кортежи
+
+Маркеры комбинируются в кортежи до 12 элементов. `access()` автоматически сливает декларации доступа от всех элементов — планировщик видит полную картину.
+
+```rust
+// 1 элемент
+type P1 = ResRead<DeltaTime>;
+
+// 2 элемента
+type P2 = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>);
+
+// 4 элемента
+type P4 = (
+    ResRead<DeltaTime>,
+    ResWrite<FrameStats>,
+    QueryParam<(Read<Vel>, Write<Pos>)>,
+    Emit<CollisionEvent>,
+);
+
+// Пустой набор (нет параметров)
+type P0 = ();
+
+// Использование:
+fn my_system(ctx: &SystemContext<'_>) {
+    let (dt, stats, q, mut writer) = ctx.fetch::<P4>();
+    // dt: Res<'_, DeltaTime>
+    // stats: ResMut<'_, FrameStats>
+    // q: CachedQuery<'_, (Read<Vel>, Write<Pos>)>
+    // writer: EventWriter<'_, CollisionEvent>
+}
+```
+
+#### Использование в Bevy RenderCommand (портирование)
+
+`SystemParam` — ключ к портированию Bevy `RenderCommand<P>` трейта:
+
+```rust
+trait RenderCommand<P: PhaseItem> {
+    type Param: SystemParam;  // ← типы ресурсов, нужные команде
+
+    fn render<'w>(
+        item: &P,
+        pass: &mut wgpu::RenderPass<'static>,
+        param: <Self::Param as SystemParam>::Item<'w>,
+    ) -> RenderCommandResult;
+}
+
+// Конкретная команда:
+impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
+    type Param = (ResRead<GpuResourceCache>, ResRead<Assets<Mesh>>);
+
+    fn render<'w>(
+        item: &P,
+        pass: &mut wgpu::RenderPass<'static>,
+        (cache, meshes): (Res<'w, GpuResourceCache>, Res<'w, Assets<Mesh>>),
+    ) -> RenderCommandResult { /* ... */ }
+}
+```
+
+#### Отличия от Bevy SystemParam
+
+| Bevy | Apex |
+|------|------|
+| `SystemParam` с разделением `State`/`Fetch` | Без разделения — `fetch()` напрямую |
+| `#[derive(SystemParam)]` proc-макрос | Типы-маркеры + кортежи (без макроса) |
+| `Query<&T, &mut U>` через SystemParam | `QueryParam<(Read<T>, Write<U>)>` |
+| Интегрирован в планировщик | Ортогонален: `system!`/`sequential_system!` работают независимо |
 
 ---
 
