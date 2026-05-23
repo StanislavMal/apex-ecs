@@ -1,5 +1,7 @@
 cargo test --workspace
 
+cargo run -p apex-examples --example system_param
+
 cargo run -p apex-examples --example bundle_composition
 
 cargo run -p apex-examples --example hot_reload_test
