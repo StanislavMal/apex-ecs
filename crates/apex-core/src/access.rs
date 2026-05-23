@@ -143,9 +143,13 @@ impl ArchetypeMask {
 
     /// Итерация по установленным индексам через trailing_zeros — O(popcount).
     pub fn iter_ones(&self) -> impl Iterator<Item = usize> + '_ {
-        self.bits.iter().enumerate().flat_map(|(chunk_i, &chunk)| {
-            BitIter { word: chunk, base: chunk_i * 64 }
-        })
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(|(chunk_i, &chunk)| BitIter {
+                word: chunk,
+                base: chunk_i * 64,
+            })
     }
 }
 
@@ -162,7 +166,7 @@ impl Iterator for BitIter {
             return None;
         }
         let bit = self.word.trailing_zeros() as usize;
-        self.word &= self.word - 1;  // сбрасываем младший установленный бит
+        self.word &= self.word - 1; // сбрасываем младший установленный бит
         Some(self.base + bit)
     }
 }
@@ -185,14 +189,14 @@ impl Iterator for BitIter {
 /// - Два читателя одного типа событий — НЕ конфликтуют
 #[derive(Default, Clone, Debug)]
 pub struct AccessDescriptor {
-    pub reads:  Vec<TypeId>,
+    pub reads: Vec<TypeId>,
     pub writes: Vec<TypeId>,
     /// Типы событий, которые система читает (TypeId, имя_типа).
-    pub reads_event:  Vec<(TypeId, &'static str)>,
+    pub reads_event: Vec<(TypeId, &'static str)>,
     /// Типы событий, которые система пишет (TypeId, имя_типа).
     pub writes_event: Vec<(TypeId, &'static str)>,
     /// Битовые маски — заполняются планировщиком через `assign_masks`.
-    pub read_mask:  ComponentMask,
+    pub read_mask: ComponentMask,
     pub write_mask: ComponentMask,
     /// Маска архетипов — заполняется планировщиком в compile().
     /// Определяет, какие архетипы нужны этой системе.
@@ -211,17 +215,23 @@ pub struct AccessDescriptor {
 }
 
 impl AccessDescriptor {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn read<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
-        if !self.reads.contains(&tid) { self.reads.push(tid); }
+        if !self.reads.contains(&tid) {
+            self.reads.push(tid);
+        }
         self
     }
 
     pub fn write<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
-        if !self.writes.contains(&tid) { self.writes.push(tid); }
+        if !self.writes.contains(&tid) {
+            self.writes.push(tid);
+        }
         self
     }
 
@@ -229,7 +239,9 @@ impl AccessDescriptor {
     pub fn read_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
         let name = std::any::type_name::<T>();
-        if !self.reads_event.iter().any(|(id, _)| *id == tid) { self.reads_event.push((tid, name)); }
+        if !self.reads_event.iter().any(|(id, _)| *id == tid) {
+            self.reads_event.push((tid, name));
+        }
         self
     }
 
@@ -251,7 +263,9 @@ impl AccessDescriptor {
     pub fn write_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
         let name = std::any::type_name::<T>();
-        if !self.writes_event.iter().any(|(id, _)| *id == tid) { self.writes_event.push((tid, name)); }
+        if !self.writes_event.iter().any(|(id, _)| *id == tid) {
+            self.writes_event.push((tid, name));
+        }
         self
     }
 
@@ -273,7 +287,7 @@ impl AccessDescriptor {
         Self::dedup_push_event(&mut self.reads_event, &other.reads_event);
         Self::dedup_push_event(&mut self.writes_event, &other.writes_event);
         // Маски сливаем битовым OR
-        self.read_mask  = self.read_mask.or(&other.read_mask);
+        self.read_mask = self.read_mask.or(&other.read_mask);
         self.write_mask = self.write_mask.or(&other.write_mask);
         // Передаём флаг par_for_each
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
@@ -294,13 +308,17 @@ impl AccessDescriptor {
     /// Вызывается планировщиком один раз после регистрации всех компонентов.
     /// После этого `conflicts_with_fast` даёт O(1) проверку.
     pub fn assign_masks(&mut self, type_to_idx: &std::collections::HashMap<TypeId, u16>) {
-        self.read_mask  = ComponentMask::EMPTY;
+        self.read_mask = ComponentMask::EMPTY;
         self.write_mask = ComponentMask::EMPTY;
-        for tid in &self.reads  {
-            if let Some(&idx) = type_to_idx.get(tid) { self.read_mask.set(idx); }
+        for tid in &self.reads {
+            if let Some(&idx) = type_to_idx.get(tid) {
+                self.read_mask.set(idx);
+            }
         }
         for tid in &self.writes {
-            if let Some(&idx) = type_to_idx.get(tid) { self.write_mask.set(idx); }
+            if let Some(&idx) = type_to_idx.get(tid) {
+                self.write_mask.set(idx);
+            }
         }
         // Освобождаем векторы — после назначения масок они больше не нужны.
         // Маски содержат всю информацию в O(1) доступе.
@@ -334,10 +352,14 @@ impl AccessDescriptor {
         // используем fallback (linear scan)
         if !self.writes.is_empty() || !other.writes.is_empty() {
             for w in &self.writes {
-                if other.reads.contains(w) || other.writes.contains(w) { return true; }
+                if other.reads.contains(w) || other.writes.contains(w) {
+                    return true;
+                }
             }
             for w in &other.writes {
-                if self.reads.contains(w) || self.writes.contains(w) { return true; }
+                if self.reads.contains(w) || self.writes.contains(w) {
+                    return true;
+                }
             }
         }
         // Нет writes — нет конфликта
@@ -346,39 +368,53 @@ impl AccessDescriptor {
 
     /// O(N+M) дедупликация — для малых наборов linear scan, для больших — HashSet.
     fn dedup_push(vec: &mut Vec<TypeId>, items: &[TypeId]) {
-        if items.is_empty() { return; }
+        if items.is_empty() {
+            return;
+        }
         // Порог: если суммарный размер < 8 — O(N²) дешевле аллокации HashSet
         if vec.len() + items.len() < 8 {
             for &item in items {
-                if !vec.contains(&item) { vec.push(item); }
+                if !vec.contains(&item) {
+                    vec.push(item);
+                }
             }
             return;
         }
         // Для больших наборов — HashSet как прежде
         let mut set: std::collections::HashSet<TypeId> = vec.iter().cloned().collect();
         for &item in items {
-            if set.insert(item) { vec.push(item); }
+            if set.insert(item) {
+                vec.push(item);
+            }
         }
     }
 
     /// O(N+M) дедупликация для event-кортежей (TypeId, имя_типа).
     fn dedup_push_event(vec: &mut Vec<(TypeId, &'static str)>, items: &[(TypeId, &'static str)]) {
-        if items.is_empty() { return; }
+        if items.is_empty() {
+            return;
+        }
         if vec.len() + items.len() < 8 {
             for &item in items {
-                if !vec.iter().any(|(id, _)| *id == item.0) { vec.push(item); }
+                if !vec.iter().any(|(id, _)| *id == item.0) {
+                    vec.push(item);
+                }
             }
             return;
         }
         let mut set: std::collections::HashSet<TypeId> = vec.iter().map(|(id, _)| *id).collect();
         for &item in items {
-            if set.insert(item.0) { vec.push(item); }
+            if set.insert(item.0) {
+                vec.push(item);
+            }
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.reads.is_empty() && self.writes.is_empty()
-            && self.reads_event.is_empty() && self.writes_event.is_empty()
+        self.reads.is_empty()
+            && self.writes.is_empty()
+            && self.reads_event.is_empty()
+            && self.writes_event.is_empty()
     }
 }
 

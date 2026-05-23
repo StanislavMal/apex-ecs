@@ -18,12 +18,12 @@ pub struct SparseSet<T> {
 enum SparseSetInner<T> {
     Dense {
         sparse: Vec<u32>,
-        dense:  Vec<u32>,
-        data:   Vec<T>,
+        dense: Vec<u32>,
+        data: Vec<T>,
     },
     Sparse {
-        map:   FxHashMap<u32, T>,
-        dense: Vec<u32>,  // для сохранения порядка итерации
+        map: FxHashMap<u32, T>,
+        dense: Vec<u32>, // для сохранения порядка итерации
     },
 }
 
@@ -32,8 +32,8 @@ impl<T> SparseSet<T> {
         Self {
             inner: SparseSetInner::Dense {
                 sparse: Vec::new(),
-                dense:  Vec::new(),
-                data:   Vec::new(),
+                dense: Vec::new(),
+                data: Vec::new(),
             },
         }
     }
@@ -42,33 +42,38 @@ impl<T> SparseSet<T> {
         Self {
             inner: SparseSetInner::Dense {
                 sparse: Vec::new(),
-                dense:  Vec::with_capacity(capacity),
-                data:   Vec::with_capacity(capacity),
+                dense: Vec::with_capacity(capacity),
+                data: Vec::with_capacity(capacity),
             },
         }
     }
 
     pub fn insert(&mut self, entity_index: u32, value: T) {
         match &mut self.inner {
-            SparseSetInner::Dense { sparse, dense, data } => {
+            SparseSetInner::Dense {
+                sparse,
+                dense,
+                data,
+            } => {
                 let idx = entity_index as usize;
 
                 // Проверяем необходимость перехода на HashMap-backend
-                if idx > dense.len().saturating_mul(SPARSITY_THRESHOLD).max(64)
-                    && idx > 1024
-                {
+                if idx > dense.len().saturating_mul(SPARSITY_THRESHOLD).max(64) && idx > 1024 {
                     // Конвертируем в HashMap
                     let mut map = FxHashMap::default();
                     let existing_dense = std::mem::take(dense);
-                    let existing_data  = std::mem::take(data);
-                    let dense_copy     = existing_dense.clone();
+                    let existing_data = std::mem::take(data);
+                    let dense_copy = existing_dense.clone();
                     for (entity, val) in existing_dense.into_iter().zip(existing_data.into_iter()) {
                         map.insert(entity, val);
                     }
                     map.insert(entity_index, value);
                     let mut new_dense = dense_copy;
                     new_dense.push(entity_index);
-                    self.inner = SparseSetInner::Sparse { map, dense: new_dense };
+                    self.inner = SparseSetInner::Sparse {
+                        map,
+                        dense: new_dense,
+                    };
                     return;
                 }
 
@@ -97,21 +102,29 @@ impl<T> SparseSet<T> {
 
     pub fn remove(&mut self, entity_index: u32) -> Option<T> {
         match &mut self.inner {
-            SparseSetInner::Dense { sparse, dense, data } => {
+            SparseSetInner::Dense {
+                sparse,
+                dense,
+                data,
+            } => {
                 let idx = entity_index as usize;
-                if idx >= sparse.len() { return None; }
+                if idx >= sparse.len() {
+                    return None;
+                }
                 let pos = sparse[idx];
-                if pos == u32::MAX { return None; }
+                if pos == u32::MAX {
+                    return None;
+                }
 
                 let last_entity = *dense.last().unwrap();
-                let pos_usize   = pos as usize;
-                let last_pos    = dense.len() - 1;
+                let pos_usize = pos as usize;
+                let last_pos = dense.len() - 1;
 
                 dense.swap(pos_usize, last_pos);
                 data.swap(pos_usize, last_pos);
 
                 sparse[last_entity as usize] = pos;
-                sparse[idx]                  = u32::MAX;
+                sparse[idx] = u32::MAX;
 
                 dense.pop();
                 Some(data.pop().unwrap())
@@ -133,9 +146,15 @@ impl<T> SparseSet<T> {
         match &self.inner {
             SparseSetInner::Dense { sparse, data, .. } => {
                 let idx = entity_index as usize;
-                if idx >= sparse.len() { return None; }
+                if idx >= sparse.len() {
+                    return None;
+                }
                 let pos = sparse[idx];
-                if pos == u32::MAX { None } else { Some(&data[pos as usize]) }
+                if pos == u32::MAX {
+                    None
+                } else {
+                    Some(&data[pos as usize])
+                }
             }
             SparseSetInner::Sparse { map, .. } => map.get(&entity_index),
         }
@@ -145,9 +164,15 @@ impl<T> SparseSet<T> {
         match &mut self.inner {
             SparseSetInner::Dense { sparse, data, .. } => {
                 let idx = entity_index as usize;
-                if idx >= sparse.len() { return None; }
+                if idx >= sparse.len() {
+                    return None;
+                }
                 let pos = sparse[idx];
-                if pos == u32::MAX { None } else { Some(&mut data[pos as usize]) }
+                if pos == u32::MAX {
+                    None
+                } else {
+                    Some(&mut data[pos as usize])
+                }
             }
             SparseSetInner::Sparse { map, .. } => map.get_mut(&entity_index),
         }
@@ -160,7 +185,7 @@ impl<T> SparseSet<T> {
     pub fn len(&self) -> usize {
         match &self.inner {
             SparseSetInner::Dense { dense, .. } => dense.len(),
-            SparseSetInner::Sparse { map, .. }  => map.len(),
+            SparseSetInner::Sparse { map, .. } => map.len(),
         }
     }
 
@@ -170,7 +195,10 @@ impl<T> SparseSet<T> {
 
     pub fn iter(&self) -> impl Iterator<Item = (u32, &T)> {
         struct EitherIter<L, R>(EitherEnum<L, R>);
-        enum EitherEnum<L, R> { Left(L), Right(R) }
+        enum EitherEnum<L, R> {
+            Left(L),
+            Right(R),
+        }
         impl<L: Iterator, R: Iterator<Item = L::Item>> Iterator for EitherIter<L, R> {
             type Item = L::Item;
             fn next(&mut self) -> Option<Self::Item> {
@@ -182,18 +210,24 @@ impl<T> SparseSet<T> {
         }
 
         match &self.inner {
-            SparseSetInner::Dense { dense, data, .. } =>
-                EitherIter(EitherEnum::Left(dense.iter().copied().zip(data.iter()))),
-            SparseSetInner::Sparse { map, dense, .. } =>
-                EitherIter(EitherEnum::Right(
-                    dense.iter().copied().filter_map(move |e| map.get(&e).map(|v| (e, v)))
-                )),
+            SparseSetInner::Dense { dense, data, .. } => {
+                EitherIter(EitherEnum::Left(dense.iter().copied().zip(data.iter())))
+            }
+            SparseSetInner::Sparse { map, dense, .. } => EitherIter(EitherEnum::Right(
+                dense
+                    .iter()
+                    .copied()
+                    .filter_map(move |e| map.get(&e).map(|v| (e, v))),
+            )),
         }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut T)> {
         struct EitherIterMut<L, R>(EitherEnum<L, R>);
-        enum EitherEnum<L, R> { Left(L), Right(R) }
+        enum EitherEnum<L, R> {
+            Left(L),
+            Right(R),
+        }
         impl<L: Iterator, R: Iterator<Item = L::Item>> Iterator for EitherIterMut<L, R> {
             type Item = L::Item;
             fn next(&mut self) -> Option<Self::Item> {
@@ -205,8 +239,9 @@ impl<T> SparseSet<T> {
         }
 
         match &mut self.inner {
-            SparseSetInner::Dense { dense, data, .. } =>
-                EitherIterMut(EitherEnum::Left(dense.iter().copied().zip(data.iter_mut()))),
+            SparseSetInner::Dense { dense, data, .. } => {
+                EitherIterMut(EitherEnum::Left(dense.iter().copied().zip(data.iter_mut())))
+            }
             SparseSetInner::Sparse { map, dense, .. } => {
                 let keys = std::mem::take(dense);
                 EitherIterMut(EitherEnum::Right(SparseIterMut {
@@ -221,7 +256,10 @@ impl<T> SparseSet<T> {
 
     pub fn values(&self) -> impl Iterator<Item = &T> {
         struct EitherIterV<L, R>(EitherEnum<L, R>);
-        enum EitherEnum<L, R> { Left(L), Right(R) }
+        enum EitherEnum<L, R> {
+            Left(L),
+            Right(R),
+        }
         impl<L: Iterator, R: Iterator<Item = L::Item>> Iterator for EitherIterV<L, R> {
             type Item = L::Item;
             fn next(&mut self) -> Option<Self::Item> {
@@ -233,16 +271,17 @@ impl<T> SparseSet<T> {
         }
 
         match &self.inner {
-            SparseSetInner::Dense { data, .. } =>
-                EitherIterV(EitherEnum::Left(data.iter())),
-            SparseSetInner::Sparse { map, .. } =>
-                EitherIterV(EitherEnum::Right(map.values())),
+            SparseSetInner::Dense { data, .. } => EitherIterV(EitherEnum::Left(data.iter())),
+            SparseSetInner::Sparse { map, .. } => EitherIterV(EitherEnum::Right(map.values())),
         }
     }
 
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
         struct EitherIterVM<L, R>(EitherEnum<L, R>);
-        enum EitherEnum<L, R> { Left(L), Right(R) }
+        enum EitherEnum<L, R> {
+            Left(L),
+            Right(R),
+        }
         impl<L: Iterator, R: Iterator<Item = L::Item>> Iterator for EitherIterVM<L, R> {
             type Item = L::Item;
             fn next(&mut self) -> Option<Self::Item> {
@@ -254,10 +293,8 @@ impl<T> SparseSet<T> {
         }
 
         match &mut self.inner {
-            SparseSetInner::Dense { data, .. } =>
-                EitherIterVM(EitherEnum::Left(data.iter_mut())),
-            SparseSetInner::Sparse { map, .. } =>
-                EitherIterVM(EitherEnum::Right(map.values_mut())),
+            SparseSetInner::Dense { data, .. } => EitherIterVM(EitherEnum::Left(data.iter_mut())),
+            SparseSetInner::Sparse { map, .. } => EitherIterVM(EitherEnum::Right(map.values_mut())),
         }
     }
 }
@@ -292,7 +329,9 @@ impl<'a, T> Iterator for SparseIterMut<'a, T> {
 }
 
 impl<T> Default for SparseSet<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

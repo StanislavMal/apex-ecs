@@ -1,13 +1,19 @@
 /// Entity — generational index.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Entity {
-    pub(crate) index:      u32,
+    pub(crate) index: u32,
     pub(crate) generation: u32,
 }
 
 impl Entity {
-    #[inline] pub fn index(self)      -> u32 { self.index }
-    #[inline] pub fn generation(self) -> u32 { self.generation }
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.index
+    }
+    #[inline]
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 impl std::fmt::Display for Entity {
@@ -21,11 +27,11 @@ const NO_LOCATION: u64 = u64::MAX;
 #[derive(Clone, Copy, Debug)]
 pub struct EntityLocation {
     pub archetype_id: crate::archetype::ArchetypeId,
-    pub row:          u32,
+    pub row: u32,
 }
 
 struct EntityRecord {
-    generation:       u32,
+    generation: u32,
     encoded_location: u64,
 }
 
@@ -35,7 +41,7 @@ impl EntityRecord {
         if self.encoded_location == NO_LOCATION {
             None
         } else {
-            let row          = (self.encoded_location & 0xFFFF_FFFF) as u32;
+            let row = (self.encoded_location & 0xFFFF_FFFF) as u32;
             let archetype_id = (self.encoded_location >> 32) as u32;
             Some(EntityLocation {
                 archetype_id: crate::archetype::ArchetypeId(archetype_id),
@@ -46,8 +52,7 @@ impl EntityRecord {
 
     #[inline]
     fn set_location(&mut self, loc: EntityLocation) {
-        self.encoded_location =
-            (loc.row as u64) | ((loc.archetype_id.0 as u64) << 32);
+        self.encoded_location = (loc.row as u64) | ((loc.archetype_id.0 as u64) << 32);
     }
 
     #[inline]
@@ -64,25 +69,38 @@ impl EntityRecord {
 /// Менеджер entity — generational IDs с batch API.
 pub struct EntityAllocator {
     next_index: u32,
-    records:    Vec<EntityRecord>,
-    free_list:  Vec<u32>,
+    records: Vec<EntityRecord>,
+    free_list: Vec<u32>,
 }
 
 impl EntityAllocator {
     pub fn new() -> Self {
-        Self { next_index: 0, records: Vec::new(), free_list: Vec::new() }
+        Self {
+            next_index: 0,
+            records: Vec::new(),
+            free_list: Vec::new(),
+        }
     }
 
     /// Выделить одну entity.
     pub fn allocate(&mut self) -> Entity {
         if let Some(index) = self.free_list.pop() {
             let gen = self.records[index as usize].generation;
-            Entity { index, generation: gen }
+            Entity {
+                index,
+                generation: gen,
+            }
         } else {
             let index = self.next_index;
             self.next_index += 1;
-            self.records.push(EntityRecord { generation: 0, encoded_location: NO_LOCATION });
-            Entity { index, generation: 0 }
+            self.records.push(EntityRecord {
+                generation: 0,
+                encoded_location: NO_LOCATION,
+            });
+            Entity {
+                index,
+                generation: 0,
+            }
         }
     }
 
@@ -100,8 +118,11 @@ impl EntityAllocator {
         let from_free = count.min(self.free_list.len());
         for _ in 0..from_free {
             let index = self.free_list.pop().unwrap();
-            let gen   = self.records[index as usize].generation;
-            entities.push(Entity { index, generation: gen });
+            let gen = self.records[index as usize].generation;
+            entities.push(Entity {
+                index,
+                generation: gen,
+            });
         }
 
         // 2. Новые записи одним resize_with
@@ -109,12 +130,16 @@ impl EntityAllocator {
         if remaining > 0 {
             let start = self.next_index as usize;
             self.next_index += remaining as u32;
-            self.records.resize_with(start + remaining, || EntityRecord {
-                generation: 0,
-                encoded_location: NO_LOCATION,
-            });
+            self.records
+                .resize_with(start + remaining, || EntityRecord {
+                    generation: 0,
+                    encoded_location: NO_LOCATION,
+                });
             for i in 0..remaining {
-                entities.push(Entity { index: (start + i) as u32, generation: 0 });
+                entities.push(Entity {
+                    index: (start + i) as u32,
+                    generation: 0,
+                });
             }
         }
 
@@ -127,9 +152,9 @@ impl EntityAllocator {
     /// `entities[i]` получает `EntityLocation { archetype_id, row: start_row + i }`.
     pub fn set_locations_batch(
         &mut self,
-        entities:     &[Entity],
+        entities: &[Entity],
         archetype_id: crate::archetype::ArchetypeId,
-        start_row:    u32,
+        start_row: u32,
     ) {
         for (i, entity) in entities.iter().enumerate() {
             let record = &mut self.records[entity.index as usize];
@@ -145,9 +170,11 @@ impl EntityAllocator {
     pub fn free(&mut self, entity: Entity) -> bool {
         let record = match self.records.get_mut(entity.index as usize) {
             Some(r) => r,
-            None    => return false,
+            None => return false,
         };
-        if record.generation != entity.generation { return false; }
+        if record.generation != entity.generation {
+            return false;
+        }
         record.generation = record.generation.wrapping_add(1);
         record.clear_location();
         self.free_list.push(entity.index);
@@ -186,7 +213,10 @@ impl EntityAllocator {
     pub fn get_by_index(&self, index: u32) -> Option<Entity> {
         let record = self.records.get(index as usize)?;
         if record.has_location() {
-            Some(Entity { index, generation: record.generation })
+            Some(Entity {
+                index,
+                generation: record.generation,
+            })
         } else {
             None
         }
@@ -194,7 +224,9 @@ impl EntityAllocator {
 }
 
 impl Default for EntityAllocator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -203,7 +235,10 @@ mod tests {
     use crate::archetype::ArchetypeId;
 
     fn make_loc() -> EntityLocation {
-        EntityLocation { archetype_id: ArchetypeId::EMPTY, row: 0 }
+        EntityLocation {
+            archetype_id: ArchetypeId::EMPTY,
+            row: 0,
+        }
     }
 
     #[test]
@@ -243,11 +278,13 @@ mod tests {
     fn allocate_batch_uses_free_list() {
         let mut alloc = EntityAllocator::new();
         // Создаём 5, освобождаем 2, batch 5 — должен переиспользовать 2
-        let entities: Vec<Entity> = (0..5).map(|_| {
-            let e = alloc.allocate();
-            alloc.set_location(e, make_loc());
-            e
-        }).collect();
+        let entities: Vec<Entity> = (0..5)
+            .map(|_| {
+                let e = alloc.allocate();
+                alloc.set_location(e, make_loc());
+                e
+            })
+            .collect();
 
         alloc.free(entities[1]);
         alloc.free(entities[3]);
@@ -256,8 +293,7 @@ mod tests {
         assert_eq!(batch.len(), 5);
 
         // Два из batch должны иметь те же индексы что освобождённые
-        let batch_indices: std::collections::HashSet<u32> =
-            batch.iter().map(|e| e.index).collect();
+        let batch_indices: std::collections::HashSet<u32> = batch.iter().map(|e| e.index).collect();
         assert!(batch_indices.contains(&entities[1].index));
         assert!(batch_indices.contains(&entities[3].index));
     }

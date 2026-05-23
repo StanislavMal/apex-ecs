@@ -150,7 +150,9 @@ impl<'w> SubWorld<'w> {
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
-            let ptr = self.world_ref().event_queue_ptr::<T>()
+            let ptr = self
+                .world_ref()
+                .event_queue_ptr::<T>()
                 .expect("event_reader: event type not registered");
             EventReader::new(&mut *ptr)
         }
@@ -159,7 +161,9 @@ impl<'w> SubWorld<'w> {
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
-            let ptr = self.world_ref().event_queue_ptr::<T>()
+            let ptr = self
+                .world_ref()
+                .event_queue_ptr::<T>()
                 .expect("event_writer: event queue not found");
             EventWriter::from_ptr(ptr)
         }
@@ -169,9 +173,15 @@ impl<'w> SubWorld<'w> {
 
     #[inline]
     fn arch_row_range(&self, arch_idx: usize) -> Option<(usize, usize)> {
-        self.row_ranges_slice().iter().find_map(|&(a, s, e)| {
-            if a == arch_idx { Some((s, e)) } else { None }
-        })
+        self.row_ranges_slice().iter().find_map(
+            |&(a, s, e)| {
+                if a == arch_idx {
+                    Some((s, e))
+                } else {
+                    None
+                }
+            },
+        )
     }
 
     /// Последовательная итерация по всем entity в этом SubWorld.
@@ -195,8 +205,8 @@ impl<'w> SubWorld<'w> {
 
     /// Параллельная итерация по всем entity в этом SubWorld.
     pub fn par_for_each_entity<F: Fn(Entity) + Send + Sync>(&self, f: F) {
-        use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
+        use rayon::prelude::*;
 
         let num_threads = rayon::current_num_threads();
         let w = self.world_ref();
@@ -250,8 +260,8 @@ impl<'w> SubWorld<'w> {
 
     /// Параллельная итерация по строкам архетипов SubWorld.
     pub fn par_for_each_row<F: Fn(Entity, usize) + Send + Sync>(&self, f: F) {
-        use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
+        use rayon::prelude::*;
 
         let num_threads = rayon::current_num_threads();
         let w = self.world_ref();

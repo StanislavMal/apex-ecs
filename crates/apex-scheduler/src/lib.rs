@@ -49,29 +49,28 @@
 //! | FnParSystem | явный + замыкание | быстрые прототипы |
 //! | Sequential | полный &mut World | structural changes |
 
-pub mod stage;
 pub mod pipeline;
+pub mod stage;
 
-use std::any::TypeId;
+use apex_core::commands::Commands;
+use apex_core::{
+    archetype::Archetype, component::ComponentRegistry, system_param::WorldQuerySystemAccess,
+    world::World, AccessDescriptor,
+};
+use apex_graph::Graph;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use std::any::TypeId;
 use thiserror::Error;
-use apex_graph::Graph;
 use thunderdome::Index;
-use apex_core::{
-    AccessDescriptor,
-    archetype::Archetype,
-    component::ComponentRegistry,
-    world::World,
-    system_param::WorldQuerySystemAccess,
-};
-use apex_core::commands::Commands;
 
-pub use stage::{Stage, StageLabel};
-pub use apex_core::system_param::{AutoSystem, ResourceAccessList, EventAccessList, ResRead, ResWrite, Listen, Emit};
-pub use apex_core::AccessDescriptor as Access;
+pub use apex_core::system_param::{
+    AutoSystem, Emit, EventAccessList, Listen, ResRead, ResWrite, ResourceAccessList,
+};
 pub use apex_core::world::SystemContext;
+pub use apex_core::AccessDescriptor as Access;
 pub use pipeline::{EventPipelineBuilder, PipelineRole, PipelineValidationError};
+pub use stage::{Stage, StageLabel};
 
 // ── ConflictKind ───────────────────────────────────────────────
 
@@ -85,9 +84,7 @@ pub enum ConflictKind {
     /// Явная зависимость через `add_dependency()`
     Explicit,
     /// Оба пишут в один компонент — Write+Write конфликт
-    WriteWrite {
-        component_name: &'static str,
-    },
+    WriteWrite { component_name: &'static str },
     /// Один пишет, другой читает — Write+Read конфликт
     WriteRead {
         component_name: &'static str,
@@ -97,9 +94,7 @@ pub enum ConflictKind {
     /// Sequential барьер — система с полным &mut World
     SequentialBarrier,
     /// Два EventWriter одного типа событий
-    EventWriteWrite {
-        event_name: &'static str,
-    },
+    EventWriteWrite { event_name: &'static str },
     /// EventWriter и EventReader одного типа событий
     EventWriteRead {
         event_name: &'static str,
@@ -108,29 +103,31 @@ pub enum ConflictKind {
     },
     /// Обе системы пишут в компоненты, которые другая читает
     /// (A writes Pos that B reads, B writes Vel that A reads).
-    BidirectionalWriteRead {
-        a_name: String,
-        b_name: String,
-    },
+    BidirectionalWriteRead { a_name: String, b_name: String },
 }
 
 impl std::fmt::Display for ConflictKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConflictKind::Explicit =>
-                write!(f, "explicit dependency"),
-            ConflictKind::WriteWrite { component_name } =>
-                write!(f, "Write+Write conflict on `{}`", component_name),
-            ConflictKind::WriteRead { component_name, .. } =>
-                write!(f, "Write+Read conflict on `{}`", component_name),
-            ConflictKind::SequentialBarrier =>
-                write!(f, "sequential barrier (&mut World)"),
-            ConflictKind::EventWriteWrite { event_name } =>
-                write!(f, "Event Write+Write conflict on `{}`", event_name),
-            ConflictKind::EventWriteRead { event_name, .. } =>
-                write!(f, "Event Write+Read conflict on `{}`", event_name),
-            ConflictKind::BidirectionalWriteRead { a_name, b_name } =>
-                write!(f, "bidirectional Write+Read between `{}` and `{}`", a_name, b_name),
+            ConflictKind::Explicit => write!(f, "explicit dependency"),
+            ConflictKind::WriteWrite { component_name } => {
+                write!(f, "Write+Write conflict on `{}`", component_name)
+            }
+            ConflictKind::WriteRead { component_name, .. } => {
+                write!(f, "Write+Read conflict on `{}`", component_name)
+            }
+            ConflictKind::SequentialBarrier => write!(f, "sequential barrier (&mut World)"),
+            ConflictKind::EventWriteWrite { event_name } => {
+                write!(f, "Event Write+Write conflict on `{}`", event_name)
+            }
+            ConflictKind::EventWriteRead { event_name, .. } => {
+                write!(f, "Event Write+Read conflict on `{}`", event_name)
+            }
+            ConflictKind::BidirectionalWriteRead { a_name, b_name } => write!(
+                f,
+                "bidirectional Write+Read between `{}` and `{}`",
+                a_name, b_name
+            ),
         }
     }
 }
@@ -159,16 +156,24 @@ struct SendPtr<T>(*mut T);
 // уникальность ptr гарантирована — каждый ptr из уникального индекса.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> { fn clone(&self) -> Self { SendPtr(self.0) } }
+impl<T> Clone for SendPtr<T> {
+    fn clone(&self) -> Self {
+        SendPtr(self.0)
+    }
+}
 impl<T> Copy for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     #[inline]
     #[allow(dead_code)]
-    unsafe fn as_mut(&self) -> &mut T { &mut *self.0 }
+    unsafe fn as_mut(&self) -> &mut T {
+        &mut *self.0
+    }
     #[inline]
     #[allow(dead_code)]
-    unsafe fn as_ref(&self) -> &T { &*self.0 }
+    unsafe fn as_ref(&self) -> &T {
+        &*self.0
+    }
 }
 
 /// Задача для ASD (Adaptive Scope Distribution).
@@ -203,10 +208,17 @@ unsafe impl Sync for AsdTask {}
 /// Внутренний механизм — используйте `AutoSystem` для публичного API.
 pub(crate) trait ParSystem: Send + Sync {
     #[allow(dead_code)]
-    fn access() -> AccessDescriptor where Self: Sized;
+    fn access() -> AccessDescriptor
+    where
+        Self: Sized;
     fn run(&mut self, ctx: SystemContext<'_>);
     #[allow(dead_code)]
-    fn name() -> &'static str where Self: Sized { std::any::type_name::<Self>() }
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
+        std::any::type_name::<Self>()
+    }
 }
 
 // ── Адаптер AutoSystem → ParSystem ────────────────────────────
@@ -220,7 +232,10 @@ struct AutoSystemAdapter<S: AutoSystem> {
 }
 
 impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
-    fn access() -> AccessDescriptor where Self: Sized {
+    fn access() -> AccessDescriptor
+    where
+        Self: Sized,
+    {
         S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses())
@@ -230,7 +245,10 @@ impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
         self.inner.run(ctx);
     }
 
-    fn name() -> &'static str where Self: Sized {
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
         S::name()
     }
 }
@@ -238,14 +256,21 @@ impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
 // ── FnParSystem ────────────────────────────────────────────────
 
 struct FnParSystem {
-    func:   Box<dyn FnMut(SystemContext<'_>) + Send + Sync>,
+    func: Box<dyn FnMut(SystemContext<'_>) + Send + Sync>,
     #[allow(dead_code)]
     access: AccessDescriptor,
 }
 
 impl ParSystem for FnParSystem {
-    fn access() -> AccessDescriptor where Self: Sized { AccessDescriptor::new() }
-    fn run(&mut self, ctx: SystemContext<'_>) { (self.func)(ctx); }
+    fn access() -> AccessDescriptor
+    where
+        Self: Sized,
+    {
+        AccessDescriptor::new()
+    }
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        (self.func)(ctx);
+    }
 }
 
 // ── SystemKind ─────────────────────────────────────────────────
@@ -259,12 +284,14 @@ enum SystemKind {
 }
 
 impl SystemKind {
-    fn is_parallel(&self) -> bool { matches!(self, SystemKind::Parallel { .. }) }
+    fn is_parallel(&self) -> bool {
+        matches!(self, SystemKind::Parallel { .. })
+    }
 
     fn access(&self) -> Option<&AccessDescriptor> {
         match self {
             SystemKind::Parallel { access, .. } => Some(access),
-            SystemKind::Sequential(_)           => None,
+            SystemKind::Sequential(_) => None,
         }
     }
 }
@@ -272,10 +299,10 @@ impl SystemKind {
 // ── SystemDescriptor ───────────────────────────────────────────
 
 struct SystemDescriptor {
-    id:     SystemId,
-    name:   String,
-    kind:   SystemKind,
-    after:  Vec<SystemId>,
+    id: SystemId,
+    name: String,
+    kind: SystemKind,
+    after: Vec<SystemId>,
     before: Vec<SystemId>,
     /// Этап выполнения (по умолчанию Update).
     stage_label: StageLabel,
@@ -286,17 +313,19 @@ struct SystemDescriptor {
 pub struct SystemBuilder<'a> {
     #[allow(dead_code)]
     scheduler: &'a mut Scheduler,
-    id:        SystemId,
+    id: SystemId,
 }
 
 impl<'a> SystemBuilder<'a> {
-    pub fn id(self) -> SystemId { self.id }
+    pub fn id(self) -> SystemId {
+        self.id
+    }
 }
 
 // ── ExecutionPlan ──────────────────────────────────────────────
 
 struct ExecutionPlan {
-    stages:     Vec<Stage>,
+    stages: Vec<Stage>,
     flat_order: Vec<SystemId>,
 }
 
@@ -306,8 +335,8 @@ struct ExecutionPlan {
 #[derive(Clone, Debug)]
 struct GraphEdgeInfo {
     from_id: SystemId,
-    to_id:   SystemId,
-    kind:    ConflictKind,
+    to_id: SystemId,
+    kind: ConflictKind,
 }
 
 // ── Scheduler ─────────────────────────────────────────────────
@@ -328,11 +357,11 @@ struct GraphEdgeInfo {
 /// `dirty_systems` отслеживает системы добавленные после последнего compile —
 /// при следующем compile добавляются только новые узлы/рёбра.
 pub struct Scheduler {
-    systems:         Vec<SystemDescriptor>,
+    systems: Vec<SystemDescriptor>,
     /// Быстрый поиск системы по SystemId: O(1) вместо O(n)
-    system_indices:  FxHashMap<SystemId, usize>,
-    next_id:         u32,
-    execution_plan:  Option<ExecutionPlan>,
+    system_indices: FxHashMap<SystemId, usize>,
+    next_id: u32,
+    execution_plan: Option<ExecutionPlan>,
 
     // ── Конфигурация параллелизма ───────────────────────────────
     /// Минимальное количество систем в Stage для параллельного выполнения
@@ -356,13 +385,13 @@ pub struct Scheduler {
     /// Хранится между compile() для инкрементального обновления.
     dependency_graph: Graph<SystemId, ConflictKind>,
     /// Map SystemId → Index в dependency_graph (для быстрого lookup).
-    graph_nodes:      FxHashMap<SystemId, Index>,
+    graph_nodes: FxHashMap<SystemId, Index>,
     /// O(1) lookup рёбер: (from, to) → exists. Синхронизирован с dependency_graph.
-    edge_set:         FxHashSet<(Index, Index)>,
+    edge_set: FxHashSet<(Index, Index)>,
     /// Рёбра с полными метаданными — для verbose диагностики.
-    edge_info:        Vec<GraphEdgeInfo>,
+    edge_info: Vec<GraphEdgeInfo>,
     /// True если после последнего compile() добавлялись системы/зависимости.
-    graph_dirty:      bool,
+    graph_dirty: bool,
     /// Пары систем с явным порядком (от add_dependency / .before / .after).
     /// Edge направлен от «раньше» к «позже»: (a, b) означает a до b.
     explicit_orderings: FxHashSet<(SystemId, SystemId)>,
@@ -425,18 +454,18 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            systems:          Vec::new(),
-            system_indices:   FxHashMap::default(),
-            next_id:          0,
-            execution_plan:   None,
+            systems: Vec::new(),
+            system_indices: FxHashMap::default(),
+            next_id: 0,
+            execution_plan: None,
             parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             parallel_min_entities: 0, // 0 = без ограничений
             auto_disable_parallel: true, // true = автоотключение по умолчанию
             dependency_graph: Graph::new(),
-            graph_nodes:      FxHashMap::default(),
-            edge_set:         FxHashSet::default(),
-            edge_info:        Vec::new(),
-            graph_dirty:      false,
+            graph_nodes: FxHashMap::default(),
+            edge_set: FxHashSet::default(),
+            edge_info: Vec::new(),
+            graph_dirty: false,
             explicit_orderings: FxHashSet::default(),
             seq_system_indices: Vec::new(),
             par_system_indices: Vec::new(),
@@ -446,9 +475,9 @@ impl Scheduler {
             cached_archetype_count: 0,
             sub_worlds_dirty: true,
             startup_completed: false,
-            stage_order:      None,
+            stage_order: None,
             default_stage_label: StageLabel::Update,
-            type_names:       FxHashMap::default(),
+            type_names: FxHashMap::default(),
             event_ordering_enabled: true,
         }
     }
@@ -481,14 +510,17 @@ impl Scheduler {
             id,
             name: name.into(),
             kind: SystemKind::Sequential(Box::new(func)),
-            after:  Vec::new(),
+            after: Vec::new(),
             before: Vec::new(),
             stage_label,
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
         self.invalidate_plan();
-        SystemBuilder { scheduler: self, id }
+        SystemBuilder {
+            scheduler: self,
+            id,
+        }
     }
 
     /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
@@ -512,7 +544,8 @@ impl Scheduler {
     where
         S: AutoSystem + 'static,
     {
-        self.add_auto_system_to_stage(name, system, self.default_stage_label.clone()).into()
+        self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
+            .into()
     }
 
     /// Регистрировать AutoSystem в указанном этапе.
@@ -525,7 +558,7 @@ impl Scheduler {
     where
         S: AutoSystem + 'static,
     {
-        let id     = SystemId(self.next_id);
+        let id = SystemId(self.next_id);
         self.next_id += 1;
         let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
@@ -538,8 +571,11 @@ impl Scheduler {
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
-            kind: SystemKind::Parallel { system: Box::new(adapter), access },
-            after:  Vec::new(),
+            kind: SystemKind::Parallel {
+                system: Box::new(adapter),
+                access,
+            },
+            after: Vec::new(),
             before: Vec::new(),
             stage_label,
         });
@@ -569,7 +605,7 @@ impl Scheduler {
     #[allow(dead_code)]
     pub(crate) fn add_par_system<S: ParSystem + 'static>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         system: S,
     ) -> SystemId {
         self.add_par_system_to_stage(name, system, self.default_stage_label.clone())
@@ -579,19 +615,22 @@ impl Scheduler {
     #[allow(dead_code)]
     pub(crate) fn add_par_system_to_stage<S: ParSystem + 'static>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         system: S,
         stage_label: StageLabel,
     ) -> SystemId {
-        let id     = SystemId(self.next_id);
+        let id = SystemId(self.next_id);
         self.next_id += 1;
         let access = S::access();
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
-            kind: SystemKind::Parallel { system: Box::new(system), access },
-            after:  Vec::new(),
+            kind: SystemKind::Parallel {
+                system: Box::new(system),
+                access,
+            },
+            after: Vec::new(),
             before: Vec::new(),
             stage_label,
         });
@@ -605,7 +644,7 @@ impl Scheduler {
     #[allow(dead_code)]
     pub(crate) fn add_startup_par_system<S: ParSystem + 'static>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         system: S,
     ) -> SystemId {
         self.add_par_system_to_stage(name, system, StageLabel::Startup)
@@ -675,9 +714,9 @@ impl Scheduler {
     /// ```
     pub fn add_par_access<F>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         access: AccessDescriptor,
-        func:   F,
+        func: F,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
@@ -689,23 +728,29 @@ impl Scheduler {
     /// в указанном этапе.
     pub fn add_par_access_to_stage<F>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         access: AccessDescriptor,
-        func:   F,
+        func: F,
         stage_label: StageLabel,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
-        let id       = SystemId(self.next_id);
+        let id = SystemId(self.next_id);
         self.next_id += 1;
-        let system   = FnParSystem { func: Box::new(func), access: access.clone() };
+        let system = FnParSystem {
+            func: Box::new(func),
+            access: access.clone(),
+        };
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
             name: name.into(),
-            kind: SystemKind::Parallel { system: Box::new(system), access },
-            after:  Vec::new(),
+            kind: SystemKind::Parallel {
+                system: Box::new(system),
+                access,
+            },
+            after: Vec::new(),
             before: Vec::new(),
             stage_label,
         });
@@ -719,9 +764,9 @@ impl Scheduler {
     /// в Startup этапе.
     pub fn add_startup_par_access<F>(
         &mut self,
-        name:   impl Into<String>,
+        name: impl Into<String>,
         access: AccessDescriptor,
-        func:   F,
+        func: F,
     ) -> SystemId
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
@@ -778,7 +823,9 @@ impl Scheduler {
     /// Пометить AutoSystem (по SystemId) как использующую `par_for_each` внутри.
     /// Планировщик не будет дополнительно чанковать эту систему через ASD.
     pub fn par_for_each_used(&mut self, id: SystemId) -> &mut Self {
-        if let Some(sys) = self.system_indices.get(&id)
+        if let Some(sys) = self
+            .system_indices
+            .get(&id)
             .and_then(|&idx| self.systems.get_mut(idx))
         {
             if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
@@ -832,7 +879,7 @@ impl Scheduler {
     /// ```
     pub fn staged<F>(&mut self, label: StageLabel, f: F) -> &mut Self
     where
-        F: FnOnce(&mut Self)
+        F: FnOnce(&mut Self),
     {
         let previous = std::mem::replace(&mut self.default_stage_label, label);
         f(self);
@@ -843,7 +890,9 @@ impl Scheduler {
     /// Добавить явную зависимость: `system` выполняется после `after_id`.
     pub fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
-            if !s.after.contains(&after_id) { s.after.push(after_id); }
+            if !s.after.contains(&after_id) {
+                s.after.push(after_id);
+            }
             self.explicit_orderings.insert((after_id, system));
             self.invalidate_plan();
         }
@@ -921,7 +970,7 @@ impl Scheduler {
         // ВНИМАНИЕ: НЕ сбрасываем stage_order — он должен сохраняться
         // между перекомпиляциями (см. тест configure_stages_persists_across_compiles).
         self.execution_plan = None;
-        self.graph_dirty    = true;
+        self.graph_dirty = true;
     }
 
     /// Управлять автоматическим упорядочиванием по событиям.
@@ -960,9 +1009,9 @@ impl Scheduler {
     ///
     /// Возвращает `None` если система не найдена или это sequential система.
     pub fn system_access(&self, id: SystemId) -> Option<&AccessDescriptor> {
-        self.system_indices.get(&id).and_then(|&idx| {
-            self.systems.get(idx)?.kind.access()
-        })
+        self.system_indices
+            .get(&id)
+            .and_then(|&idx| self.systems.get(idx)?.kind.access())
     }
 
     /// Заполнить `type_names` из ComponentRegistry World'а.
@@ -1014,17 +1063,15 @@ impl Scheduler {
         }
 
         // Топологическая сортировка всех систем → уровни параллелизма
-        let levels = self.dependency_graph
-            .parallel_levels()
-            .map_err(|_| {
-                let cycle_info = self.find_cycle_description();
-                SchedulerError::CircularDependency { cycle_info }
-            })?;
+        let levels = self.dependency_graph.parallel_levels().map_err(|_| {
+            let cycle_info = self.find_cycle_description();
+            SchedulerError::CircularDependency { cycle_info }
+        })?;
 
         // Для каждого уровня топосорта разделяем system_ids по stage_label.
         // Затем объединяем результаты по label в порядке приоритета.
-        use std::collections::BTreeMap;
         use rustc_hash::FxHashMap;
+        use std::collections::BTreeMap;
         let mut label_stages: BTreeMap<u8, Vec<Stage>> = BTreeMap::new();
 
         for level in &levels {
@@ -1032,7 +1079,9 @@ impl Scheduler {
             for &node in level {
                 if let Some(&sys_id) = self.dependency_graph.node_data(node) {
                     // O(1) lookup через system_indices вместо O(N) find()
-                    if let Some(system) = self.system_indices.get(&sys_id)
+                    if let Some(system) = self
+                        .system_indices
+                        .get(&sys_id)
                         .and_then(|&idx| self.systems.get(idx))
                     {
                         level_by_label
@@ -1044,7 +1093,8 @@ impl Scheduler {
             }
             for (label, ids) in level_by_label {
                 let all_parallel = ids.iter().all(|sid| {
-                    self.system_indices.get(sid)
+                    self.system_indices
+                        .get(sid)
                         .and_then(|&idx| self.systems.get(idx))
                         .map(|s| s.kind.is_parallel())
                         .unwrap_or(false)
@@ -1065,7 +1115,10 @@ impl Scheduler {
             let mut stage_map: FxHashMap<StageLabel, Vec<Stage>> = FxHashMap::default();
             for (_prio, mut s_stages) in label_stages {
                 for stage in s_stages.drain(..) {
-                    stage_map.entry(stage.label.clone()).or_default().push(stage);
+                    stage_map
+                        .entry(stage.label.clone())
+                        .or_default()
+                        .push(stage);
                 }
             }
             for label in order {
@@ -1092,7 +1145,9 @@ impl Scheduler {
         for stage in &mut stages {
             let mut emit_types: FxHashSet<TypeId> = FxHashSet::default();
             for &sys_id in &stage.system_ids {
-                if let Some(system) = self.system_indices.get(&sys_id)
+                if let Some(system) = self
+                    .system_indices
+                    .get(&sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
                     if let Some(access) = system.kind.access() {
@@ -1223,12 +1278,17 @@ impl Scheduler {
         if write_type_ids.is_empty() {
             return vec![];
         }
-        archetypes.iter().enumerate()
-            .filter(|(_, arch)| write_type_ids.iter().all(|tid| {
-                registry.get_id_by_type(tid)
-                    .map(|cid| arch.has_component(cid))
-                    .unwrap_or(false)
-            }))
+        archetypes
+            .iter()
+            .enumerate()
+            .filter(|(_, arch)| {
+                write_type_ids.iter().all(|tid| {
+                    registry
+                        .get_id_by_type(tid)
+                        .map(|cid| arch.has_component(cid))
+                        .unwrap_or(false)
+                })
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -1251,7 +1311,7 @@ impl Scheduler {
     ///   вместо аллокации на каждый вызов.
     fn add_new_nodes_and_edges(&mut self) -> Result<(), SchedulerError> {
         let n = self.systems.len();
-        
+
         // ── 1. Добавляем новые узлы (системы) ──────────────────
         let mut new_system_indices = Vec::new();
         for (idx, system) in self.systems.iter().enumerate() {
@@ -1279,37 +1339,41 @@ impl Scheduler {
         // ── 2. Явные зависимости для новых/изменённых систем ──
         for &idx in &systems_to_process {
             let system = &self.systems[idx];
-            
+
             // После кого выполняется
             for &after_id in &system.after {
-                if let (Some(&from), Some(&to)) =
-                    (self.graph_nodes.get(&after_id), self.graph_nodes.get(&system.id))
-                {
+                if let (Some(&from), Some(&to)) = (
+                    self.graph_nodes.get(&after_id),
+                    self.graph_nodes.get(&system.id),
+                ) {
                     // Проверяем, нет ли уже такого ребра
                     if !self.has_edge_between(from, to) {
-                        self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.dependency_graph
+                            .add_edge(from, to, ConflictKind::Explicit);
                         self.edge_set.insert((from, to));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: after_id,
-                            to_id:   system.id,
-                            kind:    ConflictKind::Explicit,
+                            to_id: system.id,
+                            kind: ConflictKind::Explicit,
                         });
                     }
                 }
             }
-            
+
             // Перед кем выполняется
             for &before_id in &system.before {
-                if let (Some(&from), Some(&to)) =
-                    (self.graph_nodes.get(&system.id), self.graph_nodes.get(&before_id))
-                {
+                if let (Some(&from), Some(&to)) = (
+                    self.graph_nodes.get(&system.id),
+                    self.graph_nodes.get(&before_id),
+                ) {
                     if !self.has_edge_between(from, to) {
-                        self.dependency_graph.add_edge(from, to, ConflictKind::Explicit);
+                        self.dependency_graph
+                            .add_edge(from, to, ConflictKind::Explicit);
                         self.edge_set.insert((from, to));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: system.id,
-                            to_id:   before_id,
-                            kind:    ConflictKind::Explicit,
+                            to_id: before_id,
+                            kind: ConflictKind::Explicit,
                         });
                     }
                 }
@@ -1327,10 +1391,10 @@ impl Scheduler {
             // Удаляем старый барьерный узел, если он был
             if let Some(old_barrier) = self.graph_nodes.remove(&barrier_sys_id) {
                 self.dependency_graph.remove_node(old_barrier);
-                self.edge_set.retain(|&(a, b)| a != old_barrier && b != old_barrier);
-                self.edge_info.retain(|e| {
-                    e.from_id != barrier_sys_id && e.to_id != barrier_sys_id
-                });
+                self.edge_set
+                    .retain(|&(a, b)| a != old_barrier && b != old_barrier);
+                self.edge_info
+                    .retain(|e| e.from_id != barrier_sys_id && e.to_id != barrier_sys_id);
             }
             // Добавляем новый барьерный узел
             let barrier_node = self.dependency_graph.add_node(barrier_sys_id);
@@ -1341,15 +1405,20 @@ impl Scheduler {
                 let par_id = self.systems[par_idx].id;
                 if let Some(&par_node) = self.graph_nodes.get(&par_id) {
                     if !self.has_edge_between(par_node, barrier_node)
-                        && (has_existing_edges && !self.dependency_graph.has_path(barrier_node, par_node)
+                        && (has_existing_edges
+                            && !self.dependency_graph.has_path(barrier_node, par_node)
                             || !has_existing_edges)
                     {
-                        self.dependency_graph.add_edge(par_node, barrier_node, ConflictKind::SequentialBarrier);
+                        self.dependency_graph.add_edge(
+                            par_node,
+                            barrier_node,
+                            ConflictKind::SequentialBarrier,
+                        );
                         self.edge_set.insert((par_node, barrier_node));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: par_id,
-                            to_id:   barrier_sys_id,
-                            kind:    ConflictKind::SequentialBarrier,
+                            to_id: barrier_sys_id,
+                            kind: ConflictKind::SequentialBarrier,
                         });
                     }
                 }
@@ -1360,15 +1429,20 @@ impl Scheduler {
                 let seq_id = self.systems[seq_idx].id;
                 if let Some(&seq_node) = self.graph_nodes.get(&seq_id) {
                     if !self.has_edge_between(barrier_node, seq_node)
-                        && (has_existing_edges && !self.dependency_graph.has_path(seq_node, barrier_node)
+                        && (has_existing_edges
+                            && !self.dependency_graph.has_path(seq_node, barrier_node)
                             || !has_existing_edges)
                     {
-                        self.dependency_graph.add_edge(barrier_node, seq_node, ConflictKind::SequentialBarrier);
+                        self.dependency_graph.add_edge(
+                            barrier_node,
+                            seq_node,
+                            ConflictKind::SequentialBarrier,
+                        );
                         self.edge_set.insert((barrier_node, seq_node));
                         self.edge_info.push(GraphEdgeInfo {
                             from_id: barrier_sys_id,
-                            to_id:   seq_id,
-                            kind:    ConflictKind::SequentialBarrier,
+                            to_id: seq_id,
+                            kind: ConflictKind::SequentialBarrier,
                         });
                     }
                 }
@@ -1378,19 +1452,28 @@ impl Scheduler {
         // ── 4. Write/Read конфликты для новых/изменённых систем ─
         for &idx in &systems_to_process {
             let system_i = &self.systems[idx];
-            let ai = match system_i.kind.access() { Some(a) => a, None => continue };
-            
+            let ai = match system_i.kind.access() {
+                Some(a) => a,
+                None => continue,
+            };
+
             // Проверяем конфликты со всеми другими системами
             // Для Write+Write конфликтов добавляем ребро только если idx < j
             // чтобы избежать дублирования
             for j in 0..n {
-                if j == idx { continue; }
-                
+                if j == idx {
+                    continue;
+                }
+
                 let system_j = &self.systems[j];
-                let aj = match system_j.kind.access() { Some(a) => a, None => continue };
-                
+                let aj = match system_j.kind.access() {
+                    Some(a) => a,
+                    None => continue,
+                };
+
                 if let Some((conflict_kind, direction)) = detect_conflict_kind(
-                    ai, aj,
+                    ai,
+                    aj,
                     system_i.id,
                     system_j.id,
                     &self.type_names,
@@ -1399,7 +1482,8 @@ impl Scheduler {
                     let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
                         || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. })
                         || matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
-                    let is_bidirectional = matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
+                    let is_bidirectional =
+                        matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
 
                     // For BidirectionalWriteRead we add edges in both directions
                     // to create a real cycle that will be detected as CircularDependency.
@@ -1410,40 +1494,42 @@ impl Scheduler {
                         if idx > j {
                             continue; // process only once per pair
                         }
-                        let explicit_fwd = self.explicit_orderings.contains(
-                            &(system_i.id, system_j.id)
-                        );
-                        let explicit_rev = self.explicit_orderings.contains(
-                            &(system_j.id, system_i.id)
-                        );
+                        let explicit_fwd = self
+                            .explicit_orderings
+                            .contains(&(system_i.id, system_j.id));
+                        let explicit_rev = self
+                            .explicit_orderings
+                            .contains(&(system_j.id, system_i.id));
 
                         // Add A→B edge — unless explicitly reversed
-                        if let (Some(&from_a), Some(&to_a)) =
-                            (self.graph_nodes.get(&system_i.id),
-                             self.graph_nodes.get(&system_j.id))
-                        {
+                        if let (Some(&from_a), Some(&to_a)) = (
+                            self.graph_nodes.get(&system_i.id),
+                            self.graph_nodes.get(&system_j.id),
+                        ) {
                             if !self.has_edge_between(from_a, to_a) && !explicit_rev {
-                                self.dependency_graph.add_edge(from_a, to_a, conflict_kind.clone());
+                                self.dependency_graph
+                                    .add_edge(from_a, to_a, conflict_kind.clone());
                                 self.edge_set.insert((from_a, to_a));
                                 self.edge_info.push(GraphEdgeInfo {
                                     from_id: system_i.id,
-                                    to_id:   system_j.id,
-                                    kind:    conflict_kind.clone(),
+                                    to_id: system_j.id,
+                                    kind: conflict_kind.clone(),
                                 });
                             }
                         }
                         // Add B→A edge — unless explicitly reversed
-                        if let (Some(&from_b), Some(&to_b)) =
-                            (self.graph_nodes.get(&system_j.id),
-                             self.graph_nodes.get(&system_i.id))
-                        {
+                        if let (Some(&from_b), Some(&to_b)) = (
+                            self.graph_nodes.get(&system_j.id),
+                            self.graph_nodes.get(&system_i.id),
+                        ) {
                             if !self.has_edge_between(from_b, to_b) && !explicit_fwd {
-                                self.dependency_graph.add_edge(from_b, to_b, conflict_kind.clone());
+                                self.dependency_graph
+                                    .add_edge(from_b, to_b, conflict_kind.clone());
                                 self.edge_set.insert((from_b, to_b));
                                 self.edge_info.push(GraphEdgeInfo {
                                     from_id: system_j.id,
-                                    to_id:   system_i.id,
-                                    kind:    conflict_kind,
+                                    to_id: system_i.id,
+                                    kind: conflict_kind,
                                 });
                             }
                         }
@@ -1454,7 +1540,8 @@ impl Scheduler {
                     let (from_idx, to_idx, from_id, to_id) = if direction {
                         (idx, j, system_i.id, system_j.id)
                     } else {
-                        if j > idx { // process only once per pair for WriteRead
+                        if j > idx {
+                            // process only once per pair for WriteRead
                             continue;
                         }
                         (j, idx, system_j.id, system_i.id)
@@ -1465,19 +1552,19 @@ impl Scheduler {
                     }
 
                     if let (Some(&from), Some(&to)) =
-                        (self.graph_nodes.get(&from_id),
-                         self.graph_nodes.get(&to_id))
+                        (self.graph_nodes.get(&from_id), self.graph_nodes.get(&to_id))
                     {
                         let need_cycle_check = !is_symmetric;
                         if !self.has_edge_between(from, to)
                             && (!need_cycle_check || !self.dependency_graph.has_path(to, from))
                         {
-                            self.dependency_graph.add_edge(from, to, conflict_kind.clone());
+                            self.dependency_graph
+                                .add_edge(from, to, conflict_kind.clone());
                             self.edge_set.insert((from, to));
                             self.edge_info.push(GraphEdgeInfo {
                                 from_id,
                                 to_id,
-                                kind:    conflict_kind,
+                                kind: conflict_kind,
                             });
                         }
                     }
@@ -1493,15 +1580,20 @@ impl Scheduler {
         // Простой поиск: находим пары систем с взаимными зависимостями
         let mut pairs = Vec::new();
         for edge in &self.edge_info {
-            let reverse = self.edge_info.iter().any(|e| {
-                e.from_id == edge.to_id && e.to_id == edge.from_id
-            });
+            let reverse = self
+                .edge_info
+                .iter()
+                .any(|e| e.from_id == edge.to_id && e.to_id == edge.from_id);
             if reverse {
-                let from_name = self.systems.iter()
+                let from_name = self
+                    .systems
+                    .iter()
                     .find(|s| s.id == edge.from_id)
                     .map(|s| s.name.as_str())
                     .unwrap_or("?");
-                let to_name = self.systems.iter()
+                let to_name = self
+                    .systems
+                    .iter()
                     .find(|s| s.id == edge.to_id)
                     .map(|s| s.name.as_str())
                     .unwrap_or("?");
@@ -1515,7 +1607,7 @@ impl Scheduler {
             let mut msg = pairs.join(", ");
             msg.push_str(
                 "\n  Hint: resolve with scheduler.chain(&[\"a\", \"b\"]), \
-                 scheduler.before(\"a\", \"b\"), or scheduler.after(\"b\", \"a\")"
+                 scheduler.before(\"a\", \"b\"), or scheduler.after(\"b\", \"a\")",
             );
             msg
         }
@@ -1638,12 +1730,14 @@ impl Scheduler {
 
         for &sys_id in stage_ids {
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                let arch_indices = self.system_archetype_indices
+                let arch_indices = self
+                    .system_archetype_indices
                     .get(&sys_id)
                     .cloned()
                     .unwrap_or_else(|| (0..archetypes.len()).collect());
 
-                let entity_count: usize = arch_indices.iter()
+                let entity_count: usize = arch_indices
+                    .iter()
                     .filter_map(|&ai| {
                         if ai < archetypes.len() {
                             Some(archetypes[ai].len())
@@ -1658,12 +1752,8 @@ impl Scheduler {
                     let has_events = access
                         .map(|a| !a.reads_event.is_empty() || !a.writes_event.is_empty())
                         .unwrap_or(false);
-                    let uses_par_for_each = access
-                        .map(|a| a.uses_par_for_each)
-                        .unwrap_or(false);
-                    let needs_whole_world = access
-                        .map(|a| a.needs_whole_world)
-                        .unwrap_or(false);
+                    let uses_par_for_each = access.map(|a| a.uses_par_for_each).unwrap_or(false);
+                    let needs_whole_world = access.map(|a| a.needs_whole_world).unwrap_or(false);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
@@ -1681,7 +1771,10 @@ impl Scheduler {
                         let sw = apex_core::SubWorld::new(world, &all_indices);
                         // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
                         // указывает на thread_commands, который жив до конца run_hybrid_parallel.
-                        sys.run(SystemContext::with_commands(&[sw], cmds_ptr as *mut Vec<Commands>));
+                        sys.run(SystemContext::with_commands(
+                            &[sw],
+                            cmds_ptr as *mut Vec<Commands>,
+                        ));
                     }
                 }
             }
@@ -1694,7 +1787,11 @@ impl Scheduler {
         // 2. Вычисляем target chunk size через adaptive_chunk_size
         //    из apex-core (используется в Query::par_for_each и CachedQuery::par_for_each).
         let per_system_entity = total_entity_count / sys_infos.len().max(1);
-        let target_chunk = apex_core::world::adaptive_chunk_size(per_system_entity, num_workers, world.chunk_config());
+        let target_chunk = apex_core::world::adaptive_chunk_size(
+            per_system_entity,
+            num_workers,
+            world.chunk_config(),
+        );
 
         // Выравниваем размер чанка до 8 entity, чтобы избежать false sharing
         // кэш-линий между соседними чанками одного архетипа (8 × sizeof(Position) = 96 байт > 64).
@@ -1711,7 +1808,11 @@ impl Scheduler {
             //   b) Систем с событиями (Emit/Listen)
             //   c) Систем с par_for_each — избегаем oversubscribe rayon
             //   d) Систем с needs_whole_world — глобальный доступ
-            if info.has_events || info.uses_par_for_each || info.needs_whole_world || info.entity_count <= effective_chunk {
+            if info.has_events
+                || info.uses_par_for_each
+                || info.needs_whole_world
+                || info.entity_count <= effective_chunk
+            {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
@@ -1732,7 +1833,9 @@ impl Scheduler {
                     let mut chunk_remaining = effective_chunk.min(remaining);
 
                     while chunk_remaining > 0 {
-                        let Some(arch_idx) = current_arch else { break; };
+                        let Some(arch_idx) = current_arch else {
+                            break;
+                        };
                         if arch_idx >= archetypes.len() {
                             current_arch = arch_iter.next();
                             arch_offset = 0;
@@ -1775,9 +1878,7 @@ impl Scheduler {
         }
 
         // 4. Сортируем чанки по archetype_id для cache locality
-        tasks.sort_unstable_by_key(|t| {
-            t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0)
-        });
+        tasks.sort_unstable_by_key(|t| t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0));
 
         // 5. Запускаем через rayon::scope
         // cmds_ptr — это usize (из &mut Vec<Commands>), который является Copy + Send + Sync.
@@ -1824,7 +1925,8 @@ impl Scheduler {
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
-        let stages: Vec<(Vec<SystemId>, bool, Vec<TypeId>)> = plan.stages
+        let stages: Vec<(Vec<SystemId>, bool, Vec<TypeId>)> = plan
+            .stages
             .iter()
             .filter(|stage| {
                 if stage.label == StageLabel::Startup && self.startup_completed {
@@ -1832,7 +1934,13 @@ impl Scheduler {
                 }
                 true
             })
-            .map(|s| (s.system_ids.clone(), s.all_parallel, s.emit_event_types.clone()))
+            .map(|s| {
+                (
+                    s.system_ids.clone(),
+                    s.all_parallel,
+                    s.emit_event_types.clone(),
+                )
+            })
             .collect();
 
         {
@@ -1854,12 +1962,15 @@ impl Scheduler {
         let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
         let num_threads = rayon::current_num_threads();
-        let mut thread_commands: Vec<Commands> = (0..num_threads)
-            .map(|_| Commands::new())
-            .collect();
+        let mut thread_commands: Vec<Commands> =
+            (0..num_threads).map(|_| Commands::new()).collect();
         let cmds_ptr: usize = &mut thread_commands as *mut Vec<Commands> as usize;
 
-        let arch_lengths: Vec<usize> = unsafe { &*const_ptr }.archetypes().iter().map(|a| a.len()).collect();
+        let arch_lengths: Vec<usize> = unsafe { &*const_ptr }
+            .archetypes()
+            .iter()
+            .map(|a| a.len())
+            .collect();
 
         for (stage_ids, all_parallel, emit_event_types) in &stages {
             if !*all_parallel {
@@ -1886,7 +1997,8 @@ impl Scheduler {
             }
 
             let should_fallback = if self.parallel_min_entities > 0 || self.auto_disable_parallel {
-                let stage_entity_count: usize = stage_ids.iter()
+                let stage_entity_count: usize = stage_ids
+                    .iter()
                     .filter_map(|&sys_id| self.system_archetype_indices.get(&sys_id))
                     .flat_map(|indices| indices.iter().copied())
                     .filter(|&ai| ai < arch_lengths.len())
@@ -1931,7 +2043,9 @@ impl Scheduler {
 
             {
                 let w = unsafe { &mut *world_ptr };
-                for cmds in &mut thread_commands { cmds.apply(w); }
+                for cmds in &mut thread_commands {
+                    cmds.apply(w);
+                }
             }
             {
                 let w = unsafe { &*const_ptr };
@@ -1997,9 +2111,8 @@ impl Scheduler {
                 }
                 _ => {
                     // fallback: все архетипы
-                    self.archetype_indices_storage.push(
-                        (0..arch_count).collect()
-                    );
+                    self.archetype_indices_storage
+                        .push((0..arch_count).collect());
                 }
             }
         }
@@ -2053,11 +2166,9 @@ impl Scheduler {
                 .first()
                 .map(|&first| stages.iter().all(|&s| s == first))
                 .unwrap_or(false);
-            let stage_is_parallel = stages
-                .first()
-                .map_or(false, |&stage_idx| {
-                    plan.stages.get(stage_idx).map_or(false, |s| s.all_parallel)
-                });
+            let stage_is_parallel = stages.first().map_or(false, |&stage_idx| {
+                plan.stages.get(stage_idx).map_or(false, |s| s.all_parallel)
+            });
             if !all_same_stage || !stage_is_parallel {
                 continue;
             }
@@ -2075,7 +2186,11 @@ impl Scheduler {
                 let chunk_size = arch_len / group_size;
                 for (i, &sys_idx) in sys_indices.iter().enumerate().take(group_size) {
                     let start = i * chunk_size;
-                    let end = if i == group_size - 1 { arch_len } else { start + chunk_size };
+                    let end = if i == group_size - 1 {
+                        arch_len
+                    } else {
+                        start + chunk_size
+                    };
                     row_ranges[sys_idx].push((arch_idx, start, end));
                 }
             }
@@ -2089,7 +2204,9 @@ impl Scheduler {
 
     // ── Инспекция ──────────────────────────────────────────────
 
-    pub fn system_count(&self) -> usize { self.systems.len() }
+    pub fn system_count(&self) -> usize {
+        self.systems.len()
+    }
 
     pub fn stages(&self) -> Option<&[Stage]> {
         self.execution_plan.as_ref().map(|p| p.stages.as_slice())
@@ -2102,19 +2219,25 @@ impl Scheduler {
         };
         let mut out = String::new();
         for (i, stage) in plan.stages.iter().enumerate() {
-            let mode = if stage.is_parallelizable()  { "PARALLEL" }
-                       else if stage.all_parallel     { "parallel/single" }
-                       else                           { "sequential" };
+            let mode = if stage.is_parallelizable() {
+                "PARALLEL"
+            } else if stage.all_parallel {
+                "parallel/single"
+            } else {
+                "sequential"
+            };
             out.push_str(&format!("Stage {} [{}] ({}) :\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
-                if let Some(s) = self.system_indices.get(sys_id)
+                if let Some(s) = self
+                    .system_indices
+                    .get(sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
                     let kind_str = match &s.kind {
-                        SystemKind::Parallel { access, .. } =>
-                            format!("par | R:{} W:{}", access.reads.len(), access.writes.len()),
-                        SystemKind::Sequential(_) =>
-                            "seq | full &mut World".to_string(),
+                        SystemKind::Parallel { access, .. } => {
+                            format!("par | R:{} W:{}", access.reads.len(), access.writes.len())
+                        }
+                        SystemKind::Sequential(_) => "seq | full &mut World".to_string(),
                     };
                     out.push_str(&format!("  - {} [{}]\n", s.name, kind_str));
                 }
@@ -2152,20 +2275,30 @@ impl Scheduler {
 
         // ── Стадии ────────────────────────────────────────────
         for (i, stage) in plan.stages.iter().enumerate() {
-            let mode = if stage.is_parallelizable()  { "PARALLEL" }
-                       else if stage.all_parallel     { "parallel/single" }
-                       else                           { "sequential" };
+            let mode = if stage.is_parallelizable() {
+                "PARALLEL"
+            } else if stage.all_parallel {
+                "parallel/single"
+            } else {
+                "sequential"
+            };
             out.push_str(&format!("Stage {} [{}] ({}):\n", i, mode, stage.label));
             for sys_id in &stage.system_ids {
-                if let Some(s) = self.system_indices.get(sys_id)
+                if let Some(s) = self
+                    .system_indices
+                    .get(sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
                     match &s.kind {
                         SystemKind::Parallel { access, .. } => {
-                            let reads: Vec<_>  = access.reads.iter()
+                            let reads: Vec<_> = access
+                                .reads
+                                .iter()
                                 .map(|tid| component_type_name(*tid, &self.type_names))
                                 .collect();
-                            let writes: Vec<_> = access.writes.iter()
+                            let writes: Vec<_> = access
+                                .writes
+                                .iter()
                                 .map(|tid| component_type_name(*tid, &self.type_names))
                                 .collect();
                             out.push_str(&format!(
@@ -2193,7 +2326,9 @@ impl Scheduler {
         if !self.system_archetype_indices.is_empty() {
             out.push_str("\n  ── SubWorld archetype mapping ──\n");
             for sys_id in plan.flat_order.iter() {
-                if let Some(s) = self.system_indices.get(sys_id)
+                if let Some(s) = self
+                    .system_indices
+                    .get(sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
                     if let Some(indices) = self.system_archetype_indices.get(sys_id) {
@@ -2202,9 +2337,13 @@ impl Scheduler {
                             s.name,
                             indices.len(),
                             if indices.len() <= 10 {
-                                indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+                                indices
+                                    .iter()
+                                    .map(|i| i.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
                             } else {
-                                format!("{}..{}", indices[0], indices[indices.len()-1])
+                                format!("{}..{}", indices[0], indices[indices.len() - 1])
                             }
                         ));
                     }
@@ -2214,13 +2353,19 @@ impl Scheduler {
 
         // ── Conflict edges ────────────────────────────────────
         if !self.edge_info.is_empty() {
-            out.push_str("\n── Conflict edges ──────────────────────────────────────────────────\n");
+            out.push_str(
+                "\n── Conflict edges ──────────────────────────────────────────────────\n",
+            );
             for edge in &self.edge_info {
-                let from_name = self.systems.iter()
+                let from_name = self
+                    .systems
+                    .iter()
                     .find(|s| s.id == edge.from_id)
                     .map(|s| s.name.as_str())
                     .unwrap_or("?");
-                let to_name = self.systems.iter()
+                let to_name = self
+                    .systems
+                    .iter()
                     .find(|s| s.id == edge.to_id)
                     .map(|s| s.name.as_str())
                     .unwrap_or("?");
@@ -2232,12 +2377,20 @@ impl Scheduler {
         }
 
         // ── Параллелизм summary ───────────────────────────────
-        let par_stages  = plan.stages.iter().filter(|s| s.is_parallelizable()).count();
-        let seq_stages  = plan.stages.iter().filter(|s| !s.all_parallel).count();
-        let max_par     = plan.stages.iter().map(|s| s.system_count()).max().unwrap_or(0);
+        let par_stages = plan.stages.iter().filter(|s| s.is_parallelizable()).count();
+        let seq_stages = plan.stages.iter().filter(|s| !s.all_parallel).count();
+        let max_par = plan
+            .stages
+            .iter()
+            .map(|s| s.system_count())
+            .max()
+            .unwrap_or(0);
         out.push_str(&format!(
             "\n── Summary: {} stages ({} parallel, {} sequential), max parallelism: {} systems\n",
-            plan.stages.len(), par_stages, seq_stages, max_par
+            plan.stages.len(),
+            par_stages,
+            seq_stages,
+            max_par
         ));
 
         out
@@ -2245,14 +2398,19 @@ impl Scheduler {
 
     /// Получить причины конфликта между двумя конкретными системами.
     pub fn conflicts_between(&self, a: SystemId, b: SystemId) -> Vec<&ConflictKind> {
-        self.edge_info.iter()
+        self.edge_info
+            .iter()
             .filter(|e| (e.from_id == a && e.to_id == b) || (e.from_id == b && e.to_id == a))
             .map(|e| &e.kind)
             .collect()
     }
 }
 
-impl Default for Scheduler { fn default() -> Self { Self::new() } }
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Вспомогательные функции ────────────────────────────────────
 
@@ -2288,9 +2446,12 @@ fn detect_conflict_kind(
     // Write+Write: оба пишут в один компонент
     for w in &ai.writes {
         if aj.writes.contains(w) {
-            return Some((ConflictKind::WriteWrite {
-                component_name: component_type_name(*w, type_names),
-            }, true)); // i→j
+            return Some((
+                ConflictKind::WriteWrite {
+                    component_name: component_type_name(*w, type_names),
+                },
+                true,
+            )); // i→j
         }
     }
     // Write(i)+Read(j): i пишет то что j читает
@@ -2303,31 +2464,37 @@ fn detect_conflict_kind(
         // которые читает другая. Это истинный циклический конфликт.
         let a_name = format!("system_{}", id_i.0);
         let b_name = format!("system_{}", id_j.0);
-        return Some((ConflictKind::BidirectionalWriteRead {
-            a_name,
-            b_name,
-        }, true)); // беззначимо — используем i→j
+        return Some((
+            ConflictKind::BidirectionalWriteRead { a_name, b_name },
+            true,
+        )); // беззначимо — используем i→j
     }
 
     if i_writes_j_reads {
-        return Some((ConflictKind::WriteRead {
-            component_name: component_type_name(
-                *ai.writes.iter().find(|w| aj.reads.contains(w)).unwrap(),
-                type_names,
-            ),
-            writer_id: id_i.0,
-            reader_id: id_j.0,
-        }, true)); // i→j (писатель → читатель)
+        return Some((
+            ConflictKind::WriteRead {
+                component_name: component_type_name(
+                    *ai.writes.iter().find(|w| aj.reads.contains(w)).unwrap(),
+                    type_names,
+                ),
+                writer_id: id_i.0,
+                reader_id: id_j.0,
+            },
+            true,
+        )); // i→j (писатель → читатель)
     }
     if j_writes_i_reads {
-        return Some((ConflictKind::WriteRead {
-            component_name: component_type_name(
-                *aj.writes.iter().find(|w| ai.reads.contains(w)).unwrap(),
-                type_names,
-            ),
-            writer_id: id_j.0,
-            reader_id: id_i.0,
-        }, false)); // j→i
+        return Some((
+            ConflictKind::WriteRead {
+                component_name: component_type_name(
+                    *aj.writes.iter().find(|w| ai.reads.contains(w)).unwrap(),
+                    type_names,
+                ),
+                writer_id: id_j.0,
+                reader_id: id_i.0,
+            },
+            false,
+        )); // j→i
     }
 
     // ── Event конфликты ─────────────────────────────────────────
@@ -2337,29 +2504,34 @@ fn detect_conflict_kind(
         // EventWriteWrite: оба пишут в один тип событий
         for w in &ai.writes_event {
             if aj.writes_event.iter().any(|(id, _)| *id == w.0) {
-                return Some((ConflictKind::EventWriteWrite {
-                    event_name: w.1,
-                }, true)); // i→j
+                return Some((ConflictKind::EventWriteWrite { event_name: w.1 }, true));
+                // i→j
             }
         }
         // EventWrite(i)+EventRead(j): i пишет событие, j читает
         for w in &ai.writes_event {
             if aj.reads_event.iter().any(|(id, _)| *id == w.0) {
-                return Some((ConflictKind::EventWriteRead {
-                    event_name: w.1,
-                    writer_id: id_i.0,
-                    reader_id: id_j.0,
-                }, true)); // i→j (писатель → читатель)
+                return Some((
+                    ConflictKind::EventWriteRead {
+                        event_name: w.1,
+                        writer_id: id_i.0,
+                        reader_id: id_j.0,
+                    },
+                    true,
+                )); // i→j (писатель → читатель)
             }
         }
         // EventWrite(j)+EventRead(i): j пишет событие, i читает
         for w in &aj.writes_event {
             if ai.reads_event.iter().any(|(id, _)| *id == w.0) {
-                return Some((ConflictKind::EventWriteRead {
-                    event_name: w.1,
-                    writer_id: id_j.0,
-                    reader_id: id_i.0,
-                }, false)); // j→i
+                return Some((
+                    ConflictKind::EventWriteRead {
+                        event_name: w.1,
+                        writer_id: id_j.0,
+                        reader_id: id_i.0,
+                    },
+                    false,
+                )); // j→i
             }
         }
     }
@@ -2383,13 +2555,23 @@ fn component_type_name(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apex_core::{prelude::*, world::World, query::Query};
     use apex_core::access_desc;
+    use apex_core::{prelude::*, query::Query, world::World};
 
-    #[derive(Component, Clone, Copy)] struct Pos { x: f32, y: f32 }
-    #[derive(Component, Clone, Copy)] struct Vel { x: f32, y: f32 }
-    #[derive(Component, Clone, Copy)] struct Hp(f32);
-    #[derive(Clone, Copy)] struct DeltaTime(f32);
+    #[derive(Component, Clone, Copy)]
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
+    #[derive(Component, Clone, Copy)]
+    struct Vel {
+        x: f32,
+        y: f32,
+    }
+    #[derive(Component, Clone, Copy)]
+    struct Hp(f32);
+    #[derive(Clone, Copy)]
+    struct DeltaTime(f32);
 
     // ── AutoSystem тесты ──────────────────────────────────────
 
@@ -2399,11 +2581,10 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>()
-                .for_each(|_, (vel, pos)| {
-                    pos.x += vel.x;
-                    pos.y += vel.y;
-                });
+            ctx.query::<Self::Query>().for_each(|_, (vel, pos)| {
+                pos.x += vel.x;
+                pos.y += vel.y;
+            });
         }
     }
 
@@ -2413,10 +2594,9 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>()
-                .for_each(|_, hp| {
-                    hp.0 = hp.0.max(0.0);
-                });
+            ctx.query::<Self::Query>().for_each(|_, hp| {
+                hp.0 = hp.0.max(0.0);
+            });
         }
     }
 
@@ -2424,7 +2604,7 @@ mod tests {
     fn auto_system_access_correct() {
         // AutoMovement должен иметь read:Vel, write:Pos
         let access = <(Read<Vel>, Write<Pos>) as WorldQuerySystemAccess>::system_access();
-        assert!(!access.reads.is_empty(),  "должен читать Vel");
+        assert!(!access.reads.is_empty(), "должен читать Vel");
         assert!(!access.writes.is_empty(), "должен писать Pos");
     }
 
@@ -2435,13 +2615,14 @@ mod tests {
 
         let mut world = World::new();
 
-
         world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { x: 3.0, y: 4.0 }));
 
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| { result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+            result = (p.x, p.y);
+        });
         assert!((result.0 - 3.0).abs() < 1e-6);
         assert!((result.1 - 4.0).abs() < 1e-6);
     }
@@ -2451,7 +2632,7 @@ mod tests {
         // AutoMovement (Write<Pos>) и AutoHealth (Write<Hp>) — нет конфликта
         let mut sched = Scheduler::new();
         sched.add_auto_system("movement", AutoMovement);
-        sched.add_auto_system("health",   AutoHealth);
+        sched.add_auto_system("health", AutoHealth);
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
@@ -2472,23 +2653,33 @@ mod tests {
         }
 
         let mut sched = Scheduler::new();
-        sched.add_auto_system("m1", AutoMovement);  // Write<Pos>
+        sched.add_auto_system("m1", AutoMovement); // Write<Pos>
         sched.add_auto_system("m2", AutoMovement2); // Write<Pos>
         sched.compile().unwrap();
 
-        assert_eq!(sched.stages().unwrap().len(), 2, "Write+Write должен дать 2 Stage");
+        assert_eq!(
+            sched.stages().unwrap().len(),
+            2,
+            "Write+Write должен дать 2 Stage"
+        );
     }
 
     // ── ConflictKind тесты ────────────────────────────────────
 
     #[test]
     fn conflict_kind_in_edge_info() {
-        struct WriterA; impl ParSystem for WriterA {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
+        struct WriterA;
+        impl ParSystem for WriterA {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
-        struct WriterB; impl ParSystem for WriterB {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
+        struct WriterB;
+        impl ParSystem for WriterB {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
@@ -2510,7 +2701,9 @@ mod tests {
         sched.compile().unwrap();
 
         // Должны быть рёбра с SequentialBarrier
-        let has_barrier = sched.edge_info.iter()
+        let has_barrier = sched
+            .edge_info
+            .iter()
             .any(|e| matches!(e.kind, ConflictKind::SequentialBarrier));
         assert!(has_barrier, "Sequential барьер должен быть в edge_info");
     }
@@ -2521,15 +2714,15 @@ mod tests {
     fn debug_plan_verbose_works() {
         let mut sched = Scheduler::new();
         sched.add_auto_system("movement", AutoMovement);
-        sched.add_auto_system("health",   AutoHealth);
+        sched.add_auto_system("health", AutoHealth);
         sched.add_system("commands", |_| {});
         sched.compile().unwrap();
 
         let plan = sched.debug_plan_verbose();
-        assert!(plan.contains("PARALLEL"),    "должен быть PARALLEL Stage");
-        assert!(plan.contains("sequential"),  "должен быть sequential Stage");
-        assert!(plan.contains("Conflict"),    "должен показывать конфликты");
-        assert!(plan.contains("Summary"),     "должен показывать summary");
+        assert!(plan.contains("PARALLEL"), "должен быть PARALLEL Stage");
+        assert!(plan.contains("sequential"), "должен быть sequential Stage");
+        assert!(plan.contains("Conflict"), "должен показывать конфликты");
+        assert!(plan.contains("Summary"), "должен показывать summary");
     }
 
     #[test]
@@ -2545,7 +2738,9 @@ mod tests {
         // Система, использующая Pos и Vel — их имена появятся в reads/writes
         struct MovementSystem;
         impl ParSystem for MovementSystem {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Vel>().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
@@ -2596,11 +2791,14 @@ mod tests {
         #[allow(dead_code)]
         struct MovementSystem;
         impl ParSystem for MovementSystem {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Vel>().write::<Pos>()
+            }
             fn run(&mut self, ctx: SystemContext<'_>) {
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
                     .for_each(|_, (vel, pos)| {
-                        pos.x += vel.x; pos.y += vel.y;
+                        pos.x += vel.x;
+                        pos.y += vel.y;
                     });
             }
         }
@@ -2609,9 +2807,17 @@ mod tests {
         let log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>> = Default::default();
 
         let log_a = log.clone();
-        let a = sched.add_system("a", move |_| { log_a.lock().unwrap().push("a"); }).id();
+        let a = sched
+            .add_system("a", move |_| {
+                log_a.lock().unwrap().push("a");
+            })
+            .id();
         let log_b = log.clone();
-        let b = sched.add_system("b", move |_| { log_b.lock().unwrap().push("b"); }).id();
+        let b = sched
+            .add_system("b", move |_| {
+                log_b.lock().unwrap().push("b");
+            })
+            .id();
 
         sched.add_dependency(b, a);
         sched.compile().unwrap();
@@ -2638,12 +2844,18 @@ mod tests {
 
     #[test]
     fn par_write_conflict_separate_stages() {
-        struct WriterA; impl ParSystem for WriterA {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
+        struct WriterA;
+        impl ParSystem for WriterA {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
-        struct WriterB; impl ParSystem for WriterB {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Pos>() }
+        struct WriterB;
+        impl ParSystem for WriterB {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
@@ -2659,12 +2871,16 @@ mod tests {
     fn sequential_breaks_parallel_groups() {
         struct MovementSystem;
         impl ParSystem for MovementSystem {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().read::<Vel>().write::<Pos>() }
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Vel>().write::<Pos>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
         struct HealthSystem;
         impl ParSystem for HealthSystem {
-            fn access() -> AccessDescriptor { AccessDescriptor::new().write::<Hp>() }
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Hp>()
+            }
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
@@ -2699,14 +2915,15 @@ mod tests {
 
         let mut world = World::new();
 
-
         world.insert_resource(DeltaTime(0.5));
         world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { x: 2.0, y: 4.0 }));
 
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| { result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+            result = (p.x, p.y);
+        });
 
         assert!((result.0 - 1.0).abs() < 1e-6);
         assert!((result.1 - 2.0).abs() < 1e-6);
@@ -2717,29 +2934,27 @@ mod tests {
     fn parallel_auto_systems_correctness() {
         let mut sched = Scheduler::new();
         sched.add_auto_system("movement", AutoMovement);
-        sched.add_auto_system("health",   AutoHealth);
+        sched.add_auto_system("health", AutoHealth);
         sched.compile().unwrap();
         assert!(sched.stages().unwrap()[0].is_parallelizable());
 
         let mut world = World::new();
 
-
-
-        world.spawn((
-            Pos { x: 0.0, y: 0.0 },
-            Vel { x: 1.0, y: 2.0 },
-            Hp(-5.0),
-        ));
+        world.spawn((Pos { x: 0.0, y: 0.0 }, Vel { x: 1.0, y: 2.0 }, Hp(-5.0)));
 
         sched.run(&mut world);
 
         let mut pos_result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| { pos_result = (p.x, p.y); });
+        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+            pos_result = (p.x, p.y);
+        });
         assert!((pos_result.0 - 1.0).abs() < 1e-6);
         assert!((pos_result.1 - 2.0).abs() < 1e-6);
 
         let mut hp_result = -1.0f32;
-        Query::<Read<Hp>>::new(&world).for_each(|_, hp| { hp_result = hp.0; });
+        Query::<Read<Hp>>::new(&world).for_each(|_, hp| {
+            hp_result = hp.0;
+        });
         assert!((hp_result - 0.0).abs() < 1e-6);
     }
 
@@ -2759,11 +2974,19 @@ mod tests {
 
         // Первый run() — Startup выполняется
         sched.run_sequential(&mut world);
-        assert_eq!(*startup_count.lock().unwrap(), 1, "Startup должен выполниться 1 раз");
+        assert_eq!(
+            *startup_count.lock().unwrap(),
+            1,
+            "Startup должен выполниться 1 раз"
+        );
 
         // Второй run() — Startup НЕ выполняется
         sched.run_sequential(&mut world);
-        assert_eq!(*startup_count.lock().unwrap(), 1, "Startup НЕ должен выполниться повторно");
+        assert_eq!(
+            *startup_count.lock().unwrap(),
+            1,
+            "Startup НЕ должен выполниться повторно"
+        );
     }
 
     #[test]
@@ -2774,8 +2997,14 @@ mod tests {
         sched.compile().unwrap();
 
         let plan = sched.debug_plan();
-        assert!(plan.contains("Startup"), "debug_plan должен содержать Startup label");
-        assert!(plan.contains("Update"),  "debug_plan должен содержать Update label");
+        assert!(
+            plan.contains("Startup"),
+            "debug_plan должен содержать Startup label"
+        );
+        assert!(
+            plan.contains("Update"),
+            "debug_plan должен содержать Update label"
+        );
     }
 
     #[test]
@@ -2790,15 +3019,21 @@ mod tests {
 
         let stages = sched.stages().unwrap();
         // Должно быть минимум 2 Stage: PreUpdate и Update
-        assert!(stages.len() >= 2, "Должно быть минимум 2 Stage, получено {}", stages.len());
+        assert!(
+            stages.len() >= 2,
+            "Должно быть минимум 2 Stage, получено {}",
+            stages.len()
+        );
 
         // Проверяем что PreUpdate идут перед Update
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
         assert!(upd_idx.is_some(), "Должен быть Update Stage");
-        assert!(pre_idx.unwrap() < upd_idx.unwrap(),
-            "PreUpdate должен быть перед Update");
+        assert!(
+            pre_idx.unwrap() < upd_idx.unwrap(),
+            "PreUpdate должен быть перед Update"
+        );
     }
 
     #[test]
@@ -2817,10 +3052,15 @@ mod tests {
         assert!(stages.len() >= 2, "Должно быть минимум 2 Stage");
 
         // Startup выполняется первым
-        assert_eq!(stages[0].label, StageLabel::Startup,
-            "Первый Stage должен быть Startup");
-        assert!(stages.iter().any(|s| s.label == StageLabel::Update),
-            "Должен быть Update Stage");
+        assert_eq!(
+            stages[0].label,
+            StageLabel::Startup,
+            "Первый Stage должен быть Startup"
+        );
+        assert!(
+            stages.iter().any(|s| s.label == StageLabel::Update),
+            "Должен быть Update Stage"
+        );
     }
 
     #[test]
@@ -2838,8 +3078,16 @@ mod tests {
 
         // Первый run
         sched.run_sequential(&mut world);
-        assert_eq!(*startup_val.lock().unwrap(), 42, "Startup система должна выполниться");
-        assert_eq!(*world.resource::<i32>(), 42, "Ресурс должен быть установлен");
+        assert_eq!(
+            *startup_val.lock().unwrap(),
+            42,
+            "Startup система должна выполниться"
+        );
+        assert_eq!(
+            *world.resource::<i32>(),
+            42,
+            "Ресурс должен быть установлен"
+        );
 
         // Второй run — ресурс должен остаться (Startup не перезаписывает)
         sched.run_sequential(&mut world);
@@ -2883,8 +3131,11 @@ mod tests {
 
         let stages = sched.stages().unwrap();
         // Два EventWriter одного типа → должны быть в разных Stage (конфликт)
-        assert!(stages.len() >= 2,
-            "EventWriteWrite конфликт: ожидается минимум 2 Stage, получено {}", stages.len());
+        assert!(
+            stages.len() >= 2,
+            "EventWriteWrite конфликт: ожидается минимум 2 Stage, получено {}",
+            stages.len()
+        );
     }
 
     #[test]
@@ -2898,8 +3149,11 @@ mod tests {
 
         let stages = sched.stages().unwrap();
         // EventWriter + EventReader одного типа → должны быть в разных Stage (конфликт)
-        assert!(stages.len() >= 2,
-            "EventWriteRead конфликт: ожидается минимум 2 Stage, получено {}", stages.len());
+        assert!(
+            stages.len() >= 2,
+            "EventWriteRead конфликт: ожидается минимум 2 Stage, получено {}",
+            stages.len()
+        );
     }
 
     #[test]
@@ -2914,11 +3168,11 @@ mod tests {
         let stages = sched.stages().unwrap();
         // Два EventReader одного типа → НЕТ конфликта, могут быть в одном Stage
         // Проверяем что есть хотя бы один Stage с обеими системами
-        let found = stages.iter().any(|s| {
-            s.system_ids.len() >= 2
-        });
-        assert!(found,
-            "EventRead не должны конфликтовать: ожидается Stage с обеими системами");
+        let found = stages.iter().any(|s| s.system_ids.len() >= 2);
+        assert!(
+            found,
+            "EventRead не должны конфликтовать: ожидается Stage с обеими системами"
+        );
     }
 
     struct DifferentEventReader;
@@ -2933,12 +3187,14 @@ mod tests {
     fn event_read_different_events_no_conflict() {
         let mut sched = Scheduler::new();
         // Слушают разные события — конфликта нет
-        sched.add_par_system("reader_i32", EventReaderForTest);     // Listen<i32>
-        sched.add_par_system("reader_f64", DifferentEventReader);  // Listen<f64>
+        sched.add_par_system("reader_i32", EventReaderForTest); // Listen<i32>
+        sched.add_par_system("reader_f64", DifferentEventReader); // Listen<f64>
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert!(stages.iter().any(|s| s.system_ids.len() >= 2),
-            "EventRead разных событий не должны конфликтовать: ожидается Stage с обеими системами");
+        assert!(
+            stages.iter().any(|s| s.system_ids.len() >= 2),
+            "EventRead разных событий не должны конфликтовать: ожидается Stage с обеими системами"
+        );
     }
 
     #[test]
@@ -2951,15 +3207,16 @@ mod tests {
         sched.compile().unwrap();
 
         let conflicts = sched.conflicts_between(wid, rid);
-        assert!(!conflicts.is_empty(),
-            "Должен быть конфликт между EventWriter и EventWriter");
+        assert!(
+            !conflicts.is_empty(),
+            "Должен быть конфликт между EventWriter и EventWriter"
+        );
 
         // Проверяем тип конфликта
-        let has_event_conflict = conflicts.iter().any(|c| {
-            matches!(c, ConflictKind::EventWriteWrite { .. })
-        });
-        assert!(has_event_conflict,
-            "Конфликт должен быть EventWriteWrite");
+        let has_event_conflict = conflicts
+            .iter()
+            .any(|c| matches!(c, ConflictKind::EventWriteWrite { .. }));
+        assert!(has_event_conflict, "Конфликт должен быть EventWriteWrite");
     }
 
     #[test]
@@ -2967,14 +3224,16 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.enable_event_ordering(false);
 
-        sched.add_par_system("emitter",  EventWriterForTest);  // Emit<i32>
-        sched.add_par_system("listener", EventReaderForTest);  // Listen<i32>
+        sched.add_par_system("emitter", EventWriterForTest); // Emit<i32>
+        sched.add_par_system("listener", EventReaderForTest); // Listen<i32>
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        assert!(stages.iter().any(|s| s.system_ids.len() >= 2),
-            "При event_ordering=false Emit+Listen не должны конфликтовать");
+        assert!(
+            stages.iter().any(|s| s.system_ids.len() >= 2),
+            "При event_ordering=false Emit+Listen не должны конфликтовать"
+        );
     }
 
     #[test]
@@ -2982,15 +3241,17 @@ mod tests {
         let mut sched = Scheduler::new();
         // По умолчанию enable_event_ordering не вызывается — должен быть true
 
-        sched.add_par_system("emitter",  EventWriterForTest);  // Emit<i32>
-        sched.add_par_system("listener", EventReaderForTest);  // Listen<i32>
+        sched.add_par_system("emitter", EventWriterForTest); // Emit<i32>
+        sched.add_par_system("listener", EventReaderForTest); // Listen<i32>
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 2,
+        assert!(
+            stages.len() >= 2,
             "По умолчанию Emit+Listen должны быть в разных Stage, получено {}",
-            stages.len());
+            stages.len()
+        );
     }
 
     // ── configure_stages ─────────────────────────────────────────
@@ -3023,8 +3284,10 @@ mod tests {
 
         assert!(upd_idx.is_some(), "Должен быть Update Stage");
         assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
-        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate при configure_stages");
+        assert!(
+            upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate при configure_stages"
+        );
     }
 
     #[test]
@@ -3052,19 +3315,27 @@ mod tests {
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         assert!(upd_idx.is_some());
         assert!(pre_idx.is_some());
-        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate");
+        assert!(
+            upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate"
+        );
 
         // Last должен быть в конце (не указан в order, добавлен автоматически)
         let last_idx = stages.iter().position(|s| s.label == StageLabel::Last);
-        assert!(last_idx.is_some(), "Last должен присутствовать даже если не указан в configure_stages");
-        assert!(last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
-            "Last (не указанный в order) должен быть в конце");
+        assert!(
+            last_idx.is_some(),
+            "Last должен присутствовать даже если не указан в configure_stages"
+        );
+        assert!(
+            last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
+            "Last (не указанный в order) должен быть в конце"
+        );
     }
 
     // ── Pipeline тесты ─────────────────────────────────────────
 
-    #[derive(Clone, Copy)] struct DamageEvent;
+    #[derive(Clone, Copy)]
+    struct DamageEvent;
 
     struct EmitDamage;
     impl ParSystem for EmitDamage {
@@ -3113,29 +3384,32 @@ mod tests {
         let mut sched = Scheduler::new();
 
         let physics_id = sched.add_par_system("physics", EmitDamage);
-        let armor_id   = sched.add_par_system("armor",   TransformDmg);
-        let health_id  = sched.add_par_system("health",  ListenDamage);
+        let armor_id = sched.add_par_system("armor", TransformDmg);
+        let health_id = sched.add_par_system("health", ListenDamage);
 
         Scheduler::event_pipeline::<DamageEvent>()
-            .produced_by(physics_id,   "physics")
-            .transformed_by(armor_id,  "armor")
-            .consumed_by(health_id,    "health")
+            .produced_by(physics_id, "physics")
+            .transformed_by(armor_id, "armor")
+            .consumed_by(health_id, "health")
             .build(&mut sched);
 
         sched.compile().unwrap();
 
         // Должно быть минимум 3 Stage: physics → armor → health
         let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 3,
-            "Конвейер из 3 стадий должен создать минимум 3 Stage, получено: {}", stages.len());
+        assert!(
+            stages.len() >= 3,
+            "Конвейер из 3 стадий должен создать минимум 3 Stage, получено: {}",
+            stages.len()
+        );
 
         // Проверяем порядок плоского списка
         let flat = &sched.execution_plan.as_ref().unwrap().flat_order;
         let pos_physics = flat.iter().position(|&id| id == physics_id).unwrap();
-        let pos_armor   = flat.iter().position(|&id| id == armor_id).unwrap();
-        let pos_health  = flat.iter().position(|&id| id == health_id).unwrap();
-        assert!(pos_physics < pos_armor,  "physics должен быть до armor");
-        assert!(pos_armor   < pos_health, "armor должен быть до health");
+        let pos_armor = flat.iter().position(|&id| id == armor_id).unwrap();
+        let pos_health = flat.iter().position(|&id| id == health_id).unwrap();
+        assert!(pos_physics < pos_armor, "physics должен быть до armor");
+        assert!(pos_armor < pos_health, "armor должен быть до health");
     }
 
     #[test]
@@ -3143,23 +3417,26 @@ mod tests {
         let mut sched = Scheduler::new();
 
         let physics_id = sched.add_par_system("physics", EmitDamage);
-        let health_id  = sched.add_par_system("health",  ListenDamage);
-        let sound_id   = sched.add_par_system("sound",   ListenDamage2);
+        let health_id = sched.add_par_system("health", ListenDamage);
+        let sound_id = sched.add_par_system("sound", ListenDamage2);
 
         Scheduler::event_pipeline::<DamageEvent>()
             .produced_by(physics_id, "physics")
-            .consumed_by(health_id,  "health")
-            .consumed_by(sound_id,   "sound")
+            .consumed_by(health_id, "health")
+            .consumed_by(sound_id, "sound")
             .build(&mut sched);
 
         sched.compile().unwrap();
 
         // health и sound — параллельные Consumer, должны оказаться в одном Stage
         let stages = sched.stages().unwrap();
-        let parallel_stage = stages.iter().find(|s| {
-            s.system_ids.contains(&health_id) && s.system_ids.contains(&sound_id)
-        });
-        assert!(parallel_stage.is_some(), "health и sound должны быть в одном параллельном Stage");
+        let parallel_stage = stages
+            .iter()
+            .find(|s| s.system_ids.contains(&health_id) && s.system_ids.contains(&sound_id));
+        assert!(
+            parallel_stage.is_some(),
+            "health и sound должны быть в одном параллельном Stage"
+        );
     }
 
     #[test]
@@ -3173,10 +3450,16 @@ mod tests {
             .produced_by(bad_id, "bad_producer")
             .build_validated(&mut sched);
 
-        assert!(result.is_err(), "Должна быть ошибка: система объявлена Producer но не имеет Emit");
+        assert!(
+            result.is_err(),
+            "Должна быть ошибка: система объявлена Producer но не имеет Emit"
+        );
 
         let errors = result.unwrap_err();
-        assert!(matches!(errors[0], PipelineValidationError::ProducerMissingEmit { .. }));
+        assert!(matches!(
+            errors[0],
+            PipelineValidationError::ProducerMissingEmit { .. }
+        ));
     }
 
     #[test]
@@ -3199,7 +3482,10 @@ mod tests {
         let stages = sched.stages().unwrap();
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
-        assert!(upd_idx.unwrap() < pre_idx.unwrap(), "Update должен быть перед PreUpdate после первой компиляции");
+        assert!(
+            upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update должен быть перед PreUpdate после первой компиляции"
+        );
 
         // Добавляем новую систему (триггерит invalidate_plan)
         sched.add_system_to_stage("more_pre_work", |_| {}, StageLabel::PreUpdate);
@@ -3209,8 +3495,14 @@ mod tests {
         let stages = sched.stages().unwrap();
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
-        assert!(upd_idx.is_some(), "Update Stage должен быть после перекомпиляции");
-        assert!(pre_idx.is_some(), "PreUpdate Stage должен быть после перекомпиляции");
+        assert!(
+            upd_idx.is_some(),
+            "Update Stage должен быть после перекомпиляции"
+        );
+        assert!(
+            pre_idx.is_some(),
+            "PreUpdate Stage должен быть после перекомпиляции"
+        );
         assert!(upd_idx.unwrap() < pre_idx.unwrap(),
             "Update должен быть перед PreUpdate после перекомпиляции — stage_order должен сохраняться");
 
@@ -3220,8 +3512,10 @@ mod tests {
         let stages = sched.stages().unwrap();
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
-        assert!(upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update перед PreUpdate после третьей компиляции");
+        assert!(
+            upd_idx.unwrap() < pre_idx.unwrap(),
+            "Update перед PreUpdate после третьей компиляции"
+        );
     }
 
     #[test]
@@ -3232,8 +3526,6 @@ mod tests {
         // и BidirectionalWriteRead в detect_conflict_kind работают корректно.
         let _world = World::new();
 
-
-
         let mut sched = Scheduler::new();
 
         // Просто dummy-системы: проверяем, что компиляция проходит
@@ -3241,7 +3533,11 @@ mod tests {
         sched.add_system("sys_b", |_: &mut World| {});
 
         let result = sched.compile();
-        assert!(result.is_ok(), "Компиляция должна пройти без ошибок: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Компиляция должна пройти без ошибок: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -3256,6 +3552,10 @@ mod tests {
         let result = sched.compile();
         // Одинаковые системы с Read<Vel>+Write<Pos> — конфликтуют
         // (WriteWrite по Pos, WriteWrite по Vel), но не создают цикл.
-        assert!(result.is_ok(), "Компиляция должна пройти без CircularDependency: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Компиляция должна пройти без CircularDependency: {:?}",
+            result.err()
+        );
     }
 }

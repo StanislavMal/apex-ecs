@@ -1,8 +1,8 @@
 pub mod algorithms;
 
 use smallvec::SmallVec;
-use thunderdome::{Arena, Index};
 use thiserror::Error;
+use thunderdome::{Arena, Index};
 
 /// Универсальный направленный граф.
 ///
@@ -192,7 +192,8 @@ impl<N, W> Graph<N, W> {
     ///
     /// Совместимо со старым API (panic при неверных узлах).
     pub fn add_edge(&mut self, from: Index, to: Index, weight: W) -> Index {
-        self.try_add_edge(from, to, weight).expect("add_edge: node not found")
+        self.try_add_edge(from, to, weight)
+            .expect("add_edge: node not found")
     }
 
     /// Удалить ребро.
@@ -218,7 +219,12 @@ impl<N, W> Graph<N, W> {
     }
 
     /// Обновить endpoints ребра (from/to), с корректным обновлением adjacency.
-    pub fn update_edge_endpoints(&mut self, edge: Index, new_from: Index, new_to: Index) -> Result<(), GraphError> {
+    pub fn update_edge_endpoints(
+        &mut self,
+        edge: Index,
+        new_from: Index,
+        new_to: Index,
+    ) -> Result<(), GraphError> {
         if self.edges.get(edge).is_none() {
             return Err(GraphError::EdgeNotFound);
         }

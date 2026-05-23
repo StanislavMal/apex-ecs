@@ -54,12 +54,12 @@
 //! sched.add_system("commands", |world: &mut World| { ... });
 //! ```
 
-use std::marker::PhantomData;
 use crate::{
     access::AccessDescriptor,
-    events::{EventCursor, Events, EventReadGuard},
+    events::{EventCursor, EventReadGuard, Events},
     query::WorldQuery,
 };
+use std::marker::PhantomData;
 
 // ── Res / ResMut ───────────────────────────────────────────────
 
@@ -69,7 +69,10 @@ pub struct Res<'w, T: Send + Sync + 'static>(pub &'w T);
 
 impl<T: Send + Sync + 'static> std::ops::Deref for Res<'_, T> {
     type Target = T;
-    #[inline] fn deref(&self) -> &T { self.0 }
+    #[inline]
+    fn deref(&self) -> &T {
+        self.0
+    }
 }
 
 impl<T: Send + Sync + 'static + std::fmt::Debug> std::fmt::Debug for Res<'_, T> {
@@ -87,17 +90,26 @@ pub struct ResMut<'w, T: Send + Sync + 'static> {
 impl<'w, T: Send + Sync + 'static> ResMut<'w, T> {
     /// # Safety: ptr валиден на 'w, уникальный доступ гарантирован планировщиком.
     pub unsafe fn from_ptr(ptr: *mut T) -> Self {
-        Self { ptr, _marker: PhantomData }
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
     }
 }
 
 impl<T: Send + Sync + 'static> std::ops::Deref for ResMut<'_, T> {
     type Target = T;
-    #[inline] fn deref(&self) -> &T { unsafe { &*self.ptr } }
+    #[inline]
+    fn deref(&self) -> &T {
+        unsafe { &*self.ptr }
+    }
 }
 
 impl<T: Send + Sync + 'static> std::ops::DerefMut for ResMut<'_, T> {
-    #[inline] fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.ptr } }
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.ptr }
+    }
 }
 
 unsafe impl<T: Send + Sync + 'static> Send for ResMut<'_, T> {}
@@ -135,7 +147,12 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
     /// Прочитать и автоматически продвинуть курсор (RAII).
     #[inline]
     pub fn read(&mut self) -> EventReadGuard<'_, T> {
-        unsafe { (self.ptr as *mut Events<T>).as_mut().unwrap().read(&self.cursor) }
+        unsafe {
+            (self.ptr as *mut Events<T>)
+                .as_mut()
+                .unwrap()
+                .read(&self.cursor)
+        }
     }
 
     /// Количество непрочитанных событий.
@@ -168,23 +185,32 @@ pub struct EventWriter<'w, T: Send + Sync + 'static> {
 impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
     /// # Safety: ptr валиден на 'w, уникальный доступ гарантирован планировщиком.
     pub unsafe fn from_ptr(ptr: *mut Events<T>) -> Self {
-        Self { ptr, _marker: PhantomData }
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
     pub fn send(&mut self, event: T) {
-        unsafe { (*self.ptr).send(event); }
+        unsafe {
+            (*self.ptr).send(event);
+        }
     }
 
     pub fn send_batch(&mut self, events: impl IntoIterator<Item = T>) {
-        unsafe { (*self.ptr).send_batch(events); }
+        unsafe {
+            (*self.ptr).send_batch(events);
+        }
     }
 
     /// Предварительно выделить capacity для отправляемых событий.
     /// Позволяет избежать реаллокаций при массовой отправке.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        unsafe { (*self.ptr).reserve(additional); }
+        unsafe {
+            (*self.ptr).reserve(additional);
+        }
     }
 }
 
@@ -322,6 +348,166 @@ impl_event_access_list_tuple!(A, B, C, D, E, F);
 impl_event_access_list_tuple!(A, B, C, D, E, F, G);
 impl_event_access_list_tuple!(A, B, C, D, E, F, G, H);
 
+// ── SystemParam ────────────────────────────────────────────────
+
+/// Типобезопасное извлечение параметров системы из `SystemContext`.
+///
+/// Аналог Bevy `SystemParam`, но БЕЗ разделения State/Fetch,
+/// БЕЗ proc-макросов, БЕЗ изменения существующих макросов `system!`/`sequential_system!`.
+///
+/// # Примеры
+///
+/// ```ignore
+/// // Один ресурс
+/// type MyParam = ResRead<DeltaTime>;
+/// let dt = MyParam::fetch(&ctx);
+///
+/// // Кортеж: ресурс + запрос + события
+/// type MyParam = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>, Listen<CollisionEvent>);
+/// let (dt, q, events) = MyParam::fetch(&ctx);
+/// ```
+///
+/// # Зачем
+///
+/// Упрощает портирование Bevy-рендера (где `RenderCommand::Param: SystemParam`)
+/// и устраняет бойлерплейт в sequential системах.
+pub trait SystemParam {
+    /// Что возвращается при [`fetch`](SystemParam::fetch) (с лайфтаймом `'w`).
+    type Item<'w>;
+
+    /// Статическая декларация доступа для планировщика.
+    fn access() -> AccessDescriptor;
+
+    /// Извлечь значение из контекста системы.
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w>;
+}
+
+// ── impl SystemParam для маркеров ресурсов ────────────────────
+
+impl<T: Send + Sync + 'static> SystemParam for ResRead<T> {
+    type Item<'w> = Res<'w, T>;
+    fn access() -> AccessDescriptor {
+        <Self as ResourceAccessList>::resource_accesses()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Res<'w, T> {
+        ctx.resource::<T>()
+    }
+}
+
+impl<T: Send + Sync + 'static> SystemParam for ResWrite<T> {
+    type Item<'w> = ResMut<'w, T>;
+    fn access() -> AccessDescriptor {
+        <Self as ResourceAccessList>::resource_accesses()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
+        ctx.resource_mut::<T>()
+    }
+}
+
+// ── impl SystemParam для маркеров событий ─────────────────────
+
+impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
+    type Item<'w> = EventReader<'w, E>;
+    fn access() -> AccessDescriptor {
+        <Self as EventAccessList>::event_accesses()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
+        ctx.event_reader::<E>()
+    }
+}
+
+impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
+    type Item<'w> = EventWriter<'w, E>;
+    fn access() -> AccessDescriptor {
+        <Self as EventAccessList>::event_accesses()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventWriter<'w, E> {
+        ctx.event_writer::<E>()
+    }
+}
+
+// ── Маркер QueryParam ──────────────────────────────────────────
+
+/// Маркер: параметр-запрос компонентов через [`SystemParam`].
+///
+/// ```ignore
+/// type MyParams = QueryParam<(Read<Position>, Write<Velocity>)>;
+/// let q = MyParams::fetch(&ctx);
+/// q.for_each(|entity, (pos, vel)| { ... });
+/// ```
+pub struct QueryParam<Q: WorldQuery>(PhantomData<Q>);
+
+impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
+    type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    fn access() -> AccessDescriptor {
+        Q::system_access()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::world::CachedQuery<'w, Q> {
+        ctx.query::<Q>()
+    }
+}
+
+// ── Маркер CommandsParam ───────────────────────────────────────
+
+/// Маркер: параметр-доступ к [`Commands`](crate::commands::Commands).
+///
+/// ```ignore
+/// type MyParams = CommandsParam;
+/// let cmds = MyParams::fetch(&ctx);
+/// cmds.spawn((Position { x: 0.0 }, Velocity { x: 1.0 }));
+/// ```
+pub struct CommandsParam;
+
+impl SystemParam for CommandsParam {
+    type Item<'w> = &'w mut crate::commands::Commands;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
+        ctx.commands()
+    }
+}
+
+// ── impl SystemParam для () (нет параметров) ──────────────────
+
+impl SystemParam for () {
+    type Item<'w> = ();
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+    fn fetch<'w>(_ctx: &crate::world::SystemContext<'w>) {}
+}
+
+// ── Кортежи SystemParam (1..12) ───────────────────────────────
+
+macro_rules! impl_system_param_tuple {
+    ( $($P:ident),+ ) => {
+        impl< $($P: SystemParam),+ > SystemParam for ( $($P,)+ ) {
+            type Item<'w> = ( $($P::Item<'w>,)+ );
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new()
+                    $( .merge(&$P::access()) )+
+            }
+            fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
+                ( $($P::fetch(ctx),)+ )
+            }
+        }
+    };
+}
+
+impl_system_param_tuple!(A);
+impl_system_param_tuple!(A, B);
+impl_system_param_tuple!(A, B, C);
+impl_system_param_tuple!(A, B, C, D);
+impl_system_param_tuple!(A, B, C, D, E);
+impl_system_param_tuple!(A, B, C, D, E, F);
+impl_system_param_tuple!(A, B, C, D, E, F, G);
+impl_system_param_tuple!(A, B, C, D, E, F, G, H);
+impl_system_param_tuple!(A, B, C, D, E, F, G, H, I);
+impl_system_param_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_system_param_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_system_param_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+
 // ── WorldQuerySystemAccess ─────────────────────────────────────
 
 /// Расширение WorldQuery — статическое описание R/W доступа для планировщика.
@@ -389,7 +575,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 ///         ctx.query::<Self::Query>().for_each(|entity, (mass, vel, pos)| {  });
 ///     }
 /// }
-/// 
+///
 /// ```
 pub trait AutoSystem: Send + Sync {
     /// Компонентный запрос — из него выводится часть `AccessDescriptor`.
@@ -408,7 +594,10 @@ pub trait AutoSystem: Send + Sync {
 
     fn run(&mut self, ctx: crate::world::SystemContext<'_>);
 
-    fn name() -> &'static str where Self: Sized {
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
         std::any::type_name::<Self>()
     }
 }

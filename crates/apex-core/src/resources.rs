@@ -1,9 +1,9 @@
+use rustc_hash::FxHashMap;
 /// Resources — глобальные синглтоны мира.
 use std::any::{Any, TypeId};
-use rustc_hash::FxHashMap;
 
 trait ResourceStorage: Send + Sync {
-    fn as_any(&self)     -> &dyn Any;
+    fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
 }
@@ -11,9 +11,15 @@ trait ResourceStorage: Send + Sync {
 struct ResourceStorageImpl(Box<dyn Any + Send + Sync>);
 
 impl ResourceStorage for ResourceStorageImpl {
-    fn as_any(&self)         -> &dyn Any { &*self.0 }
-    fn as_any_mut(&mut self) -> &mut dyn Any { &mut *self.0 }
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> { self.0 }
+    fn as_any(&self) -> &dyn Any {
+        &*self.0
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut *self.0
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
+        self.0
+    }
 }
 
 pub struct Resources {
@@ -22,7 +28,9 @@ pub struct Resources {
 
 impl Resources {
     pub fn new() -> Self {
-        Self { data: FxHashMap::default() }
+        Self {
+            data: FxHashMap::default(),
+        }
     }
 
     pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
@@ -34,18 +42,22 @@ impl Resources {
 
     #[track_caller]
     pub fn get<T: Send + Sync + 'static>(&self) -> &T {
-        self.try_get::<T>().unwrap_or_else(|| panic!(
-            "Resource `{}` not found. Did you forget insert_resource()?",
-            std::any::type_name::<T>()
-        ))
+        self.try_get::<T>().unwrap_or_else(|| {
+            panic!(
+                "Resource `{}` not found. Did you forget insert_resource()?",
+                std::any::type_name::<T>()
+            )
+        })
     }
 
     #[track_caller]
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
-        self.try_get_mut::<T>().unwrap_or_else(|| panic!(
-            "Resource `{}` not found. Did you forget insert_resource()?",
-            std::any::type_name::<T>()
-        ))
+        self.try_get_mut::<T>().unwrap_or_else(|| {
+            panic!(
+                "Resource `{}` not found. Did you forget insert_resource()?",
+                std::any::type_name::<T>()
+            )
+        })
     }
 
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&T> {
@@ -89,12 +101,18 @@ impl Resources {
         self.data.contains_key(&TypeId::of::<T>())
     }
 
-    pub fn len(&self)      -> usize { self.data.len() }
-    pub fn is_empty(&self) -> bool  { self.data.is_empty() }
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 }
 
 impl Default for Resources {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +158,9 @@ mod tests {
         map.insert(Score(10));
         let ptr = map.get_raw_ptr::<Score>().unwrap();
         // SAFETY: тест — единственный владелец
-        unsafe { (*ptr).0 = 99; }
+        unsafe {
+            (*ptr).0 = 99;
+        }
         assert_eq!(map.get::<Score>().0, 99);
     }
 

@@ -102,23 +102,30 @@ macro_rules! system {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-#[doc(hidden)] #[macro_export]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __emit_struct {
     { [] $fn_name:ident } => { #[allow(non_camel_case_types, dead_code)] struct $fn_name; };
     { [ $($t:tt)+ ] $fn_name:ident } => {};
 }
 
-#[doc(hidden)] #[macro_export]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __sys_whole_world {
     ( [] ) => {};
-    ( [ $($t:tt)+ ] ) => { const NEEDS_WHOLE_WORLD: bool = true; };
+    ( [ $($t:tt)+ ] ) => {
+        const NEEDS_WHOLE_WORLD: bool = true;
+    };
 }
 
-#[doc(hidden)] #[macro_export]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __sys_compile_error {
     ( $first:tt $($rest:tt)* ) => {
         compile_error!(concat!(
-            "unsupported parameter in system! macro: \"", stringify!($first), "\"\n\n\
+            "unsupported parameter in system! macro: \"",
+            stringify!($first),
+            "\"\n\n\
             Expected one of:\n  \
             - q: (Read<A>, Write<B>) — query (tuple)\n  \
             - q: Read<A>             — query (single)\n  \
@@ -135,7 +142,8 @@ macro_rules! __sys_compile_error {
 
 // ── Core impl ────────────────────────────────────────────────────
 
-#[doc(hidden)] #[macro_export]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __system_impl {
     // Base case
     {
@@ -595,7 +603,8 @@ macro_rules! sequential_system {
 
 // ── Sequential impl helper ───────────────────────────────────────
 
-#[doc(hidden)] #[macro_export]
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __seq_system_impl {
     // Base case — fn mode (Variant A)
     {

@@ -23,7 +23,11 @@ struct CommandArena {
 
 impl CommandArena {
     fn new() -> Self {
-        Self { data: std::ptr::null_mut(), capacity: 0, cursor: 0 }
+        Self {
+            data: std::ptr::null_mut(),
+            capacity: 0,
+            cursor: 0,
+        }
     }
 
     /// Разместить T в арене, вернуть offset в байтах.
@@ -37,28 +41,34 @@ impl CommandArena {
     /// чтения через `std::ptr::read` и дропа через function pointer.
     fn alloc<T>(&mut self, val: T) -> u32 {
         let align = mem::align_of::<T>();
-        let size  = mem::size_of::<T>();
+        let size = mem::size_of::<T>();
         // alignment padding
         let start = ((self.cursor + align - 1) / align) * align;
         let end = start + size;
         if end > self.capacity {
             let new_cap = end.max(self.capacity * 2).max(4096);
             let new_data = unsafe {
-                let ptr = alloc(Layout::from_size_align(new_cap, mem::align_of::<usize>()).unwrap());
+                let ptr =
+                    alloc(Layout::from_size_align(new_cap, mem::align_of::<usize>()).unwrap());
                 assert!(!ptr.is_null(), "CommandArena allocation failed");
                 ptr
             };
             if !self.data.is_null() {
                 unsafe {
                     std::ptr::copy_nonoverlapping(self.data, new_data, self.cursor);
-                    dealloc(self.data, Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap());
+                    dealloc(
+                        self.data,
+                        Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap(),
+                    );
                 }
             }
             self.data = new_data;
             self.capacity = new_cap;
         }
         let ptr = unsafe { self.data.add(start) as *mut T };
-        unsafe { ptr.write(val); }
+        unsafe {
+            ptr.write(val);
+        }
         self.cursor = end;
         start as u32
     }
@@ -76,18 +86,23 @@ impl CommandArena {
 impl Drop for CommandArena {
     fn drop(&mut self) {
         if !self.data.is_null() {
-            unsafe { dealloc(self.data, Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap()); }
+            unsafe {
+                dealloc(
+                    self.data,
+                    Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap(),
+                );
+            }
         }
     }
 }
 
 // ── Function pointer types ───────────────────────────────────────
 
-type SpawnApply   = unsafe fn(*mut u8, &mut World);
-type InsertApply  = unsafe fn(*mut u8, &mut World, Entity);
-type RemoveApply  = unsafe fn(Entity, &mut World);
-type DropFn       = unsafe fn(*mut u8);
-type AddRelationApply    = fn(&mut World, Entity, Entity);
+type SpawnApply = unsafe fn(*mut u8, &mut World);
+type InsertApply = unsafe fn(*mut u8, &mut World, Entity);
+type RemoveApply = unsafe fn(Entity, &mut World);
+type DropFn = unsafe fn(*mut u8);
+type AddRelationApply = fn(&mut World, Entity, Entity);
 type RemoveRelationApply = fn(&mut World, Entity, Entity);
 
 // ── Typed command enum ───────────────────────────────────────────
@@ -97,11 +112,23 @@ type RemoveRelationApply = fn(&mut World, Entity, Entity);
 
 enum Command {
     /// Spawn с данными в bump-арене (offset + apply fn)
-    Spawn { offset: u32, apply: SpawnApply, drop: DropFn },
+    Spawn {
+        offset: u32,
+        apply: SpawnApply,
+        drop: DropFn,
+    },
     /// Insert с данными в bump-арене (offset + apply fn)
-    Insert { entity: Entity, offset: u32, apply: InsertApply, drop: DropFn },
+    Insert {
+        entity: Entity,
+        offset: u32,
+        apply: InsertApply,
+        drop: DropFn,
+    },
     /// Remove — inline
-    Remove { entity: Entity, component_id: ComponentId },
+    Remove {
+        entity: Entity,
+        component_id: ComponentId,
+    },
     /// Remove typed — без Box, через function pointer, не требует данных в арене
     RemoveTyped {
         entity: Entity,
@@ -118,13 +145,24 @@ enum Command {
     /// Despawn — inline, без аллокации
     Despawn(Entity),
     /// SpawnFromTemplate — String уже на heap, но это исключение
-    SpawnFromTemplate { name: String, params: TemplateParams },
+    SpawnFromTemplate {
+        name: String,
+        params: TemplateParams,
+    },
     /// Произвольная команда — Box<dyn FnOnce>
     Apply(Box<dyn FnOnce(&mut World) + Send>),
     /// AddRelation — typed, через function pointer
-    AddRelation { subject: Entity, target: Entity, apply: AddRelationApply },
+    AddRelation {
+        subject: Entity,
+        target: Entity,
+        apply: AddRelationApply,
+    },
     /// RemoveRelation — typed, через function pointer
-    RemoveRelation { subject: Entity, target: Entity, apply: RemoveRelationApply },
+    RemoveRelation {
+        subject: Entity,
+        target: Entity,
+        apply: RemoveRelationApply,
+    },
 }
 
 /// Очередь команд — буферизует structural changes для применения после итерации.
@@ -149,11 +187,17 @@ pub struct Commands {
 
 impl Commands {
     pub fn new() -> Self {
-        Self { queue: Vec::new(), arena: CommandArena::new() }
+        Self {
+            queue: Vec::new(),
+            arena: CommandArena::new(),
+        }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
-        Self { queue: Vec::with_capacity(cap), arena: CommandArena::new() }
+        Self {
+            queue: Vec::with_capacity(cap),
+            arena: CommandArena::new(),
+        }
     }
 
     /// Уничтожить entity — без аллокации, хранится inline в enum
@@ -165,9 +209,9 @@ impl Commands {
     /// Создать entity из Bundle — typed payload в bump-арене
     pub fn spawn<B: Bundle + Send + 'static>(&mut self, bundle: B) {
         unsafe fn apply_spawn<B: Bundle>(ptr: *mut u8, world: &mut World) {
-                let bundle = std::ptr::read(ptr as *const B);
-                world.spawn(bundle);
-            }
+            let bundle = std::ptr::read(ptr as *const B);
+            world.spawn(bundle);
+        }
         unsafe fn drop_typed<T>(ptr: *mut u8) {
             std::ptr::drop_in_place(ptr as *mut T);
         }
@@ -182,9 +226,9 @@ impl Commands {
     /// Добавить компонент к entity — typed payload в bump-арене
     pub fn insert<T: Component + Send + 'static>(&mut self, entity: Entity, component: T) {
         unsafe fn apply_insert<T: Component>(ptr: *mut u8, world: &mut World, entity: Entity) {
-                let component = std::ptr::read(ptr as *const T);
-                world.insert(entity, component);
-            }
+            let component = std::ptr::read(ptr as *const T);
+            world.insert(entity, component);
+        }
         unsafe fn drop_typed<T>(ptr: *mut u8) {
             std::ptr::drop_in_place(ptr as *mut T);
         }
@@ -206,13 +250,21 @@ impl Commands {
         data: Vec<u8>,
         tick: Tick,
     ) {
-        self.queue.push(Command::InsertRaw { entity, component_id, data, tick });
+        self.queue.push(Command::InsertRaw {
+            entity,
+            component_id,
+            data,
+            tick,
+        });
     }
 
     /// Удалить компонент по ComponentId (raw).
     /// Используется когда ComponentId известен динамически (не через тип).
     pub fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
-        self.queue.push(Command::Remove { entity, component_id });
+        self.queue.push(Command::Remove {
+            entity,
+            component_id,
+        });
     }
 
     /// Удалить компонент у entity — typed variant, без Box-аллокации
@@ -236,36 +288,43 @@ impl Commands {
     /// Добавить relation между subject и target.
     ///
     /// Выполняется отложенно при `apply()` — безопасно в параллельных системах.
-    pub fn add_relation<R: RelationKind>(
-        &mut self, subject: Entity, _kind: R, target: Entity,
-    ) {
+    pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
             // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
             let kind: R = unsafe { std::mem::zeroed() };
             world.add_relation(subject, kind, target);
         }
-        self.queue.push(Command::AddRelation { subject, target, apply: apply::<R> });
+        self.queue.push(Command::AddRelation {
+            subject,
+            target,
+            apply: apply::<R>,
+        });
     }
 
     /// Удалить relation между subject и target.
     ///
     /// Выполняется отложенно при `apply()`.
-    pub fn remove_relation<R: RelationKind>(
-        &mut self, subject: Entity, _kind: R, target: Entity,
-    ) {
+    pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
             // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
             let kind: R = unsafe { std::mem::zeroed() };
             world.remove_relation(subject, kind, target);
         }
-        self.queue.push(Command::RemoveRelation { subject, target, apply: apply::<R> });
+        self.queue.push(Command::RemoveRelation {
+            subject,
+            target,
+            apply: apply::<R>,
+        });
     }
 
     /// Массовое добавление relation от множества subject'ов к одному target.
     ///
     /// Оптимизировано через `World::add_relation_batch`.
     pub fn add_relation_batch<R: RelationKind + Send + 'static>(
-        &mut self, subjects: Vec<Entity>, _kind: R, target: Entity,
+        &mut self,
+        subjects: Vec<Entity>,
+        _kind: R,
+        target: Entity,
     ) {
         self.add(move |world| {
             let kind: R = unsafe { std::mem::zeroed() };
@@ -285,7 +344,7 @@ impl Commands {
     /// ```
     pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
         self.queue.push(Command::SpawnFromTemplate {
-            name:  name.to_string(),
+            name: name.to_string(),
             params,
         });
     }
@@ -298,7 +357,7 @@ impl Commands {
     /// ```
     pub fn spawn_template(&mut self, name: &str) {
         self.queue.push(Command::SpawnFromTemplate {
-            name:  name.to_string(),
+            name: name.to_string(),
             params: TemplateParams::new(),
         });
     }
@@ -307,35 +366,84 @@ impl Commands {
     pub fn apply(&mut self, world: &mut World) {
         for cmd in self.queue.drain(..) {
             match cmd {
-                Command::Spawn { offset, apply, .. } => unsafe { apply(self.arena.get_ptr(offset), world); },
-                Command::Insert { entity, offset, apply, .. } => unsafe { apply(self.arena.get_ptr(offset), world, entity); },
-                Command::Remove { entity, component_id } => { world.remove_raw(entity, component_id); }
+                Command::Spawn { offset, apply, .. } => unsafe {
+                    apply(self.arena.get_ptr(offset), world);
+                },
+                Command::Insert {
+                    entity,
+                    offset,
+                    apply,
+                    ..
+                } => unsafe {
+                    apply(self.arena.get_ptr(offset), world, entity);
+                },
+                Command::Remove {
+                    entity,
+                    component_id,
+                } => {
+                    world.remove_raw(entity, component_id);
+                }
                 // SAFETY: remove_fn — корректный function pointer, созданный в remove::<T>.
                 // Вызов типа-специализированной функции world.remove::<T>(entity) безопасен,
                 // т.к. T статически задан при создании команды.
-                Command::RemoveTyped { entity, remove_fn } => unsafe { remove_fn(entity, world); },
-                Command::InsertRaw { entity, component_id, data, tick } => {
+                Command::RemoveTyped { entity, remove_fn } => unsafe {
+                    remove_fn(entity, world);
+                },
+                Command::InsertRaw {
+                    entity,
+                    component_id,
+                    data,
+                    tick,
+                } => {
                     world.insert_raw(entity, component_id, data, tick);
                 }
-                Command::Despawn(entity)           => { world.despawn(entity); }
-                Command::SpawnFromTemplate { name, params } => { world.spawn_from_template(&name, &params); }
-                Command::Apply(f)                  => { f(world); }
-                Command::AddRelation { subject, target, apply } => { apply(world, subject, target); }
-                Command::RemoveRelation { subject, target, apply } => { apply(world, subject, target); }
+                Command::Despawn(entity) => {
+                    world.despawn(entity);
+                }
+                Command::SpawnFromTemplate { name, params } => {
+                    world.spawn_from_template(&name, &params);
+                }
+                Command::Apply(f) => {
+                    f(world);
+                }
+                Command::AddRelation {
+                    subject,
+                    target,
+                    apply,
+                } => {
+                    apply(world, subject, target);
+                }
+                Command::RemoveRelation {
+                    subject,
+                    target,
+                    apply,
+                } => {
+                    apply(world, subject, target);
+                }
             }
         }
         self.arena.reset();
     }
 
-    #[inline] pub fn len(&self) -> usize { self.queue.len() }
-    #[inline] pub fn is_empty(&self) -> bool { self.queue.is_empty() }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
 
     /// Очистить без применения — корректно дропает typed данные в арене
     pub fn clear(&mut self) {
         for cmd in self.queue.drain(..) {
             match cmd {
-                Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
-                Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
+                Command::Spawn { offset, drop, .. } => unsafe {
+                    drop(self.arena.get_ptr(offset));
+                },
+                Command::Insert { offset, drop, .. } => unsafe {
+                    drop(self.arena.get_ptr(offset));
+                },
                 // RemoveTyped / Remove / InsertRaw не хранят данных в bump-арене — ничего не надо дропать
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
@@ -354,8 +462,12 @@ impl Drop for Commands {
         // Дропаем typed данные в арене перед деаллокацией буфера
         for cmd in self.queue.drain(..) {
             match cmd {
-                Command::Spawn { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
-                Command::Insert { offset, drop, .. } => unsafe { drop(self.arena.get_ptr(offset)); },
+                Command::Spawn { offset, drop, .. } => unsafe {
+                    drop(self.arena.get_ptr(offset));
+                },
+                Command::Insert { offset, drop, .. } => unsafe {
+                    drop(self.arena.get_ptr(offset));
+                },
                 // RemoveTyped / Remove / InsertRaw не хранят данных в bump-арене — ничего не надо дропать
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
@@ -370,7 +482,9 @@ impl Drop for Commands {
 }
 
 impl Default for Commands {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -378,7 +492,7 @@ impl Default for Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::{Component};
+    use crate::component::Component;
     use crate::entity::Entity;
 
     #[derive(Clone, Copy)]
@@ -495,8 +609,8 @@ mod tests {
 
     #[test]
     fn commands_spawn_from_template() {
-        use crate::template::{EntityTemplate, TemplateParams};
         use crate::entity::Entity;
+        use crate::template::{EntityTemplate, TemplateParams};
 
         #[derive(Clone)]
         struct TestTemplate;
@@ -526,13 +640,17 @@ mod tests {
 
     #[test]
     fn commands_spawn_from_template_with_params() {
-        use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
         use crate::query::Read;
+        use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
 
         struct ParamVal;
-        impl TemplateParam for ParamVal { type Value = f32; }
+        impl TemplateParam for ParamVal {
+            type Value = f32;
+        }
 
-        struct ParamTemplate { default: f32 }
+        struct ParamTemplate {
+            default: f32,
+        }
         impl Component for ParamTemplate {}
 
         impl EntityTemplate for ParamTemplate {

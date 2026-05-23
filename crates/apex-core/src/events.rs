@@ -34,11 +34,11 @@
 //! `Mutex<Vec<T>>`. Содержимое `sync_pending` сливается в `pending`
 //! при вызове [`Events::update`] или [`Events::flush_sync`].
 
+use rustc_hash::FxHashMap;
 use std::any::{Any, TypeId};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Mutex, OnceLock};
-use rustc_hash::FxHashMap;
 
 use crate::entity::Entity;
 
@@ -283,7 +283,9 @@ impl<T> Events<T> {
 
         // Пересчитываем lagging_count для нового состояния событий
         let new_event_len = self.events.len() as u32;
-        self.lagging_count = self.cursors.iter()
+        self.lagging_count = self
+            .cursors
+            .iter()
             .flatten()
             .filter(|&&pos| pos < new_event_len)
             .count() as u32;
@@ -300,9 +302,7 @@ impl<T> Events<T> {
         let idx = reader_id.0 as usize;
         let cursor = self.cursors.get(idx).and_then(|c| c.as_ref());
         match cursor {
-            Some(&pos) if (pos as usize) < self.events.len() => {
-                &self.events[pos as usize..]
-            }
+            Some(&pos) if (pos as usize) < self.events.len() => &self.events[pos as usize..],
             _ => &[],
         }
     }
@@ -331,7 +331,9 @@ impl<T> Events<T> {
         let event_len = self.events.len() as u32;
         if let Some(Some(pos)) = self.cursors.get_mut(idx) {
             let old_pos = *pos;
-            let new_pos = (old_pos as usize).saturating_add(count).min(self.events.len()) as u32;
+            let new_pos = (old_pos as usize)
+                .saturating_add(count)
+                .min(self.events.len()) as u32;
             if old_pos < event_len && new_pos >= event_len {
                 self.lagging_count = self.lagging_count.saturating_sub(1);
             }
@@ -356,13 +358,19 @@ impl<T> Events<T> {
     /// используйте [`EventReadGuard::peek`].
     #[inline]
     pub fn read(&mut self, reader_id: &EventCursor) -> EventReadGuard<'_, T> {
-        let idx   = reader_id.0 as usize;
-        let start = self.cursors.get(idx)
+        let idx = reader_id.0 as usize;
+        let start = self
+            .cursors
+            .get(idx)
             .and_then(|c| c.as_ref())
             .copied()
             .unwrap_or(0) as usize;
         let start = start.min(self.events.len());
-        EventReadGuard { queue: self, reader_id: *reader_id, start }
+        EventReadGuard {
+            queue: self,
+            reader_id: *reader_id,
+            start,
+        }
     }
 
     /// Прочитать не более `max_count` событий с продвижением курсора
@@ -385,16 +393,27 @@ impl<T> Events<T> {
     /// }
     /// ```
     #[inline]
-    pub fn read_partial(&mut self, reader_id: &EventCursor, max_count: usize) -> PartialReadGuard<'_, T> {
-        let idx   = reader_id.0 as usize;
-        let start = self.cursors.get(idx)
+    pub fn read_partial(
+        &mut self,
+        reader_id: &EventCursor,
+        max_count: usize,
+    ) -> PartialReadGuard<'_, T> {
+        let idx = reader_id.0 as usize;
+        let start = self
+            .cursors
+            .get(idx)
             .and_then(|c| c.as_ref())
             .copied()
             .unwrap_or(0) as usize;
-        let start  = start.min(self.events.len());
-        let end    = (start + max_count).min(self.events.len());
-        let count  = end - start;
-        PartialReadGuard { queue: self, reader_id: *reader_id, start, count }
+        let start = start.min(self.events.len());
+        let end = (start + max_count).min(self.events.len());
+        let count = end - start;
+        PartialReadGuard {
+            queue: self,
+            reader_id: *reader_id,
+            start,
+            count,
+        }
     }
 
     /// Количество событий в обоих буферах.
@@ -440,7 +459,9 @@ impl<T> Events<T> {
     #[cfg(debug_assertions)]
     fn assert_lagging_invariant(&self) {
         let event_len = self.events.len() as u32;
-        let actual = self.cursors.iter()
+        let actual = self
+            .cursors
+            .iter()
             .flatten()
             .filter(|&&pos| pos < event_len)
             .count() as u32;
@@ -483,9 +504,9 @@ impl<T> Default for Events<T> {
               bind to variable to read events, \
               or use Events::read_partial() to advance by count"]
 pub struct EventReadGuard<'q, T> {
-    queue:     &'q mut Events<T>,
+    queue: &'q mut Events<T>,
     reader_id: EventCursor,
-    start:     usize,
+    start: usize,
 }
 
 impl<'q, T> EventReadGuard<'q, T> {
@@ -520,7 +541,9 @@ impl<'q, T> EventReadGuard<'q, T> {
 impl<T> std::ops::Deref for EventReadGuard<'_, T> {
     type Target = [T];
     #[inline]
-    fn deref(&self) -> &[T] { self.as_slice() }
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
 }
 
 impl<T> Drop for EventReadGuard<'_, T> {
@@ -548,10 +571,10 @@ impl<T> Drop for EventReadGuard<'_, T> {
 /// ```
 #[must_use = "PartialReadGuard advances cursor by count on drop; bind to variable to read events"]
 pub struct PartialReadGuard<'q, T> {
-    queue:     &'q mut Events<T>,
+    queue: &'q mut Events<T>,
     reader_id: EventCursor,
-    start:     usize,
-    count:     usize,
+    start: usize,
+    count: usize,
 }
 
 impl<'q, T> PartialReadGuard<'q, T> {
@@ -569,17 +592,23 @@ impl<'q, T> PartialReadGuard<'q, T> {
 
     /// Количество событий в этом guard.
     #[inline]
-    pub fn len(&self) -> usize { self.count }
+    pub fn len(&self) -> usize {
+        self.count
+    }
 
     /// Нет ли событий.
     #[inline]
-    pub fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 impl<T> std::ops::Deref for PartialReadGuard<'_, T> {
     type Target = [T];
     #[inline]
-    fn deref(&self) -> &[T] { self.as_slice() }
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
 }
 
 impl<T> Drop for PartialReadGuard<'_, T> {
@@ -617,7 +646,9 @@ impl<T> PeekGuard<'_, T> {
 impl<T> std::ops::Deref for PeekGuard<'_, T> {
     type Target = [T];
     #[inline]
-    fn deref(&self) -> &[T] { self.as_slice() }
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
 }
 
 // ── EventCursor ─────────────────────────────────────────────────
@@ -724,7 +755,8 @@ impl<T> Ord for DelayedEvent<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // BinaryHeap — max-heap. Reverse<u32> даёт min по deliver_at.
         // При равном deliver_at — Reverse<u64> даёт FIFO (меньший sequence = старее = выше).
-        self.deliver_at.cmp(&other.deliver_at)
+        self.deliver_at
+            .cmp(&other.deliver_at)
             .then(self.sequence.cmp(&other.sequence))
     }
 }
@@ -865,47 +897,58 @@ pub struct EventRegistry {
 
 impl EventRegistry {
     pub fn new() -> Self {
-        Self { queues: FxHashMap::default() }
+        Self {
+            queues: FxHashMap::default(),
+        }
     }
 
     /// Зарегистрировать тип события.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
         if !self.queues.contains_key(&TypeId::of::<T>()) {
-            self.queues.insert(TypeId::of::<T>(), Box::new(Events::<T>::new()));
+            self.queues
+                .insert(TypeId::of::<T>(), Box::new(Events::<T>::new()));
         }
     }
 
     /// Получить очередь событий по типу (паникует если не зарегистрирована).
     #[track_caller]
     pub fn get<T: Send + Sync + 'static>(&self) -> &Events<T> {
-        self.queues.get(&TypeId::of::<T>())
+        self.queues
+            .get(&TypeId::of::<T>())
             .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
-            .unwrap_or_else(|| panic!(
-                "Event `{}` not registered. Call world.add_event::<{0}>()",
-                std::any::type_name::<T>()
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Event `{}` not registered. Call world.add_event::<{0}>()",
+                    std::any::type_name::<T>()
+                )
+            })
     }
 
     /// Мутабельный доступ к очереди (паникует если не зарегистрирована).
     #[track_caller]
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
-        self.queues.get_mut(&TypeId::of::<T>())
+        self.queues
+            .get_mut(&TypeId::of::<T>())
             .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
-            .unwrap_or_else(|| panic!(
-                "Event `{}` not registered. Call world.add_event::<{0}>()",
-                std::any::type_name::<T>()
-            ))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Event `{}` not registered. Call world.add_event::<{0}>()",
+                    std::any::type_name::<T>()
+                )
+            })
     }
 
     /// Попробовать получить очередь событий по типу.
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&Events<T>> {
-        self.queues.get(&TypeId::of::<T>())
+        self.queues
+            .get(&TypeId::of::<T>())
             .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
     }
 
     /// Попробовать получить мутабельный доступ к очереди.
     pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut Events<T>> {
-        self.queues.get_mut(&TypeId::of::<T>())
+        self.queues
+            .get_mut(&TypeId::of::<T>())
             .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
     }
 
@@ -914,7 +957,8 @@ impl EventRegistry {
         if !self.queues.contains_key(&TypeId::of::<T>()) {
             self.register::<T>();
         }
-        self.queues.get_mut(&TypeId::of::<T>())
+        self.queues
+            .get_mut(&TypeId::of::<T>())
             .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
             .unwrap()
     }
@@ -1069,7 +1113,10 @@ mod tests {
         let mut queue = Events::<EntityEvent<i32>>::new();
         let reader = queue.add_reader();
 
-        let entity = Entity { index: 42, generation: 1 };
+        let entity = Entity {
+            index: 42,
+            generation: 1,
+        };
         queue.send(EntityEvent::new(entity, 100));
         queue.update();
 
@@ -1173,9 +1220,9 @@ mod tests {
         let mut queue = Events::new();
         let mut delayed = DelayedQueue::new();
 
-        delayed.send_delayed(1, 10, 0);  // deliver_at=10
-        delayed.send_delayed(2, 10, 0);  // deliver_at=10
-        delayed.send_delayed(3, 20, 0);  // deliver_at=20
+        delayed.send_delayed(1, 10, 0); // deliver_at=10
+        delayed.send_delayed(2, 10, 0); // deliver_at=10
+        delayed.send_delayed(3, 20, 0); // deliver_at=20
 
         // flush на тике 10 — должны доставиться события с deliver_at <= 10
         delayed.flush_delayed(10, &mut queue);
@@ -1249,7 +1296,11 @@ mod tests {
 
         // Курсор должен быть в конце — новых событий нет
         let remaining = queue.iter(&reader);
-        assert_eq!(remaining.len(), 0, "read() должен продвинуть до конца буфера");
+        assert_eq!(
+            remaining.len(),
+            0,
+            "read() должен продвинуть до конца буфера"
+        );
     }
 
     // ── send_sync тесты ────────────────────────────────────────
@@ -1338,7 +1389,11 @@ mod tests {
         world.tick();
         world.flush_all_events();
         let queue = world.events::<String>();
-        assert_eq!(queue.len_readable(), 1, "Событие должно быть доступно после tick()");
+        assert_eq!(
+            queue.len_readable(),
+            1,
+            "Событие должно быть доступно после tick()"
+        );
     }
 
     #[test]
@@ -1346,7 +1401,10 @@ mod tests {
         use crate::world::World;
 
         let mut world = World::new();
-        assert!(world.try_send_event(42u32), "try_send_event должен вернуть true");
+        assert!(
+            world.try_send_event(42u32),
+            "try_send_event должен вернуть true"
+        );
         world.tick();
         world.flush_all_events();
         let queue = world.events::<u32>();

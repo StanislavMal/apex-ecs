@@ -1,8 +1,8 @@
 //! Relations — связи между entity, архитектура по образцу Flecs.
 
-use std::any::TypeId;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::any::TypeId;
 
 use crate::{
     archetype::ArchetypeId,
@@ -116,7 +116,7 @@ impl RelationStorage {
         match self {
             Self::Sparse(sv) => {
                 let pos = match sv.binary_search(&raw) {
-                    Ok(_) => return,  // уже существует
+                    Ok(_) => return, // уже существует
                     Err(pos) => pos,
                 };
                 sv.insert(pos, raw);
@@ -158,18 +158,14 @@ impl RelationStorage {
     #[inline]
     fn contains_kind(&self, kind_idx: u32) -> bool {
         match self {
-            Self::Sparse(sv) => {
-                sv.iter().any(|&r| {
-                    let cid = ComponentId(r);
-                    is_relation_id(cid) && decode_kind(cid) == kind_idx
-                })
-            }
-            Self::Dense(set) => {
-                set.iter().any(|&r| {
-                    let cid = ComponentId(r);
-                    is_relation_id(cid) && decode_kind(cid) == kind_idx
-                })
-            }
+            Self::Sparse(sv) => sv.iter().any(|&r| {
+                let cid = ComponentId(r);
+                is_relation_id(cid) && decode_kind(cid) == kind_idx
+            }),
+            Self::Dense(set) => set.iter().any(|&r| {
+                let cid = ComponentId(r);
+                is_relation_id(cid) && decode_kind(cid) == kind_idx
+            }),
         }
     }
 
@@ -209,7 +205,9 @@ struct SubjectEntry {
 impl SubjectEntry {
     #[inline]
     fn has_kind(&self, kind_idx: u32) -> bool {
-        if kind_idx >= 64 { return self.storage.contains_kind(kind_idx); }
+        if kind_idx >= 64 {
+            return self.storage.contains_kind(kind_idx);
+        }
         self.kind_mask & (1u64 << kind_idx) != 0
     }
 
@@ -245,7 +243,9 @@ impl SubjectEntry {
     #[inline]
     fn has(&self, relation_id: ComponentId) -> bool {
         let kind_idx = decode_kind(relation_id);
-        if !self.has_kind(kind_idx) { return false; }
+        if !self.has_kind(kind_idx) {
+            return false;
+        }
         self.storage.contains(relation_id.0)
     }
 }
@@ -256,13 +256,16 @@ pub(crate) struct SubjectIndex {
 
 impl SubjectIndex {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     #[inline]
     fn ensure(&mut self, entity_index: usize) {
         if entity_index >= self.entries.len() {
-            self.entries.resize_with(entity_index + 1, SubjectEntry::default);
+            self.entries
+                .resize_with(entity_index + 1, SubjectEntry::default);
         }
     }
 
@@ -306,36 +309,40 @@ impl SubjectIndex {
 }
 
 impl Default for SubjectIndex {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── RelationKind ───────────────────────────────────────────────
 
 pub trait RelationKind: Copy + Send + Sync + 'static {
-    fn cascade_delete_on_target_despawn() -> bool { false }
+    fn cascade_delete_on_target_despawn() -> bool {
+        false
+    }
 }
 
 // ── RelationRegistry ───────────────────────────────────────────
 
 pub struct RelationRegistry {
-    type_to_idx:    FxHashMap<TypeId, u32>,
-    cascade_flags:  Vec<bool>,
+    type_to_idx: FxHashMap<TypeId, u32>,
+    cascade_flags: Vec<bool>,
     /// kind_idx → type_name строка (для сериализации).
     /// Инвариант: `idx_to_name[kind_idx]` заполняется в `get_or_register`.
-    idx_to_name:    Vec<String>,
+    idx_to_name: Vec<String>,
     /// type_name → kind_idx (для десериализации).
-    name_to_idx:    FxHashMap<String, u32>,
-    next_idx:       u32,
+    name_to_idx: FxHashMap<String, u32>,
+    next_idx: u32,
 }
 
 impl RelationRegistry {
     pub fn new() -> Self {
         Self {
-            type_to_idx:   FxHashMap::default(),
+            type_to_idx: FxHashMap::default(),
             cascade_flags: Vec::new(),
-            idx_to_name:   Vec::new(),
-            name_to_idx:   FxHashMap::default(),
-            next_idx:      0,
+            idx_to_name: Vec::new(),
+            name_to_idx: FxHashMap::default(),
+            next_idx: 0,
         }
     }
 
@@ -347,7 +354,8 @@ impl RelationRegistry {
         let idx = self.next_idx;
         self.next_idx += 1;
         self.type_to_idx.insert(type_id, idx);
-        self.cascade_flags.push(R::cascade_delete_on_target_despawn());
+        self.cascade_flags
+            .push(R::cascade_delete_on_target_despawn());
 
         // Регистрируем name для сериализации
         let name = std::any::type_name::<R>().to_string();
@@ -363,7 +371,10 @@ impl RelationRegistry {
 
     #[allow(dead_code)]
     pub fn is_cascade(&self, kind_idx: u32) -> bool {
-        self.cascade_flags.get(kind_idx as usize).copied().unwrap_or(false)
+        self.cascade_flags
+            .get(kind_idx as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     // ── Методы для сериализации ────────────────────────────────
@@ -388,18 +399,22 @@ impl RelationRegistry {
     }
 
     /// Количество зарегистрированных видов relations.
-    pub fn kind_count(&self) -> usize { self.next_idx as usize }
+    pub fn kind_count(&self) -> usize {
+        self.next_idx as usize
+    }
 }
 
 impl Default for RelationRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── World extension ────────────────────────────────────────────
 
 impl World {
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
-        let kind_idx    = self.relations.get_or_register::<R>();
+        let kind_idx = self.relations.get_or_register::<R>();
         let relation_id = encode_relation(kind_idx, target.index);
         self.ensure_relation_component(relation_id);
         self.subject_index.add(subject.index, relation_id);
@@ -409,7 +424,7 @@ impl World {
     pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None      => return,
+            None => return,
         };
         let relation_id = encode_relation(kind_idx, target.index);
         self.subject_index.remove(subject.index, relation_id);
@@ -419,10 +434,12 @@ impl World {
     /// O(1) проверка через SubjectIndex: kind_mask check + binary_search.
     #[inline]
     pub fn has_relation<R: RelationKind>(&self, subject: Entity, _kind: R, target: Entity) -> bool {
-        if !self.entities.is_alive(subject) { return false; }
+        if !self.entities.is_alive(subject) {
+            return false;
+        }
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None      => return false,
+            None => return false,
         };
         let relation_id = encode_relation(kind_idx, target.index);
         self.subject_index.has(subject.index, relation_id)
@@ -430,12 +447,12 @@ impl World {
 
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
-        _kind:  R,
+        _kind: R,
         target: Entity,
     ) -> RelationIter<'w, Q> {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None      => return RelationIter::empty(self),
+            None => return RelationIter::empty(self),
         };
         let relation_id = encode_relation(kind_idx, target.index);
 
@@ -446,21 +463,35 @@ impl World {
         let arch_ids = self.id_index.get(relation_id);
 
         let arch_states: Vec<RelationArchState<Q::State>> = if all_found {
-            arch_ids.iter()
+            arch_ids
+                .iter()
                 .filter_map(|&arch_id| {
                     let arch_idx = arch_id.0 as usize;
                     let arch = &self.archetypes[arch_idx];
-                    if arch.is_empty() { return None; }
-                    if !Q::matches_archetype(arch, &data_ids) { return None; }
+                    if arch.is_empty() {
+                        return None;
+                    }
+                    if !Q::matches_archetype(arch, &data_ids) {
+                        return None;
+                    }
                     let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO) };
-                    Some(RelationArchState { arch_idx, state, len: arch.len() })
+                    Some(RelationArchState {
+                        arch_idx,
+                        state,
+                        len: arch.len(),
+                    })
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        RelationIter { world: self, arch_states, arch_cursor: 0, row_cursor: 0 }
+        RelationIter {
+            world: self,
+            arch_states,
+            arch_cursor: 0,
+            row_cursor: 0,
+        }
     }
 
     pub fn query_wildcard<'w, R: RelationKind, Q: WorldQuery>(
@@ -469,7 +500,7 @@ impl World {
     ) -> RelationIter<'w, Q> {
         let kind_idx = match self.relations.get_idx::<R>() {
             Some(idx) => idx,
-            None      => return RelationIter::empty(self),
+            None => return RelationIter::empty(self),
         };
         let wid = wildcard_id(kind_idx);
 
@@ -480,45 +511,56 @@ impl World {
         let arch_ids = self.id_index.get(wid);
 
         let arch_states: Vec<RelationArchState<Q::State>> = if all_found {
-            arch_ids.iter()
+            arch_ids
+                .iter()
                 .filter_map(|&arch_id| {
                     let arch_idx = arch_id.0 as usize;
                     let arch = &self.archetypes[arch_idx];
-                    if arch.is_empty() { return None; }
-                    if !Q::matches_archetype(arch, &data_ids) { return None; }
+                    if arch.is_empty() {
+                        return None;
+                    }
+                    if !Q::matches_archetype(arch, &data_ids) {
+                        return None;
+                    }
                     let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO) };
-                    Some(RelationArchState { arch_idx, state, len: arch.len() })
+                    Some(RelationArchState {
+                        arch_idx,
+                        state,
+                        len: arch.len(),
+                    })
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        RelationIter { world: self, arch_states, arch_cursor: 0, row_cursor: 0 }
+        RelationIter {
+            world: self,
+            arch_states,
+            arch_cursor: 0,
+            row_cursor: 0,
+        }
     }
 
     pub fn children_of<'w, R: RelationKind>(
         &'w self,
-        _kind:  R,
+        _kind: R,
         parent: Entity,
     ) -> impl Iterator<Item = Entity> + 'w {
-        let kind_idx    = self.relations.get_idx::<R>();
+        let kind_idx = self.relations.get_idx::<R>();
         let relation_id = kind_idx.map(|k| encode_relation(k, parent.index));
 
-        let arch_ids: &[ArchetypeId] = relation_id
-            .map(|rid| self.id_index.get(rid))
-            .unwrap_or(&[]);
+        let arch_ids: &[ArchetypeId] = relation_id.map(|rid| self.id_index.get(rid)).unwrap_or(&[]);
 
-        arch_ids.iter()
-            .flat_map(move |&arch_id| {
-                self.archetypes[arch_id.0 as usize].entities.iter().copied()
-            })
+        arch_ids
+            .iter()
+            .flat_map(move |&arch_id| self.archetypes[arch_id.0 as usize].entities.iter().copied())
     }
 
     pub fn get_relation_target<R: RelationKind>(
         &self,
         subject: Entity,
-        _kind:   R,
+        _kind: R,
     ) -> Option<Entity> {
         let kind_idx = self.relations.get_idx::<R>()?;
         for raw_id in self.subject_index.get_all(subject.index) {
@@ -541,56 +583,65 @@ impl World {
 
     pub(crate) fn ensure_relation_component(&mut self, relation_id: ComponentId) {
         if self.registry.get_info(relation_id).is_none() {
-            self.registry.register_raw(relation_id, ComponentInfo {
-                id:       relation_id,
-                name:     "<relation>",
-                type_id:  std::any::TypeId::of::<()>(),
-                size:     0,
-                align:    1,
-                drop_fn:  |_| {},
-                serde:    None,
-            });
+            self.registry.register_raw(
+                relation_id,
+                ComponentInfo {
+                    id: relation_id,
+                    name: "<relation>",
+                    type_id: std::any::TypeId::of::<()>(),
+                    size: 0,
+                    align: 1,
+                    drop_fn: |_| {},
+                    serde: None,
+                },
+            );
         }
     }
 
     pub(crate) fn insert_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return,
+            None => return,
         };
         if self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, relation_id);
         self.query_cache.invalidate();
-        let new_row     = self.move_entity(entity, location, new_arch_id);
-        let tick        = self.current_tick;
+        let new_row = self.move_entity(entity, location, new_arch_id);
+        let tick = self.current_tick;
         if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
             let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
             col.change_ticks.push(tick);
             col.len += 1;
         }
-        self.entities.set_location(entity, crate::entity::EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row,
-        });
+        self.entities.set_location(
+            entity,
+            crate::entity::EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row,
+            },
+        );
     }
 
     pub(crate) fn remove_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return,
+            None => return,
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
             return;
         }
         let new_arch_id = self.find_or_create_archetype_without(location.archetype_id, relation_id);
         self.query_cache.invalidate();
-        let new_row     = self.move_entity(entity, location, new_arch_id);
-        self.entities.set_location(entity, crate::entity::EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row,
-        });
+        let new_row = self.move_entity(entity, location, new_arch_id);
+        self.entities.set_location(
+            entity,
+            crate::entity::EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row,
+            },
+        );
     }
 }
 
@@ -598,20 +649,25 @@ impl World {
 
 pub(crate) struct RelationArchState<S> {
     pub arch_idx: usize,
-    pub state:    S,
-    pub len:      usize,
+    pub state: S,
+    pub len: usize,
 }
 
 pub struct RelationIter<'w, Q: WorldQuery> {
-    world:       &'w World,
+    world: &'w World,
     arch_states: Vec<RelationArchState<Q::State>>,
     arch_cursor: usize,
-    row_cursor:  usize,
+    row_cursor: usize,
 }
 
 impl<'w, Q: WorldQuery> RelationIter<'w, Q> {
     pub(crate) fn empty(world: &'w World) -> Self {
-        Self { world, arch_states: Vec::new(), arch_cursor: 0, row_cursor: 0 }
+        Self {
+            world,
+            arch_states: Vec::new(),
+            arch_cursor: 0,
+            row_cursor: 0,
+        }
     }
 }
 
@@ -624,7 +680,7 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
             let a = self.arch_states.get(self.arch_cursor)?;
             if self.row_cursor >= a.len {
                 self.arch_cursor += 1;
-                self.row_cursor   = 0;
+                self.row_cursor = 0;
                 continue;
             }
             let row = self.row_cursor;
@@ -639,15 +695,20 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
 
 // ── Встроенные relation kinds ──────────────────────────────────
 
-#[derive(Clone, Copy)] pub struct ChildOf;
+#[derive(Clone, Copy)]
+pub struct ChildOf;
 impl RelationKind for ChildOf {
-    fn cascade_delete_on_target_despawn() -> bool { true }
+    fn cascade_delete_on_target_despawn() -> bool {
+        true
+    }
 }
 
-#[derive(Clone, Copy)] pub struct Owns;
+#[derive(Clone, Copy)]
+pub struct Owns;
 impl RelationKind for Owns {}
 
-#[derive(Clone, Copy)] pub struct Likes;
+#[derive(Clone, Copy)]
+pub struct Likes;
 impl RelationKind for Likes {}
 
 // ── Тесты ─────────────────────────────────────────────────────
@@ -659,9 +720,12 @@ mod tests {
     use crate::prelude::*;
 
     use crate::component::Component;
-    
+
     #[derive(Clone, Copy, Debug, PartialEq)]
-    struct Position { x: f32, y: f32 }
+    struct Position {
+        x: f32,
+        y: f32,
+    }
     impl Component for Position {}
 
     #[test]
@@ -669,7 +733,7 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
-        let child  = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, parent);
         assert!(world.has_relation(child, ChildOf, parent));
@@ -719,12 +783,12 @@ mod tests {
     fn despawn_recursive() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let root  = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let root = world.spawn((Position { x: 0.0, y: 0.0 },));
         let child = world.spawn((Position { x: 1.0, y: 0.0 },));
-        let leaf  = world.spawn((Position { x: 2.0, y: 0.0 },));
+        let leaf = world.spawn((Position { x: 2.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, root);
-        world.add_relation(leaf,  ChildOf, child);
+        world.add_relation(leaf, ChildOf, child);
 
         assert_eq!(world.entity_count(), 3);
         world.despawn_recursive(ChildOf, root);
@@ -736,7 +800,7 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
-        let child  = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, parent);
         assert_eq!(world.get_relation_target(child, ChildOf), Some(parent));

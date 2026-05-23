@@ -22,10 +22,7 @@ pub enum BridgeEvent {
     /// Произвольное вызываемое действие.
     Action(Box<dyn FnOnce(&mut World) + Send>),
     /// Типизированное событие (сериализованное через bincode).
-    Event {
-        type_name: String,
-        data:      Vec<u8>,
-    },
+    Event { type_name: String, data: Vec<u8> },
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +44,7 @@ type EventHandler = Box<dyn Fn(&[u8], &mut World) + Send + Sync>;
 
 pub struct WorldBridge {
     /// События из основного мира в IsolatedWorld.
-    inbound:  crossbeam_channel::Sender<BridgeEvent>,
+    inbound: crossbeam_channel::Sender<BridgeEvent>,
     /// События из IsolatedWorld в основной мир.
     outbound: crossbeam_channel::Receiver<BridgeEvent>,
     /// Реестр десериализаторов: type_name → (data, world).
@@ -67,13 +64,13 @@ impl WorldBridge {
         let handlers = Arc::new(RwLock::new(HashMap::new()));
 
         let main_to_sub = Self {
-            inbound:  main_tx,
+            inbound: main_tx,
             outbound: main_rx,
             event_handlers: Arc::clone(&handlers),
         };
 
         let sub_to_main = Self {
-            inbound:  sub_tx,
+            inbound: sub_tx,
             outbound: sub_rx,
             event_handlers: handlers,
         };
@@ -121,9 +118,7 @@ impl WorldBridge {
             Ok(bytes) => bytes,
             Err(_) => return,
         };
-        let _ = self
-            .inbound
-            .send(BridgeEvent::Event { type_name, data });
+        let _ = self.inbound.send(BridgeEvent::Event { type_name, data });
     }
 
     /// Применить все накопленные сообщения к миру.
@@ -184,7 +179,7 @@ impl WorldBridge {
 /// iso.tick();
 /// ```
 pub struct IsolatedWorld {
-    world:     World,
+    world: World,
     scheduler: Scheduler,
 }
 
@@ -192,7 +187,7 @@ impl IsolatedWorld {
     /// Создать новый изолированный мир.
     pub fn new() -> Self {
         Self {
-            world:     World::new(),
+            world: World::new(),
             scheduler: Scheduler::new(),
         }
     }
@@ -249,7 +244,7 @@ impl Default for IsolatedWorld {
 #[derive(Clone)]
 pub struct CloneableBridge {
     /// Sender для отправки событий в IsolatedWorld.
-    to_sub:   crossbeam_channel::Sender<BridgeEvent>,
+    to_sub: crossbeam_channel::Sender<BridgeEvent>,
     /// Receiver для получения событий из IsolatedWorld.
     from_sub: crossbeam_channel::Receiver<BridgeEvent>,
     /// Реестр десериализаторов.
@@ -399,12 +394,9 @@ mod tests {
         let invoked = Arc::new(AtomicBool::new(false));
         let inv = invoked.clone();
 
-        iso.scheduler_mut().add_par(
-            "test",
-            move |_ctx| {
-                inv.store(true, Ordering::SeqCst);
-            },
-        );
+        iso.scheduler_mut().add_par("test", move |_ctx| {
+            inv.store(true, Ordering::SeqCst);
+        });
 
         iso.tick();
         assert_eq!(iso.world.entity_count(), 0);
@@ -518,7 +510,11 @@ mod tests {
         bridge_a.send_event(&ScoreEvent(42));
         bridge_b.apply_incoming(&mut world);
 
-        assert_eq!(world.events::<ScoreEvent>().len(), 1, "event should be in pending buffer");
+        assert_eq!(
+            world.events::<ScoreEvent>().len(),
+            1,
+            "event should be in pending buffer"
+        );
     }
 
     #[test]
@@ -566,12 +562,9 @@ mod tests {
         let entity_count = Arc::new(AtomicUsize::new(0));
         let ec = entity_count.clone();
 
-        iso.scheduler_mut().add_par(
-            "counter",
-            move |ctx| {
-                ec.store(ctx.entity_count(), Ordering::SeqCst);
-            },
-        );
+        iso.scheduler_mut().add_par("counter", move |ctx| {
+            ec.store(ctx.entity_count(), Ordering::SeqCst);
+        });
 
         iso.world_mut().spawn(());
         iso.tick();

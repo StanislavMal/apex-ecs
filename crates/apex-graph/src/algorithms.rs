@@ -42,7 +42,9 @@ impl<N, W> Graph<N, W> {
             let node_slot = node.slot() as usize;
             if let Some(edges) = self.adjacency_out.get(node_slot) {
                 for &edge_idx in edges {
-                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let Some(edge) = self.edges.get(edge_idx) else {
+                        continue;
+                    };
                     let succ = edge.to;
                     if self.nodes.get(succ).is_none() {
                         continue;
@@ -92,11 +94,7 @@ impl<N, W> Graph<N, W> {
         // Важно: берём только живые узлы (iter по Arena).
         for (node, _) in self.nodes.iter() {
             let slot = node.slot() as usize;
-            let deg = self
-                .adjacency_in
-                .get(slot)
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let deg = self.adjacency_in.get(slot).map(|v| v.len()).unwrap_or(0);
             in_degree[slot] = deg;
         }
 
@@ -121,7 +119,9 @@ impl<N, W> Graph<N, W> {
             let node_slot = node.slot() as usize;
             if let Some(edges) = self.adjacency_out.get(node_slot) {
                 for &edge_idx in edges {
-                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let Some(edge) = self.edges.get(edge_idx) else {
+                        continue;
+                    };
 
                     let to = edge.to;
                     // На всякий: если пользователь как-то оставил ребро на несуществующий узел.
@@ -184,7 +184,9 @@ impl<N, W> Graph<N, W> {
             let node_slot = node.slot() as usize;
             if let Some(edges) = self.adjacency_out.get(node_slot) {
                 for &edge_idx in edges {
-                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let Some(edge) = self.edges.get(edge_idx) else {
+                        continue;
+                    };
                     let succ = edge.to;
                     if self.nodes.get(succ).is_none() {
                         continue;
@@ -229,7 +231,9 @@ impl<N, W> Graph<N, W> {
             // добавляем successors в обратном порядке.
             if let Some(edges) = self.adjacency_out.get(slot) {
                 for &edge_idx in edges.iter().rev() {
-                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let Some(edge) = self.edges.get(edge_idx) else {
+                        continue;
+                    };
                     let succ = edge.to;
                     if self.nodes.get(succ).is_none() {
                         continue;
@@ -262,7 +266,9 @@ impl<N, W> Graph<N, W> {
 
             if let Some(edges) = self.adjacency_in.get(node_slot) {
                 for &edge_idx in edges {
-                    let Some(edge) = self.edges.get(edge_idx) else { continue; };
+                    let Some(edge) = self.edges.get(edge_idx) else {
+                        continue;
+                    };
                     let pred = edge.from;
                     if self.nodes.get(pred).is_none() {
                         continue;
@@ -346,7 +352,6 @@ mod tests {
         assert!(!g.has_path(a, b));
         assert!(!g.has_path(b, a));
     }
-
 
     #[test]
     fn test_topological_sort_chain() {

@@ -58,14 +58,14 @@ impl StageLabel {
     /// Приоритет этапа для сортировки (меньше = раньше).
     pub fn priority(&self) -> u8 {
         match self {
-            StageLabel::Startup    => 0,
-            StageLabel::First      => 1,
-            StageLabel::PreUpdate  => 2,
+            StageLabel::Startup => 0,
+            StageLabel::First => 1,
+            StageLabel::PreUpdate => 2,
             StageLabel::FixedUpdate => 3,
-            StageLabel::Update     => 4,
-            StageLabel::PostUpdate  => 5,
-            StageLabel::Last       => 6,
-            StageLabel::Custom(_)  => 7,
+            StageLabel::Update => 4,
+            StageLabel::PostUpdate => 5,
+            StageLabel::Last => 6,
+            StageLabel::Custom(_) => 7,
         }
     }
 }
@@ -73,13 +73,13 @@ impl StageLabel {
 impl fmt::Display for StageLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StageLabel::Startup    => write!(f, "Startup"),
-            StageLabel::First      => write!(f, "First"),
-            StageLabel::PreUpdate  => write!(f, "PreUpdate"),
+            StageLabel::Startup => write!(f, "Startup"),
+            StageLabel::First => write!(f, "First"),
+            StageLabel::PreUpdate => write!(f, "PreUpdate"),
             StageLabel::FixedUpdate => write!(f, "FixedUpdate"),
-            StageLabel::Update     => write!(f, "Update"),
-            StageLabel::PostUpdate  => write!(f, "PostUpdate"),
-            StageLabel::Last       => write!(f, "Last"),
+            StageLabel::Update => write!(f, "Update"),
+            StageLabel::PostUpdate => write!(f, "PostUpdate"),
+            StageLabel::Last => write!(f, "Last"),
             StageLabel::Custom(name) => write!(f, "Custom({})", name),
         }
     }
@@ -105,7 +105,12 @@ pub struct Stage {
 
 impl Stage {
     pub fn new(label: StageLabel, system_ids: Vec<SystemId>, all_parallel: bool) -> Self {
-        Self { label, system_ids, all_parallel, emit_event_types: Vec::new() }
+        Self {
+            label,
+            system_ids,
+            all_parallel,
+            emit_event_types: Vec::new(),
+        }
     }
 
     /// Можно ли запускать системы этого Stage параллельно?

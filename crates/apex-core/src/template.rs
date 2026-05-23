@@ -47,11 +47,7 @@
 //! ).unwrap();
 //! ```
 
-use crate::{
-    entity::Entity,
-    relations::ChildOf,
-    world::World,
-};
+use crate::{entity::Entity, relations::ChildOf, world::World};
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -173,7 +169,9 @@ impl TemplateParams {
     /// преобразования параметров в overrides компонентов.
     pub fn json_overrides_iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.type_names.iter().filter_map(|(tid, name)| {
-            self.json_overrides.get(tid).map(|json| (name.as_str(), json))
+            self.json_overrides
+                .get(tid)
+                .map(|json| (name.as_str(), json))
         })
     }
 
@@ -228,7 +226,9 @@ pub struct TemplateRegistry {
 
 impl TemplateRegistry {
     pub fn new() -> Self {
-        Self { templates: HashMap::default() }
+        Self {
+            templates: HashMap::default(),
+        }
     }
 
     /// Зарегистрировать именованный шаблон.
@@ -260,7 +260,9 @@ impl TemplateRegistry {
     /// # Safety
     /// Вызывающий должен гарантировать, что шаблон жив на момент вызова `spawn`.
     pub(crate) fn get_raw(&self, name: &str) -> Option<*const dyn EntityTemplate> {
-        self.templates.get(name).map(|t| t.as_ref() as *const dyn EntityTemplate)
+        self.templates
+            .get(name)
+            .map(|t| t.as_ref() as *const dyn EntityTemplate)
     }
 
     /// Проверить, зарегистрирован ли шаблон.
@@ -279,7 +281,9 @@ impl TemplateRegistry {
 }
 
 impl Default for TemplateRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Pre-exported macro ───────────────────────────────────────────
@@ -347,16 +351,24 @@ mod tests {
     // ── Marker-типы для типизированных параметров ────────────────
 
     struct ParamX;
-    impl TemplateParam for ParamX { type Value = f32; }
+    impl TemplateParam for ParamX {
+        type Value = f32;
+    }
 
     struct ParamY;
-    impl TemplateParam for ParamY { type Value = f32; }
+    impl TemplateParam for ParamY {
+        type Value = f32;
+    }
 
     struct ParamLabel;
-    impl TemplateParam for ParamLabel { type Value = String; }
+    impl TemplateParam for ParamLabel {
+        type Value = String;
+    }
 
     struct ParamVal;
-    impl TemplateParam for ParamVal { type Value = i32; }
+    impl TemplateParam for ParamVal {
+        type Value = i32;
+    }
 
     // ── Helper template ──────────────────────────────────────────
 
@@ -369,7 +381,10 @@ mod tests {
         fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity {
             let x = params.get::<ParamX>().copied().unwrap_or(self.default_x);
             let y = params.get::<ParamY>().copied().unwrap_or(self.default_y);
-            let label = params.get::<ParamLabel>().cloned().unwrap_or_else(|| "default".to_string());
+            let label = params
+                .get::<ParamLabel>()
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
 
             world.spawn((Position { x, y }, Label(label)))
         }
@@ -383,9 +398,17 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Label>();
 
-        world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
+        world.register_template(
+            "test",
+            TestTemplate {
+                default_x: 10.0,
+                default_y: 20.0,
+            },
+        );
 
-        let entity = world.spawn_from_template("test", &TemplateParams::new()).unwrap();
+        let entity = world
+            .spawn_from_template("test", &TemplateParams::new())
+            .unwrap();
         let pos = world.get::<Position>(entity).unwrap();
         assert_eq!(pos.x, 10.0);
         assert_eq!(pos.y, 20.0);
@@ -399,16 +422,26 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Label>();
 
-        world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
+        world.register_template(
+            "test",
+            TestTemplate {
+                default_x: 10.0,
+                default_y: 20.0,
+            },
+        );
 
-        let entity = world.spawn_from_template("test", &TemplateParams::new()
-            .set::<ParamX>(99.0f32)
-            .set::<ParamLabel>("custom".to_string())
-        ).unwrap();
+        let entity = world
+            .spawn_from_template(
+                "test",
+                &TemplateParams::new()
+                    .set::<ParamX>(99.0f32)
+                    .set::<ParamLabel>("custom".to_string()),
+            )
+            .unwrap();
 
         let pos = world.get::<Position>(entity).unwrap();
-        assert_eq!(pos.x, 99.0);    // override
-        assert_eq!(pos.y, 20.0);    // default
+        assert_eq!(pos.x, 99.0); // override
+        assert_eq!(pos.y, 20.0); // default
         let label = world.get::<Label>(entity).unwrap();
         assert_eq!(label.0, "custom"); // override
     }
@@ -419,7 +452,13 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Label>();
 
-        world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
+        world.register_template(
+            "test",
+            TestTemplate {
+                default_x: 10.0,
+                default_y: 20.0,
+            },
+        );
 
         let entity = world.spawn_template("test").unwrap();
         let pos = world.get::<Position>(entity).unwrap();
@@ -437,8 +476,20 @@ mod tests {
     #[test]
     fn template_registry_has() {
         let mut world = World::new();
-        world.register_template("a", TestTemplate { default_x: 1.0, default_y: 2.0 });
-        world.register_template("b", TestTemplate { default_x: 3.0, default_y: 4.0 });
+        world.register_template(
+            "a",
+            TestTemplate {
+                default_x: 1.0,
+                default_y: 2.0,
+            },
+        );
+        world.register_template(
+            "b",
+            TestTemplate {
+                default_x: 3.0,
+                default_y: 4.0,
+            },
+        );
 
         assert!(world.template_registry().has("a"));
         assert!(world.template_registry().has("b"));
@@ -448,7 +499,9 @@ mod tests {
 
     #[test]
     fn template_macro_works() {
-        struct MyTemplate { value: i32 }
+        struct MyTemplate {
+            value: i32,
+        }
         impl Component for MyTemplate {}
 
         impl_entity_template!(MyTemplate, |this, world, params| {
@@ -464,9 +517,9 @@ mod tests {
         let v = world.get::<MyTemplate>(entity).unwrap();
         assert_eq!(v.value, 42);
 
-        let entity2 = world.spawn_from_template("my", &TemplateParams::new()
-            .set::<ParamVal>(100i32)
-        ).unwrap();
+        let entity2 = world
+            .spawn_from_template("my", &TemplateParams::new().set::<ParamVal>(100i32))
+            .unwrap();
         let v2 = world.get::<MyTemplate>(entity2).unwrap();
         assert_eq!(v2.value, 100);
     }
@@ -478,7 +531,13 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Label>();
-        world.register_template("test", TestTemplate { default_x: 10.0, default_y: 20.0 });
+        world.register_template(
+            "test",
+            TestTemplate {
+                default_x: 10.0,
+                default_y: 20.0,
+            },
+        );
 
         let mut commands = crate::commands::Commands::new();
         commands.spawn_template("test");

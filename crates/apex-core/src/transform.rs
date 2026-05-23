@@ -33,12 +33,7 @@
 use glam::{Mat4, Quat, Vec3};
 use rustc_hash::FxHashSet;
 
-use crate::{
-    entity::Entity,
-    query::Read,
-    relations::ChildOf,
-    world::World,
-};
+use crate::{entity::Entity, query::Read, relations::ChildOf, world::World};
 
 // ── Компоненты трансформаций ─────────────────────────────────────
 
@@ -48,8 +43,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalTransform {
     pub translation: Vec3,
-    pub rotation:    Quat,
-    pub scale:       Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
 }
 
 impl crate::component::Component for LocalTransform {}
@@ -58,8 +53,8 @@ impl LocalTransform {
     /// Единичная трансформация (zero translation, identity rotation, unit scale).
     pub const IDENTITY: Self = Self {
         translation: Vec3::ZERO,
-        rotation:    Quat::IDENTITY,
-        scale:       Vec3::ONE,
+        rotation: Quat::IDENTITY,
+        scale: Vec3::ONE,
     };
 
     pub fn from_translation(t: Vec3) -> Self {
@@ -141,7 +136,7 @@ pub struct TransformScratch {
     /// Список dirty entity из query (шаг 1)
     pub(crate) dirty_entities: Vec<Entity>,
     /// Set для O(1) проверки dirty (по entity.index)
-    pub(crate) dirty_set:      FxHashSet<u32>,
+    pub(crate) dirty_set: FxHashSet<u32>,
     /// Топологически отсортированные entity (шаг 2–3)
     pub(crate) ordered: Vec<Entity>,
     /// Множество уже обработанных entity (для DFS)
@@ -170,7 +165,8 @@ pub fn propagate_transforms(world: &mut World) {
     // remove_resource перемещает значение в локальную переменную, освобождая
     // заимствование world — это позволяет вызывать world.get()/world.insert()
     // без конфликта borrow checker.
-    let mut scratch = world.remove_resource::<TransformScratch>()
+    let mut scratch = world
+        .remove_resource::<TransformScratch>()
         .unwrap_or_default();
 
     // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
@@ -186,7 +182,7 @@ pub fn propagate_transforms(world: &mut World) {
         let q = world.query_typed::<Read<TransformDirty>>();
         q.for_each(|e, _| {
             scratch.dirty_entities.push(e);
-            scratch.dirty_set.insert(e.index);  // заполняем set
+            scratch.dirty_set.insert(e.index); // заполняем set
         });
     } // query Q дропается здесь
 
@@ -200,7 +196,8 @@ pub fn propagate_transforms(world: &mut World) {
     //    Итеративный DFS: для каждого dirty entity поднимаемся по предкам
     //    и добавляем их в порядке от корня к листьям.
     for &entity in &scratch.dirty_entities {
-        if !scratch.dirty_set.contains(&entity.index) {  // O(1), без world lookup
+        if !scratch.dirty_set.contains(&entity.index) {
+            // O(1), без world lookup
             continue;
         }
 
@@ -247,7 +244,10 @@ pub fn propagate_transforms(world: &mut World) {
 
         let local = match world.get::<LocalTransform>(entity) {
             Some(l) => *l,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         let parent = world.get_relation_target(entity, ChildOf);
@@ -268,7 +268,7 @@ pub fn propagate_transforms(world: &mut World) {
 
         // Снимаем TransformDirty
         world.remove::<TransformDirty>(entity);
-        scratch.dirty_set.remove(&entity.index);  // поддерживаем set актуальным
+        scratch.dirty_set.remove(&entity.index); // поддерживаем set актуальным
 
         // ── Каскадирование TransformDirty на детей ─────────────────
         // Если у этой entity есть дети (ChildOf), помечаем их как dirty,
@@ -284,8 +284,8 @@ pub fn propagate_transforms(world: &mut World) {
             }
             if !scratch.dirty_set.contains(&child.index) {
                 world.insert(child, TransformDirty);
-                scratch.dirty_set.insert(child.index);  // обновляем set
-                // Добавляем в ordered-список для обработки в этом же проходе
+                scratch.dirty_set.insert(child.index); // обновляем set
+                                                       // Добавляем в ordered-список для обработки в этом же проходе
                 scratch.ordered.push(child);
             }
         }
@@ -516,7 +516,10 @@ mod tests {
 
         // GlobalTransform не должен измениться (остаётся identity)
         let gt = world.get::<GlobalTransform>(entity).unwrap();
-        assert_eq!(*gt.to_matrix(), Mat4::IDENTITY,
-            "GlobalTransform не должен измениться без TransformDirty");
+        assert_eq!(
+            *gt.to_matrix(),
+            Mat4::IDENTITY,
+            "GlobalTransform не должен измениться без TransformDirty"
+        );
     }
 }

@@ -1,6 +1,6 @@
-use std::any::TypeId;
-use rustc_hash::FxHashMap;
 use linkme::distributed_slice;
+use rustc_hash::FxHashMap;
+use std::any::TypeId;
 
 /// Тип функции-регистратора: принимает мутабельный реестр, регистрирует компонент.
 pub type ComponentRegistrarFn = fn(&mut ComponentRegistry);
@@ -41,9 +41,11 @@ pub enum ComponentSerdeError {
 impl std::fmt::Display for ComponentSerdeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SerializationFailed(s)   => write!(f, "serialize failed: {}", s),
+            Self::SerializationFailed(s) => write!(f, "serialize failed: {}", s),
             Self::DeserializationFailed(s) => write!(f, "deserialize failed: {}", s),
-            Self::FormatMismatch { expected } => write!(f, "format mismatch, expected {}", expected),
+            Self::FormatMismatch { expected } => {
+                write!(f, "format mismatch, expected {}", expected)
+            }
         }
     }
 }
@@ -63,25 +65,25 @@ impl std::fmt::Display for ComponentSerdeError {
 #[derive(Clone)]
 pub struct ComponentSerdeFns {
     /// Сериализовать компонент по raw-указателю в байты.
-    pub serialize_fn:   unsafe fn(*const u8) -> SerializeResult,
+    pub serialize_fn: unsafe fn(*const u8) -> SerializeResult,
     /// Десериализовать байты обратно в выровненный буфер с данными T.
-    pub deserialize_fn: fn(&[u8])            -> DeserializeResult,
+    pub deserialize_fn: fn(&[u8]) -> DeserializeResult,
     /// Человекочитаемое имя формата: "json", "bincode", "ron".
-    pub format:         &'static str,
+    pub format: &'static str,
 }
 
 // ── ComponentInfo ──────────────────────────────────────────────
 
 pub struct ComponentInfo {
-    pub id:       ComponentId,
-    pub name:     &'static str,
-    pub type_id:  TypeId,
-    pub size:     usize,
-    pub align:    usize,
-    pub drop_fn:  unsafe fn(*mut u8),
+    pub id: ComponentId,
+    pub name: &'static str,
+    pub type_id: TypeId,
+    pub size: usize,
+    pub align: usize,
+    pub drop_fn: unsafe fn(*mut u8),
     /// Функции сериализации — `None` если компонент не помечен как Serializable.
     /// Заполняется при вызове `register_component_serde::<T>()`.
-    pub serde:    Option<ComponentSerdeFns>,
+    pub serde: Option<ComponentSerdeFns>,
 }
 
 // ── Component trait ────────────────────────────────────────────
@@ -105,10 +107,7 @@ impl Component for cgmath::Matrix4<f32> {}
 /// Компоненты без этого маркера (PhysicsHandle, RenderMesh, …) пропускаются
 /// при снэпшоте — это нормально, они должны пересоздаваться из сериализованного state.
 pub trait Serializable: Component + serde::Serialize + for<'de> serde::Deserialize<'de> {}
-impl<T> Serializable for T
-where
-    T: Component + serde::Serialize + for<'de> serde::Deserialize<'de>,
-{}
+impl<T> Serializable for T where T: Component + serde::Serialize + for<'de> serde::Deserialize<'de> {}
 
 // ── Drop helper ────────────────────────────────────────────────
 
@@ -188,16 +187,16 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
 pub struct ComponentRegistry {
     type_to_id: FxHashMap<TypeId, ComponentId>,
     /// HashMap вместо Vec — поддержка произвольных ID (relations).
-    by_id:      FxHashMap<u32, ComponentInfo>,
-    next_id:    u32,
+    by_id: FxHashMap<u32, ComponentInfo>,
+    next_id: u32,
 }
 
 impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
             type_to_id: FxHashMap::default(),
-            by_id:      FxHashMap::default(),
-            next_id:    0,
+            by_id: FxHashMap::default(),
+            next_id: 0,
         }
     }
 
@@ -220,15 +219,18 @@ impl ComponentRegistry {
         }
         let id = ComponentId(self.next_id);
         self.next_id += 1;
-        self.by_id.insert(id.0, ComponentInfo {
-            id,
-            name:    std::any::type_name::<T>(),
-            type_id,
-            size:    std::mem::size_of::<T>(),
-            align:   std::mem::align_of::<T>(),
-            drop_fn: drop_ptr::<T>,
-            serde:   None,
-        });
+        self.by_id.insert(
+            id.0,
+            ComponentInfo {
+                id,
+                name: std::any::type_name::<T>(),
+                type_id,
+                size: std::mem::size_of::<T>(),
+                align: std::mem::align_of::<T>(),
+                drop_fn: drop_ptr::<T>,
+                serde: None,
+            },
+        );
         self.type_to_id.insert(type_id, id);
         id
     }
@@ -299,5 +301,7 @@ impl ComponentRegistry {
 }
 
 impl Default for ComponentRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

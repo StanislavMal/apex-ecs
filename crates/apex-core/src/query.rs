@@ -1,3 +1,4 @@
+use crate::par_utils::compute_par_chunks;
 use crate::{
     access::{AccessDescriptor, ArchetypeMask},
     archetype::Archetype,
@@ -7,7 +8,6 @@ use crate::{
     system_param::WorldQuerySystemAccess,
     world::World,
 };
-use crate::par_utils::compute_par_chunks;
 
 // ── WorldQuery ─────────────────────────────────────────────────
 
@@ -28,13 +28,19 @@ pub trait WorldQuery: Sized {
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State;
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
-    fn is_filter() -> bool { false }
+    fn is_filter() -> bool {
+        false
+    }
     /// Возвращает true для компонентов, которые ДОЛЖНЫ присутствовать.
     /// Для Without<T> возвращает false.
-    fn is_positive() -> bool { true }
+    fn is_positive() -> bool {
+        true
+    }
     /// Возвращает false, если запрос может работать без всех ComponentId
     /// (например, Maybe<T> для незарегистрированного компонента).
-    fn requires_all_ids() -> bool { true }
+    fn requires_all_ids() -> bool {
+        true
+    }
 }
 
 // ── Read<T> ────────────────────────────────────────────────────
@@ -43,12 +49,17 @@ pub struct Read<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> WorldQuery for Read<T> {
     type Item<'w> = &'w T;
-    type State    = *const T;
+    type State = *const T;
 
-    #[inline] fn component_count() -> usize { 1 }
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -78,12 +89,17 @@ pub struct Write<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> WorldQuery for Write<T> {
     type Item<'w> = &'w mut T;
-    type State    = *mut T;
+    type State = *mut T;
 
-    #[inline] fn component_count() -> usize { 1 }
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -113,13 +129,21 @@ pub struct With<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> WorldQuery for With<T> {
     type Item<'w> = ();
-    type State    = ();
+    type State = ();
 
-    #[inline] fn component_count() -> usize { 1 }
-    #[inline] fn is_filter() -> bool { true }
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
+    #[inline]
+    fn is_filter() -> bool {
+        true
+    }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -129,7 +153,9 @@ impl<T: Component> WorldQuery for With<T> {
     unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick) -> Self::State {}
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> { Some(()) }
+    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
+        Some(())
+    }
 }
 
 impl<T: Component + 'static> WorldQuerySystemAccess for With<T> {
@@ -145,14 +171,25 @@ pub struct Without<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> WorldQuery for Without<T> {
     type Item<'w> = ();
-    type State    = ();
+    type State = ();
 
-    #[inline] fn component_count() -> usize { 1 }
-    #[inline] fn is_filter() -> bool { true }
-    #[inline] fn is_positive() -> bool { false }
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
+    #[inline]
+    fn is_filter() -> bool {
+        true
+    }
+    #[inline]
+    fn is_positive() -> bool {
+        false
+    }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
     }
 
     fn fill_positive_ids(_: &World, _: &mut Vec<ComponentId>) {}
@@ -164,7 +201,9 @@ impl<T: Component> WorldQuery for Without<T> {
     unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick) -> Self::State {}
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> { Some(()) }
+    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
+        Some(())
+    }
 }
 
 impl<T: Component + 'static> WorldQuerySystemAccess for Without<T> {
@@ -204,21 +243,32 @@ unsafe impl Sync for MaybeState {}
 
 impl MaybeState {
     fn absent() -> Self {
-        MaybeState { data: std::ptr::null(), item_size: 0, present: false }
+        MaybeState {
+            data: std::ptr::null(),
+            item_size: 0,
+            present: false,
+        }
     }
 }
 
 impl<T: Component> WorldQuery for Maybe<T> {
     type Item<'w> = Option<&'w T>;
-    type State    = MaybeState;
+    type State = MaybeState;
 
-    #[inline] fn component_count() -> usize { 1 }
-
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    #[inline]
+    fn component_count() -> usize {
+        1
     }
 
-    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool { true }
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
+    }
+
+    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
+        true
+    }
 
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
         if ids.is_empty() || !arch.has_component(ids[0]) {
@@ -226,7 +276,11 @@ impl<T: Component> WorldQuery for Maybe<T> {
         }
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
-        MaybeState { data: col.data, item_size: col.item_size, present: true }
+        MaybeState {
+            data: col.data,
+            item_size: col.item_size,
+            present: true,
+        }
     }
 
     #[inline(always)]
@@ -243,7 +297,9 @@ impl<T: Component> WorldQuery for Maybe<T> {
         }
     }
 
-    fn requires_all_ids() -> bool { false }
+    fn requires_all_ids() -> bool {
+        false
+    }
 }
 
 impl<T: Component + 'static> WorldQuerySystemAccess for Maybe<T> {
@@ -271,21 +327,32 @@ unsafe impl Sync for MaybeMutState {}
 
 impl MaybeMutState {
     fn absent() -> Self {
-        MaybeMutState { data: std::ptr::null_mut(), item_size: 0, present: false }
+        MaybeMutState {
+            data: std::ptr::null_mut(),
+            item_size: 0,
+            present: false,
+        }
     }
 }
 
 impl<T: Component> WorldQuery for MaybeWrite<T> {
     type Item<'w> = Option<&'w mut T>;
-    type State    = MaybeMutState;
+    type State = MaybeMutState;
 
-    #[inline] fn component_count() -> usize { 1 }
-
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+    #[inline]
+    fn component_count() -> usize {
+        1
     }
 
-    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool { true }
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
+    }
+
+    fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
+        true
+    }
 
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
         if ids.is_empty() || !arch.has_component(ids[0]) {
@@ -293,7 +360,11 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         }
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
-        MaybeMutState { data: col.data as *mut u8, item_size: col.item_size, present: true }
+        MaybeMutState {
+            data: col.data as *mut u8,
+            item_size: col.item_size,
+            present: true,
+        }
     }
 
     #[inline(always)]
@@ -302,14 +373,18 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
             if state.item_size == 0 {
                 Some(Some(&mut *std::ptr::NonNull::<T>::dangling().as_ptr()))
             } else {
-                Some(Some(&mut *(state.data.add(row * state.item_size) as *mut T)))
+                Some(Some(
+                    &mut *(state.data.add(row * state.item_size) as *mut T),
+                ))
             }
         } else {
             Some(None)
         }
     }
 
-    fn requires_all_ids() -> bool { false }
+    fn requires_all_ids() -> bool {
+        false
+    }
 }
 
 impl<T: Component + 'static> WorldQuerySystemAccess for MaybeWrite<T> {
@@ -324,7 +399,7 @@ pub struct Changed<T: Component>(std::marker::PhantomData<T>);
 
 #[derive(Clone, Copy)]
 pub struct ChangedState {
-    ticks:    *const Tick,
+    ticks: *const Tick,
     last_run: Tick,
 }
 
@@ -333,13 +408,21 @@ unsafe impl Sync for ChangedState {}
 
 impl<T: Component> WorldQuery for Changed<T> {
     type Item<'w> = ();
-    type State    = ChangedState;
+    type State = ChangedState;
 
-    #[inline] fn component_count() -> usize { 1 }
-    #[inline] fn is_filter() -> bool { true }
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
+    #[inline]
+    fn is_filter() -> bool {
+        true
+    }
 
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() { ids.push(id); }
+        if let Some(id) = world.registry.get_id::<T>() {
+            ids.push(id);
+        }
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -349,7 +432,10 @@ impl<T: Component> WorldQuery for Changed<T> {
     unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
-        ChangedState { ticks: col.ticks_ptr(), last_run }
+        ChangedState {
+            ticks: col.ticks_ptr(),
+            last_run,
+        }
     }
 
     #[inline(always)]
@@ -446,15 +532,22 @@ impl WorldQuery for () {
     type Item<'w> = ();
     type State = ();
 
-    fn component_count() -> usize { 0 }
+    fn component_count() -> usize {
+        0
+    }
 
     fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
 
-    fn matches_archetype(_arch: &Archetype, _ids: &[ComponentId]) -> bool { true }
+    fn matches_archetype(_arch: &Archetype, _ids: &[ComponentId]) -> bool {
+        true
+    }
 
-    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {}
+    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {
+    }
 
-    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> { Some(()) }
+    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> {
+        Some(())
+    }
 }
 
 impl WorldQuerySystemAccess for () {
@@ -470,23 +563,32 @@ impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
 impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
-impl_world_query_tuple!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6), (H, 7));
+impl_world_query_tuple!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7)
+);
 
 // ── ArchState ──────────────────────────────────────────────────
 
 pub(crate) struct ArchState<S> {
     pub arch_idx: usize,
-    pub state:    S,
-    pub len:      usize,
+    pub state: S,
+    pub len: usize,
 }
 
 // ── Query<Q> ───────────────────────────────────────────────────
 
 pub struct Query<'w, Q: WorldQuery> {
-    world:      &'w World,
+    world: &'w World,
     archetypes: Vec<ArchState<Q::State>>,
     #[allow(dead_code)]
-    last_run:   Tick,
+    last_run: Tick,
     /// Ограничения строк для row-level splits.
     /// Если не пусто — итерация ограничена `(arch_idx, start, end)`.
     row_ranges: &'w [(usize, usize, usize)],
@@ -509,11 +611,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     /// Создать Query, перебирающий только указанные архетипы.
     /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
-    fn new_within_archetypes(
-        world: &'w World,
-        arch_indices: &[usize],
-        last_run: Tick,
-    ) -> Self {
+    fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
         let mut positive_ids = Vec::with_capacity(Q::component_count());
@@ -539,20 +637,32 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
 
-        let archetypes: Vec<ArchState<Q::State>> = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
-            arch_indices.iter()
-                .copied()
-                .filter(|&arch_idx| arch_filter(arch_idx))
-                .map(|arch_idx| {
-                    let state = unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run) };
-                    ArchState { arch_idx, state, len: world.archetypes[arch_idx].len() }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let archetypes: Vec<ArchState<Q::State>> =
+            if ids.len() == Q::component_count() || !Q::requires_all_ids() {
+                arch_indices
+                    .iter()
+                    .copied()
+                    .filter(|&arch_idx| arch_filter(arch_idx))
+                    .map(|arch_idx| {
+                        let state =
+                            unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run) };
+                        ArchState {
+                            arch_idx,
+                            state,
+                            len: world.archetypes[arch_idx].len(),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-        Self { world, archetypes, last_run, row_ranges: &[] }
+        Self {
+            world,
+            archetypes,
+            last_run,
+            row_ranges: &[],
+        }
     }
 
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
@@ -589,32 +699,55 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             // Линейный обход архетипов — быстрее для малых запросов (≤3 компонента)
             // и малых миров (≤128 архетипов). ComponentArchIndex даёт выигрыш только
             // для больших миров (500+ архетипов) и запросов с 4+ компонентами.
-            if !positive_ids.is_empty() && (positive_ids.len() <= 3 || world.archetypes.len() <= 128) {
+            if !positive_ids.is_empty()
+                && (positive_ids.len() <= 3 || world.archetypes.len() <= 128)
+            {
                 // Линейный обход: O(N) по числу архетипов, без HashMap lookup'ов
-                world.archetypes.iter().enumerate()
+                world
+                    .archetypes
+                    .iter()
+                    .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-                        ArchState { arch_idx, state, len: arch.len() }
+                        ArchState {
+                            arch_idx,
+                            state,
+                            len: arch.len(),
+                        }
                     })
                     .collect()
             } else if positive_ids.is_empty() && !ids.is_empty() {
                 // Только Without-компоненты (нет positive) — используем exclude_mask
                 // для отсеивания архетипов, которые содержат excluding-компонент
-                world.archetypes.iter().enumerate()
+                world
+                    .archetypes
+                    .iter()
+                    .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-                        ArchState { arch_idx, state, len: arch.len() }
+                        ArchState {
+                            arch_idx,
+                            state,
+                            len: arch.len(),
+                        }
                     })
                     .collect()
             } else if positive_ids.is_empty() {
                 // Запрос без компонентов — все архетипы
-                world.archetypes.iter().enumerate()
+                world
+                    .archetypes
+                    .iter()
+                    .enumerate()
                     .filter(|(_, arch)| !arch.is_empty())
                     .map(|(arch_idx, arch)| {
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-                        ArchState { arch_idx, state, len: arch.len() }
+                        ArchState {
+                            arch_idx,
+                            state,
+                            len: arch.len(),
+                        }
                     })
                     .collect()
             } else {
@@ -622,26 +755,28 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 // распространённый компонент. Для больших миров (500+ архетипов)
                 // и сложных запросов (4+ компонентов) это K << N.
                 let candidate_archetypes = {
-                    let smallest = positive_ids.iter()
+                    let smallest = positive_ids
+                        .iter()
                         .filter_map(|id| world.component_arch_index.get(id))
                         .min_by_key(|v| v.len());
 
                     match smallest {
-                        Some(arch_ids) => arch_ids.iter()
-                            .map(|id| id.0 as usize)
-                            .collect(),
-                        None => {
-                            (0..world.archetypes.len()).collect::<Vec<_>>()
-                        }
+                        Some(arch_ids) => arch_ids.iter().map(|id| id.0 as usize).collect(),
+                        None => (0..world.archetypes.len()).collect::<Vec<_>>(),
                     }
                 };
 
-                candidate_archetypes.into_iter()
+                candidate_archetypes
+                    .into_iter()
                     .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let arch = &world.archetypes[arch_idx];
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
-                        ArchState { arch_idx, state, len: arch.len() }
+                        ArchState {
+                            arch_idx,
+                            state,
+                            len: arch.len(),
+                        }
                     })
                     .collect()
             }
@@ -649,12 +784,18 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             Vec::new()
         };
 
-        Self { world, archetypes, last_run, row_ranges: &[] }
+        Self {
+            world,
+            archetypes,
+            last_run,
+            row_ranges: &[],
+        }
     }
 
     /// Получить диапазон строк для архетипа, если есть row_ranges.
     fn row_range(&self, arch_idx: usize) -> (usize, usize) {
-        self.row_ranges.iter()
+        self.row_ranges
+            .iter()
             .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
             .unwrap_or((0, usize::MAX))
     }
@@ -673,7 +814,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     /// Consuming итератор — для использования в ParamQuery.
     #[allow(dead_code)]
     pub(crate) fn into_iter_owned(self) -> QueryIterOwned<'w, Q> {
-        QueryIterOwned { query: self, arch_cursor: 0, row_cursor: 0 }
+        QueryIterOwned {
+            query: self,
+            arch_cursor: 0,
+            row_cursor: 0,
+        }
     }
 
     #[inline]
@@ -682,7 +827,9 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             let (row_start, row_end) = self.row_range(a.arch_idx);
             let end = row_end.min(a.len);
             let len = end.saturating_sub(row_start);
-            if len == 0 { continue; }
+            if len == 0 {
+                continue;
+            }
             let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = row_start + offset;
@@ -713,7 +860,8 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
         let row_ranges = self.row_ranges;
         let rr = |arch_idx: usize| -> (usize, usize) {
-            row_ranges.iter()
+            row_ranges
+                .iter()
                 .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
                 .unwrap_or((0, usize::MAX))
         };
@@ -734,7 +882,9 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             let (r_start, r_end) = rr(arch_idx);
             let clamped_start = r_start + start;
             let clamped_end = (r_start + end).min(r_end);
-            if clamped_start >= clamped_end { return; }
+            if clamped_start >= clamped_end {
+                return;
+            }
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
             let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
             let entities = &arch.entities[clamped_start..clamped_end];
@@ -759,11 +909,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 // ── Итераторы ──────────────────────────────────────────────────
 
 pub struct QueryIter<'q, Q: WorldQuery> {
-    archetypes:  &'q [ArchState<Q::State>],
-    world:       &'q World,
+    archetypes: &'q [ArchState<Q::State>],
+    world: &'q World,
     arch_cursor: usize,
-    row_cursor:  usize,
-    row_ranges:  &'q [(usize, usize, usize)],
+    row_cursor: usize,
+    row_ranges: &'q [(usize, usize, usize)],
 }
 
 impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
@@ -780,7 +930,7 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
             }
             if self.row_cursor >= effective_end {
                 self.arch_cursor += 1;
-                self.row_cursor  = 0;
+                self.row_cursor = 0;
                 continue;
             }
             let row = self.row_cursor;
@@ -795,16 +945,17 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
 
 impl<'q, Q: WorldQuery> QueryIter<'q, Q> {
     fn row_range(&self, arch_idx: usize) -> (usize, usize) {
-        self.row_ranges.iter()
+        self.row_ranges
+            .iter()
             .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
             .unwrap_or((0, usize::MAX))
     }
 }
 
 pub struct QueryIterOwned<'w, Q: WorldQuery> {
-    query:       Query<'w, Q>,
+    query: Query<'w, Q>,
     arch_cursor: usize,
-    row_cursor:  usize,
+    row_cursor: usize,
 }
 
 impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
@@ -821,7 +972,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
             }
             if self.row_cursor >= effective_end {
                 self.arch_cursor += 1;
-                self.row_cursor  = 0;
+                self.row_cursor = 0;
                 continue;
             }
             let row = self.row_cursor;
@@ -837,34 +988,48 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
 // ── QueryBuilder ───────────────────────────────────────────────
 
 pub struct QueryBuilder<'w> {
-    world:    &'w World,
-    reads:    Vec<ComponentId>,
-    writes:   Vec<ComponentId>,
+    world: &'w World,
+    reads: Vec<ComponentId>,
+    writes: Vec<ComponentId>,
     excludes: Vec<ComponentId>,
 }
 
 impl<'w> QueryBuilder<'w> {
     pub fn new(world: &'w World) -> Self {
-        Self { world, reads: Vec::new(), writes: Vec::new(), excludes: Vec::new() }
+        Self {
+            world,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            excludes: Vec::new(),
+        }
     }
 
     pub fn read<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() { self.reads.push(id); }
+        if let Some(id) = self.world.registry.get_id::<T>() {
+            self.reads.push(id);
+        }
         self
     }
 
     pub fn write<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() { self.writes.push(id); }
+        if let Some(id) = self.world.registry.get_id::<T>() {
+            self.writes.push(id);
+        }
         self
     }
 
     pub fn exclude<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() { self.excludes.push(id); }
+        if let Some(id) = self.world.registry.get_id::<T>() {
+            self.excludes.push(id);
+        }
         self
     }
 
     pub fn matching_archetype_ids(&self) -> Vec<usize> {
-        self.world.archetypes.iter().enumerate()
+        self.world
+            .archetypes
+            .iter()
+            .enumerate()
             .filter(|(_, arch)| self.matches_arch(arch))
             .map(|(i, _)| i)
             .collect()
@@ -906,12 +1071,20 @@ mod tests {
         // Query<Read<A>, Without<B>> должен вернуть только e1
         let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
-        assert_eq!(results, vec![e1], "Without<B> должен исключить сущности с B");
+        assert_eq!(
+            results,
+            vec![e1],
+            "Without<B> должен исключить сущности с B"
+        );
 
         // Query<Read<B>, Without<A>> должен вернуть только e3
         let query: Query<'_, (Read<B>, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
-        assert_eq!(results, vec![e3], "Without<A> должен исключить сущности с A");
+        assert_eq!(
+            results,
+            vec![e3],
+            "Without<A> должен исключить сущности с A"
+        );
 
         // Query<Without<A>, Without<B>> — пустой результат (все имеют хотя бы один компонент)
         let query: Query<'_, (Without<A>, Without<B>)> = Query::new(&world);
@@ -955,7 +1128,11 @@ mod tests {
         // Чистый Without<A> — все сущности без A
         let query: Query<'_, Without<A>> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
-        assert_eq!(results, vec![e2], "Without<A> должен вернуть сущности без A");
+        assert_eq!(
+            results,
+            vec![e2],
+            "Without<A> должен вернуть сущности без A"
+        );
     }
 
     #[test]
@@ -979,9 +1156,7 @@ mod tests {
         world.spawn((B,));
 
         let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
-        let results: Vec<_> = query.iter()
-            .map(|(_, (_, b))| b.is_some())
-            .collect();
+        let results: Vec<_> = query.iter().map(|(_, (_, b))| b.is_some()).collect();
 
         assert_eq!(results.len(), 2, "Должно быть 2 сущности с A");
         // e1 имеет A+B → b.is_some() == true
@@ -998,7 +1173,8 @@ mod tests {
 
         // Опциональная запись: у кого есть B — удваиваем
         let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new(&world);
-        let results: Vec<_> = query.iter()
+        let results: Vec<_> = query
+            .iter()
             .map(|(_, (_, b_opt))| b_opt.is_some())
             .collect();
 
@@ -1037,7 +1213,8 @@ mod tests {
 
         // (Maybe<A>, Maybe<C>) — все entity
         let query: Query<'_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
-        let results: Vec<_> = query.iter()
+        let results: Vec<_> = query
+            .iter()
             .map(|(_, (a, c))| (a.is_some(), c.is_some()))
             .collect();
 

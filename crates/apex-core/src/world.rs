@@ -1,22 +1,22 @@
-use std::cell::UnsafeCell;
-use std::any::TypeId;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::any::TypeId;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::RwLock;
 
 use crate::{
     archetype::{Archetype, ArchetypeId},
     commands::Commands,
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
-    entity::{EntityAllocator, EntityLocation, Entity},
+    entity::{Entity, EntityAllocator, EntityLocation},
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
     relations::{IdIndex, RelationRegistry, SubjectIndex},
     resources::Resources,
     sub_world::SubWorld,
-    system_param::{Res, ResMut, EventReader, EventWriter},
+    system_param::{EventReader, EventWriter, Res, ResMut},
     template::TemplateRegistry,
 };
 
@@ -24,7 +24,7 @@ use crate::{
 
 struct CacheEntry {
     arch_indices: Arc<[usize]>,
-    version:      u32,
+    version: u32,
 }
 
 /// Обёртка над SmallVec для zero-copy lookup через Borrow<[ComponentId]>.
@@ -52,9 +52,9 @@ impl QueryCache {
 
     pub fn get_or_compute(
         &self,
-        key:        &[ComponentId],
+        key: &[ComponentId],
         archetypes: &[Archetype],
-        matches:    impl Fn(&Archetype) -> bool,
+        matches: impl Fn(&Archetype) -> bool,
     ) -> Arc<[usize]> {
         let current_version = self.version.load(Ordering::Acquire);
 
@@ -86,10 +86,13 @@ impl QueryCache {
         }
 
         let query_key = QueryCacheKey(key.iter().copied().collect());
-        map.insert(query_key, CacheEntry {
-            arch_indices: arch_indices.clone(),
-            version:      current_version,
-        });
+        map.insert(
+            query_key,
+            CacheEntry {
+                arch_indices: arch_indices.clone(),
+                version: current_version,
+            },
+        );
 
         arch_indices
     }
@@ -136,29 +139,29 @@ impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
 // ── World ──────────────────────────────────────────────────────
 
 pub struct World {
-    pub(crate) entities:             EntityAllocator,
-    pub(crate) registry:             ComponentRegistry,
-    pub archetypes:           Vec<Archetype>,
-    pub(crate) archetype_index:      FxHashMap<ArchetypeKey, ArchetypeId>,
+    pub(crate) entities: EntityAllocator,
+    pub(crate) registry: ComponentRegistry,
+    pub archetypes: Vec<Archetype>,
+    pub(crate) archetype_index: FxHashMap<ArchetypeKey, ArchetypeId>,
     /// Индекс компонент → список архетипов, содержащих этот компонент.
     /// Используется в Query::new_with_tick для O(1) поиска архетипов-кандидатов
     /// вместо линейного обхода всех архетипов.
     pub(crate) component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>,
-    pub(crate) current_tick:         Tick,
-    pub(crate) query_cache:          QueryCache,
-    pub(crate) relations:            RelationRegistry,
-    pub(crate) id_index:             IdIndex,
-    pub(crate) subject_index:        SubjectIndex,
-    pub        resources:       Resources,
-    pub(crate) events:          EventRegistry,
+    pub(crate) current_tick: Tick,
+    pub(crate) query_cache: QueryCache,
+    pub(crate) relations: RelationRegistry,
+    pub(crate) id_index: IdIndex,
+    pub(crate) subject_index: SubjectIndex,
+    pub resources: Resources,
+    pub(crate) events: EventRegistry,
     /// Коллбэки, вызываемые при записи компонента (вызове get_mut).
     /// Функция-указатель (Copy), чтобы избежать borrow conflict с self.
     /// Ключ — ComponentId.
-    pub(crate) write_hooks:     FxHashMap<ComponentId, fn(Entity, &mut World)>,
+    pub(crate) write_hooks: FxHashMap<ComponentId, fn(Entity, &mut World)>,
     /// Реестр именованных шаблонов (EntityTemplate).
-    pub(crate) templates:       TemplateRegistry,
+    pub(crate) templates: TemplateRegistry,
     /// Конфигурация чанкования для параллельной итерации.
-    pub(crate) chunk_config:    ChunkConfig,
+    pub(crate) chunk_config: ChunkConfig,
 }
 
 impl World {
@@ -166,24 +169,28 @@ impl World {
         let mut registry = ComponentRegistry::new();
         registry.register_all_auto();
         let mut world = Self {
-            entities:        EntityAllocator::new(),
+            entities: EntityAllocator::new(),
             registry,
-            archetypes:      Vec::new(),
-            archetype_index:      FxHashMap::default(),
+            archetypes: Vec::new(),
+            archetype_index: FxHashMap::default(),
             component_arch_index: FxHashMap::default(),
-            current_tick:    Tick(1),
-            query_cache:     QueryCache::new(),
-            relations:       RelationRegistry::new(),
-            id_index:        IdIndex::default(),
-            subject_index:   SubjectIndex::new(),
-            resources:       Resources::new(),
-            events:          EventRegistry::new(),
-            write_hooks:     FxHashMap::default(),
-            templates:       TemplateRegistry::new(),
-            chunk_config:    ChunkConfig::default(),
+            current_tick: Tick(1),
+            query_cache: QueryCache::new(),
+            relations: RelationRegistry::new(),
+            id_index: IdIndex::default(),
+            subject_index: SubjectIndex::new(),
+            resources: Resources::new(),
+            events: EventRegistry::new(),
+            write_hooks: FxHashMap::default(),
+            templates: TemplateRegistry::new(),
+            chunk_config: ChunkConfig::default(),
         };
-        world.archetypes.push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
-        world.archetype_index.insert(ArchetypeKey(SmallVec::new()), ArchetypeId::EMPTY);
+        world
+            .archetypes
+            .push(Archetype::new(ArchetypeId::EMPTY, SmallVec::new(), &[]));
+        world
+            .archetype_index
+            .insert(ArchetypeKey(SmallVec::new()), ArchetypeId::EMPTY);
         world
     }
 
@@ -203,14 +210,24 @@ impl World {
         self.events.flush_all();
     }
 
-    pub fn current_tick(&self)    -> Tick  { self.current_tick }
-    pub fn entity_count(&self)    -> usize { self.entities.len() }
-    pub fn archetype_count(&self) -> usize { self.archetypes.len() }
-    pub fn resource_count(&self)  -> usize { self.resources.len() }
+    pub fn current_tick(&self) -> Tick {
+        self.current_tick
+    }
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+    pub fn archetype_count(&self) -> usize {
+        self.archetypes.len()
+    }
+    pub fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
 
     /// Получить текущую конфигурацию чанкования.
     #[inline]
-    pub fn chunk_config(&self) -> &ChunkConfig { &self.chunk_config }
+    pub fn chunk_config(&self) -> &ChunkConfig {
+        &self.chunk_config
+    }
 
     /// Установить конфигурацию чанкования.
     #[inline]
@@ -224,7 +241,9 @@ impl World {
     /// После вызова `entity_count()` вернёт 0, но ресурсы и компоненты останутся.
     pub fn clear_entities(&mut self) {
         // Collect all entity IDs first to avoid borrow issues
-        let entities: Vec<Entity> = self.archetypes.iter()
+        let entities: Vec<Entity> = self
+            .archetypes
+            .iter()
             .flat_map(|a| a.entities.iter().copied())
             .collect();
         for entity in entities {
@@ -241,26 +260,43 @@ impl World {
     }
 
     /// Зарегистрировать компонент с поддержкой сериализации в JSON-формате.
-    pub fn register_component_serde_json<T: crate::component::Serializable>(&mut self) -> ComponentId {
+    pub fn register_component_serde_json<T: crate::component::Serializable>(
+        &mut self,
+    ) -> ComponentId {
         self.registry.register_serde_json::<T>()
     }
 
-    pub fn registry(&self) -> &ComponentRegistry { &self.registry }
+    pub fn registry(&self) -> &ComponentRegistry {
+        &self.registry
+    }
 
     /// Мутабельный доступ к реестру компонентов.
-    pub fn registry_mut(&mut self) -> &mut ComponentRegistry { &mut self.registry }
+    pub fn registry_mut(&mut self) -> &mut ComponentRegistry {
+        &mut self.registry
+    }
 
-    pub fn archetypes(&self) -> &[Archetype] { &self.archetypes }
+    pub fn archetypes(&self) -> &[Archetype] {
+        &self.archetypes
+    }
 
-    pub fn relation_registry(&self) -> &RelationRegistry { &self.relations }
+    pub fn relation_registry(&self) -> &RelationRegistry {
+        &self.relations
+    }
 
-    pub fn relation_registry_mut(&mut self) -> &mut RelationRegistry { &mut self.relations }
+    pub fn relation_registry_mut(&mut self) -> &mut RelationRegistry {
+        &mut self.relations
+    }
 
     pub fn subject_index_raw(&self, entity_index: u32) -> Vec<u32> {
         self.subject_index.get_all(entity_index)
     }
 
-    pub fn insert_relation_raw(&mut self, subject: Entity, relation_id: ComponentId, _target: Entity) {
+    pub fn insert_relation_raw(
+        &mut self,
+        subject: Entity,
+        relation_id: ComponentId,
+        _target: Entity,
+    ) {
         self.ensure_relation_component(relation_id);
         self.subject_index.add(subject.index, relation_id);
         self.insert_relation_component(subject, relation_id);
@@ -273,10 +309,10 @@ impl World {
     #[inline]
     pub fn insert_raw_pub(
         &mut self,
-        entity:       Entity,
+        entity: Entity,
         component_id: ComponentId,
-        data:         Vec<u8>,
-        tick:         Tick,
+        data: Vec<u8>,
+        tick: Tick,
     ) {
         self.insert_raw(entity, component_id, data, tick);
     }
@@ -288,7 +324,7 @@ impl World {
     /// и корректность AccessDescriptor всех параллельных систем.
     pub unsafe fn as_parallel_world(&self) -> ParallelWorld<'_> {
         ParallelWorld {
-            world:   self as *const World,
+            world: self as *const World,
             _marker: std::marker::PhantomData,
         }
     }
@@ -387,7 +423,8 @@ impl World {
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
-            let ptr = self.event_queue_ptr::<T>()
+            let ptr = self
+                .event_queue_ptr::<T>()
                 .expect("event_reader: event type not registered");
             EventReader::new(&mut *ptr)
         }
@@ -399,7 +436,8 @@ impl World {
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
-            let ptr = self.event_queue_ptr::<T>()
+            let ptr = self
+                .event_queue_ptr::<T>()
                 .expect("event_writer: event type not registered");
             EventWriter::from_ptr(ptr)
         }
@@ -417,21 +455,32 @@ impl World {
         if ids.is_empty() {
             // Быстрый путь для пустой entity (spawn(()))
             let entity = self.entities.allocate();
-            let row    = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
-            self.entities.set_location(entity, EntityLocation {
-                archetype_id: ArchetypeId::EMPTY,
-                row,
-            });
+            let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
+            self.entities.set_location(
+                entity,
+                EntityLocation {
+                    archetype_id: ArchetypeId::EMPTY,
+                    row,
+                },
+            );
             return entity;
         }
         // Обычный путь
         let archetype_id = self.get_or_create_archetype(&ids);
-        let entity       = self.entities.allocate();
-        let row          = self.archetypes[archetype_id.0 as usize].entities.len();
-        let tick         = self.current_tick;
-        self.archetypes[archetype_id.0 as usize].entities.push(entity);
+        let entity = self.entities.allocate();
+        let row = self.archetypes[archetype_id.0 as usize].entities.len();
+        let tick = self.current_tick;
+        self.archetypes[archetype_id.0 as usize]
+            .entities
+            .push(entity);
         bundle.write_into(self, archetype_id, row, tick);
-        self.entities.set_location(entity, EntityLocation { archetype_id, row: row as u32 });
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype_id,
+                row: row as u32,
+            },
+        );
         entity
     }
 
@@ -443,16 +492,18 @@ impl World {
         B: Bundle,
         F: FnMut(usize) -> B,
     {
-        if count == 0 { return Vec::new(); }
+        if count == 0 {
+            return Vec::new();
+        }
 
-        let probe        = make_bundle(0);
-        let ids          = probe.component_ids(&mut self.registry);
+        let probe = make_bundle(0);
+        let ids = probe.component_ids(&mut self.registry);
         drop(probe);
 
         let archetype_id = self.get_or_create_archetype(&ids);
-        let arch_idx     = archetype_id.0 as usize;
-        let start_row    = self.archetypes[arch_idx].entities.len();
-        let tick         = self.current_tick;
+        let arch_idx = archetype_id.0 as usize;
+        let start_row = self.archetypes[arch_idx].entities.len();
+        let tick = self.current_tick;
 
         self.archetypes[arch_idx].entities.reserve(count);
         for col in &mut self.archetypes[arch_idx].columns {
@@ -466,10 +517,9 @@ impl World {
         // в write_into для каждой entity (экономит ~40k HashMap lookup'ов при 10k entity).
         // Храним только позиционный индекс колонки — без ComponentId,
         // так как порядок col_indices соответствует порядку ids.
-        let col_indices: SmallVec<[usize; 8]> = ids.iter()
-            .filter_map(|&id| {
-                self.archetypes[arch_idx].column_index(id)
-            })
+        let col_indices: SmallVec<[usize; 8]> = ids
+            .iter()
+            .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
             .collect();
 
         // Порог: для 1 компонента per-entity loop быстрее, чем bulk copy.
@@ -482,7 +532,7 @@ impl World {
         if col_indices.len() <= 1 || needs_drop {
             // Per-entity loop — старый подход, быстрее для малого числа компонентов.
             for (i, &entity) in entities.iter().enumerate() {
-                let row    = start_row + i;
+                let row = start_row + i;
                 let bundle = make_bundle(i);
                 self.archetypes[arch_idx].entities.push(entity);
                 bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
@@ -492,8 +542,8 @@ impl World {
             // Для Copy-компонентов это позволяет нам затем bulk-копировать данные из первой
             // строки во все последующие, избегая 10,000 вызовов make_bundle и 40,000 поисков
             // в col_indices.iter().find() (как в Legion SOA подходе).
-            let first_entity  = entities[0];
-            let first_bundle  = make_bundle(0);
+            let first_entity = entities[0];
+            let first_bundle = make_bundle(0);
             self.archetypes[arch_idx].entities.push(first_entity);
             first_bundle.write_into_batch(self, archetype_id, start_row, tick, &col_indices);
 
@@ -518,7 +568,8 @@ impl World {
             }
         }
 
-        self.entities.set_locations_batch(&entities, archetype_id, start_row as u32);
+        self.entities
+            .set_locations_batch(&entities, archetype_id, start_row as u32);
         entities
     }
 
@@ -573,9 +624,9 @@ impl World {
 
     pub fn insert<T: Component>(&mut self, entity: Entity, component: T) {
         let component_id = self.registry.get_or_register::<T>();
-        let location     = match self.entities.get_location(entity) {
+        let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return,
+            None => return,
         };
         let current_idx = location.archetype_id.0 as usize;
 
@@ -584,7 +635,11 @@ impl World {
             unsafe {
                 if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                     let col = &mut self.archetypes[current_idx].columns[col_idx];
-                    col.write_at(location.row as usize, &component as *const T as *const u8, tick);
+                    col.write_at(
+                        location.row as usize,
+                        &component as *const T as *const u8,
+                        tick,
+                    );
                 }
             }
             std::mem::forget(component);
@@ -593,30 +648,37 @@ impl World {
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
         self.query_cache.invalidate();
-        let new_row     = self.move_entity(entity, location, new_arch_id);
-        let tick        = self.current_tick;
+        let new_row = self.move_entity(entity, location, new_arch_id);
+        let tick = self.current_tick;
         unsafe {
-            self.archetypes[new_arch_id.0 as usize]
-                .write_component(new_row as usize, component_id, &component as *const T as *const u8, tick);
+            self.archetypes[new_arch_id.0 as usize].write_component(
+                new_row as usize,
+                component_id,
+                &component as *const T as *const u8,
+                tick,
+            );
         }
         std::mem::forget(component);
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row as u32,
-        });
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row as u32,
+            },
+        );
     }
 
     /// Вставить компонент по raw данным.
     pub(crate) fn insert_raw(
         &mut self,
-        entity:       Entity,
+        entity: Entity,
         component_id: ComponentId,
-        data:         Vec<u8>,
-        tick:         Tick,
+        data: Vec<u8>,
+        tick: Tick,
     ) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return,
+            None => return,
         };
         let current_idx = location.archetype_id.0 as usize;
 
@@ -634,77 +696,91 @@ impl World {
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
         self.query_cache.invalidate();
-        let new_row     = self.move_entity(entity, location, new_arch_id);
+        let new_row = self.move_entity(entity, location, new_arch_id);
         unsafe {
-            self.archetypes[new_arch_id.0 as usize]
-                .write_component(new_row as usize, component_id, data.as_ptr(), tick);
+            self.archetypes[new_arch_id.0 as usize].write_component(
+                new_row as usize,
+                component_id,
+                data.as_ptr(),
+                tick,
+            );
         }
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row as u32,
-        });
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row as u32,
+            },
+        );
     }
 
     /// Удалить компонент по raw ComponentId.
     pub(crate) fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return,
+            None => return,
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
             return;
         }
-        let new_arch_id = self.find_or_create_archetype_without(
-            location.archetype_id,
-            component_id,
-        );
+        let new_arch_id =
+            self.find_or_create_archetype_without(location.archetype_id, component_id);
         self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row as u32,
-        });
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row as u32,
+            },
+        );
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> bool {
         let component_id = match self.registry.get_id::<T>() {
             Some(id) => id,
-            None     => return false,
+            None => return false,
         };
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return false,
+            None => return false,
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
             return false;
         }
-        let new_arch_id = self.find_or_create_archetype_without(
-            location.archetype_id,
-            component_id,
-        );
+        let new_arch_id =
+            self.find_or_create_archetype_without(location.archetype_id, component_id);
         self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
-        self.entities.set_location(entity, EntityLocation {
-            archetype_id: new_arch_id,
-            row:          new_row as u32,
-        });
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype_id: new_arch_id,
+                row: new_row as u32,
+            },
+        );
         true
     }
 
     pub fn despawn(&mut self, entity: Entity) -> bool {
-        if !self.entities.is_alive(entity) { return false; }
+        if !self.entities.is_alive(entity) {
+            return false;
+        }
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None      => return false,
+            None => return false,
         };
         self.subject_index.clear_entity(entity.index);
         let arch_idx = location.archetype_id.0 as usize;
         unsafe {
             if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row as usize) {
-                self.entities.set_location(displaced, EntityLocation {
-                    archetype_id: location.archetype_id,
-                    row:          location.row,
-                });
+                self.entities.set_location(
+                    displaced,
+                    EntityLocation {
+                        archetype_id: location.archetype_id,
+                        row: location.row,
+                    },
+                );
             }
         }
         self.entities.free(entity);
@@ -716,7 +792,7 @@ impl World {
     #[inline]
     pub fn get<T: Component>(&self, entity: Entity) -> Option<&T> {
         let component_id = self.registry.get_id::<T>()?;
-        let location     = self.entities.get_location(entity)?;
+        let location = self.entities.get_location(entity)?;
         unsafe {
             self.archetypes[location.archetype_id.0 as usize]
                 .get_component::<T>(location.row as usize, component_id)
@@ -726,8 +802,8 @@ impl World {
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         let component_id = self.registry.get_id::<T>()?;
-        let location     = self.entities.get_location(entity)?;
-        let tick         = self.current_tick;
+        let location = self.entities.get_location(entity)?;
+        let tick = self.current_tick;
 
         // 1. Обновляем tick изменения (change detection)
         {
@@ -749,8 +825,8 @@ impl World {
 
         // 3. Перепроверяем location (хук мог изменить archetype) и получаем ссылку
         let location2 = self.entities.get_location(entity)?;
-        let arch      = &mut self.archetypes[location2.archetype_id.0 as usize];
-        let col_idx   = arch.column_index(component_id)?;
+        let arch = &mut self.archetypes[location2.archetype_id.0 as usize];
+        let col_idx = arch.column_index(component_id)?;
         unsafe { Some(arch.columns[col_idx].get_mut::<T>(location2.row as usize)) }
     }
 
@@ -759,25 +835,28 @@ impl World {
     ///
     /// Используется, например, для автоматической пометки TransformDirty
     /// при изменении LocalTransform.
-    pub fn register_write_hook<T: Component>(
-        &mut self,
-        hook: fn(Entity, &mut World),
-    ) {
+    pub fn register_write_hook<T: Component>(&mut self, hook: fn(Entity, &mut World)) {
         if let Some(cid) = self.registry.get_id::<T>() {
             self.write_hooks.insert(cid, hook);
         }
     }
 
     #[inline]
-    pub fn is_alive(&self, entity: Entity) -> bool { self.entities.is_alive(entity) }
+    pub fn is_alive(&self, entity: Entity) -> bool {
+        self.entities.is_alive(entity)
+    }
 
     /// Проверить, есть ли у сущности компонент `T`.
     ///
     /// O(1) после первого вызова для данного archetype (column_index кешируется).
     #[inline]
     pub fn has_component<T: Component>(&self, entity: Entity) -> bool {
-        let Some(cid) = self.registry.get_id::<T>() else { return false; };
-        let Some(loc) = self.entities.get_location(entity) else { return false; };
+        let Some(cid) = self.registry.get_id::<T>() else {
+            return false;
+        };
+        let Some(loc) = self.entities.get_location(entity) else {
+            return false;
+        };
         self.archetypes[loc.archetype_id.0 as usize].has_component(cid)
     }
 
@@ -791,79 +870,95 @@ impl World {
         CachedQuery::new(self, last_run)
     }
 
-    pub fn query(&self) -> QueryBuilder<'_> { QueryBuilder::new(self) }
+    pub fn query(&self) -> QueryBuilder<'_> {
+        QueryBuilder::new(self)
+    }
 
     // ── Внутренние методы ──────────────────────────────────────
 
     pub(crate) fn find_or_create_archetype_with(
         &mut self,
         current: ArchetypeId,
-        add:     ComponentId,
+        add: ComponentId,
     ) -> ArchetypeId {
         if let Some(&id) = self.archetypes[current.0 as usize].add_edges.get(&add) {
             return id;
         }
         let mut new_components: Vec<ComponentId> = self.archetypes[current.0 as usize]
-            .component_ids.iter().copied().collect();
+            .component_ids
+            .iter()
+            .copied()
+            .collect();
         new_components.push(add);
         new_components.sort_unstable();
         let new_id = self.get_or_create_archetype(&new_components);
-        self.archetypes[current.0 as usize].add_edges.insert(add, new_id);
-        self.archetypes[new_id.0 as usize].remove_edges.insert(add, current);
+        self.archetypes[current.0 as usize]
+            .add_edges
+            .insert(add, new_id);
+        self.archetypes[new_id.0 as usize]
+            .remove_edges
+            .insert(add, current);
         new_id
     }
 
     pub(crate) fn find_or_create_archetype_without(
         &mut self,
         current: ArchetypeId,
-        remove:  ComponentId,
+        remove: ComponentId,
     ) -> ArchetypeId {
-        if let Some(&id) = self.archetypes[current.0 as usize].remove_edges.get(&remove) {
+        if let Some(&id) = self.archetypes[current.0 as usize]
+            .remove_edges
+            .get(&remove)
+        {
             return id;
         }
         let new_components: Vec<ComponentId> = self.archetypes[current.0 as usize]
-            .component_ids.iter().copied()
+            .component_ids
+            .iter()
+            .copied()
             .filter(|&id| id != remove)
             .collect();
         let new_id = self.get_or_create_archetype(&new_components);
-        self.archetypes[current.0 as usize].remove_edges.insert(remove, new_id);
-        self.archetypes[new_id.0 as usize].add_edges.insert(remove, current);
+        self.archetypes[current.0 as usize]
+            .remove_edges
+            .insert(remove, new_id);
+        self.archetypes[new_id.0 as usize]
+            .add_edges
+            .insert(remove, current);
         new_id
     }
 
     #[inline(never)]
-    pub(crate) fn get_or_create_archetype(
-        &mut self,
-        components: &[ComponentId],
-    ) -> ArchetypeId {
+    pub(crate) fn get_or_create_archetype(&mut self, components: &[ComponentId]) -> ArchetypeId {
         // Borrow<[ComponentId]> — zero-copy lookup без создания ArchetypeKey
-        if let Some(&id) = self.archetype_index.get(components) { return id; }
-        let id    = ArchetypeId(self.archetypes.len() as u32);
-        let infos: Vec<&ComponentInfo> = components.iter()
+        if let Some(&id) = self.archetype_index.get(components) {
+            return id;
+        }
+        let id = ArchetypeId(self.archetypes.len() as u32);
+        let infos: Vec<&ComponentInfo> = components
+            .iter()
             .filter_map(|&cid| self.registry.get_info(cid))
             .collect();
-        let arch  = Archetype::new(id, components.iter().copied().collect(), &infos);
+        let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
         for &cid in &arch.component_ids {
             self.id_index.register_archetype(cid, id);
-            self.component_arch_index
-                .entry(cid)
-                .or_default()
-                .push(id);
+            self.component_arch_index.entry(cid).or_default().push(id);
         }
         self.archetypes.push(arch);
-        self.archetype_index.insert(ArchetypeKey::from(components), id);
+        self.archetype_index
+            .insert(ArchetypeKey::from(components), id);
         self.query_cache.invalidate();
         id
     }
 
     pub(crate) fn move_entity(
         &mut self,
-        entity:          Entity,
-        from_location:   EntityLocation,
+        entity: Entity,
+        from_location: EntityLocation,
         to_archetype_id: ArchetypeId,
     ) -> u32 {
         let from_idx = from_location.archetype_id.0 as usize;
-        let to_idx   = to_archetype_id.0 as usize;
+        let to_idx = to_archetype_id.0 as usize;
         let from_row = from_location.row as usize;
 
         let to_row = self.archetypes[to_idx].entities.len();
@@ -874,7 +969,7 @@ impl World {
         let from_len = self.archetypes[from_idx].columns.len();
 
         for i in 0..from_len {
-            let cid       = self.archetypes[from_idx].columns[i].component_id;
+            let cid = self.archetypes[from_idx].columns[i].component_id;
             let item_size = self.archetypes[from_idx].columns[i].item_size;
 
             if let Some(to_col_idx) = self.archetypes[to_idx].column_index(cid) {
@@ -891,7 +986,9 @@ impl World {
                         std::ptr::copy_nonoverlapping(src, dst, item_size);
                     }
                     let tick = self.archetypes[from_idx].columns[i].get_tick(from_row);
-                    self.archetypes[to_idx].columns[to_col_idx].change_ticks.push(tick);
+                    self.archetypes[to_idx].columns[to_col_idx]
+                        .change_ticks
+                        .push(tick);
                     self.archetypes[to_idx].columns[to_col_idx].len += 1;
 
                     // swap_remove без drop (данные перемещены в целевой архетип)
@@ -911,10 +1008,13 @@ impl World {
             let displaced = self.archetypes[from_idx].entities[from_last];
             self.archetypes[from_idx].entities.swap(from_row, from_last);
             self.archetypes[from_idx].entities.pop();
-            self.entities.set_location(displaced, EntityLocation {
-                archetype_id: from_location.archetype_id,
-                row:          from_row as u32,
-            });
+            self.entities.set_location(
+                displaced,
+                EntityLocation {
+                    archetype_id: from_location.archetype_id,
+                    row: from_row as u32,
+                },
+            );
         } else {
             self.archetypes[from_idx].entities.pop();
         }
@@ -945,9 +1045,11 @@ impl World {
         _kind: R,
         target: Entity,
     ) {
-        if subjects.is_empty() { return; }
+        if subjects.is_empty() {
+            return;
+        }
 
-        let kind_idx    = self.relations.get_or_register::<R>();
+        let kind_idx = self.relations.get_or_register::<R>();
         let relation_id = crate::relations::encode_relation(kind_idx, target.index);
         self.ensure_relation_component(relation_id);
 
@@ -969,15 +1071,20 @@ impl World {
                     let new_row = self.move_entity(entity, loc, new_arch_id);
                     // После move_entity необходимо обновить relation-колонку
                     // (move_entity копирует только общие компоненты, relation добавляется впервые)
-                    if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
+                    if let Some(col_idx) =
+                        self.archetypes[new_arch_id.0 as usize].column_index(relation_id)
+                    {
                         let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
                         col.change_ticks.push(tick);
                         col.len += 1;
                     }
-                    self.entities.set_location(entity, EntityLocation {
-                        archetype_id: new_arch_id,
-                        row: new_row as u32,
-                    });
+                    self.entities.set_location(
+                        entity,
+                        EntityLocation {
+                            archetype_id: new_arch_id,
+                            row: new_row as u32,
+                        },
+                    );
                     self.subject_index.add(entity.index, relation_id);
                 }
             }
@@ -985,7 +1092,11 @@ impl World {
     }
 }
 
-impl Default for World { fn default() -> Self { Self::new() } }
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── SystemContext ──────────────────────────────────────────────
 
@@ -1056,7 +1167,11 @@ impl Default for ChunkConfig {
     fn default() -> Self {
         let max_from_env = {
             let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-            if user > 0 { user } else { DEFAULT_MAX_CHUNK_SIZE }
+            if user > 0 {
+                user
+            } else {
+                DEFAULT_MAX_CHUNK_SIZE
+            }
         };
         Self {
             min_entities_per_thread: 16,
@@ -1082,7 +1197,8 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
         return entity_count;
     }
     let raw = (entity_count + n - 1) / n;
-    raw.clamp(config.dynamic_min_chunk, config.max_chunk_size).min(entity_count)
+    raw.clamp(config.dynamic_min_chunk, config.max_chunk_size)
+        .min(entity_count)
 }
 
 /// Установить размер чанка для par_for_each.
@@ -1188,7 +1304,8 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
-            let ptr = self.world()
+            let ptr = self
+                .world()
                 .resources
                 .get_raw_ptr::<T>()
                 .expect("resource_mut: resource not found");
@@ -1214,7 +1331,8 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
-            let ptr = self.world()
+            let ptr = self
+                .world()
                 .event_queue_ptr::<T>()
                 .expect("event_reader: event type not registered");
             EventReader::new(&mut *ptr)
@@ -1224,7 +1342,8 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
-            let ptr = self.world()
+            let ptr = self
+                .world()
                 .event_queue_ptr::<T>()
                 .expect("event_writer: event type not registered");
             EventWriter::from_ptr(ptr)
@@ -1234,6 +1353,17 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn entity_count(&self) -> usize {
         self.world().entity_count()
+    }
+
+    /// Извлечь параметры через трейт [`SystemParam`](crate::system_param::SystemParam).
+    ///
+    /// ```ignore
+    /// type Params = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>);
+    /// let (dt, q) = ctx.fetch::<Params>();
+    /// ```
+    #[inline]
+    pub fn fetch<P: crate::system_param::SystemParam>(&self) -> P::Item<'_> {
+        P::fetch(self)
     }
 
     // Итерация только через ctx.query::<Q>().for_each(...)
@@ -1247,7 +1377,9 @@ impl<'w> SystemContext<'w> {
     /// у которых также есть компоненты `Q`.
     #[inline]
     pub fn query_relation<R: crate::relations::RelationKind, Q: WorldQuery>(
-        &self, _kind: R, target: Entity,
+        &self,
+        _kind: R,
+        target: Entity,
     ) -> crate::relations::RelationIter<'_, Q> {
         self.world().query_relation::<R, Q>(_kind, target)
     }
@@ -1256,7 +1388,8 @@ impl<'w> SystemContext<'w> {
     /// у которых также есть компоненты `Q`.
     #[inline]
     pub fn query_wildcard<R: crate::relations::RelationKind, Q: WorldQuery>(
-        &self, _kind: R,
+        &self,
+        _kind: R,
     ) -> crate::relations::RelationIter<'_, Q> {
         self.world().query_wildcard::<R, Q>(_kind)
     }
@@ -1264,7 +1397,9 @@ impl<'w> SystemContext<'w> {
     /// Все entity, связанные relation `R` с `parent`.
     #[inline]
     pub fn children_of<R: crate::relations::RelationKind>(
-        &self, _kind: R, parent: Entity,
+        &self,
+        _kind: R,
+        parent: Entity,
     ) -> impl Iterator<Item = Entity> + '_ {
         self.world().children_of(_kind, parent)
     }
@@ -1272,7 +1407,10 @@ impl<'w> SystemContext<'w> {
     /// Проверить наличие relation `R` между `subject` и `target`.
     #[inline]
     pub fn has_relation<R: crate::relations::RelationKind>(
-        &self, subject: Entity, _kind: R, target: Entity,
+        &self,
+        subject: Entity,
+        _kind: R,
+        target: Entity,
     ) -> bool {
         self.world().has_relation(subject, _kind, target)
     }
@@ -1280,7 +1418,9 @@ impl<'w> SystemContext<'w> {
     /// Найти target entity, с которым `subject` связан relation `R`.
     #[inline]
     pub fn get_relation_target<R: crate::relations::RelationKind>(
-        &self, subject: Entity, _kind: R,
+        &self,
+        subject: Entity,
+        _kind: R,
     ) -> Option<Entity> {
         self.world().get_relation_target(subject, _kind)
     }
@@ -1289,7 +1429,7 @@ impl<'w> SystemContext<'w> {
 // ── ParallelWorld ──────────────────────────────────────────────
 
 pub struct ParallelWorld<'w> {
-    pub(crate) world:   *const World,
+    pub(crate) world: *const World,
     pub(crate) _marker: std::marker::PhantomData<&'w World>,
 }
 
@@ -1298,18 +1438,20 @@ unsafe impl Sync for ParallelWorld<'_> {}
 
 impl<'w> ParallelWorld<'w> {
     #[inline]
-    pub unsafe fn get(&self) -> &'w World { &*self.world }
+    pub unsafe fn get(&self) -> &'w World {
+        &*self.world
+    }
 }
 
 // ── CachedQuery ────────────────────────────────────────────────
 
 pub struct CachedQuery<'w, Q: WorldQuery> {
-    world:        &'w World,
+    world: &'w World,
     arch_indices: Arc<[usize]>,
-    last_run:     Tick,
-    cached_ids:   Vec<ComponentId>,
-    row_ranges:   &'w [(usize, usize, usize)],
-    _phantom:     std::marker::PhantomData<Q>,
+    last_run: Tick,
+    cached_ids: Vec<ComponentId>,
+    row_ranges: &'w [(usize, usize, usize)],
+    _phantom: std::marker::PhantomData<Q>,
 }
 
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
@@ -1318,10 +1460,11 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         Q::fill_ids(world, &mut ids);
 
         let arch_indices = if ids.len() == Q::component_count() {
-            world.query_cache.get_or_compute(
-                &ids, &world.archetypes,
-                |arch| Q::matches_archetype(arch, &ids),
-            )
+            world
+                .query_cache
+                .get_or_compute(&ids, &world.archetypes, |arch| {
+                    Q::matches_archetype(arch, &ids)
+                })
         } else {
             Arc::new([])
         };
@@ -1359,7 +1502,8 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     }
 
     fn row_range(&self, arch_idx: usize) -> (usize, usize) {
-        self.row_ranges.iter()
+        self.row_ranges
+            .iter()
             .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
             .unwrap_or((0, usize::MAX))
     }
@@ -1367,16 +1511,24 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         let ids = &self.cached_ids;
-        if ids.len() != Q::component_count() { return; }
+        if ids.len() != Q::component_count() {
+            return;
+        }
         for &arch_idx in self.arch_indices.as_ref() {
             let arch = &self.world.archetypes[arch_idx];
-            if arch.is_empty() { continue; }
-            if !Q::matches_archetype(arch, ids) { continue; }
-            let state    = unsafe { Q::fetch_state(arch, ids, self.last_run) };
+            if arch.is_empty() {
+                continue;
+            }
+            if !Q::matches_archetype(arch, ids) {
+                continue;
+            }
+            let state = unsafe { Q::fetch_state(arch, ids, self.last_run) };
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
-            if len == 0 { continue; }
+            if len == 0 {
+                continue;
+            }
             let entities = &arch.entities[row_start..end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = row_start + offset;
@@ -1393,19 +1545,22 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         Q: Send,
         F: Fn(Entity, Q::Item<'_>) + Send + Sync,
     {
-        use rayon::prelude::*;
         use crate::par_utils::compute_par_chunks;
+        use rayon::prelude::*;
         let num_threads = rayon::current_num_threads();
 
         // ids — owned clone, как в Query::par_for_each (не ссылка на &self)
         let ids = self.cached_ids.clone();
-        if ids.len() != Q::component_count() { return; }
+        if ids.len() != Q::component_count() {
+            return;
+        }
 
-        let world      = self.world;
-        let last_run   = self.last_run;
+        let world = self.world;
+        let last_run = self.last_run;
         let row_ranges = self.row_ranges;
         let rr = |arch_idx: usize| -> (usize, usize) {
-            row_ranges.iter()
+            row_ranges
+                .iter()
                 .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
                 .unwrap_or((0, usize::MAX))
         };
@@ -1417,8 +1572,9 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 .filter(|&arch_idx| Q::matches_archetype(&world.archetypes[arch_idx], &ids))
                 .map(|arch_idx| {
                     let s = rr(arch_idx);
-                    let effective_len = s.1.min(world.archetypes[arch_idx].len())
-                        .saturating_sub(s.0);
+                    let effective_len =
+                        s.1.min(world.archetypes[arch_idx].len())
+                            .saturating_sub(s.0);
                     (arch_idx, effective_len)
                 }),
             num_threads,
@@ -1429,9 +1585,11 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             let (r_start, r_end) = rr(arch_idx);
             let clamped_start = r_start + start;
             let clamped_end = (r_start + end).min(r_end);
-            if clamped_start >= clamped_end { return; }
-            let arch     = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state    = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            if clamped_start >= clamped_end {
+                return;
+            }
+            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
             let entities = &arch.entities[clamped_start..clamped_end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = clamped_start + offset;
@@ -1443,11 +1601,16 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     }
 
     pub fn len(&self) -> usize {
-        self.arch_indices.iter().map(|&i| self.world.archetypes[i].len()).sum()
+        self.arch_indices
+            .iter()
+            .map(|&i| self.world.archetypes[i].len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.arch_indices.iter().all(|&i| self.world.archetypes[i].is_empty())
+        self.arch_indices
+            .iter()
+            .all(|&i| self.world.archetypes[i].is_empty())
     }
 
     /// Создать `Iterator` по (Entity, компонентам).
@@ -1457,17 +1620,17 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     #[inline]
     pub fn iter(&self) -> CachedQueryIter<'w, Q> {
         CachedQueryIter {
-            world:        self.world,
+            world: self.world,
             arch_indices: self.arch_indices.clone(),
-            cached_ids:   self.cached_ids.clone(),
-            last_run:     self.last_run,
-            row_ranges:   self.row_ranges,
-            arch_pos:     0,
-            row:          0,
-            row_end:      0,
-            entities:     std::ptr::null(),
-            state:        None,
-            _phantom:     std::marker::PhantomData,
+            cached_ids: self.cached_ids.clone(),
+            last_run: self.last_run,
+            row_ranges: self.row_ranges,
+            arch_pos: 0,
+            row: 0,
+            row_end: 0,
+            entities: std::ptr::null(),
+            state: None,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
@@ -1477,18 +1640,18 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 /// Вызывает `fetch_state` только при переходе на новый архетип,
 /// а не при создании — в отличие от `QueryIter`.
 pub struct CachedQueryIter<'w, Q: WorldQuery> {
-    world:        &'w World,
+    world: &'w World,
     arch_indices: Arc<[usize]>,
-    cached_ids:   Vec<ComponentId>,
-    last_run:     Tick,
-    row_ranges:   &'w [(usize, usize, usize)],
+    cached_ids: Vec<ComponentId>,
+    last_run: Tick,
+    row_ranges: &'w [(usize, usize, usize)],
 
-    arch_pos:     usize,
-    row:          usize,
-    row_end:      usize,
-    entities:     *const Entity,
-    state:        Option<Q::State>,
-    _phantom:     std::marker::PhantomData<Q>,
+    arch_pos: usize,
+    row: usize,
+    row_end: usize,
+    entities: *const Entity,
+    state: Option<Q::State>,
+    _phantom: std::marker::PhantomData<Q>,
 }
 
 impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
@@ -1537,7 +1700,9 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
             return;
         }
 
-        let (r_start, r_end) = self.row_ranges.iter()
+        let (r_start, r_end) = self
+            .row_ranges
+            .iter()
             .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
             .unwrap_or((0, usize::MAX));
         let end = r_end.min(arch.len());
@@ -1562,7 +1727,11 @@ pub trait Bundle: Sized {
     fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]>;
 
     /// Записать ComponentId'ы напрямую в `out` — без создания промежуточных SmallVec.
-    fn push_component_ids(&self, registry: &mut ComponentRegistry, out: &mut SmallVec<[ComponentId; 8]>) {
+    fn push_component_ids(
+        &self,
+        registry: &mut ComponentRegistry,
+        out: &mut SmallVec<[ComponentId; 8]>,
+    ) {
         out.extend(self.component_ids(registry));
     }
 
@@ -1610,7 +1779,11 @@ impl<T: Component> Bundle for T {
     }
 
     #[inline(always)]
-    fn push_component_ids(&self, registry: &mut ComponentRegistry, out: &mut SmallVec<[ComponentId; 8]>) {
+    fn push_component_ids(
+        &self,
+        registry: &mut ComponentRegistry,
+        out: &mut SmallVec<[ComponentId; 8]>,
+    ) {
         out.push(registry.get_or_register::<T>());
     }
 
@@ -1655,11 +1828,7 @@ impl<T: Component> Bundle for T {
                     col.grow();
                 }
                 let dst = col.get_ptr(row);
-                std::ptr::copy_nonoverlapping(
-                    &self as *const T as *const u8,
-                    dst,
-                    col.item_size,
-                );
+                std::ptr::copy_nonoverlapping(&self as *const T as *const u8, dst, col.item_size);
             }
             col.change_ticks.push(tick);
             col.len += 1;
@@ -1775,7 +1944,7 @@ impl Bundle for () {
 ///
 /// Создаётся через [`World::entity`].
 pub struct EntityRef<'w> {
-    world:  &'w mut World,
+    world: &'w mut World,
     entity: Entity,
 }
 
@@ -1817,13 +1986,21 @@ impl<'w> EntityRef<'w> {
     }
 
     /// Добавить relation между этой entity и target.
-    pub fn add_relation<R: crate::relations::RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
+    pub fn add_relation<R: crate::relations::RelationKind>(
+        &mut self,
+        kind: R,
+        target: Entity,
+    ) -> &mut Self {
         self.world.add_relation(self.entity, kind, target);
         self
     }
 
     /// Удалить relation.
-    pub fn remove_relation<R: crate::relations::RelationKind>(&mut self, kind: R, target: Entity) -> &mut Self {
+    pub fn remove_relation<R: crate::relations::RelationKind>(
+        &mut self,
+        kind: R,
+        target: Entity,
+    ) -> &mut Self {
         self.world.remove_relation(self.entity, kind, target);
         self
     }
@@ -1837,17 +2014,19 @@ impl<'w> EntityRef<'w> {
 impl<'w> World {
     /// Получить [`EntityRef`] для entity.
     pub fn entity(&mut self, entity: Entity) -> EntityRef<'_> {
-        EntityRef { world: self, entity }
+        EntityRef {
+            world: self,
+            entity,
+        }
     }
 }
-
 
 // ── Scripting API ──────────────────────────────────────────────────────────
 //
 // Публичные accessor'ы для apex-scripting.
 // Отделены от основного impl World чтобы было ясно: это внешний API,
 // не внутренняя логика мира.
- 
+
 impl World {
     /// Доступ к аллокатору entity — для получения Entity по index.
     ///
@@ -1856,20 +2035,27 @@ impl World {
     pub fn entity_allocator(&self) -> &crate::entity::EntityAllocator {
         &self.entities
     }
-  
+
     /// Получить ComponentId по строковому имени типа.
     ///
     /// Используется `apex-scripting` для разрешения имён из скриптов.
     /// Поиск линейный (O(N) по числу зарегистрированных компонентов),
     /// но вызывается только при инициализации движка — не в hot path.
     pub fn component_id_by_name(&self, name: &str) -> Option<crate::component::ComponentId> {
-        self.registry.iter().find(|info| info.name == name).map(|i| i.id)
+        self.registry
+            .iter()
+            .find(|info| info.name == name)
+            .map(|i| i.id)
     }
 
     // ── EntityTemplate API ────────────────────────────────────────
 
     /// Зарегистрировать именованный шаблон сущности.
-    pub fn register_template(&mut self, name: &str, template: impl crate::template::EntityTemplate + 'static) {
+    pub fn register_template(
+        &mut self,
+        name: &str,
+        template: impl crate::template::EntityTemplate + 'static,
+    ) {
         self.templates.register(name, template);
     }
 
@@ -1961,33 +2147,33 @@ mod tests {
     fn adaptive_chunk_size_small_world() {
         let cfg = ChunkConfig::default();
         // entity_count < min_per_thread * threads → serial fallback (one chunk = entity_count)
-        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50);   // 50 < 16*8=128 → serial
-        assert_eq!(adaptive_chunk_size(50, 4, &cfg), 50);   // 50 < 16*4=64 → serial
-        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1);     // 1 < 128 → serial
-        assert_eq!(adaptive_chunk_size(99, 8, &cfg), 99);   // 99 < 128 → serial
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50); // 50 < 16*8=128 → serial
+        assert_eq!(adaptive_chunk_size(50, 4, &cfg), 50); // 50 < 16*4=64 → serial
+        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1); // 1 < 128 → serial
+        assert_eq!(adaptive_chunk_size(99, 8, &cfg), 99); // 99 < 128 → serial
     }
 
     #[test]
     fn adaptive_chunk_size_medium_world() {
         let cfg = ChunkConfig::default();
         // entity_count >= threshold → ceil(ec / threads), clamped to [dynamic_min_chunk=64, max]
-        assert_eq!(adaptive_chunk_size(200, 8, &cfg), 64);   // ceil(200/8)=25 < 64 → 64
-        assert_eq!(adaptive_chunk_size(500, 8, &cfg), 64);   // ceil(500/8)=63 < 64 → 64
-        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 100);  // 100 < 128 → serial
+        assert_eq!(adaptive_chunk_size(200, 8, &cfg), 64); // ceil(200/8)=25 < 64 → 64
+        assert_eq!(adaptive_chunk_size(500, 8, &cfg), 64); // ceil(500/8)=63 < 64 → 64
+        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 100); // 100 < 128 → serial
     }
 
     #[test]
     fn adaptive_chunk_size_large_world() {
         let cfg = ChunkConfig::default();
-        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125);   // ceil(1000/8) = 125
+        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125); // ceil(1000/8) = 125
         assert_eq!(adaptive_chunk_size(10000, 8, &cfg), 1250); // ceil(10000/8) = 1250
     }
 
     #[test]
     fn adaptive_chunk_size_single_thread() {
         let cfg = ChunkConfig::default();
-        assert_eq!(adaptive_chunk_size(50, 1, &cfg), 50);     // ceil(50/1)=50
-        assert_eq!(adaptive_chunk_size(200, 1, &cfg), 200);   // ceil(200/1)=200
+        assert_eq!(adaptive_chunk_size(50, 1, &cfg), 50); // ceil(50/1)=50
+        assert_eq!(adaptive_chunk_size(200, 1, &cfg), 200); // ceil(200/1)=200
         assert_eq!(adaptive_chunk_size(1000, 1, &cfg), 1000); // ceil(1000/1)=1000
     }
 
@@ -1995,9 +2181,15 @@ mod tests {
     fn adaptive_chunk_size_max_cap() {
         let cfg = ChunkConfig::default();
         // ceil(131072/1) = 131072, capped to max_chunk_size = 65536
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1, &cfg), DEFAULT_MAX_CHUNK_SIZE);
+        assert_eq!(
+            adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1, &cfg),
+            DEFAULT_MAX_CHUNK_SIZE
+        );
         // 8 threads, ceil(131072/8) = 16384, no clamp
-        assert_eq!(adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8, &cfg), 16384);
+        assert_eq!(
+            adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8, &cfg),
+            16384
+        );
     }
 
     #[test]
@@ -2022,8 +2214,8 @@ mod tests {
             auto_serial_fallback: false,
         };
         // auto_serial_fallback = false → always split into threads chunks
-        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 7);   // ceil(50/8) = 7
-        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1);    // ceil(1/8) = 1
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 7); // ceil(50/8) = 7
+        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1); // ceil(1/8) = 1
     }
 
     #[test]
@@ -2035,20 +2227,24 @@ mod tests {
             auto_serial_fallback: true,
         };
         // 8 * 8 = 64 threshold
-        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50);   // 50 < 64 → serial
-        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 13);  // 100 >= 64 → ceil(100/8)=13
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50); // 50 < 64 → serial
+        assert_eq!(adaptive_chunk_size(100, 8, &cfg), 13); // 100 >= 64 → ceil(100/8)=13
     }
 
     // ── Bundle composition tests ─────────────────────────────────
 
-    
-
     #[derive(Debug, PartialEq)]
-    struct Pos { x: f32, y: f32 }
+    struct Pos {
+        x: f32,
+        y: f32,
+    }
     impl crate::component::Component for Pos {}
 
     #[derive(Debug, PartialEq)]
-    struct Vel { x: f32, y: f32 }
+    struct Vel {
+        x: f32,
+        y: f32,
+    }
     impl crate::component::Component for Vel {}
 
     #[derive(Debug, PartialEq)]
@@ -2066,7 +2262,7 @@ mod tests {
     // Вложенные Bundle — ручная реализация (proc-макросы не работают внутри apex-core)
     struct PlayerBase {
         pos: Pos,
-        hp:  Hp,
+        hp: Hp,
     }
 
     impl crate::Bundle for PlayerBase {
@@ -2074,7 +2270,10 @@ mod tests {
             2
         }
 
-        fn component_ids(&self, registry: &mut crate::ComponentRegistry) -> SmallVec<[crate::ComponentId; 8]> {
+        fn component_ids(
+            &self,
+            registry: &mut crate::ComponentRegistry,
+        ) -> SmallVec<[crate::ComponentId; 8]> {
             let mut ids = SmallVec::new();
             crate::Bundle::push_component_ids(&self.pos, registry, &mut ids);
             crate::Bundle::push_component_ids(&self.hp, registry, &mut ids);
@@ -2082,7 +2281,13 @@ mod tests {
             ids
         }
 
-        fn write_into(self, world: &mut crate::World, archetype_id: crate::ArchetypeId, row: usize, tick: crate::Tick) {
+        fn write_into(
+            self,
+            world: &mut crate::World,
+            archetype_id: crate::ArchetypeId,
+            row: usize,
+            tick: crate::Tick,
+        ) {
             crate::Bundle::write_into(self.pos, world, archetype_id, row, tick);
             crate::Bundle::write_into(self.hp, world, archetype_id, row, tick);
         }
@@ -2093,9 +2298,9 @@ mod tests {
     }
 
     struct ArmedPlayer {
-        base:   PlayerBase,
+        base: PlayerBase,
         weapon: Vel,
-        armor:  Armor,
+        armor: Armor,
     }
 
     impl crate::Bundle for ArmedPlayer {
@@ -2103,7 +2308,10 @@ mod tests {
             4
         }
 
-        fn component_ids(&self, registry: &mut crate::ComponentRegistry) -> SmallVec<[crate::ComponentId; 8]> {
+        fn component_ids(
+            &self,
+            registry: &mut crate::ComponentRegistry,
+        ) -> SmallVec<[crate::ComponentId; 8]> {
             let mut ids = SmallVec::new();
             crate::Bundle::push_component_ids(&self.base, registry, &mut ids);
             crate::Bundle::push_component_ids(&self.weapon, registry, &mut ids);
@@ -2112,7 +2320,13 @@ mod tests {
             ids
         }
 
-        fn write_into(self, world: &mut crate::World, archetype_id: crate::ArchetypeId, row: usize, tick: crate::Tick) {
+        fn write_into(
+            self,
+            world: &mut crate::World,
+            archetype_id: crate::ArchetypeId,
+            row: usize,
+            tick: crate::Tick,
+        ) {
             crate::Bundle::write_into(self.base, world, archetype_id, row, tick);
             crate::Bundle::write_into(self.weapon, world, archetype_id, row, tick);
             crate::Bundle::write_into(self.armor, world, archetype_id, row, tick);
@@ -2132,10 +2346,10 @@ mod tests {
         let e = world.spawn(ArmedPlayer {
             base: PlayerBase {
                 pos: Pos { x: 10.0, y: 20.0 },
-                hp:  Hp(100.0),
+                hp: Hp(100.0),
             },
             weapon: Vel { x: 1.0, y: 0.5 },
-            armor:  Armor(50.0),
+            armor: Armor(50.0),
         });
 
         // Все компоненты на месте
@@ -2150,7 +2364,10 @@ mod tests {
     fn bundle_tuple_of_bundles_spawn() {
         let mut world = World::new();
         let e = world.spawn((
-            PlayerBase { pos: Pos { x: 1.0, y: 2.0 }, hp: Hp(75.0) },
+            PlayerBase {
+                pos: Pos { x: 1.0, y: 2.0 },
+                hp: Hp(75.0),
+            },
             Vel { x: 3.0, y: 4.0 },
             Team(1),
         ));
@@ -2177,7 +2394,10 @@ mod tests {
         // Смесь: одиночные компоненты + Bundle-структура + ещё компонент
         let e = world.spawn((
             Hp(200.0),
-            PlayerBase { pos: Pos { x: 7.0, y: 8.0 }, hp: Hp(80.0) },
+            PlayerBase {
+                pos: Pos { x: 7.0, y: 8.0 },
+                hp: Hp(80.0),
+            },
             Armor(30.0),
             Team(2),
         ));
@@ -2198,10 +2418,10 @@ mod tests {
         let entities = world.spawn_many(10, |_| ArmedPlayer {
             base: PlayerBase {
                 pos: Pos { x: 50.0, y: 50.0 },
-                hp:  Hp(100.0),
+                hp: Hp(100.0),
             },
             weapon: Vel { x: 0.1, y: 0.0 },
-            armor:  Armor(10.0),
+            armor: Armor(10.0),
         });
 
         assert_eq!(entities.len(), 10);
@@ -2210,7 +2430,11 @@ mod tests {
             assert!(world.get::<Pos>(e).is_some(), "Entity {:?} missing Pos", e);
             assert!(world.get::<Hp>(e).is_some(), "Entity {:?} missing Hp", e);
             assert!(world.get::<Vel>(e).is_some(), "Entity {:?} missing Vel", e);
-            assert!(world.get::<Armor>(e).is_some(), "Entity {:?} missing Armor", e);
+            assert!(
+                world.get::<Armor>(e).is_some(),
+                "Entity {:?} missing Armor",
+                e
+            );
         }
     }
 
@@ -2219,7 +2443,10 @@ mod tests {
         let mut world = World::new();
         // Разные способы spawn в одном тесте
         let boss = world.spawn(ArmedPlayer {
-            base: PlayerBase { pos: Pos { x: 1.0, y: 1.0 }, hp: Hp(50.0) },
+            base: PlayerBase {
+                pos: Pos { x: 1.0, y: 1.0 },
+                hp: Hp(50.0),
+            },
             weapon: Vel { x: 0.0, y: 0.0 },
             armor: Armor(10.0),
         });

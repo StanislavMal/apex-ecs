@@ -1,6 +1,6 @@
-use std::alloc::{alloc, dealloc, realloc, Layout};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::alloc::{alloc, dealloc, realloc, Layout};
 
 use crate::{
     component::{ComponentId, ComponentInfo, Tick},
@@ -40,8 +40,12 @@ pub struct ColumnView<'a> {
 }
 
 impl<'a> ColumnView<'a> {
-    pub fn id(&self) -> ComponentId { self.col.component_id }
-    pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 { self.col.get_ptr(row) }
+    pub fn id(&self) -> ComponentId {
+        self.col.component_id
+    }
+    pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 {
+        self.col.get_ptr(row)
+    }
 }
 
 impl Column {
@@ -60,7 +64,9 @@ impl Column {
 
     /// Публичный accessor для component_id колонки.
     #[inline]
-    pub fn id(&self) -> ComponentId { self.component_id }
+    pub fn id(&self) -> ComponentId {
+        self.component_id
+    }
 
     fn layout_for(&self, capacity: usize) -> Layout {
         if self.item_size == 0 {
@@ -127,7 +133,12 @@ impl Column {
     /// а `row == self.len` (запись всегда в конец колонки).
     #[inline]
     pub unsafe fn write_typed_at<T>(&mut self, value: T, row: usize, tick: Tick) {
-        debug_assert!(row == self.len, "write_typed_at: row {} != len {}", row, self.len);
+        debug_assert!(
+            row == self.len,
+            "write_typed_at: row {} != len {}",
+            row,
+            self.len
+        );
         self.push(&value as *const T as *const u8, tick);
         std::mem::forget(value);
     }
@@ -270,10 +281,14 @@ impl Column {
 impl Drop for Column {
     fn drop(&mut self) {
         for i in 0..self.len {
-            unsafe { (self.drop_fn)(self.get_ptr(i)); }
+            unsafe {
+                (self.drop_fn)(self.get_ptr(i));
+            }
         }
         if self.capacity > 0 && !self.data.is_null() && self.item_size > 0 {
-            unsafe { dealloc(self.data, self.layout_for(self.capacity)); }
+            unsafe {
+                dealloc(self.data, self.layout_for(self.capacity));
+            }
         }
     }
 }
@@ -311,8 +326,14 @@ impl Archetype {
         }
     }
 
-    #[inline] pub fn len(&self) -> usize { self.entities.len() }
-    #[inline] pub fn is_empty(&self) -> bool { self.entities.is_empty() }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
 
     #[inline]
     pub fn column_index(&self, component_id: ComponentId) -> Option<usize> {
@@ -329,7 +350,11 @@ impl Archetype {
         Some(self.columns[col_idx].get::<T>(row))
     }
 
-    pub unsafe fn get_component_mut<T>(&mut self, row: usize, component_id: ComponentId) -> Option<&mut T> {
+    pub unsafe fn get_component_mut<T>(
+        &mut self,
+        row: usize,
+        component_id: ComponentId,
+    ) -> Option<&mut T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get_mut::<T>(row))
     }
@@ -354,7 +379,13 @@ impl Archetype {
         row
     }
 
-    pub unsafe fn write_component(&mut self, row: usize, component_id: ComponentId, src: *const u8, tick: Tick) {
+    pub unsafe fn write_component(
+        &mut self,
+        row: usize,
+        component_id: ComponentId,
+        src: *const u8,
+        tick: Tick,
+    ) {
         if let Some(col_idx) = self.column_index(component_id) {
             let col = &mut self.columns[col_idx];
             if row >= col.len {
@@ -398,7 +429,9 @@ impl Archetype {
         &self.columns
     }
 
-    pub fn entities(&self) -> &[Entity] { &self.entities }
+    pub fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
 }
 
 /// Описание одного чанка архетипа для chunk-level параллелизма.
@@ -408,27 +441,30 @@ impl Archetype {
 /// и не происходит structural changes.
 pub struct ArchetypeChunk<'a> {
     pub entities: &'a [Entity],
-    pub arch_id:  ArchetypeId,
+    pub arch_id: ArchetypeId,
     /// Индекс строки start внутри архетипа (для column_index lookup)
     pub start_row: usize,
-    pub len:       usize,
+    pub len: usize,
 }
 
 /// Разбить архетип на чанки фиксированного размера.
 ///
 /// Возвращает срезы `entities` длиной `chunk_size` (последний может быть меньше).
 /// Используется `par_for_each` для параллельной итерации внутри одного архетипа.
-pub fn archetype_chunks(arch: &Archetype, chunk_size: usize) -> impl Iterator<Item = ArchetypeChunk<'_>> {
+pub fn archetype_chunks(
+    arch: &Archetype,
+    chunk_size: usize,
+) -> impl Iterator<Item = ArchetypeChunk<'_>> {
     let total = arch.entities.len();
     let num_chunks = (total + chunk_size - 1) / chunk_size;
     (0..num_chunks).map(move |i| {
         let start = i * chunk_size;
         let end = (start + chunk_size).min(total);
         ArchetypeChunk {
-            entities:  &arch.entities[start..end],
-            arch_id:   arch.id,
+            entities: &arch.entities[start..end],
+            arch_id: arch.id,
             start_row: start,
-            len:       end - start,
+            len: end - start,
         }
     })
 }
@@ -486,7 +522,9 @@ mod tests {
 
         for i in 0..n {
             let val: f32 = i as f32;
-            unsafe { col.push(&val as *const f32 as *const u8, Tick(i as u32)); }
+            unsafe {
+                col.push(&val as *const f32 as *const u8, Tick(i as u32));
+            }
         }
         assert_eq!(col.len, n);
         assert!(col.capacity >= n);
@@ -529,10 +567,14 @@ mod tests {
 
         for i in 0..5 {
             let val: f32 = i as f32;
-            unsafe { col.push(&val as *const f32 as *const u8, Tick(i as u32)); }
+            unsafe {
+                col.push(&val as *const f32 as *const u8, Tick(i as u32));
+            }
         }
 
-        unsafe { col.swap_remove_no_drop(1); }
+        unsafe {
+            col.swap_remove_no_drop(1);
+        }
         assert_eq!(col.len, 4);
         // Последний элемент (4.0) перемещён на место удалённого (1)
         unsafe {
@@ -553,7 +595,9 @@ mod tests {
         }
         assert_eq!(col.len, 1);
 
-        unsafe { col.swap_remove_no_drop(0); }
+        unsafe {
+            col.swap_remove_no_drop(0);
+        }
         assert_eq!(col.len, 0);
     }
 
@@ -598,7 +642,10 @@ mod tests {
         };
         let mut col = Column::new(&info);
         unsafe {
-            col.push(std::ptr::NonNull::<()>::dangling().as_ptr() as *const u8, Tick(1));
+            col.push(
+                std::ptr::NonNull::<()>::dangling().as_ptr() as *const u8,
+                Tick(1),
+            );
         }
         assert_eq!(col.len, 1);
     }
@@ -606,7 +653,8 @@ mod tests {
     // ── Archetype tests ───────────────────────────────────────
 
     fn make_arch(id: u32, component_ids: &[u32]) -> Archetype {
-        let ids: SmallVec<[ComponentId; 8]> = component_ids.iter().map(|&i| ComponentId(i)).collect();
+        let ids: SmallVec<[ComponentId; 8]> =
+            component_ids.iter().map(|&i| ComponentId(i)).collect();
         let infos: Vec<ComponentInfo> = component_ids.iter().map(|&i| make_info(i)).collect();
         let info_refs: Vec<&ComponentInfo> = infos.iter().collect();
         Archetype::new(ArchetypeId(id), ids, &info_refs)
@@ -629,7 +677,9 @@ mod tests {
     fn archetype_write_and_read_component() {
         let mut arch = make_arch(0, &[0]);
         let entity = make_entity(0, 1);
-        unsafe { arch.allocate_row(entity); }
+        unsafe {
+            arch.allocate_row(entity);
+        }
 
         let val: f32 = 3.14;
         unsafe {
@@ -650,9 +700,19 @@ mod tests {
 
         unsafe {
             arch.allocate_row(e1);
-            arch.write_component(0, ComponentId(0), &(1.0_f32) as *const f32 as *const u8, Tick(1));
+            arch.write_component(
+                0,
+                ComponentId(0),
+                &(1.0_f32) as *const f32 as *const u8,
+                Tick(1),
+            );
             arch.allocate_row(e2);
-            arch.write_component(1, ComponentId(0), &(2.0_f32) as *const f32 as *const u8, Tick(1));
+            arch.write_component(
+                1,
+                ComponentId(0),
+                &(2.0_f32) as *const f32 as *const u8,
+                Tick(1),
+            );
         }
         assert_eq!(arch.len(), 2);
 
@@ -685,7 +745,10 @@ mod tests {
         arch.remove_edges.insert(ComponentId(0), ArchetypeId(7));
 
         assert_eq!(arch.add_edges.get(&ComponentId(1)), Some(&ArchetypeId(3)));
-        assert_eq!(arch.remove_edges.get(&ComponentId(0)), Some(&ArchetypeId(7)));
+        assert_eq!(
+            arch.remove_edges.get(&ComponentId(0)),
+            Some(&ArchetypeId(7))
+        );
     }
 
     // ── ArchetypeChunk tests ──────────────────────────────────
@@ -694,7 +757,9 @@ mod tests {
     fn chunk_exact_size() {
         let mut arch = make_arch(0, &[0]);
         for i in 0..10 {
-            unsafe { arch.allocate_row(make_entity(0, i)); }
+            unsafe {
+                arch.allocate_row(make_entity(0, i));
+            }
         }
         let chunks: Vec<_> = archetype_chunks(&arch, 5).collect();
         assert_eq!(chunks.len(), 2);
@@ -708,7 +773,9 @@ mod tests {
     fn chunk_uneven() {
         let mut arch = make_arch(0, &[0]);
         for i in 0..7 {
-            unsafe { arch.allocate_row(make_entity(0, i)); }
+            unsafe {
+                arch.allocate_row(make_entity(0, i));
+            }
         }
         let chunks: Vec<_> = archetype_chunks(&arch, 3).collect();
         assert_eq!(chunks.len(), 3);

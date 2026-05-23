@@ -1,6 +1,6 @@
+use crate::{Scheduler, SystemId};
 use std::any::TypeId;
 use std::marker::PhantomData;
-use crate::{Scheduler, SystemId};
 
 /// Роль системы в конвейере — используется для валидации AccessDescriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,8 +16,8 @@ pub enum PipelineRole {
 /// Запись о системе в конвейере.
 struct PipelineEntry {
     system_id: SystemId,
-    role:      PipelineRole,
-    name:      String,
+    role: PipelineRole,
+    name: String,
 }
 
 /// Строитель конвейера событий.
@@ -25,8 +25,8 @@ struct PipelineEntry {
 /// Создаётся через `Scheduler::event_pipeline::<E>()`.
 /// Зависимости добавляются в Scheduler при вызове `build()`.
 pub struct EventPipelineBuilder<E: Send + Sync + 'static> {
-    entries:   Vec<PipelineEntry>,
-    _phantom:  PhantomData<E>,
+    entries: Vec<PipelineEntry>,
+    _phantom: PhantomData<E>,
 }
 
 // ── Ошибки валидации ──────────────────────────────────────────
@@ -34,11 +34,21 @@ pub struct EventPipelineBuilder<E: Send + Sync + 'static> {
 #[derive(Debug)]
 pub enum PipelineValidationError {
     /// Система объявлена как Producer, но не имеет Emit<E>.
-    ProducerMissingEmit { system_name: String, event: &'static str },
+    ProducerMissingEmit {
+        system_name: String,
+        event: &'static str,
+    },
     /// Система объявлена как Consumer, но не имеет Listen<E>.
-    ConsumerMissingListen { system_name: String, event: &'static str },
+    ConsumerMissingListen {
+        system_name: String,
+        event: &'static str,
+    },
     /// Система объявлена как Transformer, но не имеет Listen<E> или Emit<E>.
-    TransformerIncomplete { system_name: String, event: &'static str, missing: &'static str },
+    TransformerIncomplete {
+        system_name: String,
+        event: &'static str,
+        missing: &'static str,
+    },
     /// Система не найдена в планировщике.
     SystemNotFound { system_name: String },
 }
@@ -46,19 +56,34 @@ pub enum PipelineValidationError {
 impl std::fmt::Display for PipelineValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ProducerMissingEmit { system_name, event } =>
-                write!(f, "Pipeline: система '{}' объявлена как Producer для '{}', \
-                           но не имеет Emit<{}>. Добавь в type Events.", system_name, event, event),
-            Self::ConsumerMissingListen { system_name, event } =>
-                write!(f, "Pipeline: система '{}' объявлена как Consumer для '{}', \
-                           но не имеет Listen<{}>. Добавь в type Events.", system_name, event, event),
-            Self::TransformerIncomplete { system_name, event, missing } =>
-                write!(f, "Pipeline: система '{}' объявлена как Transformer для '{}', \
+            Self::ProducerMissingEmit { system_name, event } => write!(
+                f,
+                "Pipeline: система '{}' объявлена как Producer для '{}', \
+                           но не имеет Emit<{}>. Добавь в type Events.",
+                system_name, event, event
+            ),
+            Self::ConsumerMissingListen { system_name, event } => write!(
+                f,
+                "Pipeline: система '{}' объявлена как Consumer для '{}', \
+                           но не имеет Listen<{}>. Добавь в type Events.",
+                system_name, event, event
+            ),
+            Self::TransformerIncomplete {
+                system_name,
+                event,
+                missing,
+            } => write!(
+                f,
+                "Pipeline: система '{}' объявлена как Transformer для '{}', \
                            но не имеет {}. Transformer должен иметь оба: Listen<{}> + Emit<{}>.",
-                           system_name, event, missing, event, event),
-            Self::SystemNotFound { system_name } =>
-                write!(f, "Pipeline: система '{}' не найдена в планировщике. \
-                           Убедись, что система зарегистрирована до вызова .build().", system_name),
+                system_name, event, missing, event, event
+            ),
+            Self::SystemNotFound { system_name } => write!(
+                f,
+                "Pipeline: система '{}' не найдена в планировщике. \
+                           Убедись, что система зарегистрирована до вызова .build().",
+                system_name
+            ),
         }
     }
 }
@@ -67,7 +92,10 @@ impl std::error::Error for PipelineValidationError {}
 
 impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     pub(crate) fn new() -> Self {
-        Self { entries: Vec::new(), _phantom: PhantomData }
+        Self {
+            entries: Vec::new(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Добавить систему-производитель (только Emit<E>).
@@ -154,7 +182,10 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     ///
     /// Проверяет, что AccessDescriptor каждой системы соответствует
     /// заявленной роли. При ошибках возвращает список проблем.
-    pub fn build_validated(self, sched: &mut Scheduler) -> Result<(), Vec<PipelineValidationError>> {
+    pub fn build_validated(
+        self,
+        sched: &mut Scheduler,
+    ) -> Result<(), Vec<PipelineValidationError>> {
         let event_tid = TypeId::of::<E>();
         let event_name = std::any::type_name::<E>();
         let mut errors = Vec::new();
@@ -188,7 +219,7 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
                     }
                 }
                 PipelineRole::Transformer => {
-                    let has_read  = access.reads_event.iter().any(|(id, _)| *id == event_tid);
+                    let has_read = access.reads_event.iter().any(|(id, _)| *id == event_tid);
                     let has_write = access.writes_event.iter().any(|(id, _)| *id == event_tid);
                     if !has_read {
                         errors.push(PipelineValidationError::TransformerIncomplete {
