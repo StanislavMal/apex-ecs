@@ -1098,6 +1098,28 @@ impl Default for World {
     }
 }
 
+// ── MainWorld ──────────────────────────────────────────────────
+
+/// Wraps a [`World`] for temporary insertion as a resource.
+///
+/// Used by extract systems to read the main world while running on the
+/// render world's scheduler. Bevy-compatible pattern.
+///
+/// # Safety
+/// `Send + Sync` are safe because World is only accessed through
+/// the resource system with proper scheduler synchronization.
+pub struct MainWorld(pub World);
+
+impl MainWorld {
+    pub fn world(&self) -> &World {
+        &self.0
+    }
+}
+
+// SAFETY: MainWorld access is guarded by scheduler's sequential extract stage.
+unsafe impl Send for MainWorld {}
+unsafe impl Sync for MainWorld {}
+
 // ── SystemContext ──────────────────────────────────────────────
 
 /// Размер чанка для par_for_each.

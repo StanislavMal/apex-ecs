@@ -601,3 +601,74 @@ pub trait AutoSystem: Send + Sync {
         std::any::type_name::<Self>()
     }
 }
+
+// ── Extract<P> — Bevy-совместимый SystemParam для extract-систем ──
+
+/// Bevy-совместимый параметр extract-систем — читает из [`MainWorld`].
+///
+/// Во время extract-стадии render-мир содержит временный ресурс `MainWorld`.
+/// `Extract<P>` прозрачно применяет внутренний `SystemParam P` к этому миру,
+/// а не к render-миру.
+///
+/// # Пример
+///
+/// ```ignore
+/// system! {
+///     fn extract_cameras(
+///         q: &Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,
+///         out: &mut ExtractedCamera,
+///     ) {
+///         for (_, (cam, transform)) in q.iter() {
+///             *out = ExtractedCamera::new(cam, transform);
+///         }
+///     }
+/// }
+/// ```
+///
+/// После extract-стадии `MainWorld` удаляется из render-мира и возвращается main-потоку.
+pub struct Extract<P>(PhantomData<P>);
+
+// Extract<QueryParam<Q>> — читает компоненты из MainWorld
+impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for Extract<QueryParam<Q>> {
+    type Item<'w> = crate::world::CachedQuery<'w, Q>;
+
+    fn access() -> AccessDescriptor {
+        Q::system_access()
+    }
+
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::world::CachedQuery<'w, Q> {
+        let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
+        // Res.0 is &'w MainWorld; MainWorld.world() borrows and returns &'w World
+        crate::world::CachedQuery::new(mw.0.world(), crate::component::Tick(0))
+    }
+}
+
+// Extract<ResRead<T>> — читает ресурс из MainWorld
+impl<T: Send + Sync + 'static> SystemParam for Extract<ResRead<T>> {
+    type Item<'w> = Res<'w, T>;
+
+    fn access() -> AccessDescriptor {
+        <ResRead<T> as ResourceAccessList>::resource_accesses()
+    }
+
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Res<'w, T> {
+        let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
+        let world: &crate::world::World = mw.0.world();
+        Res(world.resource::<T>())
+    }
+}
+
+// Extract<Listen<E>> — читает события из MainWorld
+impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
+    type Item<'w> = EventReader<'w, E>;
+
+    fn access() -> AccessDescriptor {
+        <Listen<E> as EventAccessList>::event_accesses()
+    }
+
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
+        let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
+        let world: &crate::world::World = mw.0.world();
+        world.event_reader::<E>()
+    }
+}

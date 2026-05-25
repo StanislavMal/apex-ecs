@@ -183,6 +183,12 @@ pub struct IsolatedWorld {
     scheduler: Scheduler,
 }
 
+// SAFETY: IsolatedWorld is only accessed from a single thread at a time.
+// The scheduler's SystemDescriptor contains `Box<dyn FnMut>` which is Send but not Sync.
+// We assert Sync is safe because the caller guarantees single-thread access.
+unsafe impl Send for IsolatedWorld {}
+unsafe impl Sync for IsolatedWorld {}
+
 impl IsolatedWorld {
     /// Создать новый изолированный мир.
     pub fn new() -> Self {
@@ -195,6 +201,12 @@ impl IsolatedWorld {
     /// Доступ к внутреннему [`World`] (осторожно: structural changes).
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
+    }
+
+    /// Swap the internal World with another.
+    /// Used by pipelined rendering to exchange worlds between threads.
+    pub fn swap_world(&mut self, other: &mut World) {
+        std::mem::swap(&mut self.world, other);
     }
 
     /// Доступ к [`Scheduler`] для конфигурации.

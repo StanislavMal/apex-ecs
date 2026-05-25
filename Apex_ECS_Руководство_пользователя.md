@@ -1632,6 +1632,9 @@ fn new_style(ctx: &SystemContext<'_>) {
 | `Emit<E>` | `EventWriter<'w, E>` (отправка событий) | `ctx.event_writer::<E>()` |
 | `QueryParam<Q>` | `CachedQuery<'w, Q>` (запрос компонентов) | `ctx.query::<Q>()` |
 | `CommandsParam` | `&'w mut Commands` (структурные изменения) | `ctx.commands()` |
+| `Extract<QueryParam<Q>>` | `CachedQuery<'w, Q>` (из MainWorld) | `ctx.resource::<MainWorld>().0.query::<Q>()` |
+| `Extract<ResRead<T>>` | `Res<'w, T>` (из MainWorld) | `ctx.resource::<MainWorld>().0.resource::<T>()` |
+| `Extract<Listen<E>>` | `EventReader<'w, E>` (из MainWorld) | `ctx.resource::<MainWorld>().0.event_reader::<E>()` |
 
 #### Кортежи
 
@@ -1700,6 +1703,52 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
 | `#[derive(SystemParam)]` proc-макрос | Типы-маркеры + кортежи (без макроса) |
 | `Query<&T, &mut U>` через SystemParam | `QueryParam<(Read<T>, Write<U>)>` |
 | Интегрирован в планировщик | Ортогонален: `system!`/`sequential_system!` работают независимо |
+
+#### `Extract<P>` — Bevy-совместимый доступ к MainWorld
+
+`Extract<P>` позволяет extract-системам **прозрачно читать данные из другого мира** (MainWorld), временно вставленного как ресурс. Это точный порт Bevy `Extract<T>` SystemParam.
+
+```rust
+use apex_core::prelude::*;
+
+// Extract-система: читает камеры из MainWorld, пишет результат в текущий мир
+fn extract_cameras(
+    q: Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,
+    out: ResWrite<ExtractedCamera>,
+) {
+    for (_, (cam, transform)) in q.iter() {
+        *out = ExtractedCamera::new(cam, transform);
+    }
+}
+
+// Extract-система: читает ресурс из MainWorld
+fn extract_shadow_quality(
+    sq: Extract<ResRead<ShadowQuality>>,
+    out: ResWrite<ShadowQuality>,
+) {
+    *out = *sq;
+}
+
+// Extract-система: читает события из MainWorld
+fn extract_input_events(
+    events: Extract<Listen<InputEvent>>,
+    writer: Emit<InputEvent>,
+) {
+    for ev in events.iter() {
+        writer.send(*ev);
+    }
+}
+```
+
+**Как это работает:** во время extract-стадии render-мир содержит временный ресурс `MainWorld(pub World)`. `Extract<P>` через `fetch(ctx)` читает `Res<MainWorld>` из текущего мира и применяет внутренний `SystemParam P` к main-миру — прозрачно для вызывающего кода.
+
+**Доступные комбинации `Extract<P>`:**
+
+| P | Что читает из MainWorld |
+|---|---|
+| `QueryParam<(Read<A>, Read<B>)>` | Компоненты (любой WorldQuery) |
+| `ResRead<T>` | Ресурс |
+| `Listen<E>` | События |
 
 ---
 
@@ -2403,6 +2452,31 @@ sub.scheduler_mut().add_system("move", |w: &mut World| { /* ... */ });
 
 // Один кадр: scheduler.run() + world.tick()
 sub.tick();
+
+// P2c: обмен миров для pipelined rendering
+// Используется когда render_world путешествует между main и render потоками
+let mut temp = World::new();
+sub.swap_world(&mut temp);
+// sub.world теперь пуст, temp содержит GPU-ресурсы
+sub.swap_world(&mut temp);
+// sub.world снова имеет GPU-ресурсы, temp опустошён
+```
+
+### 12.1.1 `MainWorld` — временный ресурс для extract
+
+`MainWorld(pub World)` — Send+Sync wrapper для временного хранения main-мира как ресурса в render-мире во время extract-стадии. Используется вместе с `Extract<P>` SystemParam (см. [раздел 6.8](#68-systemparam--типобезопасные-параметры-систем)):
+
+```rust
+use apex_core::world::MainWorld;
+
+// Main-поток: временно вставить main мир в render мир
+render_world.insert_resource(MainWorld(std::mem::take(main_world)));
+
+// Запустить extract-системы (читают MainWorld через Extract<P>)
+render_scheduler.run_extract(&mut render_world);
+
+// Вернуть main мир обратно
+*main_world = render_world.remove_resource::<MainWorld>().unwrap().0;
 ```
 
 ### 12.2 `WorldBridge`

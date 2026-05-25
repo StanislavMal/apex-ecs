@@ -6,6 +6,18 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// Sentinel value — guaranteed to never match a real entity.
+    pub const PLACEHOLDER: Entity = Entity {
+        index: u32::MAX,
+        generation: u32::MAX,
+    };
+
+    /// Construct an `Entity` from raw parts. Only for bridge/ECS infrastructure.
+    #[inline]
+    pub const fn from_raw_parts(index: u32, generation: u32) -> Self {
+        Self { index, generation }
+    }
+
     #[inline]
     pub fn index(self) -> u32 {
         self.index
