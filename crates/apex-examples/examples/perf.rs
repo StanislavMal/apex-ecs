@@ -744,8 +744,8 @@ fn bench_compile_overhead() {
         "add_dependency → recompile (N=5)",
         || {
             let mut sched = Scheduler::new();
-            let a = sched.add_auto_system("sa", OtherSys);
-            let b = sched.add_auto_system("sb", OtherSys);
+            let a = sched.add_auto_system("sa", OtherSys).id();
+            let b = sched.add_auto_system("sb", OtherSys).id();
             for i in 2..5 { sched.add_auto_system(format!("s{i}"), OtherSys); }
             sched.compile().unwrap();
             (sched, a, b)
@@ -1052,8 +1052,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("move", move_sys),
-            |s: &mut Scheduler| s.add_auto_system("hp",   hp_sys)
+            |s: &mut Scheduler| { s.add_auto_system("move", move_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("hp",   hp_sys); }
         );
         bench_seq_par(
             &format!("2 лёгких системы ({n}k)  Move+Hp"),
@@ -1065,10 +1065,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("move", move_sys),
-            |s: &mut Scheduler| s.add_auto_system("hp",   hp_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", temp_sys),
-            |s: &mut Scheduler| s.add_auto_system("mana", mana_sys)
+            |s: &mut Scheduler| { s.add_auto_system("move", move_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("hp",   hp_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", temp_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("mana", mana_sys); }
         );
         // Проверяем 1 Stage
         debug_assert_eq!(seq.stages().unwrap().len(), 1);
@@ -1122,8 +1122,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
         );
         bench_seq_par(
             &format!("2 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1135,9 +1135,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
-            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
         );
         bench_seq_par(
             &format!("3 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1156,8 +1156,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
         );
         bench_seq_par(
             &format!("2 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1169,9 +1169,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
-            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
         );
         bench_seq_par(
             &format!("3 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1255,12 +1255,12 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys).id(); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys).id(); s.par_for_each_used(id); },
         );
         bench_seq_par(
             &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1279,14 +1279,14 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("phys", heavy_phys_sys),
-            |s: &mut Scheduler| s.add_auto_system("temp", heavy_temp_sys),
-            |s: &mut Scheduler| s.add_auto_system("mana", heavy_mana_sys)
+            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
+            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("mana", HeavyManaParSys); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys).id(); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys).id(); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { let id = s.add_auto_system("mana", HeavyManaParSys).id(); s.par_for_each_used(id); },
         );
         bench_seq_par(
             &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1390,8 +1390,8 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 1: 2 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1)
+            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
+            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); }
         );
         bench_seq_par(
             &format!("2 solo-системы, 2 архетипа ({n}k each)"),
@@ -1404,10 +1404,10 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 2: 4 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1),
-            |s: &mut Scheduler| s.add_auto_system("s2", SoloSys2),
-            |s: &mut Scheduler| s.add_auto_system("s3", SoloSys3)
+            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
+            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); },
+            |s: &mut Scheduler| { s.add_auto_system("s2", SoloSys2); },
+            |s: &mut Scheduler| { s.add_auto_system("s3", SoloSys3); }
         );
         bench_seq_par(
             &format!("4 solo-системы, 4 архетипа ({n}k each)"),
@@ -1420,14 +1420,14 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 3: 8 систем ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("s0", SoloSys0),
-            |s: &mut Scheduler| s.add_auto_system("s1", SoloSys1),
-            |s: &mut Scheduler| s.add_auto_system("s2", SoloSys2),
-            |s: &mut Scheduler| s.add_auto_system("s3", SoloSys3),
-            |s: &mut Scheduler| s.add_auto_system("s4", SoloSys4),
-            |s: &mut Scheduler| s.add_auto_system("s5", SoloSys5),
-            |s: &mut Scheduler| s.add_auto_system("s6", SoloSys6),
-            |s: &mut Scheduler| s.add_auto_system("s7", SoloSys7)
+            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
+            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); },
+            |s: &mut Scheduler| { s.add_auto_system("s2", SoloSys2); },
+            |s: &mut Scheduler| { s.add_auto_system("s3", SoloSys3); },
+            |s: &mut Scheduler| { s.add_auto_system("s4", SoloSys4); },
+            |s: &mut Scheduler| { s.add_auto_system("s5", SoloSys5); },
+            |s: &mut Scheduler| { s.add_auto_system("s6", SoloSys6); },
+            |s: &mut Scheduler| { s.add_auto_system("s7", SoloSys7); }
         );
         bench_seq_par(
             &format!("8 solo-систем, 8 архетипов ({n}k each)"),
@@ -1440,18 +1440,18 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 4: 12 систем (полная загрузка всех ядер) ─────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| s.add_auto_system("s0",  SoloSys0),
-            |s: &mut Scheduler| s.add_auto_system("s1",  SoloSys1),
-            |s: &mut Scheduler| s.add_auto_system("s2",  SoloSys2),
-            |s: &mut Scheduler| s.add_auto_system("s3",  SoloSys3),
-            |s: &mut Scheduler| s.add_auto_system("s4",  SoloSys4),
-            |s: &mut Scheduler| s.add_auto_system("s5",  SoloSys5),
-            |s: &mut Scheduler| s.add_auto_system("s6",  SoloSys6),
-            |s: &mut Scheduler| s.add_auto_system("s7",  SoloSys7),
-            |s: &mut Scheduler| s.add_auto_system("s8",  SoloSys8),
-            |s: &mut Scheduler| s.add_auto_system("s9",  SoloSys9),
-            |s: &mut Scheduler| s.add_auto_system("s10", SoloSys10),
-            |s: &mut Scheduler| s.add_auto_system("s11", SoloSys11)
+            |s: &mut Scheduler| { s.add_auto_system("s0",  SoloSys0); },
+            |s: &mut Scheduler| { s.add_auto_system("s1",  SoloSys1); },
+            |s: &mut Scheduler| { s.add_auto_system("s2",  SoloSys2); },
+            |s: &mut Scheduler| { s.add_auto_system("s3",  SoloSys3); },
+            |s: &mut Scheduler| { s.add_auto_system("s4",  SoloSys4); },
+            |s: &mut Scheduler| { s.add_auto_system("s5",  SoloSys5); },
+            |s: &mut Scheduler| { s.add_auto_system("s6",  SoloSys6); },
+            |s: &mut Scheduler| { s.add_auto_system("s7",  SoloSys7); },
+            |s: &mut Scheduler| { s.add_auto_system("s8",  SoloSys8); },
+            |s: &mut Scheduler| { s.add_auto_system("s9",  SoloSys9); },
+            |s: &mut Scheduler| { s.add_auto_system("s10", SoloSys10); },
+            |s: &mut Scheduler| { s.add_auto_system("s11", SoloSys11); }
         );
         bench_seq_par(
             &format!("12 solo-систем, 12 архетипов ({n}k each)"),

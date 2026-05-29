@@ -553,8 +553,8 @@ fn run_event_pipeline() -> Vec<EventResult> {
         }
 
         let mut sched = Scheduler::new();
-        let writer_id   = sched.add_auto_system("health_writer",   health_writer_system);
-        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system);
+        let writer_id   = sched.add_auto_system("health_writer",   health_writer_system).id();
+        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system).id();
         sched.add_dependency(listener_id, writer_id);
         sched.compile_with_world(&world).expect("compile");
 
@@ -602,9 +602,9 @@ fn run_full_pipeline() -> Vec<FullPipeResult> {
         sched.add_auto_system("movement_reader", movement_reader_system);
         sched.add_auto_system("health_reader",   health_reader_system);
         sched.add_auto_system("physics_reader",  physics_reader_system);
-        let health_id   = sched.add_auto_system("health_writer",   health_writer_system);
+        let health_id   = sched.add_auto_system("health_writer",   health_writer_system).id();
         sched.add_auto_system("cooldown",        cooldown_system);
-        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system);
+        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system).id();
         sched.add_dependency(listener_id, health_id);
         sched.compile_with_world(&world).expect("compile");
 

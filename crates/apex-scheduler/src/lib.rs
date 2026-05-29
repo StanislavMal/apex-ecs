@@ -53,6 +53,10 @@ pub mod conditions;
 pub mod pipeline;
 pub mod stage;
 
+mod config;
+use crate::config::SystemConfigKind;
+pub use config::{system, system_par, system_par_access, system_seq, IntoScheduleConfigs, SystemConfig};
+
 use apex_core::commands::Commands;
 use apex_core::{
     archetype::Archetype, component::ComponentRegistry, system_param::WorldQuerySystemAccess,
@@ -1277,6 +1281,108 @@ impl Scheduler {
             }
         }
         self
+    }
+
+    // ── add_systems — кортежный API (профессиональный) ──────────
+
+    /// Зарегистрировать несколько систем одновременно через кортежный API.
+    ///
+    /// Это рекомендованный способ регистрации. Системы конфигурируются
+    /// с условиями ДО регистрации, что исключает double-borrow conflict.
+    ///
+    /// # Пример
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel, system, system_seq};
+    /// # let mut sched = Scheduler::new();
+    /// sched.add_systems(StageLabel::Update, (
+    ///     system("a", MoveSys).run_if(|_: &apex_core::world::World| true),
+    ///     system_seq("cleanup", |_: &mut apex_core::world::World| {}),
+    /// ));
+    /// # struct MoveSys;
+    /// # impl apex_scheduler::AutoSystem for MoveSys {
+    /// #     type Query = (); type Resources = (); type Events = ();
+    /// #     fn run(&mut self, _: apex_core::world::SystemContext<'_>) {}
+    /// # }
+    /// ```
+    pub fn add_systems(
+        &mut self,
+        stage_label: StageLabel,
+        systems: impl IntoScheduleConfigs,
+    ) -> &mut Self {
+        for cfg in systems.into_vec() {
+            self.register_system_config(cfg, stage_label.clone());
+        }
+        self
+    }
+
+    /// Внутренняя регистрация одной SystemConfig.
+    fn register_system_config(&mut self, cfg: SystemConfig, stage_label: StageLabel) -> SystemId {
+        let id = SystemId(self.next_id);
+        self.next_id += 1;
+        self.last_added_system_id = Some(id);
+        let index = self.systems.len();
+
+        match cfg.kind {
+            SystemConfigKind::Auto(system, access) => {
+                self.systems.push(SystemDescriptor {
+                    id,
+                    name: cfg.name,
+                    kind: SystemKind::Parallel { system, access },
+                    after: Vec::new(),
+                    before: Vec::new(),
+                    stage_label,
+                    run_condition: cfg.condition,
+                    apply_deferred_after: false,
+                    has_deferred: false,
+                });
+                self.par_system_indices.push(index);
+            }
+            SystemConfigKind::Sequential(f) => {
+                self.systems.push(SystemDescriptor {
+                    id,
+                    name: cfg.name,
+                    kind: SystemKind::Sequential(f),
+                    after: Vec::new(),
+                    before: Vec::new(),
+                    stage_label,
+                    run_condition: cfg.condition,
+                    apply_deferred_after: false,
+                    has_deferred: false,
+                });
+                self.seq_system_indices.push(index);
+            }
+            SystemConfigKind::ParClosure { access, func } => {
+                self.systems.push(SystemDescriptor {
+                    id,
+                    name: cfg.name,
+                    kind: SystemKind::Parallel {
+                        system: Box::new(FnParSystem {
+                            func,
+                            access: access.clone(),
+                        }),
+                        access,
+                    },
+                    after: Vec::new(),
+                    before: Vec::new(),
+                    stage_label,
+                    run_condition: cfg.condition,
+                    apply_deferred_after: false,
+                    has_deferred: false,
+                });
+                self.par_system_indices.push(index);
+            }
+        }
+
+        self.system_indices.insert(id, index);
+        self.invalidate_plan();
+        id
+    }
+
+    /// `par_for_each_used` по имени системы (удобно с `add_systems`).
+    pub fn par_for_each_used_by_name(&mut self, name: &str) -> Result<&mut Self, SchedulerError> {
+        let id = self.find_id_by_name(name)?;
+        self.par_for_each_used(id);
+        Ok(self)
     }
 
     /// Получить `&mut SystemDescriptor` по `SystemId` (O(1)).

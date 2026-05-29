@@ -147,10 +147,10 @@ fn main() {
 
     let mut sched = Scheduler::new();
 
-    let collision_id = sched.add_auto_system("collision", collision_system);
-    let armor_id     = sched.add_auto_system("armor",     armor_system);
-    let health_id    = sched.add_auto_system("health",    health_system);
-    let sound_id     = sched.add_auto_system("sound",     sound_system);
+    let collision_id = sched.add_auto_system("collision", collision_system).id();
+    let armor_id     = sched.add_auto_system("armor",     armor_system).id();
+    let health_id    = sched.add_auto_system("health",    health_system).id();
+    let sound_id     = sched.add_auto_system("sound",     sound_system).id();
 
     // Конвейер событий: явный порядок выполнения
     Scheduler::event_pipeline::<DamageEvent>()
