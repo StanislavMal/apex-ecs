@@ -2,6 +2,12 @@ use crate::{Scheduler, SystemId};
 use std::any::TypeId;
 use std::marker::PhantomData;
 
+/// Запись о системе в конвейере.
+struct PipelineEntry {
+    name: String,
+    role: PipelineRole,
+}
+
 /// Роль системы в конвейере — используется для валидации AccessDescriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineRole {
@@ -11,13 +17,6 @@ pub enum PipelineRole {
     Transformer,
     /// Только читает — Listen<E> обязателен.
     Consumer,
-}
-
-/// Запись о системе в конвейере.
-struct PipelineEntry {
-    system_id: SystemId,
-    role: PipelineRole,
-    name: String,
 }
 
 /// Строитель конвейера событий.
@@ -99,9 +98,8 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     }
 
     /// Добавить систему-производитель (только Emit<E>).
-    pub fn produced_by(mut self, id: SystemId, name: impl Into<String>) -> Self {
+    pub fn produced_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
-            system_id: id,
             role: PipelineRole::Producer,
             name: name.into(),
         });
@@ -109,12 +107,8 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     }
 
     /// Добавить систему-трансформер (Listen<E> + Emit<E>).
-    ///
-    /// Получает события от всех предыдущих систем,
-    /// обрабатывает и перевыпускает событие.
-    pub fn transformed_by(mut self, id: SystemId, name: impl Into<String>) -> Self {
+    pub fn transformed_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
-            system_id: id,
             role: PipelineRole::Transformer,
             name: name.into(),
         });
@@ -122,12 +116,8 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     }
 
     /// Добавить систему-потребитель (только Listen<E>).
-    ///
-    /// Несколько `consumed_by` подряд образуют параллельную группу:
-    /// они все зависят от предыдущей стадии, но не зависят друг от друга.
-    pub fn consumed_by(mut self, id: SystemId, name: impl Into<String>) -> Self {
+    pub fn consumed_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
-            system_id: id,
             role: PipelineRole::Consumer,
             name: name.into(),
         });
@@ -135,44 +125,42 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
     }
 
     /// Применить конвейер к планировщику — добавить зависимости.
-    ///
-    /// Правило: каждая стадия зависит от последней не-Consumer стадии
-    /// или от предыдущей Consumer-стадии, если они sequential.
-    ///
-    /// Параллельные Consumer: две Consumer-системы подряд зависят от
-    /// одной и той же предыдущей стадии (не друг от друга).
     pub fn build(self, sched: &mut Scheduler) {
         if self.entries.len() < 2 {
             return;
         }
+        let ids: Vec<SystemId> = self.entries.iter()
+            .map(|e| sched.find_id_by_name(&e.name).unwrap())
+            .collect();
 
         let mut last_barrier: Option<SystemId> = None;
         let mut prev_consumer: Option<SystemId> = None;
 
-        for entry in &self.entries {
+        for (i, entry) in self.entries.iter().enumerate() {
+            let id = ids[i];
             match entry.role {
                 PipelineRole::Producer => {
                     if let Some(barrier) = last_barrier {
-                        sched.add_dependency(entry.system_id, barrier);
+                        sched.add_dependency(id, barrier);
                     }
-                    last_barrier = Some(entry.system_id);
+                    last_barrier = Some(id);
                     prev_consumer = None;
                 }
                 PipelineRole::Transformer => {
                     if let Some(barrier) = last_barrier {
-                        sched.add_dependency(entry.system_id, barrier);
+                        sched.add_dependency(id, barrier);
                     }
                     if let Some(prev) = prev_consumer {
-                        sched.add_dependency(entry.system_id, prev);
+                        sched.add_dependency(id, prev);
                     }
-                    last_barrier = Some(entry.system_id);
+                    last_barrier = Some(id);
                     prev_consumer = None;
                 }
                 PipelineRole::Consumer => {
                     if let Some(barrier) = last_barrier {
-                        sched.add_dependency(entry.system_id, barrier);
+                        sched.add_dependency(id, barrier);
                     }
-                    prev_consumer = Some(entry.system_id);
+                    prev_consumer = Some(id);
                 }
             }
         }
@@ -191,7 +179,16 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         let mut errors = Vec::new();
 
         for entry in &self.entries {
-            let access = match sched.system_access(entry.system_id) {
+            let id = match sched.find_id_by_name(&entry.name) {
+                Ok(id) => id,
+                Err(_) => {
+                    errors.push(PipelineValidationError::SystemNotFound {
+                        system_name: entry.name.clone(),
+                    });
+                    continue;
+                }
+            };
+            let access = match sched.system_access(id) {
                 Some(a) => a,
                 None => {
                     errors.push(PipelineValidationError::SystemNotFound {

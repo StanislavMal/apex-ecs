@@ -23,7 +23,7 @@
 
 use apex_core::prelude::*;
 use apex_macros::Component;
-use apex_scheduler::Scheduler;
+use apex_scheduler::{Scheduler, StageLabel, SystemConfig};
 
 // ── Компоненты ─────────────────────────────────────────────────
 
@@ -147,17 +147,19 @@ fn main() {
 
     let mut sched = Scheduler::new();
 
-    let collision_id = sched.add_auto_system("collision", collision_system).id();
-    let armor_id     = sched.add_auto_system("armor",     armor_system).id();
-    let health_id    = sched.add_auto_system("health",    health_system).id();
-    let sound_id     = sched.add_auto_system("sound",     sound_system).id();
+    sched.add_systems(StageLabel::Update, (
+        SystemConfig::auto("collision", collision_system),
+        SystemConfig::auto("armor",     armor_system),
+        SystemConfig::auto("health",    health_system),
+        SystemConfig::auto("sound",     sound_system),
+    ));
 
     // Конвейер событий: явный порядок выполнения
     Scheduler::event_pipeline::<DamageEvent>()
-        .produced_by(collision_id, "collision")
-        .transformed_by(armor_id,   "armor")        // Listen<Damage> + Write<Health> + Emit<Damage>
-        .consumed_by(health_id,    "health")        // Read<Health> — видит изменения armor того же кадра
-        .consumed_by(sound_id,     "sound")         // Listen<Damage> — прочитает на след. кадре
+        .produced_by("collision")
+        .transformed_by("armor")
+        .consumed_by("health")
+        .consumed_by("sound")
         .build(&mut sched);
 
     sched.compile_with_world(&world).unwrap();

@@ -53,9 +53,10 @@ pub mod conditions;
 pub mod pipeline;
 pub mod stage;
 
+pub use config::{IntoScheduleConfigs, SystemConfig};
+
 mod config;
 use crate::config::SystemConfigKind;
-pub use config::{system, system_par, system_par_access, system_seq, IntoScheduleConfigs, SystemConfig};
 
 use apex_core::commands::Commands;
 use apex_core::{
@@ -1292,11 +1293,11 @@ impl Scheduler {
     ///
     /// # Пример
     /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel, system, system_seq};
+    /// # use apex_scheduler::{Scheduler, StageLabel, SystemConfig};
     /// # let mut sched = Scheduler::new();
     /// sched.add_systems(StageLabel::Update, (
-    ///     system("a", MoveSys).run_if(|_: &apex_core::world::World| true),
-    ///     system_seq("cleanup", |_: &mut apex_core::world::World| {}),
+    ///     SystemConfig::auto("a", MoveSys).run_if(|_: &apex_core::world::World| true),
+    ///     SystemConfig::seq("cleanup", |_: &mut apex_core::world::World| {}),
     /// ));
     /// # struct MoveSys;
     /// # impl apex_scheduler::AutoSystem for MoveSys {
@@ -1422,9 +1423,9 @@ impl Scheduler {
     /// let health_id  = sched.add_auto_system("health",  HealthSystem);
     ///
     /// Scheduler::event_pipeline::<DamageEvent>()
-    ///     .produced_by(physics_id, "physics")
-    ///     .transformed_by(armor_id, "armor")
-    ///     .consumed_by(health_id, "health")
+    ///     .produced_by("physics")
+    ///     .transformed_by("armor")
+    ///     .consumed_by("health")
     ///     .build(&mut sched);
     /// ```
     pub fn event_pipeline<E: Send + Sync + 'static>() -> EventPipelineBuilder<E> {
@@ -3909,9 +3910,9 @@ mod tests {
         let health_id = sched.add_par_system("health", ListenDamage);
 
         Scheduler::event_pipeline::<DamageEvent>()
-            .produced_by(physics_id, "physics")
-            .transformed_by(armor_id, "armor")
-            .consumed_by(health_id, "health")
+            .produced_by("physics")
+            .transformed_by("armor")
+            .consumed_by("health")
             .build(&mut sched);
 
         sched.compile().unwrap();
@@ -3942,9 +3943,9 @@ mod tests {
         let sound_id = sched.add_par_system("sound", ListenDamage2);
 
         Scheduler::event_pipeline::<DamageEvent>()
-            .produced_by(physics_id, "physics")
-            .consumed_by(health_id, "health")
-            .consumed_by(sound_id, "sound")
+            .produced_by("physics")
+            .consumed_by("health")
+            .consumed_by("sound")
             .build(&mut sched);
 
         sched.compile().unwrap();
@@ -3968,7 +3969,7 @@ mod tests {
         let bad_id = sched.add_par_system("bad_producer", ListenerOnly);
 
         let result = Scheduler::event_pipeline::<DamageEvent>()
-            .produced_by(bad_id, "bad_producer")
+            .produced_by("bad_producer")
             .build_validated(&mut sched);
 
         assert!(

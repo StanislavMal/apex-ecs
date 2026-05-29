@@ -1,18 +1,14 @@
 //! SystemConfig — конфигурация системы с условиями (value type, без ссылки на Scheduler).
 //!
-//! Аналог Bevy `ScheduleConfig` / `Schedulable`: условия навешиваются ДО регистрации.
-//! Позволяет создавать произвольное количество конфигураций без double-borrow conflict.
-//!
 //! # Использование
 //!
 //! ```ignore
-//! use apex_scheduler::{system, system_seq, system_par, IntoScheduleConfigs};
+//! use apex_scheduler::{SystemConfig, IntoScheduleConfigs};
 //!
 //! s.add_systems(StageLabel::Update, (
-//!     system("movement", movement).run_if(is_playing),
-//!     system("ai", ai).run_if(is_playing).run_if(has_enemies),
-//!     system_seq("cleanup", |w| { ... }),
-//!     system_par("log", |_: SystemContext| println!("tick")),
+//!     SystemConfig::auto("movement", movement).run_if(is_playing),
+//!     SystemConfig::seq("cleanup", |w| { ... }),
+//!     SystemConfig::par("log", |_: SystemContext| println!("tick")),
 //! ));
 //! ```
 
@@ -22,14 +18,6 @@ use apex_core::world::SystemContext;
 
 // ── SystemConfig ───────────────────────────────────────────
 
-/// Конфигурация одной системы (имя + тело + условия).
-/// Value type — не ссылается на Scheduler, можно делать tuple.
-pub struct SystemConfig {
-    pub(crate) name: String,
-    pub(crate) kind: SystemConfigKind,
-    pub(crate) condition: ConditionTree,
-}
-
 pub(crate) enum SystemConfigKind {
     Auto(Box<dyn ParSystem>, AccessDescriptor),
     Sequential(SystemFn),
@@ -37,6 +25,14 @@ pub(crate) enum SystemConfigKind {
         access: AccessDescriptor,
         func: Box<dyn FnMut(SystemContext<'_>) + Send + Sync>,
     },
+}
+
+/// Конфигурация одной системы (имя + тело + условия).
+/// Value type — не ссылается на Scheduler, можно делать tuple.
+pub struct SystemConfig {
+    pub(crate) name: String,
+    pub(crate) kind: SystemConfigKind,
+    pub(crate) condition: ConditionTree,
 }
 
 impl SystemConfig {
@@ -85,73 +81,66 @@ impl SystemConfig {
     }
 }
 
-// ── Free functions — конструкторы SystemConfig ──────────────
+// ── Конструкторы ───────────────────────────────────────────
 
-/// Создать конфигурацию из AutoSystem (включая `system!` struct).
-pub fn system<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> SystemConfig {
-    let mut access = S::Query::system_access()
-        .merge(&S::Resources::resource_accesses())
-        .merge(&S::Events::event_accesses());
-    if S::NEEDS_WHOLE_WORLD {
-        access.needs_whole_world = true;
-    }
-    // Adapter: AutoSystem → ParSystem
-    struct Adapter<S: AutoSystem>(S);
-    impl<S: AutoSystem + 'static> ParSystem for Adapter<S> {
-        fn access() -> AccessDescriptor { unreachable!() }
-        fn run(&mut self, ctx: SystemContext<'_>) { self.0.run(ctx); }
+impl SystemConfig {
+    /// AutoSystem (включает `system!` struct).
+    pub fn auto<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
+        let mut access = S::Query::system_access()
+            .merge(&S::Resources::resource_accesses())
+            .merge(&S::Events::event_accesses());
+        if S::NEEDS_WHOLE_WORLD {
+            access.needs_whole_world = true;
+        }
+        struct Adapter<S: AutoSystem>(S);
+        impl<S: AutoSystem + 'static> ParSystem for Adapter<S> {
+            fn access() -> AccessDescriptor { unreachable!() }
+            fn run(&mut self, ctx: SystemContext<'_>) { self.0.run(ctx); }
+        }
+        Self {
+            name: name.into(),
+            kind: SystemConfigKind::Auto(Box::new(Adapter(s)), access),
+            condition: ConditionTree::default(),
+        }
     }
 
-    SystemConfig {
-        name: name.into(),
-        kind: SystemConfigKind::Auto(Box::new(Adapter(s)), access),
-        condition: ConditionTree::default(),
+    /// Sequential система.
+    pub fn seq<F>(name: impl Into<String>, f: F) -> Self
+    where
+        F: FnMut(&mut apex_core::world::World) + Send + 'static,
+    {
+        Self {
+            name: name.into(),
+            kind: SystemConfigKind::Sequential(Box::new(f)),
+            condition: ConditionTree::default(),
+        }
     }
-}
 
-/// Создать конфигурацию из sequential системы.
-pub fn system_seq<F>(name: impl Into<String>, f: F) -> SystemConfig
-where
-    F: FnMut(&mut apex_core::world::World) + Send + 'static,
-{
-    SystemConfig {
-        name: name.into(),
-        kind: SystemConfigKind::Sequential(Box::new(f)),
-        condition: ConditionTree::default(),
+    /// Параллельное замыкание (без доступа к компонентам).
+    pub fn par<F>(name: impl Into<String>, f: F) -> Self
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        Self {
+            name: name.into(),
+            kind: SystemConfigKind::ParClosure {
+                access: AccessDescriptor::new(),
+                func: Box::new(f),
+            },
+            condition: ConditionTree::default(),
+        }
     }
-}
 
-/// Создать конфигурацию из параллельного замыкания (без доступа к компонентам).
-pub fn system_par<F>(name: impl Into<String>, f: F) -> SystemConfig
-where
-    F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-{
-    SystemConfig {
-        name: name.into(),
-        kind: SystemConfigKind::ParClosure {
-            access: AccessDescriptor::new(),
-            func: Box::new(f),
-        },
-        condition: ConditionTree::default(),
-    }
-}
-
-/// Создать конфигурацию из параллельного замыкания с явным AccessDescriptor.
-pub fn system_par_access<F>(
-    name: impl Into<String>,
-    access: AccessDescriptor,
-    f: F,
-) -> SystemConfig
-where
-    F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-{
-    SystemConfig {
-        name: name.into(),
-        kind: SystemConfigKind::ParClosure {
-            access,
-            func: Box::new(f),
-        },
-        condition: ConditionTree::default(),
+    /// Параллельное замыкание с явным AccessDescriptor.
+    pub fn par_access<F>(name: impl Into<String>, access: AccessDescriptor, f: F) -> Self
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        Self {
+            name: name.into(),
+            kind: SystemConfigKind::ParClosure { access, func: Box::new(f) },
+            condition: ConditionTree::default(),
+        }
     }
 }
 
