@@ -53,7 +53,7 @@ pub mod conditions;
 pub mod pipeline;
 pub mod stage;
 
-pub use config::{IntoScheduleConfigs, SystemConfig};
+pub use config::{sys, seq, par, par_access, IntoScheduleConfigs, SystemConfig};
 
 mod config;
 use crate::config::SystemConfigKind;
@@ -1293,11 +1293,11 @@ impl Scheduler {
     ///
     /// # Пример
     /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel, SystemConfig};
+    /// # use apex_scheduler::{Scheduler, StageLabel, sys, seq};
     /// # let mut sched = Scheduler::new();
     /// sched.add_systems(StageLabel::Update, (
-    ///     SystemConfig::auto("a", MoveSys).run_if(|_: &apex_core::world::World| true),
-    ///     SystemConfig::seq("cleanup", |_: &mut apex_core::world::World| {}),
+    ///     sys("a", MoveSys).run_if(|_: &apex_core::world::World| true),
+    ///     seq("cleanup", |_: &mut apex_core::world::World| {}),
     /// ));
     /// # struct MoveSys;
     /// # impl apex_scheduler::AutoSystem for MoveSys {

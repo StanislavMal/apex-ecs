@@ -3,12 +3,12 @@
 //! # Использование
 //!
 //! ```ignore
-//! use apex_scheduler::{SystemConfig, IntoScheduleConfigs};
+//! use apex_scheduler::{sys, seq, par};
 //!
 //! s.add_systems(StageLabel::Update, (
-//!     SystemConfig::auto("movement", movement).run_if(is_playing),
-//!     SystemConfig::seq("cleanup", |w| { ... }),
-//!     SystemConfig::par("log", |_: SystemContext| println!("tick")),
+//!     sys("movement", movement).run_if(is_playing),
+//!     seq("cleanup", |w| { ... }),
+//!     par("log", |_: SystemContext| println!("tick")),
 //! ));
 //! ```
 
@@ -85,7 +85,7 @@ impl SystemConfig {
 
 impl SystemConfig {
     /// AutoSystem (включает `system!` struct).
-    pub fn auto<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
+    pub fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
         let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses());
@@ -142,6 +142,34 @@ impl SystemConfig {
             condition: ConditionTree::default(),
         }
     }
+}
+
+// ── Free function aliases — короткий API ───────────────────
+
+/// AutoSystem (включает `system!` struct). Алиас для `SystemConfig::sys()`.
+pub fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> SystemConfig {
+    SystemConfig::sys(name, s)
+}
+
+/// Sequential система. Алиас для `SystemConfig::seq()`.
+pub fn seq<F>(name: impl Into<String>, f: F) -> SystemConfig
+where F: FnMut(&mut apex_core::world::World) + Send + 'static
+{
+    SystemConfig::seq(name, f)
+}
+
+/// Параллельное замыкание (без доступа). Алиас для `SystemConfig::par()`.
+pub fn par<F>(name: impl Into<String>, f: F) -> SystemConfig
+where F: FnMut(SystemContext<'_>) + Send + Sync + 'static
+{
+    SystemConfig::par(name, f)
+}
+
+/// Параллельное замыкание с явным AccessDescriptor. Алиас для `SystemConfig::par_access()`.
+pub fn par_access<F>(name: impl Into<String>, access: AccessDescriptor, f: F) -> SystemConfig
+where F: FnMut(SystemContext<'_>) + Send + Sync + 'static
+{
+    SystemConfig::par_access(name, access, f)
 }
 
 // ── IntoScheduleConfigs — tuple развёртка ──────────────────

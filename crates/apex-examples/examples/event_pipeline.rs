@@ -23,7 +23,7 @@
 
 use apex_core::prelude::*;
 use apex_macros::Component;
-use apex_scheduler::{Scheduler, StageLabel, SystemConfig};
+use apex_scheduler::{Scheduler, StageLabel, sys};
 
 // ── Компоненты ─────────────────────────────────────────────────
 
@@ -148,10 +148,10 @@ fn main() {
     let mut sched = Scheduler::new();
 
     sched.add_systems(StageLabel::Update, (
-        SystemConfig::auto("collision", collision_system),
-        SystemConfig::auto("armor",     armor_system),
-        SystemConfig::auto("health",    health_system),
-        SystemConfig::auto("sound",     sound_system),
+        sys("collision", collision_system),
+        sys("armor",     armor_system),
+        sys("health",    health_system),
+        sys("sound",     sound_system),
     ));
 
     // Конвейер событий: явный порядок выполнения
