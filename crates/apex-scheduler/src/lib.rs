@@ -145,6 +145,15 @@ pub enum SchedulerError {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SystemId(pub u32);
 
+/// Read-only condition that determines whether a system should run this frame.
+///
+/// Evaluated on the main thread **before** the system's stage executes.
+/// When `false`, the system is skipped entirely — zero CPU for its ASD tasks.
+///
+/// Typical use: checking a resource field (paused, phase, LOD level) or input state.
+/// Keep conditions lightweight — avoid full Archetype queries.
+pub type RunCondition = Box<dyn Fn(&World) -> bool + Send + Sync>;
+
 pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
 // ── SendPtr ────────────────────────────────────────────────────
@@ -306,6 +315,12 @@ struct SystemDescriptor {
     before: Vec<SystemId>,
     /// Этап выполнения (по умолчанию Update).
     stage_label: StageLabel,
+    /// Run condition: система запускается только если condition возвращает true.
+    /// None = система запускается всегда.
+    run_condition: Option<RunCondition>,
+    /// True = применить Commands после этой системы, разбив Stage на под-Stage.
+    /// Устанавливается через `sched.apply_deferred()`.
+    apply_deferred_after: bool,
 }
 
 // ── SystemBuilder ──────────────────────────────────────────────
@@ -319,6 +334,29 @@ pub struct SystemBuilder<'a> {
 impl<'a> SystemBuilder<'a> {
     pub fn id(self) -> SystemId {
         self.id
+    }
+
+    /// Прикрепить run condition к системе.
+    ///
+    /// Система будет запущена только если `condition` возвращает `true`.
+    /// Condition оценивается на главном потоке **до** выполнения stage'а.
+    ///
+    /// Можно вызывать несколько раз — все условия AND'ятся.
+    ///
+    /// # Пример
+    /// ```
+    /// # struct GameState { paused: bool }
+    /// # use apex_scheduler::Scheduler;
+    /// # let mut sched = Scheduler::new();
+    /// sched.add_system("movement", |_| {})
+    ///     .run_if(|w| !w.resource::<GameState>().paused);
+    /// ```
+    pub fn run_if<F>(self, condition: F) -> Self
+    where
+        F: Fn(&World) -> bool + Send + Sync + 'static,
+    {
+        self.scheduler.set_run_condition(self.id, Box::new(condition));
+        self
     }
 }
 
@@ -449,6 +487,10 @@ pub struct Scheduler {
     /// При `false` поведение соответствует состоянию до введения EventAccessList:
     /// порядок Emit/Listen не определён (как в предыдущих версиях движка).
     event_ordering_enabled: bool,
+
+    /// Последняя зарегистрированная система — для `apply_deferred()`.
+    /// При вызове `s.apply_deferred()` этому SystemId ставится `apply_deferred_after = true`.
+    last_added_system_id: Option<SystemId>,
 }
 
 impl Scheduler {
@@ -479,6 +521,7 @@ impl Scheduler {
             default_stage_label: StageLabel::Update,
             type_names: FxHashMap::default(),
             event_ordering_enabled: true,
+            last_added_system_id: None,
         }
     }
 
@@ -505,6 +548,7 @@ impl Scheduler {
     {
         let id = SystemId(self.next_id);
         self.next_id += 1;
+        self.last_added_system_id = Some(id);
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
@@ -513,6 +557,8 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
+            run_condition: None,
+            apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
@@ -560,6 +606,7 @@ impl Scheduler {
     {
         let id = SystemId(self.next_id);
         self.next_id += 1;
+        self.last_added_system_id = Some(id);
         let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses());
@@ -578,6 +625,8 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
+            run_condition: None,
+            apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -621,6 +670,7 @@ impl Scheduler {
     ) -> SystemId {
         let id = SystemId(self.next_id);
         self.next_id += 1;
+        self.last_added_system_id = Some(id);
         let access = S::access();
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
@@ -633,6 +683,8 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
+            run_condition: None,
+            apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -676,7 +728,32 @@ impl Scheduler {
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
-        self.add_par_access_to_stage(name, AccessDescriptor::new(), func, stage_label)
+        let id = SystemId(self.next_id);
+        self.next_id += 1;
+        self.last_added_system_id = Some(id);
+        let access = AccessDescriptor::new();
+        let system = FnParSystem {
+            func: Box::new(func),
+            access: access.clone(),
+        };
+        let index = self.systems.len();
+        self.systems.push(SystemDescriptor {
+            id,
+            name: name.into(),
+            kind: SystemKind::Parallel {
+                system: Box::new(system),
+                access,
+            },
+            after: Vec::new(),
+            before: Vec::new(),
+            stage_label,
+            run_condition: None,
+            apply_deferred_after: false,
+        });
+        self.system_indices.insert(id, index);
+        self.par_system_indices.push(index);
+        self.invalidate_plan();
+        id
     }
 
     /// Регистрировать параллельную систему-замыкание в Startup этапе.
@@ -738,6 +815,7 @@ impl Scheduler {
     {
         let id = SystemId(self.next_id);
         self.next_id += 1;
+        self.last_added_system_id = Some(id);
         let system = FnParSystem {
             func: Box::new(func),
             access: access.clone(),
@@ -753,6 +831,8 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
+            run_condition: None,
+            apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -966,6 +1046,59 @@ impl Scheduler {
         self.invalidate_plan();
     }
 
+    // ── Run Conditions ─────────────────────────────────────────
+
+    fn set_run_condition(&mut self, id: SystemId, condition: RunCondition) {
+        if let Some(sys) = self.system_by_id_mut(id) {
+            sys.run_condition = Some(condition);
+        }
+    }
+
+    /// Прикрепить run condition к системе по имени.
+    ///
+    /// Система запускается только если `condition` возвращает `true`.
+    pub fn set_run_if<F>(&mut self, name: &str, condition: F) -> Result<(), SchedulerError>
+    where
+        F: Fn(&World) -> bool + Send + Sync + 'static,
+    {
+        let id = self.find_id_by_name(name)?;
+        self.set_run_condition(id, Box::new(condition));
+        Ok(())
+    }
+
+    // ── Apply Deferred ─────────────────────────────────────────
+
+    /// Вставить точку синхронизации после последней зарегистрированной системы.
+    ///
+    /// При `compile()` Stage будет разбит на под-Stage, и между ними будут
+    /// применены все накопленные `Commands` и сброшены события.
+    ///
+    /// Типичное использование — внутри `staged()`:
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # let mut sched = Scheduler::new();
+    /// sched.staged(StageLabel::tag("combat"), |s| {
+    ///     s.add_system("spawner", |_: &mut apex_core::world::World| {});
+    ///     s.apply_deferred();  // ← spawner's commands applied before next systems
+    ///     s.add_system("camera", |_: &mut apex_core::world::World| {});
+    /// });
+    /// ```
+    pub fn apply_deferred(&mut self) -> &mut Self {
+        if let Some(last_id) = self.last_added_system_id {
+            if let Some(sys) = self.system_by_id_mut(last_id) {
+                sys.apply_deferred_after = true;
+            }
+        }
+        self
+    }
+
+    /// Получить `&mut SystemDescriptor` по `SystemId` (O(1)).
+    fn system_by_id_mut(&mut self, id: SystemId) -> Option<&mut SystemDescriptor> {
+        self.system_indices
+            .get(&id)
+            .and_then(|&idx| self.systems.get_mut(idx))
+    }
+
     fn invalidate_plan(&mut self) {
         // ВНИМАНИЕ: НЕ сбрасываем stage_order — он должен сохраняться
         // между перекомпиляциями (см. тест configure_stages_persists_across_compiles).
@@ -1092,18 +1225,22 @@ impl Scheduler {
                 }
             }
             for (label, ids) in level_by_label {
-                let all_parallel = ids.iter().all(|sid| {
-                    self.system_indices
-                        .get(sid)
-                        .and_then(|&idx| self.systems.get(idx))
-                        .map(|s| s.kind.is_parallel())
-                        .unwrap_or(false)
-                });
                 let prio = label.priority();
-                label_stages
-                    .entry(prio)
-                    .or_default()
-                    .push(Stage::new(label, ids, all_parallel));
+                // Разбиваем на под-Stage'и по маркерам apply_deferred_after
+                let sub_groups = split_at_apply_boundaries(&ids, &self.systems);
+                for group_ids in sub_groups {
+                    let all_parallel = group_ids.iter().all(|sid| {
+                        self.system_indices
+                            .get(sid)
+                            .and_then(|&idx| self.systems.get(idx))
+                            .map(|s| s.kind.is_parallel())
+                            .unwrap_or(false)
+                    });
+                    label_stages
+                        .entry(prio)
+                        .or_default()
+                        .push(Stage::new(label.clone(), group_ids, all_parallel));
+                }
             }
         }
 
@@ -1663,6 +1800,12 @@ impl Scheduler {
 
             for &sys_id in &stage.system_ids {
                 if let Some(&index) = self.system_indices.get(&sys_id) {
+                    let system = &self.systems[index];
+                    if let Some(ref cond) = system.run_condition {
+                        if !cond(w) {
+                            continue;
+                        }
+                    }
                     let system = &mut self.systems[index];
                     match &mut system.kind {
                         SystemKind::Sequential(f) => f(w),
@@ -1715,6 +1858,18 @@ impl Scheduler {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
 
+        // 0. Evaluate run conditions on main thread BEFORE any ASD task setup
+        let mut skipped_systems: FxHashSet<SystemId> = FxHashSet::default();
+        for &sys_id in stage_ids {
+            if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                if let Some(ref cond) = self.systems[sys_idx].run_condition {
+                    if !cond(world) {
+                        skipped_systems.insert(sys_id);
+                    }
+                }
+            }
+        }
+
         // 1. Собираем per-system информацию
         struct SysInfo {
             ptr: SendPtr<SystemDescriptor>,
@@ -1729,6 +1884,9 @@ impl Scheduler {
         let mut total_entity_count: usize = 0;
 
         for &sys_id in stage_ids {
+            if skipped_systems.contains(&sys_id) {
+                continue;
+            }
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                 let arch_indices = self
                     .system_archetype_indices
@@ -1980,6 +2138,12 @@ impl Scheduler {
                     let sub_world = apex_core::SubWorld::new(w, &all_indices);
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                            let system = &self.systems[sys_idx];
+                            if let Some(ref cond) = system.run_condition {
+                                if !cond(unsafe { &*const_ptr }) {
+                                    continue;
+                                }
+                            }
                             let system = &mut self.systems[sys_idx];
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
@@ -2023,6 +2187,12 @@ impl Scheduler {
                     let sub_world = apex_core::SubWorld::new(w, &all_indices);
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                            let system = &self.systems[sys_idx];
+                            if let Some(ref cond) = system.run_condition {
+                                if !cond(unsafe { &*const_ptr }) {
+                                    continue;
+                                }
+                            }
                             let system = &mut self.systems[sys_idx];
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
@@ -2537,6 +2707,48 @@ fn detect_conflict_kind(
     }
 
     None
+}
+
+/// Разбить список `system_ids` на под-списки по маркерам `apply_deferred_after`.
+///
+/// Используется в `compile()` для создания под-Stage'ей между точками синхронизации.
+///
+/// Правила:
+/// - Система с `apply_deferred_after = true` вызывает split ПОСЛЕ себя
+///   (кроме случая когда это последняя система в списке)
+/// - Несколько подряд идущих `apply_deferred_after` → все разделяют
+/// - Пустые под-Stage'и не создаются
+fn split_at_apply_boundaries(
+    ids: &[SystemId],
+    systems: &[SystemDescriptor],
+) -> Vec<Vec<SystemId>> {
+    if ids.is_empty() {
+        return vec![];
+    }
+
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+
+    for (i, &id) in ids.iter().enumerate() {
+        let is_last = i + 1 == ids.len();
+        current.push(id);
+
+        let should_split = systems
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.apply_deferred_after)
+            .unwrap_or(false);
+
+        if should_split && !is_last {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    groups
 }
 
 /// Получить имя типа по TypeId.
@@ -3557,5 +3769,504 @@ mod tests {
             "Компиляция должна пройти без CircularDependency: {:?}",
             result.err()
         );
+    }
+
+    // ── Run Condition тесты ────────────────────────────────────
+
+    #[test]
+    fn run_condition_true_system_executes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        sched.add_system("test_sys", |_: &mut World| {
+            RAN.store(true, Ordering::SeqCst);
+        })
+        .run_if(|_| true);
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+
+        assert!(RAN.load(Ordering::SeqCst), "Система должна выполниться когда condition=true");
+    }
+
+    #[test]
+    fn run_condition_false_system_skipped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        sched.add_system("test_sys", |_: &mut World| {
+            RAN.store(true, Ordering::SeqCst);
+        })
+        .run_if(|_| false);
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+
+        assert!(!RAN.load(Ordering::SeqCst), "Система НЕ должна выполниться когда condition=false");
+    }
+
+    #[test]
+    fn run_condition_reads_resource() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Clone, Copy)]
+        struct GameState { paused: bool }
+
+        let mut sched = Scheduler::new();
+        let _id = sched.add_auto_system(
+            "pausable",
+            {
+                struct PausableSystem;
+                impl AutoSystem for PausableSystem {
+                    type Query = ();
+                    type Resources = ();
+                    type Events = ();
+                    fn run(&mut self, _: SystemContext<'_>) {
+                        RAN.store(true, Ordering::SeqCst);
+                    }
+                }
+                PausableSystem
+            },
+        );
+        sched.set_run_if("pausable", |w: &World| {
+            w.try_resource::<GameState>().map(|gs| !gs.paused).unwrap_or(true)
+        })
+        .unwrap();
+
+        // paused = true → система не запускается
+        let mut world = World::new();
+        world.insert_resource(GameState { paused: true });
+        sched.run_sequential(&mut world);
+        assert!(!RAN.load(Ordering::SeqCst), "Система не должна работать на паузе");
+
+        // paused = false → система запускается
+        RAN.store(false, Ordering::SeqCst);
+        let mut world2 = World::new();
+        world2.insert_resource(GameState { paused: false });
+        let mut sched2 = Scheduler::new();
+        let _id2 = sched2.add_auto_system(
+            "pausable2",
+            {
+                struct PausableSystem2;
+                impl AutoSystem for PausableSystem2 {
+                    type Query = ();
+                    type Resources = ();
+                    type Events = ();
+                    fn run(&mut self, _: SystemContext<'_>) {
+                        RAN.store(true, Ordering::SeqCst);
+                    }
+                }
+                PausableSystem2
+            },
+        );
+        sched2.set_run_if("pausable2", |w: &World| {
+            w.try_resource::<GameState>().map(|gs| !gs.paused).unwrap_or(true)
+        })
+        .unwrap();
+        sched2.run_sequential(&mut world2);
+        assert!(RAN.load(Ordering::SeqCst), "Система должна работать когда не пауза");
+    }
+
+    #[test]
+    fn run_condition_multiple_systems_mixed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER_A: AtomicUsize = AtomicUsize::new(0);
+        static COUNTER_B: AtomicUsize = AtomicUsize::new(0);
+
+        let mut sched = Scheduler::new();
+        sched.add_system("always_on", move |_: &mut World| {
+            COUNTER_A.fetch_add(1, Ordering::SeqCst);
+        });
+        sched.add_system("conditionally_off", move |_: &mut World| {
+            COUNTER_B.fetch_add(1, Ordering::SeqCst);
+        })
+        .run_if(|_| false);
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+
+        assert_eq!(COUNTER_A.load(Ordering::SeqCst), 1, "always_on должна выполниться");
+        assert_eq!(COUNTER_B.load(Ordering::SeqCst), 0, "conditionally_off НЕ должна выполниться");
+    }
+
+    #[test]
+    fn run_condition_parallel_stage_skips_system() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        let _id = sched.add_auto_system("skipped_in_parallel", {
+            struct SkippedSys;
+            impl AutoSystem for SkippedSys {
+                type Query = ();
+                type Resources = ();
+                type Events = ();
+                fn run(&mut self, _: SystemContext<'_>) {
+                    RAN.store(true, Ordering::SeqCst);
+                }
+            }
+            SkippedSys
+        });
+        sched.set_run_if("skipped_in_parallel", |_: &World| false).unwrap();
+
+        let mut world = World::new();
+        sched.run(&mut world);
+        assert!(!RAN.load(Ordering::SeqCst), "Параллельная система с condition=false НЕ запускается");
+    }
+
+    #[test]
+    fn run_condition_parallel_stage_runs_system() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        let _id = sched.add_auto_system("runs_in_parallel", {
+            struct RunsSys;
+            impl AutoSystem for RunsSys {
+                type Query = ();
+                type Resources = ();
+                type Events = ();
+                fn run(&mut self, _: SystemContext<'_>) {
+                    RAN.store(true, Ordering::SeqCst);
+                }
+            }
+            RunsSys
+        });
+        sched.set_run_if("runs_in_parallel", |_: &World| true).unwrap();
+
+        let mut world = World::new();
+        sched.run(&mut world);
+        assert!(RAN.load(Ordering::SeqCst), "Параллельная система с condition=true запускается");
+    }
+
+    #[test]
+    fn run_condition_startup_system_runs_once_if_true() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+        let mut sched = Scheduler::new();
+        sched.add_startup_system("conditional_startup", move |_: &mut World| {
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+        })
+        .run_if(|_| true);
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+        sched.run_sequential(&mut world);
+
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1, "Startup с condition=true должен выполниться ровно 1 раз");
+    }
+
+    #[test]
+    fn run_condition_auto_system_with_component_access() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Component, Clone, Copy)]
+        struct Flag(bool);
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        struct ConditionalSystem;
+        impl AutoSystem for ConditionalSystem {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {
+                RAN.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let f = move |w: &World| {
+            w.try_resource::<Flag>().map(|f| f.0).unwrap_or(false)
+        };
+
+        let mut sched = Scheduler::new();
+        let _id = sched.add_auto_system("conditional", ConditionalSystem);
+        sched.set_run_if("conditional", Box::new(f)).unwrap();
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+        assert!(!RAN.load(Ordering::SeqCst), "Без Flag ресурса — не запускается");
+
+        RAN.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn run_condition_auto_system_with_component_access_true() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Component, Clone, Copy)]
+        struct Flag(bool);
+
+        static RAN: AtomicBool = AtomicBool::new(false);
+
+        struct ConditionalSystem;
+        impl AutoSystem for ConditionalSystem {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {
+                RAN.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Flag(true));
+
+        let f = move |w: &World| {
+            w.try_resource::<Flag>().map(|f| f.0).unwrap_or(false)
+        };
+        let mut sched = Scheduler::new();
+        let _id = sched.add_auto_system("conditional2", ConditionalSystem);
+        sched.set_run_if("conditional2", Box::new(f)).unwrap();
+
+        sched.run_sequential(&mut world);
+        assert!(RAN.load(Ordering::SeqCst), "С Flag(true) ресурсом — запускается");
+    }
+
+    // ── Apply Deferred тесты ───────────────────────────────────
+
+    #[test]
+    fn apply_deferred_splits_into_two_sub_stages() {
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.add_system("first", |_: &mut World| {});
+            s.apply_deferred();
+            s.add_system("second", |_: &mut World| {});
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1 + 1, "Должно быть 2 под-Stage'а: first + second");
+        assert_eq!(stages[0].system_ids.len(), 1, "Первый под-Stage: 1 система");
+        assert_eq!(stages[1].system_ids.len(), 1, "Второй под-Stage: 1 система");
+    }
+
+    #[test]
+    fn apply_deferred_no_split_if_only_one_system() {
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.add_system("only", |_: &mut World| {});
+            s.apply_deferred(); // no-op: только одна система, split не нужен
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1, "Без второй системы — split не создаётся");
+    }
+
+    #[test]
+    fn apply_deferred_commands_visible_in_next_sub_stage() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ENTITY_SPAWNED: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component, Clone, Copy)]
+        struct Spawned;
+
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("spawn_then_use"), |s| {
+            s.add_system("spawn_sys", move |world: &mut World| {
+                world.spawn((Spawned,));
+                ENTITY_SPAWNED.store(true, Ordering::SeqCst);
+            });
+            s.apply_deferred();
+            s.add_system("check_sys", move |world: &mut World| {
+                let spawned = ENTITY_SPAWNED.load(Ordering::SeqCst);
+                assert!(spawned, "spawn_system должна выполниться перед check_system");
+                let count = Query::<Read<Spawned>>::new(world).iter().count();
+                assert_eq!(count, 1, "spawn должен быть видим в том же кадре");
+            });
+        });
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+    }
+
+    #[test]
+    fn apply_deferred_multiple_splits() {
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("multi"), |s| {
+            s.add_system("a", |_: &mut World| {});
+            s.apply_deferred();
+            s.add_system("b", |_: &mut World| {});
+            s.apply_deferred();
+            s.add_system("c", |_: &mut World| {});
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1 + 2, "3 под-Stage'а: [a], [b], [c]");
+    }
+
+    #[test]
+    fn apply_deferred_mixed_with_run_conditions() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Clone, Copy)]
+        struct Flag(bool);
+
+        static A_RAN: AtomicBool = AtomicBool::new(false);
+        static B_RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("mixed"), |s| {
+            s.add_system("a", move |_: &mut World| {
+                A_RAN.store(true, Ordering::SeqCst);
+            });
+            s.apply_deferred();
+            s.add_system("b", move |_: &mut World| {
+                B_RAN.store(true, Ordering::SeqCst);
+            })
+            .run_if(|w: &World| {
+                w.try_resource::<Flag>().map(|f| f.0).unwrap_or(false)
+            });
+        });
+
+        // Flag = false → b пропускается
+        let mut world1 = World::new();
+        world1.insert_resource(Flag(false));
+        sched.compile_with_world(&world1).unwrap();
+        sched.run_sequential(&mut world1);
+        assert!(A_RAN.load(Ordering::SeqCst), "a всегда должна выполняться");
+        assert!(!B_RAN.load(Ordering::SeqCst), "b НЕ должна выполняться при Flag=false");
+
+        // Flag = true → b выполняется
+        A_RAN.store(false, Ordering::SeqCst);
+        let mut sched2 = Scheduler::new();
+        sched2.staged(StageLabel::tag("mixed2"), |s| {
+            s.add_system("a2", move |_: &mut World| {
+                A_RAN.store(true, Ordering::SeqCst);
+            });
+            s.apply_deferred();
+            s.add_system("b2", move |_: &mut World| {
+                B_RAN.store(true, Ordering::SeqCst);
+            })
+            .run_if(|w: &World| {
+                w.try_resource::<Flag>().map(|f| f.0).unwrap_or(false)
+            });
+        });
+        let mut world2 = World::new();
+        world2.insert_resource(Flag(true));
+        sched2.compile_with_world(&world2).unwrap();
+        sched2.run_sequential(&mut world2);
+        assert!(A_RAN.load(Ordering::SeqCst));
+        assert!(B_RAN.load(Ordering::SeqCst), "b должна выполняться при Flag=true");
+    }
+
+    #[test]
+    fn apply_deferred_double_call_idempotent() {
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.add_system("only", |_: &mut World| {});
+            s.apply_deferred(); // первая
+            s.apply_deferred(); // вторая — идемпотентна
+            s.add_system("after", |_: &mut World| {});
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1 + 1, "Двойной apply_deferred не должен создавать пустых под-Stage'ей");
+    }
+
+    #[test]
+    fn apply_deferred_at_start_noop() {
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.apply_deferred(); // нет предыдущих систем → no-op
+            s.add_system("after", |_: &mut World| {});
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1, "apply_deferred без предыдущей системы — no-op");
+    }
+
+    #[test]
+    fn apply_deferred_with_auto_systems() {
+        struct DummySys;
+        impl AutoSystem for DummySys {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.add_auto_system("par_a", DummySys);
+            s.apply_deferred();
+            s.add_auto_system("par_b", DummySys);
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 1 + 1, "AutoSystem + apply_deferred = 2 под-Stage'а");
+        assert!(stages[0].all_parallel, "Первый под-Stage: all_parallel=true");
+        assert!(stages[1].all_parallel, "Второй под-Stage: all_parallel=true");
+    }
+
+    #[test]
+    fn apply_deferred_groups_parallel_systems_correctly() {
+        struct DummySys;
+        impl AutoSystem for DummySys {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.staged(StageLabel::tag("test"), |s| {
+            s.add_auto_system("a", DummySys);
+            s.add_auto_system("b", DummySys);
+            s.apply_deferred();
+            s.add_auto_system("c", DummySys);
+            s.add_auto_system("d", DummySys);
+        });
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        assert_eq!(stages.len(), 2, "2 под-Stage'а: [a,b] + [c,d]");
+        assert_eq!(stages[0].system_ids.len(), 2);
+        assert_eq!(stages[1].system_ids.len(), 2);
+    }
+
+    #[test]
+    fn apply_deferred_triggers_event_visibility() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Copy)]
+        struct MyEvent(#[allow(dead_code)] pub u32);
+
+        static VALUE_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+        let mut sched = Scheduler::new();
+        struct Emitter;
+        impl ParSystem for Emitter {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write_event::<MyEvent>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let _emitter_id = sched.add_par_system("emitter", Emitter);
+        sched.apply_deferred();
+
+        sched.add_startup_system("reader", move |world: &mut World| {
+            let events = world.events::<MyEvent>();
+            VALUE_SEEN.store(events.len(), Ordering::SeqCst);
+        });
+
+        let mut world = World::new();
+        world.add_event::<MyEvent>();
+        world.send_event(MyEvent(42));
+        world.tick();
+        world.flush_all_events();
+
+        sched.run_sequential(&mut world);
+        assert_eq!(VALUE_SEEN.load(Ordering::SeqCst), 1, "Событие видно между под-Stage'ями");
     }
 }

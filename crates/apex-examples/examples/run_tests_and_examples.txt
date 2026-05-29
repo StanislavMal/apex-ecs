@@ -24,6 +24,8 @@ cargo run -p apex-examples --example perf --release > perf.txt
 
 cargo run -p apex-examples --example event_pipeline --release
 
+cargo run -p apex-examples --example scheduling_features
+
 cargo clippy --workspace          
 
 
