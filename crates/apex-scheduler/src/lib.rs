@@ -49,6 +49,7 @@
 //! | FnParSystem | явный + замыкание | быстрые прототипы |
 //! | Sequential | полный &mut World | structural changes |
 
+pub mod conditions;
 pub mod pipeline;
 pub mod stage;
 
@@ -145,13 +146,58 @@ pub enum SchedulerError {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SystemId(pub u32);
 
-/// Read-only condition that determines whether a system should run this frame.
+// ── ConditionTree — составные условия выполнения ────────────
+
+/// Дерево условий: определяет, должна ли система выполниться в этом кадре.
 ///
-/// Evaluated on the main thread **before** the system's stage executes.
-/// When `false`, the system is skipped entirely — zero CPU for its ASD tasks.
+/// Оценивается на главном потоке **до** выполнения stage'а.
+/// Поддерживает AND (все дочерние true) и OR (хотя бы одно true).
 ///
-/// Typical use: checking a resource field (paused, phase, LOD level) or input state.
-/// Keep conditions lightweight — avoid full Archetype queries.
+/// # Композиция
+///
+/// ```ignore
+/// // AND — несколько run_if подряд:
+/// s.run_if(cond_a).run_if(cond_b)        → And([Leaf(a), Leaf(b)])
+///
+/// // OR — через or_else:
+/// s.or_else(cond_a).or_else(cond_b)      → Or([Leaf(a), Leaf(b)])
+/// ```
+///
+/// # Оценка
+///
+/// AND использует шорт-циркут: как только одно условие false — остальные не проверяются.
+/// OR использует шорт-циркут: как только одно true — остальные не проверяются.
+/// Это безопасно, потому что условия Apex stateless (в отличие от Bevy).
+pub enum ConditionTree {
+    Leaf(Box<dyn Fn(&World) -> bool + Send + Sync>),
+    And(Vec<ConditionTree>),
+    Or(Vec<ConditionTree>),
+}
+
+// Ручной Clone для Box<dyn Fn> не работает. ConditionTree внутри scope
+// нужен только для merge — обходимся без Clone.
+impl ConditionTree {
+    /// Оценить дерево условий для данного мира.
+    pub fn evaluate(&self, world: &World) -> bool {
+        match self {
+            ConditionTree::Leaf(f) => f(world),
+            ConditionTree::And(conds) => conds.iter().all(|c| c.evaluate(world)),
+            ConditionTree::Or(conds) => conds.iter().any(|c| c.evaluate(world)),
+        }
+    }
+
+    /// Создать Leaf из замыкания.
+    pub fn leaf(f: impl Fn(&World) -> bool + Send + Sync + 'static) -> Self {
+        ConditionTree::Leaf(Box::new(f))
+    }
+}
+
+impl Default for ConditionTree {
+    fn default() -> Self {
+        ConditionTree::And(Vec::new())
+    }
+}
+
 pub type RunCondition = Box<dyn Fn(&World) -> bool + Send + Sync>;
 
 pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
@@ -315,9 +361,9 @@ struct SystemDescriptor {
     before: Vec<SystemId>,
     /// Этап выполнения (по умолчанию Update).
     stage_label: StageLabel,
-    /// Run condition: система запускается только если condition возвращает true.
-    /// None = система запускается всегда.
-    run_condition: Option<RunCondition>,
+    /// Run condition: система запускается только если дерево условий возвращает true.
+    /// По умолчанию `ConditionTree::And(Vec::new())` — всегда true (пустой AND = true).
+    run_condition: ConditionTree,
     /// True = применить Commands после этой системы, разбив Stage на под-Stage.
     /// Устанавливается через `sched.apply_deferred()`.
     apply_deferred_after: bool,
@@ -336,12 +382,12 @@ impl<'a> SystemBuilder<'a> {
         self.id
     }
 
-    /// Прикрепить run condition к системе.
+    /// Прикрепить run condition к системе (AND-композиция).
     ///
-    /// Система будет запущена только если `condition` возвращает `true`.
+    /// Система будет запущена только если **все** прикреплённые условия возвращают `true`.
+    /// Можно вызывать несколько раз — условия AND-ятся.
+    ///
     /// Condition оценивается на главном потоке **до** выполнения stage'а.
-    ///
-    /// Можно вызывать несколько раз — все условия AND'ятся.
     ///
     /// # Пример
     /// ```
@@ -349,13 +395,59 @@ impl<'a> SystemBuilder<'a> {
     /// # use apex_scheduler::Scheduler;
     /// # let mut sched = Scheduler::new();
     /// sched.add_system("movement", |_| {})
-    ///     .run_if(|w| !w.resource::<GameState>().paused);
+    ///     .run_if(|w| !w.resource::<GameState>().paused)
+    ///     .run_if(|w| w.try_resource::<u32>().map(|&n| n > 0).unwrap_or(false));
     /// ```
     pub fn run_if<F>(self, condition: F) -> Self
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
-        self.scheduler.set_run_condition(self.id, Box::new(condition));
+        let leaf = ConditionTree::leaf(condition);
+        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
+            match &mut sys.run_condition {
+                ConditionTree::And(ref mut conds) => conds.push(leaf),
+                _ => {
+                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
+                    if let ConditionTree::And(ref mut conds) = sys.run_condition {
+                        conds.push(old);
+                        conds.push(leaf);
+                    }
+                }
+            }
+        }
+        self
+    }
+
+    /// Прикрепить OR-условие: система выполнится если хотя бы одно из OR-условий true.
+    ///
+    /// Если ранее были AND-условия через `run_if()`, OR-условия создают новую OR-группу.
+    ///
+    /// # Пример
+    /// ```
+    /// # use apex_scheduler::Scheduler;
+    /// # let mut sched = Scheduler::new();
+    /// sched.add_system("respawn", |_| {})
+    ///     .or_else(|w| w.try_resource::<u32>().map(|&n| n == 0).unwrap_or(false))
+    ///     .or_else(|w| w.try_resource::<u32>().map(|&n| n > 100).unwrap_or(false));
+    /// // Выполнится если n == 0 ИЛИ n > 100
+    /// ```
+    pub fn or_else<F>(self, condition: F) -> Self
+    where
+        F: Fn(&World) -> bool + Send + Sync + 'static,
+    {
+        let leaf = ConditionTree::leaf(condition);
+        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
+            match &mut sys.run_condition {
+                ConditionTree::Or(ref mut conds) => conds.push(leaf),
+                _ => {
+                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::Or(Vec::new()));
+                    if let ConditionTree::Or(ref mut conds) = sys.run_condition {
+                        conds.push(old);
+                        conds.push(leaf);
+                    }
+                }
+            }
+        }
         self
     }
 }
@@ -489,8 +581,11 @@ pub struct Scheduler {
     event_ordering_enabled: bool,
 
     /// Последняя зарегистрированная система — для `apply_deferred()`.
-    /// При вызове `s.apply_deferred()` этому SystemId ставится `apply_deferred_after = true`.
     last_added_system_id: Option<SystemId>,
+
+    /// Scope condition: все системы, зарегистрированные внутри `staged()` пока этот
+    /// condition активен, наследуют его (автоматически AND-ится с их условиями).
+    scope_condition: Option<std::sync::Arc<dyn Fn(&World) -> bool + Send + Sync>>,
 }
 
 impl Scheduler {
@@ -522,6 +617,7 @@ impl Scheduler {
             type_names: FxHashMap::default(),
             event_ordering_enabled: true,
             last_added_system_id: None,
+            scope_condition: None,
         }
     }
 
@@ -557,12 +653,13 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
-            run_condition: None,
+            run_condition: ConditionTree::default(),
             apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
         self.invalidate_plan();
+        self.merge_scope_condition(id);
         SystemBuilder {
             scheduler: self,
             id,
@@ -625,12 +722,13 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
-            run_condition: None,
+            run_condition: ConditionTree::default(),
             apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
+        self.merge_scope_condition(id);
         id
     }
 
@@ -683,12 +781,13 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
-            run_condition: None,
+            run_condition: ConditionTree::default(),
             apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
+        self.merge_scope_condition(id);
         id
     }
 
@@ -747,12 +846,13 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
-            run_condition: None,
+            run_condition: ConditionTree::default(),
             apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
+        self.merge_scope_condition(id);
         id
     }
 
@@ -831,12 +931,13 @@ impl Scheduler {
             after: Vec::new(),
             before: Vec::new(),
             stage_label,
-            run_condition: None,
+            run_condition: ConditionTree::default(),
             apply_deferred_after: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
+        self.merge_scope_condition(id);
         id
     }
 
@@ -967,6 +1068,51 @@ impl Scheduler {
         self
     }
 
+    /// Установить scope condition — все системы внутри текущего `staged()` блока
+    /// автоматически получат это условие (AND с их собственными condition'ами).
+    ///
+    /// # Пример
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # let mut sched = Scheduler::new();
+    /// sched.staged(StageLabel::tag("gameplay"), |s| {
+    ///     s.run_condition(|w: &apex_core::world::World| !w.has_resource::<bool>());
+    ///     s.add_system("movement", |_: &mut apex_core::world::World| {});
+    ///     s.add_system("ai", |_: &mut apex_core::world::World| {});
+    ///     // обе системы наследуют условие паузы
+    /// });
+    /// ```
+    pub fn run_condition<F>(&mut self, condition: F) -> &mut Self
+    where
+        F: Fn(&World) -> bool + Send + Sync + 'static,
+    {
+        let leaf: std::sync::Arc<dyn Fn(&World) -> bool + Send + Sync> = std::sync::Arc::new(condition);
+        self.scope_condition = match self.scope_condition.take() {
+            None => Some(leaf),
+            Some(existing) => Some(std::sync::Arc::new(move |w: &World| existing(w) && leaf(w))),
+        };
+        self
+    }
+
+    fn merge_scope_condition(&mut self, sys_id: SystemId) {
+        if let Some(ref scope_fn) = self.scope_condition {
+            let scope_clone = std::sync::Arc::clone(scope_fn);
+            if let Some(sys) = self.system_by_id_mut(sys_id) {
+                let leaf = ConditionTree::Leaf(Box::new(move |w: &World| (*scope_clone)(w)));
+                match &mut sys.run_condition {
+                    ConditionTree::And(ref mut conds) => conds.push(leaf),
+                    _ => {
+                        let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
+                        if let ConditionTree::And(ref mut conds) = sys.run_condition {
+                            conds.push(old);
+                            conds.push(leaf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Добавить явную зависимость: `system` выполняется после `after_id`.
     pub fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
@@ -1048,21 +1194,25 @@ impl Scheduler {
 
     // ── Run Conditions ─────────────────────────────────────────
 
-    fn set_run_condition(&mut self, id: SystemId, condition: RunCondition) {
-        if let Some(sys) = self.system_by_id_mut(id) {
-            sys.run_condition = Some(condition);
-        }
-    }
-
-    /// Прикрепить run condition к системе по имени.
-    ///
-    /// Система запускается только если `condition` возвращает `true`.
+    /// Прикрепить run condition к системе по имени (AND-композиция).
     pub fn set_run_if<F>(&mut self, name: &str, condition: F) -> Result<(), SchedulerError>
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
         let id = self.find_id_by_name(name)?;
-        self.set_run_condition(id, Box::new(condition));
+        let leaf = ConditionTree::leaf(condition);
+        if let Some(sys) = self.system_by_id_mut(id) {
+            match &mut sys.run_condition {
+                ConditionTree::And(ref mut conds) => conds.push(leaf),
+                _ => {
+                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
+                    if let ConditionTree::And(ref mut conds) = sys.run_condition {
+                        conds.push(old);
+                        conds.push(leaf);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1801,10 +1951,8 @@ impl Scheduler {
             for &sys_id in &stage.system_ids {
                 if let Some(&index) = self.system_indices.get(&sys_id) {
                     let system = &self.systems[index];
-                    if let Some(ref cond) = system.run_condition {
-                        if !cond(w) {
-                            continue;
-                        }
+                    if !system.run_condition.evaluate(w) {
+                        continue;
                     }
                     let system = &mut self.systems[index];
                     match &mut system.kind {
@@ -1862,10 +2010,8 @@ impl Scheduler {
         let mut skipped_systems: FxHashSet<SystemId> = FxHashSet::default();
         for &sys_id in stage_ids {
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                if let Some(ref cond) = self.systems[sys_idx].run_condition {
-                    if !cond(world) {
-                        skipped_systems.insert(sys_id);
-                    }
+                if !self.systems[sys_idx].run_condition.evaluate(world) {
+                    skipped_systems.insert(sys_id);
                 }
             }
         }
@@ -2139,11 +2285,9 @@ impl Scheduler {
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
-                            if let Some(ref cond) = system.run_condition {
-                                if !cond(unsafe { &*const_ptr }) {
-                                    continue;
-                                }
-                            }
+                        if !system.run_condition.evaluate(unsafe { &*const_ptr }) {
+                            continue;
+                        }
                             let system = &mut self.systems[sys_idx];
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
@@ -2188,11 +2332,9 @@ impl Scheduler {
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
-                            if let Some(ref cond) = system.run_condition {
-                                if !cond(unsafe { &*const_ptr }) {
-                                    continue;
-                                }
-                            }
+                        if !system.run_condition.evaluate(unsafe { &*const_ptr }) {
+                            continue;
+                        }
                             let system = &mut self.systems[sys_idx];
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
