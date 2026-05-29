@@ -153,13 +153,13 @@ fn main() {
 
         s.add_systems(StageLabel::Startup, (
             seq("spawn_entities", spawn_entities_system)
-                .run_if(conditions::run_until(1)),  // ★ 1 раз
+                .run_if_cond(conditions::run_until(1)),  // ★ 1 раз
         ));
         s.apply_deferred();  // ★ entities готовы
 
         s.add_systems(StageLabel::Startup, (
             seq("start_game", start_game_system)
-                .run_if(conditions::resource_exists::<GameState>()),
+                .run_if_cond(conditions::resource_exists::<GameState>()),
         ));
     });
 
@@ -185,7 +185,7 @@ fn main() {
 
             // AI: playing И есть враги (scope AND has_enemies)
             sys("ai", ai_system)
-                .run_if(conditions::any_with_component::<Enemy>()),
+                .run_if_cond(conditions::any_with_component::<Enemy>()),
 
             // Debug: playing И debug_overlay (scope AND debug_on)
             sys("debug_overlay", debug_overlay_system)

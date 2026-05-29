@@ -592,6 +592,11 @@ pub trait AutoSystem: Send + Sync {
     /// По умолчанию `false`.
     const NEEDS_WHOLE_WORLD: bool = false;
 
+    /// Система использует Commands (отложенные операции).
+    /// Устанавливается `system!` макросом автоматически при обнаружении `cmd: Cmd`.
+    /// Позволяет `compile()` вставлять auto-apply sync points.
+    const HAS_DEFERRED: bool = false;
+
     fn run(&mut self, ctx: crate::world::SystemContext<'_>);
 
     fn name() -> &'static str

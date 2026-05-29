@@ -65,7 +65,7 @@ macro_rules! system {
             @params: [ $($params)* ],
             @body: { $($body)* },
             @struct_body: [],
-            @slf: [], @whole: [],
+            @slf: [], @whole: [], @cmd: [],
         }
     };
 
@@ -95,7 +95,7 @@ macro_rules! system {
             @params: [ $($params)* ],
             @body: { $($body)* },
             @struct_body: [ struct $struct_name { $( $field: $fty ),* } ],
-            @slf: [ $slf ], @whole: [],
+            @slf: [ $slf ], @whole: [], @cmd: [],
         }
     };
 }
@@ -115,6 +115,15 @@ macro_rules! __sys_whole_world {
     ( [] ) => {};
     ( [ $($t:tt)+ ] ) => {
         const NEEDS_WHOLE_WORLD: bool = true;
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __sys_has_deferred {
+    ( [] ) => {};
+    ( [ $($t:tt)+ ] ) => {
+        const HAS_DEFERRED: bool = true;
     };
 }
 
@@ -155,7 +164,7 @@ macro_rules! __system_impl {
         @params: [], @body: { $( $body:tt )* },
         @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ],
-        @whole: [ $( $whole:tt )* ],
+        @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => {
         $crate::__emit_struct! { [ $( $struct_tokens )* ] $fn_name }
         impl $crate::AutoSystem for $fn_name {
@@ -163,6 +172,7 @@ macro_rules! __system_impl {
             type Resources = ( $( $($r)+ ),* );
             type Events = ( $( $($e)+ ),* );
             $crate::__sys_whole_world!([ $( $whole )* ]);
+            $crate::__sys_has_deferred!([ $( $cmd )* ]);
             fn run(&mut self, $ctx: $crate::SystemContext<'_>) {
                 $( let $slf_name = &mut *self; )*
                 $( $before )* $( $body )* $( $after )*
@@ -178,12 +188,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Ctx , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$crate::SystemContext<'_> = &$ctx; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // WholeWorld
@@ -192,12 +202,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : WholeWorld , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* ], @after: [ $( $after )* ],
         @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // Query tuple
@@ -206,12 +216,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ( $( $qty:tt )* ) , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event reader
@@ -220,12 +230,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & [ $ev:ty ] , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let $pname = $ctx.event_reader::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event writer (generates EventWriter, user calls .send())
@@ -234,12 +244,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut Vec < $ev:ty > , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource write
@@ -248,12 +258,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &mut $ty = &mut *$ctx.resource_mut::<$ty>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource read
@@ -262,12 +272,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$ty = &*$ctx.resource::<$ty>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Commands
@@ -276,12 +286,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Cmd , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &mut apex_core::Commands = $ctx.commands(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
     }};
 
     // Single component query (bare type)
@@ -290,12 +300,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : $qty:ty , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // ═══ Without trailing comma (last param) ═══
@@ -306,12 +316,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Ctx ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$crate::SystemContext<'_> = &$ctx; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // WholeWorld (last)
@@ -320,12 +330,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : WholeWorld ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* ], @after: [ $( $after )* ],
         @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // Query tuple (last)
@@ -334,12 +344,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ( $( $qty:tt )* ) ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event reader (last)
@@ -348,12 +358,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & [ $ev:ty ] ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let $pname = $ctx.event_reader::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event writer (last)
@@ -362,12 +372,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut Vec < $ev:ty > ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource write (last)
@@ -376,12 +386,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &mut $ty = &mut *$ctx.resource_mut::<$ty>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource read (last)
@@ -390,12 +400,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$ty = &*$ctx.resource::<$ty>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Commands (last)
@@ -404,12 +414,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Cmd ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &mut apex_core::Commands = $ctx.commands(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
     }};
 
     // Bare type query (last)
@@ -418,12 +428,12 @@ macro_rules! __system_impl {
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : $qty:ty ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
-        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Catch-all
@@ -431,7 +441,7 @@ macro_rules! __system_impl {
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $($rest:tt)+ ], @body: { $( $body:tt )* },
-        @struct_body: [ $( $struct_tokens:tt )* ], @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ],
+        @struct_body: [ $( $struct_tokens:tt )* ], @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__sys_compile_error! { $($rest)* } };
 }
 

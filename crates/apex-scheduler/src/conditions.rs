@@ -1,7 +1,7 @@
 //! Common run conditions — из коробки.
 //!
-//! Аналог Bevy `common_conditions`: `resource_exists`, `resource_changed`, `any_with_component`.
-//! Для Apex — stateless функции `Fn(&World) -> bool`.
+//! Каждый built-in condition реализует [`Condition`] с типизированным `access()`.
+//! Планировщик знает какие данные читает условие → автоматически строит dependency edges.
 //!
 //! # Использование
 //!
@@ -16,73 +16,121 @@
 //!     .run_if(conditions::run_until(1));
 //! ```
 
-use crate::RunCondition;
+use crate::Condition;
 use apex_core::component::Component;
 use apex_core::query::{Query, Read};
 use apex_core::world::World;
+use apex_core::AccessDescriptor;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Условие: ресурс типа `T` существует в мире.
-///
-/// ```ignore
-/// .run_if(conditions::resource_exists::<GameState>())
-/// ```
-pub fn resource_exists<T: Send + Sync + 'static>() -> RunCondition {
-    Box::new(|w: &World| w.has_resource::<T>())
+pub struct ResourceExists<T>(PhantomData<T>);
+
+impl<T> Clone for ResourceExists<T> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
 }
 
-/// Условие: ресурс типа `T` существует и равен заданному значению.
-///
-/// ```ignore
-/// .run_if(conditions::resource_equals(GamePhase::Playing))
-/// ```
-pub fn resource_equals<T: Send + Sync + 'static + PartialEq>(value: T) -> RunCondition {
-    Box::new(move |w: &World| w.try_resource::<T>().map(|r| *r == value).unwrap_or(false))
+impl<T: Send + Sync + 'static> Condition for ResourceExists<T> {
+    fn check(&self, w: &World) -> bool {
+        w.has_resource::<T>()
+    }
+    fn access(&self) -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
 }
 
-/// Условие: в мире есть хотя бы один entity с компонентом `T`.
-///
-/// ```ignore
-/// .run_if(conditions::any_with_component::<Player>())
-/// ```
-pub fn any_with_component<T: Component>() -> RunCondition {
-    Box::new(|w: &World| Query::<Read<T>>::new(w).iter().count() > 0)
+pub fn resource_exists<T: Send + Sync + 'static>() -> ResourceExists<T> {
+    ResourceExists(PhantomData)
 }
 
-/// Условие: выполняется ровно N первых раз, затем всегда false.
-///
-/// ```ignore
-/// // Startup система — выполнится 1 раз
-/// s.add_system("init", init_fn).run_if(conditions::run_until(1));
-/// ```
-pub fn run_until(limit: u32) -> RunCondition {
-    let counter = AtomicU32::new(0);
-    Box::new(move |_: &World| {
-        let n = counter.fetch_add(1, Ordering::Relaxed);
-        n < limit
-    })
+pub struct ResourceEquals<T> {
+    value: T,
 }
 
-/// Условие: выполняется не чаще чем раз в N кадров.
-///
-/// ```ignore
-/// // Тяжёлая система — раз в 60 кадров
-/// .run_if(conditions::every_n_frames(60))
-/// ```
-pub fn every_n_frames(n: u32) -> RunCondition {
-    let counter = AtomicU32::new(0);
-    Box::new(move |_: &World| {
-        let tick = counter.fetch_add(1, Ordering::Relaxed);
-        tick % n == 0
-    })
+impl<T: Clone> Clone for ResourceEquals<T> {
+    fn clone(&self) -> Self {
+        Self {
+            value: self.value.clone(),
+        }
+    }
 }
 
-/// Инвертировать условие. Возвращает `!cond(world)`.
-///
-/// ```ignore
-/// // Система работает когда нет паузы:
-/// .run_if(conditions::not(|w| w.resource::<GameState>().paused))
-/// ```
-pub fn not(cond: RunCondition) -> RunCondition {
-    Box::new(move |w: &World| !cond(w))
+impl<T: Send + Sync + 'static + PartialEq> Condition for ResourceEquals<T> {
+    fn check(&self, w: &World) -> bool {
+        w.try_resource::<T>()
+            .map(|r| *r == self.value)
+            .unwrap_or(false)
+    }
+    fn access(&self) -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+}
+
+pub fn resource_equals<T: Send + Sync + 'static + PartialEq>(value: T) -> ResourceEquals<T> {
+    ResourceEquals { value }
+}
+
+pub struct AnyWithComponent<T>(PhantomData<T>);
+
+impl<T> Clone for AnyWithComponent<T> {
+    fn clone(&self) -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<T: Component> Condition for AnyWithComponent<T> {
+    fn check(&self, w: &World) -> bool {
+        Query::<Read<T>>::new(w).iter().count() > 0
+    }
+    fn access(&self) -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+}
+
+pub fn any_with_component<T: Component>() -> AnyWithComponent<T> {
+    AnyWithComponent(PhantomData)
+}
+
+pub struct RunUntil {
+    limit: u32,
+    counter: AtomicU32,
+}
+
+impl Condition for RunUntil {
+    fn check(&self, _: &World) -> bool {
+        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        n < self.limit
+    }
+}
+
+pub fn run_until(limit: u32) -> RunUntil {
+    RunUntil {
+        limit,
+        counter: AtomicU32::new(0),
+    }
+}
+
+pub struct EveryNFrames {
+    n: u32,
+    counter: AtomicU32,
+}
+
+impl Condition for EveryNFrames {
+    fn check(&self, _: &World) -> bool {
+        let tick = self.counter.fetch_add(1, Ordering::Relaxed);
+        tick % self.n == 0
+    }
+}
+
+pub fn every_n_frames(n: u32) -> EveryNFrames {
+    EveryNFrames {
+        n,
+        counter: AtomicU32::new(0),
+    }
+}
+
+pub fn not<C: Condition>(cond: C) -> crate::NotCondition<C> {
+    cond.not()
 }

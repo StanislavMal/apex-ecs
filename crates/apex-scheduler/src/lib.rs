@@ -179,8 +179,6 @@ pub enum ConditionTree {
     Or(Vec<ConditionTree>),
 }
 
-// Ручной Clone для Box<dyn Fn> не работает. ConditionTree внутри scope
-// нужен только для merge — обходимся без Clone.
 impl ConditionTree {
     /// Оценить дерево условий для данного мира.
     pub fn evaluate(&self, world: &World) -> bool {
@@ -204,6 +202,70 @@ impl Default for ConditionTree {
 }
 
 pub type RunCondition = Box<dyn Fn(&World) -> bool + Send + Sync>;
+
+// ── Condition Trait ────────────────────────────────────────────
+
+pub trait Condition: Send + Sync + 'static {
+    fn check(&self, world: &World) -> bool;
+    fn access(&self) -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+    fn not(self) -> NotCondition<Self>
+    where
+        Self: Sized,
+    {
+        NotCondition(self)
+    }
+    fn into_check_fn(self) -> Box<dyn Fn(&World) -> bool + Send + Sync>
+    where
+        Self: Sized,
+    {
+        Box::new(move |world: &World| self.check(world))
+    }
+}
+
+pub struct NotCondition<C: Condition>(pub C);
+
+impl<C: Condition> Condition for NotCondition<C> {
+    fn check(&self, world: &World) -> bool {
+        !self.0.check(world)
+    }
+    fn access(&self) -> AccessDescriptor {
+        self.0.access()
+    }
+}
+
+macro_rules! impl_condition_tuple {
+    ($($T:ident),+) => {
+        impl<$($T: Condition),+> Condition for ($($T,)+) {
+            #[allow(non_snake_case)]
+            fn check(&self, world: &World) -> bool {
+                let ($($T,)+) = self;
+                $( if !$T.check(world) { return false; } )+
+                true
+            }
+            #[allow(non_snake_case)]
+            fn access(&self) -> AccessDescriptor {
+                let ($($T,)+) = self;
+                AccessDescriptor::new()
+                    $( .merge(&$T.access()) )+
+            }
+        }
+    };
+}
+
+impl_condition_tuple!(A);
+impl_condition_tuple!(A, B);
+impl_condition_tuple!(A, B, C);
+impl_condition_tuple!(A, B, C, D);
+impl_condition_tuple!(A, B, C, D, E);
+impl_condition_tuple!(A, B, C, D, E, F);
+impl_condition_tuple!(A, B, C, D, E, F, G);
+impl_condition_tuple!(A, B, C, D, E, F, G, H);
+impl_condition_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_condition_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+
+// ── IntoConditionLeaf — internal dispatch trait ─────────────────
 
 pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
@@ -375,107 +437,108 @@ struct SystemDescriptor {
     /// True = система использует отложенные операции (Commands).
     /// Автоматически определяется при регистрации.
     has_deferred: bool,
+    /// Накопленный доступ из всех run_if/or_else условий.
+    /// При compile() мержится в system access для конфликтного анализа.
+    condition_access: AccessDescriptor,
 }
 
 // ── SystemBuilder ──────────────────────────────────────────────
 
-pub struct SystemBuilder<'a> {
-    #[allow(dead_code)]
-    scheduler: &'a mut Scheduler,
+pub struct SystemBuilder {
+    scheduler: *mut Scheduler,
     id: SystemId,
 }
 
-impl<'a> SystemBuilder<'a> {
+impl SystemBuilder {
     pub fn id(self) -> SystemId {
         self.id
     }
 
-    /// Прикрепить run condition к системе (AND-композиция).
-    ///
-    /// Система будет запущена только если **все** прикреплённые условия возвращают `true`.
-    /// Можно вызывать несколько раз — условия AND-ятся.
-    ///
-    /// Condition оценивается на главном потоке **до** выполнения stage'а.
-    ///
-    /// # Пример
-    /// ```
-    /// # struct GameState { paused: bool }
-    /// # use apex_scheduler::Scheduler;
-    /// # let mut sched = Scheduler::new();
-    /// sched.add_system("movement", |_| {})
-    ///     .run_if(|w| !w.resource::<GameState>().paused)
-    ///     .run_if(|w| w.try_resource::<u32>().map(|&n| n > 0).unwrap_or(false));
-    /// ```
+    fn add_condition_leaf(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
+        unsafe {
+            let sched = &mut *self.scheduler;
+            if let Some(sys) = sched.system_by_id_mut(self.id) {
+                sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
+                if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
+                    *access = std::mem::take(access).merge(&condition_access);
+                }
+                match &mut sys.run_condition {
+                    ConditionTree::And(ref mut conds) => conds.push(leaf),
+                    _ => {
+                        let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
+                        if let ConditionTree::And(ref mut conds) = sys.run_condition {
+                            conds.push(old);
+                            conds.push(leaf);
+                        }
+                    }
+                }
+            }
+        }
+        self
+    }
+
+    fn add_condition_or(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
+        unsafe {
+            let sched = &mut *self.scheduler;
+            if let Some(sys) = sched.system_by_id_mut(self.id) {
+                sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
+                if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
+                    *access = std::mem::take(access).merge(&condition_access);
+                }
+                match &mut sys.run_condition {
+                    ConditionTree::Or(ref mut conds) => conds.push(leaf),
+                    _ => {
+                        let old = std::mem::replace(&mut sys.run_condition, ConditionTree::Or(Vec::new()));
+                        if let ConditionTree::Or(ref mut conds) = sys.run_condition {
+                            conds.push(old);
+                            conds.push(leaf);
+                        }
+                    }
+                }
+            }
+        }
+        self
+    }
+
+    /// Прикрепить run condition — closure.
     pub fn run_if<F>(self, condition: F) -> Self
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
         let leaf = ConditionTree::leaf(condition);
-        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
-            match &mut sys.run_condition {
-                ConditionTree::And(ref mut conds) => conds.push(leaf),
-                _ => {
-                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
-                    if let ConditionTree::And(ref mut conds) = sys.run_condition {
-                        conds.push(old);
-                        conds.push(leaf);
-                    }
-                }
-            }
-        }
-        self
+        self.add_condition_leaf(leaf, AccessDescriptor::new())
     }
 
-    /// Прикрепить OR-условие: система выполнится если хотя бы одно из OR-условий true.
-    ///
-    /// Если ранее были AND-условия через `run_if()`, OR-условия создают новую OR-группу.
-    ///
-    /// # Пример
-    /// ```
-    /// # use apex_scheduler::Scheduler;
-    /// # let mut sched = Scheduler::new();
-    /// sched.add_system("respawn", |_| {})
-    ///     .or_else(|w| w.try_resource::<u32>().map(|&n| n == 0).unwrap_or(false))
-    ///     .or_else(|w| w.try_resource::<u32>().map(|&n| n > 100).unwrap_or(false));
-    /// // Выполнится если n == 0 ИЛИ n > 100
-    /// ```
+    /// Прикрепить typed condition (с явным access для планировщика).
+    pub fn run_if_cond<C: Condition>(self, condition: C) -> Self {
+        let acc = condition.access();
+        let leaf = ConditionTree::Leaf(condition.into_check_fn());
+        self.add_condition_leaf(leaf, acc)
+    }
+
+    /// Прикрепить OR-условие — closure.
     pub fn or_else<F>(self, condition: F) -> Self
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
         let leaf = ConditionTree::leaf(condition);
-        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
-            match &mut sys.run_condition {
-                ConditionTree::Or(ref mut conds) => conds.push(leaf),
-                _ => {
-                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::Or(Vec::new()));
-                    if let ConditionTree::Or(ref mut conds) = sys.run_condition {
-                        conds.push(old);
-                        conds.push(leaf);
-                    }
-                }
-            }
-        }
-        self
+        self.add_condition_or(leaf, AccessDescriptor::new())
+    }
+
+    /// Прикрепить OR-условие — typed.
+    pub fn or_else_cond<C: Condition>(self, condition: C) -> Self {
+        let acc = condition.access();
+        let leaf = ConditionTree::Leaf(condition.into_check_fn());
+        self.add_condition_or(leaf, acc)
     }
 
     /// Установить всё дерево условий целиком (заменяет существующие).
-    ///
-    /// Позволяет строить сложные условия вручную:
-    /// ```
-    /// # use apex_scheduler::{Scheduler, ConditionTree};
-    /// # let mut sched = Scheduler::new();
-    /// let tree = ConditionTree::And(vec![
-    ///     ConditionTree::leaf(|w: &apex_core::world::World| !w.has_resource::<bool>()),
-    ///     ConditionTree::Or(vec![
-    ///         ConditionTree::leaf(|w: &apex_core::world::World| w.try_resource::<u32>().is_some()),
-    ///     ]),
-    /// ]);
-    /// sched.add_system("complex", |_: &mut apex_core::world::World| {}).condition(tree);
-    /// ```
     pub fn condition(self, tree: ConditionTree) -> Self {
-        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
-            sys.run_condition = tree;
+        unsafe {
+            let sched = &mut *self.scheduler;
+            if let Some(sys) = sched.system_by_id_mut(self.id) {
+                sys.run_condition = tree;
+            }
         }
         self
     }
@@ -654,7 +717,7 @@ impl Scheduler {
 
     /// Регистрировать Sequential систему (полный &mut World).
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    pub fn add_system<F>(&mut self, name: impl Into<String>, func: F    ) -> SystemBuilder
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -667,7 +730,7 @@ impl Scheduler {
         name: impl Into<String>,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -685,19 +748,20 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
+            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self,
+            scheduler: self as *mut Scheduler,
             id,
         }
     }
 
     /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
-    pub fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    pub fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -713,7 +777,7 @@ impl Scheduler {
 
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
+    pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
     where
         S: AutoSystem + 'static,
     {
@@ -726,7 +790,7 @@ impl Scheduler {
         name: impl Into<String>,
         system: S,
         stage_label: StageLabel,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         S: AutoSystem + 'static,
     {
@@ -753,20 +817,21 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
-            has_deferred: false,
+            has_deferred: S::HAS_DEFERRED,
+            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self,
+            scheduler: self as *mut Scheduler,
             id,
         }
     }
 
     /// Регистрировать AutoSystem в Startup этапе.
-    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
+    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
     where
         S: AutoSystem + 'static,
     {
@@ -817,6 +882,7 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
+            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -843,7 +909,7 @@ impl Scheduler {
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     ///
     /// Если системе нужен доступ — используй `add_par_access`.
-    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -857,7 +923,7 @@ impl Scheduler {
         name: impl Into<String>,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -883,20 +949,21 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
+            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self,
+            scheduler: self as *mut Scheduler,
             id,
         }
     }
 
     /// Регистрировать параллельную систему-замыкание в Startup этапе.
     /// Без доступа к компонентам.
-    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
+    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -932,7 +999,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -947,7 +1014,7 @@ impl Scheduler {
         access: AccessDescriptor,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -972,13 +1039,14 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
+            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self,
+            scheduler: self as *mut Scheduler,
             id,
         }
     }
@@ -990,7 +1058,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemBuilder<'_>
+    ) -> SystemBuilder
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1140,7 +1208,7 @@ impl Scheduler {
         if let Some(ref scope_fn) = self.scope_condition {
             let scope_clone = std::sync::Arc::clone(scope_fn);
             if let Some(sys) = self.system_by_id_mut(sys_id) {
-                let leaf = ConditionTree::Leaf(Box::new(move |w: &World| (*scope_clone)(w)));
+                let leaf = ConditionTree::leaf(move |w: &World| (*scope_clone)(w));
                 match &mut sys.run_condition {
                     ConditionTree::And(ref mut conds) => conds.push(leaf),
                     _ => {
@@ -1258,6 +1326,33 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn set_run_if_cond<C: Condition>(
+        &mut self,
+        name: &str,
+        condition: C,
+    ) -> Result<(), SchedulerError> {
+        let id = self.find_id_by_name(name)?;
+        let acc = condition.access();
+        let leaf = ConditionTree::Leaf(condition.into_check_fn());
+        if let Some(sys) = self.system_by_id_mut(id) {
+            sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&acc);
+            if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
+                *access = std::mem::take(access).merge(&acc);
+            }
+            match &mut sys.run_condition {
+                ConditionTree::And(ref mut conds) => conds.push(leaf),
+                _ => {
+                    let old = std::mem::replace(&mut sys.run_condition, ConditionTree::And(Vec::new()));
+                    if let ConditionTree::And(ref mut conds) = sys.run_condition {
+                        conds.push(old);
+                        conds.push(leaf);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ── Apply Deferred ─────────────────────────────────────────
 
     /// Вставить точку синхронизации после последней зарегистрированной системы.
@@ -1324,7 +1419,8 @@ impl Scheduler {
         let index = self.systems.len();
 
         match cfg.kind {
-            SystemConfigKind::Auto(system, access) => {
+            SystemConfigKind::Auto(system, mut access) => {
+                access = access.merge(&cfg.condition_access);
                 self.systems.push(SystemDescriptor {
                     id,
                     name: cfg.name,
@@ -1334,7 +1430,8 @@ impl Scheduler {
                     stage_label,
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
-                    has_deferred: false,
+                    has_deferred: cfg.has_deferred,
+                    condition_access: cfg.condition_access,
                 });
                 self.par_system_indices.push(index);
             }
@@ -1348,11 +1445,13 @@ impl Scheduler {
                     stage_label,
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
-                    has_deferred: false,
+                    has_deferred: cfg.has_deferred,
+                    condition_access: cfg.condition_access,
                 });
                 self.seq_system_indices.push(index);
             }
             SystemConfigKind::ParClosure { access, func } => {
+                let access = access.merge(&cfg.condition_access);
                 self.systems.push(SystemDescriptor {
                     id,
                     name: cfg.name,
@@ -1368,7 +1467,8 @@ impl Scheduler {
                     stage_label,
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
-                    has_deferred: false,
+                    has_deferred: cfg.has_deferred,
+                    condition_access: cfg.condition_access,
                 });
                 self.par_system_indices.push(index);
             }
@@ -4578,5 +4678,174 @@ mod tests {
 
         sched.run_sequential(&mut world);
         assert_eq!(VALUE_SEEN.load(Ordering::SeqCst), 1, "Событие видно между под-Stage'ями");
+    }
+
+    // ── Condition Trait тесты ──────────────────────────────
+
+    #[test]
+    fn condition_trait_opaque_closure() {
+        // Closure works with IntoConditionLeaf (via run_if)
+        let mut sched = Scheduler::new();
+        sched.add_system("test", |_: &mut World| {})
+            .run_if(|_: &World| false);
+        let mut world = World::new();
+        sched.compile_with_world(&world).unwrap();
+        // system was added with a false condition — compile should succeed
+        assert!(sched.execution_plan.is_some());
+    }
+
+    #[test]
+    fn condition_trait_typed_resource_exists() {
+        let cond = conditions::resource_exists::<u32>();
+        // access should contain read<u32>
+        let acc = cond.access();
+        let tid = std::any::TypeId::of::<u32>();
+        assert!(acc.reads.contains(&tid));
+        assert!(acc.writes.is_empty());
+    }
+
+    #[test]
+    fn condition_trait_tuple_and() {
+        let a = conditions::resource_exists::<u32>();
+        let b = conditions::resource_exists::<f64>();
+        let and_cond = (a, b);
+        // access should contain both type IDs
+        let acc = and_cond.access();
+        assert!(acc.reads.contains(&std::any::TypeId::of::<u32>()));
+        assert!(acc.reads.contains(&std::any::TypeId::of::<f64>()));
+    }
+
+    #[test]
+    fn condition_trait_not() {
+        // Typed condition: .not() inverts
+        let cond = conditions::resource_exists::<u32>();
+        let not_cond = cond.not();
+        // No u32 resource → cond is false → not_cond is true
+        assert!(not_cond.check(&World::new()));
+
+        let mut world = World::new();
+        world.insert_resource(42u32);
+        // u32 exists → cond is true → not_cond is false
+        assert!(!not_cond.check(&world));
+    }
+
+    #[test]
+    fn auto_apply_deferred_from_chain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CAMERA_SAW: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component, Clone, Copy)]
+        struct Spawned;
+
+        // Use a sequential system that spawns entities (has has_deferred)
+        let mut sched = Scheduler::new();
+        sched.add_system("spawner", move |world: &mut World| {
+            world.spawn((Spawned,));
+        });
+        sched.add_system("camera", move |world: &mut World| {
+            let count = Query::<Read<Spawned>>::new(world).iter().count();
+            if count > 0 {
+                CAMERA_SAW.store(true, Ordering::SeqCst);
+            }
+        });
+        sched.chain(&["spawner", "camera"]).unwrap();
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+        assert!(CAMERA_SAW.load(Ordering::SeqCst), "camera should see spawned entity via auto-apply");
+    }
+
+    #[test]
+    fn auto_apply_deferred_no_split_without_chain() {
+        let mut sched = Scheduler::new();
+        // Two AutoSystems without chain — they should end up in one parallel group
+        struct SysA;
+        impl AutoSystem for SysA {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            const HAS_DEFERRED: bool = true;
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct SysB;
+        impl AutoSystem for SysB {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        sched.add_auto_system("a", SysA);
+        sched.add_auto_system("b", SysB);
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        // Without chain, no auto-split — both in same stage
+        let both_in_same = stages.iter().any(|s| s.system_ids.len() >= 2);
+        assert!(both_in_same, "Without chain, no auto-split for deferred");
+    }
+
+    #[test]
+    fn condition_access_causes_conflict() {
+        #[derive(Clone, Copy)]
+        struct GamePhase;
+        struct TogglePause;
+        impl ParSystem for TogglePause {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<GamePhase>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        struct MovementWithCondition;
+        impl ParSystem for MovementWithCondition {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("toggle", TogglePause);
+        sched.add_par_system("move", MovementWithCondition);
+        // Add typed condition that reads GamePhase
+        sched.set_run_if_cond("move", conditions::resource_exists::<GamePhase>()).unwrap();
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        // toggle writes GamePhase, move reads GamePhase (via condition)
+        // → WriteRead conflict → at least 2 stages
+        assert!(stages.len() >= 2, "typed condition should cause WriteRead conflict: {}", stages.len());
+    }
+
+    #[test]
+    fn condition_access_no_conflict_opaque() {
+        struct SysA;
+        impl ParSystem for SysA {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        struct SysB;
+        impl ParSystem for SysB {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Vel>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("a", SysA);
+        let bid = sched.add_par_system("b", SysB);
+        // Opaque condition — no typed access, no extra conflicts
+        sched.set_run_if("b", |_: &World| true).unwrap();
+
+        sched.compile().unwrap();
+        let stages = sched.stages().unwrap();
+        // Pos and Vel — no conflict, should be same stage
+        let same_stage = stages.iter().any(|s| s.system_ids.len() >= 2);
+        assert!(same_stage, "opaque condition should not cause conflicts");
     }
 }

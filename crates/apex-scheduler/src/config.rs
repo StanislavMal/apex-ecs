@@ -12,7 +12,7 @@
 //! ));
 //! ```
 
-use crate::{AccessDescriptor, ConditionTree, ParSystem, SystemFn};
+use crate::{AccessDescriptor, Condition, ConditionTree, ParSystem, SystemFn};
 use apex_core::system_param::{AutoSystem, EventAccessList, ResourceAccessList, WorldQuerySystemAccess};
 use apex_core::world::SystemContext;
 
@@ -33,15 +33,39 @@ pub struct SystemConfig {
     pub(crate) name: String,
     pub(crate) kind: SystemConfigKind,
     pub(crate) condition: ConditionTree,
+    pub(crate) condition_access: AccessDescriptor,
+    pub(crate) has_deferred: bool,
 }
 
 impl SystemConfig {
-    /// AND-условие: добавляет condition в AND-группу.
-    pub fn run_if<F>(mut self, condition: F) -> Self
+    pub fn run_if<F>(self, condition: F) -> Self
     where
         F: Fn(&apex_core::world::World) -> bool + Send + Sync + 'static,
     {
-        let leaf = ConditionTree::leaf(condition);
+        self.push_and_leaf(ConditionTree::leaf(condition), AccessDescriptor::new())
+    }
+
+    pub fn run_if_cond<C: Condition>(self, condition: C) -> Self {
+        let acc = condition.access();
+        let leaf = ConditionTree::Leaf(condition.into_check_fn());
+        self.push_and_leaf(leaf, acc)
+    }
+
+    pub fn or_else<F>(self, condition: F) -> Self
+    where
+        F: Fn(&apex_core::world::World) -> bool + Send + Sync + 'static,
+    {
+        self.push_or_leaf(ConditionTree::leaf(condition), AccessDescriptor::new())
+    }
+
+    pub fn or_else_cond<C: Condition>(self, condition: C) -> Self {
+        let acc = condition.access();
+        let leaf = ConditionTree::Leaf(condition.into_check_fn());
+        self.push_or_leaf(leaf, acc)
+    }
+
+    fn push_and_leaf(mut self, leaf: ConditionTree, acc: AccessDescriptor) -> Self {
+        self.condition_access = std::mem::take(&mut self.condition_access).merge(&acc);
         match &mut self.condition {
             ConditionTree::And(ref mut conds) => conds.push(leaf),
             _ => {
@@ -55,12 +79,8 @@ impl SystemConfig {
         self
     }
 
-    /// OR-условие: добавляет condition в OR-группу.
-    pub fn or_else<F>(mut self, condition: F) -> Self
-    where
-        F: Fn(&apex_core::world::World) -> bool + Send + Sync + 'static,
-    {
-        let leaf = ConditionTree::leaf(condition);
+    fn push_or_leaf(mut self, leaf: ConditionTree, acc: AccessDescriptor) -> Self {
+        self.condition_access = std::mem::take(&mut self.condition_access).merge(&acc);
         match &mut self.condition {
             ConditionTree::Or(ref mut conds) => conds.push(leaf),
             _ => {
@@ -101,6 +121,8 @@ impl SystemConfig {
             name: name.into(),
             kind: SystemConfigKind::Auto(Box::new(Adapter(s)), access),
             condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred: S::HAS_DEFERRED,
         }
     }
 
@@ -113,6 +135,8 @@ impl SystemConfig {
             name: name.into(),
             kind: SystemConfigKind::Sequential(Box::new(f)),
             condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred: false,
         }
     }
 
@@ -128,6 +152,8 @@ impl SystemConfig {
                 func: Box::new(f),
             },
             condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred: false,
         }
     }
 
@@ -140,6 +166,8 @@ impl SystemConfig {
             name: name.into(),
             kind: SystemConfigKind::ParClosure { access, func: Box::new(f) },
             condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred: false,
         }
     }
 }
