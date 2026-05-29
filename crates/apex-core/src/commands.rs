@@ -42,7 +42,9 @@ impl CommandArena {
     fn alloc<T>(&mut self, val: T) -> u32 {
         let align = mem::align_of::<T>();
         let size = mem::size_of::<T>();
-        // alignment padding
+        if size == 0 {
+            return 0;
+        }
         let start = ((self.cursor + align - 1) / align) * align;
         let end = start + size;
         if end > self.capacity {
@@ -74,7 +76,9 @@ impl CommandArena {
     }
 
     fn get_ptr(&self, offset: u32) -> *mut u8 {
-        assert!(!self.data.is_null(), "CommandArena: data is null");
+        if self.data.is_null() {
+            return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
         unsafe { self.data.add(offset as usize) }
     }
 

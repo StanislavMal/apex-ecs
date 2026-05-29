@@ -2187,6 +2187,9 @@ impl Scheduler {
         let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
         let sub_world = apex_core::SubWorld::new(w, &all_indices);
 
+        let mut thread_commands: Vec<Commands> = vec![Commands::new()];
+        let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
+
         for stage in &plan.stages {
             if stage.label == StageLabel::Startup && self.startup_completed {
                 continue;
@@ -2202,11 +2205,20 @@ impl Scheduler {
                     match &mut system.kind {
                         SystemKind::Sequential(f) => f(w),
                         SystemKind::Parallel { system, .. } => {
-                            system.run(SystemContext::from_sub_world(&sub_world));
+                            system.run(SystemContext::with_commands(
+                                std::slice::from_ref(&sub_world),
+                                cmds_ptr,
+                            ));
                         }
                     }
                 }
             }
+
+            // Применяем отложенные команды после каждой стадии
+            for cmds in &mut thread_commands {
+                cmds.apply(w);
+            }
+            thread_commands[0] = Commands::new();
 
             // Per-stage flush — делает события доступными для следующего этапа
             if !stage.emit_event_types.is_empty() {
@@ -2536,11 +2548,23 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::from_sub_world(&sub_world));
+                                    system.run(SystemContext::with_commands(
+                                        std::slice::from_ref(&sub_world),
+                                        cmds_ptr as *mut Vec<Commands>,
+                                    ));
                                 }
                             }
                         }
                     }
+                }
+                {
+                    let w = unsafe { &mut *world_ptr };
+                    for cmds in &mut thread_commands {
+                        cmds.apply(w);
+                    }
+                }
+                for cmds in &mut thread_commands {
+                    *cmds = Commands::new();
                 }
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
@@ -2563,7 +2587,8 @@ impl Scheduler {
                     let per_system = stage_entity_count / sys_count.max(1);
                     per_system < Self::min_entities_for_parallelism(sys_count)
                 };
-                below_hard_limit || below_auto_limit
+                let result = below_hard_limit || below_auto_limit;
+                result
             } else {
                 false
             };
@@ -2583,11 +2608,23 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::from_sub_world(&sub_world));
+                                    system.run(SystemContext::with_commands(
+                                        std::slice::from_ref(&sub_world),
+                                        cmds_ptr as *mut Vec<Commands>,
+                                    ));
                                 }
                             }
                         }
                     }
+                }
+                {
+                    let w = unsafe { &mut *world_ptr };
+                    for cmds in &mut thread_commands {
+                        cmds.apply(w);
+                    }
+                }
+                for cmds in &mut thread_commands {
+                    *cmds = Commands::new();
                 }
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
@@ -4727,6 +4764,47 @@ mod tests {
         world.insert_resource(42u32);
         // u32 exists → cond is true → not_cond is false
         assert!(!not_cond.check(&world));
+    }
+
+    #[test]
+    fn cmd_commands_roundtrip_direct() {
+        let mut cmds = Commands::new();
+        #[derive(Component, Clone, Copy)]
+        struct Sp;
+        cmds.spawn((Sp,));
+        let mut world = World::new();
+        cmds.apply(&mut world);
+        assert_eq!(Query::<Read<Sp>>::new(&world).iter().count(), 1,
+            "Commands::spawn + apply should work");
+    }
+
+    #[test]
+    fn system_macro_cmd_works() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAW: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Component, Clone, Copy)]
+        struct Sp(f32);
+
+        system! {
+            fn sys_cmd(cmd: Cmd) {
+                cmd.spawn((Sp(1.0),));
+            }
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("spn", sys_cmd);
+        sched.add_system("chk", move |world: &mut World| {
+            if Query::<Read<Sp>>::new(world).iter().count() > 0 {
+                SAW.store(true, Ordering::SeqCst);
+            }
+        });
+        sched.chain(&["spn", "chk"]).unwrap();
+
+        let mut world = World::new();
+        // Use run() (parallel path) — known to work with Commands
+        sched.run(&mut world);
+        assert!(SAW.load(Ordering::SeqCst), "system! with cmd: Cmd + run() should work");
     }
 
     #[test]

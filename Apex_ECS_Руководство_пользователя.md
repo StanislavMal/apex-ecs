@@ -46,8 +46,8 @@
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
 - **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
 - **Batch API** — `spawn_many` создаёт тысячи entity за один проход
-- **Run Conditions** — условное выполнение систем: `.run_if(cond)`, AND/OR-комбинация, scope conditions, common conditions из коробки
-- **Apply Deferred** — немедленное применение Commands между системами в том же кадре (compile-time, ноль runtime overhead)
+- **Run Conditions** — условное выполнение систем: `.run_if(cond)` для closures, `.run_if_cond(typed_cond)` для typed-доступа (планировщик знает что читает условие), AND/OR-комбинация, scope conditions, common conditions из коробки
+- **Apply Deferred** — применение Commands: ручное `apply_deferred()` для sequential систем, авто-apply через `system!` + `cmd: Cmd` + `chain()` (HAS_DEFERRED auto-detect, compile-time split)
 - **Event Pipeline** — конвейерная обработка событий (Producer → Transformer → Consumer) с порядком по именам
 > **Версия 0.3.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
 ### 1.2 Структура крейтов
@@ -55,7 +55,7 @@
 | Крейт | Назначение |
 |---|---|
 | `apex-core` | Ядро ECS: entity, component, archetype, query, world, events, relations, resources, EntityTemplate, TemplateRegistry |
-| `apex-scheduler` | Планировщик систем: компиляция графа зависимостей, параллельные Stage, Run Conditions, Apply Deferred, Event Pipeline |
+| `apex-scheduler` | Планировщик систем: компиляция графа зависимостей, параллельные Stage, typed Run Conditions (condition access → авто-порядок), apply_deferred + HAS_DEFERRED auto-apply, Event Pipeline |
 | `apex-graph` | Граф зависимостей: топологическая сортировка, обнаружение циклов |
 | `apex-serialization` | Сериализация мира: WorldSnapshot, snapshot/restore, PrefabManifest, PrefabLoader |
 | `apex-hot-reload` | Горячая перезагрузка: FileWatcher, HotReloadPlugin, PrefabPlugin |
@@ -961,40 +961,84 @@ sched.add_systems(StageLabel::Update, (
 
 ### 6.0a Run Conditions — условное выполнение систем
 
-Система может быть пропущена в зависимости от состояния мира:
+Система может быть пропущена в зависимости от состояния мира. Apex предлагает два способа задания условий:
+
+| Метод | Для чего | Планировщик видит доступ? |
+|---|---|---|
+| `.run_if(closure)` | 90% случаев — простые проверки | Нет (opaque) |
+| `.run_if_cond(typed_cond)` | Нужен автопорядок систем | Да — `access()` → dependency edges |
+
+**Closures** — простой и быстрый способ (тот же API что и раньше):
+
+```rust
+sched.add_systems(StageLabel::Update, (
+    sys("movement", movement_system)
+        .run_if(|w| !w.resource::<GameState>().paused)   // AND-композиция
+        .run_if(|w| w.try_resource::<u32>().is_some()),   // оба должны быть true
+));
+```
+
+**Typed conditions** — планировщик знает какие данные читает условие. Если система B пишет в ресурс, который читает условие системы A — планировщик автоматически поставит их в разные Stage (WriteRead конфликт):
 
 ```rust
 use apex_scheduler::{sys, conditions};
 
 sched.add_systems(StageLabel::Update, (
-    // AND-комбинация: оба условия должны быть true
+    // Одно typed-условие — планировщик видит read<GamePhase>
     sys("movement", movement_system)
-        .run_if(|w| !w.resource::<GameState>().paused)
-        .run_if(conditions::any_with_component::<Player>()),
+        .run_if_cond(conditions::resource_equals(GamePhase::Playing)),
 
-    // OR-комбинация: хотя бы одно true
-    sys("respawn", respawn_system)
-        .or_else(|w| conditions::resource_equals(0)(w))
-        .or_else(|w| conditions::resource_equals(100)(w)),
+    // AND-комбинация typed условий — оба должны быть true
+    sys("ai", ai_system)
+        .run_if_cond(conditions::resource_equals(GamePhase::Playing))
+        .run_if_cond(conditions::any_with_component::<Enemy>()),
 
-    // Инвертирование
+    // Tuple AND — оба условия typed, access автоматически мержится
+    sys("damage", damage_system)
+        .run_if_cond((
+            conditions::resource_exists::<Player>(),
+            conditions::resource_equals(GamePhase::Playing),
+        )),
+
+    // Инвертирование через .not()
     sys("idle_ai", idle_ai)
-        .run_if(conditions::not(combat_active)),
+        .run_if_cond(conditions::resource_exists::<Paused>().not()),
+
+    // Смешанный подход — opaque closure для простого, typed для access
+    sys("physics", physics_system)
+        .run_if(|w| w.try_resource::<Config>().map(|c| c.enabled).unwrap_or(true))
+        .run_if_cond(conditions::any_with_component::<PhysicsBody>()),
 ));
 ```
 
-**Условия** (`Fn(&World) -> bool`) оцениваются на **главном потоке до** запуска stage'а. Когда `false` — система пропускается целиком (не создаются ASD-таски, ноль CPU).
+**OR-комбинация** — `.or_else()` (closure) и `.or_else_cond()` (typed):
 
-**Встроенные условия** (модуль `conditions`):
+```rust
+sys("respawn", respawn_system)
+    .or_else(|w| w.try_resource::<u32>().map(|&n| n == 0).unwrap_or(false))
+    .or_else(|w| w.try_resource::<u32>().map(|&n| n > 100).unwrap_or(false));
+// Выполнится если n == 0 ИЛИ n > 100
+```
 
-| Функция | Описание |
-|---|---|
-| `resource_exists::<T>()` | Ресурс T существует в мире |
-| `resource_equals(value)` | Ресурс T равен заданному значению |
-| `any_with_component::<T>()` | Есть хотя бы один entity с компонентом T |
-| `run_until(n)` | Выполниться ровно N раз, затем всегда `false` |
-| `every_n_frames(n)` | Выполниться раз в N кадров |
-| `not(condition)` | Инвертировать условие |
+> **Важно об OR:** дефолтное дерево условий — всегда `true`. При первом `.or_else()` оно оборачивается в `Or([true, new_cond])` → результат всегда `true`. Чтобы создать чистый OR без always-true базы, сначала сбросьте дерево через `.condition()`:
+> ```rust
+> .condition(ConditionTree::And(vec![ConditionTree::leaf(|_| false)]))
+> .or_else(|w| w.has_resource::<Paused>())
+> // Теперь: false OR has_resource::<Paused>()
+> ```
+
+**Условия** (opaque и typed) оцениваются на **главном потоке до** запуска stage'а. Когда `false` — система пропускается целиком (не создаются ASD-таски, ноль CPU).
+
+**Встроенные условия** (модуль `conditions`) — **все возвращают typed struct с `access()`** (используйте с `run_if_cond`):
+
+| Функция | Тип условия | `access()` |
+|---|---|---|
+| `resource_exists::<T>()` | typed | `read<T>` |
+| `resource_equals(value)` | typed | `read<T>` |
+| `any_with_component::<T>()` | typed | `read<T>` |
+| `run_until(n)` | typed (opaque access) | empty |
+| `every_n_frames(n)` | typed (opaque access) | empty |
+| `not(cond)` | typed (наследует access) | = `cond.access()` |
 
 ### 6.0b Scope Conditions — условия на группу систем
 
@@ -1008,7 +1052,7 @@ sched.staged(StageLabel::tag("combat"), |s| {
     s.add_systems(StageLabel::Update, (
         sys("movement", movement),
         sys("ai", ai)
-            .run_if(conditions::any_with_component::<Enemy>()),
+            .run_if_cond(conditions::any_with_component::<Enemy>()),
         sys("damage", damage),
     ));
     // movement: paused=false
@@ -1036,6 +1080,35 @@ sched.staged(StageLabel::tag("spawn_pipeline"), |s| {
 ```
 
 `apply_deferred()` работает на этапе **compile()** — Stage разбивается на под-Stage. Горячий цикл `run()` не знает о split'е — **ноль runtime overhead**.
+
+#### 6.0c.1 Авто-apply через `HAS_DEFERRED` + `chain()`
+
+`system!` макрос автоматически выставляет `const HAS_DEFERRED = true` при обнаружении параметра `cmd: Cmd`. Если такие системы объединены в `chain()` — планировщик **сам** вставляет точку синхронизации (compile-time split). Ручной `apply_deferred()` не нужен:
+
+```rust
+system! {
+    fn spawner(cmd: Cmd) {
+        cmd.spawn((Enemy, Position { x: 0.0, y: 0.0 }));
+    }
+}
+
+let mut sched = Scheduler::new();
+sched.add_auto_system("spawner", spawner);
+sched.add_system("camera", move |world: &mut World| {
+    // ✅ видит заспавненные Enemy — Commands уже применены
+    let count = Query::<Read<Enemy>>::new(world).iter().count();
+    assert!(count > 0);
+});
+sched.chain(&["spawner", "camera"]).unwrap();
+// ↑ compile() видит has_deferred + explicit_ordering → авто-split
+```
+
+| Способ | Когда | Что делать |
+|---|---|---|
+| Ручной `apply_deferred()` | sequential системы, `world.spawn()` | Вызвать явно |
+| Авто-apply | `system!` + `cmd: Cmd` + `chain()` | Ничего — compile сам вставит split |
+| `run_sequential()` | Тесты, отладка | Commands работают (per-stage apply) |
+| `run()` | Production | Commands работают (per-thread + per-stage apply) |
 
 ### 6.1 `system!` макрос
 
@@ -1128,11 +1201,13 @@ system! {
 | `name: &mut T` | `ResWrite<T>` | `let name: &mut T = &mut *ctx.resource_mut::<T>();` |
 | `name: &[E]` | `Listen<E>` | `let name = ctx.event_reader::<E>();` |
 | `name: &mut Vec<E>` | `Emit<E>` | `let mut name = ctx.event_writer::<E>();` (`.send()`) |
-| `name: Cmd` | *(none)* | `let name: &mut Commands = ctx.commands();` |
+| `name: Cmd` | `const HAS_DEFERRED = true` | `let name: &mut Commands = ctx.commands();` |
 | `name: Ctx` | *(none)* | `let name: &SystemContext = &ctx;` |
 | `__whole: WholeWorld` | `const NEEDS_WHOLE_WORLD = true` | *(none)* |
 
 При нераспознанном параметре макрос выдаёт `compile_error!` с подсказкой.
+
+> **HAS_DEFERRED и авто-apply:** `system!` с `cmd: Cmd` автоматически выставляет `const HAS_DEFERRED = true`. Если такая система объединена в `chain(&["spawner", "reader"])`, планировщик на этапе `compile()` сам вставляет точку синхронизации (split Stage) — ручной `apply_deferred()` не нужен. Подробнее: [секция 6.0c](#60c-apply-deferred--применение-команд-в-том-же-кадре).
 
 ### 6.2 `sequential_system!` макрос
 
@@ -1235,6 +1310,8 @@ impl AutoSystem for MovementSystem {
     type Query = (Read<Velocity>, Write<Position>);
     type Resources = ();
     type Events = ();
+    // HAS_DEFERRED = false по умолчанию — система не использует Commands
+    // Установите true вручную или используйте system! с cmd: Cmd для авто-обнаружения
     fn run(&mut self, ctx: SystemContext<'_>) { ... }
 }
 
@@ -1263,6 +1340,7 @@ impl AutoSystem for PhysicsSystem {
     type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
     type Resources = ResRead<PhysicsConfig>;
     type Events    = Emit<CollisionEvent>;
+    const HAS_DEFERRED: bool = false;  // не использует Commands
     fn run(&mut self, ctx: SystemContext<'_>) {
         let cfg = ctx.resource::<PhysicsConfig>();
         let mut writer = ctx.event_writer::<CollisionEvent>();
@@ -3571,21 +3649,28 @@ fn main() {
 
 | Метод | Описание |
 |---|---|
-| `.run_if(condition)` | AND-комбинация — система выполнится только если условие true |
-| `.or_else(condition)` | OR-комбинация — хотя бы одно true |
+| `.run_if(closure)` | Opaque AND-комбинация — 90% случаев |
+| `.run_if_cond(typed)` | Typed условие — планировщик видит `access()`, авто-порядок |
+| `.run_if_cond((a, b))` | Tuple AND — оба typed, access мержится |
+| `.or_else(closure)` | Opaque OR-комбинация — хотя бы одно true |
+| `.or_else_cond(typed)` | Typed OR-условие |
 | `s.run_condition(f)` | Scope condition внутри `staged()` — применяется ко всем системам |
-| `conditions::resource_exists::<T>()` | Ресурс T существует? |
-| `conditions::resource_equals(val)` | Ресурс равен значению? |
-| `conditions::any_with_component::<T>()` | Есть entity с компонентом? |
+| `conditions::resource_exists::<T>()` | Ресурс T существует? (typed, `access: read<T>`) |
+| `conditions::resource_equals(val)` | Ресурс равен значению? (typed, `access: read<T>`) |
+| `conditions::any_with_component::<T>()` | Есть entity с компонентом? (typed, `access: read<T>`) |
 | `conditions::run_until(n)` | Выполниться N раз |
 | `conditions::every_n_frames(n)` | Раз в N кадров |
 | `conditions::not(cond)` | Инвертировать условие |
+| `cond.not()` | Инвертировать typed condition (наследует `access`) |
 
 **Apply Deferred**
 
 | Метод | Описание |
 |---|---|
-| `s.apply_deferred()` | Применить все накопленные команды (spawn/despawn/insert) |
+| `s.apply_deferred()` | Ручной sync-point: применить команды после последней системы |
+| `chain() + HAS_DEFERRED` | Авто-apply: `system!` + `cmd: Cmd` → auto-split через compile |
+| `run_sequential()` | Per-stage apply — Commands работают в тестах |
+| `run()` | Per-thread + per-stage apply — production |
 
 **Порядок и Pipeline**
 
