@@ -1,6 +1,6 @@
 # APEX ECS — Entity Component System Engine
 ### Руководство пользователя
-> **Версия 0.1.0** | Rust Edition 2021
+> **Версия 0.3.0** | Rust Edition 2021
 
 ---
 
@@ -12,6 +12,11 @@
 4. [Query API](#4-query-api)
 5. [Ресурсы и события](#5-ресурсы-и-события)
 6. [Системы и планировщик](#6-системы-и-планировщик)
+   - [6.0 Регистрация систем — `add_systems()`](#60-регистрация-систем--add_systems-рекомендуемый-способ)
+   - [6.0a Run Conditions — условное выполнение систем](#60a-run-conditions--условное-выполнение-систем)
+   - [6.0b Scope Conditions — условия на группу систем](#60b-scope-conditions--условия-на-группу-систем)
+   - [6.0c Apply Deferred — применение команд в том же кадре](#60c-apply-deferred--применение-команд-в-том-же-кадре)
+   - [6.1 `system!` макрос](#61-system-макрос)
    - [6.8 `SystemParam` — типобезопасные параметры систем](#68-systemparam--типобезопасные-параметры-систем)
 7. [Commands](#7-commands)
 8. [Relations (связи между entity)](#8-relations-связи-между-entity)
@@ -41,13 +46,16 @@
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
 - **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
 - **Batch API** — `spawn_many` создаёт тысячи entity за один проход
-> **Версия 0.1.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
+- **Run Conditions** — условное выполнение систем: `.run_if(cond)`, AND/OR-комбинация, scope conditions, common conditions из коробки
+- **Apply Deferred** — немедленное применение Commands между системами в том же кадре (compile-time, ноль runtime overhead)
+- **Event Pipeline** — конвейерная обработка событий (Producer → Transformer → Consumer) с порядком по именам
+> **Версия 0.3.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
 ### 1.2 Структура крейтов
 
 | Крейт | Назначение |
 |---|---|
 | `apex-core` | Ядро ECS: entity, component, archetype, query, world, events, relations, resources, EntityTemplate, TemplateRegistry |
-| `apex-scheduler` | Планировщик систем: компиляция графа зависимостей, параллельные Stage |
+| `apex-scheduler` | Планировщик систем: компиляция графа зависимостей, параллельные Stage, Run Conditions, Apply Deferred, Event Pipeline |
 | `apex-graph` | Граф зависимостей: топологическая сортировка, обнаружение циклов |
 | `apex-serialization` | Сериализация мира: WorldSnapshot, snapshot/restore, PrefabManifest, PrefabLoader |
 | `apex-hot-reload` | Горячая перезагрузка: FileWatcher, HotReloadPlugin, PrefabPlugin |
@@ -855,21 +863,24 @@ CollisionSystem (Emit) → ArmorSystem (Listen+Emit) → [HealthSystem, SoundSys
 #### 5.3.3 Базовое использование
 
 ```rust
-use apex_scheduler::Scheduler;
+use apex_scheduler::{Scheduler, sys};
 
 let mut sched = Scheduler::new();
 
-let collision_id = sched.add_auto_system("collision", CollisionSystem);  // Emit<DamageEvent>
-let armor_id     = sched.add_auto_system("armor",     ArmorSystem);      // Listen+Emit<DamageEvent>
-let health_id    = sched.add_auto_system("health",    HealthSystem);     // Listen<DamageEvent>
-let sound_id     = sched.add_auto_system("sound",     SoundSystem);      // Listen<DamageEvent>
+// Системы регистрируются по именам (не SystemId)
+sched.add_systems(StageLabel::Update, (
+    sys("collision", CollisionSystem),  // Emit<DamageEvent>
+    sys("armor",     ArmorSystem),      // Listen+Emit<DamageEvent>
+    sys("health",    HealthSystem),     // Listen<DamageEvent>
+    sys("sound",     SoundSystem),      // Listen<DamageEvent>
+));
 
 // Конвейер: collision → armor → [health, sound]
 Scheduler::event_pipeline::<DamageEvent>()
-    .produced_by(collision_id, "collision")
-    .transformed_by(armor_id,   "armor")
-    .consumed_by(health_id,    "health")
-    .consumed_by(sound_id,     "sound")
+    .produced_by("collision")     // ← только имя, без SystemId
+    .transformed_by("armor")
+    .consumed_by("health")
+    .consumed_by("sound")
     .build(&mut sched);
 
 sched.compile().unwrap();
@@ -883,7 +894,7 @@ sched.compile().unwrap();
 
 ```rust
 let result = Scheduler::event_pipeline::<DamageEvent>()
-    .produced_by(bad_id, "bad_producer")
+    .produced_by("bad_producer")
     .build_validated(&mut sched);
 
 if let Err(errors) = result {
@@ -917,11 +928,118 @@ if let Err(errors) = result {
 
 ## 6. Системы и планировщик
 
-Apex ECS предоставляет **два макроса** для объявления систем и три уровня API.
+Apex ECS предоставляет **два макроса** для объявления систем (`system!`, `sequential_system!`) и единый API регистрации через `add_systems()`.
 
-### 6.1 `system!` макрос (рекомендуется)
+### 6.0 Регистрация систем — `add_systems()` (рекомендуемый способ)
 
-`system!` макрос автоматически генерирует `struct` + `impl AutoSystem`, сокращая boilerplate с 8-10 строк до 2-6. Доступен через `use apex_core::system;` или `apex_core::prelude::*`.
+Единая точка регистрации всех типов систем. Используйте конструкторы `sys`/`seq`/`par`/`par_access` из `apex_scheduler`:
+
+```rust
+use apex_scheduler::{Scheduler, StageLabel, sys, seq, par, par_access};
+
+let mut sched = Scheduler::new();
+
+sched.add_systems(StageLabel::Update, (
+    sys("movement", movement_system),                     // AutoSystem / system! macro
+    seq("cleanup", |world: &mut World| { ... }),          // sequential_system! macro
+    par("log", |_: SystemContext| println!("tick")),      // closure без доступа
+    par_access("physics", access_desc!(read<Vel>, write<Pos>),
+        |ctx| { ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, p)| p.x += v.x); }
+    ),
+    seq("spawner", spawner_fn),                           // sequential система
+));
+```
+
+| Конструктор | Тип системы |
+|---|---|
+| `sys(name, struct)` | AutoSystem / `system!` struct |
+| `seq(name, fn)` | Sequential / `sequential_system!` функция |
+| `par(name, closure)` | Parallel замыкание без доступа к компонентам |
+| `par_access(name, access, closure)` | Parallel замыкание с явным `AccessDescriptor` |
+
+Кортежи принимают до 12 элементов. Имена систем (`sys("name", ...)`) используются для `chain()`, `before()`/`after()`, event pipeline и `apply_deferred()`.
+
+### 6.0a Run Conditions — условное выполнение систем
+
+Система может быть пропущена в зависимости от состояния мира:
+
+```rust
+use apex_scheduler::{sys, conditions};
+
+sched.add_systems(StageLabel::Update, (
+    // AND-комбинация: оба условия должны быть true
+    sys("movement", movement_system)
+        .run_if(|w| !w.resource::<GameState>().paused)
+        .run_if(conditions::any_with_component::<Player>()),
+
+    // OR-комбинация: хотя бы одно true
+    sys("respawn", respawn_system)
+        .or_else(|w| conditions::resource_equals(0)(w))
+        .or_else(|w| conditions::resource_equals(100)(w)),
+
+    // Инвертирование
+    sys("idle_ai", idle_ai)
+        .run_if(conditions::not(combat_active)),
+));
+```
+
+**Условия** (`Fn(&World) -> bool`) оцениваются на **главном потоке до** запуска stage'а. Когда `false` — система пропускается целиком (не создаются ASD-таски, ноль CPU).
+
+**Встроенные условия** (модуль `conditions`):
+
+| Функция | Описание |
+|---|---|
+| `resource_exists::<T>()` | Ресурс T существует в мире |
+| `resource_equals(value)` | Ресурс T равен заданному значению |
+| `any_with_component::<T>()` | Есть хотя бы один entity с компонентом T |
+| `run_until(n)` | Выполниться ровно N раз, затем всегда `false` |
+| `every_n_frames(n)` | Выполниться раз в N кадров |
+| `not(condition)` | Инвертировать условие |
+
+### 6.0b Scope Conditions — условия на группу систем
+
+Условие применяется ко всем системам внутри `staged()`-блока:
+
+```rust
+sched.staged(StageLabel::tag("combat"), |s| {
+    // Все системы внутри наследуют это условие (AND с их собственными)
+    s.run_condition(|w| !w.resource::<GameState>().paused);
+
+    s.add_systems(StageLabel::Update, (
+        sys("movement", movement),
+        sys("ai", ai)
+            .run_if(conditions::any_with_component::<Enemy>()),
+        sys("damage", damage),
+    ));
+    // movement: paused=false
+    // ai:      paused=false AND any_enemy
+    // damage:  paused=false
+});
+```
+
+### 6.0c Apply Deferred — применение команд в том же кадре
+
+Обычно команды (spawn/despawn/insert) применяются **после** завершения stage'а. `apply_deferred()` создаёт точку синхронизации внутри stage'а:
+
+```rust
+sched.staged(StageLabel::tag("spawn_pipeline"), |s| {
+    s.add_systems(StageLabel::Update, (
+        seq("spawner", |world| { world.spawn(...); }),
+    ));
+    s.apply_deferred();  // ★ команды spawner'а применены к миру
+
+    s.add_systems(StageLabel::Update, (
+        sys("camera", camera),   // ✅ видит только что созданные entity
+        sys("ai", ai),           // ✅ видит только что созданные entity
+    ));
+});
+```
+
+`apply_deferred()` работает на этапе **compile()** — Stage разбивается на под-Stage. Горячий цикл `run()` не знает о split'е — **ноль runtime overhead**.
+
+### 6.1 `system!` макрос
+
+`system!` макрос автоматически генерирует `struct` + `impl AutoSystem`, сокращая boilerplate с 8-10 строк до 2-6. Доступен через `use apex_core::prelude::*`.
 
 > **Как это работает:** макрос анализирует типы параметров:
 > - `q: (Read<A>, Write<B>)` → `type Query = (...)`
@@ -3436,6 +3554,50 @@ fn main() {
 | `CloneableBridge::register_event::<T>(world)` | Зарегистрировать тип для десериализации |
 | `CloneableBridge::apply_incoming(world)` | Применить входящие события |
 | `sync_bridge_cloneable(world)` | Система синхронизации CloneableBridge |
+
+### Scheduler API (v0.3)
+
+**Регистрация систем**
+
+| Метод | Описание |
+|---|---|
+| `sched.add_systems(label, (...))` | Зарегистрировать кортеж систем (до 12) |
+| `sys("name", struct)` | Конструктор AutoSystem / `system!` |
+| `seq("name", fn)` | Конструктор sequential / `sequential_system!` |
+| `par("name", closure)` | Конструктор parallel замыкания |
+| `par_access("name", access, closure)` | Конструктор parallel с `AccessDescriptor` |
+
+**Run Conditions**
+
+| Метод | Описание |
+|---|---|
+| `.run_if(condition)` | AND-комбинация — система выполнится только если условие true |
+| `.or_else(condition)` | OR-комбинация — хотя бы одно true |
+| `s.run_condition(f)` | Scope condition внутри `staged()` — применяется ко всем системам |
+| `conditions::resource_exists::<T>()` | Ресурс T существует? |
+| `conditions::resource_equals(val)` | Ресурс равен значению? |
+| `conditions::any_with_component::<T>()` | Есть entity с компонентом? |
+| `conditions::run_until(n)` | Выполниться N раз |
+| `conditions::every_n_frames(n)` | Раз в N кадров |
+| `conditions::not(cond)` | Инвертировать условие |
+
+**Apply Deferred**
+
+| Метод | Описание |
+|---|---|
+| `s.apply_deferred()` | Применить все накопленные команды (spawn/despawn/insert) |
+
+**Порядок и Pipeline**
+
+| Метод | Описание |
+|---|---|
+| `s.chain(&["a", "b"])` | Явный порядок: a → b |
+| `s.before("a", "b")` | a выполняется до b |
+| `s.after("a", "b")` | a выполняется после b |
+| `event_pipeline::<E>().produced_by("name")` | Producer в конвейере |
+| `.transformed_by("name")` | Transformer в конвейере |
+| `.consumed_by("name")` | Consumer в конвейере |
+| `.build(&mut sched)` | Применить конвейер |
 
 ### WorldScriptingExt API (рекомендуемый способ регистрации)
 
