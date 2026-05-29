@@ -76,3 +76,13 @@ pub fn every_n_frames(n: u32) -> RunCondition {
         tick % n == 0
     })
 }
+
+/// Инвертировать условие. Возвращает `!cond(world)`.
+///
+/// ```ignore
+/// // Система работает когда нет паузы:
+/// .run_if(conditions::not(|w| w.resource::<GameState>().paused))
+/// ```
+pub fn not(cond: RunCondition) -> RunCondition {
+    Box::new(move |w: &World| !cond(w))
+}

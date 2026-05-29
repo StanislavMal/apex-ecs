@@ -177,22 +177,19 @@ fn main() {
                 .unwrap_or(false)
         });
 
-        let _m = s.add_auto_system("movement", movement_system);
+        // ★ add_auto_system теперь возвращает SystemBuilder — chain API!
+        s.add_auto_system("movement", movement_system);
 
-        // AI: is_playing И ещё есть враги (AND-композиция)
-        let _a = s.add_auto_system("ai", ai_system);
-        s.set_run_if("ai", conditions::any_with_component::<Enemy>()).unwrap();
+        // AI: AND-композиция — scope condition + has_enemies
+        s.add_auto_system("ai", ai_system)
+            .run_if(conditions::any_with_component::<Enemy>());
 
-        // Debug: is_playing И debug_overlay (AND)
-        let _d = s.add_auto_system("debug_overlay", debug_overlay_system);
-        s.set_run_if("debug_overlay", debug_on).unwrap();
+        // Debug: AND — scope + debug_on
+        s.add_auto_system("debug_overlay", debug_overlay_system)
+            .run_if(debug_on);
 
-        // Damage: is_playing ИЛИ всегда (но здесь всегда, т.к. scope уже даёт is_playing)
-        let _dm = s.add_auto_system("damage", damage_system);
-        // or_else demoonstrate: damage выполнится если is_playing ИЛИ ещё что-то
-        // но scope condition уже AND, так что фактически: (scope) AND (or_else...)
-        s.set_run_if("damage", debug_on).unwrap();
-        // ↳ damage будет работать когда is_playing AND (или любой другой)
+        // Damage: всегда работает (scope condition уже фильтрует)
+        s.add_auto_system("damage", damage_system);
     });
 
     // Movement↔AI bidirectional — chain resolves it

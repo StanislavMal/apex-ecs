@@ -367,6 +367,9 @@ struct SystemDescriptor {
     /// True = применить Commands после этой системы, разбив Stage на под-Stage.
     /// Устанавливается через `sched.apply_deferred()`.
     apply_deferred_after: bool,
+    /// True = система использует отложенные операции (Commands).
+    /// Автоматически определяется при регистрации.
+    has_deferred: bool,
 }
 
 // ── SystemBuilder ──────────────────────────────────────────────
@@ -447,6 +450,27 @@ impl<'a> SystemBuilder<'a> {
                     }
                 }
             }
+        }
+        self
+    }
+
+    /// Установить всё дерево условий целиком (заменяет существующие).
+    ///
+    /// Позволяет строить сложные условия вручную:
+    /// ```
+    /// # use apex_scheduler::{Scheduler, ConditionTree};
+    /// # let mut sched = Scheduler::new();
+    /// let tree = ConditionTree::And(vec![
+    ///     ConditionTree::leaf(|w: &apex_core::world::World| !w.has_resource::<bool>()),
+    ///     ConditionTree::Or(vec![
+    ///         ConditionTree::leaf(|w: &apex_core::world::World| w.try_resource::<u32>().is_some()),
+    ///     ]),
+    /// ]);
+    /// sched.add_system("complex", |_: &mut apex_core::world::World| {}).condition(tree);
+    /// ```
+    pub fn condition(self, tree: ConditionTree) -> Self {
+        if let Some(sys) = self.scheduler.system_by_id_mut(self.id) {
+            sys.run_condition = tree;
         }
         self
     }
@@ -655,6 +679,7 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
+            has_deferred: false,
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
@@ -683,12 +708,11 @@ impl Scheduler {
 
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemId
+    pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
         self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
-            .into()
     }
 
     /// Регистрировать AutoSystem в указанном этапе.
@@ -697,7 +721,7 @@ impl Scheduler {
         name: impl Into<String>,
         system: S,
         stage_label: StageLabel,
-    ) -> SystemId
+    ) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -724,16 +748,20 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
+            has_deferred: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
-        id
+        SystemBuilder {
+            scheduler: self,
+            id,
+        }
     }
 
     /// Регистрировать AutoSystem в Startup этапе.
-    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemId
+    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -783,6 +811,7 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
+            has_deferred: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -809,7 +838,7 @@ impl Scheduler {
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     ///
     /// Если системе нужен доступ — используй `add_par_access`.
-    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemId
+    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -823,7 +852,7 @@ impl Scheduler {
         name: impl Into<String>,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemId
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -848,17 +877,21 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
+            has_deferred: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
-        id
+        SystemBuilder {
+            scheduler: self,
+            id,
+        }
     }
 
     /// Регистрировать параллельную систему-замыкание в Startup этапе.
     /// Без доступа к компонентам.
-    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemId
+    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -894,7 +927,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemId
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -909,7 +942,7 @@ impl Scheduler {
         access: AccessDescriptor,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemId
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -933,12 +966,16 @@ impl Scheduler {
             stage_label,
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
+            has_deferred: false,
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
         self.invalidate_plan();
         self.merge_scope_condition(id);
-        id
+        SystemBuilder {
+            scheduler: self,
+            id,
+        }
     }
 
     /// Регистрировать параллельную систему-замыкание с явным доступом
@@ -948,7 +985,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemId
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1377,7 +1414,7 @@ impl Scheduler {
             for (label, ids) in level_by_label {
                 let prio = label.priority();
                 // Разбиваем на под-Stage'и по маркерам apply_deferred_after
-                let sub_groups = split_at_apply_boundaries(&ids, &self.systems);
+                let sub_groups = split_at_apply_boundaries(&ids, &self.systems, &self.explicit_orderings);
                 for group_ids in sub_groups {
                     let all_parallel = group_ids.iter().all(|sid| {
                         self.system_indices
@@ -2630,6 +2667,11 @@ impl Scheduler {
                             out.push_str(&format!("  - {} [seq | full &mut World]\n", s.name));
                         }
                     }
+                    // Показать условия
+                    let cond_str = format_condition(&s.run_condition);
+                    if !cond_str.is_empty() {
+                        out.push_str(&format!("      run_if: {}\n", cond_str));
+                    }
                 }
             }
         }
@@ -2863,6 +2905,7 @@ fn detect_conflict_kind(
 fn split_at_apply_boundaries(
     ids: &[SystemId],
     systems: &[SystemDescriptor],
+    explicit_orderings: &FxHashSet<(SystemId, SystemId)>,
 ) -> Vec<Vec<SystemId>> {
     if ids.is_empty() {
         return vec![];
@@ -2875,13 +2918,20 @@ fn split_at_apply_boundaries(
         let is_last = i + 1 == ids.len();
         current.push(id);
 
-        let should_split = systems
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.apply_deferred_after)
-            .unwrap_or(false);
+        let sys = systems.iter().find(|s| s.id == id);
+        let manual_split = sys.map(|s| s.apply_deferred_after).unwrap_or(false);
 
-        if should_split && !is_last {
+        // Auto-split: если эта система использует Commands и следующая зависит
+        // от неё явно (explicit ordering), вставляем split-точку.
+        let auto_split = if !is_last {
+            let next_id = ids[i + 1];
+            sys.map(|s| s.has_deferred).unwrap_or(false)
+                && explicit_orderings.contains(&(id, next_id))
+        } else {
+            false
+        };
+
+        if (manual_split || auto_split) && !is_last {
             groups.push(std::mem::take(&mut current));
         }
     }
@@ -2902,6 +2952,17 @@ fn component_type_name(
     type_names: &FxHashMap<TypeId, &'static str>,
 ) -> &'static str {
     type_names.get(&type_id).copied().unwrap_or("<component>")
+}
+
+/// Форматировать дерево условий для debug-вывода.
+/// Возвращает пустую строку если условий нет (default And([])).
+fn format_condition(tree: &ConditionTree) -> String {
+    match tree {
+        ConditionTree::Leaf(_) => "<condition>".to_string(),
+        ConditionTree::And(conds) if conds.is_empty() => String::new(),
+        ConditionTree::And(conds) => format!("AND({})", conds.iter().map(|_| "<cond>").collect::<Vec<_>>().join(", ")),
+        ConditionTree::Or(conds) => format!("OR({})", conds.iter().map(|_| "<cond>").collect::<Vec<_>>().join(", ")),
+    }
 }
 
 // ── Тесты ─────────────────────────────────────────────────────
