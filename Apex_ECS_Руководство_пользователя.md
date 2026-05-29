@@ -3094,7 +3094,15 @@ app.add_sequential_system(PostUpdate, "lua", ScriptedSystem::default().into_syst
 ### 14.5 Intra-system Parallelism
 
 `par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
-- **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: трёхуровневый минимум (128/32/64) и верхний лимит 65536 (настраивается через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`).
+- **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: по умолчанию создаётся `2×threads` задач (work-stealing Rayon). Нижний лимит `dynamic_min_chunk=64` entity, верхний `max_chunk_size=65536`. Настраивается через `ChunkConfig`:
+  ```rust
+  world.set_chunk_config(ChunkConfig {
+      task_multiplier: 2.0,  // 1.0 = ровно threads задач, 2.0 = вдвое больше (default)
+      dynamic_min_chunk: 64, // мин. размер чанка
+      max_chunk_size: 65536, // макс. размер чанка
+      ..Default::default()
+  });
+  ```
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
 - **Флаг `.par_for_each_used()`** — для `add_par_access` через `access_desc!(...).par_for_each_used()`, для `add_auto_system` через `sched.par_for_each_used(id)` после регистрации.
 

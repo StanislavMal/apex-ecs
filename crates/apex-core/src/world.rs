@@ -1183,6 +1183,13 @@ pub struct ChunkConfig {
     ///
     /// Default: `true`.
     pub auto_serial_fallback: bool,
+
+    /// Во сколько раз больше задач создавать чем потоков Rayon.
+    /// 1.0 = ровно num_threads задач, 2.0 = вдвое больше.
+    /// Больше задач → лучше work-stealing, но больше per-task overhead.
+    ///
+    /// Default: `2.0`.
+    pub task_multiplier: f32,
 }
 
 impl Default for ChunkConfig {
@@ -1200,15 +1207,16 @@ impl Default for ChunkConfig {
             dynamic_min_chunk: 64,
             max_chunk_size: max_from_env,
             auto_serial_fallback: true,
+            task_multiplier: 2.0,
         }
     }
 }
 
 /// Вычислить адаптивный размер чанка на основе количества entity и конфигурации.
 ///
-/// Логика (с учётом dynamic_min_chunk для предотвращения микро-задач rayon):
+/// Логика (с учётом `task_multiplier` для work-stealing Rayon):
 /// 1. Если `auto_serial_fallback` и `entity_count < min_entities_per_thread * thread_count` — один чанк (serial).
-/// 2. Иначе — `ceil(entity_count / thread_count)`, зажато в `[dynamic_min_chunk, max_chunk_size]`.
+/// 2. Иначе — `ceil(entity_count / thread_count / task_multiplier)`, зажато в `[dynamic_min_chunk, max_chunk_size]`.
 pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &ChunkConfig) -> usize {
     if entity_count == 0 {
         return 1;
@@ -1218,7 +1226,12 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
     if config.auto_serial_fallback && entity_count < serial_threshold {
         return entity_count;
     }
-    let raw = (entity_count + n - 1) / n;
+    let targets = if n > 1 {
+        (n as f32 * config.task_multiplier).ceil() as usize
+    } else {
+        1
+    };
+    let raw = (entity_count + targets - 1) / targets;
     raw.clamp(config.dynamic_min_chunk, config.max_chunk_size)
         .min(entity_count)
 }
@@ -2187,30 +2200,33 @@ mod tests {
     #[test]
     fn adaptive_chunk_size_large_world() {
         let cfg = ChunkConfig::default();
-        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125); // ceil(1000/8) = 125
-        assert_eq!(adaptive_chunk_size(10000, 8, &cfg), 1250); // ceil(10000/8) = 1250
+        // task_multiplier=2.0 → targets=ceil(8*2)=16 → ceil(1000/16)=63 → clamp(63,64,65536)=64
+        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 64);
+        // targets=16 → ceil(10000/16)=625
+        assert_eq!(adaptive_chunk_size(10000, 8, &cfg), 625);
     }
 
     #[test]
     fn adaptive_chunk_size_single_thread() {
         let cfg = ChunkConfig::default();
-        assert_eq!(adaptive_chunk_size(50, 1, &cfg), 50); // ceil(50/1)=50
-        assert_eq!(adaptive_chunk_size(200, 1, &cfg), 200); // ceil(200/1)=200
-        assert_eq!(adaptive_chunk_size(1000, 1, &cfg), 1000); // ceil(1000/1)=1000
+        // single thread → targets=1 (multiplier only for n>1)
+        assert_eq!(adaptive_chunk_size(50, 1, &cfg), 50);
+        assert_eq!(adaptive_chunk_size(200, 1, &cfg), 200);
+        assert_eq!(adaptive_chunk_size(1000, 1, &cfg), 1000);
     }
 
     #[test]
     fn adaptive_chunk_size_max_cap() {
         let cfg = ChunkConfig::default();
-        // ceil(131072/1) = 131072, capped to max_chunk_size = 65536
+        // single thread → targets=1 → ceil(131072/1)=131072 → cap 65536
         assert_eq!(
             adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 1, &cfg),
             DEFAULT_MAX_CHUNK_SIZE
         );
-        // 8 threads, ceil(131072/8) = 16384, no clamp
+        // 8 threads → targets=16 → ceil(131072/16)=8192, within bounds
         assert_eq!(
             adaptive_chunk_size(DEFAULT_MAX_CHUNK_SIZE * 2, 8, &cfg),
-            16384
+            8192
         );
     }
 
@@ -2221,10 +2237,10 @@ mod tests {
         assert_eq!(adaptive_chunk_size(99, 8, &cfg), 99);
         // 100 < 128 → serial
         assert_eq!(adaptive_chunk_size(100, 8, &cfg), 100);
-        // 999 >= 128 → ceil(999/8) = 125
-        assert_eq!(adaptive_chunk_size(999, 8, &cfg), 125);
-        // 1000 >= 128 → ceil(1000/8) = 125
-        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 125);
+        // 999 >= 128 → targets=ceil(8*2.0)=16 → ceil(999/16)=63 → clamp(63,64,65536)=64
+        assert_eq!(adaptive_chunk_size(999, 8, &cfg), 64);
+        // 1000 >= 128 → targets=16 → ceil(1000/16)=63 → clamp=64
+        assert_eq!(adaptive_chunk_size(1000, 8, &cfg), 64);
     }
 
     #[test]
@@ -2234,10 +2250,13 @@ mod tests {
             dynamic_min_chunk: 1,
             max_chunk_size: 4096,
             auto_serial_fallback: false,
+            task_multiplier: 1.0,
         };
         // auto_serial_fallback = false → always split into threads chunks
-        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 7); // ceil(50/8) = 7
-        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1); // ceil(1/8) = 1
+        // multiplier=1.0 → targets=8 → ceil(50/8)=7
+        assert_eq!(adaptive_chunk_size(50, 8, &cfg), 7);
+        // ceil(1/8) = 1
+        assert_eq!(adaptive_chunk_size(1, 8, &cfg), 1);
     }
 
     #[test]
@@ -2247,6 +2266,7 @@ mod tests {
             dynamic_min_chunk: 1,
             max_chunk_size: 8192,
             auto_serial_fallback: true,
+            task_multiplier: 1.0,
         };
         // 8 * 8 = 64 threshold
         assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50); // 50 < 64 → serial
