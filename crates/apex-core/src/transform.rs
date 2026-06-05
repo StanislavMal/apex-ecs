@@ -4,14 +4,21 @@
 //!
 //! - [`LocalTransform`] — position/rotation/scale entity (локальное пространство)
 //! - [`GlobalTransform`] — итоговая мировая матрица (пересчитывается из иерархии)
-//! - [`TransformDirty`] — маркерный компонент: эта entity требует пересчёта
-//! - [`propagate_transforms`] — sequential система, выполняющая BFS propagation
+//! - [`propagate_transforms`] — эксклюзивная система, выполняющая иерархический пересчёт
+//!
+//! # DX (после C1/C2)
+//!
+//! Ручной `TransformDirty` **удалён**: dirty-детекция идёт через
+//! `Changed<LocalTransform>` — достоверно для мутаций и через `Query<Write>`, и
+//! через `World::get_mut` (C1). Достаточно изменить `LocalTransform` — пересчёт
+//! произойдёт автоматически, каскадируясь на потомков. Спавн с одним
+//! `LocalTransform` авто-инициализирует `GlobalTransform`.
 //!
 //! # Алгоритм
 //!
-//! 1. Собрать все entity с TransformDirty
-//! 2. Для каждой: вычислить GlobalTransform = parent.GlobalTransform * self.LocalTransform
-//! 3. Снять `TransformDirty` после пересчёта
+//! 1. Собрать entity с `Changed<LocalTransform>` (с прошлого запуска).
+//! 2. Для каждой: `GlobalTransform = parent.GlobalTransform * self.LocalTransform`.
+//! 3. Каскадировать пересчёт на детей изменённых entity.
 //!
 //! # Использование в Scheduler
 //!
@@ -19,10 +26,8 @@
 //! use apex_core::transform::{LocalTransform, GlobalTransform, TransformPlugin};
 //! use apex_scheduler::stage::StageLabel;
 //!
-//! // Зарегистрировать компоненты
 //! TransformPlugin::register_components(&mut world);
 //!
-//! // Добавить propagate_transforms как sequential систему в PostUpdate
 //! scheduler.add_system_to_stage(
 //!     "propagate_transforms",
 //!     apex_core::transform::propagate_transforms,
@@ -33,7 +38,13 @@
 use glam::{Mat4, Quat, Vec3};
 use rustc_hash::FxHashSet;
 
-use crate::{entity::Entity, query::Read, relations::ChildOf, world::World};
+use crate::{
+    component::Tick,
+    entity::Entity,
+    query::{Changed, Query},
+    relations::ChildOf,
+    world::World,
+};
 
 // ── Компоненты трансформаций ─────────────────────────────────────
 
@@ -115,24 +126,14 @@ impl Default for GlobalTransform {
     }
 }
 
-/// Маркер: эта entity требует пересчёта GlobalTransform.
-///
-/// Устанавливается:
-/// - При изменении LocalTransform у родителя (все дети помечаются рекурсивно)
-/// - При добавлении/удалении ChildOf отношения
-///
-/// Снимается системой `propagate_transforms` после пересчёта.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TransformDirty;
-
-impl crate::component::Component for TransformDirty {}
-
 // ── Система Propagation ─────────────────────────────────────────
 
-/// Scratch-буферы для [`propagate_transforms`] — переиспользуются каждый кадр,
-/// избегая Vec-аллокаций в горячем пути.
+/// Scratch-буферы + состояние change-detection для [`propagate_transforms`].
+/// Переиспользуются каждый кадр, избегая Vec-аллокаций в горячем пути.
 #[derive(Default)]
 pub struct TransformScratch {
+    /// Тик предыдущего запуска propagate — база для `Changed<LocalTransform>`.
+    pub(crate) last_run: Tick,
     /// Список dirty entity из query (шаг 1)
     pub(crate) dirty_entities: Vec<Entity>,
     /// Set для O(1) проверки dirty (по entity.index)
@@ -147,15 +148,24 @@ pub struct TransformScratch {
     pub(crate) children: Vec<Entity>,
 }
 
-/// Sequential-система: пересчитывает GlobalTransform для всех entity с TransformDirty.
-///
-/// Выполняется в PostUpdate этапе.
+/// Эксклюзивная система: пересчитывает `GlobalTransform` для всех entity,
+/// чей `LocalTransform` **изменился** с прошлого запуска (`Changed<LocalTransform>`),
+/// каскадируя на потомков. Ручной `TransformDirty` больше не нужен — после C1
+/// `Changed<LocalTransform>` достоверен на всех путях мутации (`Query<Write>` и
+/// `World::get_mut`). Выполняется в PostUpdate.
 ///
 /// # Алгоритм
 ///
-/// 1. Найти все entity с TransformDirty (через query_typed)
-/// 2. Для каждой: вычислить GlobalTransform = parent.GlobalTransform * self.LocalTransform
-/// 3. Снять флаг TransformDirty
+/// 1. Собрать entity с `Changed<LocalTransform>` (с прошлого `last_run`).
+/// 2. Топосортировать (корни → листья), каскадируя dirty на детей изменённых.
+/// 3. `GlobalTransform = parent.GlobalTransform * self.LocalTransform`;
+///    если `GlobalTransform` ещё нет — авто-инициализировать (DX: спавн с одним
+///    `LocalTransform` достаточно).
+///
+/// # Change-detection
+///
+/// База — `scratch.last_run`; в конце пишется `world.current_tick()`. Требует
+/// покадрового продвижения тика (`world.tick()` перед `run()`; авто — в C7).
 ///
 /// # Ресурсы
 ///
@@ -169,6 +179,9 @@ pub fn propagate_transforms(world: &mut World) {
         .remove_resource::<TransformScratch>()
         .unwrap_or_default();
 
+    let last_run = scratch.last_run;
+    let this_run = world.current_tick();
+
     // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
     scratch.dirty_entities.clear();
     scratch.dirty_set.clear();
@@ -177,17 +190,20 @@ pub fn propagate_transforms(world: &mut World) {
     scratch.stack.clear();
     scratch.children.clear();
 
-    // 1. Собираем dirty entity и сразу строим set
+    // 1. Собираем entity с Changed<LocalTransform> (с прошлого запуска) и строим set.
+    //    Используем не-кэшированный Query::new_with_tick + for_each (надёжный путь;
+    //    см. TD-1 про CachedQuery::iter).
     {
-        let q = world.query_typed::<Read<TransformDirty>>();
+        let q = Query::<Changed<LocalTransform>>::new_with_tick(world, last_run);
         q.for_each(|e, _| {
             scratch.dirty_entities.push(e);
-            scratch.dirty_set.insert(e.index); // заполняем set
+            scratch.dirty_set.insert(e.index);
         });
     } // query Q дропается здесь
 
     if scratch.dirty_entities.is_empty() {
-        // Возвращаем scratch в ресурсы перед ранним выходом
+        // Ничего не изменилось — фиксируем тик и выходим.
+        scratch.last_run = this_run;
         world.insert_resource(scratch);
         return;
     }
@@ -261,19 +277,22 @@ pub fn propagate_transforms(world: &mut World) {
             local.to_matrix()
         };
 
-        // Записываем новый GlobalTransform
-        if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
-            gt.0 = global_matrix;
+        // Записываем новый GlobalTransform; если его ещё нет — авто-инициализируем
+        // (DX: достаточно заспавнить entity с одним LocalTransform — issue #3/#17).
+        if world.get::<GlobalTransform>(entity).is_some() {
+            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
+                gt.0 = global_matrix;
+            }
+        } else {
+            world.insert(entity, GlobalTransform(global_matrix));
         }
 
-        // Снимаем TransformDirty
-        world.remove::<TransformDirty>(entity);
         scratch.dirty_set.remove(&entity.index); // поддерживаем set актуальным
 
-        // ── Каскадирование TransformDirty на детей ─────────────────
-        // Если у этой entity есть дети (ChildOf), помечаем их как dirty,
-        // чтобы их GlobalTransform тоже пересчитался.
-        // Это решает проблему "пользователь пометил только родителя" (Feature 2, issue #2).
+        // ── Каскадирование dirty на детей ──────────────────────────
+        // Если у этой entity есть дети (ChildOf), помечаем их dirty (в scratch-set,
+        // без компонента-маркера), чтобы их GlobalTransform пересчитался в этом же
+        // проходе. Решает «пользователь изменил только родителя» (issue #2).
         scratch.children.clear();
         for child in world.children_of(ChildOf, entity) {
             scratch.children.push(child);
@@ -282,10 +301,8 @@ pub fn propagate_transforms(world: &mut World) {
             if !world.is_alive(child) {
                 continue;
             }
-            if !scratch.dirty_set.contains(&child.index) {
-                world.insert(child, TransformDirty);
-                scratch.dirty_set.insert(child.index); // обновляем set
-                                                       // Добавляем в ordered-список для обработки в этом же проходе
+            if scratch.dirty_set.insert(child.index) {
+                // вставка вернула true ⇒ ребёнка ещё не было в наборе
                 scratch.ordered.push(child);
             }
         }
@@ -293,7 +310,8 @@ pub fn propagate_transforms(world: &mut World) {
         i += 1;
     }
 
-    // Возвращаем scratch в ресурсы для переиспользования в следующем кадре
+    // Фиксируем тик этого запуска и возвращаем scratch для переиспользования.
+    scratch.last_run = this_run;
     world.insert_resource(scratch);
 }
 
@@ -316,28 +334,16 @@ pub fn propagate_transforms(world: &mut World) {
 ///     StageLabel::PostUpdate,
 /// );
 /// ```
-/// Функция-хук: автоматически вставляет TransformDirty при изменении LocalTransform.
-///
-/// Вызывается из `World::get_mut::<LocalTransform>()` после обновления tick изменения.
-fn mark_local_transform_dirty(entity: Entity, world: &mut World) {
-    // Вставляем TransformDirty, если ещё нет (insert дедуплицируется).
-    // Если entity уже имеет TransformDirty, это no-op (просто обновит tick).
-    world.insert(entity, TransformDirty);
-}
-
 pub struct TransformPlugin;
 
 impl TransformPlugin {
     /// Зарегистрировать Transform-компоненты в World.
+    ///
+    /// `TransformDirty` и write-hook больше не нужны: dirty-детекция идёт через
+    /// `Changed<LocalTransform>` (достоверно после C1 на всех путях мутации).
     pub fn register_components(world: &mut World) {
         world.register_component::<LocalTransform>();
         world.register_component::<GlobalTransform>();
-        world.register_component::<TransformDirty>();
-
-        // Регистрируем write_hook для автоматической пометки TransformDirty
-        // при любом вызове get_mut::<LocalTransform>().
-        // Это решает проблему "забыл пометить Dirty" (Feature 2, issue #1).
-        world.register_write_hook::<LocalTransform>(mark_local_transform_dirty);
 
         // Инициализируем scratch-буфер для propagate_transforms
         // (переиспользуется между кадрами, избегая Vec-аллокаций)
@@ -348,7 +354,6 @@ impl TransformPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::Read;
     use crate::world::World;
 
     #[test]
@@ -376,32 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn propagate_single_entity_no_parent() {
+    fn propagate_single_entity_auto_init_global() {
         let mut world = World::new();
-
-        // Регистрируем компоненты
         TransformPlugin::register_components(&mut world);
 
-        let entity = world.spawn((
-            LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-            TransformDirty,
-        ));
+        // Спавн с ОДНИМ LocalTransform — без GlobalTransform, без TransformDirty.
+        let entity = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+
+        // GlobalTransform ещё не существует.
+        assert!(world.get::<GlobalTransform>(entity).is_none());
 
         propagate_transforms(&mut world);
 
-        // После пропагации GlobalTransform должен быть = LocalTransform
+        // propagate авто-инициализировал GlobalTransform = LocalTransform.
         let gt = world.get::<GlobalTransform>(entity).unwrap();
         assert_eq!(gt.0.transform_point3(Vec3::ZERO), Vec3::new(10.0, 0.0, 0.0));
-
-        // TransformDirty должен быть снят
-        let has_dirty = {
-            let q = world.query_typed::<Read<TransformDirty>>();
-            let mut count = 0;
-            q.for_each(|_, _| count += 1);
-            count
-        };
-        assert_eq!(has_dirty, 0, "TransformDirty должен быть снят");
     }
 
     #[test]
@@ -409,45 +403,22 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        // Создаём иерархию: parent → child
-        let parent = world.spawn((
-            LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-        ));
-
-        let child = world.spawn((
-            LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-            TransformDirty,
-        ));
-
+        // Иерархия parent → child, оба с одним LocalTransform (GlobalTransform авто).
+        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
         world.add_relation(child, ChildOf, parent);
-
-        // Сначала propagate родителя (parent не dirty, но нужно обновить его GlobalTransform вручную)
-        let parent_local = *world.get::<LocalTransform>(parent).unwrap();
-        if let Some(gt) = world.get_mut::<GlobalTransform>(parent) {
-            gt.0 = parent_local.to_matrix();
-        }
 
         propagate_transforms(&mut world);
 
-        // После пропагации: child.Global = parent.Global * child.Local
-        // parent на (100,0,0), child локально на (10,0,0) → итог (110,0,0)
+        // child.Global = parent.Global * child.Local = (100 + 10) = 110 по X.
         let child_gt = world.get::<GlobalTransform>(child).unwrap();
         assert_eq!(
             child_gt.0.transform_point3(Vec3::ZERO),
             Vec3::new(110.0, 0.0, 0.0),
             "Child должен быть на 110.0 по X (100 parent + 10 local)"
         );
-
-        // TransformDirty снят
-        let has_dirty = {
-            let q = world.query_typed::<Read<TransformDirty>>();
-            let mut count = 0;
-            q.for_each(|_, _| count += 1);
-            count
-        };
-        assert_eq!(has_dirty, 0);
+        let parent_gt = world.get::<GlobalTransform>(parent).unwrap();
+        assert_eq!(parent_gt.0.transform_point3(Vec3::ZERO), Vec3::new(100.0, 0.0, 0.0));
     }
 
     #[test]
@@ -461,26 +432,11 @@ mod tests {
             GlobalTransform::default(),
         ));
 
-        let parent = world.spawn((
-            LocalTransform::from_translation(Vec3::new(30.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-            TransformDirty,
-        ));
-
-        let child = world.spawn((
-            LocalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-            TransformDirty,
-        ));
+        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(30.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0)),));
 
         world.add_relation(parent, ChildOf, grandparent);
         world.add_relation(child, ChildOf, parent);
-
-        // Устанавливаем GlobalTransform для grandparent вручную
-        let grandparent_local = *world.get::<LocalTransform>(grandparent).unwrap();
-        if let Some(gt) = world.get_mut::<GlobalTransform>(grandparent) {
-            gt.0 = grandparent_local.to_matrix();
-        }
 
         propagate_transforms(&mut world);
 
@@ -501,25 +457,79 @@ mod tests {
         );
     }
 
+    /// Ключевой C1+C2: мутация `LocalTransform` через `Query<Write<_>>` (без
+    /// ручного `TransformDirty`) триггерит пересчёт `GlobalTransform`.
     #[test]
-    fn no_transform_dirty_skips_propagation() {
+    fn changed_local_via_write_query_triggers_recompute() {
+        use crate::query::Write;
+
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        // Entity без TransformDirty
-        let entity = world.spawn((
-            LocalTransform::from_translation(Vec3::new(5.0, 0.0, 0.0)),
-            GlobalTransform::default(),
-        ));
+        let e = world.spawn((LocalTransform::from_translation(Vec3::new(1.0, 0.0, 0.0)),));
+
+        // Первый проход: авто-init GlobalTransform = (1,0,0).
+        propagate_transforms(&mut world);
+        assert_eq!(
+            world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(1.0, 0.0, 0.0)
+        );
+
+        // Продвигаем тик (как делает кадр) и мутируем через Query<Write> — без
+        // какого-либо ручного маркера.
+        world.tick();
+        {
+            let q = Query::<Write<LocalTransform>>::new(&world);
+            q.for_each(|_, mut lt| {
+                lt.translation = Vec3::new(42.0, 0.0, 0.0);
+            });
+        }
 
         propagate_transforms(&mut world);
 
-        // GlobalTransform не должен измениться (остаётся identity)
-        let gt = world.get::<GlobalTransform>(entity).unwrap();
+        // GlobalTransform пересчитан без TransformDirty.
         assert_eq!(
-            *gt.to_matrix(),
-            Mat4::IDENTITY,
-            "GlobalTransform не должен измениться без TransformDirty"
+            world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(42.0, 0.0, 0.0),
+            "Changed<LocalTransform> через Query<Write> должен триггерить пересчёт"
+        );
+    }
+
+    /// Изменение только родителя каскадирует пересчёт на детей.
+    #[test]
+    fn parent_change_cascades_to_children() {
+        use crate::query::Write;
+
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(Vec3::new(5.0, 0.0, 0.0)),));
+        world.add_relation(child, ChildOf, parent);
+
+        propagate_transforms(&mut world);
+        assert_eq!(
+            world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(5.0, 0.0, 0.0)
+        );
+
+        // Двигаем ТОЛЬКО родителя.
+        world.tick();
+        {
+            let q = Query::<Write<LocalTransform>>::new(&world);
+            q.for_each(|e, mut lt| {
+                if e == parent {
+                    lt.translation = Vec3::new(100.0, 0.0, 0.0);
+                }
+            });
+        }
+        propagate_transforms(&mut world);
+
+        // Ребёнок пересчитан каскадно: 100 (parent) + 5 (local) = 105.
+        assert_eq!(
+            world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(105.0, 0.0, 0.0),
+            "изменение родителя должно каскадно пересчитать ребёнка"
         );
     }
 }
