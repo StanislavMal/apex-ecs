@@ -120,7 +120,7 @@ pub struct EveryNFrames {
 impl Condition for EveryNFrames {
     fn check(&self, _: &World) -> bool {
         let tick = self.counter.fetch_add(1, Ordering::Relaxed);
-        tick % self.n == 0
+        tick.is_multiple_of(self.n)
     }
 }
 

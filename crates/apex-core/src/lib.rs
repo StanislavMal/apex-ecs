@@ -1,3 +1,18 @@
+// ── Политика clippy ────────────────────────────────────────────
+// Ядро — низкоуровневый высокопроизводительный код с большим объёмом
+// внутреннего `unsafe` (storage/archetype/query). Следующие линты намеренно
+// смягчены: их «исправление» либо ухудшает перф/читаемость, либо относится к
+// внутренним примитивам, чьи safety-контракты документированы на уровне типов.
+// Корректность важнее: `unsafe`-инварианты покрыты тестами и debug_assert.
+#![allow(
+    clippy::missing_safety_doc,    // внутренние storage-примитивы (Column и пр.)
+    clippy::needless_range_loop,   // индексные циклы в горячих путях — намеренно
+    clippy::nonminimal_bool,       // явные булевы выражения ради читаемости
+    clippy::question_mark,         // явный if-let ради ясности control-flow
+    clippy::type_complexity,       // сложные типы в API запросов/планировщика
+    clippy::too_many_arguments,    // низкоуровневые fn хранилища
+)]
+
 // Позволяет `#[derive(Component)]` (эмитит пути `::apex_core::…`) работать на
 // типах ВНУТРИ самого apex-core (transform и пр.).
 extern crate self as apex_core;
@@ -32,7 +47,9 @@ pub use component::{
 pub use entity::Entity;
 pub use events::{DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard};
 pub use linkme; // re-exported for #[derive(Component)] macro
-pub use query::{Changed, Maybe, MaybeWrite, Mut, Query, Read, With, Without, WorldQuery, Write};
+pub use query::{
+    Changed, Maybe, MaybeWrite, Mut, Query, Read, Ref, With, Without, WorldQuery, Write,
+};
 pub use relations::{ChildOf, Owns, RelationKind};
 pub use resources::Resources;
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
@@ -52,7 +69,7 @@ pub mod prelude {
     pub use crate::events::{DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard};
     pub use crate::impl_entity_template;
     pub use crate::query::{
-        Changed, Maybe, MaybeWrite, Mut, Query, QueryBuilder, Read, With, Without, WorldQuery,
+        Changed, Maybe, MaybeWrite, Mut, Query, QueryBuilder, Read, Ref, With, Without, WorldQuery,
         Write,
     };
     pub use crate::relations::{ChildOf, Owns, RelationKind};

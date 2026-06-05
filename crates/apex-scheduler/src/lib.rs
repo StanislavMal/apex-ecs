@@ -49,6 +49,18 @@
 //! | FnParSystem | явный + замыкание | быстрые прототипы |
 //! | Sequential | полный &mut World | structural changes |
 
+// Планировщик — высокопроизводительный код с внутренним `unsafe` (ASD, SendPtr,
+// rayon::scope). Часть линтов смягчена намеренно (см. аналогичный блок в apex-core).
+#![allow(
+    clippy::missing_safety_doc,
+    clippy::needless_range_loop,
+    clippy::nonminimal_bool,
+    clippy::question_mark,
+    clippy::type_complexity,
+    clippy::too_many_arguments,
+    clippy::large_enum_variant
+)]
+
 pub mod conditions;
 pub mod pipeline;
 pub mod stage;
@@ -283,7 +295,7 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 impl<T> Clone for SendPtr<T> {
     fn clone(&self) -> Self {
-        SendPtr(self.0)
+        *self
     }
 }
 impl<T> Copy for SendPtr<T> {}
@@ -291,6 +303,9 @@ impl<T> Copy for SendPtr<T> {}
 impl<T> SendPtr<T> {
     #[inline]
     #[allow(dead_code)]
+    // Обёртка над сырым `*mut T`; уникальность гарантируется вызывающим
+    // (каждая ASD-задача держит свой уникальный указатель).
+    #[allow(clippy::mut_from_ref)]
     unsafe fn as_mut(&self) -> &mut T {
         &mut *self.0
     }
@@ -937,6 +952,11 @@ impl Scheduler {
     }
 
     /// Регистрировать параллельную систему-замыкание без доступа к компонентам.
+    ///
+    /// **Продвинутый низкоуровневый API.** Приоритетный путь — типизированные
+    /// системы через `system!` + [`add_systems`](Self::add_systems); `add_par`/
+    /// [`add_par_access`](Self::add_par_access) нужны для сырых замыканий с
+    /// динамическим доступом и удобны внутри [`staged`](Self::staged).
     ///
     /// Для систем, которым не нужен доступ к компонентам/ресурсам/событиям
     /// (логирование, отладка, пустые хуки).
@@ -1693,7 +1713,7 @@ impl Scheduler {
                 }
             }
             // Стадии не указанные в порядке — добавляем в конец
-            let mut remaining: Vec<Stage> = stage_map.into_values().flat_map(|v| v).collect();
+            let mut remaining: Vec<Stage> = stage_map.into_values().flatten().collect();
             stages.append(&mut remaining);
         } else {
             // Стандартный порядок по priority (Startup → First → ... → Last → Custom)
@@ -2197,11 +2217,21 @@ impl Scheduler {
 
         self.run_hybrid_parallel(world as *mut World);
 
+        // Граница кадра: продвигаем change-tick, чтобы `Changed<T>` в системах
+        // на следующем кадре детектировал только мутации этого кадра (TD-9).
+        world.advance_change_tick();
+
         // После первого run() Startup больше не выполняется
         self.startup_completed = true;
     }
 
     /// Последовательное выполнение — для тестов и non-parallel builds.
+    ///
+    /// Принимает `*mut World` намеренно: внутри одновременно создаются `SubWorld`
+    /// (read-only вид) и применяются `Commands` (`&mut World`), что невозможно
+    /// выразить через единый `&mut World` без reborrow-конфликтов. Вызывающий
+    /// гарантирует валидность указателя (обычно `&mut world`).
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn run_sequential(&mut self, world_ptr: *mut World) {
         let w = unsafe { &mut *world_ptr };
         self.populate_type_names(w.registry());
@@ -2260,6 +2290,9 @@ impl Scheduler {
                 w.flush_events_by_type(&stage.emit_event_types);
             }
         }
+
+        // Граница кадра: продвигаем change-tick (TD-9).
+        w.advance_change_tick();
 
         self.startup_completed = true;
     }
@@ -2622,8 +2655,8 @@ impl Scheduler {
                     let per_system = stage_entity_count / sys_count.max(1);
                     per_system < Self::min_entities_for_parallelism(sys_count)
                 };
-                let result = below_hard_limit || below_auto_limit;
-                result
+                
+                below_hard_limit || below_auto_limit
             } else {
                 false
             };
@@ -2794,8 +2827,8 @@ impl Scheduler {
                 .first()
                 .map(|&first| stages.iter().all(|&s| s == first))
                 .unwrap_or(false);
-            let stage_is_parallel = stages.first().map_or(false, |&stage_idx| {
-                plan.stages.get(stage_idx).map_or(false, |s| s.all_parallel)
+            let stage_is_parallel = stages.first().is_some_and(|&stage_idx| {
+                plan.stages.get(stage_idx).is_some_and(|s| s.all_parallel)
             });
             if !all_same_stage || !stage_is_parallel {
                 continue;
@@ -4110,7 +4143,7 @@ mod tests {
     fn pipeline_parallel_consumers() {
         let mut sched = Scheduler::new();
 
-        let physics_id = sched.add_par_system("physics", EmitDamage);
+        let _physics_id = sched.add_par_system("physics", EmitDamage);
         let health_id = sched.add_par_system("health", ListenDamage);
         let sound_id = sched.add_par_system("sound", ListenDamage2);
 
@@ -4138,7 +4171,7 @@ mod tests {
         let mut sched = Scheduler::new();
 
         // ListenerOnly не имеет Emit<Damage> — не может быть Producer
-        let bad_id = sched.add_par_system("bad_producer", ListenerOnly);
+        let _bad_id = sched.add_par_system("bad_producer", ListenerOnly);
 
         let result = Scheduler::event_pipeline::<DamageEvent>()
             .produced_by("bad_producer")
@@ -4760,7 +4793,7 @@ mod tests {
         let mut sched = Scheduler::new();
         sched.add_system("test", |_: &mut World| {})
             .run_if(|_: &World| false);
-        let mut world = World::new();
+        let world = World::new();
         sched.compile_with_world(&world).unwrap();
         // system was added with a false condition — compile should succeed
         assert!(sched.execution_plan.is_some());
@@ -4819,7 +4852,7 @@ mod tests {
         static SAW: AtomicBool = AtomicBool::new(false);
 
         #[derive(Component, Clone, Copy)]
-        struct Sp(f32);
+        struct Sp(#[allow(dead_code)] f32);
 
         system! {
             fn sys_cmd(cmd: Cmd) {
@@ -4951,7 +4984,7 @@ mod tests {
 
         let mut sched = Scheduler::new();
         sched.add_par_system("a", SysA);
-        let bid = sched.add_par_system("b", SysB);
+        let _bid = sched.add_par_system("b", SysB);
         // Opaque condition — no typed access, no extra conflicts
         sched.set_run_if("b", |_: &World| true).unwrap();
 

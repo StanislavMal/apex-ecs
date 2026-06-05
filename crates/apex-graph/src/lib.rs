@@ -118,9 +118,7 @@ impl<N, W> Graph<N, W> {
     ///
     /// Возвращает данные узла (если существовал).
     pub fn remove_node(&mut self, node: Index) -> Option<N> {
-        if self.nodes.get(node).is_none() {
-            return None;
-        }
+        self.nodes.get(node)?;
 
         self.mark_dirty();
 

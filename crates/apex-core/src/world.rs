@@ -148,16 +148,16 @@ pub struct World {
     /// вместо линейного обхода всех архетипов.
     pub(crate) component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>,
     pub(crate) current_tick: Tick,
+    /// База change-detection для систем: тик предыдущей границы кадра.
+    /// `Changed<T>` внутри систем сравнивает change-tick строки с этим значением
+    /// (продвигается планировщиком в конце кадра / `advance_change_tick`).
+    pub(crate) last_run_tick: Tick,
     pub(crate) query_cache: QueryCache,
     pub(crate) relations: RelationRegistry,
     pub(crate) id_index: IdIndex,
     pub(crate) subject_index: SubjectIndex,
     pub resources: Resources,
     pub(crate) events: EventRegistry,
-    /// Коллбэки, вызываемые при записи компонента (вызове get_mut).
-    /// Функция-указатель (Copy), чтобы избежать borrow conflict с self.
-    /// Ключ — ComponentId.
-    pub(crate) write_hooks: FxHashMap<ComponentId, fn(Entity, &mut World)>,
     /// Реестр именованных шаблонов (EntityTemplate).
     pub(crate) templates: TemplateRegistry,
     /// Конфигурация чанкования для параллельной итерации.
@@ -175,13 +175,13 @@ impl World {
             archetype_index: FxHashMap::default(),
             component_arch_index: FxHashMap::default(),
             current_tick: Tick(1),
+            last_run_tick: Tick::ZERO,
             query_cache: QueryCache::new(),
             relations: RelationRegistry::new(),
             id_index: IdIndex::default(),
             subject_index: SubjectIndex::new(),
             resources: Resources::new(),
             events: EventRegistry::new(),
-            write_hooks: FxHashMap::default(),
             templates: TemplateRegistry::new(),
             chunk_config: ChunkConfig::default(),
         };
@@ -200,6 +200,24 @@ impl World {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
     }
 
+    /// Продвинуть change-tick на границе кадра: запомнить текущий тик как базу
+    /// `Changed<T>` для следующего кадра и инкрементировать `current_tick`.
+    ///
+    /// Вызывается планировщиком в конце `run()`/`run_sequential()`. После этого
+    /// `Changed<T>` внутри систем достоверно детектирует мутации **этого** кадра
+    /// (а не «всё подряд»). На первом кадре база = `Tick::ZERO` (всё новое видно).
+    #[inline]
+    pub fn advance_change_tick(&mut self) {
+        self.last_run_tick = self.current_tick;
+        self.current_tick.0 = self.current_tick.0.wrapping_add(1);
+    }
+
+    /// База change-detection для систем (тик предыдущей границы кадра).
+    #[inline]
+    pub fn last_run_tick(&self) -> Tick {
+        self.last_run_tick
+    }
+
     /// Flush конкретных типов событий (по TypeId). Используется Scheduler для per-Stage flush.
     pub fn flush_events_by_type(&mut self, type_ids: &[std::any::TypeId]) {
         self.events.flush_by_type_id(type_ids);
@@ -208,6 +226,25 @@ impl World {
     /// Flush всех событий. Используется при работе без Scheduler.
     pub fn flush_all_events(&mut self) {
         self.events.flush_all();
+    }
+
+    /// Завершить кадр: **флаш всех событий + продвижение change-tick**.
+    ///
+    /// Самодостаточная замена ручной паре `flush_all_events()` + `tick()` при
+    /// работе **без планировщика** (#9). Вызывайте один раз в конце каждой
+    /// итерации игрового цикла:
+    ///
+    /// ```ignore
+    /// loop {
+    ///     // ... мутации, отправка событий ...
+    ///     world.advance_frame(); // события видны на следующем кадре, change-tick++
+    /// }
+    /// ```
+    ///
+    /// Планировщик делает per-stage флаш сам; там это звать не нужно.
+    pub fn advance_frame(&mut self) {
+        self.flush_all_events();
+        self.advance_change_tick();
     }
 
     pub fn current_tick(&self) -> Tick {
@@ -663,7 +700,7 @@ impl World {
             entity,
             EntityLocation {
                 archetype_id: new_arch_id,
-                row: new_row as u32,
+                row: new_row,
             },
         );
     }
@@ -709,7 +746,7 @@ impl World {
             entity,
             EntityLocation {
                 archetype_id: new_arch_id,
-                row: new_row as u32,
+                row: new_row,
             },
         );
     }
@@ -731,7 +768,7 @@ impl World {
             entity,
             EntityLocation {
                 archetype_id: new_arch_id,
-                row: new_row as u32,
+                row: new_row,
             },
         );
     }
@@ -756,7 +793,7 @@ impl World {
             entity,
             EntityLocation {
                 archetype_id: new_arch_id,
-                row: new_row as u32,
+                row: new_row,
             },
         );
         true
@@ -799,46 +836,24 @@ impl World {
         }
     }
 
+    /// Мутабельный доступ с обновлением change-tick строки (change detection).
+    ///
+    /// Стампит текущий тик мира → `Changed<T>` срабатывает (как и при мутации
+    /// через `Query<&mut T>`/`Write<T>`, C1).
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         let component_id = self.registry.get_id::<T>()?;
         let location = self.entities.get_location(entity)?;
         let tick = self.current_tick;
+        let row = location.row as usize;
 
-        // 1. Обновляем tick изменения (change detection)
-        {
-            let arch = &mut self.archetypes[location.archetype_id.0 as usize];
-            if let Some(col_idx) = arch.column_index(component_id) {
-                if (location.row as usize) < arch.columns[col_idx].change_ticks.len() {
-                    arch.columns[col_idx].change_ticks[location.row as usize] = tick;
-                }
-            }
-        }
-
-        // 2. Вызываем write_hook, если зарегистрирован.
-        //    Хук может переместить entity в другой archetype (например, insert TransformDirty).
-        //    fn pointer — Copy, поэтому копируем и отпускаем borrow на self.write_hooks.
-        let hook_fn: Option<fn(Entity, &mut World)> = self.write_hooks.get(&component_id).copied();
-        if let Some(hook) = hook_fn {
-            hook(entity, self);
-        }
-
-        // 3. Перепроверяем location (хук мог изменить archetype) и получаем ссылку
-        let location2 = self.entities.get_location(entity)?;
-        let arch = &mut self.archetypes[location2.archetype_id.0 as usize];
+        let arch = &mut self.archetypes[location.archetype_id.0 as usize];
         let col_idx = arch.column_index(component_id)?;
-        unsafe { Some(arch.columns[col_idx].get_mut::<T>(location2.row as usize)) }
-    }
-
-    /// Зарегистрировать write_hook для компонента T.
-    /// Хук вызывается при каждом вызове `get_mut::<T>()` ПОСЛЕ обновления tick'а изменения.
-    ///
-    /// Используется, например, для автоматической пометки TransformDirty
-    /// при изменении LocalTransform.
-    pub fn register_write_hook<T: Component>(&mut self, hook: fn(Entity, &mut World)) {
-        if let Some(cid) = self.registry.get_id::<T>() {
-            self.write_hooks.insert(cid, hook);
+        let col = &mut arch.columns[col_idx];
+        if row < col.change_ticks.len() {
+            col.change_ticks[row] = tick;
         }
+        unsafe { Some(col.get_mut::<T>(row)) }
     }
 
     #[inline]
@@ -1082,7 +1097,7 @@ impl World {
                         entity,
                         EntityLocation {
                             archetype_id: new_arch_id,
-                            row: new_row as u32,
+                            row: new_row,
                         },
                     );
                     self.subject_index.add(entity.index, relation_id);
@@ -1231,7 +1246,7 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
     } else {
         1
     };
-    let raw = (entity_count + targets - 1) / targets;
+    let raw = entity_count.div_ceil(targets);
     raw.clamp(config.dynamic_min_chunk, config.max_chunk_size)
         .min(entity_count)
 }
@@ -1301,6 +1316,12 @@ impl<'w> SystemContext<'w> {
 
     /// Получить `Commands` для текущего потока.
     /// Команды применяются планировщиком после завершения Stage.
+    ///
+    /// `&self → &mut Commands` намеренно: буфер команд — thread-local (по индексу
+    /// rayon-потока) либо `UnsafeCell` в sequential-режиме, поэтому уникальность
+    /// `&mut` гарантирована без `&mut self`. Это позволяет нескольким системам
+    /// в одном батче складывать команды параллельно через общий `&SystemContext`.
+    #[allow(clippy::mut_from_ref)]
     #[inline]
     pub fn commands(&self) -> &mut Commands {
         if let Some(deferred_cmds) = self.deferred_cmds {
@@ -1323,7 +1344,10 @@ impl<'w> SystemContext<'w> {
 
     #[inline]
     pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
-        CachedQuery::from_sub_world(&self.sub_worlds[0], Tick::ZERO)
+        // База change-detection — `last_run_tick` мира (граница прошлого кадра),
+        // так `Changed<T>` внутри системы достоверен (TD-9), а не «всё подряд».
+        let last_run = self.sub_worlds[0].world().last_run_tick();
+        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
     }
 
     #[inline]
@@ -1603,7 +1627,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             self.arch_indices
                 .iter()
                 .copied()
-                .filter(|&arch_idx| world.archetypes[arch_idx].len() > 0)
+                .filter(|&arch_idx| !world.archetypes[arch_idx].is_empty())
                 .filter(|&arch_idx| Q::matches_archetype(&world.archetypes[arch_idx], &ids))
                 .map(|arch_idx| {
                     let s = rr(arch_idx);
@@ -1695,13 +1719,11 @@ impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Пока нет активного архетипа или его строки закончились
-            while self.arch_pos < self.arch_indices.len() && self.row >= self.row_end {
-                self.advance_archetype();
-            }
-
-            if self.arch_pos >= self.arch_indices.len() {
-                return None;
+            // Текущий архетип исчерпан — настраиваем следующий совпадающий.
+            while self.row >= self.row_end {
+                if !self.advance_archetype() {
+                    return None;
+                }
             }
 
             let row = self.row;
@@ -1718,42 +1740,38 @@ impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
 }
 
 impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
-    fn advance_archetype(&mut self) {
-        self.arch_pos += 1;
-        self.state = None;
+    /// Настроить следующий непустой совпадающий архетип (начиная с `arch_pos`).
+    /// Возвращает `false`, когда архетипы кончились. Пропускает пустые/не-matching
+    /// в цикле, поэтому первый архетип (индекс 0) НЕ теряется (см. TD-1).
+    fn advance_archetype(&mut self) -> bool {
+        while self.arch_pos < self.arch_indices.len() {
+            let arch_idx = self.arch_indices[self.arch_pos];
+            self.arch_pos += 1; // потребляем текущий индекс
 
-        if self.arch_pos >= self.arch_indices.len() {
-            return;
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() || !Q::matches_archetype(arch, &self.cached_ids) {
+                continue;
+            }
+
+            let (r_start, r_end) = self
+                .row_ranges
+                .iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX));
+            let end = r_end.min(arch.len());
+            if end <= r_start {
+                continue;
+            }
+
+            self.state = Some(unsafe {
+                Q::fetch_state(arch, &self.cached_ids, self.last_run, self.world.current_tick())
+            });
+            self.row = r_start;
+            self.row_end = end;
+            self.entities = arch.entities.as_ptr();
+            return true;
         }
-
-        let arch_idx = self.arch_indices[self.arch_pos];
-        let arch = &self.world.archetypes[arch_idx];
-
-        if arch.is_empty() || !Q::matches_archetype(arch, &self.cached_ids) {
-            self.row = 0;
-            self.row_end = 0;
-            return;
-        }
-
-        let (r_start, r_end) = self
-            .row_ranges
-            .iter()
-            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
-            .unwrap_or((0, usize::MAX));
-        let end = r_end.min(arch.len());
-        let len = end.saturating_sub(r_start);
-
-        if len == 0 {
-            self.row = 0;
-            self.row_end = 0;
-            return;
-        }
-
-        self.state =
-            Some(unsafe { Q::fetch_state(arch, &self.cached_ids, self.last_run, self.world.current_tick()) });
-        self.row = r_start;
-        self.row_end = end;
-        self.entities = arch.entities.as_ptr();
+        false
     }
 }
 
@@ -2047,7 +2065,7 @@ impl<'w> EntityRef<'w> {
     }
 }
 
-impl<'w> World {
+impl World {
     /// Получить [`EntityRef`] для entity.
     pub fn entity(&mut self, entity: Entity) -> EntityRef<'_> {
         EntityRef {
@@ -2301,6 +2319,39 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Team(u8);
     impl crate::component::Component for Team {}
+
+    /// TD-1: `CachedQuery::iter()` НЕ должен пропускать первый архетип.
+    #[test]
+    fn cached_query_iter_does_not_skip_first_archetype() {
+        use crate::query::Read;
+
+        // Один архетип (только Pos).
+        let mut world = World::new();
+        let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
+        let got: Vec<_> = world
+            .query_changed::<Read<Pos>>(Tick::ZERO)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(got.len(), 2, "iter() должен вернуть ОБА entity (не пропустить первый)");
+        assert!(got.contains(&a) && got.contains(&b));
+
+        // Несколько архетипов: (Pos) и (Pos, Vel).
+        let c = world.spawn((Pos { x: 3.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
+        let got2: Vec<_> = world
+            .query_changed::<Read<Pos>>(Tick::ZERO)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(got2.len(), 3, "iter() должен охватить все архетипы, включая первый");
+        assert!(got2.contains(&a) && got2.contains(&b) && got2.contains(&c));
+
+        // for_each и iter дают одинаковый набор.
+        let mut fe = 0usize;
+        world.query_changed::<Read<Pos>>(Tick::ZERO).for_each(|_, _| fe += 1);
+        assert_eq!(fe, got2.len(), "for_each и iter должны быть согласованы");
+    }
 
     // Вложенные Bundle — ручная реализация (proc-макросы не работают внутри apex-core)
     struct PlayerBase {

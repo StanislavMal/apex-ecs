@@ -222,6 +222,10 @@ impl EntityAllocator {
         self.records.len() - self.free_list.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get_by_index(&self, index: u32) -> Option<Entity> {
         let record = self.records.get(index as usize)?;
         if record.has_location() {

@@ -248,10 +248,8 @@ impl<T> Events<T> {
         if all_read {
             // Все читатели прочитали старые события — очищаем буфер и сбрасываем курсоры
             self.events.clear();
-            for cursor in &mut self.cursors {
-                if let Some(pos) = cursor {
-                    *pos = 0;
-                }
+            for pos in self.cursors.iter_mut().flatten() {
+                *pos = 0;
             }
         }
 
@@ -267,10 +265,8 @@ impl<T> Events<T> {
             let new_count = self.events.len() as u32;
 
             // Сдвигаем курсоры на количество новых событий, которые встали перед старыми
-            for cursor in &mut self.cursors {
-                if let Some(pos) = cursor {
-                    *pos += new_count;
-                }
+            for pos in self.cursors.iter_mut().flatten() {
+                *pos += new_count;
             }
 
             // Переносим старые события в конец буфера чтения
@@ -447,10 +443,8 @@ impl<T> Events<T> {
             sync.lock().unwrap().clear();
         }
         self.free_list.clear();
-        for cursor in &mut self.cursors {
-            if let Some(pos) = cursor {
-                *pos = 0;
-            }
+        for pos in self.cursors.iter_mut().flatten() {
+            *pos = 0;
         }
         self.lagging_count = 0;
     }
@@ -844,6 +838,9 @@ pub trait AnyEventQueue: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Raw mutable pointer для EventWriter в SystemContext.
     fn as_ptr_mut(&mut self) -> *mut u8;
     /// Зарегистрировать читателя — возвращает EventCursor (как u32).
@@ -904,10 +901,7 @@ impl EventRegistry {
 
     /// Зарегистрировать тип события.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
-        if !self.queues.contains_key(&TypeId::of::<T>()) {
-            self.queues
-                .insert(TypeId::of::<T>(), Box::new(Events::<T>::new()));
-        }
+        self.queues.entry(TypeId::of::<T>()).or_insert_with(|| Box::new(Events::<T>::new()));
     }
 
     /// Получить очередь событий по типу (паникует если не зарегистрирована).
@@ -1409,5 +1403,28 @@ mod tests {
         world.flush_all_events();
         let queue = world.events::<u32>();
         assert_eq!(queue.len_readable(), 1);
+    }
+
+    /// C7: `advance_frame()` самодостаточен — флашит события (становятся читаемы
+    /// на следующем кадре) И продвигает change-tick. Без ручной пары tick+flush.
+    #[test]
+    fn advance_frame_flushes_events_and_ticks() {
+        use crate::world::World;
+
+        let mut world = World::new();
+        let t0 = world.current_tick();
+
+        world.send_event(7u32);
+        // До конца кадра событие ещё не во «readable»-буфере.
+        assert_eq!(world.events::<u32>().len_readable(), 0);
+
+        world.advance_frame(); // флаш + tick
+
+        assert_eq!(
+            world.events::<u32>().len_readable(),
+            1,
+            "advance_frame должен сделать событие читаемым"
+        );
+        assert_ne!(world.current_tick(), t0, "advance_frame должен продвинуть change-tick");
     }
 }

@@ -45,7 +45,7 @@ impl CommandArena {
         if size == 0 {
             return 0;
         }
-        let start = ((self.cursor + align - 1) / align) * align;
+        let start = self.cursor.div_ceil(align) * align;
         let end = start + size;
         if end > self.capacity {
             let new_cap = end.max(self.capacity * 2).max(4096);

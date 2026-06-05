@@ -64,7 +64,7 @@ impl<T> SparseSet<T> {
                     let existing_dense = std::mem::take(dense);
                     let existing_data = std::mem::take(data);
                     let dense_copy = existing_dense.clone();
-                    for (entity, val) in existing_dense.into_iter().zip(existing_data.into_iter()) {
+                    for (entity, val) in existing_dense.into_iter().zip(existing_data) {
                         map.insert(entity, val);
                     }
                     map.insert(entity_index, value);

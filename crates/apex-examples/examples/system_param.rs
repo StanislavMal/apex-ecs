@@ -4,7 +4,7 @@
 //! - Одиночные параметры (ResRead, ResWrite, Listen, Emit, QueryParam, CommandsParam)
 //! - Кортежи 2–4 элемента
 //! - Удобный метод ctx.fetch::<P>()
-//! - Использование в sequential_system! через SystemContext
+//! - Использование в эксклюзивной системе (`with_ctx`) через SystemContext
 //! - Доступ через access() без рантайма (проверка деклараций)
 //! - Корректность логики (фактическое применение параметров)
 //!
@@ -320,11 +320,11 @@ fn test_tuples() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 6: SystemParam внутри sequential_system! + Scheduler
+// ТЕСТ 6: SystemParam внутри эксклюзивной системы + Scheduler
 // ══════════════════════════════════════════════════════════════
 
-fn test_inside_sequential_system() {
-    println!("─── TEST 6: SystemParam inside sequential_system! ───");
+fn test_inside_exclusive_system() {
+    println!("─── TEST 6: SystemParam inside exclusive system ───");
 
     let mut world = World::new();
     world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
@@ -449,7 +449,7 @@ fn main() {
     test_query_param();
     test_commands_and_empty();
     test_tuples();
-    test_inside_sequential_system();
+    test_inside_exclusive_system();
     test_access_descriptors();
 
     println!("═══════════════════════════════════════");

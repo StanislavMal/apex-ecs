@@ -456,7 +456,7 @@ pub fn archetype_chunks(
     chunk_size: usize,
 ) -> impl Iterator<Item = ArchetypeChunk<'_>> {
     let total = arch.entities.len();
-    let num_chunks = (total + chunk_size - 1) / chunk_size;
+    let num_chunks = total.div_ceil(chunk_size);
     (0..num_chunks).map(move |i| {
         let start = i * chunk_size;
         let end = (start + chunk_size).min(total);
@@ -532,10 +532,10 @@ mod tests {
 
         for i in 0..n {
             unsafe {
-                let stored: &f32 = col.get::<f32>(i as usize);
+                let stored: &f32 = col.get::<f32>(i);
                 assert_eq!(*stored, i as f32);
             }
-            assert_eq!(col.get_tick(i as usize).0, i as u32);
+            assert_eq!(col.get_tick(i).0, i as u32);
         }
     }
 
@@ -681,14 +681,14 @@ mod tests {
             arch.allocate_row(entity);
         }
 
-        let val: f32 = 3.14;
+        let val: f32 = 2.5;
         unsafe {
             arch.write_component(0, ComponentId(0), &val as *const f32 as *const u8, Tick(1));
         }
 
         unsafe {
             let stored: &f32 = arch.get_component::<f32>(0, ComponentId(0)).unwrap();
-            assert_eq!(*stored, 3.14);
+            assert_eq!(*stored, 2.5);
         }
     }
 

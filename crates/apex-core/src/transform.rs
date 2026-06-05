@@ -11,8 +11,10 @@
 //! Ручной `TransformDirty` **удалён**: dirty-детекция идёт через
 //! `Changed<LocalTransform>` — достоверно для мутаций и через `Query<Write>`, и
 //! через `World::get_mut` (C1). Достаточно изменить `LocalTransform` — пересчёт
-//! произойдёт автоматически, каскадируясь на потомков. Спавн с одним
-//! `LocalTransform` авто-инициализирует `GlobalTransform`.
+//! произойдёт автоматически, каскадируясь на потомков. Достаточно заспавнить
+//! entity с одним `LocalTransform` — `GlobalTransform` создаётся **системой
+//! `propagate_transforms` при первом проходе** (не в момент спавна; до этого
+//! `get::<GlobalTransform>` вернёт `None`). См. doc у [`GlobalTransform`].
 //!
 //! # Алгоритм
 //!
@@ -101,6 +103,22 @@ impl Default for LocalTransform {
 }
 
 /// Глобальная (мировая) трансформация entity.
+///
+/// # Когда появляется (важно!)
+///
+/// `GlobalTransform` **НЕ добавляется в момент спавна** — достаточно заспавнить
+/// entity с одним [`LocalTransform`]. Компонент создаётся **автоматически** системой
+/// [`propagate_transforms`] при её **первом проходе** после спавна (для entity, у
+/// которых есть `LocalTransform`, но ещё нет `GlobalTransform`).
+///
+/// Практически: между `world.spawn((LocalTransform...,))` и первым запуском
+/// `propagate_transforms` (PostUpdate) `world.get::<GlobalTransform>(e)` вернёт
+/// `None`. После первого прохода — `Some(..)` с корректной матрицей. Рендер и
+/// прочие потребители читают `GlobalTransform` уже после propagate в том же кадре.
+///
+/// Если `GlobalTransform` нужен **немедленно** при спавне — добавьте его в bundle
+/// явно: `world.spawn((LocalTransform::from_translation(t), GlobalTransform::IDENTITY))`
+/// (его значение всё равно будет пересчитано propagate).
 ///
 /// Пересчитывается в PostUpdate системой `propagate_transforms`.
 /// Не сериализуется — восстанавливается из иерархии + LocalTransform.

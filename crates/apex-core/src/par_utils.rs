@@ -22,7 +22,7 @@ where
         .into_iter()
         .flat_map(|(arch_idx, len)| {
             let chunk_size = adaptive_chunk_size(len, num_threads, config);
-            let num_chunks = (len + chunk_size - 1) / chunk_size;
+            let num_chunks = len.div_ceil(chunk_size);
             (0..num_chunks).map(move |chunk_i| {
                 let start = chunk_i * chunk_size;
                 let end = (start + chunk_size).min(len);

@@ -216,6 +216,75 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
     }
 }
 
+// ── Bevy-подобные алиасы и `&T`/`&mut T` синтаксис (C3) ─────────
+
+/// Алиас `Read<T>` — для совместимости стиля (`Ref<T>` ≡ `Read<T>`).
+pub type Ref<T> = Read<T>;
+
+/// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
+/// выдаёт `&T`.
+impl<T: Component> WorldQuery for &T {
+    type Item<'w> = &'w T;
+    type State = <Read<T> as WorldQuery>::State;
+
+    #[inline]
+    fn component_count() -> usize {
+        <Read<T> as WorldQuery>::component_count()
+    }
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        <Read<T> as WorldQuery>::fill_ids(world, ids)
+    }
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        <Read<T> as WorldQuery>::matches_archetype(arch, ids)
+    }
+    #[inline]
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], lr: Tick, tr: Tick) -> Self::State {
+        <Read<T> as WorldQuery>::fetch_state(arch, ids, lr, tr)
+    }
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        <Read<T> as WorldQuery>::fetch_item(state, row)
+    }
+}
+
+impl<T: Component + 'static> WorldQuerySystemAccess for &T {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+}
+
+/// `&mut T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в
+/// [`Write<T>`], выдаёт [`Mut<T>`] (со стампом change-tick на `DerefMut`).
+impl<T: Component> WorldQuery for &mut T {
+    type Item<'w> = Mut<'w, T>;
+    type State = <Write<T> as WorldQuery>::State;
+
+    #[inline]
+    fn component_count() -> usize {
+        <Write<T> as WorldQuery>::component_count()
+    }
+    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        <Write<T> as WorldQuery>::fill_ids(world, ids)
+    }
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        <Write<T> as WorldQuery>::matches_archetype(arch, ids)
+    }
+    #[inline]
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], lr: Tick, tr: Tick) -> Self::State {
+        <Write<T> as WorldQuery>::fetch_state(arch, ids, lr, tr)
+    }
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        <Write<T> as WorldQuery>::fetch_item(state, row)
+    }
+}
+
+impl<T: Component + 'static> WorldQuerySystemAccess for &mut T {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new().write::<T>()
+    }
+}
+
 // ── With<T> ────────────────────────────────────────────────────
 
 pub struct With<T: Component>(std::marker::PhantomData<T>);
@@ -468,7 +537,7 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
         MaybeMutState {
-            data: col.data as *mut u8,
+            data: col.data,
             ticks: col.ticks_ptr() as *mut Tick,
             item_size: col.item_size,
             present: true,
@@ -1279,6 +1348,34 @@ mod tests {
             vec![target],
             "мутация через Query<Write<T>> должна помечать Changed<T>"
         );
+    }
+
+    /// C3: Bevy-подобный синтаксис `&T` / `&mut T` в запросах.
+    #[test]
+    fn bevy_ref_syntax_query() {
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0 },));
+
+        // Чтение через &Pos, мутация через &mut Pos — как в Bevy.
+        Query::<(&Pos,)>::new(&world).for_each(|_, (p,)| {
+            assert_eq!(p.x, 1.0);
+        });
+        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+            p.x += 10.0;
+        });
+        assert_eq!(world.get::<Pos>(e).unwrap().x, 11.0);
+
+        // &mut стампит change-tick (как Write) — Changed достоверен.
+        world.tick();
+        let lr = world.current_tick();
+        world.tick();
+        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+            p.x += 1.0;
+        });
+        let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(changed, 1, "&mut T должен помечать Changed как Write<T>");
     }
 
     /// Чистое чтение через `Write<T>` без `DerefMut` НЕ должно помечать изменённым
