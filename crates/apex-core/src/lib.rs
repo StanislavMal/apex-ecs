@@ -1,3 +1,7 @@
+// Позволяет `#[derive(Component)]` (эмитит пути `::apex_core::…`) работать на
+// типах ВНУТРИ самого apex-core (transform и пр.).
+extern crate self as apex_core;
+
 pub mod access;
 pub mod archetype;
 pub mod commands;

@@ -51,14 +51,12 @@ use crate::{
 /// Локальная трансформация entity (относительно родителя).
 ///
 /// Если entity не имеет родителя (no ChildOf) — это мировая трансформация.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
 pub struct LocalTransform {
     pub translation: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
 }
-
-impl crate::component::Component for LocalTransform {}
 
 impl LocalTransform {
     /// Единичная трансформация (zero translation, identity rotation, unit scale).
@@ -106,10 +104,8 @@ impl Default for LocalTransform {
 ///
 /// Пересчитывается в PostUpdate системой `propagate_transforms`.
 /// Не сериализуется — восстанавливается из иерархии + LocalTransform.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
 pub struct GlobalTransform(pub Mat4);
-
-impl crate::component::Component for GlobalTransform {}
 
 impl GlobalTransform {
     pub const IDENTITY: Self = Self(Mat4::IDENTITY);
@@ -337,16 +333,14 @@ pub fn propagate_transforms(world: &mut World) {
 pub struct TransformPlugin;
 
 impl TransformPlugin {
-    /// Зарегистрировать Transform-компоненты в World.
+    /// (Опционально) пред-инициализировать состояние Transform в World.
     ///
-    /// `TransformDirty` и write-hook больше не нужны: dirty-детекция идёт через
-    /// `Changed<LocalTransform>` (достоверно после C1 на всех путях мутации).
+    /// **Регистрация компонентов больше не нужна** — `LocalTransform`/`GlobalTransform`
+    /// помечены `#[derive(Component)]` и авто-регистрируются при `World::new()`
+    /// (linkme). `TransformDirty` и write-hook удалены (dirty-детекция — через
+    /// `Changed<LocalTransform>`, C1). Эта функция лишь пред-создаёт scratch-буфер
+    /// `propagate_transforms` (он также создаётся лениво при первом запуске).
     pub fn register_components(world: &mut World) {
-        world.register_component::<LocalTransform>();
-        world.register_component::<GlobalTransform>();
-
-        // Инициализируем scratch-буфер для propagate_transforms
-        // (переиспользуется между кадрами, избегая Vec-аллокаций)
         world.insert_resource(TransformScratch::default());
     }
 }
@@ -380,10 +374,26 @@ mod tests {
         assert_eq!(*gt.to_matrix(), Mat4::IDENTITY);
     }
 
+    /// C6: `LocalTransform`/`GlobalTransform` авто-регистрируются при `World::new()`
+    /// через `#[derive(Component)]` (linkme) — без ручного `register_component`.
+    #[test]
+    fn transform_components_auto_registered() {
+        let world = World::new();
+        assert!(
+            world.registry().get_id::<LocalTransform>().is_some(),
+            "LocalTransform должен авто-регистрироваться через derive(Component)"
+        );
+        assert!(
+            world.registry().get_id::<GlobalTransform>().is_some(),
+            "GlobalTransform должен авто-регистрироваться через derive(Component)"
+        );
+    }
+
     #[test]
     fn propagate_single_entity_auto_init_global() {
+        // БЕЗ register_components: derive авто-регистрирует компоненты,
+        // scratch создаётся лениво в propagate.
         let mut world = World::new();
-        TransformPlugin::register_components(&mut world);
 
         // Спавн с ОДНИМ LocalTransform — без GlobalTransform, без TransformDirty.
         let entity = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
