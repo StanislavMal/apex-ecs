@@ -474,7 +474,7 @@ impl World {
                     if !Q::matches_archetype(arch, &data_ids) {
                         return None;
                     }
-                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO) };
+                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO, self.current_tick()) };
                     Some(RelationArchState {
                         arch_idx,
                         state,
@@ -522,7 +522,7 @@ impl World {
                     if !Q::matches_archetype(arch, &data_ids) {
                         return None;
                     }
-                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO) };
+                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO, self.current_tick()) };
                     Some(RelationArchState {
                         arch_idx,
                         state,

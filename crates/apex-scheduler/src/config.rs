@@ -13,7 +13,9 @@
 //! ```
 
 use crate::{AccessDescriptor, Condition, ConditionTree, ParSystem, SystemFn};
-use apex_core::system_param::{AutoSystem, EventAccessList, ResourceAccessList, WorldQuerySystemAccess};
+use apex_core::system_param::{
+    AutoSystem, EventAccessList, ExclusiveSystem, ResourceAccessList, WorldQuerySystemAccess,
+};
 use apex_core::world::SystemContext;
 
 // ── SystemConfig ───────────────────────────────────────────
@@ -140,6 +142,21 @@ impl SystemConfig {
         }
     }
 
+    /// Эксклюзивная система (`system!` с `world: &mut World`).
+    ///
+    /// Объявляет FULL access и регистрируется как Sequential — планировщик
+    /// исполняет её в одиночку. Имя берётся из самой системы.
+    pub fn exclusive<S: ExclusiveSystem>(mut system: S) -> Self {
+        let name = system.name().to_string();
+        Self {
+            name,
+            kind: SystemConfigKind::Sequential(Box::new(move |w| system.run(w))),
+            condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred: false,
+        }
+    }
+
     /// Параллельное замыкание (без доступа к компонентам).
     pub fn par<F>(name: impl Into<String>, f: F) -> Self
     where
@@ -200,23 +217,55 @@ where F: FnMut(SystemContext<'_>) + Send + Sync + 'static
     SystemConfig::par_access(name, access, f)
 }
 
-// ── IntoScheduleConfigs — tuple развёртка ──────────────────
+// ── IntoScheduleConfigs — единый вход регистрации (U.3/U.4) ─────
+//
+// Маркер-параметр `M` различает источники (Bevy-style disambiguation), что
+// позволяет передавать в `add_systems` РАЗНОРОДНЫЕ элементы одним кортежом:
+//   - bare `AutoSystem`-маркер (параллельная система из `system!`) — имя из fn;
+//   - bare `ExclusiveSystem`-маркер (`system!` с `world: &mut World`) — имя из fn;
+//   - готовый `SystemConfig` (`sys()`/`seq()`/`.run_if()`…).
+// Разные маркеры → разные инстанцирования трейта → нет конфликта когерентности.
 
-/// Трейт для конвертации в Vec<SystemConfig>.
-/// Реализован для SystemConfig и кортежей до 12 элементов.
-pub trait IntoScheduleConfigs {
+/// Маркер: элемент — готовый `SystemConfig`.
+#[doc(hidden)]
+pub struct ConfigMarker;
+/// Маркер: элемент — bare `AutoSystem` (параллельная система).
+#[doc(hidden)]
+pub struct AutoMarker;
+/// Маркер: элемент — bare `ExclusiveSystem`.
+#[doc(hidden)]
+pub struct ExclusiveMarker;
+
+/// Трейт конвертации в `Vec<SystemConfig>`. Реализован для `SystemConfig`,
+/// bare `AutoSystem`/`ExclusiveSystem`-маркеров и кортежей до 12 элементов.
+pub trait IntoScheduleConfigs<M> {
     fn into_vec(self) -> Vec<SystemConfig>;
 }
 
-impl IntoScheduleConfigs for SystemConfig {
+impl IntoScheduleConfigs<ConfigMarker> for SystemConfig {
     fn into_vec(self) -> Vec<SystemConfig> {
         vec![self]
     }
 }
 
+impl<S: AutoSystem + 'static> IntoScheduleConfigs<AutoMarker> for S {
+    fn into_vec(self) -> Vec<SystemConfig> {
+        vec![SystemConfig::sys(S::name(), self)]
+    }
+}
+
+impl<S: ExclusiveSystem> IntoScheduleConfigs<ExclusiveMarker> for S {
+    fn into_vec(self) -> Vec<SystemConfig> {
+        vec![SystemConfig::exclusive(self)]
+    }
+}
+
 macro_rules! impl_into_schedule_configs_tuple {
-    ($($T:ident),+) => {
-        impl<$($T: IntoScheduleConfigs),+> IntoScheduleConfigs for ($($T,)+) {
+    ($($T:ident : $M:ident),+) => {
+        impl<$($T, $M),+> IntoScheduleConfigs<($($M,)+)> for ($($T,)+)
+        where
+            $( $T: IntoScheduleConfigs<$M>, )+
+        {
             #[allow(non_snake_case)]
             fn into_vec(self) -> Vec<SystemConfig> {
                 let ($($T,)+) = self;
@@ -228,15 +277,15 @@ macro_rules! impl_into_schedule_configs_tuple {
     };
 }
 
-impl_into_schedule_configs_tuple!(A);
-impl_into_schedule_configs_tuple!(A, B);
-impl_into_schedule_configs_tuple!(A, B, C);
-impl_into_schedule_configs_tuple!(A, B, C, D);
-impl_into_schedule_configs_tuple!(A, B, C, D, E);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G, H);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G, H, I);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G, H, I, J);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G, H, I, J, K);
-impl_into_schedule_configs_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_into_schedule_configs_tuple!(A: MA);
+impl_into_schedule_configs_tuple!(A: MA, B: MB);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG, H: MH);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG, H: MH, I: MI);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG, H: MH, I: MI, J: MJ);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG, H: MH, I: MI, J: MJ, K: MK);
+impl_into_schedule_configs_tuple!(A: MA, B: MB, C: MC, D: MD, E: ME, F: MF, G: MG, H: MH, I: MI, J: MJ, K: MK, L: ML);

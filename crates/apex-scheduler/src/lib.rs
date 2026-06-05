@@ -53,7 +53,10 @@ pub mod conditions;
 pub mod pipeline;
 pub mod stage;
 
-pub use config::{sys, seq, par, par_access, IntoScheduleConfigs, SystemConfig};
+pub use config::{
+    par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, IntoScheduleConfigs,
+    SystemConfig,
+};
 
 mod config;
 use crate::config::SystemConfigKind;
@@ -775,6 +778,38 @@ impl Scheduler {
         self.add_system_to_stage(name_str, func, StageLabel::Startup)
     }
 
+    /// Регистрировать эксклюзивную систему (`system!` с `world: &mut World`).
+    ///
+    /// Имя выводится из самой системы. Этап — `default_stage_label`.
+    /// Возвращает `SystemBuilder` (для `.id()`/`.run_if()`/зависимостей).
+    pub fn add_exclusive_system<S>(&mut self, system: S) -> SystemBuilder
+    where
+        S: apex_core::system_param::ExclusiveSystem,
+    {
+        self.add_exclusive_system_to_stage(system, self.default_stage_label.clone())
+    }
+
+    /// Регистрировать эксклюзивную систему в указанном этапе.
+    pub fn add_exclusive_system_to_stage<S>(
+        &mut self,
+        mut system: S,
+        stage_label: StageLabel,
+    ) -> SystemBuilder
+    where
+        S: apex_core::system_param::ExclusiveSystem,
+    {
+        let name = system.name().to_string();
+        self.add_system_to_stage(name, move |w: &mut World| system.run(w), stage_label)
+    }
+
+    /// Регистрировать эксклюзивную систему в Startup-этапе (один раз).
+    pub fn add_exclusive_startup_system<S>(&mut self, system: S) -> SystemBuilder
+    where
+        S: apex_core::system_param::ExclusiveSystem,
+    {
+        self.add_exclusive_system_to_stage(system, StageLabel::Startup)
+    }
+
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
@@ -988,7 +1023,7 @@ impl Scheduler {
     ///     "physics",
     ///     access_desc!(read<Vel>, write<Pos>),
     ///     |ctx| {
-    ///         ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, p)| {
+    ///         ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, mut p)| {
     ///             p.x += v.x;
     ///         });
     ///     },
@@ -1400,10 +1435,10 @@ impl Scheduler {
     /// #     fn run(&mut self, _: apex_core::world::SystemContext<'_>) {}
     /// # }
     /// ```
-    pub fn add_systems(
+    pub fn add_systems<M>(
         &mut self,
         stage_label: StageLabel,
-        systems: impl IntoScheduleConfigs,
+        systems: impl IntoScheduleConfigs<M>,
     ) -> &mut Self {
         for cfg in systems.into_vec() {
             self.register_system_config(cfg, stage_label.clone());
@@ -3240,7 +3275,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>().for_each(|_, (vel, pos)| {
+            ctx.query::<Self::Query>().for_each(|_, (vel, mut pos)| {
                 pos.x += vel.x;
                 pos.y += vel.y;
             });
@@ -3253,7 +3288,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>().for_each(|_, hp| {
+            ctx.query::<Self::Query>().for_each(|_, mut hp| {
                 hp.0 = hp.0.max(0.0);
             });
         }
@@ -3455,7 +3490,7 @@ mod tests {
             }
             fn run(&mut self, ctx: SystemContext<'_>) {
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
-                    .for_each(|_, (vel, pos)| {
+                    .for_each(|_, (vel, mut pos)| {
                         pos.x += vel.x;
                         pos.y += vel.y;
                     });
@@ -3565,7 +3600,7 @@ mod tests {
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
                 ctx.query::<(Read<Vel>, Write<Pos>)>()
-                    .for_each(|_, (vel, pos)| {
+                    .for_each(|_, (vel, mut pos)| {
                         pos.x += vel.x * (*dt).0;
                         pos.y += vel.y * (*dt).0;
                     });

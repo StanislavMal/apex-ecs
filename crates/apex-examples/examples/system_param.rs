@@ -190,7 +190,7 @@ fn test_query_param() {
             let q = ctx.fetch::<P>();
             let count = q.iter().count();
             assert_eq!(count, 3);
-            q.for_each(|_, pos| { pos.x += 100.0; });
+            q.for_each(|_, mut pos| { pos.x += 100.0; });
             println!("  Write<Position>: {} entities mutated", count);
         }
     });

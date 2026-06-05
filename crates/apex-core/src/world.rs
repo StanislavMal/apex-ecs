@@ -1557,7 +1557,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if !Q::matches_archetype(arch, ids) {
                 continue;
             }
-            let state = unsafe { Q::fetch_state(arch, ids, self.last_run) };
+            let state = unsafe { Q::fetch_state(arch, ids, self.last_run, self.world.current_tick()) };
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
@@ -1624,7 +1624,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 return;
             }
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = clamped_start + offset;
@@ -1749,7 +1749,8 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
             return;
         }
 
-        self.state = Some(unsafe { Q::fetch_state(arch, &self.cached_ids, self.last_run) });
+        self.state =
+            Some(unsafe { Q::fetch_state(arch, &self.cached_ids, self.last_run, self.world.current_tick()) });
         self.row = r_start;
         self.row_end = end;
         self.entities = arch.entities.as_ptr();

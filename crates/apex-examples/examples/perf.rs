@@ -167,7 +167,7 @@ system! {
     fn move_sys(
         q: (Read<Velocity>, Write<Position>),
     ) {
-        q.for_each(|_, (v, p)| {
+        q.for_each(|_, (v, mut p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
             p.z += v.z * 0.016;
@@ -179,7 +179,7 @@ system! {
     fn hp_sys(
         q: Write<Health>,
     ) {
-        q.for_each(|_, hp| {
+        q.for_each(|_, mut hp| {
             hp.current = hp.current.min(hp.max).max(0.0);
         });
     }
@@ -189,7 +189,7 @@ system! {
     fn temp_sys(
         q: Write<Temperature>,
     ) {
-        q.for_each(|_, t| {
+        q.for_each(|_, mut t| {
             t.0 += (20.0 - t.0) * 0.001;
         });
     }
@@ -199,7 +199,7 @@ system! {
     fn mana_sys(
         q: Write<Mana>,
     ) {
-        q.for_each(|_, m| {
+        q.for_each(|_, mut m| {
             m.current = (m.current + 0.2).min(m.max);
         });
     }
@@ -209,7 +209,7 @@ system! {
     fn heavy_phys_sys(
         q: (Write<Velocity>, Write<Position>),
     ) {
-        q.for_each(|_, (v, p)| {
+        q.for_each(|_, (mut v, mut p)| {
             let dt    = 0.016f32;
             let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
             let angle = speed.atan2(1.0);
@@ -229,7 +229,7 @@ system! {
     fn heavy_temp_sys(
         q: Write<Temperature>,
     ) {
-        q.for_each(|_, t| {
+        q.for_each(|_, mut t| {
             let ambient = 20.0f32;
             let diff    = t.0 - ambient;
             let rate    = (diff * 0.1).tanh() * 0.05;
@@ -246,7 +246,7 @@ system! {
     fn heavy_mana_sys(
         q: Write<Mana>,
     ) {
-        q.for_each(|_, m| {
+        q.for_each(|_, mut m| {
             let ratio = m.current / m.max;
             let regen = (1.0 - ratio).sqrt() * 0.5;
             m.current = (m.current + regen).min(m.max);
@@ -261,7 +261,7 @@ system! {
     fn auto_move_sys(
         q: (Read<Velocity>, Write<Position>),
     ) {
-        q.for_each(|_, (v, p)| {
+        q.for_each(|_, (v, mut p)| {
             p.x += v.x * 0.016;
             p.y += v.y * 0.016;
         });
@@ -524,7 +524,7 @@ fn bench_scheduler_throughput(n: usize) {
             access_desc!(read<PhysicsConfig>, write<Position>),
             |ctx| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
-                ctx.query::<Write<Position>>().for_each(|_, pos| { pos.x += dt; });
+                ctx.query::<Write<Position>>().for_each(|_, mut pos| { pos.x += dt; });
             },
         );
         sched.compile().unwrap();
@@ -547,7 +547,7 @@ fn bench_scheduler_throughput(n: usize) {
         let mut sched = Scheduler::new();
         sched.add_system("move", |world: &mut World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(world)
-                .for_each(|_, (v, p)| { p.x += v.x; p.y += v.y; });
+                .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
         });
         sched.compile().unwrap();
         bench_with_setup(
@@ -905,7 +905,7 @@ fn bench_query(n: usize) {
         || make_world_3comp(n * 1000),
         |mut world: World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(&mut world)
-                .for_each(|_, (v, p)| { p.x += v.x; p.y += v.y; });
+                .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
         },
@@ -1200,7 +1200,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
+            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (mut v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1222,7 +1222,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Temperature>>().par_for_each(|_, t| {
+            ctx.query::<Write<Temperature>>().par_for_each(|_, mut t| {
                 let ambient = 20.0f32;
                 let diff    = t.0 - ambient;
                 let rate    = (diff * 0.1).tanh() * 0.05;
@@ -1241,7 +1241,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Mana>>().par_for_each(|_, m| {
+            ctx.query::<Write<Mana>>().par_for_each(|_, mut m| {
                 let ratio = m.current / m.max;
                 let regen = (1.0 - ratio).sqrt() * 0.5;
                 m.current = (m.current + regen).min(m.max);
@@ -1335,7 +1335,7 @@ fn bench_parallel_scheduler(n: usize) {
                 fn $name(
                     q: Write<$comp>,
                 ) {
-                    q.for_each(|_, c| {
+                    q.for_each(|_, mut c| {
                         c.0 = (c.0 * 1.01 + 0.5).sin();
                     });
                 }
@@ -1551,7 +1551,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1566,7 +1566,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1581,7 +1581,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1599,7 +1599,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, p)| {
+            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);

@@ -28,14 +28,15 @@ pub use component::{
 pub use entity::Entity;
 pub use events::{DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard};
 pub use linkme; // re-exported for #[derive(Component)] macro
-pub use query::{Changed, Maybe, MaybeWrite, Query, Read, With, Without, WorldQuery, Write};
+pub use query::{Changed, Maybe, MaybeWrite, Mut, Query, Read, With, Without, WorldQuery, Write};
 pub use relations::{ChildOf, Owns, RelationKind};
 pub use resources::Resources;
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
 pub use system_param::{
-    AutoSystem, CommandsParam, Emit, EventAccessList, EventReader, EventWriter, Listen, QueryParam,
-    Res, ResMut, ResRead, ResWrite, ResourceAccessList, SystemParam, WorldQuerySystemAccess,
+    AutoSystem, CommandsParam, Emit, EventAccessList, EventReader, EventWriter, ExclusiveSystem,
+    Listen, QueryParam, Res, ResMut, ResRead, ResWrite, ResourceAccessList, SystemParam,
+    WorldQuerySystemAccess,
 };
 pub use world::{Bundle, CachedQuery, ParallelWorld, SystemContext, World};
 
@@ -47,15 +48,15 @@ pub mod prelude {
     pub use crate::events::{DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard};
     pub use crate::impl_entity_template;
     pub use crate::query::{
-        Changed, Maybe, MaybeWrite, Query, QueryBuilder, Read, With, Without, WorldQuery, Write,
+        Changed, Maybe, MaybeWrite, Mut, Query, QueryBuilder, Read, With, Without, WorldQuery,
+        Write,
     };
     pub use crate::relations::{ChildOf, Owns, RelationKind};
     pub use crate::resources::Resources;
-    pub use crate::sequential_system;
     pub use crate::system;
     pub use crate::system_param::{
-        AutoSystem, CommandsParam, Emit, EventReader, EventWriter, Listen, QueryParam, Res, ResMut,
-        ResRead, ResWrite, SystemParam, WorldQuerySystemAccess,
+        AutoSystem, CommandsParam, Emit, EventReader, EventWriter, ExclusiveSystem, Listen,
+        QueryParam, Res, ResMut, ResRead, ResWrite, SystemParam, WorldQuerySystemAccess,
     };
     pub use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
     pub use crate::world::{Bundle, CachedQuery, SystemContext, World};

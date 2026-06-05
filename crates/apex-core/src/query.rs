@@ -25,7 +25,17 @@ pub trait WorldQuery: Sized {
     }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State;
+    /// Захватывает per-archetype состояние для итерации.
+    ///
+    /// `last_run` — тик предыдущего запуска (для `Changed<T>`-фильтрации).
+    /// `this_run` — текущий тик мира; `Write<T>`/`MaybeWrite<T>` стампят его в
+    /// change-tick строки при `DerefMut` через возвращаемый `Mut<T>`.
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        last_run: Tick,
+        this_run: Tick,
+    ) -> Self::State;
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
     fn is_filter() -> bool {
@@ -42,6 +52,75 @@ pub trait WorldQuery: Sized {
         true
     }
 }
+
+// ── Mut<T> — smart-pointer для Write<T> (change detection) ──────
+
+/// Мутабельный доступ к компоненту с автоматическим change-detection.
+///
+/// Возвращается из `Query<Write<T>>`. На `DerefMut` стампит текущий тик мира в
+/// change-tick строки → `Changed<T>` достоверно срабатывает на ВСЕХ путях
+/// мутации (а не только `World::get_mut`). Семантика как у Bevy `Mut<T>`:
+/// любое мутабельное заимствование помечает компонент изменённым, даже если
+/// фактически только читали — это приемлемый и стандартный компромисс.
+pub struct Mut<'w, T: 'static> {
+    pub(crate) value: &'w mut T,
+    /// Указатель на change-tick этой строки (внутри `Column::change_ticks`).
+    pub(crate) change_tick: *mut Tick,
+    /// Текущий тик мира — стампится при `DerefMut`.
+    pub(crate) this_run: Tick,
+}
+
+impl<T: 'static> Mut<'_, T> {
+    /// Явно пометить компонент изменённым без мутации значения.
+    #[inline]
+    pub fn set_changed(&mut self) {
+        unsafe { *self.change_tick = self.this_run };
+    }
+
+    /// Получить `&mut T` без пометки изменения (escape-hatch).
+    #[inline]
+    pub fn bypass_change_detection(&mut self) -> &mut T {
+        self.value
+    }
+}
+
+impl<T: 'static> std::ops::Deref for Mut<'_, T> {
+    type Target = T;
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        self.value
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for Mut<'_, T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { *self.change_tick = self.this_run };
+        self.value
+    }
+}
+
+impl<T: std::fmt::Debug + 'static> std::fmt::Debug for Mut<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+/// Per-archetype состояние `Write<T>`: базовый указатель данных + указатель на
+/// массив change-ticks + текущий тик мира.
+pub struct WriteState<T> {
+    data: *mut T,
+    ticks: *mut Tick,
+    this_run: Tick,
+}
+
+impl<T> Clone for WriteState<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for WriteState<T> {}
 
 // ── Read<T> ────────────────────────────────────────────────────
 
@@ -66,7 +145,7 @@ impl<T: Component> WorldQuery for Read<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick, _: Tick) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         arch.columns[col_idx].get_ptr(0) as *const T
     }
@@ -88,8 +167,8 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Read<T> {
 pub struct Write<T: Component>(std::marker::PhantomData<T>);
 
 impl<T: Component> WorldQuery for Write<T> {
-    type Item<'w> = &'w mut T;
-    type State = *mut T;
+    type Item<'w> = Mut<'w, T>;
+    type State = WriteState<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -106,14 +185,28 @@ impl<T: Component> WorldQuery for Write<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        _: Tick,
+        this_run: Tick,
+    ) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
-        arch.columns[col_idx].get_ptr(0) as *mut T
+        let col = &arch.columns[col_idx];
+        WriteState {
+            data: col.get_ptr(0) as *mut T,
+            ticks: col.ticks_ptr() as *mut Tick,
+            this_run,
+        }
     }
 
     #[inline(always)]
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
-        Some(&mut *state.add(row))
+        Some(Mut {
+            value: &mut *state.data.add(row),
+            change_tick: state.ticks.add(row),
+            this_run: state.this_run,
+        })
     }
 }
 
@@ -150,7 +243,7 @@ impl<T: Component> WorldQuery for With<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick) -> Self::State {}
+    unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick, _: Tick) -> Self::State {}
 
     #[inline(always)]
     unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
@@ -198,7 +291,7 @@ impl<T: Component> WorldQuery for Without<T> {
         ids.is_empty() || !arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick) -> Self::State {}
+    unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick, _: Tick) -> Self::State {}
 
     #[inline(always)]
     unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
@@ -270,7 +363,12 @@ impl<T: Component> WorldQuery for Maybe<T> {
         true
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        _: Tick,
+        _: Tick,
+    ) -> Self::State {
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeState::absent();
         }
@@ -318,8 +416,10 @@ pub struct MaybeWrite<T: Component>(std::marker::PhantomData<T>);
 #[derive(Clone, Copy)]
 pub struct MaybeMutState {
     data: *mut u8,
+    ticks: *mut Tick,
     item_size: usize,
     present: bool,
+    this_run: Tick,
 }
 
 unsafe impl Send for MaybeMutState {}
@@ -329,14 +429,16 @@ impl MaybeMutState {
     fn absent() -> Self {
         MaybeMutState {
             data: std::ptr::null_mut(),
+            ticks: std::ptr::null_mut(),
             item_size: 0,
             present: false,
+            this_run: Tick::ZERO,
         }
     }
 }
 
 impl<T: Component> WorldQuery for MaybeWrite<T> {
-    type Item<'w> = Option<&'w mut T>;
+    type Item<'w> = Option<Mut<'w, T>>;
     type State = MaybeMutState;
 
     #[inline]
@@ -354,7 +456,12 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         true
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], _: Tick) -> Self::State {
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        _: Tick,
+        this_run: Tick,
+    ) -> Self::State {
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeMutState::absent();
         }
@@ -362,21 +469,26 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         let col = &arch.columns[col_idx];
         MaybeMutState {
             data: col.data as *mut u8,
+            ticks: col.ticks_ptr() as *mut Tick,
             item_size: col.item_size,
             present: true,
+            this_run,
         }
     }
 
     #[inline(always)]
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
         if state.present {
-            if state.item_size == 0 {
-                Some(Some(&mut *std::ptr::NonNull::<T>::dangling().as_ptr()))
+            let value = if state.item_size == 0 {
+                &mut *std::ptr::NonNull::<T>::dangling().as_ptr()
             } else {
-                Some(Some(
-                    &mut *(state.data.add(row * state.item_size) as *mut T),
-                ))
-            }
+                &mut *(state.data.add(row * state.item_size) as *mut T)
+            };
+            Some(Some(Mut {
+                value,
+                change_tick: state.ticks.add(row),
+                this_run: state.this_run,
+            }))
         } else {
             Some(None)
         }
@@ -429,7 +541,12 @@ impl<T: Component> WorldQuery for Changed<T> {
         !ids.is_empty() && arch.has_component(ids[0])
     }
 
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        last_run: Tick,
+        _: Tick,
+    ) -> Self::State {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
         ChangedState {
@@ -491,13 +608,13 @@ macro_rules! impl_world_query_tuple {
                 all
             }
 
-            unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> Self::State {
+            unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick, this_run: Tick) -> Self::State {
                 let mut offset = 0;
                 ($(
                     {
                         let n = $Q::component_count();
                         let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
-                        let s = $Q::fetch_state(arch, slice, last_run);
+                        let s = $Q::fetch_state(arch, slice, last_run, this_run);
                         #[allow(unused_assignments)] { offset += n; }
                         s
                     },
@@ -542,7 +659,12 @@ impl WorldQuery for () {
         true
     }
 
-    unsafe fn fetch_state(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> Self::State {
+    unsafe fn fetch_state(
+        _arch: &Archetype,
+        _ids: &[ComponentId],
+        _last_run: Tick,
+        _this_run: Tick,
+    ) -> Self::State {
     }
 
     unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> {
@@ -645,7 +767,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let state =
-                            unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run) };
+                            unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -709,7 +831,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -726,7 +848,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -742,7 +864,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .enumerate()
                     .filter(|(_, arch)| !arch.is_empty())
                     .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -771,7 +893,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let arch = &world.archetypes[arch_idx];
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -886,7 +1008,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 return;
             }
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, last_run) };
+            let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = clamped_start + offset;
@@ -1115,6 +1237,75 @@ mod tests {
             assert!(only_a.contains(e), "Сущность должна быть из only_a");
             assert!(!with_b.contains(e), "Сущность не должна быть из with_b");
         }
+    }
+
+    #[derive(Debug)]
+    struct Pos {
+        x: f32,
+    }
+    impl Component for Pos {}
+
+    /// C1: мутация через `Query<Write<T>>` должна делать `Changed<T>`
+    /// достоверным (раньше change-tick ставился только в `World::get_mut`).
+    #[test]
+    fn write_query_marks_changed() {
+        let mut world = World::new();
+        let target = world.spawn((Pos { x: 0.0 },));
+        let _other = world.spawn((Pos { x: 100.0 },));
+
+        // Базовая линия: тик, относительно которого считаем "изменения".
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
+        {
+            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            q.for_each(|e, mut p| {
+                if e == target {
+                    p.x += 1.0;
+                }
+            });
+        }
+
+        // Changed<Pos> относительно last_run должен вернуть ровно target.
+        let changed: Vec<_> =
+            Query::<(crate::query::Changed<Pos>, Read<Pos>)>::new_with_tick(&world, last_run)
+                .iter()
+                .map(|(e, _)| e)
+                .collect();
+        assert_eq!(
+            changed,
+            vec![target],
+            "мутация через Query<Write<T>> должна помечать Changed<T>"
+        );
+    }
+
+    /// Чистое чтение через `Write<T>` без `DerefMut` НЕ должно помечать изменённым
+    /// (стамп происходит только при мутабельном разыменовании).
+    #[test]
+    fn write_query_read_only_no_change() {
+        let mut world = World::new();
+        let _e = world.spawn((Pos { x: 5.0 },));
+
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        {
+            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            let mut sink = 0.0;
+            q.for_each(|_, p| {
+                // Только Deref (чтение) — без DerefMut.
+                sink += p.x;
+            });
+            std::hint::black_box(sink);
+        }
+
+        let changed_count = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, last_run)
+            .iter()
+            .count();
+        assert_eq!(changed_count, 0, "чтение через Write<T> не должно помечать Changed");
     }
 
     #[test]

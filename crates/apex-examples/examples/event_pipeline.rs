@@ -78,7 +78,7 @@ system! {
             count += 1;
 
             let mut reduced = ev.amount;
-            q.for_each(|entity, (armor, hp)| {
+            q.for_each(|entity, (armor, mut hp)| {
                 if entity == ev.target {
                     let reduction = (armor.0 / (armor.0 + 100.0)).min(0.8);
                     reduced = ev.amount * (1.0 - reduction);

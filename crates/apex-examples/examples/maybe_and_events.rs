@@ -103,7 +103,7 @@ fn main() {
     // Замедляем все движущиеся entity, у кого есть Speed
     let query = Query::<(MaybeWrite<Speed>, With<Enemy>)>::new(&world);
     query.for_each(|entity, (speed_opt, _)| {
-        if let Some(speed) = speed_opt {
+        if let Some(mut speed) = speed_opt {
             speed.0 *= 0.8;
             println!("  entity {:?}: замедлен до speed={}", entity, speed.0);
         } else {

@@ -44,7 +44,7 @@ impl FragIter {
 
     pub fn run(&self) {
         self.world.query_typed::<Write<Data>>()
-            .for_each(|_, data| {
+            .for_each(|_, mut data| {
                 data.0 *= 2.0;
             });
     }

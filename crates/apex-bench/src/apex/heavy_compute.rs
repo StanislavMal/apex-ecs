@@ -24,7 +24,7 @@ impl HeavyCompute {
 
     pub fn run(&self) {
         self.world.query_typed::<(Write<Matrix4<f32>>, Write<Position>)>()
-            .par_for_each(|_, (mat, pos)| {
+            .par_for_each(|_, (mut mat, mut pos)| {
                 let mut m = *mat;
                 for _ in 0..100 {
                     m = m.invert().unwrap();

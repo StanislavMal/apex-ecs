@@ -73,15 +73,15 @@ static S10_COUNT: Mutex<u32> = Mutex::new(0);
 // ── Scenario 1: run_if closure ───────────────────────────────────
 // .run_if(|w| !paused) — skipped when Paused(true)
 
-sequential_system! {
-    fn s1_system(world: &mut World) {
+system! {
+    fn s1_system(_world: &mut World) {
         S1_CALLED.store(true, Ordering::SeqCst);
     }
 }
 
 fn setup_s1() -> (Scheduler, World) {
     let mut sched = Scheduler::new();
-    sched.add_system("s1", s1_system)
+    sched.add_exclusive_system(s1_system)
         .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true));
 
     let mut world = World::new();
@@ -110,7 +110,7 @@ fn check_s1(sched: &mut Scheduler, world: &mut World) {
 
 system! {
     fn s2_system(q: (Read<Player>, Write<Pos>)) {
-        q.for_each(|_, (_, pos)| { pos.x += 1.0; });
+        q.for_each(|_, (_, mut pos)| { pos.x += 1.0; });
         S2_CALLED.store(true, Ordering::SeqCst);
     }
 }
@@ -258,7 +258,7 @@ fn check_s4() {
 // ── Scenario 5a: chain + sequential (immediate apply) ────────────
 // chain гарантирует порядок; world.spawn() — немедленная видимость
 
-sequential_system! {
+system! {
     fn s5a_spawner(world: &mut World) {
         world.spawn((Spawned,));
     }
@@ -266,14 +266,14 @@ sequential_system! {
 
 fn check_s5a() {
     let mut sched = Scheduler::new();
-    sched.add_system("spawner", s5a_spawner);
+    sched.add_exclusive_system(s5a_spawner);
     sched.add_system("reader", move |world: &mut World| {
         let c = Query::<Read<Spawned>>::new(world).iter().count();
         if c > 0 {
             S5_SEEN.store(true, Ordering::SeqCst);
         }
     });
-    sched.chain(&["spawner", "reader"]).unwrap();
+    sched.chain(&["s5a_spawner", "reader"]).unwrap();
 
     let mut world = World::new();
     S5_SEEN.store(false, Ordering::SeqCst);

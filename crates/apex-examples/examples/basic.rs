@@ -56,7 +56,7 @@ system! {
         let dt = cfg.dt;
         let g = cfg.gravity;
         let count = q.len();
-        q.for_each(|_, (mass, vel, pos)| {
+        q.for_each(|_, (mass, mut vel, mut pos)| {
             vel.y -= g * mass.0 * dt;
             pos.x += vel.x * dt;
             pos.y += vel.y * dt;
@@ -73,7 +73,7 @@ system! {
         cmd: Cmd,
     ) {
         let mut dead_entities: Vec<Entity> = Vec::new();
-        q.for_each(|entity, hp| {
+        q.for_each(|entity, mut hp| {
             hp.current = hp.current.clamp(0.0, hp.max);
             if hp.current <= 0.0 {
                 dead_entities.push(entity);
@@ -93,7 +93,7 @@ system! {
         q: (Read<Velocity>, Write<Position>),
     ) {
         let count = q.len();
-        q.for_each(|_, (vel, pos)| {
+        q.for_each(|_, (vel, mut pos)| {
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -103,7 +103,7 @@ system! {
 
 // ── Sequential системы ────────────────────────────────────────
 
-sequential_system! {
+system! {
     fn damage_apply(
         world: &mut World,
     ) {
@@ -125,7 +125,7 @@ sequential_system! {
     }
 }
 
-sequential_system! {
+system! {
     fn despawn_dead(
         world: &mut World,
     ) {
@@ -144,7 +144,7 @@ sequential_system! {
     }
 }
 
-sequential_system! {
+system! {
     fn stats_update(
         world: &mut World,
     ) {
@@ -159,7 +159,7 @@ sequential_system! {
 // ── Startup-системы ──────────────────────────────────────────
 // Выполняются один раз при первом run().
 
-sequential_system! {
+system! {
     fn init_resources(
         world: &mut World,
     ) {
@@ -174,7 +174,7 @@ sequential_system! {
     }
 }
 
-sequential_system! {
+system! {
     fn spawn_player(
         world: &mut World,
     ) {
@@ -232,7 +232,7 @@ system! {
         q: (Read<Enemy>, Write<Velocity>),
     ) {
         let count = q.len();
-        q.for_each(|_, (_, vel)| {
+        q.for_each(|_, (_, mut vel)| {
             vel.x *= 0.99;
             vel.y *= 0.99;
         });
@@ -257,8 +257,8 @@ fn main() {
     // ╔══════════════════════════════════════════════════════════╗
     // ║  Startup — выполняется один раз при первом run()       ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_startup_system("init_resources", init_resources);
-    sched.add_startup_system("spawn_player",   spawn_player);
+    sched.add_exclusive_startup_system(init_resources);
+    sched.add_exclusive_startup_system(spawn_player);
 
     // ╔══════════════════════════════════════════════════════════╗
     // ║  PreUpdate — AutoSystem (автовывод доступа)            ║
@@ -276,9 +276,9 @@ fn main() {
     // ╔══════════════════════════════════════════════════════════╗
     // ║  PostUpdate — Sequential системы                        ║
     // ╚══════════════════════════════════════════════════════════╝
-    let damage_id  = sched.add_system_to_stage("damage_apply",  damage_apply,  StageLabel::PostUpdate).id();
-    let despawn_id = sched.add_system_to_stage("despawn_dead",  despawn_dead,  StageLabel::PostUpdate).id();
-    let stats_id   = sched.add_system_to_stage("stats_update",  stats_update,  StageLabel::PostUpdate).id();
+    let damage_id  = sched.add_exclusive_system_to_stage(damage_apply,  StageLabel::PostUpdate).id();
+    let despawn_id = sched.add_exclusive_system_to_stage(despawn_dead,  StageLabel::PostUpdate).id();
+    let stats_id   = sched.add_exclusive_system_to_stage(stats_update,  StageLabel::PostUpdate).id();
 
     sched.add_dependency(despawn_id, damage_id);
     sched.add_dependency(stats_id,   despawn_id);

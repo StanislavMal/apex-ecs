@@ -607,6 +607,24 @@ pub trait AutoSystem: Send + Sync {
     }
 }
 
+/// Эксклюзивная система — получает полный `&mut World`.
+///
+/// Генерируется тем же макросом [`system!`](crate::system), когда среди
+/// параметров есть `world: &mut World`. Такая система объявляет **FULL access**
+/// (конфликтует со всем) и исполняется планировщиком в одиночку (sync-точка),
+/// между параллельными батчами. `world: &mut World` нельзя комбинировать с
+/// другими data-параметрами — макрос проверяет это и даёт compile-ошибку.
+///
+/// Это замена удалённого `sequential_system!`: один макрос `system!` для
+/// параллельных и эксклюзивных систем, режим выбирается по наличию `&mut World`.
+pub trait ExclusiveSystem: Send + 'static {
+    fn run(&mut self, world: &mut crate::world::World);
+
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+}
+
 // ── Extract<P> — Bevy-совместимый SystemParam для extract-систем ──
 
 /// Bevy-совместимый параметр extract-систем — читает из [`MainWorld`].

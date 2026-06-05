@@ -24,7 +24,7 @@ system! {
     fn sys_ab(
         q: (Write<A>, Write<B>),
     ) {
-        q.for_each(|_, (a, b)| {
+        q.for_each(|_, (mut a, mut b)| {
             std::mem::swap(&mut a.0, &mut b.0);
         });
     }
@@ -34,7 +34,7 @@ system! {
     fn sys_cd(
         q: (Write<C>, Write<D>),
     ) {
-        q.for_each(|_, (c, d)| {
+        q.for_each(|_, (mut c, mut d)| {
             std::mem::swap(&mut c.0, &mut d.0);
         });
     }
@@ -44,7 +44,7 @@ system! {
     fn sys_ce(
         q: (Write<C>, Write<E>),
     ) {
-        q.for_each(|_, (c, e)| {
+        q.for_each(|_, (mut c, mut e)| {
             std::mem::swap(&mut c.0, &mut e.0);
         });
     }

@@ -118,7 +118,7 @@ system! {
         q: (Write<Position>, Read<Velocity>),
         dt: &DeltaTime,
     ) {
-        q.for_each(|_, (pos, vel)| {
+        q.for_each(|_, (mut pos, vel)| {
             pos.x += vel.x * dt.0;
             pos.y += vel.y * dt.0;
             pos.z += vel.z * dt.0;
@@ -131,7 +131,7 @@ system! {
         q: (Write<Position>, Read<Acceleration>),
         dt: &DeltaTime,
     ) {
-        q.for_each(|_, (pos, acc)| {
+        q.for_each(|_, (mut pos, acc)| {
             pos.x += acc.x * dt.0 * dt.0 * 0.5;
             pos.y += acc.y * dt.0 * dt.0 * 0.5;
         });
@@ -145,7 +145,7 @@ system! {
     ) {
         let n = q.len();
         writer.reserve(n / 10 + 1);
-        q.for_each(|entity, (hp, dmg)| {
+        q.for_each(|entity, (mut hp, dmg)| {
             hp.current -= dmg.0;
             if hp.current < 0.0 {
                 writer.send(DamageEvent { target: entity, amount: dmg.0 });
@@ -178,7 +178,7 @@ system! {
         q: Write<Cooldown>,
         dt: &DeltaTime,
     ) {
-        q.for_each(|_, cd| {
+        q.for_each(|_, mut cd| {
             if cd.0 > 0.0 { cd.0 -= dt.0; }
         });
     }
@@ -200,7 +200,7 @@ fn register_par_for_each_demo(sched: &mut Scheduler) {
         access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
         |ctx| {
             ctx.query::<(Read<Velocity>, Write<Position>)>()
-                .par_for_each(|_, (vel, pos)| {
+                .par_for_each(|_, (vel, mut pos)| {
                     pos.x += vel.x * 0.016;
                     pos.y += vel.y * 0.016;
                 });
