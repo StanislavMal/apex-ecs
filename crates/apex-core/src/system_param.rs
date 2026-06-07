@@ -625,6 +625,23 @@ pub trait ExclusiveSystem: Send + 'static {
     }
 }
 
+/// Любое замыкание/функция `FnMut(&mut World)` — это эксклюзивная система.
+///
+/// Унифицирует регистрацию: `add_exclusive_system` / `add_systems` принимают как
+/// struct-маркеры из `system!`, так и обычные `fn(&mut World)` (например,
+/// `propagate_transforms`) и инлайн-замыкания — единый профессиональный путь.
+/// Конфликта с ручными `impl ExclusiveSystem` из макроса нет: struct-маркеры не
+/// реализуют `FnMut`.
+impl<F> ExclusiveSystem for F
+where
+    F: FnMut(&mut crate::world::World) + Send + 'static,
+{
+    #[inline]
+    fn run(&mut self, world: &mut crate::world::World) {
+        self(world)
+    }
+}
+
 // ── Extract<P> — Bevy-совместимый SystemParam для extract-систем ──
 
 /// Bevy-совместимый параметр extract-систем — читает из [`MainWorld`].

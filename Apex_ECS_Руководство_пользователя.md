@@ -1328,6 +1328,13 @@ system! {
 `add_exclusive_system(sys)`, `add_exclusive_system_to_stage(sys, label)`, `add_exclusive_startup_system(sys)`.
 Либо — bare-идентификатором в `add_systems(label, (par_sys, excl_sys))` (имя выводится из fn).
 
+> **Единый вход для эксклюзива.** `add_exclusive_system` принимает **любой `FnMut(&mut World)`**:
+> struct-маркеры из `system!`, обычные функции (`fn name(world: &mut World)` — напр.
+> `propagate_transforms`) и инлайн-замыкания — через blanket `impl ExclusiveSystem for FnMut(&mut World)`.
+> Так `propagate_transforms` регистрируется так же, как макрос-системы:
+> `app.add_exclusive_system(StageLabel::PostUpdate, propagate_transforms)`. (`add_sequential_system`/
+> `seq()` остаются как эквивалент для замыканий.)
+
 > Большинство бывших sequential-систем после исправления change-detection (`Changed<T>` достоверен,
 > §C1/TD-9) и `Cmd` становятся **параллельными** `system!`. Оставляйте `world: &mut World` только там,
 > где реально нужен немедленный структурный доступ ко всему миру.
