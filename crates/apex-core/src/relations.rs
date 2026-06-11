@@ -611,11 +611,8 @@ impl World {
         &'w self,
         subjects: impl Iterator<Item = Entity>,
     ) -> RelationIter<'w, Q> {
-        let mut data_ids = Vec::with_capacity(Q::component_count());
+        let mut data_ids = crate::query::IdBuf::new();
         Q::fill_ids(self, &mut data_ids);
-        if data_ids.len() != Q::component_count() {
-            return RelationIter::empty(self);
-        }
 
         // Локации subjects, сгруппированные по архетипу (sort по arch, row).
         let mut locs: Vec<(u32, u32)> = subjects

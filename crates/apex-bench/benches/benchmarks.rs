@@ -27,8 +27,13 @@ fn bench_simple_insert(c: &mut Criterion) {
 fn bench_simple_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_iter");
     group.bench_function("apex", |b| {
-        let mut bench = apex::simple_iter::SimpleIter::new();
+        let bench = apex::simple_iter::SimpleIter::new();
         b.iter(move || bench.run());
+    });
+    // W2-0.5: плотная chunk-итерация (графа «скорость Legion + тики Bevy»)
+    group.bench_function("apex_chunked", |b| {
+        let mut bench = apex::simple_iter::SimpleIter::new();
+        b.iter(move || bench.run_chunked());
     });
     #[cfg(feature = "flecs")]
     group.bench_function("flecs", |b| {
@@ -50,7 +55,7 @@ fn bench_simple_iter(c: &mut Criterion) {
 fn bench_frag_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("fragmented_iter");
     group.bench_function("apex", |b| {
-        let mut bench = apex::frag_iter::FragIter::new();
+        let bench = apex::frag_iter::FragIter::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "flecs")]
@@ -91,7 +96,7 @@ fn bench_schedule(c: &mut Criterion) {
 fn bench_heavy_compute(c: &mut Criterion) {
     let mut group = c.benchmark_group("heavy_compute");
     group.bench_function("apex", |b| {
-        let mut bench = apex::heavy_compute::HeavyCompute::new();
+        let bench = apex::heavy_compute::HeavyCompute::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "flecs")]

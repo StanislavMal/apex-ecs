@@ -690,10 +690,10 @@ fn bench_run_if_overhead() {
         AtomicUsize::new(0),
     ];
     let mut sched7 = Scheduler::new();
-    for i in 0..10 {
+    for (i, counter) in B6_COUNTS.iter().enumerate() {
         sched7.add_system(
             format!("b6_{}", i),
-            move |_: &mut World| { B6_COUNTS[i].fetch_add(1, Ordering::Relaxed); },
+            move |_: &mut World| { counter.fetch_add(1, Ordering::Relaxed); },
         )
         .run_if_cond(conditions::run_until(50));
     }

@@ -7,8 +7,8 @@
 //! - Bevy-подобные Stages (Startup, PreUpdate, Update, PostUpdate)
 //! - Relations (ChildOf иерархии)
 //! - Commands
-//! cargo run -p apex-examples --example basic --release
-//! cargo test --workspace
+//!
+//! Запуск: `cargo run -p apex-examples --example basic --release`
 
 use apex_core::prelude::*;
 

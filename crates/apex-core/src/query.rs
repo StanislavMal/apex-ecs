@@ -11,20 +11,39 @@ use crate::{
 
 // ── WorldQuery ─────────────────────────────────────────────────
 
+/// Inline-буфер ComponentId формы запроса: до 8 компонентов БЕЗ heap-аллокации
+/// (W2-0 — `fill_ids` на горячем пути `ctx.query` каждый вызов).
+pub type IdBuf = smallvec::SmallVec<[ComponentId; 8]>;
+
 /// Роли компонентов в ключе кэша запросов (старшие биты поверх ComponentId).
 pub const KEY_ROLE_WITHOUT: u64 = 1 << 32;
 pub const KEY_ROLE_OPTIONAL: u64 = 2 << 32;
+/// Структурные маркеры `Or<>`-группы в ключе кэша (W2-5). Не несут ComponentId
+/// и ПРОПУСКАЮТСЯ при восстановлении ids из ключа (см. [`KEY_MARKER_BIT`]):
+/// `(Or<(With<A>,)>, With<B>)` и `Or<(With<A>, With<B>)>` обязаны давать
+/// разные записи кэша — у них разная матч-семантика при одинаковых ids.
+pub const KEY_OR_OPEN: u64 = 4 << 32;
+pub const KEY_OR_CLOSE: u64 = 5 << 32;
+/// Бит «запись ключа — структурный маркер, а не компонент».
+pub const KEY_MARKER_BIT: u64 = 4 << 32;
 
 pub trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
 
     fn component_count() -> usize;
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>);
+
+    /// Заполняет ComponentId формы. ИНВАРИАНТ (W2): каждая форма кладёт РОВНО
+    /// `component_count()` записей — незарегистрированный компонент кодируется
+    /// сентинелом [`ComponentId::INVALID`]. Это гарантирует выравнивание
+    /// сегментов ids в кортежах/`Or` при любой комбинации регистраций;
+    /// «пустой запрос для незарегистрированного обязательного компонента»
+    /// получается естественно: `has_component(INVALID)` не матчится нигде.
+    fn fill_ids(world: &World, ids: &mut IdBuf);
 
     /// Заполняет только "positive" (не-Without) component IDs.
     /// По умолчанию — то же что fill_ids.
-    fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
+    fn fill_positive_ids(world: &World, ids: &mut IdBuf) {
         Self::fill_ids(world, ids);
     }
 
@@ -34,7 +53,7 @@ pub trait WorldQuery: Sized {
     /// Используется `Query::new` для выбора архетипов-кандидатов из
     /// `component_arch_index` (кандидаты = архетипы самого редкого
     /// обязательного компонента).
-    fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
+    fn fill_required_ids(world: &World, ids: &mut IdBuf) {
         Self::fill_positive_ids(world, ids);
     }
 
@@ -69,11 +88,6 @@ pub trait WorldQuery: Sized {
     /// Возвращает true для компонентов, которые ДОЛЖНЫ присутствовать.
     /// Для Without<T> возвращает false.
     fn is_positive() -> bool {
-        true
-    }
-    /// Возвращает false, если запрос может работать без всех ComponentId
-    /// (например, Maybe<T> для незарегистрированного компонента).
-    fn requires_all_ids() -> bool {
         true
     }
 }
@@ -160,16 +174,13 @@ impl<T: Component> WorldQuery for Read<T> {
         1
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64); // роль REQUIRED = 0
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64); // роль REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -206,16 +217,13 @@ impl<T: Component> WorldQuery for Write<T> {
         1
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64); // роль REQUIRED = 0
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64); // роль REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -268,7 +276,7 @@ impl<T: Component> WorldQuery for &T {
     fn component_count() -> usize {
         <Read<T> as WorldQuery>::component_count()
     }
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
         <Read<T> as WorldQuery>::fill_ids(world, ids)
     }
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
@@ -303,7 +311,7 @@ impl<T: Component> WorldQuery for &mut T {
     fn component_count() -> usize {
         <Write<T> as WorldQuery>::component_count()
     }
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
         <Write<T> as WorldQuery>::fill_ids(world, ids)
     }
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
@@ -345,16 +353,13 @@ impl<T: Component> WorldQuery for With<T> {
         true
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64); // роль REQUIRED = 0
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64); // роль REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -397,18 +402,15 @@ impl<T: Component> WorldQuery for Without<T> {
         false
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
-    fn fill_positive_ids(_: &World, _: &mut Vec<ComponentId>) {}
+    fn fill_positive_ids(_: &World, _: &mut IdBuf) {}
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64 | KEY_ROLE_WITHOUT);
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64 | KEY_ROLE_WITHOUT);
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -477,19 +479,19 @@ impl<T: Component> WorldQuery for Maybe<T> {
         1
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    /// Optional ВСЕГДА вносит запись (сентинел [`ComponentId::INVALID`] для
+    /// незарегистрированного T) — иначе компоненты ПОСЛЕ него в кортеже
+    /// читали бы чужие id (выравнивание по `component_count`).
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
-    fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
+    fn fill_required_ids(_: &World, _: &mut IdBuf) {}
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
     }
 
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
@@ -502,6 +504,7 @@ impl<T: Component> WorldQuery for Maybe<T> {
         _: Tick,
         _: Tick,
     ) -> Self::State {
+        // INVALID-сентинел не матчится has_component'ом ни в одном архетипе.
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeState::absent();
         }
@@ -526,10 +529,6 @@ impl<T: Component> WorldQuery for Maybe<T> {
         } else {
             Some(None)
         }
-    }
-
-    fn requires_all_ids() -> bool {
-        false
     }
 }
 
@@ -579,19 +578,18 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         1
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    /// Optional ВСЕГДА вносит запись (сентинел [`ComponentId::INVALID`] для
+    /// незарегистрированного T) — выравнивание ids по `component_count`.
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
-    fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
+    fn fill_required_ids(_: &World, _: &mut IdBuf) {}
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
     }
 
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
@@ -604,6 +602,7 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         _: Tick,
         this_run: Tick,
     ) -> Self::State {
+        // INVALID-сентинел не матчится has_component'ом ни в одном архетипе.
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeMutState::absent();
         }
@@ -634,10 +633,6 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
         } else {
             Some(None)
         }
-    }
-
-    fn requires_all_ids() -> bool {
-        false
     }
 }
 
@@ -673,16 +668,13 @@ impl<T: Component> WorldQuery for Changed<T> {
         true
     }
 
-    fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            ids.push(id);
-        }
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        if let Some(id) = world.registry.get_id::<T>() {
-            key.push(id.0 as u64); // роль REQUIRED = 0
-        }
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64); // роль REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -720,6 +712,132 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Changed<T> {
     }
 }
 
+// ── Or<> — дизъюнкция фильтров (W2-5) ──────────────────────────
+
+/// Дизъюнкция фильтров уровня Bevy: строка проходит, если проходит ХОТЯ БЫ
+/// ОДНА ветка. Главный потребитель — `Or<(Changed<A>, Changed<B>)>` вместо
+/// двух запросов + dedup-set (паттерн extract-систем движка).
+///
+/// ```ignore
+/// Query::<(Read<A>, Read<B>, Or<(Changed<A>, Changed<B>)>)>::new(&world)
+///     .for_each(|e, (a, b, _)| { /* A ИЛИ B изменился */ });
+/// ```
+///
+/// Семантика:
+/// - архетип матчится, если матчится хотя бы одна ветка;
+/// - ветка с незарегистрированным компонентом просто не матчится
+///   (остальные работают);
+/// - ветки — фильтры (`With`/`Without`/`Changed`/вложенный `Or`/кортежи-
+///   конъюнкции из них); item ветки игнорируется, поэтому data-формы
+///   (`Read` и пр.) внутри `Or` допускаются, но бессмысленны;
+/// - `Or` не сужает кандидатов запроса (`fill_required_ids` пуст): строка
+///   может пройти по любой ветке.
+pub struct Or<T>(std::marker::PhantomData<T>);
+
+macro_rules! impl_or_query {
+    ( $( ($F:ident, $idx:tt) ),+ ) => {
+        impl< $($F: WorldQuery),+ > WorldQuery for Or<( $($F,)+ )> {
+            type Item<'w> = ();
+            /// Per-arch состояние ветки: `Some(state)` — ветка матчит этот
+            /// архетип, `None` — ветка мертва (state НЕ фетчится, иначе UB
+            /// на отсутствующей колонке).
+            type State = ( $(Option<$F::State>,)+ );
+
+            #[inline]
+            fn component_count() -> usize { 0 $( + $F::component_count() )+ }
+            #[inline]
+            fn is_filter() -> bool { true }
+
+            /// Ветка с незарегистрированным компонентом несёт INVALID-сентинел
+            /// (инвариант `fill_ids`) — мёртвая ветка не опустошает запрос.
+            fn fill_ids(world: &World, ids: &mut IdBuf) {
+                $( $F::fill_ids(world, ids); )+
+            }
+
+            fn fill_positive_ids(world: &World, ids: &mut IdBuf) {
+                Self::fill_ids(world, ids);
+            }
+
+            /// Дизъюнкция не сужает кандидатов: строка может пройти по любой
+            /// ветке, поэтому НИ ОДИН компонент Or не «обязателен».
+            fn fill_required_ids(_: &World, _: &mut IdBuf) {}
+
+            fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+                key.push(KEY_OR_OPEN);
+                $( $F::fill_cache_key(world, key); )+
+                key.push(KEY_OR_CLOSE);
+            }
+
+            fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+                let mut offset = 0;
+                $(
+                    let n = $F::component_count();
+                    let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                    if $F::matches_archetype(arch, slice) { return true; }
+                    #[allow(unused_assignments)] { offset += n; }
+                )+
+                false
+            }
+
+            unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick, this_run: Tick) -> Self::State {
+                let mut offset = 0;
+                ($(
+                    {
+                        let n = $F::component_count();
+                        let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                        let s = if $F::matches_archetype(arch, slice) {
+                            Some($F::fetch_state(arch, slice, last_run, this_run))
+                        } else {
+                            None
+                        };
+                        #[allow(unused_assignments)] { offset += n; }
+                        s
+                    },
+                )+)
+            }
+
+            #[inline(always)]
+            unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+                $(
+                    if let Some(s) = state.$idx {
+                        if $F::fetch_item(s, row).is_some() {
+                            return Some(());
+                        }
+                    }
+                )+
+                None
+            }
+        }
+
+        impl< $($F: WorldQuery + WorldQuerySystemAccess + 'static),+ >
+            WorldQuerySystemAccess for Or<( $($F,)+ )>
+        {
+            fn system_access() -> AccessDescriptor {
+                AccessDescriptor::new()
+                    $( .merge(&$F::system_access()) )+
+            }
+        }
+    };
+}
+
+impl_or_query!((A, 0));
+impl_or_query!((A, 0), (B, 1));
+impl_or_query!((A, 0), (B, 1), (C, 2));
+impl_or_query!((A, 0), (B, 1), (C, 2), (D, 3));
+impl_or_query!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4));
+impl_or_query!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5));
+impl_or_query!((A, 0), (B, 1), (C, 2), (D, 3), (E, 4), (F, 5), (G, 6));
+impl_or_query!(
+    (A, 0),
+    (B, 1),
+    (C, 2),
+    (D, 3),
+    (E, 4),
+    (F, 5),
+    (G, 6),
+    (H, 7)
+);
+
 // ── Tuple impls ────────────────────────────────────────────────
 
 macro_rules! impl_world_query_tuple {
@@ -731,15 +849,15 @@ macro_rules! impl_world_query_tuple {
             #[inline]
             fn component_count() -> usize { 0 $( + $Q::component_count() )+ }
 
-            fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
+            fn fill_ids(world: &World, ids: &mut IdBuf) {
                 $( $Q::fill_ids(world, ids); )+
             }
 
-            fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
+            fn fill_positive_ids(world: &World, ids: &mut IdBuf) {
                 $( $Q::fill_positive_ids(world, ids); )+
             }
 
-            fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
+            fn fill_required_ids(world: &World, ids: &mut IdBuf) {
                 $( $Q::fill_required_ids(world, ids); )+
             }
 
@@ -756,12 +874,6 @@ macro_rules! impl_world_query_tuple {
                     #[allow(unused_assignments)] { offset += n; }
                 )+
                 true
-            }
-
-            fn requires_all_ids() -> bool {
-                let mut all = true;
-                $( all = all && $Q::requires_all_ids(); )+
-                all
             }
 
             unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick, this_run: Tick) -> Self::State {
@@ -809,7 +921,7 @@ impl WorldQuery for () {
         0
     }
 
-    fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+    fn fill_ids(_world: &World, _ids: &mut IdBuf) {}
 
     fn fill_cache_key(_world: &World, _key: &mut smallvec::SmallVec<[u64; 8]>) {}
 
@@ -892,8 +1004,9 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     /// Создать Query, перебирающий только указанные архетипы.
     /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
     fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
-        let mut ids = Vec::with_capacity(Q::component_count());
+        let mut ids = IdBuf::new();
         Q::fill_ids(world, &mut ids);
+        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
 
         // Without-семантика целиком в matches_archetype (Without::matches_archetype
         // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
@@ -902,25 +1015,21 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
 
-        let archetypes: Vec<ArchState<Q::State>> =
-            if ids.len() == Q::component_count() || !Q::requires_all_ids() {
-                arch_indices
-                    .iter()
-                    .copied()
-                    .filter(|&arch_idx| arch_filter(arch_idx))
-                    .map(|arch_idx| {
-                        let state =
-                            unsafe { Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run, world.current_tick()) };
-                        ArchState {
-                            arch_idx,
-                            state,
-                            len: world.archetypes[arch_idx].len(),
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let archetypes: Vec<ArchState<Q::State>> = arch_indices
+            .iter()
+            .copied()
+            .filter(|&arch_idx| arch_filter(arch_idx))
+            .map(|arch_idx| {
+                let state = unsafe {
+                    Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run, world.current_tick())
+                };
+                ArchState {
+                    arch_idx,
+                    state,
+                    len: world.archetypes[arch_idx].len(),
+                }
+            })
+            .collect();
 
         Self {
             world,
@@ -931,8 +1040,9 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
-        let mut ids = Vec::with_capacity(Q::component_count());
+        let mut ids = IdBuf::new();
         Q::fill_ids(world, &mut ids);
+        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
 
         // Without-семантика целиком в matches_archetype (Without::matches_archetype
         // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
@@ -945,13 +1055,12 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         // дешевле, чем ходить в component_arch_index (hash-lookup на компонент).
         const LINEAR_SCAN_MAX_ARCHETYPES: usize = 128;
 
-        let archetypes = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
+        let archetypes = {
             // Обязательные компоненты (без Maybe/Without) — источник кандидатов.
             // Считаются ТОЛЬКО на большом мире: на малом (типичный случай)
             // линейный обход не требует ни прохода реестра, ни аллокации.
-            let mut required_ids: Vec<ComponentId> = Vec::new();
+            let mut required_ids = IdBuf::new();
             if world.archetypes.len() > LINEAR_SCAN_MAX_ARCHETYPES {
-                required_ids.reserve(Q::component_count());
                 Q::fill_required_ids(world, &mut required_ids);
             }
 
@@ -1007,8 +1116,6 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     })
                     .collect()
             }
-        } else {
-            Vec::new()
         };
 
         Self {
@@ -1078,11 +1185,8 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         let num_threads = rayon::current_num_threads();
 
         // Предварительно вычисляем ID компонентов (как в new_with_tick)
-        let mut ids = Vec::with_capacity(Q::component_count());
+        let mut ids = IdBuf::new();
         Q::fill_ids(self.world, &mut ids);
-        if ids.len() != Q::component_count() {
-            return;
-        }
 
         // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
         let row_ranges = self.row_ranges;
@@ -1130,6 +1234,89 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     pub fn is_empty(&self) -> bool {
         self.archetypes.iter().all(|a| a.len == 0)
+    }
+
+    /// Плотная (chunk) итерация (W2-0.5): колбэк получает entities-слайс и
+    /// СЛАЙСЫ колонок архетипа целиком — без per-row `fetch_item`. Доступна
+    /// только не-фильтрующим формам ([`DenseQuery`]); `Changed<T>` не
+    /// компилируется (построчный фильтр несовместим со слайсами).
+    ///
+    /// Write-колонки стампятся ДИАПАЗОНОМ при выдаче слайса: контракт
+    /// «слайс на запись = весь диапазон changed».
+    ///
+    /// ```ignore
+    /// Query::<(Read<Vel>, Write<Pos>)>::new(&world)
+    ///     .for_each_chunk(|_entities, (vel, pos)| {
+    ///         for i in 0..pos.len() { pos[i].0 += vel[i].0; } // SIMD-friendly
+    ///     });
+    /// ```
+    pub fn for_each_chunk<F>(&self, mut f: F)
+    where
+        Q: crate::dense::DenseQuery,
+        F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        let mut ids = IdBuf::new();
+        Q::fill_ids(self.world, &mut ids);
+        let this_run = self.world.current_tick();
+
+        for a in &self.archetypes {
+            let (row_start, row_end) = self.row_range(a.arch_idx);
+            let end = row_end.min(a.len);
+            let len = end.saturating_sub(row_start);
+            if len == 0 {
+                continue;
+            }
+            let arch = &self.world.archetypes[a.arch_idx];
+            let slices = unsafe { Q::fetch_slices(arch, &ids, row_start, len, this_run) };
+            f(&arch.entities[row_start..end], slices);
+        }
+    }
+
+    /// Параллельная плотная итерация: те же chunk-диапазоны, что у
+    /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
+    pub fn par_for_each_chunk<F>(&self, f: F)
+    where
+        Q: crate::dense::DenseQuery + Send,
+        F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        use rayon::prelude::*;
+
+        let num_threads = rayon::current_num_threads();
+        let mut ids = IdBuf::new();
+        Q::fill_ids(self.world, &mut ids);
+
+        let row_ranges = self.row_ranges;
+        let rr = |arch_idx: usize| -> (usize, usize) {
+            row_ranges
+                .iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX))
+        };
+        let chunks = compute_par_chunks(
+            self.archetypes.iter().map(|a| {
+                let s = rr(a.arch_idx);
+                let effective_len = s.1.min(a.len).saturating_sub(s.0);
+                (a.arch_idx, effective_len)
+            }),
+            num_threads,
+            self.world.chunk_config(),
+        );
+
+        let world = self.world;
+        let this_run = world.current_tick();
+
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let (r_start, r_end) = rr(arch_idx);
+            let clamped_start = r_start + start;
+            let clamped_end = (r_start + end).min(r_end);
+            if clamped_start >= clamped_end {
+                return;
+            }
+            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let len = clamped_end - clamped_start;
+            let slices = unsafe { Q::fetch_slices(arch, &ids, clamped_start, len, this_run) };
+            f(&arch.entities[clamped_start..clamped_end], slices);
+        });
     }
 }
 
@@ -1519,6 +1706,122 @@ mod tests {
         let results: Vec<_> = query.iter().collect();
         assert_eq!(results.len(), 1, "Должна вернуться entity без B");
         assert!(results[0].1.is_none(), "B должен быть None");
+    }
+
+    /// Регрессия W2: (Maybe<X>, Read<A>) с НЕзарегистрированным X раньше
+    /// смещал ids — Read<A> читал чужой сегмент и запрос был ложно пуст.
+    /// INVALID-сентинел сохраняет выравнивание.
+    #[test]
+    fn maybe_unregistered_does_not_misalign_following_ids() {
+        struct NeverRegistered;
+        impl Component for NeverRegistered {}
+
+        let mut world = World::new();
+        world.spawn((A,));
+        world.spawn((A, B));
+
+        let query: Query<'_, (Maybe<NeverRegistered>, Read<A>)> = Query::new(&world);
+        assert_eq!(
+            query.iter().count(),
+            2,
+            "незарегистрированный Maybe не должен опустошать запрос"
+        );
+    }
+
+    // ── Or<> (W2-5) ────────────────────────────────────────────
+
+    #[test]
+    fn or_changed_matches_either_branch() {
+        let mut world = World::new();
+        let ea = world.spawn((Pos { x: 0.0 }, A));
+        let eb = world.spawn((Pos { x: 0.0 }, B));
+        let _ec = world.spawn((Pos { x: 0.0 },));
+
+        #[derive(Debug)]
+        struct Marker2(f32);
+        impl Component for Marker2 {}
+        let em = world.spawn((Pos { x: 0.0 }, Marker2(0.0)));
+
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        // Мутируем Pos у ea и Marker2 у em — ловим Or<(Changed<Pos>, Changed<Marker2>)>.
+        if let Some(p) = world.get_mut::<Pos>(ea) {
+            p.x = 1.0;
+        }
+        if let Some(m) = world.get_mut::<Marker2>(em) {
+            m.0 = 1.0;
+        }
+
+        let hits: Vec<_> = Query::<(
+            Read<Pos>,
+            Or<(Changed<Pos>, Changed<Marker2>)>,
+        )>::new_with_tick(&world, last_run)
+        .iter()
+        .map(|(e, _)| e)
+        .collect();
+
+        assert!(hits.contains(&ea), "ветка Changed<Pos>");
+        assert!(hits.contains(&em), "ветка Changed<Marker2>");
+        assert!(!hits.contains(&eb), "B не менялся");
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn or_with_matches_archetype_union() {
+        let mut world = World::new();
+        let ea = world.spawn((Pos { x: 0.0 }, A));
+        let eb = world.spawn((Pos { x: 0.0 }, B));
+        let none = world.spawn((Pos { x: 0.0 },));
+
+        let hits: Vec<_> = Query::<(Read<Pos>, Or<(With<A>, With<B>)>)>::new(&world)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert!(hits.contains(&ea) && hits.contains(&eb));
+        assert!(!hits.contains(&none));
+    }
+
+    /// Ветка Or с незарегистрированным компонентом мертва, но НЕ опустошает
+    /// запрос — другая ветка работает (и не падает на fetch_state).
+    #[test]
+    fn or_with_unregistered_branch_is_dead_not_fatal() {
+        struct NeverRegistered;
+        impl Component for NeverRegistered {}
+
+        let mut world = World::new();
+        let ea = world.spawn((Pos { x: 0.0 }, A));
+        let _e = world.spawn((Pos { x: 0.0 },));
+
+        let hits: Vec<_> =
+            Query::<(Read<Pos>, Or<(With<NeverRegistered>, With<A>)>)>::new(&world)
+                .iter()
+                .map(|(e, _)| e)
+                .collect();
+        assert_eq!(hits, vec![ea]);
+    }
+
+    /// Or в CachedQuery: `(Or<(With<A>,)>, With<B>)` и `Or<(With<A>, With<B>)>`
+    /// имеют одинаковые ids, но разную семантику — маркеры группы в ключе
+    /// кэша обязаны разводить их по разным записям.
+    #[test]
+    fn or_cache_key_distinguishes_grouping() {
+        let mut world = World::new();
+        let _only_a = world.spawn((A,));
+        let both = world.spawn((A, B));
+
+        // (Or<(With<A>,)>, With<B>) ≡ With<A> AND With<B> → только both
+        let strict: Vec<_> = world
+            .query_typed::<(Or<(With<A>,)>, With<B>)>()
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(strict, vec![both]);
+
+        // Or<(With<A>, With<B>)> → обе entity
+        let union_count = world.query_typed::<Or<(With<A>, With<B>)>>().iter().count();
+        assert_eq!(union_count, 2);
     }
 
     #[test]

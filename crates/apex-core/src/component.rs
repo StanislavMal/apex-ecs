@@ -13,15 +13,45 @@ pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn] = [..];
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ComponentId(pub u32);
 
+impl ComponentId {
+    /// Сентинел «компонент не зарегистрирован» — используется optional-формами
+    /// запросов (`Maybe`/`MaybeWrite`) и ветками `Or<>`, чтобы СОХРАНИТЬ
+    /// ВЫРАВНИВАНИЕ списка ids по `component_count()` (иначе компоненты после
+    /// незарегистрированного читали бы чужие id — латентный баг до W2).
+    /// Ни один реальный компонент этого id не получает (`next_id` растёт от 0).
+    pub const INVALID: Self = Self(u32::MAX);
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub struct Tick(pub u32);
 
 impl Tick {
     pub const ZERO: Self = Self(0);
 
+    /// Максимальный «возраст» change-тика относительно текущего тика мира.
+    ///
+    /// `is_newer_than` — wrapping-сравнение, корректное при разнице < 2³¹.
+    /// Строка, не менявшаяся дольше, «перевернулась» бы в ложно-Changed
+    /// (~99 дней аптайма @250Hz). Периодический кламп
+    /// ([`World::check_change_ticks`](crate::World::check_change_ticks))
+    /// подтягивает старые тики к этому возрасту, сохраняя инвариант (W2-3).
+    pub const MAX_CHANGE_AGE: u32 = 1 << 30;
+
     #[inline]
     pub fn is_newer_than(self, last_run: Tick) -> bool {
         self.0.wrapping_sub(last_run.0) as i32 > 0
+    }
+
+    /// Подтянуть тик к окну `MAX_CHANGE_AGE` от `current`, если он старше.
+    /// Возвращает `true`, если кламп произошёл.
+    #[inline]
+    pub fn check_against(&mut self, current: Tick) -> bool {
+        if current.0.wrapping_sub(self.0) > Self::MAX_CHANGE_AGE {
+            self.0 = current.0.wrapping_sub(Self::MAX_CHANGE_AGE);
+            true
+        } else {
+            false
+        }
     }
 }
 

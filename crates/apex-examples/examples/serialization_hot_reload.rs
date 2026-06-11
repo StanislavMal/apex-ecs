@@ -8,7 +8,8 @@
 //! - WorldDiff                       — инкрементальные сохранения (только изменения)
 //! - HotReloadPlugin::watch_config() — горячая перезагрузка JSON-конфигов
 //! - Entity remapping после restore
-//! cargo run --example serialization_hot_reload --release
+//!
+//! Запуск: `cargo run --example serialization_hot_reload --release`
 use apex_core::prelude::*;
 use apex_macros::Component;
 use apex_serialization::{SaveFormat, WorldDiff, WorldSerializer};

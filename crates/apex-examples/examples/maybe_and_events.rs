@@ -225,7 +225,7 @@ fn main() {
     world.flush_all_events();
     {
         let ev = world.events::<&str>().iter(&str_cursor);
-        println!("  Прочитано в тик 1: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
+        println!("  Прочитано в тик 1: [{}]", ev.to_vec().join(", "));
         // alpha before beta (FIFO)
         assert_eq!(ev[0], "alpha");
         assert_eq!(ev[1], "beta");
@@ -238,7 +238,7 @@ fn main() {
     world.flush_all_events();
     {
         let ev = world.events::<&str>().iter(&str_cursor);
-        println!("  Прочитано в тик 2: [{}]", ev.iter().map(|s| *s).collect::<Vec<_>>().join(", "));
+        println!("  Прочитано в тик 2: [{}]", ev.to_vec().join(", "));
         assert_eq!(ev[0], "gamma");
         assert_eq!(ev[1], "delta");
     }
@@ -266,7 +266,7 @@ fn main() {
     world.flush_all_events();
     {
         let ev = world.events::<i32>().iter(&sync_cursor);
-        let vals: Vec<_> = ev.iter().copied().collect();
+        let vals: Vec<_> = ev.to_vec();
         println!("  Прочитано: {:?}", vals);
         assert_eq!(vals, vec![100, 200, 300, 301, 302]);
     }

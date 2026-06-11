@@ -164,7 +164,14 @@ impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
 
 // ── World ──────────────────────────────────────────────────────
 
+/// Генератор уникальных id миров (для привязки [`QueryState`] к миру).
+/// Начинается с 1: id 0 зарезервирован как «ничей» (свежий QueryState).
+static WORLD_ID_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct World {
+    /// Уникален в пределах процесса; `QueryState` сверяет его, чтобы не
+    /// применить стейт одного мира к другому (main vs render vs isolated).
+    pub(crate) world_id: u64,
     pub(crate) entities: EntityAllocator,
     pub(crate) registry: ComponentRegistry,
     pub archetypes: Vec<Archetype>,
@@ -195,6 +202,7 @@ impl World {
         let mut registry = ComponentRegistry::new();
         registry.register_all_auto();
         let mut world = Self {
+            world_id: WORLD_ID_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             entities: EntityAllocator::new(),
             registry,
             archetypes: Vec::new(),
@@ -220,10 +228,25 @@ impl World {
         world
     }
 
+    /// Уникальный id мира в пределах процесса (привязка [`QueryState`]).
+    #[inline]
+    pub fn id(&self) -> u64 {
+        self.world_id
+    }
+
+    /// Интервал автозапуска [`check_change_ticks`](Self::check_change_ticks):
+    /// каждые 2²⁶ тиков (~3 дня @250Hz). Должен быть много меньше
+    /// `2³¹ − Tick::MAX_CHANGE_AGE`, чтобы тик не успел «перевернуться»
+    /// между проходами клампа.
+    const TICK_CHECK_INTERVAL: u32 = 1 << 26;
+
     /// Продвигает глобальный tick. **Не делает flush событий** — это ответственность Scheduler.
     /// Для использования без Scheduler вызывайте [`flush_all_events()`](Self::flush_all_events) вручную.
     pub fn tick(&mut self) {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
+        if self.current_tick.0.is_multiple_of(Self::TICK_CHECK_INTERVAL) {
+            self.check_change_ticks();
+        }
     }
 
     /// Продвинуть change-tick на границе кадра: запомнить текущий тик как базу
@@ -236,6 +259,29 @@ impl World {
     pub fn advance_change_tick(&mut self) {
         self.last_run_tick = self.current_tick;
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
+        if self.current_tick.0.is_multiple_of(Self::TICK_CHECK_INTERVAL) {
+            self.check_change_ticks();
+        }
+    }
+
+    /// Кламп старых change-тиков к окну [`Tick::MAX_CHANGE_AGE`] (W2-3,
+    /// аналог Bevy `check_change_ticks`).
+    ///
+    /// `Changed<T>` использует wrapping-сравнение, корректное при разнице
+    /// < 2³¹: строка, не менявшаяся дольше, стала бы ложно-Changed (~99 дней
+    /// аптайма @250Hz). Кламп подтягивает такие тики к границе окна, сохраняя
+    /// «давно не менялась» навсегда. Запускается автоматически из
+    /// [`tick`](Self::tick)/[`advance_change_tick`](Self::advance_change_tick)
+    /// раз в `TICK_CHECK_INTERVAL`; публичен для прод-серверов/редактора с
+    /// собственным циклом.
+    pub fn check_change_ticks(&mut self) {
+        let current = self.current_tick;
+        for arch in &mut self.archetypes {
+            for col in &mut arch.columns {
+                col.check_change_ticks(current);
+            }
+        }
+        self.last_run_tick.check_against(current);
     }
 
     /// База change-detection для систем (тик предыдущей границы кадра).
@@ -704,7 +750,9 @@ impl World {
             unsafe {
                 if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                     let col = &mut self.archetypes[current_idx].columns[col_idx];
-                    col.write_at(
+                    // replace_at дропает СТАРОЕ значение (W2-1: write_at молча
+                    // терял его — утечка для Drop-типов: String, Vec, Arc…).
+                    col.replace_at(
                         location.row as usize,
                         &component as *const T as *const u8,
                         tick,
@@ -755,7 +803,8 @@ impl World {
                 unsafe {
                     if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                         let col = &mut self.archetypes[current_idx].columns[col_idx];
-                        col.write_at(location.row as usize, data.as_ptr(), tick);
+                        // replace_at: дроп старого значения (см. W2-1).
+                        col.replace_at(location.row as usize, data.as_ptr(), tick);
                     }
                 }
             }
@@ -779,6 +828,59 @@ impl World {
                 row: new_row,
             },
         );
+    }
+
+    /// Групповая вставка компонентов одной entity (W2-1): ОДИН archetype move
+    /// на всю пачку вместо move-на-компонент. Используется `Commands::apply`
+    /// для бёрстов `insert` на одну entity.
+    ///
+    /// `parts` — (ComponentId, указатель на значение, tick). Значения
+    /// ПЕРЕДАЮТСЯ ВО ВЛАДЕНИЕ (байтовая копия в колонку; вызывающий обязан
+    /// `forget`-нуть источник / не дропать байты). Уже существующие компоненты
+    /// перезаписываются с дропом старого значения; дубликаты в пачке
+    /// применяются по порядку (выживает последний, промежуточные дропаются).
+    ///
+    /// Возвращает `false` (ничего не записано), если entity мертва —
+    /// вызывающий обязан сам освободить payload'ы.
+    pub(crate) fn insert_parts(
+        &mut self,
+        entity: Entity,
+        parts: &[(ComponentId, *const u8, Tick)],
+    ) -> bool {
+        let location = match self.entities.get_location(entity) {
+            Some(loc) => loc,
+            None => return false,
+        };
+
+        // Финальный архетип — цепочкой add_edges, БЕЗ перемещения данных.
+        let mut target = location.archetype_id;
+        for &(cid, _, _) in parts {
+            if !self.archetypes[target.0 as usize].has_component(cid) {
+                target = self.find_or_create_archetype_with(target, cid);
+            }
+        }
+
+        let row = if target != location.archetype_id {
+            let new_row = self.move_entity(entity, location, target);
+            self.entities.set_location(
+                entity,
+                EntityLocation {
+                    archetype_id: target,
+                    row: new_row,
+                },
+            );
+            new_row as usize
+        } else {
+            location.row as usize
+        };
+
+        let arch = &mut self.archetypes[target.0 as usize];
+        for &(cid, ptr, tick) in parts {
+            // Новая колонка (len == row) — push; существующая — replace с
+            // дропом старого значения.
+            unsafe { arch.write_or_replace_component(row, cid, ptr, tick) };
+        }
+        true
     }
 
     /// Удалить компонент по raw ComponentId.
@@ -1575,11 +1677,35 @@ impl<'w> ParallelWorld<'w> {
 
 // ── CachedQuery ────────────────────────────────────────────────
 
+/// Список архетипов запроса: shared из глобального `QueryCache` ЛИБО
+/// заимствованный (per-system индексы SubWorld / [`QueryState`]).
+///
+/// Заимствование — ключ к нулевой стоимости `ctx.query` (W2-0): раньше каждый
+/// вызов копировал весь список индексов в новый `Arc<[usize]>` (heap-аллокация,
+/// растущая с числом архетипов системы).
+#[derive(Clone)]
+enum ArchIndices<'w> {
+    Shared(Arc<[usize]>),
+    Borrowed(&'w [usize]),
+}
+
+impl<'w> ArchIndices<'w> {
+    /// Слайс с лайфтаймом 'w (для Shared — через &self, безопасно: Arc жив,
+    /// пока жив владелец; итератор держит собственный clone).
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            ArchIndices::Shared(arc) => arc,
+            ArchIndices::Borrowed(s) => s,
+        }
+    }
+}
+
 pub struct CachedQuery<'w, Q: WorldQuery> {
     world: &'w World,
-    arch_indices: Arc<[usize]>,
+    arch_indices: ArchIndices<'w>,
     last_run: Tick,
-    cached_ids: Vec<ComponentId>,
+    cached_ids: SmallVec<[ComponentId; 8]>,
     row_ranges: &'w [(usize, usize, usize)],
     _phantom: std::marker::PhantomData<Q>,
 }
@@ -1587,24 +1713,26 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     pub fn new(world: &'w World, last_run: Tick) -> Self {
         // Один проход реестра: ключ кэша несёт и ids (нижние 32 бита каждой
-        // записи, в порядке fill_ids — инвариант fill_cache_key), и роли формы.
+        // НЕ-маркерной записи, в порядке fill_ids — инвариант fill_cache_key),
+        // и роли формы. Структурные маркеры Or<> (KEY_MARKER_BIT) пропускаются.
         let mut key: SmallVec<[u64; 8]> = SmallVec::new();
         Q::fill_cache_key(world, &mut key);
-        let ids: Vec<ComponentId> = key.iter().map(|&e| ComponentId(e as u32)).collect();
+        let ids: SmallVec<[ComponentId; 8]> = key
+            .iter()
+            .filter(|&&e| e & crate::query::KEY_MARKER_BIT == 0)
+            .map(|&e| ComponentId(e as u32))
+            .collect();
+        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_cache_key нарушен");
 
-        let arch_indices = if ids.len() == Q::component_count() {
-            world
-                .query_cache
-                .get_or_compute(&key, &world.archetypes, |arch| {
-                    Q::matches_archetype(arch, &ids)
-                })
-        } else {
-            Arc::new([])
-        };
+        let arch_indices = world
+            .query_cache
+            .get_or_compute(&key, &world.archetypes, |arch| {
+                Q::matches_archetype(arch, &ids)
+            });
 
         Self {
             world,
-            arch_indices,
+            arch_indices: ArchIndices::Shared(arch_indices),
             last_run,
             cached_ids: ids,
             row_ranges: &[],
@@ -1614,22 +1742,39 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
     /// Создать CachedQuery с ограничением на архетипы и строки из SubWorld.
     ///
-    /// Не вызывает `get_or_compute` (thread-safe для параллельных систем).
-    /// Фильтрация по `Q::matches_archetype` происходит в `for_each`/`par_for_each`
-    /// — там `fetch_state` вызывается только для совпадающих архетипов.
+    /// Zero-alloc (W2-0): индексы архетипов ЗАИМСТВУЮТСЯ у SubWorld (они
+    /// предвычислены планировщиком per-system и дополняются инкрементально),
+    /// ids — inline-SmallVec. Не вызывает `get_or_compute` (thread-safe для
+    /// параллельных систем). Фильтрация по `Q::matches_archetype` происходит
+    /// в `for_each`/`par_for_each` — `fetch_state` только для совпадающих.
     pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
-        let mut ids = Vec::with_capacity(Q::component_count());
+        let mut ids = crate::query::IdBuf::new();
         Q::fill_ids(sub.world(), &mut ids);
-
-        let arch_indices: Arc<[usize]> = sub.archetype_indices().into();
-        let row_ranges: &'w [(usize, usize, usize)] = sub.row_ranges();
 
         Self {
             world: sub.world(),
-            arch_indices,
+            arch_indices: ArchIndices::Borrowed(sub.archetype_indices()),
             last_run,
             cached_ids: ids,
-            row_ranges,
+            row_ranges: sub.row_ranges(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Внутренний конструктор для [`QueryState`]: заимствует готовые индексы
+    /// и ids стейта — ноль аллокаций, ноль локов.
+    pub(crate) fn from_state_parts(
+        world: &'w World,
+        arch_indices: &'w [usize],
+        ids: &[ComponentId],
+        last_run: Tick,
+    ) -> Self {
+        Self {
+            world,
+            arch_indices: ArchIndices::Borrowed(arch_indices),
+            last_run,
+            cached_ids: ids.iter().copied().collect(),
+            row_ranges: &[],
             _phantom: std::marker::PhantomData,
         }
     }
@@ -1644,10 +1789,8 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     #[inline]
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         let ids = &self.cached_ids;
-        if ids.len() != Q::component_count() {
-            return;
-        }
-        for &arch_idx in self.arch_indices.as_ref() {
+        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
+        for &arch_idx in self.arch_indices.as_slice() {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() {
                 continue;
@@ -1682,11 +1825,8 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         use rayon::prelude::*;
         let num_threads = rayon::current_num_threads();
 
-        // ids — owned clone, как в Query::par_for_each (не ссылка на &self)
+        // ids — owned clone (inline-копия SmallVec), как в Query::par_for_each
         let ids = self.cached_ids.clone();
-        if ids.len() != Q::component_count() {
-            return;
-        }
 
         let world = self.world;
         let last_run = self.last_run;
@@ -1699,6 +1839,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         };
         let chunks = compute_par_chunks(
             self.arch_indices
+                .as_slice()
                 .iter()
                 .copied()
                 .filter(|&arch_idx| !world.archetypes[arch_idx].is_empty())
@@ -1735,6 +1876,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
     pub fn len(&self) -> usize {
         self.arch_indices
+            .as_slice()
             .iter()
             .map(|&i| self.world.archetypes[i].len())
             .sum()
@@ -1742,8 +1884,89 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 
     pub fn is_empty(&self) -> bool {
         self.arch_indices
+            .as_slice()
             .iter()
             .all(|&i| self.world.archetypes[i].is_empty())
+    }
+
+    /// Плотная (chunk) итерация (W2-0.5) — см. [`Query::for_each_chunk`]
+    /// (crate::query::Query::for_each_chunk): слайсы колонок вместо per-row
+    /// `fetch_item`; write-слайсы стампятся диапазоном. `Changed<T>` не
+    /// компилируется.
+    pub fn for_each_chunk<F>(&self, mut f: F)
+    where
+        Q: crate::dense::DenseQuery,
+        F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        let ids = &self.cached_ids;
+        let this_run = self.world.current_tick();
+        for &arch_idx in self.arch_indices.as_slice() {
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() || !Q::matches_archetype(arch, ids) {
+                continue;
+            }
+            let (row_start, row_end) = self.row_range(arch_idx);
+            let end = row_end.min(arch.len());
+            let len = end.saturating_sub(row_start);
+            if len == 0 {
+                continue;
+            }
+            let slices = unsafe { Q::fetch_slices(arch, ids, row_start, len, this_run) };
+            f(&arch.entities[row_start..end], slices);
+        }
+    }
+
+    /// Параллельная плотная итерация — те же chunk-диапазоны, что у
+    /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
+    pub fn par_for_each_chunk<F>(&self, f: F)
+    where
+        Q: crate::dense::DenseQuery + Send,
+        F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        use crate::par_utils::compute_par_chunks;
+        use rayon::prelude::*;
+        let num_threads = rayon::current_num_threads();
+
+        let ids = self.cached_ids.clone();
+        let world = self.world;
+        let row_ranges = self.row_ranges;
+        let rr = |arch_idx: usize| -> (usize, usize) {
+            row_ranges
+                .iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX))
+        };
+        let chunks = compute_par_chunks(
+            self.arch_indices
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|&arch_idx| !world.archetypes[arch_idx].is_empty())
+                .filter(|&arch_idx| Q::matches_archetype(&world.archetypes[arch_idx], &ids))
+                .map(|arch_idx| {
+                    let s = rr(arch_idx);
+                    let effective_len =
+                        s.1.min(world.archetypes[arch_idx].len())
+                            .saturating_sub(s.0);
+                    (arch_idx, effective_len)
+                }),
+            num_threads,
+            world.chunk_config(),
+        );
+
+        let this_run = world.current_tick();
+        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
+            let (r_start, r_end) = rr(arch_idx);
+            let clamped_start = r_start + start;
+            let clamped_end = (r_start + end).min(r_end);
+            if clamped_start >= clamped_end {
+                return;
+            }
+            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            let len = clamped_end - clamped_start;
+            let slices = unsafe { Q::fetch_slices(arch, &ids, clamped_start, len, this_run) };
+            f(&arch.entities[clamped_start..clamped_end], slices);
+        });
     }
 
     /// Создать `Iterator` по (Entity, компонентам).
@@ -1774,8 +1997,8 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
 /// а не при создании — в отличие от `QueryIter`.
 pub struct CachedQueryIter<'w, Q: WorldQuery> {
     world: &'w World,
-    arch_indices: Arc<[usize]>,
-    cached_ids: Vec<ComponentId>,
+    arch_indices: ArchIndices<'w>,
+    cached_ids: SmallVec<[ComponentId; 8]>,
     last_run: Tick,
     row_ranges: &'w [(usize, usize, usize)],
 
@@ -1818,8 +2041,8 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
     /// Возвращает `false`, когда архетипы кончились. Пропускает пустые/не-matching
     /// в цикле, поэтому первый архетип (индекс 0) НЕ теряется (см. TD-1).
     fn advance_archetype(&mut self) -> bool {
-        while self.arch_pos < self.arch_indices.len() {
-            let arch_idx = self.arch_indices[self.arch_pos];
+        while self.arch_pos < self.arch_indices.as_slice().len() {
+            let arch_idx = self.arch_indices.as_slice()[self.arch_pos];
             self.arch_pos += 1; // потребляем текущий индекс
 
             let arch = &self.world.archetypes[arch_idx];
@@ -1846,6 +2069,109 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
             return true;
         }
         false
+    }
+}
+
+// ── QueryState — per-system стейт запроса (W2-0, модель Bevy) ──
+
+/// Владелец долгоживущего стейта запроса: список матчащих архетипов +
+/// разрешённые ComponentId. Дополняется ИНКРЕМЕНТАЛЬНО (архетипы append-only),
+/// в устоявшемся состоянии `query()` — это одна проверка счётчика: ни локов,
+/// ни hash-lookup'ов, ни аллокаций (в отличие от глобального `QueryCache`,
+/// который платит ключ+hash+RwLock+Arc-clone на каждый вызов).
+///
+/// Привязан к конкретному миру по [`World::id`]: применение к другому миру
+/// (main vs render vs isolated) прозрачно перестраивает стейт — ComponentId
+/// одного мира не валидны в другом.
+///
+/// ```ignore
+/// struct ExtractMeshes {
+///     q: QueryState<(Read<Mesh>, Read<GlobalTransform>)>,
+/// }
+/// // в горячем цикле:
+/// self.q.query(&world).for_each(|e, (mesh, gt)| { ... });
+/// ```
+pub struct QueryState<Q: WorldQuery> {
+    world_id: u64,
+    ids: crate::query::IdBuf,
+    /// Все ли компоненты формы были зарегистрированы на момент апдейта.
+    /// Пока нет — ids перепроверяются каждый вызов (регистрация ленивая),
+    /// а скан архетипов не начинается.
+    ids_resolved: bool,
+    arch_indices: Vec<usize>,
+    seen_arch_count: usize,
+    _phantom: std::marker::PhantomData<fn() -> Q>,
+}
+
+impl<Q: WorldQuery> Default for QueryState<Q> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Q: WorldQuery> QueryState<Q> {
+    /// Пустой стейт; к миру привяжется при первом [`query`](Self::query).
+    pub fn new() -> Self {
+        Self {
+            world_id: 0,
+            ids: crate::query::IdBuf::new(),
+            ids_resolved: false,
+            arch_indices: Vec::new(),
+            seen_arch_count: 0,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Запрос с базой change-detection `world.last_run_tick()` (как
+    /// `ctx.query` в системах).
+    #[inline]
+    pub fn query<'a>(&'a mut self, world: &'a World) -> CachedQuery<'a, Q> {
+        self.query_with_tick(world, world.last_run_tick())
+    }
+
+    /// Запрос с явной базой `last_run` (для `Changed<T>`-форм с собственным
+    /// отсчётом, например extract-систем).
+    pub fn query_with_tick<'a>(&'a mut self, world: &'a World, last_run: Tick) -> CachedQuery<'a, Q> {
+        self.update(world);
+        CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
+    }
+
+    /// Инкрементальный апдейт под мир: пересборка при смене мира, доразрешение
+    /// ids (ленивая регистрация компонентов), доскан ТОЛЬКО новых архетипов.
+    fn update(&mut self, world: &World) {
+        if self.world_id != world.world_id {
+            self.world_id = world.world_id;
+            self.ids = crate::query::IdBuf::new();
+            self.ids_resolved = false;
+            self.arch_indices.clear();
+            self.seen_arch_count = 0;
+        }
+
+        if !self.ids_resolved {
+            // Сентинел INVALID = ещё не зарегистрированный компонент формы.
+            // Он может быть ЛЕГИТИМЕН навсегда (Maybe/Without/мёртвая ветка
+            // Or) — поэтому не блокируем скан, а перечитываем ids каждый
+            // вызов; если разрешение изменилось (компонент зарегистрировали
+            // позже) — пересканируем архетипы с нуля: матчи могли поменяться.
+            let mut fresh = crate::query::IdBuf::new();
+            Q::fill_ids(world, &mut fresh);
+            if fresh != self.ids {
+                self.ids = fresh;
+                self.arch_indices.clear();
+                self.seen_arch_count = 0;
+            }
+            self.ids_resolved = !self.ids.contains(&ComponentId::INVALID);
+        }
+
+        let total = world.archetypes.len();
+        if self.seen_arch_count < total {
+            for (i, arch) in world.archetypes[self.seen_arch_count..].iter().enumerate() {
+                if Q::matches_archetype(arch, &self.ids) {
+                    self.arch_indices.push(self.seen_arch_count + i);
+                }
+            }
+            self.seen_arch_count = total;
+        }
     }
 }
 
@@ -2229,6 +2555,135 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Score(u32);
 
+    // ── W2-3: tick-wrap кламп ──────────────────────────────────
+
+    #[test]
+    fn check_change_ticks_clamps_stale_rows() {
+        use crate::query::{Changed, Read};
+
+        struct P(#[allow(dead_code)] f32);
+        impl crate::component::Component for P {}
+
+        let mut world = World::new();
+        let _e = world.spawn((P(0.0),)); // change-tick строки = текущий тик
+
+        // Симулируем долгий аптайм: прыжки < 2³¹ с клампом между ними —
+        // суммарно далеко за период переполнения.
+        for _ in 0..4 {
+            world.current_tick.0 = world.current_tick.0.wrapping_add(1 << 30);
+            world.check_change_ticks();
+        }
+
+        // last_run «вчера»: строка очень старая и НЕ должна быть Changed.
+        let last_run = Tick(world.current_tick.0.wrapping_sub(2));
+        let changed = crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world, last_run)
+            .iter()
+            .count();
+        assert_eq!(changed, 0, "кламп удержал строку в «давно не менялась»");
+
+        // Контроль: БЕЗ клампа тот же сценарий даёт ложно-Changed.
+        let mut world2 = World::new();
+        let _e2 = world2.spawn((P(0.0),));
+        world2.current_tick.0 = world2.current_tick.0.wrapping_add(1 << 31).wrapping_add(8);
+        let last_run2 = Tick(world2.current_tick.0.wrapping_sub(2));
+        let false_changed =
+            crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world2, last_run2)
+                .iter()
+                .count();
+        assert_eq!(false_changed, 1, "санити: без клампа wrap даёт ложный Changed");
+    }
+
+    // ── W2-0: QueryState ───────────────────────────────────────
+
+    #[test]
+    fn query_state_incremental_and_reusable() {
+        use crate::query::Read;
+
+        struct P(f32);
+        impl crate::component::Component for P {}
+        struct Tag;
+        impl crate::component::Component for Tag {}
+
+        let mut world = World::new();
+        world.spawn((P(1.0),));
+
+        let mut state = QueryState::<Read<P>>::new();
+        assert_eq!(state.query(&world).iter().count(), 1);
+
+        // Новый архетип ПОСЛЕ первого запроса — стейт дополняется хвостом.
+        world.spawn((P(2.0), Tag));
+        assert_eq!(state.query(&world).iter().count(), 2);
+
+        // Повторный вызов без изменений — чистый hit (ничего не пересканируется).
+        assert_eq!(state.query(&world).iter().count(), 2);
+        let mut sum = 0.0;
+        state.query(&world).for_each(|_, p| sum += p.0);
+        assert_eq!(sum, 3.0);
+    }
+
+    #[test]
+    fn query_state_rebinds_to_other_world() {
+        use crate::query::Read;
+
+        struct P(#[allow(dead_code)] f32);
+        impl crate::component::Component for P {}
+
+        let mut a = World::new();
+        let mut b = World::new();
+        a.spawn((P(0.0),));
+        b.spawn((P(0.0),));
+        b.spawn((P(0.0),));
+
+        let mut state = QueryState::<Read<P>>::new();
+        assert_eq!(state.query(&a).iter().count(), 1);
+        assert_eq!(state.query(&b).iter().count(), 2, "стейт перепривязался к миру B");
+        assert_eq!(state.query(&a).iter().count(), 1, "и обратно к A");
+    }
+
+    #[test]
+    fn query_state_resolves_late_registered_component() {
+        use crate::query::Read;
+
+        struct Late(#[allow(dead_code)] u32);
+        impl crate::component::Component for Late {}
+
+        let mut world = World::new();
+        let mut state = QueryState::<Read<Late>>::new();
+        // Компонент ещё не зарегистрирован — запрос пуст, но не падает.
+        assert_eq!(state.query(&world).iter().count(), 0);
+
+        world.spawn((Late(7),));
+        assert_eq!(state.query(&world).iter().count(), 1, "ids доразрешились после регистрации");
+    }
+
+    #[test]
+    fn query_state_changed_with_explicit_tick() {
+        use crate::query::{Changed, Read};
+
+        struct P(f32);
+        impl crate::component::Component for P {}
+
+        let mut world = World::new();
+        let target = world.spawn((P(0.0),));
+        let _other = world.spawn((P(0.0),));
+
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        if let Some(p) = world.get_mut::<P>(target) {
+            p.0 = 1.0;
+        }
+
+        let mut state = QueryState::<(Changed<P>, Read<P>)>::new();
+        let hits: Vec<_> = state
+            .query_with_tick(&world, last_run)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(hits, vec![target]);
+    }
+
     #[test]
     fn system_context_try_resource_some() {
         let mut world = World::new();
@@ -2501,7 +2956,7 @@ mod tests {
         struct F5;
         struct F6;
         struct F7;
-        struct Rare(u32);
+        struct Rare(#[allow(dead_code)] u32);
         impl crate::component::Component for F0 {}
         impl crate::component::Component for F1 {}
         impl crate::component::Component for F2 {}

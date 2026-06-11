@@ -1,7 +1,6 @@
 #![allow(dead_code)]
-/// Apex ECS — Performance Benchmark (corrected v2)
-/// cargo run -p apex-examples --example perf --release
-/// cargo run -p apex-examples --example perf --release
+// Apex ECS — Performance Benchmark (corrected v2)
+// Запуск: cargo run -p apex-examples --example perf --release
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
@@ -216,7 +215,7 @@ system! {
             let drag  = angle.cos() * 0.99;
             v.x = v.x * drag + angle.sin() * 0.001;
             v.y = v.y * drag - 9.8 * dt;
-            v.z = v.z * drag;
+            v.z *= drag;
             p.x += v.x * dt;
             p.y += v.y * dt;
             p.z += v.z * dt;
@@ -903,8 +902,8 @@ fn bench_query(n: usize) {
     bench_with_setup(
         &format!("Query<(Read<Vel>, Write<Pos>)>    ({n}k)"),
         || make_world_3comp(n * 1000),
-        |mut world: World| {
-            Query::<(Read<Velocity>, Write<Position>)>::new(&mut world)
+        |world: World| {
+            Query::<(Read<Velocity>, Write<Position>)>::new(&world)
                 .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
@@ -1017,7 +1016,7 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Вспомогательная функция ──────────────────────────────
     // Принимает готовый скомпилированный Scheduler, прогоняет bench_seq_par.
     // compile() вызывается один раз в setup — честно.
-    fn run_bench<FS, FP>(
+    fn run_bench(
         label: &str,
         setup: impl FnMut() -> World,
         mut seq_sched: Scheduler,
@@ -1207,7 +1206,7 @@ fn bench_parallel_scheduler(n: usize) {
                 let drag  = angle.cos() * 0.99;
                 v.x = v.x * drag + angle.sin() * 0.001;
                 v.y = v.y * drag - 9.8 * dt;
-                v.z = v.z * drag;
+                v.z *= drag;
                 p.x += v.x * dt;
                 p.y += v.y * dt;
                 p.z += v.z * dt;

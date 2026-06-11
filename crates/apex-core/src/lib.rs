@@ -21,6 +21,7 @@ pub mod access;
 pub mod archetype;
 pub mod commands;
 pub mod component;
+pub mod dense;
 pub mod entity;
 pub mod events;
 pub mod par_utils;
@@ -47,8 +48,9 @@ pub use component::{
 pub use entity::Entity;
 pub use events::{DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard};
 pub use linkme; // re-exported for #[derive(Component)] macro
+pub use dense::DenseQuery;
 pub use query::{
-    Changed, Maybe, MaybeWrite, Mut, Query, Read, Ref, With, Without, WorldQuery, Write,
+    Changed, Maybe, MaybeWrite, Mut, Or, Query, Read, Ref, With, Without, WorldQuery, Write,
 };
 pub use relations::{ChildOf, Owns, RelationKind};
 pub use resources::Resources;
@@ -60,7 +62,9 @@ pub use system_param::{
     WorldQuerySystemAccess,
 };
 pub use transform::IndexStamp;
-pub use world::{ArchetypeStats, Bundle, CachedQuery, ParallelWorld, SystemContext, World};
+pub use world::{
+    ArchetypeStats, Bundle, CachedQuery, ParallelWorld, QueryState, SystemContext, World,
+};
 
 pub mod prelude {
     pub use crate::access::AccessDescriptor;
@@ -69,9 +73,10 @@ pub mod prelude {
     pub use crate::entity::Entity;
     pub use crate::events::{DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard};
     pub use crate::impl_entity_template;
+    pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Changed, Maybe, MaybeWrite, Mut, Query, QueryBuilder, Read, Ref, With, Without, WorldQuery,
-        Write,
+        Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Read, Ref, With, Without,
+        WorldQuery, Write,
     };
     pub use crate::relations::{ChildOf, Owns, RelationKind};
     pub use crate::resources::Resources;
@@ -81,7 +86,7 @@ pub mod prelude {
         QueryParam, Res, ResMut, ResRead, ResWrite, SystemParam, WorldQuerySystemAccess,
     };
     pub use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
-    pub use crate::world::{Bundle, CachedQuery, SystemContext, World};
+    pub use crate::world::{Bundle, CachedQuery, QueryState, SystemContext, World};
     pub use crate::BundleDerive as Bundle;
     pub use crate::Component;
 }

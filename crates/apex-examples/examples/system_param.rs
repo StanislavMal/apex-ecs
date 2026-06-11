@@ -241,8 +241,7 @@ fn test_commands_and_empty() {
         let world = World::new();
         with_ctx(&world, |ctx| {
             type P = ();
-            let result = ctx.fetch::<P>();
-            assert_eq!(result, ());
+            ctx.fetch::<P>(); // () — фетч ничего не возвращает
 
             let access = P::access();
             assert!(access.reads.is_empty());

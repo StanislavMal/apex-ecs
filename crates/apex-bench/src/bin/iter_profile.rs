@@ -10,7 +10,7 @@
 
 use apex_bench::{Position, Rotation, Transform, Velocity};
 use apex_core::prelude::*;
-use apex_core::Query;
+use apex_core::{Query, QueryState};
 use cgmath::{Matrix4, Vector3};
 use std::hint::black_box;
 use std::time::Instant;
@@ -91,4 +91,68 @@ fn main() {
         9,
     );
     println!("Query::new + for_each 10k:    {t:.3} µs");
+
+    // ── W2-0: QueryState (per-system стейт, ноль локов/аллокаций) ──
+    let mut state = QueryState::<(Read<Velocity>, Write<Position>)>::new();
+    let t = median_us(
+        || {
+            let t = Instant::now();
+            for _ in 0..N {
+                let q = state.query(&world);
+                black_box(&q);
+            }
+            t.elapsed().as_secs_f64() * 1e6 / N as f64
+        },
+        9,
+    );
+    println!("QueryState конструктор:       {t:.3} µs");
+
+    let t = median_us(
+        || {
+            let t = Instant::now();
+            for _ in 0..N {
+                state.query(&world).for_each(|_, (vel, mut pos)| {
+                    pos.0 += vel.0;
+                });
+            }
+            t.elapsed().as_secs_f64() * 1e6 / N as f64
+        },
+        9,
+    );
+    println!("QueryState + for_each 10k:    {t:.3} µs");
+
+    // ── W2-0.5: плотная chunk-итерация (слайсы + stamp_range) ──
+    let t = median_us(
+        || {
+            let t = Instant::now();
+            for _ in 0..N {
+                state.query(&world).for_each_chunk(|_, (vel, pos)| {
+                    for i in 0..pos.len() {
+                        pos[i].0 += vel[i].0;
+                    }
+                });
+            }
+            t.elapsed().as_secs_f64() * 1e6 / N as f64
+        },
+        9,
+    );
+    println!("QueryState + for_each_chunk:  {t:.3} µs");
+
+    let t = median_us(
+        || {
+            let t = Instant::now();
+            for _ in 0..N {
+                world
+                    .query_typed::<(Read<Velocity>, Write<Position>)>()
+                    .for_each_chunk(|_, (vel, pos)| {
+                        for i in 0..pos.len() {
+                            pos[i].0 += vel[i].0;
+                        }
+                    });
+            }
+            t.elapsed().as_secs_f64() * 1e6 / N as f64
+        },
+        9,
+    );
+    println!("CachedQuery + for_each_chunk: {t:.3} µs");
 }

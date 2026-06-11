@@ -6,6 +6,8 @@ use cgmath::{Matrix4, Vector3};
 // CachedQuery кешируется через QueryCache внутри query_typed()
 pub struct SimpleIter {
     world: World,
+    // W2-0/W2-0.5: per-state запрос для chunked-варианта (модель Bevy QueryState)
+    state: QueryState<(Read<Velocity>, Write<Position>)>,
 }
 
 impl Default for SimpleIter {
@@ -25,7 +27,7 @@ impl SimpleIter {
             Velocity(Vector3::new(1.0, 0.0, 0.0)),
         ));
 
-        Self { world }
+        Self { world, state: QueryState::new() }
     }
 
     pub fn run(&self) {
@@ -33,5 +35,14 @@ impl SimpleIter {
             .for_each(|_, (vel, mut pos)| {
                 pos.0 += vel.0;
             });
+    }
+
+    /// W2-0.5: плотная chunk-итерация (слайсы колонок + stamp_range).
+    pub fn run_chunked(&mut self) {
+        self.state.query(&self.world).for_each_chunk(|_, (vel, pos)| {
+            for (p, v) in pos.iter_mut().zip(vel) {
+                p.0 += v.0;
+            }
+        });
     }
 }

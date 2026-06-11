@@ -108,6 +108,9 @@ type RemoveApply = unsafe fn(Entity, &mut World);
 type DropFn = unsafe fn(*mut u8);
 type AddRelationApply = fn(&mut World, Entity, Entity);
 type RemoveRelationApply = fn(&mut World, Entity, Entity);
+/// Разрешить/зарегистрировать ComponentId типа команды — для группового
+/// применения insert-бёрстов (W2-1): id нужен ДО вызова typed-apply.
+type ComponentIdFn = fn(&mut crate::component::ComponentRegistry) -> ComponentId;
 
 // ── Typed command enum ───────────────────────────────────────────
 //
@@ -127,6 +130,8 @@ enum Command {
         offset: u32,
         apply: InsertApply,
         drop: DropFn,
+        /// Для группового применения бёрста insert'ов одной entity (W2-1).
+        cid_fn: ComponentIdFn,
     },
     /// Remove — inline
     Remove {
@@ -167,6 +172,14 @@ enum Command {
         target: Entity,
         apply: RemoveRelationApply,
     },
+}
+
+/// Entity-цель insert-подобной команды — критерий группировки бёрстов (W2-1).
+fn insert_target(cmd: &Command) -> Option<Entity> {
+    match cmd {
+        Command::Insert { entity, .. } | Command::InsertRaw { entity, .. } => Some(*entity),
+        _ => None,
+    }
 }
 
 /// Очередь команд — буферизует structural changes для применения после итерации.
@@ -236,12 +249,16 @@ impl Commands {
         unsafe fn drop_typed<T>(ptr: *mut u8) {
             std::ptr::drop_in_place(ptr as *mut T);
         }
+        fn cid<T: Component>(registry: &mut crate::component::ComponentRegistry) -> ComponentId {
+            registry.get_or_register::<T>()
+        }
         let offset = self.arena.alloc(component);
         self.queue.push(Command::Insert {
             entity,
             offset,
             apply: apply_insert::<T>,
             drop: drop_typed::<T>,
+            cid_fn: cid::<T>,
         });
     }
 
@@ -366,9 +383,83 @@ impl Commands {
         });
     }
 
-    /// Применить все накопленные команды к миру
+    /// Применить все накопленные команды к миру.
+    ///
+    /// Бёрст ПОДРЯД идущих insert'ов на одну entity (`insert(e, A);
+    /// insert(e, B); …`) применяется ГРУППОЙ — один archetype move на пачку
+    /// вместо move-на-компонент (W2-1, `World::insert_parts`). Порядок
+    /// применения команд сохраняется.
     pub fn apply(&mut self, world: &mut World) {
-        for cmd in self.queue.drain(..) {
+        let queue = std::mem::take(&mut self.queue);
+        let mut it = queue.into_iter().peekable();
+        // Переиспользуемые буферы группы (вне цикла — без реаллокаций).
+        let mut group: smallvec::SmallVec<[Command; 8]> = smallvec::SmallVec::new();
+        let mut parts: smallvec::SmallVec<[(ComponentId, *const u8, Tick); 8]> =
+            smallvec::SmallVec::new();
+
+        while let Some(cmd) = it.next() {
+            if let Some(entity) = insert_target(&cmd) {
+                if it.peek().and_then(insert_target) == Some(entity) {
+                    group.clear();
+                    group.push(cmd);
+                    while it.peek().and_then(insert_target) == Some(entity) {
+                        group.push(it.next().unwrap());
+                    }
+                    self.apply_insert_group(world, entity, &mut group, &mut parts);
+                    continue;
+                }
+            }
+            self.apply_one(cmd, world);
+        }
+        self.arena.reset();
+    }
+
+    /// Применить группу insert/insert_raw одной entity одним archetype move.
+    fn apply_insert_group(
+        &self,
+        world: &mut World,
+        entity: Entity,
+        group: &mut smallvec::SmallVec<[Command; 8]>,
+        parts: &mut smallvec::SmallVec<[(ComponentId, *const u8, Tick); 8]>,
+    ) {
+        let tick = world.current_tick();
+        parts.clear();
+        for cmd in group.iter() {
+            match cmd {
+                Command::Insert { offset, cid_fn, .. } => {
+                    let cid = cid_fn(&mut world.registry);
+                    parts.push((cid, self.arena.get_ptr(*offset) as *const u8, tick));
+                }
+                Command::InsertRaw {
+                    component_id,
+                    data,
+                    tick,
+                    ..
+                } => {
+                    parts.push((*component_id, data.as_ptr(), *tick));
+                }
+                _ => unreachable!("в insert-группе только Insert/InsertRaw"),
+            }
+        }
+
+        if world.insert_parts(entity, parts) {
+            // Значения скопированы во владение мира: typed payload'ы НЕ дропаем
+            // (эквивалент ptr::read + forget), Vec<u8> из InsertRaw — лишь байты.
+            group.clear();
+        } else {
+            // Entity мертва — освобождаем typed payload'ы, как world.insert
+            // дропал бы значение на раннем return.
+            for cmd in group.drain(..) {
+                if let Command::Insert { offset, drop, .. } = cmd {
+                    unsafe { drop(self.arena.get_ptr(offset)) };
+                }
+            }
+        }
+    }
+
+    /// Применить одну команду (вне групп).
+    fn apply_one(&self, cmd: Command, world: &mut World) {
+        {
             match cmd {
                 Command::Spawn { offset, apply, .. } => unsafe {
                     apply(self.arena.get_ptr(offset), world);
@@ -426,7 +517,6 @@ impl Commands {
                 }
             }
         }
-        self.arena.reset();
     }
 
     #[inline]
@@ -750,6 +840,118 @@ mod tests {
         let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
         let count = query.iter().count();
         assert_eq!(count, 20);
+    }
+
+    // ── W2-1: группировка insert-бёрстов ───────────────────────
+
+    #[derive(Clone, Copy)]
+    struct Acc(f32);
+    impl Component for Acc {}
+    #[derive(Clone, Copy)]
+    struct Hp(f32);
+    impl Component for Hp {}
+
+    /// Бёрст insert'ов на одну entity применяется группой: один archetype
+    /// move, все компоненты на месте, значения корректны.
+    #[test]
+    fn commands_insert_burst_grouped_single_move() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Vel(1.0));
+        cmds.insert(entity, Acc(2.0));
+        cmds.insert(entity, Hp(3.0));
+        cmds.apply(&mut world);
+
+        assert_eq!(world.get::<Vel>(entity).unwrap().0, 1.0);
+        assert_eq!(world.get::<Acc>(entity).unwrap().0, 2.0);
+        assert_eq!(world.get::<Hp>(entity).unwrap().0, 3.0);
+        assert_eq!(world.get::<Pos>(entity).unwrap().0, 0.0, "старый компонент пережил move");
+    }
+
+    /// Дубликат компонента в группе: выживает ПОСЛЕДНЕЕ значение (порядок
+    /// команд сохраняется), промежуточное дропается.
+    #[test]
+    fn commands_insert_burst_duplicate_last_wins() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Vel(1.0));
+        cmds.insert(entity, Vel(2.0));
+        cmds.insert(entity, Acc(9.0));
+        cmds.apply(&mut world);
+
+        assert_eq!(world.get::<Vel>(entity).unwrap().0, 2.0);
+        assert_eq!(world.get::<Acc>(entity).unwrap().0, 9.0);
+    }
+
+    /// Группа на МЁРТВУЮ entity: payload'ы освобождаются (нет ни паники,
+    /// ни утечки), мир не меняется.
+    #[test]
+    fn commands_insert_burst_dead_entity_drops_payloads() {
+        use std::sync::Arc;
+
+        struct Holder(#[allow(dead_code)] Arc<()>);
+        impl Component for Holder {}
+
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+        world.despawn(entity);
+
+        let probe = Arc::new(());
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Holder(probe.clone()));
+        cmds.insert(entity, Holder(probe.clone()));
+        cmds.apply(&mut world);
+
+        assert_eq!(Arc::strong_count(&probe), 1, "payload'ы мёртвой entity дропнуты");
+    }
+
+    /// Группировка не ломает порядок с другими командами: insert'ы до
+    /// despawn применяются, despawn после — убивает entity.
+    #[test]
+    fn commands_insert_burst_then_despawn_order_preserved() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(0.0),));
+
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Vel(1.0));
+        cmds.insert(entity, Acc(2.0));
+        cmds.despawn(entity);
+        cmds.apply(&mut world);
+
+        assert!(world.get::<Pos>(entity).is_none(), "despawn после бёрста применён");
+    }
+
+    /// W2-1 фикс утечки: insert ПОВЕРХ существующего компонента дропает
+    /// старое значение (и в группе, и поодиночке).
+    #[test]
+    fn commands_insert_overwrite_drops_old_value() {
+        use std::sync::Arc;
+
+        struct Holder(#[allow(dead_code)] Arc<()>);
+        impl Component for Holder {}
+
+        let probe = Arc::new(());
+        let mut world = World::new();
+        let entity = world.spawn((Holder(probe.clone()),));
+        assert_eq!(Arc::strong_count(&probe), 2);
+
+        // Одиночный insert поверх существующего
+        world.insert(entity, Holder(probe.clone()));
+        assert_eq!(Arc::strong_count(&probe), 2, "старое значение дропнуто (одиночный путь)");
+
+        // Групповой путь (бёрст с дубликатом поверх существующего)
+        let mut cmds = Commands::new();
+        cmds.insert(entity, Holder(probe.clone()));
+        cmds.insert(entity, Holder(probe.clone()));
+        cmds.apply(&mut world);
+        assert_eq!(Arc::strong_count(&probe), 2, "групповой путь дропает перезаписанные");
+
+        world.despawn(entity);
+        assert_eq!(Arc::strong_count(&probe), 1);
     }
 
     #[test]

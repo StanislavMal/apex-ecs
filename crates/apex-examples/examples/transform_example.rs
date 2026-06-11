@@ -88,7 +88,7 @@ fn main() {
     // Модель кадра: тик продвигается В НАЧАЛЕ кадра (до мутаций). В реальном
     // приложении это делает планировщик (C7); здесь — вручную.
     world.tick();
-    if let Some(mut lt) = world.get_mut::<LocalTransform>(parent) {
+    if let Some(lt) = world.get_mut::<LocalTransform>(parent) {
         lt.translation = Vec3::new(100.0, 0.0, 0.0);
     }
     transform::propagate_transforms(&mut world);

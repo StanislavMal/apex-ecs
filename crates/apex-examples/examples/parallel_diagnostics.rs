@@ -279,9 +279,6 @@ fn fmt_meps(meps: f64) -> String {
     format!("{:>7.2}", meps)
 }
 
-/// Напечатать заголовок таблицы с колонками
-
-
 /// Напечатать строку таблицы для SEQ vs PAR сравнения
 fn table_row_seqpar(
     n: usize, seq_us: f64, par_us: f64,

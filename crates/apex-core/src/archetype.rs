@@ -87,6 +87,23 @@ impl Column {
         *ptr.add(row) = tick;
     }
 
+    /// Проставить change-tick ДИАПАЗОНУ строк `[start, end)` (W2-0.5).
+    ///
+    /// Используется плотной итерацией ([`DenseQuery`](crate::query::DenseQuery)):
+    /// контракт «слайс на запись = весь диапазон changed». Простой цикл
+    /// векторизуется компилятором в fill.
+    ///
+    /// # Safety
+    /// `end <= self.len`; никакая другая ссылка на тики этих строк не существует.
+    #[inline]
+    pub unsafe fn stamp_range(&self, start: usize, end: usize, tick: Tick) {
+        debug_assert!(end <= self.len);
+        let ptr = self.change_ticks.as_ptr() as *mut Tick;
+        for row in start..end {
+            *ptr.add(row) = tick;
+        }
+    }
+
     pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
         if self.item_size == 0 {
             self.item_align as *mut u8
@@ -143,13 +160,34 @@ impl Column {
         std::mem::forget(value);
     }
 
-    /// Записать элемент в уже существующую строку, обновить тик
+    /// Записать элемент в уже существующую строку, обновить тик.
+    ///
+    /// НЕ дропает прежнее значение — для строк, чьё содержимое уже вынесено
+    /// (move) либо тривиально. Для перезаписи ЖИВОГО значения используйте
+    /// [`replace_at`](Self::replace_at), иначе Drop-типы текут.
     pub unsafe fn write_at(&mut self, row: usize, src: *const u8, tick: Tick) {
         if self.item_size > 0 {
             std::ptr::copy_nonoverlapping(src, self.get_ptr(row), self.item_size);
         }
         if row < self.change_ticks.len() {
             self.change_ticks[row] = tick;
+        }
+    }
+
+    /// Заменить ЖИВОЕ значение строки: дропнуть старое, записать новое, тик.
+    ///
+    /// Закрывает утечку `insert` поверх существующего компонента (W2-1):
+    /// старое значение Drop-типа (String, Vec, Arc…) раньше молча терялось.
+    pub unsafe fn replace_at(&mut self, row: usize, src: *const u8, tick: Tick) {
+        debug_assert!(row < self.len);
+        (self.drop_fn)(self.get_ptr(row));
+        self.write_at(row, src, tick);
+    }
+
+    /// Кламп старых change-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3).
+    pub(crate) fn check_change_ticks(&mut self, current: Tick) {
+        for t in &mut self.change_ticks {
+            t.check_against(current);
         }
     }
 
@@ -406,6 +444,25 @@ impl Archetype {
                 col.push(src, tick);
             } else {
                 col.write_at(row, src, tick);
+            }
+        }
+    }
+
+    /// Записать компонент: в новую строку — push, поверх живого значения —
+    /// replace (с дропом старого). Используется групповым `insert_parts` (W2-1).
+    pub unsafe fn write_or_replace_component(
+        &mut self,
+        row: usize,
+        component_id: ComponentId,
+        src: *const u8,
+        tick: Tick,
+    ) {
+        if let Some(col_idx) = self.column_index(component_id) {
+            let col = &mut self.columns[col_idx];
+            if row >= col.len {
+                col.push(src, tick);
+            } else {
+                col.replace_at(row, src, tick);
             }
         }
     }
