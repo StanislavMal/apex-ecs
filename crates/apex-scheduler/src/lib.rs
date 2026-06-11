@@ -143,11 +143,16 @@ fn main_prof_world_stats(world: &apex_core::World) {
         *last = Some(Instant::now());
         let s = world.archetype_stats();
         log::info!(
-            "MAIN PROF мир: archetypes={} (empty={}), rows={}, max_arch_rows={}",
+            "MAIN PROF мир: archetypes={} (empty={}), rows={}, max_arch_rows={}, \
+             mem={:.2} MiB (data={:.2} ticks={:.2} entities={:.2})",
             s.archetypes,
             s.empty_archetypes,
             s.total_rows,
-            s.max_rows_in_archetype
+            s.max_rows_in_archetype,
+            s.total_bytes() as f64 / (1024.0 * 1024.0),
+            s.component_bytes as f64 / (1024.0 * 1024.0),
+            s.tick_bytes as f64 / (1024.0 * 1024.0),
+            s.entity_bytes as f64 / (1024.0 * 1024.0),
         );
     }
 }
@@ -934,6 +939,11 @@ impl Scheduler {
         if S::NEEDS_WHOLE_WORLD {
             access.needs_whole_world = true;
         }
+        // W3-4: система с состоянием не делится ASD row-split'ом — несколько
+        // задач звали бы run(&mut self) одного экземпляра конкурентно.
+        if std::mem::size_of::<S>() > 0 {
+            access.stateful = true;
+        }
         let adapter = AutoSystemAdapter { inner: system };
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
@@ -998,7 +1008,11 @@ impl Scheduler {
         let id = SystemId(self.next_id);
         self.next_id += 1;
         self.last_added_system_id = Some(id);
-        let access = S::access();
+        let mut access = S::access();
+        // W3-4: система с состоянием → без ASD row-split.
+        if std::mem::size_of::<S>() > 0 {
+            access.stateful = true;
+        }
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,
@@ -1066,7 +1080,11 @@ impl Scheduler {
         let id = SystemId(self.next_id);
         self.next_id += 1;
         self.last_added_system_id = Some(id);
-        let access = AccessDescriptor::new();
+        let mut access = AccessDescriptor::new();
+        // W3-4: замыкание с захватами = состояние → без ASD row-split.
+        if std::mem::size_of::<F>() > 0 {
+            access.stateful = true;
+        }
         let system = FnParSystem {
             func: Box::new(func),
             access: access.clone(),
@@ -1157,6 +1175,11 @@ impl Scheduler {
         let id = SystemId(self.next_id);
         self.next_id += 1;
         self.last_added_system_id = Some(id);
+        let mut access = access;
+        // W3-4: замыкание с захватами = состояние → без ASD row-split.
+        if std::mem::size_of::<F>() > 0 {
+            access.stateful = true;
+        }
         let system = FnParSystem {
             func: Box::new(func),
             access: access.clone(),
@@ -2470,6 +2493,7 @@ impl Scheduler {
             has_events: bool,
             uses_par_for_each: bool,
             needs_whole_world: bool,
+            stateful: bool,
         }
 
         let mut sys_infos: Vec<SysInfo> = Vec::new();
@@ -2504,6 +2528,9 @@ impl Scheduler {
                         .unwrap_or(false);
                     let uses_par_for_each = access.map(|a| a.uses_par_for_each).unwrap_or(false);
                     let needs_whole_world = access.map(|a| a.needs_whole_world).unwrap_or(false);
+                    // Нет access (динамическая система) — состояние неизвестно,
+                    // консервативно считаем stateful (без row-split).
+                    let stateful = access.map(|a| a.stateful).unwrap_or(true);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
@@ -2512,6 +2539,7 @@ impl Scheduler {
                         has_events,
                         uses_par_for_each,
                         needs_whole_world,
+                        stateful,
                     });
                 } else {
                     // Система без entity (только ресурсы/события) — запускаем сразу
@@ -2558,9 +2586,12 @@ impl Scheduler {
             //   b) Систем с событиями (Emit/Listen)
             //   c) Систем с par_for_each — избегаем oversubscribe rayon
             //   d) Систем с needs_whole_world — глобальный доступ
+            //   e) Систем с состоянием (W3-4) — row-split звал бы
+            //      run(&mut self) одного экземпляра конкурентно
             if info.has_events
                 || info.uses_par_for_each
                 || info.needs_whole_world
+                || info.stateful
                 || info.entity_count <= effective_chunk
             {
                 // Per-system scope: одна задача, все entity целиком
@@ -2638,6 +2669,13 @@ impl Scheduler {
                 let cmds = cmds_ptr;
                 s.spawn(move |_| {
                     let cmds_ptr = cmds as *mut Vec<Commands>;
+                    // SAFETY (W3-4): несколько задач одной системы существуют
+                    // ТОЛЬКО для систем без состояния (`stateful`/`has_events`/
+                    // `uses_par_for_each`/`needs_whole_world` получают единый
+                    // per-system scope). Для них `run(&mut self)` не читает и
+                    // не пишет байтов self (ZST/без захватов) — конкурентные
+                    // вызовы не гоняются по данным. Диапазоны строк задач
+                    // дизъюнктны по построению (последовательная нарезка).
                     unsafe {
                         let system = &mut *task.ptr.0;
                         if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
@@ -5138,5 +5176,76 @@ mod tests {
         // Pos and Vel — no conflict, should be same stage
         let same_stage = stages.iter().any(|s| s.system_ids.len() >= 2);
         assert!(same_stage, "opaque condition should not cause conflicts");
+    }
+
+    // ── W3-4: стресс ASD row-split ────────────────────────────
+
+    /// Stateless-система на большом мире ЧАНКУЕТСЯ (ASD row-split):
+    /// каждая строка должна быть обработана РОВНО один раз — ни пропусков
+    /// (полнота чанков), ни дублей (дизъюнктность диапазонов).
+    #[test]
+    fn asd_row_split_visits_each_row_exactly_once() {
+        #[derive(Component, Clone, Copy)]
+        struct Hits(u32);
+
+        system! {
+            fn bump(q: Write<Hits>) {
+                q.for_each(|_, mut h| h.0 += 1);
+            }
+        }
+
+        const N: usize = 100_000; // заведомо больше effective_chunk
+        let mut world = World::new();
+        world.spawn_many(N, |_| (Hits(0),));
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, bump);
+        for _ in 0..3 {
+            sched.run(&mut world);
+        }
+
+        let mut bad = 0usize;
+        Query::<Read<Hits>>::new(&world).for_each(|_, h| {
+            if h.0 != 3 {
+                bad += 1;
+            }
+        });
+        assert_eq!(bad, 0, "каждая строка обработана ровно по разу за кадр");
+    }
+
+    /// Система с СОСТОЯНИЕМ не делится row-split'ом (W3-4): один экземпляр,
+    /// один вызов run на кадр, состояние видит ВСЕ строки. До фикса несколько
+    /// split-задач звали run(&mut self) конкурентно: гонка на состоянии +
+    /// каждая задача видела только свой диапазон.
+    #[test]
+    fn asd_does_not_split_stateful_system() {
+        #[derive(Component, Clone, Copy)]
+        struct Tag;
+
+        struct SeenTotal(u64);
+
+        system! {
+            struct CountRows { seen: u64 = 0 }
+            fn run(s: &mut Self, q: Read<Tag>, out: &mut SeenTotal) {
+                s.seen = 0;
+                q.for_each(|_, _| s.seen += 1);
+                out.0 = s.seen;
+            }
+        }
+
+        const N: usize = 100_000;
+        let mut world = World::new();
+        world.spawn_many(N, |_| (Tag,));
+        world.insert_resource(SeenTotal(0));
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, CountRows::default());
+        sched.run(&mut world);
+
+        assert_eq!(
+            world.resource::<SeenTotal>().0,
+            N as u64,
+            "stateful-система получает полный SubWorld (без row-split)"
+        );
     }
 }

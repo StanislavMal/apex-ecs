@@ -885,6 +885,50 @@ impl<T: Send + Sync + 'static> AnyEventQueue for Events<T> {
     }
 }
 
+// ── Removed<T> — событие удаления компонента (W3-1) ────────────
+
+/// Событие «у entity удалён компонент `T`» — аналог Bevy `RemovedComponents`.
+///
+/// Эмитится ядром для типов, включённых через
+/// [`World::track_removals::<T>()`](crate::World::track_removals), на ВСЕХ
+/// путях потери компонента: `remove`/`remove_raw` и `despawn` (в этом случае
+/// entity уже мертва). Читается как обычное событие — `&[Removed<T>]` в
+/// `system!`, `world.event_reader::<Removed<T>>()` — с per-reader курсорами
+/// (без дублей и пропусков) и обычной дисциплиной флаша (per-stage в
+/// планировщике / `advance_frame()` без него).
+pub struct Removed<T: crate::component::Component> {
+    pub entity: crate::entity::Entity,
+    _marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: crate::component::Component> Removed<T> {
+    #[inline]
+    pub(crate) fn new(entity: crate::entity::Entity) -> Self {
+        Self {
+            entity,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: crate::component::Component> Clone for Removed<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: crate::component::Component> Copy for Removed<T> {}
+
+impl<T: crate::component::Component> std::fmt::Debug for Removed<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Removed<{}>({})",
+            std::any::type_name::<T>(),
+            self.entity
+        )
+    }
+}
+
 // ── EventRegistry ───────────────────────────────────────────────
 
 /// Реестр очередей событий — карта `TypeId → Events<T>`.

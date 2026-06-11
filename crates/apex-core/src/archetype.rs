@@ -29,6 +29,14 @@ pub struct Column {
     pub(crate) capacity: usize,
     /// Per-row тик последнего изменения (для change detection)
     pub(crate) change_ticks: Vec<Tick>,
+    /// Per-row тик ДОБАВЛЕНИЯ компонента entity (W3-1, фильтр `Added<T>`).
+    ///
+    /// Семантика: ставится при появлении компонента у entity (spawn/insert
+    /// нового) и ПЕРЕЖИВАЕТ archetype move (insert/remove соседних компонентов
+    /// entity её не «обновляют»). Замена значения через `insert` поверх
+    /// существующего компонента обновляет ТОЛЬКО change-tick (как Bevy:
+    /// re-insert не перезапускает `Added<T>`).
+    pub(crate) added_ticks: Vec<Tick>,
 }
 
 unsafe impl Send for Column {}
@@ -59,6 +67,7 @@ impl Column {
             len: 0,
             capacity: 0,
             change_ticks: Vec::new(),
+            added_ticks: Vec::new(),
         }
     }
 
@@ -127,7 +136,11 @@ impl Column {
         &mut *(self.get_ptr(row) as *mut T)
     }
 
-    /// Записать новый элемент в конец, проставить тик изменения
+    /// Записать новый элемент в конец, проставить тики изменения и добавления.
+    ///
+    /// `push` — путь СВЕЖЕГО значения (spawn / insert нового компонента):
+    /// added-tick == change-tick == `tick`. Для переноса строки между
+    /// архетипами с сохранением тиков см. [`push_moved`](Self::push_moved).
     pub unsafe fn push(&mut self, src: *const u8, tick: Tick) {
         if self.len >= self.capacity {
             self.grow();
@@ -137,6 +150,20 @@ impl Column {
             std::ptr::copy_nonoverlapping(src, dst, self.item_size);
         }
         self.change_ticks.push(tick);
+        self.added_ticks.push(tick);
+        self.len += 1;
+    }
+
+    /// Дозаписать тики ПЕРЕНЕСЁННОЙ строки (archetype move): данные уже
+    /// скопированы вызывающим, оба тика сохраняются как были — перенос
+    /// entity между архетипами не «обновляет» ни `Changed<T>`, ни `Added<T>`.
+    ///
+    /// # Safety
+    /// Данные строки `len` уже записаны; вызывается ровно один раз на строку.
+    #[inline]
+    pub(crate) unsafe fn push_moved_ticks(&mut self, changed: Tick, added: Tick) {
+        self.change_ticks.push(changed);
+        self.added_ticks.push(added);
         self.len += 1;
     }
 
@@ -184,9 +211,12 @@ impl Column {
         self.write_at(row, src, tick);
     }
 
-    /// Кламп старых change-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3).
+    /// Кламп старых change/added-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3).
     pub(crate) fn check_change_ticks(&mut self, current: Tick) {
         for t in &mut self.change_ticks {
+            t.check_against(current);
+        }
+        for t in &mut self.added_ticks {
             t.check_against(current);
         }
     }
@@ -201,10 +231,12 @@ impl Column {
                 std::ptr::copy_nonoverlapping(self.get_ptr(last), remove_ptr, self.item_size);
             }
             self.change_ticks.swap(row, last);
+            self.added_ticks.swap(row, last);
         } else {
             (self.drop_fn)(self.get_ptr(row));
         }
         self.change_ticks.pop();
+        self.added_ticks.pop();
         self.len -= 1;
     }
 
@@ -217,8 +249,10 @@ impl Column {
         }
         if row != last {
             self.change_ticks.swap(row, last);
+            self.added_ticks.swap(row, last);
         }
         self.change_ticks.pop();
+        self.added_ticks.pop();
         self.len -= 1;
     }
 
@@ -267,12 +301,14 @@ impl Column {
         let needed = self.len + additional;
         if needed <= self.capacity {
             self.change_ticks.reserve(additional);
+            self.added_ticks.reserve(additional);
             return;
         }
         let new_cap = needed.next_power_of_two().max(4);
         if self.item_size == 0 {
             self.capacity = new_cap;
             self.change_ticks.reserve(additional);
+            self.added_ticks.reserve(additional);
             return;
         }
         if self.capacity == 0 {
@@ -295,6 +331,7 @@ impl Column {
         }
         self.capacity = new_cap;
         self.change_ticks.reserve(additional);
+        self.added_ticks.reserve(additional);
     }
 
     /// Тик изменения для строки row
@@ -303,16 +340,41 @@ impl Column {
         self.change_ticks.get(row).copied().unwrap_or(Tick::ZERO)
     }
 
+    /// Тик добавления компонента для строки row (W3-1, `Added<T>`).
+    #[inline]
+    pub fn get_added_tick(&self, row: usize) -> Tick {
+        self.added_ticks.get(row).copied().unwrap_or(Tick::ZERO)
+    }
+
     /// Указатель на массив тиков — для zero-cost Changed<T> query
     #[inline]
     pub fn ticks_ptr(&self) -> *const Tick {
         self.change_ticks.as_ptr()
     }
 
+    /// Указатель на массив added-тиков — для zero-cost `Added<T>` query
+    #[inline]
+    pub fn added_ticks_ptr(&self) -> *const Tick {
+        self.added_ticks.as_ptr()
+    }
+
     /// Сырой указатель на данные — для chunk-level параллелизма
     #[inline]
     pub fn data_ptr(&self) -> *mut u8 {
         self.data
+    }
+
+    /// Аллоцированная память колонки: (байты данных, байты тиков) — для
+    /// [`World::archetype_stats`](crate::World::archetype_stats) (W3-5).
+    pub(crate) fn allocated_bytes(&self) -> (usize, usize) {
+        let data = if self.item_size == 0 {
+            0
+        } else {
+            self.capacity * self.item_size
+        };
+        let ticks = (self.change_ticks.capacity() + self.added_ticks.capacity())
+            * std::mem::size_of::<Tick>();
+        (data, ticks)
     }
 }
 

@@ -112,6 +112,12 @@ pub struct AccessDescriptor {
     /// Флаг: системе нужны ВСЕ entity (глобальный доступ).
     /// ASD-чанкование запрещено — система всегда получает полный SubWorld.
     pub needs_whole_world: bool,
+    /// Флаг: у системы есть СОСТОЯНИЕ (`size_of::<S>() > 0` — state-системы
+    /// `system!`, замыкания с захватами). ASD row-split запрещён (W3-4):
+    /// несколько split-задач звали бы `run(&mut self)` ОДНОЙ системы
+    /// конкурентно — гонка на состоянии. Ставится планировщиком при
+    /// регистрации; параллельность МЕЖДУ системами не ограничивает.
+    pub stateful: bool,
     /// Типы и зарезервированные capacity для event-буферов.
     /// Планировщик вызывает `world.event_reserve::<T>(cap)` перед
     /// выполнением системы, чтобы избежать реаллокаций в hot-пути send().
@@ -196,6 +202,7 @@ impl AccessDescriptor {
         // Передаём флаг par_for_each
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
         self.needs_whole_world = self.needs_whole_world || other.needs_whole_world;
+        self.stateful = self.stateful || other.stateful;
         // Сливаем резервирования событий (берём максимум по каждому типу)
         for &(tid, cap) in &other.event_reserves {
             if let Some(entry) = self.event_reserves.iter_mut().find(|(id, _)| *id == tid) {

@@ -712,6 +712,85 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Changed<T> {
     }
 }
 
+// ── Added<T> ───────────────────────────────────────────────────
+
+/// Фильтр «компонент `T` ДОБАВЛЕН entity после `last_run`» (W3-1, паритет
+/// Bevy `Added<T>`).
+///
+/// Семантика added-тика: ставится при ПОЯВЛЕНИИ компонента у entity
+/// (spawn / insert нового), переживает archetype move (insert/remove соседних
+/// компонентов) и НЕ обновляется ни мутацией (`Changed`), ни `insert` поверх
+/// существующего компонента (replace = Changed, не Added — как в Bevy).
+/// Построчный фильтр: с плотной итерацией ([`DenseQuery`](crate::dense::DenseQuery))
+/// не компилируется, как и `Changed<T>`.
+pub struct Added<T: Component>(std::marker::PhantomData<T>);
+
+#[derive(Clone, Copy)]
+pub struct AddedState {
+    added: *const Tick,
+    last_run: Tick,
+}
+
+unsafe impl Send for AddedState {}
+unsafe impl Sync for AddedState {}
+
+impl<T: Component> WorldQuery for Added<T> {
+    type Item<'w> = ();
+    type State = AddedState;
+
+    #[inline]
+    fn component_count() -> usize {
+        1
+    }
+    #[inline]
+    fn is_filter() -> bool {
+        true
+    }
+
+    fn fill_ids(world: &World, ids: &mut IdBuf) {
+        ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
+    }
+
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
+        key.push(id.0 as u64); // роль REQUIRED = 0
+    }
+
+    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
+        !ids.is_empty() && arch.has_component(ids[0])
+    }
+
+    unsafe fn fetch_state(
+        arch: &Archetype,
+        ids: &[ComponentId],
+        last_run: Tick,
+        _: Tick,
+    ) -> Self::State {
+        let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
+        let col = &arch.columns[col_idx];
+        AddedState {
+            added: col.added_ticks_ptr(),
+            last_run,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        let tick = *state.added.add(row);
+        if tick.is_newer_than(state.last_run) {
+            Some(())
+        } else {
+            None
+        }
+    }
+}
+
+impl<T: Component + 'static> WorldQuerySystemAccess for Added<T> {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+}
+
 // ── Or<> — дизъюнкция фильтров (W2-5) ──────────────────────────
 
 /// Дизъюнкция фильтров уровня Bevy: строка проходит, если проходит ХОТЯ БЫ

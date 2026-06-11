@@ -132,13 +132,27 @@ impl QueryCache {
 // ── ArchetypeStats ─────────────────────────────────────────────
 
 /// Сводка [`World::archetype_stats`]: число архетипов, пустых среди них,
-/// суммарные живые строки и максимум строк в одном архетипе.
+/// суммарные живые строки, максимум строк в одном архетипе и память (W3-5).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ArchetypeStats {
     pub archetypes: usize,
     pub empty_archetypes: usize,
     pub total_rows: usize,
     pub max_rows_in_archetype: usize,
+    /// Аллоцировано под данные компонентов (Σ capacity × item_size).
+    pub component_bytes: usize,
+    /// Аллоцировано под change/added-тики (Σ capacity × 4 × 2).
+    pub tick_bytes: usize,
+    /// Аллоцировано под списки entity архетипов (Σ capacity × 8).
+    pub entity_bytes: usize,
+}
+
+impl ArchetypeStats {
+    /// Суммарная память хранилища (компоненты + тики + entity-списки).
+    #[inline]
+    pub fn total_bytes(&self) -> usize {
+        self.component_bytes + self.tick_bytes + self.entity_bytes
+    }
 }
 
 // ── ArchetypeKey ───────────────────────────────────────────────
@@ -195,6 +209,30 @@ pub struct World {
     pub(crate) templates: TemplateRegistry,
     /// Конфигурация чанкования для параллельной итерации.
     pub(crate) chunk_config: ChunkConfig,
+    /// Очередь хуков состава (W3-1): структурные операции СНАЧАЛА завершаются,
+    /// потом диспетчер вызывает хуки на консистентном мире. Вложенные
+    /// структурные операции из хуков дописывают в ту же очередь — обрабатывает
+    /// тот же (внешний) диспетчер, без рекурсии.
+    pub(crate) hook_queue: Vec<HookEvent>,
+    /// Диспетчер хуков уже работает выше по стеку (re-entrancy guard).
+    pub(crate) hook_dispatch_active: bool,
+}
+
+/// Отложенное событие состава для диспетчера хуков (W3-1).
+#[derive(Clone, Copy)]
+pub(crate) enum HookEvent {
+    Added(Entity, ComponentId),
+    Removed(Entity, ComponentId),
+    RelationAdded {
+        kind_idx: u32,
+        subject: Entity,
+        target: Entity,
+    },
+    RelationRemoved {
+        kind_idx: u32,
+        subject: Entity,
+        target: Entity,
+    },
 }
 
 impl World {
@@ -218,6 +256,8 @@ impl World {
             events: EventRegistry::new(),
             templates: TemplateRegistry::new(),
             chunk_config: ChunkConfig::default(),
+            hook_queue: Vec::new(),
+            hook_dispatch_active: false,
         };
         world
             .archetypes
@@ -375,6 +415,172 @@ impl World {
         self.registry.register_serde_json::<T>()
     }
 
+    // ── Хуки состава (W3-1) ────────────────────────────────────
+
+    /// Зарегистрировать `on_add`-хук компонента `T`: вызывается после того,
+    /// как `T` ПОЯВИЛСЯ у entity (spawn / insert нового; замена значения
+    /// существующего компонента хук НЕ дёргает — это `Changed`, не `Added`).
+    ///
+    /// Хук вызывается на консистентном мире (после завершения структурной
+    /// операции) и может делать любые операции, включая структурные.
+    /// Один хук на компонент; повторная регистрация — panic (для нескольких
+    /// подписчиков используйте события).
+    pub fn on_add<T: Component>(&mut self, hook: crate::component::ComponentHookFn) {
+        let cid = self.registry.get_or_register::<T>();
+        let hooks = self.registry.hooks_mut(cid);
+        assert!(
+            hooks.on_add.is_none(),
+            "on_add-хук для `{}` уже зарегистрирован (один хук на компонент; \
+             для нескольких подписчиков используйте события)",
+            std::any::type_name::<T>()
+        );
+        hooks.on_add = Some(hook);
+        self.registry.set_flag(cid, crate::component::FLAG_ON_ADD);
+    }
+
+    /// Зарегистрировать `on_remove`-хук компонента `T`: вызывается после того,
+    /// как entity ПОТЕРЯЛА `T` (`remove` или `despawn` — в последнем случае
+    /// entity уже мертва, `is_alive == false`). Значение компонента к моменту
+    /// вызова уже уничтожено — хук получает только entity.
+    ///
+    /// Один хук на компонент; повторная регистрация — panic.
+    pub fn on_remove<T: Component>(&mut self, hook: crate::component::ComponentHookFn) {
+        let cid = self.registry.get_or_register::<T>();
+        let hooks = self.registry.hooks_mut(cid);
+        assert!(
+            hooks.on_remove.is_none(),
+            "on_remove-хук для `{}` уже зарегистрирован (один хук на компонент; \
+             для нескольких подписчиков используйте события)",
+            std::any::type_name::<T>()
+        );
+        hooks.on_remove = Some(hook);
+        self.registry.set_flag(cid, crate::component::FLAG_ON_REMOVE);
+    }
+
+    /// Включить эмиссию событий [`Removed<T>`](crate::events::Removed) при
+    /// потере компонента `T` (remove/despawn) — аналог Bevy
+    /// `RemovedComponents`. Чтение — обычными путями событий (`&[Removed<T>]`
+    /// в `system!`, `event_reader`), per-reader курсоры исключают дубли.
+    ///
+    /// Идемпотентна. Для невключённых типов удаления не записываются
+    /// (нулевая стоимость).
+    pub fn track_removals<T: Component>(&mut self) {
+        let cid = self.registry.get_or_register::<T>();
+        self.events.register::<crate::events::Removed<T>>();
+        self.registry.hooks_mut(cid).emit_removed = Some(|events, entity| {
+            events
+                .get_or_register_mut::<crate::events::Removed<T>>()
+                .send(crate::events::Removed::new(entity));
+        });
+        self.registry
+            .set_flag(cid, crate::component::FLAG_TRACK_REMOVED);
+    }
+
+    /// Зарегистрировать `on_add`-хук связи вида `R`: вызывается после
+    /// успешного `add_relation` с `(subject, target)`.
+    /// Один хук на вид; повторная регистрация — panic.
+    pub fn on_relation_add<R: crate::relations::RelationKind>(
+        &mut self,
+        hook: crate::relations::RelationHookFn,
+    ) {
+        let kind_idx = self.relations.get_or_register::<R>();
+        self.relations.set_on_add(kind_idx, hook);
+    }
+
+    /// Зарегистрировать `on_remove`-хук связи вида `R`: вызывается после
+    /// исчезновения пары — явный `remove_relation` ИЛИ вычистка при despawn
+    /// subject'а/target'а (включая каскад; entity к этому моменту могут быть
+    /// мертвы). Один хук на вид; повторная регистрация — panic.
+    pub fn on_relation_remove<R: crate::relations::RelationKind>(
+        &mut self,
+        hook: crate::relations::RelationHookFn,
+    ) {
+        let kind_idx = self.relations.get_or_register::<R>();
+        self.relations.set_on_remove(kind_idx, hook);
+    }
+
+    /// Диспетчер хуков: вызывается в КОНЦЕ публичных структурных операций.
+    /// Быстрый путь (нет подписчиков/очередь пуста) — одна проверка.
+    #[inline]
+    pub(crate) fn flush_hooks(&mut self) {
+        if self.hook_queue.is_empty() || self.hook_dispatch_active {
+            return;
+        }
+        self.flush_hooks_slow();
+    }
+
+    #[cold]
+    fn flush_hooks_slow(&mut self) {
+        self.hook_dispatch_active = true;
+        let mut i = 0;
+        // Хуки могут дописывать события в хвост очереди (вложенные структурные
+        // операции) — обычный while по растущему Vec, без рекурсии.
+        while i < self.hook_queue.len() {
+            let ev = self.hook_queue[i];
+            i += 1;
+            match ev {
+                HookEvent::Added(entity, cid) => {
+                    let hook = self.registry.hooks(cid).and_then(|h| h.on_add);
+                    if let Some(f) = hook {
+                        f(self, entity);
+                    }
+                }
+                HookEvent::Removed(entity, cid) => {
+                    let hook = self.registry.hooks(cid).and_then(|h| h.on_remove);
+                    if let Some(f) = hook {
+                        f(self, entity);
+                    }
+                }
+                HookEvent::RelationAdded {
+                    kind_idx,
+                    subject,
+                    target,
+                } => {
+                    if let Some(f) = self.relations.on_add_hook(kind_idx) {
+                        f(self, subject, target);
+                    }
+                }
+                HookEvent::RelationRemoved {
+                    kind_idx,
+                    subject,
+                    target,
+                } => {
+                    if let Some(f) = self.relations.on_remove_hook(kind_idx) {
+                        f(self, subject, target);
+                    }
+                }
+            }
+        }
+        self.hook_queue.clear();
+        self.hook_dispatch_active = false;
+    }
+
+    /// Поставить `Added`-хуки для свежесозданной entity по списку её
+    /// компонентов (вызывающий уже проверил `registry.any_flags()`).
+    fn queue_added_hooks(&mut self, entity: Entity, ids: &[ComponentId]) {
+        for &cid in ids {
+            if self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0 {
+                self.hook_queue.push(HookEvent::Added(entity, cid));
+            }
+        }
+    }
+
+    /// Уведомления о ПОТЕРЕ компонента: `on_remove`-хук в очередь +
+    /// немедленная эмиссия `Removed<T>`-события (вызывающий уже проверил
+    /// `registry.any_flags()`).
+    fn notify_removed(&mut self, entity: Entity, cid: ComponentId) {
+        let flags = self.registry.flags(cid);
+        if flags & crate::component::FLAG_ON_REMOVE != 0 {
+            self.hook_queue.push(HookEvent::Removed(entity, cid));
+        }
+        if flags & crate::component::FLAG_TRACK_REMOVED != 0 {
+            let emit = self.registry.hooks(cid).and_then(|h| h.emit_removed);
+            if let Some(f) = emit {
+                f(&mut self.events, entity);
+            }
+        }
+    }
+
     pub fn registry(&self) -> &ComponentRegistry {
         &self.registry
     }
@@ -405,6 +611,12 @@ impl World {
                 stats.empty_archetypes += 1;
             }
             stats.max_rows_in_archetype = stats.max_rows_in_archetype.max(rows);
+            stats.entity_bytes += arch.entities.capacity() * std::mem::size_of::<Entity>();
+            for col in &arch.columns {
+                let (data, ticks) = col.allocated_bytes();
+                stats.component_bytes += data;
+                stats.tick_bytes += ticks;
+            }
         }
         stats
     }
@@ -596,6 +808,10 @@ impl World {
                 row: row as u32,
             },
         );
+        if self.registry.any_flags() {
+            self.queue_added_hooks(entity, &ids);
+            self.flush_hooks();
+        }
         entity
     }
 
@@ -677,6 +893,7 @@ impl World {
                             std::ptr::copy_nonoverlapping(src, dst, col.item_size);
                         }
                         col.change_ticks.push(tick);
+                        col.added_ticks.push(tick);
                         col.len += 1;
                     }
                 }
@@ -685,6 +902,22 @@ impl World {
 
         self.entities
             .set_locations_batch(&entities, archetype_id, start_row as u32);
+
+        if self.registry.any_flags() {
+            let flagged: SmallVec<[ComponentId; 8]> = ids
+                .iter()
+                .copied()
+                .filter(|&cid| self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0)
+                .collect();
+            if !flagged.is_empty() {
+                for &entity in &entities {
+                    for &cid in &flagged {
+                        self.hook_queue.push(HookEvent::Added(entity, cid));
+                    }
+                }
+                self.flush_hooks();
+            }
+        }
         entities
     }
 
@@ -782,6 +1015,12 @@ impl World {
                 row: new_row,
             },
         );
+        if self.registry.any_flags()
+            && self.registry.flags(component_id) & crate::component::FLAG_ON_ADD != 0
+        {
+            self.hook_queue.push(HookEvent::Added(entity, component_id));
+            self.flush_hooks();
+        }
     }
 
     /// Вставить компонент по raw данным.
@@ -828,6 +1067,12 @@ impl World {
                 row: new_row,
             },
         );
+        if self.registry.any_flags()
+            && self.registry.flags(component_id) & crate::component::FLAG_ON_ADD != 0
+        {
+            self.hook_queue.push(HookEvent::Added(entity, component_id));
+            self.flush_hooks();
+        }
     }
 
     /// Групповая вставка компонентов одной entity (W2-1): ОДИН archetype move
@@ -853,10 +1098,18 @@ impl World {
         };
 
         // Финальный архетип — цепочкой add_edges, БЕЗ перемещения данных.
+        // Попутно собираем СВЕЖЕдобавленные компоненты с on_add-подпиской
+        // (дубликат в пачке второй раз сюда не попадает — компонент уже в
+        // target-составе).
+        let any_flags = self.registry.any_flags();
+        let mut added_hooked: SmallVec<[ComponentId; 8]> = SmallVec::new();
         let mut target = location.archetype_id;
         for &(cid, _, _) in parts {
             if !self.archetypes[target.0 as usize].has_component(cid) {
                 target = self.find_or_create_archetype_with(target, cid);
+                if any_flags && self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0 {
+                    added_hooked.push(cid);
+                }
             }
         }
 
@@ -880,6 +1133,10 @@ impl World {
             // дропом старого значения.
             unsafe { arch.write_or_replace_component(row, cid, ptr, tick) };
         }
+        for &cid in &added_hooked {
+            self.hook_queue.push(HookEvent::Added(entity, cid));
+        }
+        self.flush_hooks();
         true
     }
 
@@ -902,6 +1159,10 @@ impl World {
                 row: new_row,
             },
         );
+        if self.registry.any_flags() {
+            self.notify_removed(entity, component_id);
+            self.flush_hooks();
+        }
     }
 
     pub fn remove<T: Component>(&mut self, entity: Entity) -> bool {
@@ -926,6 +1187,10 @@ impl World {
                 row: new_row,
             },
         );
+        if self.registry.any_flags() {
+            self.notify_removed(entity, component_id);
+            self.flush_hooks();
+        }
         true
     }
 
@@ -961,6 +1226,15 @@ impl World {
                     for &s in &subjects {
                         self.subject_index.remove(s.index, pair);
                     }
+                    if self.relations.has_remove_hook(kind_idx) {
+                        for &s in &subjects {
+                            self.hook_queue.push(HookEvent::RelationRemoved {
+                                kind_idx,
+                                subject: s,
+                                target: cur,
+                            });
+                        }
+                    }
                     if self.relations.is_cascade(kind_idx) {
                         stack.extend(subjects);
                     }
@@ -971,6 +1245,13 @@ impl World {
             for pair in self.subject_index.take_all(cur.index) {
                 self.target_index
                     .remove(pair.kind_idx, pair.target.index, cur);
+                if self.relations.has_remove_hook(pair.kind_idx) {
+                    self.hook_queue.push(HookEvent::RelationRemoved {
+                        kind_idx: pair.kind_idx,
+                        subject: cur,
+                        target: pair.target,
+                    });
+                }
             }
 
             // ── Строка хранилища ───────────────────────────────
@@ -982,6 +1263,21 @@ impl World {
                 }
             };
             let arch_idx = location.archetype_id.0 as usize;
+
+            // Уведомления о потере ВСЕХ компонентов entity (on_remove /
+            // Removed<T>); хуки увидят entity уже мёртвой — после despawn.
+            if self.registry.any_flags() {
+                let ids: SmallVec<[ComponentId; 8]> = self.archetypes[arch_idx]
+                    .component_ids
+                    .iter()
+                    .copied()
+                    .filter(|&cid| self.registry.flags(cid) != 0)
+                    .collect();
+                for cid in ids {
+                    self.notify_removed(cur, cid);
+                }
+            }
+
             unsafe {
                 if let Some(displaced) =
                     self.archetypes[arch_idx].remove_row(location.row as usize)
@@ -997,6 +1293,7 @@ impl World {
             }
             self.entities.free(cur);
         }
+        self.flush_hooks();
         true
     }
 
@@ -1221,11 +1518,11 @@ impl World {
                         let dst = self.archetypes[to_idx].columns[to_col_idx].get_ptr(to_row);
                         std::ptr::copy_nonoverlapping(src, dst, item_size);
                     }
-                    let tick = self.archetypes[from_idx].columns[i].get_tick(from_row);
-                    self.archetypes[to_idx].columns[to_col_idx]
-                        .change_ticks
-                        .push(tick);
-                    self.archetypes[to_idx].columns[to_col_idx].len += 1;
+                    // Перенос строки сохраняет ОБА тика: archetype move не
+                    // «обновляет» ни Changed<T>, ни Added<T> (W3-1).
+                    let changed = self.archetypes[from_idx].columns[i].get_tick(from_row);
+                    let added = self.archetypes[from_idx].columns[i].get_added_tick(from_row);
+                    self.archetypes[to_idx].columns[to_col_idx].push_moved_ticks(changed, added);
 
                     // swap_remove без drop (данные перемещены в целевой архетип)
                     self.archetypes[from_idx].columns[i].swap_remove_no_drop(from_row);
@@ -2259,6 +2556,7 @@ impl<T: Component> Bundle for T {
                     );
                 }
                 col.change_ticks.push(tick);
+                col.added_ticks.push(tick);
                 col.len += 1;
             }
         }
@@ -2285,6 +2583,7 @@ impl<T: Component> Bundle for T {
                 std::ptr::copy_nonoverlapping(&self as *const T as *const u8, dst, col.item_size);
             }
             col.change_ticks.push(tick);
+            col.added_ticks.push(tick);
             col.len += 1;
         }
         std::mem::forget(self);
@@ -3202,5 +3501,282 @@ mod tests {
         assert!(world.has_component::<Pos>(minion));
         assert_eq!(world.get::<Team>(minion), Some(&Team(3)));
         assert!(!world.has_component::<Pos>(empty));
+    }
+}
+
+// ── W3-1: hooks/observers + Added/Removed ──────────────────────
+
+#[cfg(test)]
+mod hooks_and_added_tests {
+    use super::*;
+    use crate::query::{Added, Changed, Query, Read};
+
+    #[derive(Debug, PartialEq)]
+    struct Hp(u32);
+    impl Component for Hp {}
+
+    #[derive(Debug, PartialEq)]
+    struct Armor(u32);
+    impl Component for Armor {}
+
+    /// Лог вызовов хуков (ресурс — состояние подписчика живёт в ресурсах).
+    #[derive(Default)]
+    struct HookLog {
+        added: Vec<Entity>,
+        removed: Vec<Entity>,
+        removed_alive: Vec<bool>,
+        rel_added: Vec<(Entity, Entity)>,
+        rel_removed: Vec<(Entity, Entity)>,
+    }
+
+    fn log_world() -> World {
+        let mut w = World::new();
+        w.insert_resource(HookLog::default());
+        w
+    }
+
+    // ── Added<T> ───────────────────────────────────────────────
+
+    #[test]
+    fn added_detects_fresh_spawn_and_expires_next_frame() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+
+        let lr = world.last_run_tick();
+        let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(n, 1, "свежий spawn виден Added<T>");
+
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(n, 0, "на следующем кадре Added<T> истекает");
+    }
+
+    #[test]
+    fn added_survives_archetype_move_and_not_retriggered() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        // insert Armor двигает entity в новый архетип: Added<Armor> — да,
+        // Added<Hp> — НЕТ (added-тик пережил перенос).
+        world.insert(e, Armor(5));
+        let added_armor = Query::<(Added<Armor>, Read<Armor>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        let added_hp = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(added_armor, 1);
+        assert_eq!(added_hp, 0, "archetype move не «обновляет» Added");
+    }
+
+    #[test]
+    fn reinsert_existing_is_changed_but_not_added() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        world.insert(e, Hp(2)); // replace существующего
+        let added = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        let changed = Query::<(Changed<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(added, 0, "replace не перезапускает Added (как Bevy)");
+        assert_eq!(changed, 1, "replace помечает Changed");
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(2)));
+    }
+
+    #[test]
+    fn added_alignment_survives_swap_remove() {
+        let mut world = World::new();
+        let e0 = world.spawn((Hp(0),));
+        let _e1 = world.spawn((Hp(1),));
+        let _e2 = world.spawn((Hp(2),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        let e3 = world.spawn((Hp(3),)); // единственный «свежий»
+        world.despawn(e0); // swap_remove: e3 переедет на строку 0
+
+        let fresh: Vec<Entity> = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(
+            fresh,
+            vec![e3],
+            "swap_remove сохраняет выравнивание added-тиков"
+        );
+    }
+
+    // ── on_add / on_remove ─────────────────────────────────────
+
+    #[test]
+    fn on_add_fires_for_spawn_insert_and_commands_burst() {
+        let mut world = log_world();
+        world.on_add::<Hp>(|w, e| w.resource_mut::<HookLog>().added.push(e));
+
+        let a = world.spawn((Hp(1),)); // spawn
+        let b = world.spawn((Armor(0),));
+        world.insert(b, Hp(2)); // insert (archetype move)
+
+        // Commands-бёрст → insert_parts (групповой путь W2-1).
+        let c = world.spawn((Armor(0),));
+        let mut cmds = Commands::new();
+        cmds.insert(c, Hp(3));
+        cmds.insert(c, Armor(1)); // replace — НЕ on_add
+        cmds.apply(&mut world);
+
+        assert_eq!(world.resource::<HookLog>().added, vec![a, b, c]);
+    }
+
+    #[test]
+    fn on_add_fires_for_spawn_many() {
+        let mut world = log_world();
+        world.on_add::<Hp>(|w, e| w.resource_mut::<HookLog>().added.push(e));
+        let spawned = world.spawn_many(3, |i| (Hp(i as u32),));
+        assert_eq!(world.resource::<HookLog>().added, spawned);
+    }
+
+    #[test]
+    fn on_add_hook_can_do_structural_changes() {
+        // Хук дотягивает Armor каждому, кто получил Hp (прообраз required
+        // components D2-4). Вложенный insert идёт через ту же очередь.
+        let mut world = World::new();
+        world.on_add::<Hp>(|w, e| {
+            if !w.has_component::<Armor>(e) {
+                w.insert(e, Armor(100));
+            }
+        });
+        let e = world.spawn((Hp(1),));
+        assert_eq!(world.get::<Armor>(e), Some(&Armor(100)));
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(1)));
+    }
+
+    #[test]
+    fn on_remove_fires_for_remove_and_despawn_with_dead_entity() {
+        let mut world = log_world();
+        world.on_remove::<Hp>(|w, e| {
+            let alive = w.is_alive(e);
+            let log = w.resource_mut::<HookLog>();
+            log.removed.push(e);
+            log.removed_alive.push(alive);
+        });
+
+        let a = world.spawn((Hp(1),));
+        world.remove::<Hp>(a); // remove: entity жива
+        let b = world.spawn((Hp(2),));
+        world.despawn(b); // despawn: entity мертва
+
+        let log = world.resource::<HookLog>();
+        assert_eq!(log.removed, vec![a, b]);
+        assert_eq!(log.removed_alive, vec![true, false]);
+    }
+
+    #[test]
+    fn on_remove_fires_for_cascade_despawn() {
+        let mut world = log_world();
+        world.on_remove::<Hp>(|w, e| w.resource_mut::<HookLog>().removed.push(e));
+
+        let parent = world.spawn((Armor(0),));
+        let child = world.spawn((Hp(1),));
+        world.add_relation(child, crate::relations::ChildOf, parent);
+
+        world.despawn(parent); // каскад сносит child
+        assert!(!world.is_alive(child));
+        assert_eq!(world.resource::<HookLog>().removed, vec![child]);
+    }
+
+    #[test]
+    #[should_panic(expected = "уже зарегистрирован")]
+    fn double_on_add_registration_panics() {
+        let mut world = World::new();
+        world.on_add::<Hp>(|_, _| {});
+        world.on_add::<Hp>(|_, _| {});
+    }
+
+    // ── Relation hooks ─────────────────────────────────────────
+
+    #[test]
+    fn relation_hooks_fire_on_add_remove_and_despawn_cleanup() {
+        let mut world = log_world();
+        world.on_relation_add::<crate::relations::Owns>(|w, s, t| {
+            w.resource_mut::<HookLog>().rel_added.push((s, t))
+        });
+        world.on_relation_remove::<crate::relations::Owns>(|w, s, t| {
+            w.resource_mut::<HookLog>().rel_removed.push((s, t))
+        });
+
+        let owner = world.spawn((Hp(1),));
+        let item = world.spawn((Armor(0),));
+        world.add_relation(owner, crate::relations::Owns, item);
+        world.remove_relation(owner, crate::relations::Owns, item);
+
+        // Повторная связь — вычистка через despawn target'а.
+        world.add_relation(owner, crate::relations::Owns, item);
+        world.despawn(item);
+
+        let log = world.resource::<HookLog>();
+        assert_eq!(log.rel_added, vec![(owner, item), (owner, item)]);
+        assert_eq!(
+            log.rel_removed,
+            vec![(owner, item), (owner, item)],
+            "explicit remove + despawn-вычистка"
+        );
+    }
+
+    // ── track_removals / Removed<T> ────────────────────────────
+
+    #[test]
+    fn removed_events_emitted_for_remove_and_despawn() {
+        let mut world = World::new();
+        world.track_removals::<Hp>();
+
+        let a = world.spawn((Hp(1),));
+        let b = world.spawn((Hp(2),));
+        world.remove::<Hp>(a);
+        world.despawn(b);
+
+        world.flush_all_events();
+        let mut reader = world.event_reader::<crate::events::Removed<Hp>>();
+        let got: Vec<Entity> = reader.read().iter().map(|r| r.entity).collect();
+        assert_eq!(got, vec![a, b]);
+    }
+
+    // ── W3-5: память в archetype_stats ─────────────────────────
+
+    #[test]
+    fn archetype_stats_reports_memory() {
+        let mut world = World::new();
+        world.spawn_many(100, |i| (Hp(i as u32),));
+        let s = world.archetype_stats();
+        assert!(s.component_bytes >= 100 * std::mem::size_of::<Hp>());
+        assert!(s.tick_bytes >= 100 * 2 * std::mem::size_of::<Tick>()); // change + added
+        assert!(s.entity_bytes >= 100 * std::mem::size_of::<Entity>());
+        assert_eq!(
+            s.total_bytes(),
+            s.component_bytes + s.tick_bytes + s.entity_bytes
+        );
+    }
+
+    #[test]
+    fn untracked_component_emits_nothing() {
+        let mut world = World::new();
+        world.track_removals::<Hp>();
+        let e = world.spawn((Armor(1),));
+        world.despawn(e); // Armor не трекается
+
+        world.flush_all_events();
+        let mut reader = world.event_reader::<crate::events::Removed<Hp>>();
+        assert_eq!(reader.read().iter().count(), 0);
     }
 }

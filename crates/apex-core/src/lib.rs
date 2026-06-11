@@ -42,17 +42,19 @@ pub use apex_macros::Component;
 pub use archetype::ArchetypeId;
 pub use commands::Commands;
 pub use component::{
-    make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentId,
+    make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentHookFn, ComponentId,
     ComponentRegistry, ComponentSerdeFns, Serializable, Tick,
 };
 pub use entity::Entity;
-pub use events::{DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard};
+pub use events::{
+    DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard, Removed,
+};
 pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
-    Changed, Maybe, MaybeWrite, Mut, Or, Query, Read, Ref, With, Without, WorldQuery, Write,
+    Added, Changed, Maybe, MaybeWrite, Mut, Or, Query, Read, Ref, With, Without, WorldQuery, Write,
 };
-pub use relations::{ChildOf, Owns, RelationKind};
+pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
@@ -71,14 +73,16 @@ pub mod prelude {
     pub use crate::commands::Commands;
     pub use crate::component::{Component as ComponentTrait, Serializable, Tick};
     pub use crate::entity::Entity;
-    pub use crate::events::{DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard};
+    pub use crate::events::{
+        DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard, Removed,
+    };
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Read, Ref, With, Without,
+        Added, Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Read, Ref, With, Without,
         WorldQuery, Write,
     };
-    pub use crate::relations::{ChildOf, Owns, RelationKind};
+    pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
     pub use crate::resources::Resources;
     pub use crate::system;
     pub use crate::system_param::{

@@ -378,6 +378,7 @@ Query — основной способ итерации по компонент
 | `With<T>` | — | `()` | Фильтр: entity должен иметь T |
 | `Without<T>` | — | `()` | Фильтр: entity не должен иметь T |
 | `Changed<T>` | — | `()` | Фильтр: изменённые с прошлого запуска; комбинируется с `Read<T>` |
+| `Added<T>` | — | `()` | Фильтр: компонент ДОБАВЛЕН entity с прошлого запуска (W3-1, §4.3.4) |
 | `Maybe<T>` | — | `Option<&T>` | Чтение, если компонент есть |
 | `MaybeWrite<T>` | — | `Option<Mut<T>>` | Запись, если компонент есть |
 | `Or<(F1, F2, …)>` | — | `()` | Дизъюнкция фильтров: строка проходит, если проходит хотя бы одна ветка (§4.3) |
@@ -545,8 +546,8 @@ world.query_typed::<(Read<Velocity>, Write<Position>)>()
 
 Правила:
 - доступно формам `Read`/`Write`/`&T`/`&mut T`/`Maybe`/`MaybeWrite`/`With`/`Without` и кортежам
-  (трейт `DenseQuery`); **`Changed<T>` не компилируется** — построчный фильтр несовместим со
-  слайсами, для него остаётся `for_each`;
+  (трейт `DenseQuery`); **`Changed<T>` и `Added<T>` не компилируются** — построчные фильтры
+  несовместимы со слайсами, для них остаётся `for_each`;
 - **контракт change-detection**: write-слайс стампит change-tick **всему выданному диапазону**
   в момент выдачи («взял слайс на запись = весь диапазон changed»); точечный стампинг через
   `Mut<T>` в обычном `for_each` не изменился;
@@ -575,6 +576,29 @@ self.q.query_with_tick(&world, last_run).for_each(|e, item| { /* ... */ });
 
 Стейт привязан к миру по `World::id()`: применение к другому миру (main/render/isolated)
 прозрачно перестраивает его; ленивая регистрация компонентов доразрешается сама.
+
+### 4.3.4 `Added<T>` и наблюдение за составом (W3-1)
+
+`Added<T>` — фильтр «компонент **добавлен** entity после `last_run`» (паритет Bevy). Каждая
+строка хранит отдельный added-tick рядом с change-tick'ом:
+
+```rust
+// Только что получившие PhysicsBody (spawn или insert):
+Query::<(Added<PhysicsBody>, Read<PhysicsBody>)>::new_with_tick(&world, last_run)
+    .for_each(|e, ((), body)| { /* инициализация */ });
+
+// Внутри систем база last_run подставляется автоматически (как у Changed).
+```
+
+Семантика added-тика:
+- ставится при **появлении** компонента у entity (spawn / insert нового);
+- **переживает archetype move**: insert/remove соседних компонентов entity не «обновляет» Added;
+- `insert` поверх существующего компонента (replace) — это `Changed`, но **не** `Added` (как Bevy);
+- мутации (`Mut<T>`) added-tick не трогают;
+- построчный фильтр: с `for_each_chunk`/`DenseQuery` не компилируется (как `Changed`).
+
+Помимо фильтра, есть **хуки состава** и **события удаления** — см. §5.2.10 (`Removed<T>`),
+§16 (быстрый справочник API `on_add`/`on_remove`/`track_removals`) и §8 (хуки relations).
 
 ### 4.4 `QueryBuilder` (динамический запрос)
 
@@ -935,6 +959,39 @@ queue.send_batch_sync((0..100).map(|i| DamageEvent { target: e, amount: i as f32
 | `flush_sync(&mut self)` | Слить `sync_pending` в основной `pending` |
 
 > **Примечание:** `update()` вызывается Scheduler'ом после каждого Stage (или через `world.flush_all_events()`). Ручной вызов `flush_sync()` нужен только если требуется прочитать события до следующего flush.
+
+#### 5.2.10 `Removed<T>` — события удаления компонентов + хуки состава (W3-1)
+
+Аналог Bevy `RemovedComponents`, реализованный поверх обычных событий (per-reader курсоры —
+без дублей и пропусков, обычная дисциплина флаша):
+
+```rust
+world.track_removals::<PhysicsBody>();   // включить (идемпотентно)
+
+// ... remove::<PhysicsBody>(e) или despawn(e) где-то в кадре ...
+
+// Чтение — как любое событие: &[Removed<PhysicsBody>] в system! или reader:
+let mut reader = world.event_reader::<Removed<PhysicsBody>>();
+for r in reader.read().iter() {
+    physics.remove_body(r.entity);       // при despawn entity уже мертва
+}
+```
+
+Для невключённых типов удаления не записываются — нулевая стоимость.
+
+**Хуки состава** — синхронные наблюдатели (`fn(&mut World, Entity)`, без захватов; один хук
+на компонент на вид события — для нескольких подписчиков используйте события):
+
+```rust
+world.on_add::<MeshRenderer>(|w, e| { /* появился у e (spawn/insert нового) */ });
+world.on_remove::<MeshRenderer>(|w, e| { /* e потеряла компонент (remove/despawn) */ });
+```
+
+Дисциплина вызова: структурная операция **сначала завершается**, затем диспетчер зовёт хуки на
+консистентном мире — хук может делать любые операции, включая структурные (вложенные хуки
+встают в ту же очередь, без рекурсии). `on_add` НЕ дёргается на replace существующего
+компонента (это `Changed`, см. §4.3.4); `on_remove` вызывается после удаления — значение
+компонента уже уничтожено; при `despawn` entity уже мертва (`is_alive == false`).
 
 ### 5.3 Event Pipeline — конвейерная обработка событий
 
@@ -2308,6 +2365,24 @@ system! {
 
 ---
 
+### 8.7 Хуки связей (W3-1)
+
+Наблюдатели за появлением/исчезновением пар вида `R` (один хук на вид на событие):
+
+```rust
+world.on_relation_add::<ChildOf>(|w, subject, target| {
+    /* пара (subject ─ChildOf→ target) добавлена */
+});
+world.on_relation_remove::<ChildOf>(|w, subject, target| {
+    /* пара исчезла: явный remove_relation ИЛИ вычистка при despawn
+       subject'а/target'а (включая каскад) — entity могут быть уже мертвы */
+});
+```
+
+Дисциплина та же, что у хуков компонентов (§5.2.10): вызов после завершения операции на
+консистентном мире, структурные операции из хука разрешены. Без подписчиков — нулевая
+стоимость на горячих путях `add_relation`/despawn (один bool-гейт).
+
 ## 9. EntityTemplate
 
 EntityTemplate — программные шаблоны сущностей. Позволяют определить многократно используемый «рецепт» создания entity с заданными компонентами, параметрами и родительской связью.
@@ -3658,8 +3733,13 @@ fn main() {
 | `register_component::<T>()` | Зарегистрировать компонент |
 | `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
+| `on_add::<T>(fn)` | Хук «компонент T появился у entity» (W3-1, §5.2.10); один хук на компонент, fn-pointer без захватов |
+| `on_remove::<T>(fn)` | Хук «entity потеряла T» (remove/despawn; значение уже уничтожено, при despawn entity мертва) |
+| `track_removals::<T>()` | Включить эмиссию событий `Removed<T>` при потере компонента (аналог Bevy `RemovedComponents`) |
+| `on_relation_add::<R>(fn)` | Хук появления пары вида R: `fn(&mut World, subject, target)` (§8.7) |
+| `on_relation_remove::<R>(fn)` | Хук исчезновения пары (явный remove ИЛИ despawn-вычистка, вкл. каскад) |
 | `entity_count()` | Количество живых entity → `usize` |
-| `archetype_stats()` | Сводка по архетипам → `ArchetypeStats` (всего/пустых/строк/максимум; CR-M4) |
+| `archetype_stats()` | Сводка по архетипам → `ArchetypeStats` (всего/пустых/строк/максимум + память: `component_bytes`/`tick_bytes`/`entity_bytes`, `total_bytes()`; CR-M4, W3-5) |
 | `is_alive(entity)` | Проверить, жив ли entity → `bool` |
 | `has_component::<T>(entity)` | Проверить наличие компонента у entity (v0.1.0) → `bool` |
 | `clear_entities()` | Удалить все entity, сохранив ресурсы и события (v0.1.0) |
@@ -3679,9 +3759,20 @@ fn main() {
 
 **Плотная итерация** (W2-0.5): `for_each_chunk` / `par_for_each_chunk` на `Query` и
 `CachedQuery` — слайсы колонок (`&[T]`/`&mut [T]`/`Option<&[T]>`), write-слайс стампит
-change-tick всему диапазону; `Changed<T>` не компилируется (§4.3.1).
+change-tick всему диапазону; `Changed<T>`/`Added<T>` не компилируются (§4.3.1).
 
 **`Or<(F1,…)>`** (W2-5): дизъюнкция фильтров в запросе (§4.3).
+
+**`Added<T>`** (W3-1): фильтр «компонент добавлен после last_run»; переживает archetype
+move, replace не перезапускает; с плотной итерацией не компилируется (§4.3.4).
+
+**Generation-wrap (W3-3):** слот entity, чей generation дошёл до `u32::MAX`, ретируется
+(не переиспользуется) — застрявший хэндл прошлой «жизни» слота никогда не укажет на чужую
+entity (ABA исключён; цена — одна запись на 2³² переиспользований слота).
+
+**Stateful-системы и ASD (W3-4):** системы с состоянием (`system!` со `struct {…}`,
+замыкания с захватами) не делятся row-split'ом — один вызов `run` на кадр на весь
+SubWorld (внутри можно `par_for_each`). Параллельность МЕЖДУ системами не ограничена.
 
 **Утилита `apex_core::IndexStamp`** (CR-M4): генерационная «карта посещений» по
 `entity.index()` — O(1) `mark`/`contains` без хэширования, очистка — `next_generation()`.

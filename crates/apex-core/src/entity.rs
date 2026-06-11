@@ -189,7 +189,17 @@ impl EntityAllocator {
         }
         record.generation = record.generation.wrapping_add(1);
         record.clear_location();
-        self.free_list.push(entity.index);
+        // W3-3: защита от ABA при wrap'е generation. free_list — LIFO, т.е.
+        // churn концентрируется на ОДНОМ слоте (spawn+despawn временной entity
+        // каждый кадр ≈ 2³² переиспользований за ~198 дней @250Hz). Слот,
+        // дошедший до u32::MAX, РЕТИРУЕТСЯ (не возвращается в free_list):
+        // ни одно значение generation не выдаётся дважды → застрявший хэндл
+        // прошлой жизни никогда не «оживёт» на чужой entity. Цена — одна
+        // запись EntityRecord на 2³² переиспользований (PLACEHOLDER использует
+        // generation == u32::MAX — он и так никогда не жив).
+        if record.generation != u32::MAX {
+            self.free_list.push(entity.index);
+        }
         true
     }
 
@@ -312,6 +322,53 @@ mod tests {
         let batch_indices: std::collections::HashSet<u32> = batch.iter().map(|e| e.index).collect();
         assert!(batch_indices.contains(&entities[1].index));
         assert!(batch_indices.contains(&entities[3].index));
+    }
+
+    // ── W3-3: generation-wrap / ABA ────────────────────────────
+
+    #[test]
+    fn slot_at_max_generation_is_retired_not_reused() {
+        let mut alloc = EntityAllocator::new();
+        let e = alloc.allocate();
+        alloc.set_location(e, make_loc());
+
+        // Симулируем 2³²−2 переиспользований слота: догоняем generation
+        // до предпоследнего значения (поля приватны — тест в том же модуле).
+        alloc.records[e.index as usize].generation = u32::MAX - 1;
+        let last_life = Entity::from_raw_parts(e.index, u32::MAX - 1);
+        alloc.set_location(last_life, make_loc());
+        assert!(alloc.is_alive(last_life));
+
+        // free доводит generation до MAX → слот ретирован.
+        assert!(alloc.free(last_life));
+        assert!(!alloc.is_alive(last_life));
+        assert!(
+            alloc.free_list.is_empty(),
+            "слот на границе generation не возвращается в free_list"
+        );
+
+        // Следующий allocate берёт НОВЫЙ индекс, а не ретированный слот.
+        let fresh = alloc.allocate();
+        assert_ne!(fresh.index, e.index);
+
+        // Стародавний хэндл первой жизни слота (generation 0) мёртв навсегда —
+        // ABA невозможен: ни is_alive, ни get_location не дают чужую entity.
+        assert!(!alloc.is_alive(e));
+        assert!(alloc.get_location(e).is_none());
+    }
+
+    #[test]
+    fn get_by_index_dead_slot_returns_none() {
+        let mut alloc = EntityAllocator::new();
+        let e = alloc.allocate();
+        alloc.set_location(e, make_loc());
+        assert_eq!(alloc.get_by_index(e.index), Some(e));
+        alloc.free(e);
+        assert_eq!(
+            alloc.get_by_index(e.index),
+            None,
+            "слот без location (свободный/ретированный) не выдаёт entity"
+        );
     }
 
     #[test]

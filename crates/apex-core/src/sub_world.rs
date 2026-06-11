@@ -228,12 +228,13 @@ impl<'w> SubWorld<'w> {
             let w = self.world_ref();
             let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
-            let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
-                end.min(rr_e)
-            } else {
-                end
-            };
-            for row in start..effective_end {
+            // Чанки считаются в координатах ДИАПАЗОНА (0..len) — переводим в
+            // глобальные строки архетипа смещением r_start (W3-4: раньше
+            // смещение терялось и сплит-задача ходила по чужим строкам).
+            let (r_start, r_end) = self.arch_row_range(arch_idx).unwrap_or((0, usize::MAX));
+            let row_start = r_start + start;
+            let row_end = (r_start + end).min(r_end).min(entities.len());
+            for row in row_start..row_end {
                 f(entities[row]);
             }
         });
@@ -283,12 +284,11 @@ impl<'w> SubWorld<'w> {
             let w = self.world_ref();
             let arch = unsafe { &*w.archetype_ptr(arch_idx) };
             let entities = arch.entities();
-            let effective_end = if let Some((_rr_s, rr_e)) = self.arch_row_range(arch_idx) {
-                end.min(rr_e)
-            } else {
-                end
-            };
-            for row in start..effective_end {
+            // См. par_for_each_entity: чанк → глобальные строки через r_start.
+            let (r_start, r_end) = self.arch_row_range(arch_idx).unwrap_or((0, usize::MAX));
+            let row_start = r_start + start;
+            let row_end = (r_start + end).min(r_end).min(entities.len());
+            for row in row_start..row_end {
                 f(entities[row], row);
             }
         });

@@ -102,6 +102,37 @@ pub struct ComponentSerdeFns {
     pub format: &'static str,
 }
 
+// ── Хуки компонентов (W3-1) ────────────────────────────────────
+
+/// Хук состава: вызывается ПОСЛЕ завершения структурной операции, когда мир
+/// консистентен (`on_add` — компонент уже у entity; `on_remove` — компонента
+/// уже нет; при `despawn` entity уже мертва — `is_alive` вернёт `false`).
+///
+/// Хук получает `&mut World` и может делать любые операции, включая
+/// структурные — вложенные хуки ставятся в ту же очередь и обрабатываются
+/// тем же диспетчером (без рекурсии). Только не-захватывающие функции
+/// (fn-pointer): состояние подписчика живёт в ресурсах/компонентах.
+/// Один хук на компонент на вид события; для нескольких подписчиков
+/// используйте события ([`World::track_removals`](crate::World::track_removals)).
+pub type ComponentHookFn = fn(&mut crate::World, crate::Entity);
+
+/// Эмиттер события `Removed<T>` — мономорфизированный fn-pointer,
+/// ставится `World::track_removals::<T>()`.
+pub(crate) type EmitRemovedFn = fn(&mut crate::events::EventRegistry, crate::Entity);
+
+/// Биты `ComponentRegistry::flags` — быстрый «есть ли подписчики» без
+/// hashmap-lookup'а на горячих структурных путях.
+pub(crate) const FLAG_ON_ADD: u8 = 1;
+pub(crate) const FLAG_ON_REMOVE: u8 = 2;
+pub(crate) const FLAG_TRACK_REMOVED: u8 = 4;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ComponentHooks {
+    pub on_add: Option<ComponentHookFn>,
+    pub on_remove: Option<ComponentHookFn>,
+    pub emit_removed: Option<EmitRemovedFn>,
+}
+
 // ── ComponentInfo ──────────────────────────────────────────────
 
 pub struct ComponentInfo {
@@ -216,9 +247,18 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
 
 pub struct ComponentRegistry {
     type_to_id: FxHashMap<TypeId, ComponentId>,
-    /// HashMap вместо Vec — поддержка произвольных ID (relations).
+    /// HashMap вместо Vec — историческое решение (произвольные ID relations
+    /// до CR-M1); ids сейчас плотные от 0.
     by_id: FxHashMap<u32, ComponentInfo>,
     next_id: u32,
+    /// Биты подписок per-ComponentId ([`FLAG_ON_ADD`]/[`FLAG_ON_REMOVE`]/
+    /// [`FLAG_TRACK_REMOVED`]) — индекс = `ComponentId.0` (ids плотные).
+    /// Горячие структурные пути сначала смотрят [`any_flags`](Self::any_flags)
+    /// (один bool), потом бит — hashmap-lookup'ов нет.
+    flags: Vec<u8>,
+    /// Сами хуки — только для компонентов с ненулевыми flags.
+    hooks: FxHashMap<u32, ComponentHooks>,
+    any_flags: bool,
 }
 
 impl ComponentRegistry {
@@ -227,7 +267,42 @@ impl ComponentRegistry {
             type_to_id: FxHashMap::default(),
             by_id: FxHashMap::default(),
             next_id: 0,
+            flags: Vec::new(),
+            hooks: FxHashMap::default(),
+            any_flags: false,
         }
+    }
+
+    // ── Хуки (W3-1) ────────────────────────────────────────────
+
+    /// Есть ли в мире хоть один подписчик на состав (fast-path гейт).
+    #[inline]
+    pub(crate) fn any_flags(&self) -> bool {
+        self.any_flags
+    }
+
+    /// Биты подписок компонента (0 — подписчиков нет).
+    #[inline]
+    pub(crate) fn flags(&self, cid: ComponentId) -> u8 {
+        self.flags.get(cid.0 as usize).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn set_flag(&mut self, cid: ComponentId, flag: u8) {
+        let idx = cid.0 as usize;
+        if self.flags.len() <= idx {
+            self.flags.resize(idx + 1, 0);
+        }
+        self.flags[idx] |= flag;
+        self.any_flags = true;
+    }
+
+    #[inline]
+    pub(crate) fn hooks(&self, cid: ComponentId) -> Option<&ComponentHooks> {
+        self.hooks.get(&cid.0)
+    }
+
+    pub(crate) fn hooks_mut(&mut self, cid: ComponentId) -> &mut ComponentHooks {
+        self.hooks.entry(cid.0).or_default()
     }
 
     /// Регистрирует все компоненты, объявленные через `#[derive(Component)]`.
@@ -291,11 +366,6 @@ impl ComponentRegistry {
             }
         }
         id
-    }
-
-    /// Зарегистрировать компонент с заранее известным ID (для relations).
-    pub fn register_raw(&mut self, id: ComponentId, info: ComponentInfo) {
-        self.by_id.entry(id.0).or_insert(info);
     }
 
     pub fn get_id<T: Component>(&self) -> Option<ComponentId> {

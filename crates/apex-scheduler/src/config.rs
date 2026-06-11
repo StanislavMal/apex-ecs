@@ -114,6 +114,11 @@ impl SystemConfig {
         if S::NEEDS_WHOLE_WORLD {
             access.needs_whole_world = true;
         }
+        // W3-4: система с состоянием → без ASD row-split (run(&mut self)
+        // одного экземпляра нельзя звать из нескольких задач конкурентно).
+        if std::mem::size_of::<S>() > 0 {
+            access.stateful = true;
+        }
         struct Adapter<S: AutoSystem>(S);
         impl<S: AutoSystem + 'static> ParSystem for Adapter<S> {
             fn access() -> AccessDescriptor { unreachable!() }
@@ -162,10 +167,15 @@ impl SystemConfig {
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
+        let mut access = AccessDescriptor::new();
+        // W3-4: замыкание с захватами = состояние → без ASD row-split.
+        if std::mem::size_of::<F>() > 0 {
+            access.stateful = true;
+        }
         Self {
             name: name.into(),
             kind: SystemConfigKind::ParClosure {
-                access: AccessDescriptor::new(),
+                access,
                 func: Box::new(f),
             },
             condition: ConditionTree::default(),
@@ -179,6 +189,11 @@ impl SystemConfig {
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
+        let mut access = access;
+        // W3-4: замыкание с захватами = состояние → без ASD row-split.
+        if std::mem::size_of::<F>() > 0 {
+            access.stateful = true;
+        }
         Self {
             name: name.into(),
             kind: SystemConfigKind::ParClosure { access, func: Box::new(f) },

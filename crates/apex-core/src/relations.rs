@@ -427,6 +427,11 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
 
 // ── RelationRegistry ───────────────────────────────────────────
 
+/// Хук связи (W3-1): `fn(&mut World, subject, target)` — вызывается после
+/// завершения операции на консистентном мире (despawn-вычистка: entity могут
+/// быть уже мертвы). Только fn-pointer; один хук на вид на событие.
+pub type RelationHookFn = fn(&mut crate::world::World, Entity, Entity);
+
 pub struct RelationRegistry {
     type_to_idx: FxHashMap<TypeId, u32>,
     cascade_flags: Vec<bool>,
@@ -436,6 +441,10 @@ pub struct RelationRegistry {
     /// type_name → kind_idx (для десериализации).
     name_to_idx: FxHashMap<String, u32>,
     next_idx: u32,
+    /// Хуки per kind_idx (W3-1); `any_hooks` — fast-path гейт горячих путей.
+    on_add_hooks: Vec<Option<RelationHookFn>>,
+    on_remove_hooks: Vec<Option<RelationHookFn>>,
+    any_hooks: bool,
 }
 
 impl RelationRegistry {
@@ -446,6 +455,9 @@ impl RelationRegistry {
             idx_to_name: Vec::new(),
             name_to_idx: FxHashMap::default(),
             next_idx: 0,
+            on_add_hooks: Vec::new(),
+            on_remove_hooks: Vec::new(),
+            any_hooks: false,
         }
     }
 
@@ -459,6 +471,8 @@ impl RelationRegistry {
         self.type_to_idx.insert(type_id, idx);
         self.cascade_flags
             .push(R::cascade_delete_on_target_despawn());
+        self.on_add_hooks.push(None);
+        self.on_remove_hooks.push(None);
 
         // Регистрируем name для сериализации
         let name = std::any::type_name::<R>().to_string();
@@ -466,6 +480,55 @@ impl RelationRegistry {
         self.name_to_idx.insert(name, idx);
 
         idx
+    }
+
+    // ── Хуки связей (W3-1) ─────────────────────────────────────
+
+    pub(crate) fn set_on_add(&mut self, kind_idx: u32, hook: RelationHookFn) {
+        let slot = &mut self.on_add_hooks[kind_idx as usize];
+        assert!(
+            slot.is_none(),
+            "on_relation_add-хук для вида {} уже зарегистрирован (один хук на вид)",
+            self.idx_to_name[kind_idx as usize]
+        );
+        *slot = Some(hook);
+        self.any_hooks = true;
+    }
+
+    pub(crate) fn set_on_remove(&mut self, kind_idx: u32, hook: RelationHookFn) {
+        let slot = &mut self.on_remove_hooks[kind_idx as usize];
+        assert!(
+            slot.is_none(),
+            "on_relation_remove-хук для вида {} уже зарегистрирован (один хук на вид)",
+            self.idx_to_name[kind_idx as usize]
+        );
+        *slot = Some(hook);
+        self.any_hooks = true;
+    }
+
+    #[inline]
+    pub(crate) fn on_add_hook(&self, kind_idx: u32) -> Option<RelationHookFn> {
+        if !self.any_hooks {
+            return None;
+        }
+        self.on_add_hooks.get(kind_idx as usize).copied().flatten()
+    }
+
+    #[inline]
+    pub(crate) fn on_remove_hook(&self, kind_idx: u32) -> Option<RelationHookFn> {
+        if !self.any_hooks {
+            return None;
+        }
+        self.on_remove_hooks
+            .get(kind_idx as usize)
+            .copied()
+            .flatten()
+    }
+
+    /// Быстрая проверка «у вида есть on_remove-хук» (despawn-вычистка).
+    #[inline]
+    pub(crate) fn has_remove_hook(&self, kind_idx: u32) -> bool {
+        self.on_remove_hook(kind_idx).is_some()
     }
 
     pub fn get_idx<R: RelationKind>(&self) -> Option<u32> {
@@ -545,6 +608,14 @@ impl World {
         let pair = RelationPair { kind_idx, target };
         if self.subject_index.insert(subject.index, pair) {
             self.target_index.add(kind_idx, target, subject);
+            if self.relations.on_add_hook(kind_idx).is_some() {
+                self.hook_queue.push(crate::world::HookEvent::RelationAdded {
+                    kind_idx,
+                    subject,
+                    target,
+                });
+                self.flush_hooks();
+            }
         }
     }
 
@@ -556,6 +627,15 @@ impl World {
         let pair = RelationPair { kind_idx, target };
         if self.subject_index.remove(subject.index, pair) {
             self.target_index.remove(kind_idx, target.index, subject);
+            if self.relations.on_remove_hook(kind_idx).is_some() {
+                self.hook_queue
+                    .push(crate::world::HookEvent::RelationRemoved {
+                        kind_idx,
+                        subject,
+                        target,
+                    });
+                self.flush_hooks();
+            }
         }
     }
 
