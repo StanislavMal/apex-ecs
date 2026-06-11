@@ -1057,7 +1057,10 @@ pub(crate) struct ArchState<S> {
 
 pub struct Query<'w, Q: WorldQuery> {
     world: &'w World,
-    archetypes: Vec<ArchState<Q::State>>,
+    /// Inline до 8 архетипов (D2-1): типичный системный запрос матчит 1-5
+    /// архетипов — конструктор без heap-аллокации (plain-fn `Query`-параметр
+    /// строится на КАЖДЫЙ вызов системы).
+    archetypes: smallvec::SmallVec<[ArchState<Q::State>; 8]>,
     #[allow(dead_code)]
     last_run: Tick,
     /// Ограничения строк для row-level splits.
@@ -1094,7 +1097,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
 
-        let archetypes: Vec<ArchState<Q::State>> = arch_indices
+        let archetypes: smallvec::SmallVec<[ArchState<Q::State>; 8]> = arch_indices
             .iter()
             .copied()
             .filter(|&arch_idx| arch_filter(arch_idx))

@@ -64,8 +64,26 @@ use std::marker::PhantomData;
 // ── Res / ResMut ───────────────────────────────────────────────
 
 /// Иммутабельный доступ к ресурсу.
+///
+/// Поле скрыто (D2-1): публичный `.0` ПЕРЕКРЫВАЛ Deref — `res.0` на ресурсе-
+/// кортеже выдавал `&T` вместо поля ресурса (футган для Bevy-мигранта).
+/// Доступ — через Deref (`*res`, `res.field`) или [`into_inner`](Self::into_inner).
 #[derive(Clone, Copy)]
-pub struct Res<'w, T: Send + Sync + 'static>(pub &'w T);
+pub struct Res<'w, T: Send + Sync + 'static>(pub(crate) &'w T);
+
+impl<'w, T: Send + Sync + 'static> Res<'w, T> {
+    /// Сконструировать из ссылки (низкоуровневый API планировщика/мостов).
+    #[inline]
+    pub fn new(value: &'w T) -> Self {
+        Self(value)
+    }
+
+    /// Извлечь `&T` с полным лайфтаймом мира.
+    #[inline]
+    pub fn into_inner(self) -> &'w T {
+        self.0
+    }
+}
 
 impl<T: Send + Sync + 'static> std::ops::Deref for Res<'_, T> {
     type Target = T;
@@ -380,6 +398,12 @@ pub trait SystemParam {
 
     /// Извлечь значение из контекста системы.
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w>;
+
+    /// Параметр использует отложенные команды (`Commands`) — планировщик
+    /// вставляет auto-apply sync-точку после системы (D2-1).
+    fn has_deferred() -> bool {
+        false
+    }
 }
 
 // ── impl SystemParam для маркеров ресурсов ────────────────────
@@ -466,6 +490,97 @@ impl SystemParam for CommandsParam {
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
         ctx.commands()
     }
+    fn has_deferred() -> bool {
+        true
+    }
+}
+
+// ── Bevy-style параметры plain-fn систем (D2-1) ────────────────
+//
+// В plain-fn пути (см. [`SystemParamFunction`](crate::fn_system::SystemParamFunction))
+// параметром служит САМ пользовательский тип: `Res<T>`, `ResMut<T>`,
+// `Query<Q>`, `EventReader<E>`, `EventWriter<E>`, `&mut Commands` — семантика
+// Bevy 1:1 (в отличие от `system!`, где `&T` означает ресурс).
+// Item обязан быть тем же конструктором типа, что и параметр (двойной
+// Fn-баунд SystemParamFunction связывает обе формы).
+
+impl<'a, T: Send + Sync + 'static> SystemParam for Res<'a, T> {
+    type Item<'w> = Res<'w, T>;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new().read::<T>()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Res<'w, T> {
+        ctx.resource::<T>()
+    }
+}
+
+impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
+    type Item<'w> = ResMut<'w, T>;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new().write::<T>()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
+        ctx.resource_mut::<T>()
+    }
+}
+
+impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::query::Query<'a, Q> {
+    type Item<'w> = crate::query::Query<'w, Q>;
+    fn access() -> AccessDescriptor {
+        Q::system_access()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, Q> {
+        // База Changed/Added — last_run_tick мира (граница прошлого кадра),
+        // как у ctx.query() (TD-9).
+        let sub = &ctx.sub_worlds[0];
+        let last_run = sub.world().last_run_tick();
+        crate::query::Query::from_sub_world(sub, last_run)
+    }
+}
+
+impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::CachedQuery<'a, Q> {
+    type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    fn access() -> AccessDescriptor {
+        Q::system_access()
+    }
+    fn fetch<'w>(
+        ctx: &'w crate::world::SystemContext<'w>,
+    ) -> crate::world::CachedQuery<'w, Q> {
+        ctx.query::<Q>()
+    }
+}
+
+impl<'a, E: Send + Sync + 'static> SystemParam for EventReader<'a, E> {
+    type Item<'w> = EventReader<'w, E>;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new().read_event::<E>()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
+        ctx.event_reader::<E>()
+    }
+}
+
+impl<'a, E: Send + Sync + 'static> SystemParam for EventWriter<'a, E> {
+    type Item<'w> = EventWriter<'w, E>;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new().write_event::<E>()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventWriter<'w, E> {
+        ctx.event_writer::<E>()
+    }
+}
+
+impl SystemParam for &mut crate::commands::Commands {
+    type Item<'w> = &'w mut crate::commands::Commands;
+    fn access() -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
+        ctx.commands()
+    }
+    fn has_deferred() -> bool {
+        true
+    }
 }
 
 // ── impl SystemParam для () (нет параметров) ──────────────────
@@ -490,6 +605,9 @@ macro_rules! impl_system_param_tuple {
             }
             fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
                 ( $($P::fetch(ctx),)+ )
+            }
+            fn has_deferred() -> bool {
+                false $( || $P::has_deferred() )+
             }
         }
     };

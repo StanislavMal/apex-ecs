@@ -66,8 +66,8 @@ pub mod pipeline;
 pub mod stage;
 
 pub use config::{
-    par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, IntoScheduleConfigs,
-    SystemConfig,
+    par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemMarker,
+    IntoScheduleConfigs, SystemConfig,
 };
 
 mod config;
@@ -5176,6 +5176,131 @@ mod tests {
         // Pos and Vel — no conflict, should be same stage
         let same_stage = stages.iter().any(|s| s.system_ids.len() >= 2);
         assert!(same_stage, "opaque condition should not cause conflicts");
+    }
+
+    // ── D2-1: plain-fn системы (Bevy-стиль) ────────────────────
+
+    /// Обычные функции с Bevy-параметрами регистрируются bare-идентификаторами
+    /// и работают: Res/ResMut/Query<(&T, &mut U)>/EventWriter/EventReader.
+    #[test]
+    fn plain_fn_systems_bevy_style() {
+        use apex_core::query::Query as Q;
+
+        // Именованное поле: `.0` на Res разрешается в публичный кортежный
+        // филд самого Res (&T), а не в Deref — известная шероховатость.
+        struct Dt {
+            step: f32,
+        }
+        struct Moved(u32);
+        #[derive(Clone, Copy)]
+        struct Ping(u32);
+
+        fn movement(dt: Res<Dt>, q: Q<(&Vel, &mut Pos)>) {
+            q.for_each(|_, (v, mut p)| {
+                p.x += v.x * dt.step;
+                p.y += v.y * dt.step;
+            });
+        }
+
+        fn emit_pings(q: Q<&Pos>, mut out: EventWriter<Ping>) {
+            out.send(Ping(q.len() as u32));
+        }
+
+        fn count_moved(mut evs: EventReader<Ping>, mut moved: ResMut<Moved>) {
+            for p in evs.read().iter() {
+                moved.0 += p.0;
+            }
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Dt { step: 1.0 });
+        world.insert_resource(Moved(0));
+        world.add_event::<Ping>();
+        for i in 0..10 {
+            world.spawn((
+                Pos { x: 0.0, y: 0.0 },
+                Vel {
+                    x: i as f32,
+                    y: 1.0,
+                },
+            ));
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, (movement, emit_pings, count_moved));
+        sched.run(&mut world);
+        sched.run(&mut world);
+
+        // movement подвинул каждую entity дважды.
+        let mut sum = 0.0;
+        Q::<Read<Pos>>::new(&world).for_each(|_, p| sum += p.y);
+        assert_eq!(sum, 20.0, "movement отработал 2 кадра по 10 entity");
+
+        // Конвейер событий: emit (10 на кадр) → reader (per-stage flush).
+        // Минимум один кадр доставлен (зависит от порядка в стадии — но за
+        // 2 кадра хотя бы 10 дойдёт).
+        assert!(
+            world.resource::<Moved>().0 >= 10,
+            "события прошли через plain-fn writer/reader: {}",
+            world.resource::<Moved>().0
+        );
+    }
+
+    /// `&mut Commands` в plain-fn: has_deferred → команды применяются
+    /// планировщиком (auto-apply sync-точка).
+    #[test]
+    fn plain_fn_commands_are_applied() {
+        fn spawner(cmd: &mut Commands) {
+            cmd.spawn((Pos { x: 7.0, y: 7.0 },));
+        }
+
+        let mut world = World::new();
+        world.register_component::<Pos>();
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, spawner);
+        sched.run(&mut world);
+
+        let n = apex_core::query::Query::<Read<Pos>>::new(&world)
+            .iter()
+            .count();
+        assert_eq!(n, 1, "spawn из &mut Commands применён к концу кадра");
+    }
+
+    /// Имя системы выводится из имени функции (D2-1/U.4).
+    #[test]
+    fn plain_fn_name_derived_from_fn() {
+        fn my_special_system(_q: apex_core::query::Query<'_, Read<Pos>>) {}
+        let cfg = SystemConfig::fn_sys(my_special_system);
+        assert_eq!(cfg.name, "my_special_system");
+    }
+
+    /// Plain-fn системы с непересекающимся доступом попадают в одну стадию
+    /// (параллельный батч), с пересекающимся — конфликтуют.
+    #[test]
+    fn plain_fn_access_inferred_for_conflicts() {
+        fn writes_pos(q: apex_core::query::Query<'_, Write<Pos>>) {
+            q.for_each(|_, mut p| p.x += 1.0);
+        }
+        fn writes_vel(q: apex_core::query::Query<'_, Write<Vel>>) {
+            q.for_each(|_, mut v| v.x += 1.0);
+        }
+        fn reads_pos(q: apex_core::query::Query<'_, Read<Pos>>) {
+            q.for_each(|_, _| {});
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, (writes_pos, writes_vel, reads_pos));
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        // writes_pos конфликтует с reads_pos (W+R по Pos) → разные батчи;
+        // writes_vel ни с кем не пересекается → делит батч с одним из них.
+        // Минимальная проверка: доступ ВЫВЕДЕН (есть >1 стадии исполнения).
+        assert!(
+            stages.len() >= 2,
+            "W+R конфликт по Pos должен разнести системы по батчам: {} стадий",
+            stages.len()
+        );
     }
 
     // ── W3-4: стресс ASD row-split ────────────────────────────

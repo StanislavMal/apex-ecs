@@ -1092,19 +1092,36 @@ Apex ECS предоставляет **единый макрос** `system!` дл
 
 ### 6.0 Регистрация систем — `add_systems()` (рекомендуемый способ)
 
-Единая точка регистрации. Принимает **bare-идентификаторы** систем из `system!` (имя выводится из
-`fn`) — как параллельные, так и эксклюзивные — в одном кортеже:
+Единая точка регистрации. Принимает **обычные функции с Bevy-параметрами**
+(plain-fn системы, D2-1), **bare-идентификаторы** систем из `system!` (имя
+выводится из `fn`) — как параллельные, так и эксклюзивные — в одном кортеже:
 
 ```rust
 use apex_scheduler::{Scheduler, StageLabel};
+
+// Plain-fn система — Bevy-стиль 1:1, БЕЗ макроса. Параметры:
+// Res<T> / ResMut<T> / Query<Q> / CachedQuery<Q> / EventReader<E> /
+// EventWriter<E> / &mut Commands. Access выведен, имя — из имени функции.
+fn movement(dt: Res<DeltaTime>, q: Query<(&Velocity, &mut Position)>) {
+    q.for_each(|_, (vel, mut pos)| pos.x += vel.x * dt.step);
+}
 
 let mut sched = Scheduler::new();
 
 // move_player — параллельная (system!), load_level — эксклюзивная (system! + world:&mut World).
 // Имена выведены из fn; маркер-дизамбигуация различает их автоматически.
-sched.add_systems(StageLabel::Update, (move_player, load_level));
+sched.add_systems(StageLabel::Update, (movement, move_player, load_level));
 sched.add_systems(StageLabel::Update, WaveSpawner::default());   // стейтфул, значением
 ```
+
+> **Plain-fn vs `system!` — где какая семантика.** В plain-fn пути семантика
+> Bevy 1:1: `Res<T>`/`ResMut<T>` — ресурсы, компоненты живут внутри
+> `Query<…>` (включая `&T`/`&mut T`-формы), `&mut Commands` — отложенные
+> команды (планировщик сам ставит apply-точку). В `system!` же `&T` означает
+> РЕСУРС — ловушка для Bevy-мигранта; в plain-fn её нет. `system!` остаётся
+> рекомендованным диалектом для систем с состоянием (`struct {…}` удобнее
+> Bevy `Local<T>`). Plain-fn системы без захватов — кандидаты ASD row-split
+> (как stateless `system!`); замыкания с захватами планируются целиком (W3-4).
 
 Для условий/имён/доступа-замыканий доступны конструкторы `sys`/`seq`/`par`/`par_access` из `apex_scheduler`:
 
@@ -1123,6 +1140,7 @@ sched.add_systems(StageLabel::Update, (
 
 | Способ | Тип системы |
 |---|---|
+| bare `movement` (plain-fn) | обычная `fn` с Bevy-параметрами (D2-1) — имя из fn, access из параметров |
 | bare `move_player` | `system!` (параллельная) — имя из fn |
 | bare `load_level` | `system!` + `world:&mut World` (эксклюзивная) — имя из fn |
 | `sys(name, struct)` | AutoSystem / `system!` struct с явным именем |
@@ -3783,6 +3801,7 @@ generation entity не участвует — НЕ использовать дл
 
 | Метод | Описание |
 |---|---|---|
+| `add_systems(label, systems)` | **Единый вход**: plain-fn системы (D2-1), bare `system!`-идентификаторы, `SystemConfig` и кортежи до 12 — см. §6.0 |
 | `add_auto_system(name, sys)` | Добавить AutoSystem (компоненты + ресурсы + события) |
 | `add_par(name, f)` | Добавить параллельную систему-замыкание (без доступа к компонентам) |
 | `add_par_access(name, access, f)` | Добавить параллельную систему-замыкание с явным `AccessDescriptor` |

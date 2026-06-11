@@ -24,6 +24,7 @@ pub mod component;
 pub mod dense;
 pub mod entity;
 pub mod events;
+pub mod fn_system;
 pub mod par_utils;
 pub mod query;
 pub mod relations;
@@ -49,6 +50,7 @@ pub use entity::Entity;
 pub use events::{
     DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard, Removed,
 };
+pub use fn_system::{short_system_name, SystemParamFunction};
 pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
@@ -76,6 +78,7 @@ pub mod prelude {
     pub use crate::events::{
         DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard, Removed,
     };
+    pub use crate::fn_system::SystemParamFunction;
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{

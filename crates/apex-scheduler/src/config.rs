@@ -162,6 +162,36 @@ impl SystemConfig {
         }
     }
 
+    /// Plain-fn система (D2-1): обычная функция с Bevy-параметрами
+    /// (`Res<T>`/`ResMut<T>`/`Query<Q>`/`EventReader<E>`/`EventWriter<E>`/
+    /// `&mut Commands`). Access выводится из параметров, имя — из имени
+    /// функции. Обычно вызывается неявно через `add_systems(stage, (fn1, …))`.
+    pub fn fn_sys<F, M>(f: F) -> Self
+    where
+        F: apex_core::SystemParamFunction<M>,
+    {
+        let mut access = <F::Param as apex_core::SystemParam>::access();
+        // W3-4: замыкание с захватами = состояние → без ASD row-split
+        // (fn-item — ZST, не попадает).
+        if std::mem::size_of::<F>() > 0 {
+            access.stateful = true;
+        }
+        let has_deferred = <F::Param as apex_core::SystemParam>::has_deferred();
+        let mut f = f;
+        let func: Box<dyn FnMut(SystemContext<'_>) + Send + Sync> =
+            Box::new(move |ctx: SystemContext<'_>| {
+                let item = <F::Param as apex_core::SystemParam>::fetch(&ctx);
+                f.run(item);
+            });
+        Self {
+            name: apex_core::short_system_name::<F>().to_string(),
+            kind: SystemConfigKind::ParClosure { access, func },
+            condition: ConditionTree::default(),
+            condition_access: AccessDescriptor::new(),
+            has_deferred,
+        }
+    }
+
     /// Параллельное замыкание (без доступа к компонентам).
     pub fn par<F>(name: impl Into<String>, f: F) -> Self
     where
@@ -250,6 +280,10 @@ pub struct AutoMarker;
 /// Маркер: элемент — bare `ExclusiveSystem`.
 #[doc(hidden)]
 pub struct ExclusiveMarker;
+/// Маркер: элемент — plain-fn система (D2-1, `SystemParamFunction`).
+/// Не кортеж — иначе пересекался бы с кортежным имплом `IntoScheduleConfigs`.
+#[doc(hidden)]
+pub struct FnSystemMarker<M>(std::marker::PhantomData<M>);
 
 /// Трейт конвертации в `Vec<SystemConfig>`. Реализован для `SystemConfig`,
 /// bare `AutoSystem`/`ExclusiveSystem`-маркеров и кортежей до 12 элементов.
@@ -272,6 +306,18 @@ impl<S: AutoSystem + 'static> IntoScheduleConfigs<AutoMarker> for S {
 impl<S: ExclusiveSystem> IntoScheduleConfigs<ExclusiveMarker> for S {
     fn into_vec(self) -> Vec<SystemConfig> {
         vec![SystemConfig::exclusive(self)]
+    }
+}
+
+/// Plain-fn система (D2-1): `fn movement(time: Res<Time>, q: Query<…>)` →
+/// `add_systems(stage, (movement, …))`. Маркер несёт сигнатуру `fn(P1, …)`,
+/// поэтому когерентность с Auto/Exclusive-имплами не конфликтует.
+impl<F, M> IntoScheduleConfigs<FnSystemMarker<M>> for F
+where
+    F: apex_core::SystemParamFunction<M>,
+{
+    fn into_vec(self) -> Vec<SystemConfig> {
+        vec![SystemConfig::fn_sys(self)]
     }
 }
 
