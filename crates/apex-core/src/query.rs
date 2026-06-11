@@ -11,6 +11,10 @@ use crate::{
 
 // ── WorldQuery ─────────────────────────────────────────────────
 
+/// Роли компонентов в ключе кэша запросов (старшие биты поверх ComponentId).
+pub const KEY_ROLE_WITHOUT: u64 = 1 << 32;
+pub const KEY_ROLE_OPTIONAL: u64 = 2 << 32;
+
 pub trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
@@ -33,6 +37,16 @@ pub trait WorldQuery: Sized {
     fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
         Self::fill_positive_ids(world, ids);
     }
+
+    /// Ключ кэша запросов (CR-M2b): по одному `u64` на компонент — ComponentId
+    /// в нижних 32 битах, роль в верхних ([`KEY_ROLE_WITHOUT`]/[`KEY_ROLE_OPTIONAL`];
+    /// обязательные — 0). Однозначно кодирует матч-семантику формы запроса
+    /// ((Read<A>, Read<B>) ≠ (Read<A>, Without<B>) ≠ (Read<A>, Maybe<B>)).
+    ///
+    /// ВАЖНО: последовательность нижних 32 бит обязана совпадать с `fill_ids`
+    /// (CachedQuery восстанавливает ids из ключа без второго прохода реестра).
+    /// Один проход, без heap-аллокаций до 8 компонентов.
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>);
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
@@ -152,6 +166,12 @@ impl<T: Component> WorldQuery for Read<T> {
         }
     }
 
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64); // роль REQUIRED = 0
+        }
+    }
+
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         !ids.is_empty() && arch.has_component(ids[0])
     }
@@ -189,6 +209,12 @@ impl<T: Component> WorldQuery for Write<T> {
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         if let Some(id) = world.registry.get_id::<T>() {
             ids.push(id);
+        }
+    }
+
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64); // роль REQUIRED = 0
         }
     }
 
@@ -245,6 +271,9 @@ impl<T: Component> WorldQuery for &T {
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         <Read<T> as WorldQuery>::fill_ids(world, ids)
     }
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        <Read<T> as WorldQuery>::fill_cache_key(world, key)
+    }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         <Read<T> as WorldQuery>::matches_archetype(arch, ids)
     }
@@ -276,6 +305,9 @@ impl<T: Component> WorldQuery for &mut T {
     }
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         <Write<T> as WorldQuery>::fill_ids(world, ids)
+    }
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        <Write<T> as WorldQuery>::fill_cache_key(world, key)
     }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         <Write<T> as WorldQuery>::matches_archetype(arch, ids)
@@ -316,6 +348,12 @@ impl<T: Component> WorldQuery for With<T> {
     fn fill_ids(world: &World, ids: &mut Vec<ComponentId>) {
         if let Some(id) = world.registry.get_id::<T>() {
             ids.push(id);
+        }
+    }
+
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64); // роль REQUIRED = 0
         }
     }
 
@@ -366,6 +404,12 @@ impl<T: Component> WorldQuery for Without<T> {
     }
 
     fn fill_positive_ids(_: &World, _: &mut Vec<ComponentId>) {}
+
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64 | KEY_ROLE_WITHOUT);
+        }
+    }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         ids.is_empty() || !arch.has_component(ids[0])
@@ -441,6 +485,12 @@ impl<T: Component> WorldQuery for Maybe<T> {
 
     /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
     fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
+
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
+        }
+    }
 
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
         true
@@ -538,6 +588,12 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
     /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
     fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
 
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
+        }
+    }
+
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
         true
     }
@@ -623,6 +679,12 @@ impl<T: Component> WorldQuery for Changed<T> {
         }
     }
 
+    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+        if let Some(id) = world.registry.get_id::<T>() {
+            key.push(id.0 as u64); // роль REQUIRED = 0
+        }
+    }
+
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         !ids.is_empty() && arch.has_component(ids[0])
     }
@@ -679,6 +741,10 @@ macro_rules! impl_world_query_tuple {
 
             fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
                 $( $Q::fill_required_ids(world, ids); )+
+            }
+
+            fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
+                $( $Q::fill_cache_key(world, key); )+
             }
 
             fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -744,6 +810,8 @@ impl WorldQuery for () {
     }
 
     fn fill_ids(_world: &World, _ids: &mut Vec<ComponentId>) {}
+
+    fn fill_cache_key(_world: &World, _key: &mut smallvec::SmallVec<[u64; 8]>) {}
 
     fn matches_archetype(_arch: &Archetype, _ids: &[ComponentId]) -> bool {
         true
@@ -879,10 +947,15 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
         let archetypes = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
             // Обязательные компоненты (без Maybe/Without) — источник кандидатов.
-            let mut required_ids = Vec::with_capacity(Q::component_count());
-            Q::fill_required_ids(world, &mut required_ids);
+            // Считаются ТОЛЬКО на большом мире: на малом (типичный случай)
+            // линейный обход не требует ни прохода реестра, ни аллокации.
+            let mut required_ids: Vec<ComponentId> = Vec::new();
+            if world.archetypes.len() > LINEAR_SCAN_MAX_ARCHETYPES {
+                required_ids.reserve(Q::component_count());
+                Q::fill_required_ids(world, &mut required_ids);
+            }
 
-            if required_ids.is_empty() || world.archetypes.len() <= LINEAR_SCAN_MAX_ARCHETYPES {
+            if required_ids.is_empty() {
                 // Линейный обход: мир мал ЛИБО запрос без обязательных
                 // компонентов (Without-only / Maybe-only / пустой) — такие
                 // матчат почти всё, кандидат-индекс не сузит.

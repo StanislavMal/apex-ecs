@@ -33,24 +33,20 @@ struct CacheEntry {
 /// matches — ключ по одним ids отравлял бы кэш между ними. Тройка
 /// (ids, positive, required) однозначно задаёт матч-семантику формы:
 /// without-набор = ids − positive, optional-набор = positive − required.
+/// Ключ кэша запросов (CR-M2b): по одному `u64` на компонент — ComponentId в
+/// нижних 32 битах, роль (required/without/optional) в верхних
+/// (`WorldQuery::fill_cache_key`). Однозначно кодирует матч-семантику формы:
+/// `(Read<A>, Read<B>)`, `(Read<A>, Without<B>)` и `(Read<A>, Maybe<B>)` —
+/// РАЗНЫЕ записи (раньше делили одну — отравление кэша).
+///
+/// Hot-path без аллокаций: ключ строится одним проходом в inline-SmallVec,
+/// lookup — zero-copy по `&[u64]` (Borrow), владение — только при вставке.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct QueryCacheKey {
-    ids: SmallVec<[ComponentId; 8]>,
-    positive: SmallVec<[ComponentId; 8]>,
-    required: SmallVec<[ComponentId; 8]>,
-}
+pub(crate) struct QueryCacheKey(SmallVec<[u64; 8]>);
 
-impl QueryCacheKey {
-    pub fn for_query<Q: WorldQuery>(world: &World, ids: &[ComponentId]) -> Self {
-        let mut positive = Vec::with_capacity(Q::component_count());
-        Q::fill_positive_ids(world, &mut positive);
-        let mut required = Vec::with_capacity(Q::component_count());
-        Q::fill_required_ids(world, &mut required);
-        Self {
-            ids: ids.iter().copied().collect(),
-            positive: positive.into_iter().collect(),
-            required: required.into_iter().collect(),
-        }
+impl std::borrow::Borrow<[u64]> for QueryCacheKey {
+    fn borrow(&self) -> &[u64] {
+        &self.0
     }
 }
 
@@ -76,16 +72,17 @@ impl QueryCache {
 
     pub fn get_or_compute(
         &self,
-        key: QueryCacheKey,
+        key: &SmallVec<[u64; 8]>,
         archetypes: &[Archetype],
         matches: impl Fn(&Archetype) -> bool,
     ) -> Arc<[usize]> {
         let total = archetypes.len();
 
         // Hit path: запись актуальна, если видела все текущие архетипы.
+        // Lookup по &[u64] — без построения владеющего ключа.
         {
             let map = self.entries.read().unwrap();
-            if let Some(entry) = map.get(&key) {
+            if let Some(entry) = map.get(key.as_slice()) {
                 if entry.seen_arch_count == total {
                     return entry.arch_indices.clone();
                 }
@@ -94,7 +91,7 @@ impl QueryCache {
 
         let mut map = self.entries.write().unwrap();
         // Двойная проверка: другой поток мог дополнить между read и write lock.
-        let (mut indices, start) = match map.get(&key) {
+        let (mut indices, start) = match map.get(key.as_slice()) {
             Some(entry) if entry.seen_arch_count == total => {
                 return entry.arch_indices.clone();
             }
@@ -113,7 +110,7 @@ impl QueryCache {
 
         let arch_indices: Arc<[usize]> = indices.into();
         map.insert(
-            key,
+            QueryCacheKey(key.clone()),
             CacheEntry {
                 arch_indices: arch_indices.clone(),
                 seen_arch_count: total,
@@ -1589,14 +1586,16 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
 
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     pub fn new(world: &'w World, last_run: Tick) -> Self {
-        let mut ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(world, &mut ids);
+        // Один проход реестра: ключ кэша несёт и ids (нижние 32 бита каждой
+        // записи, в порядке fill_ids — инвариант fill_cache_key), и роли формы.
+        let mut key: SmallVec<[u64; 8]> = SmallVec::new();
+        Q::fill_cache_key(world, &mut key);
+        let ids: Vec<ComponentId> = key.iter().map(|&e| ComponentId(e as u32)).collect();
 
         let arch_indices = if ids.len() == Q::component_count() {
-            let key = QueryCacheKey::for_query::<Q>(world, &ids);
             world
                 .query_cache
-                .get_or_compute(key, &world.archetypes, |arch| {
+                .get_or_compute(&key, &world.archetypes, |arch| {
                     Q::matches_archetype(arch, &ids)
                 })
         } else {
