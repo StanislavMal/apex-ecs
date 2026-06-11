@@ -8,6 +8,12 @@ pub struct SimpleIter {
     world: World,
 }
 
+impl Default for SimpleIter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SimpleIter {
     pub fn new() -> Self {
         let mut world = World::new();

@@ -2,7 +2,6 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::any::TypeId;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -13,7 +12,7 @@ use crate::{
     entity::{Entity, EntityAllocator, EntityLocation},
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
-    relations::{IdIndex, RelationRegistry, SubjectIndex},
+    relations::{RelationRegistry, SubjectIndex, TargetIndex},
     resources::Resources,
     sub_world::SubWorld,
     system_param::{EventReader, EventWriter, Res, ResMut},
@@ -24,95 +23,125 @@ use crate::{
 
 struct CacheEntry {
     arch_indices: Arc<[usize]>,
-    version: u32,
+    /// Сколько архетипов мира запись уже видела (архетипы append-only —
+    /// дополняем список только хвостом `archetypes[seen_arch_count..]`).
+    seen_arch_count: usize,
 }
 
-/// Обёртка над SmallVec для zero-copy lookup через Borrow<[ComponentId]>.
+/// Ключ кэша запросов. ТОЛЬКО списка `ids` недостаточно: `(Read<A>, Read<B>)`
+/// и `(Read<A>, Without<B>)` дают одинаковый `fill_ids`, но разную семантику
+/// matches — ключ по одним ids отравлял бы кэш между ними. Тройка
+/// (ids, positive, required) однозначно задаёт матч-семантику формы:
+/// without-набор = ids − positive, optional-набор = positive − required.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct QueryCacheKey(SmallVec<[ComponentId; 8]>);
+pub(crate) struct QueryCacheKey {
+    ids: SmallVec<[ComponentId; 8]>,
+    positive: SmallVec<[ComponentId; 8]>,
+    required: SmallVec<[ComponentId; 8]>,
+}
 
-impl std::borrow::Borrow<[ComponentId]> for QueryCacheKey {
-    fn borrow(&self) -> &[ComponentId] {
-        &self.0
+impl QueryCacheKey {
+    pub fn for_query<Q: WorldQuery>(world: &World, ids: &[ComponentId]) -> Self {
+        let mut positive = Vec::with_capacity(Q::component_count());
+        Q::fill_positive_ids(world, &mut positive);
+        let mut required = Vec::with_capacity(Q::component_count());
+        Q::fill_required_ids(world, &mut required);
+        Self {
+            ids: ids.iter().copied().collect(),
+            positive: positive.into_iter().collect(),
+            required: required.into_iter().collect(),
+        }
     }
 }
 
+/// Кэш списков архетипов для `CachedQuery` (инкрементальный, CR-M2).
+///
+/// Инварианты, на которых построен:
+/// - архетипы append-only (никогда не удаляются и не меняют состав) →
+///   запись дополняется ТОЛЬКО новыми архетипами с индекса `seen_arch_count`;
+/// - перемещение entity между архетипами список НЕ инвалидирует: какие
+///   архетипы матчат запрос — свойство состава архетипа, а не его строк;
+/// - пустые архетипы ВКЛЮЧАЮТСЯ в список (потребитель пропускает их на
+///   итерации) — иначе entity, въехавшая в опустевший архетип, терялась бы.
 pub(crate) struct QueryCache {
     entries: RwLock<FxHashMap<QueryCacheKey, CacheEntry>>,
-    version: AtomicU32,
 }
 
 impl QueryCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(FxHashMap::default()),
-            version: AtomicU32::new(0),
         }
     }
 
     pub fn get_or_compute(
         &self,
-        key: &[ComponentId],
+        key: QueryCacheKey,
         archetypes: &[Archetype],
         matches: impl Fn(&Archetype) -> bool,
     ) -> Arc<[usize]> {
-        let current_version = self.version.load(Ordering::Acquire);
+        let total = archetypes.len();
 
-        // Hit path — zero-copy lookup через Borrow<[ComponentId]>
+        // Hit path: запись актуальна, если видела все текущие архетипы.
         {
             let map = self.entries.read().unwrap();
-            if let Some(entry) = map.get(key) {
-                if entry.version == current_version {
+            if let Some(entry) = map.get(&key) {
+                if entry.seen_arch_count == total {
                     return entry.arch_indices.clone();
                 }
             }
         }
 
-        // Miss или stale — расчёт нового списка архетипов
-        let arch_indices: Arc<[usize]> = archetypes
-            .iter()
-            .enumerate()
-            .filter(|(_, arch)| !arch.is_empty() && matches(arch))
-            .map(|(i, _)| i)
-            .collect::<Vec<usize>>()
-            .into();
-
         let mut map = self.entries.write().unwrap();
-        // Двойная проверка: другой поток мог вставить между read и write lock
-        if let Some(entry) = map.get(key) {
-            if entry.version == current_version {
+        // Двойная проверка: другой поток мог дополнить между read и write lock.
+        let (mut indices, start) = match map.get(&key) {
+            Some(entry) if entry.seen_arch_count == total => {
                 return entry.arch_indices.clone();
             }
-        }
+            Some(entry) => (entry.arch_indices.to_vec(), entry.seen_arch_count),
+            None => (Vec::new(), 0),
+        };
 
-        let query_key = QueryCacheKey(key.iter().copied().collect());
+        // Дополняем только новыми архетипами (append-only инвариант).
+        indices.extend(
+            archetypes[start..]
+                .iter()
+                .enumerate()
+                .filter(|(_, arch)| matches(arch))
+                .map(|(i, _)| start + i),
+        );
+
+        let arch_indices: Arc<[usize]> = indices.into();
         map.insert(
-            query_key,
+            key,
             CacheEntry {
                 arch_indices: arch_indices.clone(),
-                version: current_version,
+                seen_arch_count: total,
             },
         );
 
         arch_indices
     }
 
-    /// Инвалидировать все записи кеша запросов.
-    ///
-    /// При вставке/удалении компонента архетипы entity меняются, что
-    /// делает недействительным любой кеш архетипов для любых запросов.
-    /// Частичная инвалидация (invalidate_for) ненадёжна: запрос (A, B)
-    /// мог закешировать архетип без C, а добавление C к entity меняет
-    /// её архетип, но кеш (A, B) не содержит C и не инвалидируется.
+    /// Полная инвалидация. Не нужна в текущей модели (архетипы append-only);
+    /// останется точкой подключения despawn-компакции (CR-M4), если та
+    /// когда-нибудь появится.
+    #[allow(dead_code)]
     pub fn invalidate(&self) {
         self.entries.write().unwrap().clear();
-        self.version.fetch_add(1, Ordering::Release);
     }
+}
 
-    #[allow(dead_code)]
-    pub fn version(&self) -> u32 {
-        self.version.load(Ordering::Acquire)
-    }
+// ── ArchetypeStats ─────────────────────────────────────────────
+
+/// Сводка [`World::archetype_stats`]: число архетипов, пустых среди них,
+/// суммарные живые строки и максимум строк в одном архетипе.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArchetypeStats {
+    pub archetypes: usize,
+    pub empty_archetypes: usize,
+    pub total_rows: usize,
+    pub max_rows_in_archetype: usize,
 }
 
 // ── ArchetypeKey ───────────────────────────────────────────────
@@ -154,8 +183,8 @@ pub struct World {
     pub(crate) last_run_tick: Tick,
     pub(crate) query_cache: QueryCache,
     pub(crate) relations: RelationRegistry,
-    pub(crate) id_index: IdIndex,
     pub(crate) subject_index: SubjectIndex,
+    pub(crate) target_index: TargetIndex,
     pub resources: Resources,
     pub(crate) events: EventRegistry,
     /// Реестр именованных шаблонов (EntityTemplate).
@@ -178,8 +207,8 @@ impl World {
             last_run_tick: Tick::ZERO,
             query_cache: QueryCache::new(),
             relations: RelationRegistry::new(),
-            id_index: IdIndex::default(),
             subject_index: SubjectIndex::new(),
+            target_index: TargetIndex::new(),
             resources: Resources::new(),
             events: EventRegistry::new(),
             templates: TemplateRegistry::new(),
@@ -316,27 +345,33 @@ impl World {
         &self.archetypes
     }
 
+    /// Сводка по архетипам — дебаг/профилирование (CR-M4).
+    ///
+    /// Пустые архетипы не переиспользуются под другой состав и не компактируются
+    /// (append-only инвариант дешевле; слот по СОВПАДАЮЩЕМУ составу переиспользуется
+    /// через archetype_index). Эта сводка — инструмент наблюдения за их числом.
+    pub fn archetype_stats(&self) -> ArchetypeStats {
+        let mut stats = ArchetypeStats {
+            archetypes: self.archetypes.len(),
+            ..Default::default()
+        };
+        for arch in &self.archetypes {
+            let rows = arch.len();
+            stats.total_rows += rows;
+            if rows == 0 {
+                stats.empty_archetypes += 1;
+            }
+            stats.max_rows_in_archetype = stats.max_rows_in_archetype.max(rows);
+        }
+        stats
+    }
+
     pub fn relation_registry(&self) -> &RelationRegistry {
         &self.relations
     }
 
     pub fn relation_registry_mut(&mut self) -> &mut RelationRegistry {
         &mut self.relations
-    }
-
-    pub fn subject_index_raw(&self, entity_index: u32) -> Vec<u32> {
-        self.subject_index.get_all(entity_index)
-    }
-
-    pub fn insert_relation_raw(
-        &mut self,
-        subject: Entity,
-        relation_id: ComponentId,
-        _target: Entity,
-    ) {
-        self.ensure_relation_component(relation_id);
-        self.subject_index.add(subject.index, relation_id);
-        self.insert_relation_component(subject, relation_id);
     }
 
     /// Публичная обёртка над pub(crate) insert_raw — для apex-serialization.
@@ -684,7 +719,6 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
-        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         let tick = self.current_tick;
         unsafe {
@@ -732,7 +766,6 @@ impl World {
         }
 
         let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
-        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         unsafe {
             self.archetypes[new_arch_id.0 as usize].write_component(
@@ -762,7 +795,6 @@ impl World {
         }
         let new_arch_id =
             self.find_or_create_archetype_without(location.archetype_id, component_id);
-        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(
             entity,
@@ -787,7 +819,6 @@ impl World {
         }
         let new_arch_id =
             self.find_or_create_archetype_without(location.archetype_id, component_id);
-        self.query_cache.invalidate();
         let new_row = self.move_entity(entity, location, new_arch_id);
         self.entities.set_location(
             entity,
@@ -799,28 +830,74 @@ impl World {
         true
     }
 
+    /// Удалить entity и ВСЕ её связи (как subject и как target).
+    ///
+    /// Для видов связи с `cascade_delete_on_target_despawn()` (например,
+    /// `ChildOf`) subjects деспавнятся каскадом — итеративно, без рекурсии.
+    /// Для остальных видов пары вычищаются из индексов: ни одна связь не
+    /// переживает свой target (generation-честность TargetIndex).
     pub fn despawn(&mut self, entity: Entity) -> bool {
         if !self.entities.is_alive(entity) {
             return false;
         }
-        let location = match self.entities.get_location(entity) {
-            Some(loc) => loc,
-            None => return false,
-        };
-        self.subject_index.clear_entity(entity.index);
-        let arch_idx = location.archetype_id.0 as usize;
-        unsafe {
-            if let Some(displaced) = self.archetypes[arch_idx].remove_row(location.row as usize) {
-                self.entities.set_location(
-                    displaced,
-                    EntityLocation {
-                        archetype_id: location.archetype_id,
-                        row: location.row,
-                    },
-                );
+        let mut stack: SmallVec<[Entity; 8]> = SmallVec::new();
+        stack.push(entity);
+
+        while let Some(cur) = stack.pop() {
+            if !self.entities.is_alive(cur) {
+                continue; // уже снесён каскадом по другому пути
             }
+
+            // ── Связи, где cur — target ────────────────────────
+            if self.target_index.has_target(cur.index) {
+                for kind_idx in 0..self.relations.kind_count() as u32 {
+                    let Some(subjects) = self.target_index.take_subjects(kind_idx, cur.index)
+                    else {
+                        continue;
+                    };
+                    let pair = crate::relations::RelationPair {
+                        kind_idx,
+                        target: cur,
+                    };
+                    for &s in &subjects {
+                        self.subject_index.remove(s.index, pair);
+                    }
+                    if self.relations.is_cascade(kind_idx) {
+                        stack.extend(subjects);
+                    }
+                }
+            }
+
+            // ── Связи, где cur — subject ───────────────────────
+            for pair in self.subject_index.take_all(cur.index) {
+                self.target_index
+                    .remove(pair.kind_idx, pair.target.index, cur);
+            }
+
+            // ── Строка хранилища ───────────────────────────────
+            let location = match self.entities.get_location(cur) {
+                Some(loc) => loc,
+                None => {
+                    self.entities.free(cur);
+                    continue;
+                }
+            };
+            let arch_idx = location.archetype_id.0 as usize;
+            unsafe {
+                if let Some(displaced) =
+                    self.archetypes[arch_idx].remove_row(location.row as usize)
+                {
+                    self.entities.set_location(
+                        displaced,
+                        EntityLocation {
+                            archetype_id: location.archetype_id,
+                            row: location.row,
+                        },
+                    );
+                }
+            }
+            self.entities.free(cur);
         }
-        self.entities.free(entity);
         true
     }
 
@@ -843,6 +920,51 @@ impl World {
     #[inline]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         let component_id = self.registry.get_id::<T>()?;
+        self.get_mut_by_id(entity, component_id)
+    }
+
+    // ── Random-access fast path (CR-M3) ────────────────────────
+    //
+    // Горячие циклы (анимация: ~22k get_mut/кадр) берут ComponentId ОДИН раз
+    // на проход через `component_id::<T>()` и дальше ходят `get_by_id`/
+    // `get_mut_by_id` — без TypeId-hash на каждый вызов.
+
+    /// ComponentId типа `T`, если тот зарегистрирован.
+    #[inline]
+    pub fn component_id<T: Component>(&self) -> Option<ComponentId> {
+        self.registry.get_id::<T>()
+    }
+
+    /// `get` по заранее взятому ComponentId (см. [`component_id`](Self::component_id)).
+    ///
+    /// `component_id` обязан соответствовать `T` (debug_assert).
+    #[inline]
+    pub fn get_by_id<T: Component>(&self, entity: Entity, component_id: ComponentId) -> Option<&T> {
+        debug_assert_eq!(
+            self.registry.get_id::<T>(),
+            Some(component_id),
+            "get_by_id: ComponentId не соответствует T"
+        );
+        let location = self.entities.get_location(entity)?;
+        unsafe {
+            self.archetypes[location.archetype_id.0 as usize]
+                .get_component::<T>(location.row as usize, component_id)
+        }
+    }
+
+    /// `get_mut` по заранее взятому ComponentId — со стампом change-tick,
+    /// как и [`get_mut`](Self::get_mut).
+    #[inline]
+    pub fn get_mut_by_id<T: Component>(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Option<&mut T> {
+        debug_assert_eq!(
+            self.registry.get_id::<T>(),
+            Some(component_id),
+            "get_mut_by_id: ComponentId не соответствует T"
+        );
         let location = self.entities.get_location(entity)?;
         let tick = self.current_tick;
         let row = location.row as usize;
@@ -956,13 +1078,13 @@ impl World {
             .collect();
         let arch = Archetype::new(id, components.iter().copied().collect(), &infos);
         for &cid in &arch.component_ids {
-            self.id_index.register_archetype(cid, id);
             self.component_arch_index.entry(cid).or_default().push(id);
         }
         self.archetypes.push(arch);
         self.archetype_index
             .insert(ArchetypeKey::from(components), id);
-        self.query_cache.invalidate();
+        // QueryCache не инвалидируем: новые архетипы записи кэша подхватывают
+        // инкрементально (seen_arch_count), перемещения entity список не меняют.
         id
     }
 
@@ -1041,19 +1163,8 @@ impl World {
 
     /// Batch-добавление одинаковой relation от множества субъектов к одному target.
     ///
-    /// Оптимизирован для массового создания иерархий (тайловые карты, армии).
-    /// Группирует subjects по текущему архетипу и делает один batch move
-    /// для каждой группы вместо N отдельных move_entity.
-    ///
-    /// # Сложность
-    /// O(S log S) где S = subjects.len() (группировка по архетипу).
-    /// Против O(S) вызовов move_entity при наивном подходе.
-    ///
-    /// # Пример
-    /// ```ignore
-    /// // Создание иерархии 1000 тайлов за один batch
-    /// world.add_relation_batch(&tiles, ChildOf, map_entity);
-    /// ```
+    /// После CR-M1 relations не входят в идентичность архетипа, поэтому это
+    /// просто bulk-вставка в индексы — O(S), без структурных изменений мира.
     pub fn add_relation_batch<R: crate::relations::RelationKind>(
         &mut self,
         subjects: &[Entity],
@@ -1063,46 +1174,9 @@ impl World {
         if subjects.is_empty() {
             return;
         }
-
         let kind_idx = self.relations.get_or_register::<R>();
-        let relation_id = crate::relations::encode_relation(kind_idx, target.index);
-        self.ensure_relation_component(relation_id);
-
-        // Группируем subjects по текущему архетипу
-        let mut by_arch: FxHashMap<ArchetypeId, Vec<Entity>> = FxHashMap::default();
-        for &entity in subjects {
-            if let Some(loc) = self.entities.get_location(entity) {
-                by_arch.entry(loc.archetype_id).or_default().push(entity);
-            }
-        }
-
-        // Для каждой группы — batch move в целевой архетип
-        let tick = self.current_tick;
-        for (arch_id, group) in by_arch {
-            let new_arch_id = self.find_or_create_archetype_with(arch_id, relation_id);
-
-            for entity in group {
-                if let Some(loc) = self.entities.get_location(entity) {
-                    let new_row = self.move_entity(entity, loc, new_arch_id);
-                    // После move_entity необходимо обновить relation-колонку
-                    // (move_entity копирует только общие компоненты, relation добавляется впервые)
-                    if let Some(col_idx) =
-                        self.archetypes[new_arch_id.0 as usize].column_index(relation_id)
-                    {
-                        let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
-                        col.change_ticks.push(tick);
-                        col.len += 1;
-                    }
-                    self.entities.set_location(
-                        entity,
-                        EntityLocation {
-                            archetype_id: new_arch_id,
-                            row: new_row,
-                        },
-                    );
-                    self.subject_index.add(entity.index, relation_id);
-                }
-            }
+        for &subject in subjects {
+            self.add_relation_by_kind_idx(subject, kind_idx, target);
         }
     }
 }
@@ -1519,9 +1593,10 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         Q::fill_ids(world, &mut ids);
 
         let arch_indices = if ids.len() == Q::component_count() {
+            let key = QueryCacheKey::for_query::<Q>(world, &ids);
             world
                 .query_cache
-                .get_or_compute(&ids, &world.archetypes, |arch| {
+                .get_or_compute(key, &world.archetypes, |arch| {
                     Q::matches_archetype(arch, &ids)
                 })
         } else {
@@ -2351,6 +2426,127 @@ mod tests {
         let mut fe = 0usize;
         world.query_changed::<Read<Pos>>(Tick::ZERO).for_each(|_, _| fe += 1);
         assert_eq!(fe, got2.len(), "for_each и iter должны быть согласованы");
+    }
+
+    /// CR-M2: `(Read<A>, Read<B>)` и `(Read<A>, Without<B>)` имеют одинаковый
+    /// fill_ids — записи кэша НЕ должны отравлять друг друга.
+    #[test]
+    fn cached_query_without_does_not_share_entry_with_read() {
+        use crate::query::{Read, Without};
+
+        let mut world = World::new();
+        let _both = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
+        let only_pos = world.spawn((Pos { x: 2.0, y: 0.0 },));
+
+        // Сначала прогреваем кэш формой (Read, Read)…
+        let with_vel = world.query_typed::<(Read<Pos>, Read<Vel>)>().len();
+        assert_eq!(with_vel, 1);
+
+        // …затем (Read, Without) обязан увидеть СВОЙ список архетипов.
+        let mut seen = Vec::new();
+        world
+            .query_typed::<(Read<Pos>, Without<Vel>)>()
+            .for_each(|e, _| seen.push(e));
+        assert_eq!(seen, vec![only_pos], "Without-форма не должна делить запись кэша с Read-формой");
+    }
+
+    /// CR-M2: запись кэша инкрементально дополняется архетипами, созданными
+    /// ПОСЛЕ первого построения списка.
+    #[test]
+    fn cached_query_picks_up_new_archetypes() {
+        use crate::query::Read;
+
+        let mut world = World::new();
+        world.spawn((Pos { x: 1.0, y: 0.0 },));
+        assert_eq!(world.query_typed::<Read<Pos>>().len(), 1);
+
+        // Новый архетип (Pos, Vel) после прогрева кэша.
+        world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
+        assert_eq!(world.query_typed::<Read<Pos>>().len(), 2);
+    }
+
+    /// CR-M2: entity, въехавшая в ОПУСТЕВШИЙ архетип, не теряется кэшем
+    /// (пустые архетипы остаются в списках; insert/remove кэш не сбрасывают).
+    #[test]
+    fn cached_query_sees_entity_in_repopulated_archetype() {
+        use crate::query::Read;
+
+        let mut world = World::new();
+        let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 3.0, y: 0.0 }));
+        assert_eq!(world.query_typed::<(Read<Pos>, Read<Vel>)>().len(), 1);
+
+        // Архетип (Pos, Vel) пустеет…
+        world.remove::<Vel>(e);
+        assert_eq!(world.query_typed::<(Read<Pos>, Read<Vel>)>().len(), 0);
+
+        // …и снова наполняется — кэшированный список обязан его видеть.
+        world.insert(e, Vel { x: 4.0, y: 0.0 });
+        let mut seen = Vec::new();
+        world
+            .query_typed::<(Read<Pos>, Read<Vel>)>()
+            .for_each(|ent, _| seen.push(ent));
+        assert_eq!(seen, vec![e]);
+    }
+
+    /// CR-M2 (C-4): на мире >128 архетипов Query::new берёт кандидатов из
+    /// component_arch_index по САМОМУ РЕДКОМУ обязательному компоненту.
+    #[test]
+    fn query_new_candidates_from_rarest_component_on_large_world() {
+        use crate::query::{Query, Read, With};
+
+        struct F0;
+        struct F1;
+        struct F2;
+        struct F3;
+        struct F4;
+        struct F5;
+        struct F6;
+        struct F7;
+        struct Rare(u32);
+        impl crate::component::Component for F0 {}
+        impl crate::component::Component for F1 {}
+        impl crate::component::Component for F2 {}
+        impl crate::component::Component for F3 {}
+        impl crate::component::Component for F4 {}
+        impl crate::component::Component for F5 {}
+        impl crate::component::Component for F6 {}
+        impl crate::component::Component for F7 {}
+        impl crate::component::Component for Rare {}
+
+        let mut world = World::new();
+        let mut rare_holder = None;
+        // 200 уникальных составов → >128 архетипов (кандидат-путь).
+        for i in 0..200u32 {
+            let e = world.spawn((Pos { x: i as f32, y: 0.0 },));
+            if i & 1 != 0 { world.insert(e, F0); }
+            if i & 2 != 0 { world.insert(e, F1); }
+            if i & 4 != 0 { world.insert(e, F2); }
+            if i & 8 != 0 { world.insert(e, F3); }
+            if i & 16 != 0 { world.insert(e, F4); }
+            if i & 32 != 0 { world.insert(e, F5); }
+            if i & 64 != 0 { world.insert(e, F6); }
+            if i & 128 != 0 { world.insert(e, F7); }
+            if i == 137 {
+                world.insert(e, Rare(7));
+                rare_holder = Some(e);
+            }
+        }
+        assert!(world.archetype_count() > 128, "тесту нужен кандидат-путь");
+
+        // Редкий компонент: кандидаты = 1 архетип, результат корректен.
+        let got: Vec<_> = Query::<(Read<Pos>, Read<Rare>)>::new(&world)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(got, vec![rare_holder.unwrap()]);
+
+        // With-форма тем же путём.
+        let cnt = Query::<(Read<Pos>, With<Rare>)>::new(&world).iter().count();
+        assert_eq!(cnt, 1);
+
+        // Широкий запрос на том же мире — все 200 строк на месте.
+        let all = Query::<Read<Pos>>::new(&world).iter().count();
+        assert_eq!(all, 200);
     }
 
     // Вложенные Bundle — ручная реализация (proc-макросы не работают внутри apex-core)

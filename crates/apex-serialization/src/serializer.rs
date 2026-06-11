@@ -12,7 +12,7 @@ use std::path::Path;
 use apex_core::{
     component::{ComponentId, Tick},
     entity::Entity,
-    relations::{is_relation_id, decode_kind, decode_target, encode_relation, ChildOf},
+    relations::ChildOf,
     world::World,
 };
 
@@ -91,9 +91,6 @@ impl WorldSerializer {
                         None    => continue,
                     };
 
-                    // Relation-компоненты пропускаем — сохраняются отдельно
-                    if is_relation_id(info.id) { continue; }
-
                     // Компоненты без serde пропускаем
                     let serde_fns = match &info.serde {
                         Some(s) => s,
@@ -132,31 +129,19 @@ impl WorldSerializer {
         }
 
         // ── Relations ──────────────────────────────────────────
-        for arch in world.archetypes() {
-            if arch.is_empty() { continue; }
-            for &entity in arch.entities() {
-                for raw_id in world.subject_index_raw(entity.index()) {
-                    let rel_cid = ComponentId(raw_id);
-                    if !is_relation_id(rel_cid) { continue; }
+        // SubjectIndex — источник истины: записи чистятся при despawn,
+        // поэтому iter_relations отдаёт только связи живых entity.
+        for (subject_index, kind_idx, target) in world.iter_relations() {
+            let kind_name = world.relation_registry()
+                .get_name(kind_idx)
+                .unwrap_or("<unknown>")
+                .to_string();
 
-                    let kind_idx   = decode_kind(rel_cid);
-                    let target_idx = decode_target(rel_cid);
-
-                    // Wildcard ID пропускаем
-                    if target_idx == (1u32 << 20) - 1 { continue; }
-
-                    let kind_name = world.relation_registry()
-                        .get_name(kind_idx)
-                        .unwrap_or("<unknown>")
-                        .to_string();
-
-                    snap.relations.push(RelationSnapshot {
-                        subject_index: entity.index(),
-                        target_index:  target_idx,
-                        kind_name,
-                    });
-                }
-            }
+            snap.relations.push(RelationSnapshot {
+                subject_index,
+                target_index: target.index(),
+                kind_name,
+            });
         }
 
         Ok(snap)
@@ -212,7 +197,7 @@ impl WorldSerializer {
                     // Данные уже в нужном формате — используем как есть
                     let raw = &comp_snap.data;
 
-                    (serde_fns.deserialize_fn)(&raw)
+                    (serde_fns.deserialize_fn)(raw)
                         .map_err(|e| SerializationError::DeserializeFailed {
                             type_name: comp_snap.type_name.clone(),
                             reason:    e.to_string(),
@@ -247,8 +232,7 @@ impl WorldSerializer {
             };
 
             if let Some(kind_idx) = world.relation_registry().get_idx_by_name(&rel_snap.kind_name) {
-                let relation_id = encode_relation(kind_idx, target.index());
-                world.insert_relation_raw(subject, relation_id, target);
+                world.add_relation_by_kind_idx(subject, kind_idx, target);
             } else {
                 log::warn!(
                     "restore: relation kind '{}' not registered, skipping",
@@ -534,11 +518,6 @@ impl WorldSerializer {
                 Some(i) => i,
                 None => continue,
             };
-
-            // Relation-компоненты пропускаем
-            if is_relation_id(info.id) {
-                continue;
-            }
 
             // Компоненты без serde пропускаем
             let serde_fns = match &info.serde {

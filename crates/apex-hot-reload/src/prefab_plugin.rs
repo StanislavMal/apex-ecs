@@ -99,7 +99,7 @@ impl PrefabPlugin {
                 && path
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .map_or(false, |s| s.ends_with(".prefab"))
+                    .is_some_and(|s| s.ends_with(".prefab"))
             {
                 self.load_file(&path, registry)?;
             }

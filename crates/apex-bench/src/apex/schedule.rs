@@ -58,6 +58,12 @@ pub struct Schedule {
     scheduler: Scheduler,
 }
 
+impl Default for Schedule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Schedule {
     pub fn new() -> Self {
         let mut world = World::new();

@@ -1,6 +1,6 @@
 use crate::par_utils::compute_par_chunks;
 use crate::{
-    access::{AccessDescriptor, ArchetypeMask},
+    access::AccessDescriptor,
     archetype::Archetype,
     component::{Component, ComponentId, Tick},
     entity::Entity,
@@ -23,6 +23,17 @@ pub trait WorldQuery: Sized {
     fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
         Self::fill_ids(world, ids);
     }
+
+    /// Заполняет только ОБЯЗАТЕЛЬНЫЕ component IDs — те, без которых архетип
+    /// заведомо не матчится (Read/Write/Ref/With/Changed). В отличие от
+    /// `fill_positive_ids` НЕ включает optional (`Maybe`/`MaybeWrite`).
+    /// Используется `Query::new` для выбора архетипов-кандидатов из
+    /// `component_arch_index` (кандидаты = архетипы самого редкого
+    /// обязательного компонента).
+    fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
+        Self::fill_positive_ids(world, ids);
+    }
+
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
     /// Захватывает per-archetype состояние для итерации.
@@ -428,6 +439,9 @@ impl<T: Component> WorldQuery for Maybe<T> {
         }
     }
 
+    /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
+    fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
+
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
         true
     }
@@ -520,6 +534,9 @@ impl<T: Component> WorldQuery for MaybeWrite<T> {
             ids.push(id);
         }
     }
+
+    /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
+    fn fill_required_ids(_: &World, _: &mut Vec<ComponentId>) {}
 
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
         true
@@ -658,6 +675,10 @@ macro_rules! impl_world_query_tuple {
 
             fn fill_positive_ids(world: &World, ids: &mut Vec<ComponentId>) {
                 $( $Q::fill_positive_ids(world, ids); )+
+            }
+
+            fn fill_required_ids(world: &World, ids: &mut Vec<ComponentId>) {
+                $( $Q::fill_required_ids(world, ids); )+
             }
 
             fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -805,25 +826,10 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
-        let mut positive_ids = Vec::with_capacity(Q::component_count());
-        Q::fill_positive_ids(world, &mut positive_ids);
 
-        let exclude_mask = {
-            let mut mask = ArchetypeMask::EMPTY;
-            for &id in ids.iter().filter(|id| !positive_ids.contains(id)) {
-                if let Some(arch_ids) = world.component_arch_index.get(&id) {
-                    for arch_id in arch_ids {
-                        mask.set(arch_id.0 as usize);
-                    }
-                }
-            }
-            mask
-        };
-
+        // Without-семантика целиком в matches_archetype (Without::matches_archetype
+        // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
         let arch_filter = |arch_idx: usize| -> bool {
-            if exclude_mask.get(arch_idx) {
-                return false;
-            }
             let arch = &world.archetypes[arch_idx];
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
@@ -860,78 +866,31 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         let mut ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(world, &mut ids);
 
-        // Собираем positive IDs (не-Without) для candidate selection
-        let mut positive_ids = Vec::with_capacity(Q::component_count());
-        Q::fill_positive_ids(world, &mut positive_ids);
-
-        // Строим exclude_mask из negative (Without) компонентов
-        let exclude_mask = {
-            let mut mask = ArchetypeMask::EMPTY;
-            for &id in ids.iter().filter(|id| !positive_ids.contains(id)) {
-                if let Some(arch_ids) = world.component_arch_index.get(&id) {
-                    for arch_id in arch_ids {
-                        mask.set(arch_id.0 as usize);
-                    }
-                }
-            }
-            mask
-        };
-
-        // Predicate для фильтрации архетипов: проверка exclude_mask + matches_archetype
+        // Without-семантика целиком в matches_archetype (Without::matches_archetype
+        // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
         let arch_filter = |arch_idx: usize| -> bool {
-            if exclude_mask.get(arch_idx) {
-                return false;
-            }
             let arch = &world.archetypes[arch_idx];
             !arch.is_empty() && Q::matches_archetype(arch, &ids)
         };
 
+        // Порог линейного обхода: на малых мирах сканировать все архетипы
+        // дешевле, чем ходить в component_arch_index (hash-lookup на компонент).
+        const LINEAR_SCAN_MAX_ARCHETYPES: usize = 128;
+
         let archetypes = if ids.len() == Q::component_count() || !Q::requires_all_ids() {
-            // Линейный обход архетипов — быстрее для малых запросов (≤3 компонента)
-            // и малых миров (≤128 архетипов). ComponentArchIndex даёт выигрыш только
-            // для больших миров (500+ архетипов) и запросов с 4+ компонентами.
-            if !positive_ids.is_empty()
-                && (positive_ids.len() <= 3 || world.archetypes.len() <= 128)
-            {
-                // Линейный обход: O(N) по числу архетипов, без HashMap lookup'ов
+            // Обязательные компоненты (без Maybe/Without) — источник кандидатов.
+            let mut required_ids = Vec::with_capacity(Q::component_count());
+            Q::fill_required_ids(world, &mut required_ids);
+
+            if required_ids.is_empty() || world.archetypes.len() <= LINEAR_SCAN_MAX_ARCHETYPES {
+                // Линейный обход: мир мал ЛИБО запрос без обязательных
+                // компонентов (Without-only / Maybe-only / пустой) — такие
+                // матчат почти всё, кандидат-индекс не сузит.
                 world
                     .archetypes
                     .iter()
                     .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
-                    .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
-                        ArchState {
-                            arch_idx,
-                            state,
-                            len: arch.len(),
-                        }
-                    })
-                    .collect()
-            } else if positive_ids.is_empty() && !ids.is_empty() {
-                // Только Without-компоненты (нет positive) — используем exclude_mask
-                // для отсеивания архетипов, которые содержат excluding-компонент
-                world
-                    .archetypes
-                    .iter()
-                    .enumerate()
-                    .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
-                    .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
-                        ArchState {
-                            arch_idx,
-                            state,
-                            len: arch.len(),
-                        }
-                    })
-                    .collect()
-            } else if positive_ids.is_empty() {
-                // Запрос без компонентов — все архетипы
-                world
-                    .archetypes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, arch)| !arch.is_empty())
                     .map(|(arch_idx, arch)| {
                         let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
@@ -942,23 +901,27 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     })
                     .collect()
             } else {
-                // component_arch_index — O(K) поиск кандидатов через наименее
-                // распространённый компонент. Для больших миров (500+ архетипов)
-                // и сложных запросов (4+ компонентов) это K << N.
-                let candidate_archetypes = {
-                    let smallest = positive_ids
-                        .iter()
-                        .filter_map(|id| world.component_arch_index.get(id))
-                        .min_by_key(|v| v.len());
-
-                    match smallest {
-                        Some(arch_ids) => arch_ids.iter().map(|id| id.0 as usize).collect(),
-                        None => (0..world.archetypes.len()).collect::<Vec<_>>(),
+                // Кандидаты = архетипы САМОГО РЕДКОГО обязательного компонента
+                // из component_arch_index: O(кандидатов), не O(всех архетипов).
+                // Отсутствие записи в индексе = компонент не встречается ни в
+                // одном архетипе → запрос заведомо пуст (кандидатов нет).
+                let mut candidates: &[crate::archetype::ArchetypeId] = &[];
+                let mut best = usize::MAX;
+                for id in &required_ids {
+                    let list = world
+                        .component_arch_index
+                        .get(id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    if list.len() < best {
+                        best = list.len();
+                        candidates = list;
                     }
-                };
+                }
 
-                candidate_archetypes
-                    .into_iter()
+                candidates
+                    .iter()
+                    .map(|id| id.0 as usize)
                     .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let arch = &world.archetypes[arch_idx];

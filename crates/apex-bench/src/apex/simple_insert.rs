@@ -9,6 +9,12 @@ use crate::{Transform, Position, Rotation, Velocity};
 //       с Bevy/Legion бенчмарками (они тоже не используют black_box).
 pub struct SimpleInsert;
 
+impl Default for SimpleInsert {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SimpleInsert {
     pub fn new() -> Self {
         Self

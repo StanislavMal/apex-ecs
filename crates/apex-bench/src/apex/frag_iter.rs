@@ -32,6 +32,12 @@ macro_rules! spawn_batches {
     };
 }
 
+impl Default for FragIter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FragIter {
     pub fn new() -> Self {
         let mut world = World::new();

@@ -335,14 +335,28 @@ impl Archetype {
         self.entities.is_empty()
     }
 
+    /// Порог линейного поиска колонки: на ≤8 компонентах скан inline-SmallVec
+    /// быстрее FxHashMap-lookup'а (CR-M3; критерий — frag_world random get_mut).
+    const COLUMN_LINEAR_MAX: usize = 8;
+
     #[inline]
     pub fn column_index(&self, component_id: ComponentId) -> Option<usize> {
-        self.column_map.get(&component_id).copied()
+        // Инвариант: columns построены в порядке component_ids, поэтому
+        // позиция в component_ids == значение в column_map.
+        if self.component_ids.len() <= Self::COLUMN_LINEAR_MAX {
+            self.component_ids.iter().position(|&c| c == component_id)
+        } else {
+            self.column_map.get(&component_id).copied()
+        }
     }
 
     #[inline]
     pub fn has_component(&self, component_id: ComponentId) -> bool {
-        self.column_map.contains_key(&component_id)
+        if self.component_ids.len() <= Self::COLUMN_LINEAR_MAX {
+            self.component_ids.contains(&component_id)
+        } else {
+            self.column_map.contains_key(&component_id)
+        }
     }
 
     pub unsafe fn get_component<T>(&self, row: usize, component_id: ComponentId) -> Option<&T> {

@@ -74,8 +74,8 @@ fn register_query(lua: &mlua::Lua) -> mlua::Result<()> {
                 cached.clone()
             } else {
                 let world = ctx_ref.world_ref();
-                let states = iterators::build_arch_states(world, &ctx_ref, &parsed);
-                states
+                
+                iterators::build_arch_states(world, &ctx_ref, &parsed)
             }
         };
 
@@ -213,12 +213,12 @@ fn register_log_levels(lua: &mlua::Lua) -> mlua::Result<()> {
 // ── inspect(table) ────────────────────────────────────────────
 
 fn register_inspect(lua: &mlua::Lua) -> mlua::Result<()> {
-    lua.globals().set("inspect", lua.create_function(|lua, val: mlua::Value| {
-        Ok(inspect_value(lua, &val, 0))
+    lua.globals().set("inspect", lua.create_function(|_, val: mlua::Value| {
+        Ok(inspect_value(&val, 0))
     })?)
 }
 
-fn inspect_value(lua: &mlua::Lua, val: &mlua::Value, depth: usize) -> String {
+fn inspect_value(val: &mlua::Value, depth: usize) -> String {
     if depth > 4 {
         return "{...}".to_string();
     }
@@ -240,16 +240,14 @@ fn inspect_value(lua: &mlua::Lua, val: &mlua::Value, depth: usize) -> String {
             let len = t.raw_len();
             for i in 1..=len {
                 if let Ok(v) = t.get::<mlua::Value>(i) {
-                    parts.push(inspect_value(lua, &v, depth + 1));
+                    parts.push(inspect_value(&v, depth + 1));
                 }
             }
             // Hash part (строковые ключи)
-            for pair in t.clone().pairs::<String, mlua::Value>() {
-                if let Ok((k, v)) = pair {
-                    if k == "_meta" { continue; }
-                    let val_str = inspect_value(lua, &v, depth + 1);
-                    parts.push(format!("{} = {}", k, val_str));
-                }
+            for (k, v) in t.clone().pairs::<String, mlua::Value>().flatten() {
+                if k == "_meta" { continue; }
+                let val_str = inspect_value(&v, depth + 1);
+                parts.push(format!("{} = {}", k, val_str));
             }
 
             if parts.is_empty() {
@@ -259,7 +257,7 @@ fn inspect_value(lua: &mlua::Lua, val: &mlua::Value, depth: usize) -> String {
                 format!("{{ {} }}", parts.join(", "))
             } else {
                 let inner = parts.iter()
-                    .map(|p| format!("{}{}", if p.contains('=') { &indent } else { &indent }, p))
+                    .map(|p| format!("{indent}{p}"))
                     .collect::<Vec<_>>()
                     .join(",\n");
                 format!("{{\n{}\n{}}}", inner, "  ".repeat(depth))

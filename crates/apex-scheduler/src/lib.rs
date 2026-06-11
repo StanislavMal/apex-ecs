@@ -85,6 +85,73 @@ use std::any::TypeId;
 use thiserror::Error;
 use thunderdome::Index;
 
+// ── Main-world per-system профайлер (`APEX_MAIN_PROF=1`) ────────────────────
+//
+// Зеркало рендерного `APEX_PROF`: render-мир и extract давно имели разбивку, а
+// exclusive-системы main-мира мерились только ad-hoc обёртками в примерах.
+// Лог раз в ~2с: среднее ms/вызов по каждой системе, отсортировано по убыванию.
+
+fn main_prof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("APEX_MAIN_PROF").as_deref() == Ok("1"))
+}
+
+fn main_prof_record(name: &str, elapsed: std::time::Duration) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static ACC: Mutex<Vec<(String, f64, u32)>> = Mutex::new(Vec::new());
+    static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let mut acc = ACC.lock().unwrap();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if let Some(e) = acc.iter_mut().find(|(n, _, _)| n == name) {
+        e.1 += ms;
+        e.2 += 1;
+    } else {
+        acc.push((name.to_string(), ms, 1));
+    }
+
+    let mut last = LAST_LOG.lock().unwrap();
+    if last.map(|t| t.elapsed().as_secs_f32() > 2.0).unwrap_or(true) {
+        *last = Some(Instant::now());
+        let mut rows: Vec<(String, f64)> = acc
+            .iter()
+            .map(|(n, sum, count)| (n.clone(), *sum / (*count).max(1) as f64))
+            .collect();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let line: String = rows
+            .iter()
+            .map(|(n, avg)| format!("{n} {avg:.2}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        log::info!("MAIN PROF (ms/вызов, avg ~2s): {line}");
+        for e in acc.iter_mut() {
+            e.1 = 0.0;
+            e.2 = 0;
+        }
+    }
+}
+
+/// Раз в ~2с — сводка по архетипам мира (CR-M4: счётчик живых строк в отчёте
+/// `APEX_MAIN_PROF`; рост empty/archetypes — сигнал фрагментации).
+fn main_prof_world_stats(world: &apex_core::World) {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.map(|t| t.elapsed().as_secs_f32() > 2.0).unwrap_or(true) {
+        *last = Some(Instant::now());
+        let s = world.archetype_stats();
+        log::info!(
+            "MAIN PROF мир: archetypes={} (empty={}), rows={}, max_arch_rows={}",
+            s.archetypes,
+            s.empty_archetypes,
+            s.total_rows,
+            s.max_rows_in_archetype
+        );
+    }
+}
+
 pub use apex_core::system_param::{
     AutoSystem, Emit, EventAccessList, Listen, ResRead, ResWrite, ResourceAccessList,
 };
@@ -593,6 +660,20 @@ struct GraphEdgeInfo {
 ///
 /// # Инкрементальность
 ///
+/// Какие архетипы нужны системе (CR-M4).
+///
+/// Системы без компонентных доступов (только ресурсы/события) получают
+/// маркер `All` вместо материализованного `Vec` всех индексов — на больших
+/// мирах это убирало по Vec<usize> длиной в число архетипов на систему.
+#[derive(Debug, Clone)]
+enum SystemArchetypes {
+    /// Без ограничений — системе подходят все архетипы.
+    All,
+    /// Архетипы, содержащие хотя бы один компонент системы
+    /// (критерий `any()`; Query сам дофильтрует через matches_archetype).
+    Filtered(Vec<usize>),
+}
+
 /// Граф зависимостей хранится между `compile()` вызовами.
 /// `dirty_systems` отслеживает системы добавленные после последнего compile —
 /// при следующем compile добавляются только новые узлы/рёбра.
@@ -645,7 +726,7 @@ pub struct Scheduler {
     // ── SubWorld маппинг ────────────────────────────────────────
     /// Для каждой системы — индексы архетипов, которые ей нужны.
     /// Заполняется в compile() и используется в run_hybrid_parallel().
-    system_archetype_indices: FxHashMap<SystemId, Vec<usize>>,
+    system_archetype_indices: FxHashMap<SystemId, SystemArchetypes>,
     /// Owned storage для Vec<usize>, используемых SubWorld.
     /// Позволяет избежать Box::leak — данные живут в Scheduler.
     archetype_indices_storage: Vec<Vec<usize>>,
@@ -1318,11 +1399,23 @@ impl Scheduler {
     }
 
     fn find_id_by_name(&self, name: &str) -> Result<SystemId, SchedulerError> {
-        self.systems
+        // Exact match first.
+        if let Some(s) = self.systems.iter().find(|s| s.name == name) {
+            return Ok(s.id);
+        }
+        // Fallback: match the last `::` path segment, so a fn-based exclusive system registered
+        // under its `type_name` (e.g. "my_crate::init_metrics") can be referenced by its short name
+        // ("init_metrics") in `chain`/`after`. Only when exactly one system matches (no ambiguity).
+        let mut matches = self
+            .systems
             .iter()
-            .find(|s| s.name == name)
-            .map(|s| s.id)
-            .ok_or_else(|| SchedulerError::SystemNotFound(name.to_string()))
+            .filter(|s| s.name.rsplit("::").next() == Some(name));
+        if let Some(first) = matches.next() {
+            if matches.next().is_none() {
+                return Ok(first.id);
+            }
+        }
+        Err(SchedulerError::SystemNotFound(name.to_string()))
     }
 
     /// Цепочка систем: каждая запускается после предыдущей.
@@ -1781,7 +1874,16 @@ impl Scheduler {
             return;
         }
 
-        self.system_archetype_indices.clear();
+        // Архетипы append-only: при росте мира существующие списки ДОПОЛНЯЮТСЯ
+        // только хвостом archetypes[prev_count..] — полный пересчёт O(systems ×
+        // archetypes) был квадратичным на спавн-бёрстах (C-8). Полный скан —
+        // только при первом вызове и для систем без записи (новые после compile).
+        let prev_count = if self.system_archetype_indices.is_empty() {
+            0
+        } else {
+            self.cached_archetype_count.min(arch_count)
+        };
+
         self.archetype_indices_storage.clear();
         self.row_ranges_storage.clear();
 
@@ -1792,6 +1894,8 @@ impl Scheduler {
             self.cached_archetype_count = 0;
             return;
         }
+
+        let registry = world.registry();
 
         // Для каждой системы находим подходящие архетипы.
         // Используем критерий `any()`: архетип подходит, если содержит
@@ -1811,32 +1915,43 @@ impl Scheduler {
             system_type_ids.extend(access.writes.iter().copied());
 
             if system_type_ids.is_empty() {
-                // Система без компонентов (только ресурсы/события) — все архетипы
-                let all: Vec<usize> = (0..arch_count).collect();
-                self.system_archetype_indices.insert(system.id, all);
+                // Система без компонентов (только ресурсы/события) — маркер
+                // «без ограничений» вместо материализованного Vec всех индексов.
+                self.system_archetype_indices
+                    .insert(system.id, SystemArchetypes::All);
                 continue;
             }
 
-            let mut indices = Vec::new();
-            for (arch_idx, arch) in archetypes.iter().enumerate() {
-                // Архетип подходит если содержит хотя бы один компонент из системы.
-                // Query сам отфильтрует неподходящие архетипы через matches_archetype,
-                // а слишком жёсткий критерий (all) ломает SubWorld для систем
-                // с разными подмножествами компонентов в разных архетипах.
-                let registry = world.registry();
-                let has_match = system_type_ids.iter().any(|tid| {
-                    if let Some(cid) = registry.get_id_by_type(tid) {
-                        arch.has_component(cid)
-                    } else {
-                        false
-                    }
-                });
-                if has_match {
-                    indices.push(arch_idx);
+            // ComponentId резолвим один раз на систему, не на архетип.
+            // (Незарезолвленный TypeId безвреден: архетип с компонентом не может
+            // существовать раньше регистрации компонента.)
+            let cids: Vec<apex_core::ComponentId> = system_type_ids
+                .iter()
+                .filter_map(|tid| registry.get_id_by_type(tid))
+                .collect();
+
+            // Существующий список дополняем с prev_count; новый (система,
+            // появившаяся после прошлого вызова) сканируем с нуля.
+            let start = match self.system_archetype_indices.get(&system.id) {
+                Some(SystemArchetypes::Filtered(_)) => prev_count,
+                Some(SystemArchetypes::All) => continue, // состав доступа статичен
+                None => {
+                    self.system_archetype_indices
+                        .insert(system.id, SystemArchetypes::Filtered(Vec::new()));
+                    0
+                }
+            };
+            let Some(SystemArchetypes::Filtered(indices)) =
+                self.system_archetype_indices.get_mut(&system.id)
+            else {
+                unreachable!("ветки выше гарантируют Filtered");
+            };
+
+            for (offset, arch) in archetypes[start..].iter().enumerate() {
+                if cids.iter().any(|&cid| arch.has_component(cid)) {
+                    indices.push(start + offset);
                 }
             }
-
-            self.system_archetype_indices.insert(system.id, indices);
         }
 
         self.cached_archetype_count = arch_count;
@@ -2206,6 +2321,9 @@ impl Scheduler {
     ///
     /// Startup этап выполняется только при первом вызове `run()`.
     pub fn run(&mut self, world: &mut World) {
+        if main_prof_enabled() {
+            main_prof_world_stats(world);
+        }
         // Заполняем реестр имён компонентов для диагностики конфликтов
         self.populate_type_names(world.registry());
         if self.execution_plan.is_none() {
@@ -2267,6 +2385,7 @@ impl Scheduler {
                         continue;
                     }
                     let system = &mut self.systems[index];
+                    let prof_t = main_prof_enabled().then(std::time::Instant::now);
                     match &mut system.kind {
                         SystemKind::Sequential(f) => f(w),
                         SystemKind::Parallel { system, .. } => {
@@ -2275,6 +2394,9 @@ impl Scheduler {
                                 cmds_ptr,
                             ));
                         }
+                    }
+                    if let Some(t) = prof_t {
+                        main_prof_record(&self.systems[index].name, t.elapsed());
                     }
                 }
             }
@@ -2358,11 +2480,11 @@ impl Scheduler {
                 continue;
             }
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                let arch_indices = self
-                    .system_archetype_indices
-                    .get(&sys_id)
-                    .cloned()
-                    .unwrap_or_else(|| (0..archetypes.len()).collect());
+                let arch_indices = match self.system_archetype_indices.get(&sys_id) {
+                    Some(SystemArchetypes::Filtered(v)) => v.clone(),
+                    // All или нет записи — система видит все архетипы
+                    _ => (0..archetypes.len()).collect(),
+                };
 
                 let entity_count: usize = arch_indices
                     .iter()
@@ -2613,6 +2735,7 @@ impl Scheduler {
                             continue;
                         }
                             let system = &mut self.systems[sys_idx];
+                            let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
@@ -2621,6 +2744,9 @@ impl Scheduler {
                                         cmds_ptr as *mut Vec<Commands>,
                                     ));
                                 }
+                            }
+                            if let Some(t) = prof_t {
+                                main_prof_record(&self.systems[sys_idx].name, t.elapsed());
                             }
                         }
                     }
@@ -2641,12 +2767,19 @@ impl Scheduler {
             }
 
             let should_fallback = if self.parallel_min_entities > 0 || self.auto_disable_parallel {
+                let total_entities: usize = arch_lengths.iter().sum();
                 let stage_entity_count: usize = stage_ids
                     .iter()
                     .filter_map(|&sys_id| self.system_archetype_indices.get(&sys_id))
-                    .flat_map(|indices| indices.iter().copied())
-                    .filter(|&ai| ai < arch_lengths.len())
-                    .map(|ai| arch_lengths[ai])
+                    .map(|indices| match indices {
+                        SystemArchetypes::All => total_entities,
+                        SystemArchetypes::Filtered(v) => v
+                            .iter()
+                            .copied()
+                            .filter(|&ai| ai < arch_lengths.len())
+                            .map(|ai| arch_lengths[ai])
+                            .sum(),
+                    })
                     .sum();
                 let below_hard_limit = self.parallel_min_entities > 0
                     && stage_entity_count < self.parallel_min_entities;
@@ -2673,6 +2806,7 @@ impl Scheduler {
                             continue;
                         }
                             let system = &mut self.systems[sys_idx];
+                            let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
@@ -2681,6 +2815,9 @@ impl Scheduler {
                                         cmds_ptr as *mut Vec<Commands>,
                                     ));
                                 }
+                            }
+                            if let Some(t) = prof_t {
+                                main_prof_record(&self.systems[sys_idx].name, t.elapsed());
                             }
                         }
                     }
@@ -2764,14 +2901,16 @@ impl Scheduler {
         let arch_count = world.archetypes().len();
 
         // ── 1. Заполняем archetype_indices_storage ────────────────
+        // (SubWorld требует материализованный список — для All/fallback он
+        // строится здесь, один раз на prepare, а не хранится постоянно.)
         for system in &self.systems {
             let indices = self.system_archetype_indices.get(&system.id);
             match indices {
-                Some(indices) if !indices.is_empty() => {
-                    self.archetype_indices_storage.push(indices.clone());
+                Some(SystemArchetypes::Filtered(v)) if !v.is_empty() => {
+                    self.archetype_indices_storage.push(v.clone());
                 }
                 _ => {
-                    // fallback: все архетипы
+                    // All / пустой список / нет записи — все архетипы
                     self.archetype_indices_storage
                         .push((0..arch_count).collect());
                 }
@@ -2997,21 +3136,27 @@ impl Scheduler {
                     .get(sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
-                    if let Some(indices) = self.system_archetype_indices.get(sys_id) {
-                        out.push_str(&format!(
-                            "  {}: {} archetypes [{}]\n",
-                            s.name,
-                            indices.len(),
-                            if indices.len() <= 10 {
-                                indices
-                                    .iter()
-                                    .map(|i| i.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            } else {
-                                format!("{}..{}", indices[0], indices[indices.len() - 1])
-                            }
-                        ));
+                    match self.system_archetype_indices.get(sys_id) {
+                        Some(SystemArchetypes::All) => {
+                            out.push_str(&format!("  {}: all archetypes\n", s.name));
+                        }
+                        Some(SystemArchetypes::Filtered(indices)) => {
+                            out.push_str(&format!(
+                                "  {}: {} archetypes [{}]\n",
+                                s.name,
+                                indices.len(),
+                                if indices.len() <= 10 {
+                                    indices
+                                        .iter()
+                                        .map(|i| i.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                } else {
+                                    format!("{}..{}", indices[0], indices[indices.len() - 1])
+                                }
+                            ));
+                        }
+                        None => {}
                     }
                 }
             }

@@ -165,9 +165,7 @@ pub(crate) fn build_arch_states(
 
             // With-фильтры: все должны присутствовать
             for cid in &with_ids {
-                if arch.column_index(*cid).is_none() {
-                    return None;
-                }
+                arch.column_index(*cid)?;
             }
 
             // Without-фильтры: ни один не должен присутствовать

@@ -41,7 +41,7 @@
 - **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon с адаптивным отключением для малых миров
 - **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>` работают без overhead
 - **Композиция Bundle** — вложенные `#[derive(Bundle)]`, кортежи Bundle до 12 элементов, одиночные компоненты напрямую в `spawn()`
-- **Relations (связи между entity)** — иерархии, ownership и произвольные связи закодированы как компоненты
+- **Relations (связи между entity)** — иерархии, ownership и произвольные связи в выделенных индексах мира (O(1) добавление, без влияния на архетипы; cascade delete при despawn target)
 - **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
 - **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
 - **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
@@ -311,6 +311,17 @@ Archetype [Position, Velocity, Health]
 ```
 
 > **Примечание:** При добавлении или удалении компонента entity перемещается в другой архетип. Используйте `add_edges`/`remove_edges` кеш для O(1) поиска нужного архетипа при повторных операциях.
+
+**Стоимость фрагментации.** Число архетипов — это цена, которую платит каждый
+`Query::new` (выбор архетипов-кандидатов), планировщик (маппинг систем на архетипы)
+и кэш-профиль итерации: мир из множества мелких архетипов теряет contiguous-преимущество.
+На больших мирах (>128 архетипов) `Query::new` берёт кандидатов из индекса по самому
+редкому обязательному компоненту, но архетип-на-горстку-строк всё равно дороже плотного
+хранения. Фрагментацию создаёт только РАЗНООБРАЗИЕ СОСТАВОВ компонентов — следите за
+ним на реальных сценах через `world.archetype_stats()` (или строку
+`MAIN PROF мир: archetypes=…` при `APEX_MAIN_PROF=1`). **Relations фрагментацию НЕ
+создают**: с CR-M1 пара `(kind, target)` не входит в идентичность архетипа — иерархия
+из 27k уникальных родителей живёт в считанных архетипах (см. §8 и §14.7).
 
 ### 3.2 Граф переходов архетипов
 
@@ -2051,7 +2062,21 @@ cmds.add(|world: &mut World| { world.insert_resource(MyRes(42)); });
 
 ## 8. Relations (связи между entity)
 
-Relations позволяют создавать иерархии, ownership и произвольные связи между entity. Внутри они кодируются как специальные компоненты.
+Relations позволяют создавать иерархии, ownership и произвольные связи между entity.
+
+**Модель хранения (с рефакторинга 2026-06-11, CR-M1):** пара `(kind, target)` НЕ
+является компонентом и не входит в состав архетипа. Связи живут в двух индексах мира:
+subject-индекс (`entity → её пары`, target хранится целиком — index + generation) и
+target-индекс (`(kind, target) → subjects`). Следствия:
+
+- `add_relation`/`remove_relation` — O(1)-вставки в индексы, БЕЗ архетипного перехода
+  и без влияния на кэш запросов; иерархия любого размера не плодит архетипов;
+- `children_of(kind, parent)` — O(числа детей);
+- **связь никогда не переживает свой target**: `despawn(target)` вычищает все пары,
+  где entity — target, а generation в индексах гарантирует, что переиспользованный
+  `entity.index` не вернёт чужие связи;
+- `add_relation` с МЁРТВЫМ subject или target — no-op с `warn` в лог (такая связь
+  никогда не была бы вычищена корректно).
 
 ### 8.1 Встроенные виды связей
 
@@ -2079,21 +2104,30 @@ for child in world.children_of(ChildOf, parent) {
 // Удаление связи:
 world.remove_relation(child, ChildOf, parent);
 
-// Рекурсивное уничтожение иерархии:
+// Уничтожение иерархии: для cascade-видов (ChildOf) достаточно обычного despawn —
+// все subjects уничтожаются каскадом (итеративно, без рекурсии):
+world.despawn(root);
+
+// Явный рекурсивный вариант работает для ЛЮБОГО вида связи (включая не-cascade):
 world.despawn_recursive(ChildOf, root); // удаляет root + всех потомков
 ```
+
+**Семантика despawn(target):** для видов с
+`cascade_delete_on_target_despawn() == true` (например, `ChildOf`) subjects
+уничтожаются вместе с target; для остальных видов (например, `Owns`) subjects
+живут дальше, но связь вычищается из индексов — `get_relation_target` вернёт `None`.
 
 ### 8.1.1 Массовое добавление Relations
 
 ```rust
 // Массовое добавление одинаковой relation от множества субъектов к одному target.
-// Оптимизировано для создания иерархий (например, тайловые карты).
-// Все subjects группируются по текущему архетипу и перемещаются за один проход.
 let subjects = vec![entity1, entity2, entity3];
-world.add_relation_batch(subjects, ChildOf, parent);
+world.add_relation_batch(&subjects, ChildOf, parent);
 ```
 
-> **Производительность:** При создании иерархии 1000 объектов `add_relation_batch` выполняет 1 архетипный переход на группу вместо 1000 отдельных переходов. Используйте вместо цикла `add_relation()` при пакетном создании связей.
+> **Производительность:** после CR-M1 `add_relation` не делает структурных изменений,
+> поэтому batch — это просто bulk-вставка в индексы (O(N)); отдельный цикл
+> `add_relation()` стоит столько же. API сохранён для удобства и обратной совместимости.
 
 ### 8.2 Пользовательские RelationKind
 
@@ -3242,6 +3276,41 @@ cargo run --release
 > **«Valley of death»:** PAR в 2-3× медленнее SEQ при 5 000–50 000 entity в зависимости от числа систем.
 > Для малых миров автоотключатель переводит stage на sequential.
 
+**Фрагментированный мир (бенч `frag_world`, CR-M0 из `apex-engine/plans/CORE_REFACTORING.md`):**
+
+Профиль ~ many_foxes @1000: 28k entity, 1000 цепочек root→26 узлов→prim через `ChildOf`
+→ 27k уникальных родителей. **ДО** рефакторинга (модель «пара = компонент архетипа») мир
+фрагментировался на **27 005 архетипов**; **ПОСЛЕ** (CR-M1…M4, 2026-06-11) тот же мир —
+**5 архетипов**. Все таблицы выше меряны на мирах из единиц архетипов и фрагментированный
+профиль не ловили. Числа (i5-12400F, release + LTO, медиана из 9):
+
+| Операция | ДО (27k архетипов) | ПОСЛЕ (5 архетипов) | Δ |
+|----------|:------------------:|:-------------------:|:--:|
+| `Query::new` Read×1 (28k строк) | 549 µs | **~0.2-0.3 µs** | ~2000× |
+| `Query::new` Read×2 (1k строк) | 185 µs | **~0.15 µs** | ~1200× |
+| `Query::new` Read×3 (27k строк) | 1.42 ms | **~0.2-0.4 µs** | ~4000× |
+| `Query::new` (Read, Maybe) | 912 µs | **~0.15-0.2 µs** | ~5000× |
+| `Query::new` (Read, Without) | 477 µs | **~0.15 µs** | ~3000× |
+| `Query::new` (Read, With) (1k) | 222 µs | **~0.17 µs** | ~1300× |
+| `Query::new` редкий комп. (8 строк) | 173 µs | **~0.12 µs** | ~1400× |
+| `Query::new` Changed (with_tick) | 974 µs | **~0.13 µs** | ~7000× |
+| `children_of` ×27k родителей | 264 µs (9.8 ns/вызов) | **~190 µs (7 ns)** | 1.4× |
+| `get_relation_target` ×27k | 1.64 ms (61 ns/вызов) | **80 µs (3 ns)** | 20× |
+| random `get_mut` ×28k (shuffle) | 3.25 ms (116 ns/вызов) | **195 µs (7 ns)** | 16× |
+| random `get_mut_by_id` ×28k (CR-M3) | — | **172 µs (6.1 ns)** | 19× от ДО-get_mut |
+| `has_component` ×28k | 425 µs (15 ns/вызов) | **120 µs (4.3 ns)** | 3.5× |
+| extract-цикл (18 `Query::new` + iter) | **15.1 ms** | **~0.21 ms** | **73×** |
+| spawn поддерева (28 spawn + 27 `add_relation`) | 86.8 µs (3.2 µs/add_relation) | **~14 µs (0.5 µs)** | 6× |
+| построение мира 28k | 47.5 ms | **~7 ms** | 6× |
+
+> Что изменилось: CR-M1 — relations вне идентичности архетипа (27k архетипов → 5);
+> CR-M2 — кандидаты Query::new из component_arch_index + инкрементальный QueryCache;
+> CR-M3 — `component_id`/`get_by_id`/`get_mut_by_id` + линейный поиск колонки при ≤8
+> компонентах; CR-M4 — гигиена (см. apex-engine/plans/CORE_REFACTORING.md).
+> На DoD-сцене движка many_foxes @1000: ~160 → **~390 FPS** (Bevy ~235).
+> Бенч-страж: `cargo run --release -p apex-bench --bin frag_world` — падение >20% на нём
+> блокирует мерж.
+
 ### 14.8 Применённые оптимизации
 
 В версии 0.1.0 применён ряд оптимизаций внутренних структур данных:
@@ -3465,6 +3534,9 @@ fn main() {
 | `remove::<T>(entity)` | Удалить компонент |
 | `get::<T>(entity)` | Прочитать компонент → `Option<&T>` |
 | `get_mut::<T>(entity)` | Изменить компонент → `Option<&mut T>` |
+| `component_id::<T>()` | ComponentId типа → `Option<ComponentId>` (CR-M3) |
+| `get_by_id::<T>(entity, cid)` | `get` по заранее взятому ComponentId — без TypeId-hash на вызов (горячие циклы) |
+| `get_mut_by_id::<T>(entity, cid)` | `get_mut` по ComponentId (стампит change-tick) |
 | `insert_resource(value)` | Вставить ресурс |
 | `resource::<T>()` | Прочитать ресурс (panic если нет) |
 | `resource_mut::<T>()` | Изменить ресурс |
@@ -3486,16 +3558,19 @@ fn main() {
 | `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>` как фильтр в Q) |
 | `query_relation::<K, Q>(kind, target)` | Query по relation |
 | `query_wildcard::<K, Q>(kind)` | Query по relation (любой target) |
-| `add_relation(s, kind, t)` | Создать связь subject→target |
-| `add_relation_batch(subjects, kind, target)` | Массовое добавление relation (оптимизировано) |
+| `add_relation(s, kind, t)` | Создать связь subject→target (O(1), без структурных изменений; мёртвые s/t — no-op+warn) |
+| `add_relation_batch(&subjects, kind, target)` | Массовое добавление relation (bulk-вставка в индексы) |
 | `has_relation(s, kind, t)` | Проверить наличие связи |
-| `get_relation_target(s, kind)` | Получить target связи → `Option<Entity>` |
-| `children_of(kind, parent)` | Итерация по дочерним entity |
-| `despawn_recursive(kind, e)` | Удалить entity + потомков |
+| `get_relation_target(s, kind)` | Получить target связи → `Option<Entity>` (generation-честно) |
+| `children_of(kind, parent)` | Итерация по дочерним entity — O(числа детей) |
+| `despawn_recursive(kind, e)` | Удалить entity + потомков (для cascade-видов хватает обычного `despawn`) |
+| `iter_relations()` | Все связи мира `(subject_index, kind_idx, target)` — сериализация |
+| `add_relation_by_kind_idx(s, kind_idx, t)` | Низкоуровневое добавление по kind_idx (restore/горячие циклы) |
 | `register_component::<T>()` | Зарегистрировать компонент |
 | `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
 | `entity_count()` | Количество живых entity → `usize` |
+| `archetype_stats()` | Сводка по архетипам → `ArchetypeStats` (всего/пустых/строк/максимум; CR-M4) |
 | `is_alive(entity)` | Проверить, жив ли entity → `bool` |
 | `has_component::<T>(entity)` | Проверить наличие компонента у entity (v0.1.0) → `bool` |
 | `clear_entities()` | Удалить все entity, сохранив ресурсы и события (v0.1.0) |
@@ -3506,6 +3581,11 @@ fn main() {
 | `register_template(name, tmpl)` | Зарегистрировать EntityTemplate по имени |
 | `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
 | `has_template(name)` | Проверить наличие шаблона → `bool` |
+
+**Утилита `apex_core::IndexStamp`** (CR-M4): генерационная «карта посещений» по
+`entity.index()` — O(1) `mark`/`contains` без хэширования, очистка — `next_generation()`.
+Замена `FxHashSet<Entity>`-на-кадр для ПЛОТНЫХ кадровых множеств (тысячи отметок;
+generation entity не участвует — НЕ использовать для множеств, переживающих кадр).
 
 ### Scheduler API
 

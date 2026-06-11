@@ -1,90 +1,66 @@
-//! Relations — связи между entity, архитектура по образцу Flecs.
+//! Relations — связи между entity.
+//!
+//! # Модель (CR-M1, 2026-06-11)
+//!
+//! Пара `(kind, target)` НЕ является компонентом и не входит в идентичность
+//! архетипа. Истина о связях живёт в двух индексах мира:
+//!
+//! - [`SubjectIndex`]: `entity.index` → набор [`RelationPair`] (kind + target
+//!   **целиком**, с generation) — отвечает за `has_relation`,
+//!   `get_relation_target`, сериализацию;
+//! - [`TargetIndex`]: `(kind, target.index)` → subjects — отвечает за
+//!   `children_of` (O(детей)), `query_relation`/`query_wildcard` и
+//!   **cascade delete при `despawn(target)`**.
+//!
+//! Следствия:
+//! - `add_relation` = две индекс-вставки, БЕЗ структурного изменения
+//!   (нет archetype move, нет нового архетипа, нет инвалидации QueryCache);
+//! - `despawn(target)` вычищает все связи, где entity — target; для kind'ов с
+//!   `cascade_delete_on_target_despawn()` subjects деспавнятся каскадом;
+//! - generation-честность: в индексах хранится `Entity` целиком, поэтому
+//!   переиспользование `entity.index` новым поколением не возвращает чужие
+//!   связи; лимитов кодирования (2^20 на index, 2^11 на kind) больше нет.
+//!
+//! Историческая модель «пара кодируется в ComponentId и входит в состав
+//! архетипа» фрагментировала мир на архетип-на-родителя (many_foxes @1000 —
+//! 22k архетипов) и удалена; см. apex-engine/plans/CORE_REFACTORING.md (C-1..C-3).
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::any::TypeId;
 
 use crate::{
-    archetype::ArchetypeId,
-    component::{ComponentId, ComponentInfo, Tick},
+    component::Tick,
     entity::Entity,
     query::WorldQuery,
     world::World,
 };
 
-// ── Константы кодирования ──────────────────────────────────────
+// ── RelationPair ───────────────────────────────────────────────
 
-pub(crate) const RELATION_FLAG: u32 = 1 << 31;
-const WILDCARD_TARGET: u32 = (1 << 20) - 1;
-
-#[inline]
-pub fn encode_relation(kind_idx: u32, target_idx: u32) -> ComponentId {
-    debug_assert!(kind_idx < (1 << 11), "too many relation kinds");
-    debug_assert!(target_idx < WILDCARD_TARGET, "entity index too large");
-    ComponentId(RELATION_FLAG | (kind_idx << 20) | target_idx)
+/// Одна связь субъекта: вид + target целиком (index + generation).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RelationPair {
+    pub kind_idx: u32,
+    pub target: Entity,
 }
 
-#[inline]
-pub(crate) fn wildcard_id(kind_idx: u32) -> ComponentId {
-    ComponentId(RELATION_FLAG | (kind_idx << 20) | WILDCARD_TARGET)
-}
-
-#[inline]
-pub fn is_relation_id(id: ComponentId) -> bool {
-    id.0 & RELATION_FLAG != 0
-}
-
-#[inline]
-pub fn decode_kind(id: ComponentId) -> u32 {
-    (id.0 & !RELATION_FLAG) >> 20
-}
-
-#[inline]
-pub fn decode_target(id: ComponentId) -> u32 {
-    id.0 & ((1 << 20) - 1)
-}
-
-#[inline]
-fn is_wildcard(id: ComponentId) -> bool {
-    decode_target(id) == WILDCARD_TARGET
-}
-
-// ── IdRecord ───────────────────────────────────────────────────
-
-#[derive(Default)]
-pub(crate) struct IdRecord {
-    pub archetypes: SmallVec<[ArchetypeId; 4]>,
-}
-
-#[derive(Default)]
-pub(crate) struct IdIndex {
-    records: FxHashMap<u32, IdRecord>,
-}
-
-impl IdIndex {
-    pub fn register_archetype(&mut self, component_id: ComponentId, arch_id: ArchetypeId) {
-        self.records
-            .entry(component_id.0)
-            .or_default()
-            .archetypes
-            .push(arch_id);
-
-        if is_relation_id(component_id) && !is_wildcard(component_id) {
-            let wid = wildcard_id(decode_kind(component_id));
-            self.records
-                .entry(wid.0)
-                .or_default()
-                .archetypes
-                .push(arch_id);
-        }
-    }
-
+impl RelationPair {
     #[inline]
-    pub fn get(&self, component_id: ComponentId) -> &[ArchetypeId] {
-        self.records
-            .get(&component_id.0)
-            .map(|r| r.archetypes.as_slice())
-            .unwrap_or(&[])
+    fn sort_key(&self) -> (u32, u32, u32) {
+        (self.kind_idx, self.target.index(), self.target.generation())
+    }
+}
+
+impl PartialOrd for RelationPair {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RelationPair {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
     }
 }
 
@@ -99,95 +75,102 @@ const DENSE_THRESHOLD: usize = 8;
 ///   Использует binary_search — O(log n).
 /// - `Dense`: FxHashSet для большого числа отношений (>8).
 ///   Все операции O(1) amortized.
-enum RelationStorage {
-    Sparse(SmallVec<[u32; 8]>),
-    Dense(rustc_hash::FxHashSet<u32>),
+enum PairStorage {
+    Sparse(SmallVec<[RelationPair; 4]>),
+    Dense(rustc_hash::FxHashSet<RelationPair>),
 }
 
-impl Default for RelationStorage {
+impl Default for PairStorage {
     fn default() -> Self {
         Self::Sparse(SmallVec::new())
     }
 }
 
-impl RelationStorage {
+impl PairStorage {
+    /// true, если пары не было (вставлена впервые).
     #[inline]
-    fn insert(&mut self, raw: u32) {
+    fn insert(&mut self, pair: RelationPair) -> bool {
         match self {
             Self::Sparse(sv) => {
-                let pos = match sv.binary_search(&raw) {
-                    Ok(_) => return, // уже существует
+                let pos = match sv.binary_search(&pair) {
+                    Ok(_) => return false, // уже существует
                     Err(pos) => pos,
                 };
-                sv.insert(pos, raw);
+                sv.insert(pos, pair);
                 // Auto-upgrade: при превышении порога переключаемся на Dense
                 if sv.len() > DENSE_THRESHOLD {
-                    let set: rustc_hash::FxHashSet<u32> = sv.drain(..).collect();
+                    let set: rustc_hash::FxHashSet<RelationPair> = sv.drain(..).collect();
                     *self = Self::Dense(set);
                 }
+                true
             }
-            Self::Dense(set) => {
-                set.insert(raw);
-            }
+            Self::Dense(set) => set.insert(pair),
         }
     }
 
     #[inline]
-    fn remove(&mut self, raw: u32) -> bool {
+    fn remove(&mut self, pair: RelationPair) -> bool {
         match self {
             Self::Sparse(sv) => {
-                if let Ok(pos) = sv.binary_search(&raw) {
+                if let Ok(pos) = sv.binary_search(&pair) {
                     sv.remove(pos);
                     true
                 } else {
                     false
                 }
             }
-            Self::Dense(set) => set.remove(&raw),
+            Self::Dense(set) => set.remove(&pair),
         }
     }
 
     #[inline]
-    fn contains(&self, raw: u32) -> bool {
+    fn contains(&self, pair: RelationPair) -> bool {
         match self {
-            Self::Sparse(sv) => sv.binary_search(&raw).is_ok(),
-            Self::Dense(set) => set.contains(&raw),
+            Self::Sparse(sv) => sv.binary_search(&pair).is_ok(),
+            Self::Dense(set) => set.contains(&pair),
         }
     }
 
     #[inline]
     fn contains_kind(&self, kind_idx: u32) -> bool {
         match self {
-            Self::Sparse(sv) => sv.iter().any(|&r| {
-                let cid = ComponentId(r);
-                is_relation_id(cid) && decode_kind(cid) == kind_idx
-            }),
-            Self::Dense(set) => set.iter().any(|&r| {
-                let cid = ComponentId(r);
-                is_relation_id(cid) && decode_kind(cid) == kind_idx
-            }),
+            Self::Sparse(sv) => sv.iter().any(|p| p.kind_idx == kind_idx),
+            Self::Dense(set) => set.iter().any(|p| p.kind_idx == kind_idx),
         }
     }
 
-    fn clear(&mut self) {
+    /// Первая пара заданного вида (для Sparse — с минимальным target).
+    #[inline]
+    fn first_with_kind(&self, kind_idx: u32) -> Option<RelationPair> {
         match self {
-            Self::Sparse(sv) => sv.clear(),
-            Self::Dense(set) => set.clear(),
+            Self::Sparse(sv) => sv.iter().find(|p| p.kind_idx == kind_idx).copied(),
+            Self::Dense(set) => set.iter().find(|p| p.kind_idx == kind_idx).copied(),
         }
     }
 
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
+    fn is_empty(&self) -> bool {
         match self {
-            Self::Sparse(sv) => sv.len(),
-            Self::Dense(set) => set.len(),
+            Self::Sparse(sv) => sv.is_empty(),
+            Self::Dense(set) => set.is_empty(),
         }
     }
 
-    fn iter(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+    fn iter(&self) -> Box<dyn Iterator<Item = RelationPair> + '_> {
         match self {
             Self::Sparse(sv) => Box::new(sv.iter().copied()),
             Self::Dense(set) => Box::new(set.iter().copied()),
+        }
+    }
+
+    /// Забрать все пары, оставив хранилище пустым (без аллокаций при Sparse≤4).
+    fn take_all(&mut self) -> SmallVec<[RelationPair; 4]> {
+        match self {
+            Self::Sparse(sv) => std::mem::take(sv),
+            Self::Dense(set) => {
+                let out: SmallVec<[RelationPair; 4]> = set.iter().copied().collect();
+                set.clear();
+                out
+            }
         }
     }
 }
@@ -198,8 +181,8 @@ impl RelationStorage {
 struct SubjectEntry {
     /// Битовая маска: бит k установлен ↔ есть relation с kind_idx = k.
     kind_mask: u64,
-    /// Хранилище отношений (Sparse для ≤8, Dense для >8).
-    storage: RelationStorage,
+    /// Хранилище пар (Sparse для ≤8, Dense для >8).
+    storage: PairStorage,
 }
 
 impl SubjectEntry {
@@ -211,42 +194,33 @@ impl SubjectEntry {
         self.kind_mask & (1u64 << kind_idx) != 0
     }
 
-    #[cold]
-    #[allow(dead_code)]
-    fn has_kind_slow(&self, kind_idx: u32) -> bool {
-        self.storage.contains_kind(kind_idx)
-    }
-
     #[inline]
-    fn insert(&mut self, relation_id: ComponentId) {
-        let raw = relation_id.0;
-        let kind_idx = decode_kind(relation_id);
-        if kind_idx < 64 {
-            self.kind_mask |= 1u64 << kind_idx;
+    fn insert(&mut self, pair: RelationPair) -> bool {
+        let inserted = self.storage.insert(pair);
+        if inserted && pair.kind_idx < 64 {
+            self.kind_mask |= 1u64 << pair.kind_idx;
         }
-        self.storage.insert(raw);
+        inserted
     }
 
     #[inline]
-    fn remove(&mut self, relation_id: ComponentId) {
-        let raw = relation_id.0;
-        let kind_idx = decode_kind(relation_id);
-        let existed = self.storage.remove(raw);
-        if existed && kind_idx < 64 {
+    fn remove(&mut self, pair: RelationPair) -> bool {
+        let existed = self.storage.remove(pair);
+        if existed && pair.kind_idx < 64 {
             // Проверяем, остались ли ещё отношения этого вида
-            if !self.storage.contains_kind(kind_idx) {
-                self.kind_mask &= !(1u64 << kind_idx);
+            if !self.storage.contains_kind(pair.kind_idx) {
+                self.kind_mask &= !(1u64 << pair.kind_idx);
             }
         }
+        existed
     }
 
     #[inline]
-    fn has(&self, relation_id: ComponentId) -> bool {
-        let kind_idx = decode_kind(relation_id);
-        if !self.has_kind(kind_idx) {
+    fn has(&self, pair: RelationPair) -> bool {
+        if !self.has_kind(pair.kind_idx) {
             return false;
         }
-        self.storage.contains(relation_id.0)
+        self.storage.contains(pair)
     }
 }
 
@@ -269,42 +243,59 @@ impl SubjectIndex {
         }
     }
 
+    /// true, если пары не было (вставлена впервые).
     #[inline]
-    pub fn add(&mut self, entity_index: u32, relation_id: ComponentId) {
+    pub fn insert(&mut self, entity_index: u32, pair: RelationPair) -> bool {
         let idx = entity_index as usize;
         self.ensure(idx);
-        self.entries[idx].insert(relation_id);
+        self.entries[idx].insert(pair)
     }
 
     #[inline]
-    pub fn remove(&mut self, entity_index: u32, relation_id: ComponentId) {
+    pub fn remove(&mut self, entity_index: u32, pair: RelationPair) -> bool {
         let idx = entity_index as usize;
         if idx < self.entries.len() {
-            self.entries[idx].remove(relation_id);
-        }
-    }
-
-    #[inline]
-    pub fn has(&self, entity_index: u32, relation_id: ComponentId) -> bool {
-        let idx = entity_index as usize;
-        idx < self.entries.len() && self.entries[idx].has(relation_id)
-    }
-
-    pub fn get_all(&self, entity_index: u32) -> Vec<u32> {
-        let idx = entity_index as usize;
-        if idx < self.entries.len() {
-            self.entries[idx].storage.iter().collect()
+            self.entries[idx].remove(pair)
         } else {
-            Vec::new()
+            false
         }
     }
 
-    pub fn clear_entity(&mut self, entity_index: u32) {
+    #[inline]
+    pub fn has(&self, entity_index: u32, pair: RelationPair) -> bool {
         let idx = entity_index as usize;
-        if idx < self.entries.len() {
-            self.entries[idx].kind_mask = 0;
-            self.entries[idx].storage.clear();
+        idx < self.entries.len() && self.entries[idx].has(pair)
+    }
+
+    #[inline]
+    pub fn first_with_kind(&self, entity_index: u32, kind_idx: u32) -> Option<RelationPair> {
+        let idx = entity_index as usize;
+        let entry = self.entries.get(idx)?;
+        if !entry.has_kind(kind_idx) {
+            return None;
         }
+        entry.storage.first_with_kind(kind_idx)
+    }
+
+    /// Забрать все пары entity (для despawn).
+    #[inline]
+    pub fn take_all(&mut self, entity_index: u32) -> SmallVec<[RelationPair; 4]> {
+        let idx = entity_index as usize;
+        if idx < self.entries.len() && !self.entries[idx].storage.is_empty() {
+            self.entries[idx].kind_mask = 0;
+            self.entries[idx].storage.take_all()
+        } else {
+            SmallVec::new()
+        }
+    }
+
+    /// Итерация всех (subject_index, pair) — для сериализации.
+    pub fn iter_all(&self) -> impl Iterator<Item = (u32, RelationPair)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.storage.is_empty())
+            .flat_map(|(i, e)| e.storage.iter().map(move |p| (i as u32, p)))
     }
 }
 
@@ -314,9 +305,121 @@ impl Default for SubjectIndex {
     }
 }
 
+// ── TargetIndex ────────────────────────────────────────────────
+
+/// Обратный индекс: `(kind, target.index)` → subjects.
+///
+/// Ключ — голый `target.index`: записи вычищаются при despawn target'а,
+/// поэтому живая запись всегда принадлежит ТЕКУЩЕМУ поколению индекса
+/// (generation-честность обеспечивается чисткой, subjects хранятся целиком).
+pub(crate) struct TargetIndex {
+    /// kind_idx → (target.index → subjects в порядке вставки).
+    by_kind: Vec<FxHashMap<u32, SmallVec<[Entity; 4]>>>,
+    /// Число пар, где `entity.index` — target (fast-skip в despawn).
+    target_counts: Vec<u32>,
+}
+
+impl TargetIndex {
+    pub fn new() -> Self {
+        Self {
+            by_kind: Vec::new(),
+            target_counts: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn ensure_kind(&mut self, kind_idx: u32) -> &mut FxHashMap<u32, SmallVec<[Entity; 4]>> {
+        let k = kind_idx as usize;
+        if k >= self.by_kind.len() {
+            self.by_kind.resize_with(k + 1, FxHashMap::default);
+        }
+        &mut self.by_kind[k]
+    }
+
+    #[inline]
+    pub fn add(&mut self, kind_idx: u32, target: Entity, subject: Entity) {
+        self.ensure_kind(kind_idx)
+            .entry(target.index())
+            .or_default()
+            .push(subject);
+        let ti = target.index() as usize;
+        if ti >= self.target_counts.len() {
+            self.target_counts.resize(ti + 1, 0);
+        }
+        self.target_counts[ti] += 1;
+    }
+
+    #[inline]
+    pub fn remove(&mut self, kind_idx: u32, target_index: u32, subject: Entity) -> bool {
+        let Some(map) = self.by_kind.get_mut(kind_idx as usize) else {
+            return false;
+        };
+        let Some(subjects) = map.get_mut(&target_index) else {
+            return false;
+        };
+        let Some(pos) = subjects.iter().position(|&s| s == subject) else {
+            return false;
+        };
+        subjects.swap_remove(pos);
+        if subjects.is_empty() {
+            map.remove(&target_index);
+        }
+        self.target_counts[target_index as usize] -= 1;
+        true
+    }
+
+    /// Забрать всех subjects записи `(kind, target.index)` (для despawn).
+    #[inline]
+    pub fn take_subjects(
+        &mut self,
+        kind_idx: u32,
+        target_index: u32,
+    ) -> Option<SmallVec<[Entity; 4]>> {
+        let map = self.by_kind.get_mut(kind_idx as usize)?;
+        let subjects = map.remove(&target_index)?;
+        self.target_counts[target_index as usize] -= subjects.len() as u32;
+        Some(subjects)
+    }
+
+    #[inline]
+    pub fn subjects(&self, kind_idx: u32, target_index: u32) -> &[Entity] {
+        self.by_kind
+            .get(kind_idx as usize)
+            .and_then(|m| m.get(&target_index))
+            .map(|sv| sv.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Все subjects вида (wildcard) — по одному вхождению на пару.
+    pub fn all_subjects(&self, kind_idx: u32) -> impl Iterator<Item = Entity> + '_ {
+        self.by_kind
+            .get(kind_idx as usize)
+            .into_iter()
+            .flat_map(|m| m.values().flat_map(|sv| sv.iter().copied()))
+    }
+
+    /// Есть ли хоть одна связь, где данный index — target.
+    #[inline]
+    pub fn has_target(&self, entity_index: u32) -> bool {
+        self.target_counts
+            .get(entity_index as usize)
+            .map(|&c| c > 0)
+            .unwrap_or(false)
+    }
+}
+
+impl Default for TargetIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── RelationKind ───────────────────────────────────────────────
 
 pub trait RelationKind: Copy + Send + Sync + 'static {
+    /// При `despawn(target)` subjects этого вида деспавнятся каскадом.
+    /// Для остальных видов связь просто вычищается из индексов
+    /// (ни одна связь не переживает свой target).
     fn cascade_delete_on_target_despawn() -> bool {
         false
     }
@@ -369,7 +472,7 @@ impl RelationRegistry {
         self.type_to_idx.get(&TypeId::of::<R>()).copied()
     }
 
-    #[allow(dead_code)]
+    #[inline]
     pub fn is_cascade(&self, kind_idx: u32) -> bool {
         self.cascade_flags
             .get(kind_idx as usize)
@@ -413,12 +516,36 @@ impl Default for RelationRegistry {
 // ── World extension ────────────────────────────────────────────
 
 impl World {
+    /// Добавить связь `(kind, target)` субъекту.
+    ///
+    /// Две индекс-вставки, БЕЗ структурного изменения мира (не создаёт
+    /// архетипов, не двигает entity, не инвалидирует кэш запросов).
+    ///
+    /// Мёртвые subject/target игнорируются (с warn в лог): связь с мёртвым
+    /// target никогда не была бы вычищена и при переиспользовании индекса
+    /// указала бы на чужую entity.
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         let kind_idx = self.relations.get_or_register::<R>();
-        let relation_id = encode_relation(kind_idx, target.index);
-        self.ensure_relation_component(relation_id);
-        self.subject_index.add(subject.index, relation_id);
-        self.insert_relation_component(subject, relation_id);
+        self.add_relation_by_kind_idx(subject, kind_idx, target);
+    }
+
+    /// Низкоуровневый вариант `add_relation` по уже известному kind_idx
+    /// (горячие циклы, restore в apex-serialization).
+    pub fn add_relation_by_kind_idx(&mut self, subject: Entity, kind_idx: u32, target: Entity) {
+        debug_assert!(
+            (kind_idx as usize) < self.relations.kind_count(),
+            "add_relation_by_kind_idx: незарегистрированный kind_idx {kind_idx}"
+        );
+        if !self.entities.is_alive(subject) || !self.entities.is_alive(target) {
+            log::warn!(
+                "add_relation: subject {subject} или target {target} не живы — связь не добавлена"
+            );
+            return;
+        }
+        let pair = RelationPair { kind_idx, target };
+        if self.subject_index.insert(subject.index, pair) {
+            self.target_index.add(kind_idx, target, subject);
+        }
     }
 
     pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
@@ -426,9 +553,10 @@ impl World {
             Some(idx) => idx,
             None => return,
         };
-        let relation_id = encode_relation(kind_idx, target.index);
-        self.subject_index.remove(subject.index, relation_id);
-        self.remove_relation_component(subject, relation_id);
+        let pair = RelationPair { kind_idx, target };
+        if self.subject_index.remove(subject.index, pair) {
+            self.target_index.remove(kind_idx, target.index, subject);
+        }
     }
 
     /// O(1) проверка через SubjectIndex: kind_mask check + binary_search.
@@ -441,10 +569,14 @@ impl World {
             Some(idx) => idx,
             None => return false,
         };
-        let relation_id = encode_relation(kind_idx, target.index);
-        self.subject_index.has(subject.index, relation_id)
+        let pair = RelationPair { kind_idx, target };
+        self.subject_index.has(subject.index, pair)
     }
 
+    /// Subjects связи `(kind, target)` с данными компонентов `Q`.
+    ///
+    /// План исполнения: subjects из TargetIndex → группировка по архетипам →
+    /// `fetch_state` на архетип + точечные строки. O(детей), не O(архетипов).
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -454,46 +586,15 @@ impl World {
             Some(idx) => idx,
             None => return RelationIter::empty(self),
         };
-        let relation_id = encode_relation(kind_idx, target.index);
-
-        let mut data_ids = Vec::with_capacity(Q::component_count());
-        Q::fill_ids(self, &mut data_ids);
-        let all_found = data_ids.len() == Q::component_count();
-
-        let arch_ids = self.id_index.get(relation_id);
-
-        let arch_states: Vec<RelationArchState<Q::State>> = if all_found {
-            arch_ids
-                .iter()
-                .filter_map(|&arch_id| {
-                    let arch_idx = arch_id.0 as usize;
-                    let arch = &self.archetypes[arch_idx];
-                    if arch.is_empty() {
-                        return None;
-                    }
-                    if !Q::matches_archetype(arch, &data_ids) {
-                        return None;
-                    }
-                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO, self.current_tick()) };
-                    Some(RelationArchState {
-                        arch_idx,
-                        state,
-                        len: arch.len(),
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        RelationIter {
-            world: self,
-            arch_states,
-            arch_cursor: 0,
-            row_cursor: 0,
+        if !self.entities.is_alive(target) {
+            return RelationIter::empty(self);
         }
+        let subjects = self.target_index.subjects(kind_idx, target.index);
+        self.relation_iter_for_subjects(subjects.iter().copied())
     }
 
+    /// Все subjects, имеющие связь вида `R` (wildcard `(R, *)`).
+    /// Subject с несколькими target'ами одного вида выдаётся по разу на пару.
     pub fn query_wildcard<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -502,77 +603,98 @@ impl World {
             Some(idx) => idx,
             None => return RelationIter::empty(self),
         };
-        let wid = wildcard_id(kind_idx);
+        let subjects: Vec<Entity> = self.target_index.all_subjects(kind_idx).collect();
+        self.relation_iter_for_subjects(subjects.into_iter())
+    }
 
+    fn relation_iter_for_subjects<'w, Q: WorldQuery>(
+        &'w self,
+        subjects: impl Iterator<Item = Entity>,
+    ) -> RelationIter<'w, Q> {
         let mut data_ids = Vec::with_capacity(Q::component_count());
         Q::fill_ids(self, &mut data_ids);
-        let all_found = data_ids.len() == Q::component_count();
+        if data_ids.len() != Q::component_count() {
+            return RelationIter::empty(self);
+        }
 
-        let arch_ids = self.id_index.get(wid);
+        // Локации subjects, сгруппированные по архетипу (sort по arch, row).
+        let mut locs: Vec<(u32, u32)> = subjects
+            .filter_map(|s| {
+                self.entities
+                    .get_location(s)
+                    .map(|l| (l.archetype_id.0, l.row))
+            })
+            .collect();
+        locs.sort_unstable();
 
-        let arch_states: Vec<RelationArchState<Q::State>> = if all_found {
-            arch_ids
-                .iter()
-                .filter_map(|&arch_id| {
-                    let arch_idx = arch_id.0 as usize;
-                    let arch = &self.archetypes[arch_idx];
-                    if arch.is_empty() {
-                        return None;
-                    }
-                    if !Q::matches_archetype(arch, &data_ids) {
-                        return None;
-                    }
-                    let state = unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO, self.current_tick()) };
-                    Some(RelationArchState {
-                        arch_idx,
+        let mut groups: Vec<RelationArchState<Q::State>> = Vec::new();
+        let mut rows: Vec<(u32, u32)> = Vec::with_capacity(locs.len());
+        let mut cur_arch = u32::MAX;
+        let mut cur_group: Option<u32> = None;
+
+        for (arch_id, row) in locs {
+            if arch_id != cur_arch {
+                cur_arch = arch_id;
+                let arch = &self.archetypes[arch_id as usize];
+                cur_group = if Q::matches_archetype(arch, &data_ids) {
+                    let state =
+                        unsafe { Q::fetch_state(arch, &data_ids, Tick::ZERO, self.current_tick()) };
+                    groups.push(RelationArchState {
+                        arch_idx: arch_id as usize,
                         state,
-                        len: arch.len(),
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                    });
+                    Some((groups.len() - 1) as u32)
+                } else {
+                    None
+                };
+            }
+            if let Some(g) = cur_group {
+                rows.push((g, row));
+            }
+        }
 
         RelationIter {
             world: self,
-            arch_states,
-            arch_cursor: 0,
-            row_cursor: 0,
+            groups,
+            rows,
+            cursor: 0,
         }
     }
 
+    /// Дети (subjects) связи `(kind, parent)` — O(числа детей).
     pub fn children_of<'w, R: RelationKind>(
         &'w self,
         _kind: R,
         parent: Entity,
     ) -> impl Iterator<Item = Entity> + 'w {
-        let kind_idx = self.relations.get_idx::<R>();
-        let relation_id = kind_idx.map(|k| encode_relation(k, parent.index));
-
-        let arch_ids: &[ArchetypeId] = relation_id.map(|rid| self.id_index.get(rid)).unwrap_or(&[]);
-
-        arch_ids
-            .iter()
-            .flat_map(move |&arch_id| self.archetypes[arch_id.0 as usize].entities.iter().copied())
+        let subjects: &[Entity] = match self.relations.get_idx::<R>() {
+            Some(kind_idx) if self.entities.is_alive(parent) => {
+                self.target_index.subjects(kind_idx, parent.index)
+            }
+            _ => &[],
+        };
+        subjects.iter().copied()
     }
 
+    /// Target первой связи вида `R` у субъекта (с корректным generation).
     pub fn get_relation_target<R: RelationKind>(
         &self,
         subject: Entity,
         _kind: R,
     ) -> Option<Entity> {
-        let kind_idx = self.relations.get_idx::<R>()?;
-        for raw_id in self.subject_index.get_all(subject.index) {
-            let cid = ComponentId(raw_id);
-            if is_relation_id(cid) && decode_kind(cid) == kind_idx && !is_wildcard(cid) {
-                let target_idx = decode_target(cid);
-                return self.entities.get_by_index(target_idx);
-            }
+        if !self.entities.is_alive(subject) {
+            return None;
         }
-        None
+        let kind_idx = self.relations.get_idx::<R>()?;
+        self.subject_index
+            .first_with_kind(subject.index, kind_idx)
+            .map(|p| p.target)
     }
 
+    /// Рекурсивный despawn поддерева по виду связи.
+    ///
+    /// Для kind'ов с `cascade_delete_on_target_despawn()` обычный `despawn`
+    /// корня делает то же самое автоматически.
     pub fn despawn_recursive<R: RelationKind + Copy>(&mut self, _kind: R, entity: Entity) {
         let children: Vec<Entity> = self.children_of(_kind, entity).collect();
         for child in children {
@@ -581,67 +703,11 @@ impl World {
         self.despawn(entity);
     }
 
-    pub(crate) fn ensure_relation_component(&mut self, relation_id: ComponentId) {
-        if self.registry.get_info(relation_id).is_none() {
-            self.registry.register_raw(
-                relation_id,
-                ComponentInfo {
-                    id: relation_id,
-                    name: "<relation>",
-                    type_id: std::any::TypeId::of::<()>(),
-                    size: 0,
-                    align: 1,
-                    drop_fn: |_| {},
-                    serde: None,
-                },
-            );
-        }
-    }
-
-    pub(crate) fn insert_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
-        let location = match self.entities.get_location(entity) {
-            Some(loc) => loc,
-            None => return,
-        };
-        if self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
-            return;
-        }
-        let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, relation_id);
-        self.query_cache.invalidate();
-        let new_row = self.move_entity(entity, location, new_arch_id);
-        let tick = self.current_tick;
-        if let Some(col_idx) = self.archetypes[new_arch_id.0 as usize].column_index(relation_id) {
-            let col = &mut self.archetypes[new_arch_id.0 as usize].columns[col_idx];
-            col.change_ticks.push(tick);
-            col.len += 1;
-        }
-        self.entities.set_location(
-            entity,
-            crate::entity::EntityLocation {
-                archetype_id: new_arch_id,
-                row: new_row,
-            },
-        );
-    }
-
-    pub(crate) fn remove_relation_component(&mut self, entity: Entity, relation_id: ComponentId) {
-        let location = match self.entities.get_location(entity) {
-            Some(loc) => loc,
-            None => return,
-        };
-        if !self.archetypes[location.archetype_id.0 as usize].has_component(relation_id) {
-            return;
-        }
-        let new_arch_id = self.find_or_create_archetype_without(location.archetype_id, relation_id);
-        self.query_cache.invalidate();
-        let new_row = self.move_entity(entity, location, new_arch_id);
-        self.entities.set_location(
-            entity,
-            crate::entity::EntityLocation {
-                archetype_id: new_arch_id,
-                row: new_row,
-            },
-        );
+    /// Все связи мира: `(subject.index, kind_idx, target)` — для сериализации.
+    pub fn iter_relations(&self) -> impl Iterator<Item = (u32, u32, Entity)> + '_ {
+        self.subject_index
+            .iter_all()
+            .map(|(subject_index, pair)| (subject_index, pair.kind_idx, pair.target))
     }
 }
 
@@ -650,23 +716,23 @@ impl World {
 pub(crate) struct RelationArchState<S> {
     pub arch_idx: usize,
     pub state: S,
-    pub len: usize,
 }
 
 pub struct RelationIter<'w, Q: WorldQuery> {
     world: &'w World,
-    arch_states: Vec<RelationArchState<Q::State>>,
-    arch_cursor: usize,
-    row_cursor: usize,
+    groups: Vec<RelationArchState<Q::State>>,
+    /// (индекс группы, row) на каждого subject.
+    rows: Vec<(u32, u32)>,
+    cursor: usize,
 }
 
 impl<'w, Q: WorldQuery> RelationIter<'w, Q> {
     pub(crate) fn empty(world: &'w World) -> Self {
         Self {
             world,
-            arch_states: Vec::new(),
-            arch_cursor: 0,
-            row_cursor: 0,
+            groups: Vec::new(),
+            rows: Vec::new(),
+            cursor: 0,
         }
     }
 }
@@ -677,16 +743,11 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let a = self.arch_states.get(self.arch_cursor)?;
-            if self.row_cursor >= a.len {
-                self.arch_cursor += 1;
-                self.row_cursor = 0;
-                continue;
-            }
-            let row = self.row_cursor;
-            self.row_cursor += 1;
-            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
-                let entity = self.world.archetypes[a.arch_idx].entities[row];
+            let &(group_idx, row) = self.rows.get(self.cursor)?;
+            self.cursor += 1;
+            let group = &self.groups[group_idx as usize];
+            if let Some(item) = unsafe { Q::fetch_item(group.state, row as usize) } {
+                let entity = self.world.archetypes[group.arch_idx].entities[row as usize];
                 return Some((entity, item));
             }
         }
@@ -728,6 +789,13 @@ mod tests {
     }
     impl Component for Position {}
 
+    fn pair(kind_idx: u32, index: u32) -> RelationPair {
+        RelationPair {
+            kind_idx,
+            target: Entity::from_raw_parts(index, 0),
+        }
+    }
+
     #[test]
     fn add_has_remove_relation() {
         let mut world = World::new();
@@ -744,11 +812,27 @@ mod tests {
     }
 
     #[test]
+    fn add_relation_no_structural_change() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
+
+        let arch_count = world.archetype_count();
+        world.add_relation(child, ChildOf, parent);
+        assert_eq!(
+            world.archetype_count(),
+            arch_count,
+            "add_relation не должен создавать архетипов"
+        );
+    }
+
+    #[test]
     fn subject_entry_kind_mask() {
         let mut entry = SubjectEntry::default();
-        let rel1 = encode_relation(0, 100);
-        let rel2 = encode_relation(1, 200);
-        let rel3 = encode_relation(0, 300);
+        let rel1 = pair(0, 100);
+        let rel2 = pair(1, 200);
+        let rel3 = pair(0, 300);
 
         entry.insert(rel1);
         assert!(entry.has_kind(0));
@@ -804,5 +888,155 @@ mod tests {
 
         world.add_relation(child, ChildOf, parent);
         assert_eq!(world.get_relation_target(child, ChildOf), Some(parent));
+    }
+
+    // ── Новые гарантии CR-M1 ───────────────────────────────────
+
+    /// C-2: cascade-вид (ChildOf) деспавнит детей при despawn родителя.
+    #[test]
+    fn despawn_target_cascades() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let root = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let leaf = world.spawn((Position { x: 2.0, y: 0.0 },));
+
+        world.add_relation(child, ChildOf, root);
+        world.add_relation(leaf, ChildOf, child);
+
+        world.despawn(root);
+        assert_eq!(world.entity_count(), 0, "ChildOf — cascade: дети умирают с родителем");
+    }
+
+    /// C-2: не-cascade вид — subjects живут, но связь вычищается.
+    #[test]
+    fn despawn_target_clears_non_cascade() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let owner = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let item = world.spawn((Position { x: 1.0, y: 0.0 },));
+
+        world.add_relation(item, Owns, owner);
+        assert!(world.has_relation(item, Owns, owner));
+
+        world.despawn(owner);
+        assert!(world.is_alive(item));
+        assert_eq!(
+            world.get_relation_target(item, Owns),
+            None,
+            "связь не должна переживать свой target"
+        );
+    }
+
+    /// C-2/C-3: переиспользованный index не возвращает чужие связи.
+    #[test]
+    fn reused_index_does_not_leak_relations() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
+        world.add_relation(child, ChildOf, parent);
+
+        world.despawn(parent); // cascade: child тоже умер
+
+        // Новые entity переиспользуют оба освободившихся индекса
+        let n1 = world.spawn((Position { x: 9.0, y: 9.0 },));
+        let n2 = world.spawn((Position { x: 8.0, y: 8.0 },));
+        let newcomer = [n1, n2]
+            .into_iter()
+            .find(|e| e.index() == parent.index())
+            .expect("тест требует переиспользования index родителя");
+
+        assert_eq!(world.children_of(ChildOf, newcomer).count(), 0);
+        // Стейл-хэндл старого родителя тоже ничего не возвращает
+        assert_eq!(world.children_of(ChildOf, parent).count(), 0);
+    }
+
+    #[test]
+    fn children_of_lists_all_children() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let mut spawned: Vec<Entity> = Vec::new();
+        for i in 0..30 {
+            let c = world.spawn((Position { x: i as f32, y: 0.0 },));
+            world.add_relation(c, ChildOf, parent);
+            spawned.push(c);
+        }
+        let mut children: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        children.sort_by_key(|e| e.index());
+        spawned.sort_by_key(|e| e.index());
+        assert_eq!(children, spawned);
+    }
+
+    #[test]
+    fn query_relation_fetches_components() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let c1 = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let c2 = world.spawn((Position { x: 2.0, y: 0.0 },));
+        world.add_relation(c1, ChildOf, parent);
+        world.add_relation(c2, ChildOf, parent);
+
+        let mut seen: Vec<(Entity, f32)> = world
+            .query_relation::<ChildOf, crate::query::Read<Position>>(ChildOf, parent)
+            .map(|(e, p)| (e, p.x))
+            .collect();
+        seen.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], (c1, 1.0));
+        assert_eq!(seen[1], (c2, 2.0));
+    }
+
+    #[test]
+    fn query_wildcard_fetches_all_subjects() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let p1 = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let p2 = world.spawn((Position { x: 0.0, y: 1.0 },));
+        let c1 = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let c2 = world.spawn((Position { x: 2.0, y: 0.0 },));
+        world.add_relation(c1, ChildOf, p1);
+        world.add_relation(c2, ChildOf, p2);
+
+        let count = world
+            .query_wildcard::<ChildOf, crate::query::Read<Position>>(ChildOf)
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn add_relation_dead_target_is_noop() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let child = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        world.despawn(parent);
+
+        world.add_relation(child, ChildOf, parent);
+        assert!(!world.has_relation(child, ChildOf, parent));
+        assert_eq!(world.get_relation_target(child, ChildOf), None);
+    }
+
+    #[test]
+    fn pair_storage_dense_upgrade() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let hub = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let targets: Vec<Entity> = (0..20)
+            .map(|i| world.spawn((Position { x: i as f32, y: 0.0 },)))
+            .collect();
+        for &t in &targets {
+            world.add_relation(hub, Likes, t);
+        }
+        for &t in &targets {
+            assert!(world.has_relation(hub, Likes, t));
+        }
+        // Удаление одного target'а вычищает ровно его
+        world.despawn(targets[7]);
+        assert!(!world.has_relation(hub, Likes, targets[7]));
+        let alive = targets.iter().filter(|&&t| world.has_relation(hub, Likes, t)).count();
+        assert_eq!(alive, 19);
     }
 }

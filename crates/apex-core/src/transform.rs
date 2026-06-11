@@ -19,8 +19,12 @@
 //! # Алгоритм
 //!
 //! 1. Собрать entity с `Changed<LocalTransform>` (с прошлого запуска).
-//! 2. Для каждой: `GlobalTransform = parent.GlobalTransform * self.LocalTransform`.
-//! 3. Каскадировать пересчёт на детей изменённых entity.
+//! 2. Оставить «dirty-корни» — изменённые entity без изменённого предка
+//!    (остальные лежат внутри их поддеревьев и будут пересчитаны спуском).
+//! 3. Для каждого dirty-корня спуститься по всему поддереву (DFS), передавая
+//!    мировую матрицу родителя по значению: `Global = parent_global * Local`.
+//!    Каждый узел посещается ровно один раз; stale-чтений родителя нет по
+//!    построению (родитель всегда вычислен до ребёнка).
 //!
 //! # Использование в Scheduler
 //!
@@ -38,15 +42,51 @@
 //! ```
 
 use glam::{Mat4, Quat, Vec3};
-use rustc_hash::FxHashSet;
 
-use crate::{
-    component::Tick,
-    entity::Entity,
-    query::{Changed, Query},
-    relations::ChildOf,
-    world::World,
-};
+use crate::{component::Tick, entity::Entity, relations::ChildOf, world::World};
+
+/// Генерационная «карта посещений» по `entity.index`: O(1) mark/contains без
+/// хэширования и без пер-кадровой очистки (сравнение поколений; на wrap'е — сброс).
+/// 21k hash-вставок FxHashSet на кадр стоили дороже всего остального propagate.
+///
+/// Публичная утилита (CR-M4) для паттерна «множество entity на кадр» — замена
+/// `FxHashSet<Entity>`-на-кадр в потребителях (extract движка: shadow_markers,
+/// skins active-set). Ключ — `entity.index()`; generation entity не участвует,
+/// поэтому корректна только для короткоживущих (кадровых) множеств.
+#[derive(Default)]
+pub struct IndexStamp {
+    stamps: Vec<u32>,
+    generation: u32,
+}
+
+impl IndexStamp {
+    /// Начать новое поколение (прежние отметки мгновенно «забываются»).
+    pub fn next_generation(&mut self) {
+        let (g, wrapped) = self.generation.overflowing_add(1);
+        self.generation = g;
+        if wrapped || g == 0 {
+            // Раз в 2^32 кадров: нулевое поколение совпадает с дефолтом ячеек — чистим.
+            self.stamps.iter_mut().for_each(|s| *s = u32::MAX);
+            self.generation = 1;
+        }
+    }
+
+    /// Отметить индекс в текущем поколении.
+    #[inline]
+    pub fn mark(&mut self, index: u32) {
+        let i = index as usize;
+        if i >= self.stamps.len() {
+            self.stamps.resize(i + 1, self.generation.wrapping_sub(1));
+        }
+        self.stamps[i] = self.generation;
+    }
+
+    /// Отмечен ли индекс в текущем поколении.
+    #[inline]
+    pub fn contains(&self, index: u32) -> bool {
+        self.stamps.get(index as usize) == Some(&self.generation)
+    }
+}
 
 // ── Компоненты трансформаций ─────────────────────────────────────
 
@@ -150,36 +190,44 @@ pub struct TransformScratch {
     pub(crate) last_run: Tick,
     /// Список dirty entity из query (шаг 1)
     pub(crate) dirty_entities: Vec<Entity>,
-    /// Set для O(1) проверки dirty (по entity.index)
-    pub(crate) dirty_set: FxHashSet<u32>,
-    /// Топологически отсортированные entity (шаг 2–3)
-    pub(crate) ordered: Vec<Entity>,
-    /// Множество уже обработанных entity (для DFS)
-    pub(crate) seen: FxHashSet<u32>,
-    /// Стек для итеративного DFS
-    pub(crate) stack: Vec<Entity>,
-    /// Временный буфер для children (шаг 3)
-    pub(crate) children: Vec<Entity>,
+    /// O(1)-проверка dirty по entity.index (генерационный stamp вместо hash-set)
+    pub(crate) dirty: IndexStamp,
+    /// DFS-стек спуска по поддеревьям: (entity, мировая матрица РОДИТЕЛЯ).
+    pub(crate) stack: Vec<(Entity, Mat4)>,
 }
 
 /// Эксклюзивная система: пересчитывает `GlobalTransform` для всех entity,
 /// чей `LocalTransform` **изменился** с прошлого запуска (`Changed<LocalTransform>`),
-/// каскадируя на потомков. Ручной `TransformDirty` больше не нужен — после C1
+/// и всех их потомков. Ручной `TransformDirty` больше не нужен — после C1
 /// `Changed<LocalTransform>` достоверен на всех путях мутации (`Query<Write>` и
 /// `World::get_mut`). Выполняется в PostUpdate.
 ///
-/// # Алгоритм
+/// # Алгоритм (поддеревья от dirty-корней)
 ///
 /// 1. Собрать entity с `Changed<LocalTransform>` (с прошлого `last_run`).
-/// 2. Топосортировать (корни → листья), каскадируя dirty на детей изменённых.
-/// 3. `GlobalTransform = parent.GlobalTransform * self.LocalTransform`;
+/// 2. Оставить **dirty-корни** — изменённые entity, у которых НЕТ изменённого
+///    предка (остальные внутри их поддеревьев). Подъём прекращается на первом
+///    dirty-предке, поэтому в типичных сценах это 1–2 lookup'а на entity.
+/// 3. От каждого dirty-корня — итеративный DFS по всему поддереву с передачей
+///    мировой матрицы родителя **по значению**: `Global = parent_global * Local`;
 ///    если `GlobalTransform` ещё нет — авто-инициализировать (DX: спавн с одним
-///    `LocalTransform` достаточно).
+///    `LocalTransform` достаточно). Каждый узел посещается ровно один раз и
+///    строго после родителя — stale-чтений родительской матрицы нет по построению
+///    (прежняя версия пересчитывала dirty-узлы под чистым промежуточным предком
+///    дважды: сперва со старой матрицей, затем повторно каскадом).
+///
+/// Стоимость — O(|объединение dirty-поддеревьев|): статичная сцена с одним
+/// мувером посещает только его поддерево, полностью анимированная — каждый узел
+/// один раз. Иерархия `ChildOf` предполагается ацикличной (как и всюду в ядре).
 ///
 /// # Change-detection
 ///
 /// База — `scratch.last_run`; в конце пишется `world.current_tick()`. Требует
 /// покадрового продвижения тика (`world.tick()` перед `run()`; авто — в C7).
+///
+/// # Диагностика
+///
+/// `APEX_PROP_TRACE=1` — лог фаз (changed-query / спуск, число dirty/посещений).
 ///
 /// # Ресурсы
 ///
@@ -198,22 +246,41 @@ pub fn propagate_transforms(world: &mut World) {
 
     // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
     scratch.dirty_entities.clear();
-    scratch.dirty_set.clear();
-    scratch.ordered.clear();
-    scratch.seen.clear();
+    scratch.dirty.next_generation();
     scratch.stack.clear();
-    scratch.children.clear();
 
-    // 1. Собираем entity с Changed<LocalTransform> (с прошлого запуска) и строим set.
-    //    Используем не-кэшированный Query::new_with_tick + for_each (надёжный путь;
-    //    см. TD-1 про CachedQuery::iter).
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trace = *TRACE.get_or_init(|| std::env::var("APEX_PROP_TRACE").is_ok_and(|v| v == "1"));
+    let t0 = std::time::Instant::now();
+
+    // 1. Собираем entity с изменённым LocalTransform (с прошлого запуска) и метим их в
+    //    stamp-карте. Семантика — ровно `Query<Changed<LocalTransform>>` (тот же
+    //    `is_newer_than`), но прямым линейным сканом тик-колонок архетипов: генерик-
+    //    итерация запроса стоила ~35нс/строку (косвенность fetch_item + клоужер),
+    //    тут — узкий цикл по `Vec<Tick>` (паритет закреплён тестом
+    //    `direct_tick_scan_matches_changed_query`).
     {
-        let q = Query::<Changed<LocalTransform>>::new_with_tick(world, last_run);
-        q.for_each(|e, _| {
-            scratch.dirty_entities.push(e);
-            scratch.dirty_set.insert(e.index);
-        });
-    } // query Q дропается здесь
+        let TransformScratch {
+            dirty_entities,
+            dirty,
+            ..
+        } = &mut scratch;
+        if let Some(lt_id) = world.registry.get_id::<LocalTransform>() {
+            for arch in &world.archetypes {
+                let Some(col_idx) = arch.column_index(lt_id) else {
+                    continue;
+                };
+                let col = &arch.columns[col_idx];
+                for (&tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
+                    if tick.is_newer_than(last_run) {
+                        dirty_entities.push(entity);
+                        dirty.mark(entity.index);
+                    }
+                }
+            }
+        }
+    }
+    let t1 = std::time::Instant::now();
 
     if scratch.dirty_entities.is_empty() {
         // Ничего не изменилось — фиксируем тик и выходим.
@@ -222,111 +289,199 @@ pub fn propagate_transforms(world: &mut World) {
         return;
     }
 
-    // 2. Топологическая сортировка dirty entity (корни → листья)
-    //    Итеративный DFS: для каждого dirty entity поднимаемся по предкам
-    //    и добавляем их в порядке от корня к листьям.
-    for &entity in &scratch.dirty_entities {
-        if !scratch.dirty_set.contains(&entity.index) {
-            // O(1), без world lookup
-            continue;
+    // 2. Сеем стек dirty-корнями: dirty entity без dirty-предка. Подъём по предкам
+    //    останавливается на первом dirty (тогда entity внутри его поддерева и будет
+    //    пересчитана спуском — сеять её отдельно нельзя, иначе double-process).
+    //    Фаза только читает мир → при большом dirty-set распараллеливается.
+    {
+        let TransformScratch {
+            dirty_entities,
+            dirty,
+            stack,
+            ..
+        } = &mut scratch;
+        let dirty: &IndexStamp = dirty;
+        let seed = |world: &World, entity: Entity| -> Option<(Entity, Mat4)> {
+            let parent = world.get_relation_target(entity, ChildOf);
+            let mut ancestor = parent;
+            while let Some(p) = ancestor {
+                if dirty.contains(p.index) {
+                    return None; // покрыта dirty-предком — пересчитается его спуском
+                }
+                ancestor = world.get_relation_target(p, ChildOf);
+            }
+            // Родитель чист (или отсутствует) — его мировая матрица валидна с прошлых
+            // кадров; отсутствие GlobalTransform трактуем как identity (прежняя семантика).
+            let parent_global = parent
+                .and_then(|p| world.get::<GlobalTransform>(p))
+                .map(|g| g.0)
+                .unwrap_or(Mat4::IDENTITY);
+            Some((entity, parent_global))
+        };
+        const PAR_MIN_DIRTY: usize = 4096;
+        if dirty_entities.len() >= PAR_MIN_DIRTY {
+            use rayon::prelude::*;
+            let world_ref: &World = world;
+            stack.par_extend(
+                dirty_entities
+                    .par_iter()
+                    .filter_map(|&e| seed(world_ref, e)),
+            );
+        } else {
+            for &entity in dirty_entities.iter() {
+                if let Some(s) = seed(world, entity) {
+                    stack.push(s);
+                }
+            }
         }
+    }
+    let seeds = scratch.stack.len();
+    let t2 = std::time::Instant::now();
 
-        // Явный стек для итеративного DFS (очищаем перед каждым entity)
-        scratch.stack.clear();
-        scratch.stack.push(entity);
-
-        while let Some(top) = scratch.stack.last().copied() {
-            if scratch.seen.contains(&top.index) {
-                scratch.stack.pop();
+    // 3. Спуск. Два режима с одинаковой семантикой:
+    //    — мало корней / мелкие поддеревья → последовательный DFS на месте;
+    //    — много независимых корней (типично: толпа анимированных персонажей) →
+    //      фаза A: параллельное вычисление матриц по дизъюнктным поддеревьям
+    //      (только чтение &World — Sync, как в параллельных запросах), фаза B:
+    //      последовательная запись (get_mut/insert требуют &mut World).
+    //      Поддеревья дизъюнктны по построению (у entity один родитель, корни не
+    //      вложены друг в друга), поэтому записи не конфликтуют и порядок фазы B
+    //      не важен.
+    let mut visits = 0usize;
+    const PAR_MIN_ROOTS: usize = 64;
+    if scratch.stack.len() >= PAR_MIN_ROOTS {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Записи идут ПРЯМО из параллельного спуска по (archetype, row)-указателям — тот же
+        // контракт, что у параллельных Write-запросов (каждая строка колонки пишется ровно
+        // одним потоком): поддеревья дизъюнктны, entity посещается один раз. Структурных
+        // изменений в фазе нет — entity без GlobalTransform откладываются в `missing` и
+        // вставляются последовательно после.
+        let roots: Vec<(Entity, Mat4)> = scratch.stack.drain(..).collect();
+        let gt_id = world.registry.get_id::<GlobalTransform>();
+        let missing: std::sync::Mutex<Vec<(Entity, Mat4)>> = std::sync::Mutex::new(Vec::new());
+        let visited = AtomicUsize::new(0);
+        let world_ref: &World = world;
+        roots.par_iter().for_each(|&(root, parent_global)| {
+            let mut stack: Vec<(Entity, Mat4)> = Vec::with_capacity(64);
+            stack.push((root, parent_global));
+            let mut local_missing: Vec<(Entity, Mat4)> = Vec::new();
+            let mut n = 0usize;
+            while let Some((entity, pg)) = stack.pop() {
+                if !world_ref.is_alive(entity) {
+                    continue;
+                }
+                let local = match world_ref.get::<LocalTransform>(entity) {
+                    Some(l) => *l,
+                    None => continue,
+                };
+                let global = pg * local.to_matrix();
+                n += 1;
+                if !write_global_parallel(world_ref, gt_id, entity, global, this_run) {
+                    local_missing.push((entity, global));
+                }
+                for child in world_ref.children_of(ChildOf, entity) {
+                    stack.push((child, global));
+                }
+            }
+            if n > 0 {
+                visited.fetch_add(n, Ordering::Relaxed);
+            }
+            if !local_missing.is_empty() {
+                missing.lock().unwrap().extend(local_missing);
+            }
+        });
+        visits = visited.load(Ordering::Relaxed);
+        // Авто-инициализация отсутствующих GlobalTransform (двойная вставка невозможна —
+        // entity посещается ровно один раз).
+        for (entity, global) in missing.into_inner().unwrap() {
+            world.insert(entity, GlobalTransform(global));
+        }
+    } else {
+        // Последовательный DFS: каждый узел ровно один раз, строго после родителя.
+        while let Some((entity, parent_global)) = scratch.stack.pop() {
+            if !world.is_alive(entity) {
                 continue;
             }
+            // Entity без LocalTransform останавливает спуск (как и раньше: каскад шёл
+            // только через узлы с трансформом).
+            let local = match world.get::<LocalTransform>(entity) {
+                Some(l) => *l,
+                None => continue,
+            };
+            let global = parent_global * local.to_matrix();
+            visits += 1;
 
-            // Есть ли dirty родитель, который ещё не в `seen`?
-            let parent = world.get_relation_target(top, ChildOf);
-            let need_parent = parent
-                .map(|p| {
-                    scratch.dirty_set.contains(&p.index)  // O(1) вместо world.get
-                        && !scratch.seen.contains(&p.index)
-                })
-                .unwrap_or(false);
-
-            if need_parent {
-                scratch.stack.push(parent.unwrap());
+            // Записываем новый GlobalTransform; если его ещё нет — авто-инициализируем
+            // (DX: достаточно заспавнить entity с одним LocalTransform — issue #3/#17).
+            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
+                gt.0 = global;
             } else {
-                scratch.seen.insert(top.index);
-                scratch.ordered.push(top);
-                scratch.stack.pop();
+                world.insert(entity, GlobalTransform(global));
+            }
+
+            for child in world.children_of(ChildOf, entity) {
+                scratch.stack.push((child, global));
             }
         }
     }
 
-    // 3. Sequential обработка от корней к листьям с каскадированием dirty на детей
-    //    Используем while i < ordered.len(), т.к. ordered динамически растёт
-    //    при добавлении детей dirty-родителя.
-    let mut i = 0;
-    while i < scratch.ordered.len() {
-        let entity = scratch.ordered[i];
-
-        if !world.is_alive(entity) {
-            i += 1;
-            continue;
-        }
-
-        let local = match world.get::<LocalTransform>(entity) {
-            Some(l) => *l,
-            None => {
-                i += 1;
-                continue;
-            }
-        };
-
-        let parent = world.get_relation_target(entity, ChildOf);
-
-        let global_matrix = if let Some(parent_entity) = parent {
-            match world.get::<GlobalTransform>(parent_entity) {
-                Some(pg) => pg.0 * local.to_matrix(),
-                None => local.to_matrix(),
-            }
-        } else {
-            local.to_matrix()
-        };
-
-        // Записываем новый GlobalTransform; если его ещё нет — авто-инициализируем
-        // (DX: достаточно заспавнить entity с одним LocalTransform — issue #3/#17).
-        if world.get::<GlobalTransform>(entity).is_some() {
-            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
-                gt.0 = global_matrix;
-            }
-        } else {
-            world.insert(entity, GlobalTransform(global_matrix));
-        }
-
-        scratch.dirty_set.remove(&entity.index); // поддерживаем set актуальным
-
-        // ── Каскадирование dirty на детей ──────────────────────────
-        // Если у этой entity есть дети (ChildOf), помечаем их dirty (в scratch-set,
-        // без компонента-маркера), чтобы их GlobalTransform пересчитался в этом же
-        // проходе. Решает «пользователь изменил только родителя» (issue #2).
-        scratch.children.clear();
-        for child in world.children_of(ChildOf, entity) {
-            scratch.children.push(child);
-        }
-        for &child in &scratch.children {
-            if !world.is_alive(child) {
-                continue;
-            }
-            if scratch.dirty_set.insert(child.index) {
-                // вставка вернула true ⇒ ребёнка ещё не было в наборе
-                scratch.ordered.push(child);
-            }
-        }
-
-        i += 1;
+    if trace {
+        log::info!(
+            "PROP_TRACE: total {:.2}ms | changed-query {:.2} | seed-roots {:.2} | descend {:.2} \
+             | dirty {} roots {} visits {}",
+            t0.elapsed().as_secs_f64() * 1000.0,
+            (t1 - t0).as_secs_f64() * 1000.0,
+            (t2 - t1).as_secs_f64() * 1000.0,
+            t2.elapsed().as_secs_f64() * 1000.0,
+            scratch.dirty_entities.len(),
+            seeds,
+            visits
+        );
     }
 
     // Фиксируем тик этого запуска и возвращаем scratch для переиспользования.
     scratch.last_run = this_run;
     world.insert_resource(scratch);
+}
+
+/// Прямая запись `GlobalTransform` по (archetype, row) из параллельного спуска.
+/// Возвращает `false`, если у entity ещё НЕТ компонента (нужен отложенный insert);
+/// мёртвые/невалидные строки молча игнорируются (`true`) — как is_alive-фильтр.
+///
+/// Контракт безопасности (тот же, что у параллельных Write-запросов): вызывающий
+/// гарантирует, что (а) каждая entity пишется не более чем одним потоком и
+/// (б) во время фазы нет структурных изменений мира (spawn/despawn/insert/remove).
+fn write_global_parallel(
+    world: &World,
+    gt_id: Option<crate::component::ComponentId>,
+    entity: Entity,
+    global: Mat4,
+    tick: Tick,
+) -> bool {
+    let Some(cid) = gt_id else {
+        // Компонент ещё не зарегистрирован (самый первый кадр) → отложенный insert.
+        return false;
+    };
+    let Some(loc) = world.entities.get_location(entity) else {
+        return true;
+    };
+    let arch = &world.archetypes[loc.archetype_id.as_usize()];
+    let Some(col_idx) = arch.column_index(cid) else {
+        return false;
+    };
+    let col = &arch.columns[col_idx];
+    let row = loc.row as usize;
+    if row >= col.len {
+        return true;
+    }
+    // SAFETY: строка валидна (row < len); эксклюзив на строку и отсутствие структурных
+    // изменений — контракт вызывающего (см. doc). GlobalTransform: Copy, без Drop.
+    unsafe {
+        *(col.get_ptr(row) as *mut GlobalTransform) = GlobalTransform(global);
+        col.set_change_tick(row, tick);
+    }
+    true
 }
 
 // ── Plugin ───────────────────────────────────────────────────────
@@ -366,6 +521,7 @@ impl TransformPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::{Changed, Query};
     use crate::world::World;
 
     #[test]
@@ -521,6 +677,135 @@ mod tests {
             Vec3::new(42.0, 0.0, 0.0),
             "Changed<LocalTransform> через Query<Write> должен триггерить пересчёт"
         );
+    }
+
+    /// Dirty-узел под ЧИСТЫМ промежуточным родителем при dirty-прародителе: спуск
+    /// от dirty-корня обязан пересчитать его ровно один раз и СТРОГО после
+    /// прародителя (прежний топосорт упорядочивал его до пересчёта предка и
+    /// чинил результат повторным каскадным проходом).
+    #[test]
+    fn dirty_leaf_under_clean_intermediate_uses_fresh_ancestor_global() {
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let gp = world.spawn((LocalTransform::from_translation(Vec3::new(1.0, 0.0, 0.0)),));
+        let mid = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+        let leaf = world.spawn((LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),));
+        world.add_relation(mid, ChildOf, gp);
+        world.add_relation(leaf, ChildOf, mid);
+
+        propagate_transforms(&mut world);
+        assert_eq!(
+            world.get::<GlobalTransform>(leaf).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(111.0, 0.0, 0.0)
+        );
+
+        // Меняем прародителя и лист; промежуточный узел остаётся чистым.
+        world.tick();
+        world.get_mut::<LocalTransform>(gp).unwrap().translation = Vec3::new(2.0, 0.0, 0.0);
+        world.get_mut::<LocalTransform>(leaf).unwrap().translation = Vec3::new(200.0, 0.0, 0.0);
+        propagate_transforms(&mut world);
+
+        // 2 (gp) + 10 (mid, чистый) + 200 (leaf) = 212.
+        assert_eq!(
+            world.get::<GlobalTransform>(leaf).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(212.0, 0.0, 0.0),
+            "лист обязан считаться от СВЕЖЕЙ матрицы прародителя через чистый промежуточный узел"
+        );
+        // Чистый промежуточный узел тоже пересчитан (он в поддереве dirty-корня).
+        assert_eq!(
+            world.get::<GlobalTransform>(mid).unwrap().0.transform_point3(Vec3::ZERO),
+            Vec3::new(12.0, 0.0, 0.0)
+        );
+    }
+
+    /// Прямой скан тик-колонок (фаза 1) обязан давать ровно тот же dirty-набор, что
+    /// эталонный `Query<Changed<LocalTransform>>` с той же базы.
+    #[test]
+    fn direct_tick_scan_matches_changed_query() {
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+        let mut all = Vec::new();
+        for i in 0..100 {
+            all.push(world.spawn((LocalTransform::from_translation(Vec3::new(
+                i as f32, 0.0, 0.0,
+            )),)));
+        }
+        // Половина сущностей — с другим составом (другой архетип в скане).
+        for (i, &e) in all.iter().enumerate() {
+            if i % 2 == 0 {
+                world.insert(e, GlobalTransform::IDENTITY);
+            }
+        }
+        propagate_transforms(&mut world);
+        let last_run = world.resource::<TransformScratch>().last_run;
+
+        world.tick();
+        for (i, &e) in all.iter().enumerate() {
+            if i % 3 == 0 {
+                world.get_mut::<LocalTransform>(e).unwrap().translation.y = 5.0;
+            }
+        }
+
+        // Эталон — генерик-запрос с той же базы.
+        let mut expected: Vec<Entity> = Vec::new();
+        {
+            let q = Query::<Changed<LocalTransform>>::new_with_tick(&world, last_run);
+            q.for_each(|e, _| expected.push(e));
+        }
+
+        propagate_transforms(&mut world);
+        let mut actual = world.resource::<TransformScratch>().dirty_entities.clone();
+        expected.sort_by_key(|e| e.index);
+        actual.sort_by_key(|e| e.index);
+        assert!(!expected.is_empty());
+        assert_eq!(actual, expected, "прямой скан тиков должен совпадать с Changed-запросом");
+    }
+
+    /// Параллельная ветка спуска (≥64 независимых dirty-корней): результат идентичен
+    /// последовательному — у каждого ребёнка global = parent.local * child.local.
+    #[test]
+    fn many_dirty_roots_take_parallel_descent_and_stay_correct() {
+        use crate::query::Write;
+
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let n = 200; // > PAR_MIN_ROOTS
+        let mut pairs = Vec::new();
+        for i in 0..n {
+            let parent =
+                world.spawn((LocalTransform::from_translation(Vec3::new(i as f32, 0.0, 0.0)),));
+            let child =
+                world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 1.0, 0.0)),));
+            world.add_relation(child, ChildOf, parent);
+            pairs.push((parent, child));
+        }
+        propagate_transforms(&mut world);
+
+        // Все родители dirty одновременно → n независимых поддеревьев → parallel-ветка.
+        world.tick();
+        {
+            let q = Query::<Write<LocalTransform>>::new(&world);
+            q.for_each(|_, mut lt| {
+                if lt.translation.y == 0.0 {
+                    lt.translation.x += 1000.0;
+                }
+            });
+        }
+        propagate_transforms(&mut world);
+
+        for (i, (parent, child)) in pairs.iter().enumerate() {
+            assert_eq!(
+                world.get::<GlobalTransform>(*parent).unwrap().0.transform_point3(Vec3::ZERO),
+                Vec3::new(1000.0 + i as f32, 0.0, 0.0)
+            );
+            assert_eq!(
+                world.get::<GlobalTransform>(*child).unwrap().0.transform_point3(Vec3::ZERO),
+                Vec3::new(1000.0 + i as f32, 1.0, 0.0),
+                "child {i} должен пересчитаться от свежего родителя в параллельной ветке"
+            );
+        }
     }
 
     /// Изменение только родителя каскадирует пересчёт на детей.

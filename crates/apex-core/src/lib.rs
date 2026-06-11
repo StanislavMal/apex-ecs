@@ -59,7 +59,8 @@ pub use system_param::{
     Listen, QueryParam, Res, ResMut, ResRead, ResWrite, ResourceAccessList, SystemParam,
     WorldQuerySystemAccess,
 };
-pub use world::{Bundle, CachedQuery, ParallelWorld, SystemContext, World};
+pub use transform::IndexStamp;
+pub use world::{ArchetypeStats, Bundle, CachedQuery, ParallelWorld, SystemContext, World};
 
 pub mod prelude {
     pub use crate::access::AccessDescriptor;

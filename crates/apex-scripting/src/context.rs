@@ -196,14 +196,16 @@ impl ScriptContext {
         }
 
         // Собираем биндинги до заимствования world
-        let write_infos: Vec<(&'static str, fn(&mlua::Value, &mut World) -> bool)> = writes.iter()
+        type ApplyFn = fn(&mlua::Value, &mut World) -> bool;
+
+        let write_infos: Vec<(&'static str, ApplyFn)> = writes.iter()
             .filter_map(|(name, _)| {
                 self.resource_bindings.get(name)
                     .map(|b| (*name, b.write))
             })
             .collect();
 
-        let emit_infos: Vec<(&'static str, fn(&mlua::Value, &mut World) -> bool)> = events.iter()
+        let emit_infos: Vec<(&'static str, ApplyFn)> = events.iter()
             .filter_map(|(name, _)| {
                 self.event_bindings.get(name)
                     .map(|b| (*name, b.emit))

@@ -12,6 +12,12 @@ pub struct AddRemove {
     entities: Vec<Entity>,
 }
 
+impl Default for AddRemove {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AddRemove {
     pub fn new() -> Self {
         let mut world = World::new();

@@ -8,6 +8,12 @@ pub struct HeavyCompute {
     world: World,
 }
 
+impl Default for HeavyCompute {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeavyCompute {
     pub fn new() -> Self {
         let mut world = World::new();

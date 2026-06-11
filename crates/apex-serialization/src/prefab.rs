@@ -147,6 +147,9 @@ impl PrefabLoader {
     /// * `parent` — если указан, entity становится ребёнком через `ChildOf`.
     /// * `params` — параметры шаблона для проброса (могут быть использованы
     ///   кастомными компонентами, реализующими `EntityTemplate`).
+    // `params` сейчас лишь пробрасывается вглубь рекурсии — это публичный
+    // контракт под кастомные EntityTemplate-компоненты, не мёртвый код.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn instantiate(
         &self,
         world: &mut World,
