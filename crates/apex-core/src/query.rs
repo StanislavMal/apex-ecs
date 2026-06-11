@@ -1045,6 +1045,32 @@ impl_world_query_tuple!(
     (H, 7)
 );
 
+// ── ArchetypeFilter (D2-2) ─────────────────────────────────────
+
+/// Маркер «фильтр целиком архетипного уровня» — не смотрит на строки.
+/// Реализован для `()`, `With<T>`, `Without<T>` и их кортежей. Требуется
+/// плотной итерацией (`for_each_chunk`): построчные фильтры (`Changed`/
+/// `Added`/`Or` с ними) со слайсовой выдачей несовместимы.
+pub trait ArchetypeFilter: WorldQuery {}
+
+impl ArchetypeFilter for () {}
+impl<T: Component> ArchetypeFilter for With<T> {}
+impl<T: Component> ArchetypeFilter for Without<T> {}
+
+macro_rules! impl_archetype_filter_tuple {
+    ( $($F:ident),+ ) => {
+        impl< $($F: ArchetypeFilter),+ > ArchetypeFilter for ( $($F,)+ ) {}
+    };
+}
+impl_archetype_filter_tuple!(A);
+impl_archetype_filter_tuple!(A, B);
+impl_archetype_filter_tuple!(A, B, C);
+impl_archetype_filter_tuple!(A, B, C, D);
+impl_archetype_filter_tuple!(A, B, C, D, E);
+impl_archetype_filter_tuple!(A, B, C, D, E, F);
+impl_archetype_filter_tuple!(A, B, C, D, E, F, G);
+impl_archetype_filter_tuple!(A, B, C, D, E, F, G, H);
+
 // ── ArchState ──────────────────────────────────────────────────
 
 pub(crate) struct ArchState<S> {
@@ -1053,14 +1079,22 @@ pub(crate) struct ArchState<S> {
     pub len: usize,
 }
 
-// ── Query<Q> ───────────────────────────────────────────────────
+// ── Query<Q, F = ()> ───────────────────────────────────────────
 
-pub struct Query<'w, Q: WorldQuery> {
+/// Запрос по компонентам. Вторым параметром принимает ФИЛЬТР (D2-2,
+/// Bevy-форма): `Query<(&A, &mut B), (With<C>, Changed<A>)>` — данные и
+/// фильтрация разнесены, item фильтра не попадает в выдачу. По умолчанию
+/// `F = ()` — единый кортеж остаётся как вторая форма
+/// (`Query<(Read<A>, With<C>)>` эквивалентен).
+pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
     world: &'w World,
     /// Inline до 8 архетипов (D2-1): типичный системный запрос матчит 1-5
     /// архетипов — конструктор без heap-аллокации (plain-fn `Query`-параметр
     /// строится на КАЖДЫЙ вызов системы).
-    archetypes: smallvec::SmallVec<[ArchState<Q::State>; 8]>,
+    ///
+    /// Состояние — ПАРЫ `(Q, F)`: data и filter исполняются одним проходом
+    /// (matches = AND, fetch_item фильтра отбрасывается на выдаче).
+    archetypes: smallvec::SmallVec<[ArchState<<(Q, F) as WorldQuery>::State>; 8]>,
     #[allow(dead_code)]
     last_run: Tick,
     /// Ограничения строк для row-level splits.
@@ -1068,7 +1102,7 @@ pub struct Query<'w, Q: WorldQuery> {
     row_ranges: &'w [(usize, usize, usize)],
 }
 
-impl<'w, Q: WorldQuery> Query<'w, Q> {
+impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     pub fn new(world: &'w World) -> Self {
         Self::new_with_tick(world, Tick::ZERO)
     }
@@ -1087,31 +1121,41 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
     fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
         let mut ids = IdBuf::new();
-        Q::fill_ids(world, &mut ids);
-        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
+        <(Q, F)>::fill_ids(world, &mut ids);
+        debug_assert_eq!(
+            ids.len(),
+            <(Q, F)>::component_count(),
+            "инвариант fill_ids нарушен"
+        );
 
         // Without-семантика целиком в matches_archetype (Without::matches_archetype
         // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
         let arch_filter = |arch_idx: usize| -> bool {
             let arch = &world.archetypes[arch_idx];
-            !arch.is_empty() && Q::matches_archetype(arch, &ids)
+            !arch.is_empty() && <(Q, F)>::matches_archetype(arch, &ids)
         };
 
-        let archetypes: smallvec::SmallVec<[ArchState<Q::State>; 8]> = arch_indices
-            .iter()
-            .copied()
-            .filter(|&arch_idx| arch_filter(arch_idx))
-            .map(|arch_idx| {
-                let state = unsafe {
-                    Q::fetch_state(&world.archetypes[arch_idx], &ids, last_run, world.current_tick())
-                };
-                ArchState {
-                    arch_idx,
-                    state,
-                    len: world.archetypes[arch_idx].len(),
-                }
-            })
-            .collect();
+        let archetypes: smallvec::SmallVec<[ArchState<<(Q, F) as WorldQuery>::State>; 8]> =
+            arch_indices
+                .iter()
+                .copied()
+                .filter(|&arch_idx| arch_filter(arch_idx))
+                .map(|arch_idx| {
+                    let state = unsafe {
+                        <(Q, F)>::fetch_state(
+                            &world.archetypes[arch_idx],
+                            &ids,
+                            last_run,
+                            world.current_tick(),
+                        )
+                    };
+                    ArchState {
+                        arch_idx,
+                        state,
+                        len: world.archetypes[arch_idx].len(),
+                    }
+                })
+                .collect();
 
         Self {
             world,
@@ -1123,14 +1167,18 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
         let mut ids = IdBuf::new();
-        Q::fill_ids(world, &mut ids);
-        debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
+        <(Q, F)>::fill_ids(world, &mut ids);
+        debug_assert_eq!(
+            ids.len(),
+            <(Q, F)>::component_count(),
+            "инвариант fill_ids нарушен"
+        );
 
         // Without-семантика целиком в matches_archetype (Without::matches_archetype
         // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
         let arch_filter = |arch_idx: usize| -> bool {
             let arch = &world.archetypes[arch_idx];
-            !arch.is_empty() && Q::matches_archetype(arch, &ids)
+            !arch.is_empty() && <(Q, F)>::matches_archetype(arch, &ids)
         };
 
         // Порог линейного обхода: на малых мирах сканировать все архетипы
@@ -1143,7 +1191,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             // линейный обход не требует ни прохода реестра, ни аллокации.
             let mut required_ids = IdBuf::new();
             if world.archetypes.len() > LINEAR_SCAN_MAX_ARCHETYPES {
-                Q::fill_required_ids(world, &mut required_ids);
+                <(Q, F)>::fill_required_ids(world, &mut required_ids);
             }
 
             if required_ids.is_empty() {
@@ -1156,7 +1204,8 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .enumerate()
                     .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
                     .map(|(arch_idx, arch)| {
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
+                        let state =
+                            unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -1189,7 +1238,8 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                     .filter(|&arch_idx| arch_filter(arch_idx))
                     .map(|arch_idx| {
                         let arch = &world.archetypes[arch_idx];
-                        let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
+                        let state =
+                            unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
                         ArchState {
                             arch_idx,
                             state,
@@ -1217,7 +1267,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     /// Итератор по entity и компонентам.
-    pub fn iter(&self) -> QueryIter<'_, Q> {
+    pub fn iter(&self) -> QueryIter<'_, Q, F> {
         QueryIter {
             archetypes: &self.archetypes,
             world: self.world,
@@ -1229,7 +1279,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     /// Consuming итератор — для использования в ParamQuery.
     #[allow(dead_code)]
-    pub(crate) fn into_iter_owned(self) -> QueryIterOwned<'w, Q> {
+    pub(crate) fn into_iter_owned(self) -> QueryIterOwned<'w, Q, F> {
         QueryIterOwned {
             query: self,
             arch_cursor: 0,
@@ -1237,8 +1287,29 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
         }
     }
 
+    /// Ровно одна матчащаяся entity (Bevy-паритет, D2-2).
+    ///
+    /// `Err(QuerySingleError)` при нуле или нескольких. Работает и для
+    /// мутабельных форм (item `Write<T>` — это `Mut<T>`), поэтому отдельного
+    /// `&mut self`-варианта не требуется; [`single_mut`](Self::single_mut) —
+    /// алиас для привычки мигранта.
+    pub fn single(&self) -> Result<(Entity, Q::Item<'_>), QuerySingleError> {
+        let mut it = self.iter();
+        let first = it.next().ok_or(QuerySingleError::NoEntities)?;
+        if it.next().is_some() {
+            return Err(QuerySingleError::MultipleEntities);
+        }
+        Ok(first)
+    }
+
+    /// Алиас [`single`](Self::single) (Bevy-паритет).
     #[inline]
-    pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
+    pub fn single_mut(&mut self) -> Result<(Entity, Q::Item<'_>), QuerySingleError> {
+        self.single()
+    }
+
+    #[inline]
+    pub fn for_each<Func: FnMut(Entity, Q::Item<'_>)>(&self, mut f: Func) {
         for a in &self.archetypes {
             let (row_start, row_end) = self.row_range(a.arch_idx);
             let end = row_end.min(a.len);
@@ -1249,7 +1320,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = row_start + offset;
-                if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
                     f(entity, item);
                 }
             }
@@ -1257,10 +1328,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     }
 
     /// Параллельная итерация.
-    pub fn par_for_each<F>(&self, f: F)
+    pub fn par_for_each<Func>(&self, f: Func)
     where
         Q: Send,
-        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+        F: Send,
+        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
     {
         use rayon::prelude::*;
 
@@ -1268,7 +1340,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
         // Предварительно вычисляем ID компонентов (как в new_with_tick)
         let mut ids = IdBuf::new();
-        Q::fill_ids(self.world, &mut ids);
+        <(Q, F)>::fill_ids(self.world, &mut ids);
 
         // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
         let row_ranges = self.row_ranges;
@@ -1299,11 +1371,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
                 return;
             }
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
-            let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
+            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = clamped_start + offset;
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, row) } {
                     f(entity, item);
                 }
             }
@@ -1332,10 +1404,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
     ///         for i in 0..pos.len() { pos[i].0 += vel[i].0; } // SIMD-friendly
     ///     });
     /// ```
-    pub fn for_each_chunk<F>(&self, mut f: F)
+    pub fn for_each_chunk<Func>(&self, mut f: Func)
     where
         Q: crate::dense::DenseQuery,
-        F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+        F: ArchetypeFilter,
+        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
     {
         let mut ids = IdBuf::new();
         Q::fill_ids(self.world, &mut ids);
@@ -1356,10 +1429,11 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     /// Параллельная плотная итерация: те же chunk-диапазоны, что у
     /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
-    pub fn par_for_each_chunk<F>(&self, f: F)
+    pub fn par_for_each_chunk<Func>(&self, f: Func)
     where
         Q: crate::dense::DenseQuery + Send,
-        F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+        F: ArchetypeFilter,
+        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
     {
         use rayon::prelude::*;
 
@@ -1404,15 +1478,19 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
 // ── Итераторы ──────────────────────────────────────────────────
 
-pub struct QueryIter<'q, Q: WorldQuery> {
-    archetypes: &'q [ArchState<Q::State>],
+pub struct QueryIter<'q, Q: WorldQuery, F: WorldQuery = ()>
+where
+    Q::State: 'q,
+    F::State: 'q,
+{
+    archetypes: &'q [ArchState<<(Q, F) as WorldQuery>::State>],
     world: &'q World,
     arch_cursor: usize,
     row_cursor: usize,
     row_ranges: &'q [(usize, usize, usize)],
 }
 
-impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
+impl<'q, Q: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, Q, F> {
     type Item = (Entity, Q::Item<'q>);
 
     #[inline]
@@ -1431,7 +1509,7 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
             }
             let row = self.row_cursor;
             self.row_cursor += 1;
-            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+            if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
                 let entity = self.world.archetypes[a.arch_idx].entities[row];
                 return Some((entity, item));
             }
@@ -1439,7 +1517,7 @@ impl<'q, Q: WorldQuery> Iterator for QueryIter<'q, Q> {
     }
 }
 
-impl<'q, Q: WorldQuery> QueryIter<'q, Q> {
+impl<'q, Q: WorldQuery, F: WorldQuery> QueryIter<'q, Q, F> {
     fn row_range(&self, arch_idx: usize) -> (usize, usize) {
         self.row_ranges
             .iter()
@@ -1448,13 +1526,52 @@ impl<'q, Q: WorldQuery> QueryIter<'q, Q> {
     }
 }
 
-pub struct QueryIterOwned<'w, Q: WorldQuery> {
-    query: Query<'w, Q>,
+/// Ошибка [`Query::single`] (D2-2, Bevy-паритет).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuerySingleError {
+    NoEntities,
+    MultipleEntities,
+}
+
+impl std::fmt::Display for QuerySingleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEntities => write!(f, "Query::single: ни одной матчащейся entity"),
+            Self::MultipleEntities => write!(f, "Query::single: больше одной матчащейся entity"),
+        }
+    }
+}
+
+impl std::error::Error for QuerySingleError {}
+
+/// `for (entity, item) in &query` (D2-2) — поверх существующего `iter()`:
+/// выдаёт `(Entity, Q::Item)`, как и остальные пути итерации ядра.
+impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q Query<'w, Q, F> {
+    type Item = (Entity, Q::Item<'q>);
+    type IntoIter = QueryIter<'q, Q, F>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// `for (entity, mut item) in &mut query` — привычная Bevy-форма для
+/// мутабельных запросов (наш `iter()` и так выдаёт `Mut<T>` через `&self`,
+/// но `&mut`-форма оставлена для построчного переноса кода).
+impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, Q, F> {
+    type Item = (Entity, Q::Item<'q>);
+    type IntoIter = QueryIter<'q, Q, F>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+pub struct QueryIterOwned<'w, Q: WorldQuery, F: WorldQuery = ()> {
+    query: Query<'w, Q, F>,
     arch_cursor: usize,
     row_cursor: usize,
 }
 
-impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
+impl<'w, Q: WorldQuery, F: WorldQuery> Iterator for QueryIterOwned<'w, Q, F> {
     type Item = (Entity, Q::Item<'w>);
 
     #[inline]
@@ -1473,7 +1590,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterOwned<'w, Q> {
             }
             let row = self.row_cursor;
             self.row_cursor += 1;
-            if let Some(item) = unsafe { Q::fetch_item(a.state, row) } {
+            if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
                 let entity = self.query.world.archetypes[a.arch_idx].entities[row];
                 return Some((entity, item));
             }
@@ -1540,6 +1657,124 @@ impl<'w> QueryBuilder<'w> {
 }
 
 // ── Tests ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod query_filter_tests {
+    use super::*;
+    use crate::component::Component;
+    use crate::world::World;
+
+    #[derive(Debug, PartialEq)]
+    struct Hp(u32);
+    impl Component for Hp {}
+    #[derive(Debug, PartialEq)]
+    struct Mana(u32);
+    impl Component for Mana {}
+    struct Boss;
+    impl Component for Boss {}
+
+    /// Bevy-форма `Query<Data, Filter>`: фильтр не попадает в выдачу.
+    #[test]
+    fn query_data_filter_form() {
+        let mut world = World::new();
+        let boss = world.spawn((Hp(100), Mana(50), Boss));
+        let _mob = world.spawn((Hp(10), Mana(5)));
+
+        // С фильтром (With<Boss>,): item — только данные.
+        let q = Query::<(Read<Hp>, Read<Mana>), (With<Boss>,)>::new(&world);
+        let got: Vec<(Entity, (&Hp, &Mana))> = q.iter().collect();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, boss);
+        assert_eq!(*got[0].1 .0, Hp(100));
+        drop(q);
+
+        // Одиночный фильтр без кортежа тоже работает.
+        let n = Query::<Read<Hp>, With<Boss>>::new(&world).iter().count();
+        assert_eq!(n, 1);
+
+        // Changed в фильтре: после advance — пусто, после мутации — снова 1.
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        let n = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(n, 0);
+        world.get_mut::<Hp>(boss).unwrap().0 += 1;
+        let n = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+            .iter()
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    /// `for (e, item) in &q` / `&mut q` — IntoIterator поверх iter() (D2-2).
+    #[test]
+    fn query_for_loop_iteration() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        world.spawn((Hp(2),));
+
+        let q = Query::<Read<Hp>>::new(&world);
+        let mut sum = 0;
+        for (_e, hp) in &q {
+            sum += hp.0;
+        }
+        assert_eq!(sum, 3);
+
+        let mut q = Query::<Write<Hp>>::new(&world);
+        for (_e, mut hp) in &mut q {
+            hp.0 *= 10;
+        }
+        let total: u32 = Query::<Read<Hp>>::new(&world)
+            .iter()
+            .map(|(_, hp)| hp.0)
+            .sum();
+        assert_eq!(total, 30);
+    }
+
+    /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
+    #[test]
+    fn query_single() {
+        let mut world = World::new();
+        assert_eq!(
+            Query::<Read<Hp>>::new(&world).single().unwrap_err(),
+            QuerySingleError::NoEntities
+        );
+
+        let e = world.spawn((Hp(42),));
+        let q = Query::<Read<Hp>>::new(&world);
+        let (got_e, hp) = q.single().unwrap();
+        assert_eq!((got_e, hp.0), (e, 42));
+        drop(q);
+
+        // single_mut: мутация через Mut<T>.
+        let mut q = Query::<Write<Hp>>::new(&world);
+        let (_, mut hp) = q.single_mut().unwrap();
+        hp.0 = 7;
+        drop(q);
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(7)));
+
+        world.spawn((Hp(1),));
+        assert_eq!(
+            Query::<Read<Hp>>::new(&world).single().unwrap_err(),
+            QuerySingleError::MultipleEntities
+        );
+    }
+
+    /// Архетипный фильтр совместим с плотной итерацией; данные приходят
+    /// только из отфильтрованных архетипов.
+    #[test]
+    fn query_filter_with_chunks() {
+        let mut world = World::new();
+        world.spawn((Hp(1), Boss));
+        world.spawn((Hp(2),));
+
+        let mut sum = 0;
+        Query::<Read<Hp>, With<Boss>>::new(&world).for_each_chunk(|_, hp| {
+            sum += hp.iter().map(|h| h.0).sum::<u32>();
+        });
+        assert_eq!(sum, 1, "for_each_chunk уважает архетипный фильтр");
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -393,6 +393,27 @@ Query — основной способ итерации по компонент
 > `Query::<(&Velocity, &mut Position)>::new(&world)`. Внутри `system!` для запросов используйте
 > `Read<T>`/`Write<T>` (там `&T`/`&mut T` зарезервированы под ресурсы).
 
+### 4.1.1 Bevy-форма `Query<Data, Filter>`, for-итерация и `single()` (D2-2)
+
+Второй параметр `Query` — фильтр (по умолчанию `()`); item фильтра не попадает в выдачу:
+
+```rust
+// Данные и фильтрация разнесены (1:1 перенос с Bevy):
+let q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_with_tick(&world, last_run);
+
+// for-итерация поверх iter(): выдаёт (Entity, item) — на одну деструктуризацию
+// больше, чем в Bevy (entity всегда первая):
+for (entity, (hp, mut pos)) in &q { /* … */ }
+
+// Ровно одна entity (Result, как Bevy 0.15+):
+let (e, (hp, _)) = q.single()?;        // NoEntities / MultipleEntities
+```
+
+Единый кортеж остаётся как вторая форма: `Query<(&Hp, With<Boss>)>` эквивалентен.
+Плотная итерация (`for_each_chunk`) требует **архетипного** фильтра
+(`()`/`With`/`Without`/их кортежи — маркер `ArchetypeFilter`); построчные
+`Changed`/`Added` в позиции фильтра с chunk-методами не компилируются.
+
 ### 4.2 `Query<Q>`
 
 ```rust

@@ -524,12 +524,16 @@ impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
     }
 }
 
-impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::query::Query<'a, Q> {
-    type Item<'w> = crate::query::Query<'w, Q>;
+impl<'a, Q, F> SystemParam for crate::query::Query<'a, Q, F>
+where
+    Q: WorldQuery + WorldQuerySystemAccess,
+    F: WorldQuery + WorldQuerySystemAccess,
+{
+    type Item<'w> = crate::query::Query<'w, Q, F>;
     fn access() -> AccessDescriptor {
-        Q::system_access()
+        Q::system_access().merge(&F::system_access())
     }
-    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, Q> {
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, Q, F> {
         // База Changed/Added — last_run_tick мира (граница прошлого кадра),
         // как у ctx.query() (TD-9).
         let sub = &ctx.sub_worlds[0];
