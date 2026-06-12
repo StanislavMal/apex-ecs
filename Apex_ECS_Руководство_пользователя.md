@@ -337,7 +337,7 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 | `#[derive(Component)]` `#[require(A, B)]` | то же | required components (D2-4); плюс у нас derive **авто-регистрирует** компонент (linkme) — `register_component` не нужен |
 | `App::new().add_plugins((DefaultPlugins, MyPlugin))` | то же | группы плагинов и кортежи, включая вложенные (D2-7) |
 | `commands.spawn(bundle)` / `despawn` / `insert` | то же | `Commands` — bump-arena (без per-command Box) |
-| `EventReader::read()`, `EventWriter::send()` | то же | регистрация типов событий не нужна (авто) |
+| `EventReader::read()`, `EventWriter::send()` | то же | `read()` возвращает guard: итерация `for e in r.read().iter()`; регистрация типов событий не нужна (авто) |
 | `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — condition'ы, а не отдельные schedule (D2-6) |
 | `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` (D2-5) |
 | `RemovedComponents<T>` | то же | трекинг **opt-in**: `world.track_removals::<T>()` — нулевая стоимость по умолчанию |
