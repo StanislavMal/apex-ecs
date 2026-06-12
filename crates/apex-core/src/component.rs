@@ -1,3 +1,4 @@
+#[cfg(not(target_arch = "wasm32"))]
 use linkme::distributed_slice;
 use rustc_hash::FxHashMap;
 use std::any::TypeId;
@@ -7,8 +8,18 @@ pub type ComponentRegistrarFn = fn(&mut ComponentRegistry);
 
 /// Глобальный список всех авторегистраторов компонентов.
 /// Заполняется линкером из всех крейтов, использующих #[derive(Component)].
+#[cfg(not(target_arch = "wasm32"))]
 #[distributed_slice]
 pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn] = [..];
+
+/// На wasm32 `linkme::distributed_slice` не реализован — авторегистрация
+/// на `World::new()` не выполняется, компоненты регистрируются лениво
+/// (`get_or_register` на spawn/insert). ⚠ Следствие: `#[require(...)]`
+/// на wasm пока НЕ применяется (регистраторы derive не запускаются) —
+/// TD-25 в `apex-engine/plans/TECH_DEBT.md`, закрыть до первого
+/// wasm-рантайма (план: ленивый require через trait-метод Component).
+#[cfg(target_arch = "wasm32")]
+pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn; 0] = [];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct ComponentId(pub u32);

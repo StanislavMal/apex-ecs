@@ -107,7 +107,11 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl ::apex_core::component::Component for #name {}
 
+        // linkme не реализован на wasm32: регистратор не эмитится, компонент
+        // регистрируется лениво (get_or_register), #[require] не применяется —
+        // TD-25 (apex-engine/plans/TECH_DEBT.md).
         #[allow(non_upper_case_globals)]
+        #[cfg(not(target_arch = "wasm32"))]
         #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
         #[linkme(crate = ::apex_core::linkme)]
         static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =

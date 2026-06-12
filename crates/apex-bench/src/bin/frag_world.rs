@@ -45,6 +45,21 @@ const TREES: usize = 1000;
 const CHAIN: usize = 26; // root → n1..n26 → prim
 const LIGHTS: usize = 8;
 
+/// CI-страж структурного класса CR-M1: relations НЕ должны попадать в
+/// идентичность архетипа. Здоровый профиль — 5 архетипов; регресс класса
+/// даёт ~27 000 (по уникальному родителю на архетип). Порог с запасом на
+/// новые формы компонентов. Таймерные пороги в CI не ставим — раннеры
+/// шумят; правило «падение >20% = блокер» остаётся локальной дисциплиной.
+const MAX_ARCHETYPES: usize = 64;
+
+fn assert_archetype_guard(world: &World, when: &str) {
+    assert!(
+        world.archetype_count() <= MAX_ARCHETYPES,
+        "СТРАЖ ({when}): {} архетипов (> {MAX_ARCHETYPES}) — relations снова в идентичности архетипа? (CR-M1)",
+        world.archetype_count(),
+    );
+}
+
 // ── Тайминг: медиана из SAMPLES прогонов ───────────────────────
 
 const SAMPLES: usize = 9;
@@ -430,6 +445,7 @@ fn bench_spawn_subtree(fw: &mut FragWorld, rep: &mut Report) {
 fn main() {
     println!("=== CR-M0: фрагментированный мир (профиль many_foxes @1000) ===\n");
     let mut fw = build();
+    assert_archetype_guard(&fw.world, "после build");
     let mut rep = Report { rows: Vec::new() };
 
     bench_query_new(&fw, &mut rep);
@@ -449,4 +465,5 @@ fn main() {
         fw.world.entity_count(),
         fw.world.archetype_count()
     );
+    assert_archetype_guard(&fw.world, "после spawn-бенча");
 }

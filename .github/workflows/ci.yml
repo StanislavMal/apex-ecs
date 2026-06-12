@@ -1,0 +1,44 @@
+# CI ядра: build + test + clippy(-D warnings) + frag_world-страж + wasm32-check.
+# Голдены/GPU-тесты живут в apex-engine и остаются локальными (нет GPU в раннерах).
+# Таймерные пороги здесь НЕ проверяются (шумные раннеры) — frag_world падает только
+# на структурном регрессе (assert числа архетипов, класс CR-M1); тайминги — в лог.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test + Clippy (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (workspace)
+        run: cargo test --workspace
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: frag_world guard (структурный assert архетипов; тайминги информативно)
+        run: cargo run --release -p apex-bench --bin frag_world
+
+  wasm:
+    name: wasm32 check (core crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # apex-scripting (mlua/C) и apex-hot-reload (notify) — нативные, в wasm-срез не входят.
+      # ⚠ Авторегистрация компонентов (linkme) на wasm отключена — TD-25 в apex-engine/plans/TECH_DEBT.md.
+      - name: cargo check (wasm32-unknown-unknown)
+        run: cargo check --target wasm32-unknown-unknown -p apex-core -p apex-scheduler -p apex-graph -p apex-isolated -p apex-serialization
