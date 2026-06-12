@@ -69,6 +69,10 @@ pub use config::{
     par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemMarker,
     IntoScheduleConfigs, SystemConfig,
 };
+pub mod fixed;
+pub use fixed::FixedTime;
+pub mod states;
+pub use states::{in_state, init_state, on_enter, on_exit, NextState, State, StateTransitions, States};
 
 mod config;
 use crate::config::SystemConfigKind;
@@ -2396,43 +2400,55 @@ impl Scheduler {
         let mut thread_commands: Vec<Commands> = vec![Commands::new()];
         let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
 
-        for stage in &plan.stages {
-            if stage.label == StageLabel::Startup && self.startup_completed {
+        // (клонируем метаданные стадий — plan заимствует self, а stage_steps
+        // и системы ниже требуют &mut)
+        let stages_meta: Vec<(StageLabel, Vec<SystemId>, Vec<TypeId>)> = plan
+            .stages
+            .iter()
+            .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone()))
+            .collect();
+
+        for (label, system_ids, emit_event_types) in &stages_meta {
+            if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
 
-            for &sys_id in &stage.system_ids {
-                if let Some(&index) = self.system_indices.get(&sys_id) {
-                    let system = &self.systems[index];
-                    if !system.run_condition.evaluate(w) {
-                        continue;
-                    }
-                    let system = &mut self.systems[index];
-                    let prof_t = main_prof_enabled().then(std::time::Instant::now);
-                    match &mut system.kind {
-                        SystemKind::Sequential(f) => f(w),
-                        SystemKind::Parallel { system, .. } => {
-                            system.run(SystemContext::with_commands(
-                                std::slice::from_ref(&sub_world),
-                                cmds_ptr,
-                            ));
+            // D2-5: FixedUpdate — 0..N шагов по аккумулятору FixedTime.
+            let steps = Self::stage_steps(w, label);
+            for _step in 0..steps {
+                for &sys_id in system_ids {
+                    if let Some(&index) = self.system_indices.get(&sys_id) {
+                        let system = &self.systems[index];
+                        if !system.run_condition.evaluate(w) {
+                            continue;
+                        }
+                        let system = &mut self.systems[index];
+                        let prof_t = main_prof_enabled().then(std::time::Instant::now);
+                        match &mut system.kind {
+                            SystemKind::Sequential(f) => f(w),
+                            SystemKind::Parallel { system, .. } => {
+                                system.run(SystemContext::with_commands(
+                                    std::slice::from_ref(&sub_world),
+                                    cmds_ptr,
+                                ));
+                            }
+                        }
+                        if let Some(t) = prof_t {
+                            main_prof_record(&self.systems[index].name, t.elapsed());
                         }
                     }
-                    if let Some(t) = prof_t {
-                        main_prof_record(&self.systems[index].name, t.elapsed());
-                    }
                 }
-            }
 
-            // Применяем отложенные команды после каждой стадии
-            for cmds in &mut thread_commands {
-                cmds.apply(w);
-            }
-            thread_commands[0] = Commands::new();
+                // Применяем отложенные команды после каждой стадии/шага
+                for cmds in &mut thread_commands {
+                    cmds.apply(w);
+                }
+                thread_commands[0] = Commands::new();
 
-            // Per-stage flush — делает события доступными для следующего этапа
-            if !stage.emit_event_types.is_empty() {
-                w.flush_events_by_type(&stage.emit_event_types);
+                // Per-stage flush — делает события доступными для следующего этапа
+                if !emit_event_types.is_empty() {
+                    w.flush_events_by_type(emit_event_types);
+                }
             }
         }
 
@@ -2713,7 +2729,7 @@ impl Scheduler {
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
-        let stages: Vec<(Vec<SystemId>, bool, Vec<TypeId>)> = plan
+        let stages: Vec<(StageLabel, Vec<SystemId>, bool, Vec<TypeId>)> = plan
             .stages
             .iter()
             .filter(|stage| {
@@ -2724,6 +2740,7 @@ impl Scheduler {
             })
             .map(|s| {
                 (
+                    s.label.clone(),
                     s.system_ids.clone(),
                     s.all_parallel,
                     s.emit_event_types.clone(),
@@ -2760,7 +2777,13 @@ impl Scheduler {
             .map(|a| a.len())
             .collect();
 
-        for (stage_ids, all_parallel, emit_event_types) in &stages {
+        for (label, stage_ids, all_parallel, emit_event_types) in &stages {
+            // D2-5: FixedUpdate исполняется 0..N раз по аккумулятору FixedTime
+            // (каждый шаг — своё применение команд и флаш событий); остальные
+            // стадии — ровно один раз. `continue` внутри тела продолжает
+            // ШАГОВЫЙ цикл — семантика шагов сохраняется.
+            let steps = Self::stage_steps(unsafe { &mut *world_ptr }, label);
+            for _step in 0..steps {
             if !*all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
@@ -2896,7 +2919,21 @@ impl Scheduler {
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
+            } // конец шагового цикла (D2-5)
         }
+    }
+
+    /// Число исполнений стадии в этом кадре (D2-5): FixedUpdate — по
+    /// аккумулятору [`FixedTime`] (без ресурса — 1, обычная стадия);
+    /// остальные стадии — всегда 1.
+    fn stage_steps(world: &mut World, label: &StageLabel) -> usize {
+        if *label != StageLabel::FixedUpdate {
+            return 1;
+        }
+        world
+            .try_resource_mut::<crate::fixed::FixedTime>()
+            .map(|ft| ft.drain_steps())
+            .unwrap_or(1)
     }
 
     /// Создать SubWorld для системы на основе предвычисленных archetype_indices
@@ -5301,6 +5338,163 @@ mod tests {
             "W+R конфликт по Pos должен разнести системы по батчам: {} стадий",
             stages.len()
         );
+    }
+
+    // ── D2-5: FixedUpdate ──────────────────────────────────────
+
+    /// FixedUpdate исполняется по аккумулятору FixedTime: 0..N шагов за кадр,
+    /// остаток переносится; Update при этом — ровно раз за кадр.
+    #[test]
+    fn fixed_update_steps_by_accumulator() {
+        struct Counts {
+            fixed: u32,
+            update: u32,
+        }
+
+        fn fixed_step(mut c: ResMut<Counts>) {
+            c.fixed += 1;
+        }
+        fn frame_step(mut c: ResMut<Counts>) {
+            c.update += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Counts {
+            fixed: 0,
+            update: 0,
+        });
+        world.insert_resource(crate::FixedTime::from_dt(0.010));
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::FixedUpdate, fixed_step);
+        sched.add_systems(StageLabel::Update, frame_step);
+
+        // Кадр 1: 35мс → 3 шага, остаток 5мс.
+        world
+            .resource_mut::<crate::FixedTime>()
+            .accumulate(0.035);
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Counts>().fixed, 3);
+        assert_eq!(world.resource::<Counts>().update, 1);
+
+        // Кадр 2: +0мс → 0 шагов (остаток 5мс < dt).
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Counts>().fixed, 3);
+        assert_eq!(world.resource::<Counts>().update, 2);
+
+        // Кадр 3: +6мс → остаток 11мс → 1 шаг.
+        world
+            .resource_mut::<crate::FixedTime>()
+            .accumulate(0.006);
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Counts>().fixed, 4);
+        assert_eq!(world.resource::<Counts>().update, 3);
+    }
+
+    /// Защита от спирали смерти: шаги капятся, излишек отбрасывается.
+    #[test]
+    fn fixed_update_death_spiral_cap() {
+        struct N(u32);
+        fn step(mut n: ResMut<N>) {
+            n.0 += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(N(0));
+        let mut ft = crate::FixedTime::from_dt(0.001);
+        ft.max_steps_per_frame = 4;
+        ft.accumulate(10.0); // 10000 шагов «задолженности»
+        world.insert_resource(ft);
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::FixedUpdate, step);
+        sched.run(&mut world);
+
+        assert_eq!(world.resource::<N>().0, 4, "кап шагов");
+        assert_eq!(
+            world.resource::<crate::FixedTime>().overstep(),
+            0.0,
+            "излишек отброшен"
+        );
+    }
+
+    /// Без ресурса FixedTime стадия FixedUpdate — обычная (1 раз за кадр).
+    #[test]
+    fn fixed_update_without_resource_runs_once() {
+        struct N(u32);
+        fn step(mut n: ResMut<N>) {
+            n.0 += 1;
+        }
+        let mut world = World::new();
+        world.insert_resource(N(0));
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::FixedUpdate, step);
+        sched.run(&mut world);
+        sched.run(&mut world);
+        assert_eq!(world.resource::<N>().0, 2);
+    }
+
+    // ── D2-6: States ───────────────────────────────────────────
+
+    /// Полный жизненный цикл состояний: in_state гейтит системы, on_enter/
+    /// on_exit истинны ровно один кадр, переход — через NextState.
+    #[test]
+    fn states_in_state_on_enter_on_exit() {
+        use crate::states::{in_state, init_state, on_enter, on_exit, NextState};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Game {
+            Menu,
+            Playing,
+        }
+
+        #[derive(Default)]
+        struct Log {
+            menu_frames: u32,
+            entered_playing: u32,
+            exited_menu: u32,
+        }
+
+        fn menu_ui(mut log: ResMut<Log>) {
+            log.menu_frames += 1;
+        }
+        fn spawn_level(mut log: ResMut<Log>) {
+            log.entered_playing += 1;
+        }
+        fn teardown_menu(mut log: ResMut<Log>) {
+            log.exited_menu += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        let mut sched = Scheduler::new();
+        init_state(&mut world, &mut sched, Game::Menu);
+
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                SystemConfig::fn_sys(menu_ui).run_if(in_state(Game::Menu)),
+                SystemConfig::fn_sys(spawn_level).run_if(on_enter(Game::Playing)),
+                SystemConfig::fn_sys(teardown_menu).run_if(on_exit(Game::Menu)),
+            ),
+        );
+
+        sched.run(&mut world); // кадр 1: Menu
+        sched.run(&mut world); // кадр 2: Menu
+        assert_eq!(world.resource::<Log>().menu_frames, 2);
+        assert_eq!(world.resource::<Log>().entered_playing, 0);
+
+        world.resource_mut::<NextState<Game>>().set(Game::Playing);
+        sched.run(&mut world); // кадр 3: переход в начале кадра
+        let log = world.resource::<Log>();
+        assert_eq!(log.menu_frames, 2, "in_state(Menu) больше не пускает");
+        assert_eq!(log.entered_playing, 1, "on_enter — ровно один кадр");
+        assert_eq!(log.exited_menu, 1, "on_exit — ровно один кадр");
+
+        sched.run(&mut world); // кадр 4: Playing, переходов нет
+        let log = world.resource::<Log>();
+        assert_eq!(log.entered_playing, 1);
+        assert_eq!(log.exited_menu, 1);
     }
 
     // ── W3-4: стресс ASD row-split ────────────────────────────

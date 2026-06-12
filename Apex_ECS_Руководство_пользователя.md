@@ -1354,6 +1354,52 @@ sched.chain(&["spawner", "camera"]).unwrap();
 | `run_sequential()` | Тесты, отладка | Commands работают (per-stage apply) |
 | `run()` | Production | Commands работают (per-thread + per-stage apply) |
 
+### 6.0d FixedUpdate — фиксированный шаг симуляции (D2-5)
+
+Стадия `StageLabel::FixedUpdate` шагает по аккумулятору ресурса
+`apex_scheduler::FixedTime` (0..N раз за кадр, остаток переносится; каждый шаг
+со своим применением команд и флашем событий):
+
+```rust
+use apex_scheduler::FixedTime;
+
+world.insert_resource(FixedTime::from_hz(60.0));   // в движке App вставляет сам
+// раз в кадр, до run():
+world.resource_mut::<FixedTime>().accumulate(frame_dt); // App кормит Time.delta_seconds
+
+sched.add_systems(StageLabel::FixedUpdate, physics_step); // dt шага = FixedTime.dt
+```
+
+- `max_steps_per_frame` (default 8) — защита от «спирали смерти», излишек
+  отбрасывается; `overstep_fraction()` — коэффициент интерполяции рендера;
+- БЕЗ ресурса `FixedTime` стадия выполняется один раз за кадр (как раньше);
+- DtConditioner (apex-window) кондиционирует ВХОДНОЙ dt — аккумулятор работает
+  поверх него штатно, `FixedTime.dt` независим.
+
+### 6.0e App-состояния — `State<S>` / `NextState<S>` (D2-6)
+
+Состояния поверх run conditions: `in_state` / `on_enter` / `on_exit`
+(переход применяется в начале кадра — кадр видит одно состояние;
+enter/exit-условия истинны ровно один кадр):
+
+```rust
+use apex_scheduler::{init_state, in_state, on_enter, on_exit, NextState};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GameState { Menu, Playing }
+
+init_state(&mut world, &mut sched, GameState::Menu); // или app.add_state(GameState::Menu)
+
+sched.add_systems(StageLabel::Update, (
+    SystemConfig::fn_sys(menu_ui).run_if(in_state(GameState::Menu)),
+    SystemConfig::fn_sys(spawn_level).run_if(on_enter(GameState::Playing)),
+    SystemConfig::fn_sys(save_game).run_if(on_exit(GameState::Playing)),
+));
+
+// Переход — из любой системы:
+world.resource_mut::<NextState<GameState>>().set(GameState::Playing);
+```
+
 ### 6.1 `system!` макрос — единый для всех систем
 
 `system!` — **единственный** макрос объявления систем (параллельных и эксклюзивных).
@@ -3854,6 +3900,8 @@ generation entity не участвует — НЕ использовать дл
 | Метод | Описание |
 |---|---|---|
 | `add_systems(label, systems)` | **Единый вход**: plain-fn системы (D2-1), bare `system!`-идентификаторы, `SystemConfig` и кортежи до 12 — см. §6.0 |
+| `FixedTime` (ресурс) | Фиксированный шаг для `StageLabel::FixedUpdate`: `from_hz`/`accumulate`/`overstep_fraction`, кап шагов (D2-5, §6.0d) |
+| `init_state(world, sched, s)` / `in_state`/`on_enter`/`on_exit` | App-состояния поверх run conditions; переход через `NextState<S>` (D2-6, §6.0e) |
 | `add_auto_system(name, sys)` | Добавить AutoSystem (компоненты + ресурсы + события) |
 | `add_par(name, f)` | Добавить параллельную систему-замыкание (без доступа к компонентам) |
 | `add_par_access(name, access, f)` | Добавить параллельную систему-замыкание с явным `AccessDescriptor` |
