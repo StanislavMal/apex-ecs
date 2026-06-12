@@ -235,6 +235,20 @@ impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
 unsafe impl<T: Send + Sync + 'static> Send for EventWriter<'_, T> {}
 unsafe impl<T: Send + Sync + 'static> Sync for EventWriter<'_, T> {}
 
+/// Bevy-совместимое имя для чтения удалений компонента `T` (D2-3):
+/// обычный [`EventReader`] событий [`Removed<T>`](crate::events::Removed).
+///
+/// Требует включённого трекинга — `world.track_removals::<T>()` при setup'е
+/// (в отличие от Bevy, где удаления пишутся для всех компонентов всегда,
+/// у нас это opt-in с нулевой стоимостью по умолчанию).
+///
+/// ```ignore
+/// fn cleanup(mut removed: RemovedComponents<PhysicsBody>, mut phys: ResMut<Physics>) {
+///     for r in removed.read().iter() { phys.remove_body(r.entity); }
+/// }
+/// ```
+pub type RemovedComponents<'w, T> = EventReader<'w, crate::events::Removed<T>>;
+
 // ── Маркеры для ResourceAccessList ────────────────────────────
 
 /// Маркер: read-доступ к ресурсу T в `AutoSystem::Resources`.

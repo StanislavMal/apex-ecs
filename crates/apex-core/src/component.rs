@@ -125,6 +125,14 @@ pub(crate) type EmitRemovedFn = fn(&mut crate::events::EventRegistry, crate::Ent
 pub(crate) const FLAG_ON_ADD: u8 = 1;
 pub(crate) const FLAG_ON_REMOVE: u8 = 2;
 pub(crate) const FLAG_TRACK_REMOVED: u8 = 4;
+/// У компонента есть required-компоненты (D2-4, `#[require(...)]`).
+pub(crate) const FLAG_REQUIRES: u8 = 8;
+/// Маска «появление компонента кого-то интересует» (requires + on_add).
+pub(crate) const ADDED_NOTIFY_MASK: u8 = FLAG_ON_ADD | FLAG_REQUIRES;
+
+/// Вставка недостающего required-компонента (D2-4): no-op, если `R` уже есть
+/// у entity (явное значение из спавна/бандла ВСЕГДА выигрывает у дефолта).
+pub(crate) type RequiredInsertFn = fn(&mut crate::World, crate::Entity);
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct ComponentHooks {
@@ -258,6 +266,11 @@ pub struct ComponentRegistry {
     flags: Vec<u8>,
     /// Сами хуки — только для компонентов с ненулевыми flags.
     hooks: FxHashMap<u32, ComponentHooks>,
+    /// Required-компоненты per cid (D2-4): вставляются дефолтом, если
+    /// отсутствуют, ПОСЛЕ появления компонента-владельца (через очередь
+    /// хуков, до пользовательского on_add; транзитивность — естественно
+    /// через ту же очередь).
+    requires: FxHashMap<u32, Vec<RequiredInsertFn>>,
     any_flags: bool,
 }
 
@@ -269,8 +282,34 @@ impl ComponentRegistry {
             next_id: 0,
             flags: Vec::new(),
             hooks: FxHashMap::default(),
+            requires: FxHashMap::default(),
             any_flags: false,
         }
+    }
+
+    /// Объявить: компонент `C` требует `R` (D2-4, аналог Bevy
+    /// `#[require(...)]`). При ПОЯВЛЕНИИ `C` у entity недостающий `R`
+    /// вставляется `R::default()` (явно заданное значение всегда выигрывает).
+    /// Вызывается registrar'ом derive-макроса или вручную
+    /// ([`World::require_component`](crate::World::require_component)).
+    pub fn register_required<C: Component, R: Component + Default>(&mut self) {
+        let cid = self.register::<C>();
+        self.register::<R>();
+        self.requires
+            .entry(cid.0)
+            .or_default()
+            .push(|world, entity| {
+                if !world.has_component::<R>(entity) {
+                    world.insert(entity, R::default());
+                }
+            });
+        self.set_flag(cid, FLAG_REQUIRES);
+    }
+
+    /// Required-вставки компонента (D2-4); `None` — требований нет.
+    #[inline]
+    pub(crate) fn requires(&self, cid: ComponentId) -> Option<&[RequiredInsertFn]> {
+        self.requires.get(&cid.0).map(|v| v.as_slice())
     }
 
     // ── Хуки (W3-1) ────────────────────────────────────────────

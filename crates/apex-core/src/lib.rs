@@ -63,8 +63,8 @@ pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
 pub use system_param::{
     AutoSystem, CommandsParam, Emit, EventAccessList, EventReader, EventWriter, ExclusiveSystem,
-    Listen, QueryParam, Res, ResMut, ResRead, ResWrite, ResourceAccessList, SystemParam,
-    WorldQuerySystemAccess,
+    Listen, QueryParam, RemovedComponents, Res, ResMut, ResRead, ResWrite, ResourceAccessList,
+    SystemParam, WorldQuerySystemAccess,
 };
 pub use transform::IndexStamp;
 pub use world::{
@@ -91,7 +91,8 @@ pub mod prelude {
     pub use crate::system;
     pub use crate::system_param::{
         AutoSystem, CommandsParam, Emit, EventReader, EventWriter, ExclusiveSystem, Listen,
-        QueryParam, Res, ResMut, ResRead, ResWrite, SystemParam, WorldQuerySystemAccess,
+        QueryParam, RemovedComponents, Res, ResMut, ResRead, ResWrite, SystemParam,
+        WorldQuerySystemAccess,
     };
     pub use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
     pub use crate::world::{Bundle, CachedQuery, QueryState, SystemContext, World};

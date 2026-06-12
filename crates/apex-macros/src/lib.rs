@@ -65,11 +65,44 @@ use syn::{parse_macro_input, DeriveInput, Data, Fields, Type};
 /// Генерирует:
 /// - `impl Component for Type {}` (трейт с границами `Send + Sync + 'static`)
 /// - статический регистратор в `COMPONENT_REGISTRARS`, вызываемый при `World::new()`
-#[proc_macro_derive(Component)]
+///
+/// # `#[require(A, B, …)]` — required components (D2-4, аналог Bevy 0.15+)
+///
+/// ```ignore
+/// #[derive(Component)]
+/// #[require(LocalTransform, GlobalTransform)]
+/// struct MeshRenderer { /* … */ }
+///
+/// // спавн сам дотягивает недостающие трансформы дефолтами:
+/// world.spawn((MeshRenderer::new(mesh, mat),));
+/// ```
+///
+/// Требуемые типы обязаны реализовывать `Default`; явно заданное значение
+/// всегда выигрывает у дефолта; требования транзитивны.
+#[proc_macro_derive(Component, attributes(require))]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let registrar_ident = quote::format_ident!("__COMPONENT_REGISTRAR_{}", name);
+
+    // #[require(A, B, …)] — список типов через запятую (атрибутов может быть несколько).
+    let mut required: Vec<Type> = Vec::new();
+    for attr in &input.attrs {
+        if attr.path().is_ident("require") {
+            match attr.parse_args_with(
+                syn::punctuated::Punctuated::<Type, syn::Token![,]>::parse_terminated,
+            ) {
+                Ok(types) => required.extend(types),
+                Err(e) => return e.to_compile_error().into(),
+            }
+        }
+    }
+
+    let requires_calls = required.iter().map(|ty| {
+        quote! {
+            registry.register_required::<#name, #ty>();
+        }
+    });
 
     let expanded = quote! {
         impl ::apex_core::component::Component for #name {}
@@ -80,6 +113,7 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
             |registry: &mut ::apex_core::component::ComponentRegistry| {
                 registry.get_or_register::<#name>();
+                #( #requires_calls )*
             };
     };
     expanded.into()

@@ -457,6 +457,22 @@ impl World {
         self.registry.set_flag(cid, crate::component::FLAG_ON_REMOVE);
     }
 
+    /// Объявить: компонент `C` требует `R` (D2-4, аналог Bevy `#[require]`).
+    ///
+    /// При появлении `C` у entity (spawn / insert) недостающий `R`
+    /// дотягивается `R::default()` — явно заданное значение всегда выигрывает.
+    /// Требования транзитивны (если `R` сам что-то требует). Для derive-типов
+    /// удобнее атрибут: `#[derive(Component)] #[require(LocalTransform)]`.
+    ///
+    /// ```ignore
+    /// world.require_component::<MeshRenderer, LocalTransform>();
+    /// world.require_component::<MeshRenderer, GlobalTransform>();
+    /// let e = world.spawn((MeshRenderer::new(mesh, mat),)); // трансформы дотянутся
+    /// ```
+    pub fn require_component<C: Component, R: Component + Default>(&mut self) {
+        self.registry.register_required::<C, R>();
+    }
+
     /// Включить эмиссию событий [`Removed<T>`](crate::events::Removed) при
     /// потере компонента `T` (remove/despawn) — аналог Bevy
     /// `RemovedComponents`. Чтение — обычными путями событий (`&[Removed<T>]`
@@ -520,6 +536,20 @@ impl World {
             i += 1;
             match ev {
                 HookEvent::Added(entity, cid) => {
+                    // Required-компоненты (D2-4) — ДО пользовательского
+                    // on_add: хук видит entity уже с полным составом.
+                    // Транзитивные requires идут через эту же очередь
+                    // (вставка R ставит своё Added-событие).
+                    if self.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
+                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = self
+                            .registry
+                            .requires(cid)
+                            .map(|s| s.iter().copied().collect())
+                            .unwrap_or_default();
+                        for f in fns {
+                            f(self, entity);
+                        }
+                    }
                     let hook = self.registry.hooks(cid).and_then(|h| h.on_add);
                     if let Some(f) = hook {
                         f(self, entity);
@@ -559,7 +589,7 @@ impl World {
     /// компонентов (вызывающий уже проверил `registry.any_flags()`).
     fn queue_added_hooks(&mut self, entity: Entity, ids: &[ComponentId]) {
         for &cid in ids {
-            if self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0 {
+            if self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
                 self.hook_queue.push(HookEvent::Added(entity, cid));
             }
         }
@@ -907,7 +937,7 @@ impl World {
             let flagged: SmallVec<[ComponentId; 8]> = ids
                 .iter()
                 .copied()
-                .filter(|&cid| self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0)
+                .filter(|&cid| self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0)
                 .collect();
             if !flagged.is_empty() {
                 for &entity in &entities {
@@ -1016,7 +1046,7 @@ impl World {
             },
         );
         if self.registry.any_flags()
-            && self.registry.flags(component_id) & crate::component::FLAG_ON_ADD != 0
+            && self.registry.flags(component_id) & crate::component::ADDED_NOTIFY_MASK != 0
         {
             self.hook_queue.push(HookEvent::Added(entity, component_id));
             self.flush_hooks();
@@ -1068,7 +1098,7 @@ impl World {
             },
         );
         if self.registry.any_flags()
-            && self.registry.flags(component_id) & crate::component::FLAG_ON_ADD != 0
+            && self.registry.flags(component_id) & crate::component::ADDED_NOTIFY_MASK != 0
         {
             self.hook_queue.push(HookEvent::Added(entity, component_id));
             self.flush_hooks();
@@ -1107,7 +1137,7 @@ impl World {
         for &(cid, _, _) in parts {
             if !self.archetypes[target.0 as usize].has_component(cid) {
                 target = self.find_or_create_archetype_with(target, cid);
-                if any_flags && self.registry.flags(cid) & crate::component::FLAG_ON_ADD != 0 {
+                if any_flags && self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
                     added_hooked.push(cid);
                 }
             }
@@ -3750,6 +3780,83 @@ mod hooks_and_added_tests {
         let mut reader = world.event_reader::<crate::events::Removed<Hp>>();
         let got: Vec<Entity> = reader.read().iter().map(|r| r.entity).collect();
         assert_eq!(got, vec![a, b]);
+    }
+
+    // ── D2-4: required components ──────────────────────────────
+
+    #[test]
+    fn required_components_via_derive_attr() {
+        #[derive(apex_macros::Component, Default, Debug, PartialEq)]
+        struct LocalTf(u32);
+        #[derive(apex_macros::Component, Default, Debug, PartialEq)]
+        struct GlobalTf(u32);
+
+        #[derive(apex_macros::Component)]
+        #[require(LocalTf, GlobalTf)]
+        struct Renderer;
+
+        let mut world = World::new(); // derive-регистраторы через linkme
+        let e = world.spawn((Renderer,));
+        assert_eq!(
+            world.get::<LocalTf>(e),
+            Some(&LocalTf(0)),
+            "недостающий required дотянут дефолтом"
+        );
+        assert_eq!(world.get::<GlobalTf>(e), Some(&GlobalTf(0)));
+
+        // Явно заданное значение выигрывает у дефолта.
+        let e2 = world.spawn((Renderer, LocalTf(7)));
+        assert_eq!(world.get::<LocalTf>(e2), Some(&LocalTf(7)));
+        assert_eq!(world.get::<GlobalTf>(e2), Some(&GlobalTf(0)));
+
+        // insert-путь тоже дотягивает.
+        let e3 = world.spawn((Hp(1),));
+        world.insert(e3, Renderer);
+        assert_eq!(world.get::<GlobalTf>(e3), Some(&GlobalTf(0)));
+    }
+
+    #[test]
+    fn required_components_transitive_and_manual_api() {
+        // C требует B, B требует A — ручной API (для типов с ручным
+        // impl Component, как в движке).
+        #[derive(Default, Debug, PartialEq)]
+        struct A(u8);
+        impl Component for A {}
+        #[derive(Default, Debug, PartialEq)]
+        struct B(u8);
+        impl Component for B {}
+        struct C;
+        impl Component for C {}
+
+        let mut world = World::new();
+        world.require_component::<C, B>();
+        world.require_component::<B, A>();
+
+        let e = world.spawn((C,));
+        assert_eq!(world.get::<B>(e), Some(&B(0)), "прямое требование");
+        assert_eq!(world.get::<A>(e), Some(&A(0)), "транзитивное через очередь");
+    }
+
+    #[test]
+    fn required_components_user_on_add_sees_full_entity() {
+        struct C;
+        impl Component for C {}
+        #[derive(Default)]
+        struct R(#[allow(dead_code)] u8);
+        impl Component for R {}
+
+        let mut world = log_world();
+        world.require_component::<C, R>();
+        // on_add владельца вызывается ПОСЛЕ дотяжки requires.
+        world.on_add::<C>(|w, e| {
+            assert!(
+                w.has_component::<R>(e),
+                "требуемый компонент уже на месте при вызове on_add"
+            );
+            w.resource_mut::<HookLog>().added.push(e);
+        });
+        let e = world.spawn((C,));
+        assert_eq!(world.resource::<HookLog>().added, vec![e]);
     }
 
     // ── W3-5: память в archetype_stats ─────────────────────────

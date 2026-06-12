@@ -170,6 +170,34 @@ world.register_component_serde::<Position>();
 >
 > **Внешние типы (`cgmath::Matrix4<f32>`):** Для использования внешних типов как компонентов, включите feature-флаг `cgmath` в `apex-core` — он предоставляет `impl Component for cgmath::Matrix4<f32>`.
 
+### 2.2.1 Required components — `#[require(...)]` (D2-4, аналог Bevy 0.15+)
+
+Компонент может объявить, какие компоненты ему нужны рядом — спавн/insert
+сам дотягивает недостающие дефолтами:
+
+```rust
+#[derive(Component)]
+#[require(LocalTransform, GlobalTransform)]
+struct MeshRenderer { /* … */ }
+
+// Никакого GlobalTransform::IDENTITY-бойлерплейта:
+let e = world.spawn((MeshRenderer::new(mesh, mat),));
+assert!(world.has_component::<GlobalTransform>(e));
+
+// Для типов с ручным impl Component — ручной API (идемпотентная декларация):
+world.require_component::<Camera, LocalTransform>();
+```
+
+Семантика:
+- требуемый тип обязан реализовывать `Default`; **явно заданное значение
+  всегда выигрывает** у дефолта (`spawn((MeshRenderer…, LocalTransform::at(…)))`);
+- требования **транзитивны** (если требуемый компонент сам что-то требует);
+- дотяжка происходит через очередь хуков состава (W3-1) сразу по завершении
+  spawn/insert — к моменту пользовательского `on_add` и к возврату из `spawn`
+  состав уже полный;
+- движок объявляет requires для `MeshRenderer`/`Camera`/светов
+  (LocalTransform + GlobalTransform) в `RenderPlugin::build`.
+
 ### 2.3 World
 
 World — центральный контейнер, который хранит всё: entity, компоненты, ресурсы, события, relations.
@@ -999,6 +1027,8 @@ for r in reader.read().iter() {
 ```
 
 Для невключённых типов удаления не записываются — нулевая стоимость.
+Bevy-совместимое имя — алиас `RemovedComponents<'w, T>` (= `EventReader<Removed<T>>`),
+работает и параметром plain-fn системы (D2-3).
 
 **Хуки состава** — синхронные наблюдатели (`fn(&mut World, Entity)`, без захватов; один хук
 на компонент на вид события — для нескольких подписчиков используйте события):
@@ -3772,6 +3802,7 @@ fn main() {
 | `register_component::<T>()` | Зарегистрировать компонент |
 | `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
+| `require_component::<C, R>()` | Объявить: C требует R — спавн дотягивает `R::default()` (D2-4, §2.2.1; derive-атрибут `#[require(…)]`) |
 | `on_add::<T>(fn)` | Хук «компонент T появился у entity» (W3-1, §5.2.10); один хук на компонент, fn-pointer без захватов |
 | `on_remove::<T>(fn)` | Хук «entity потеряла T» (remove/despawn; значение уже уничтожено, при despawn entity мертва) |
 | `track_removals::<T>()` | Включить эмиссию событий `Removed<T>` при потере компонента (аналог Bevy `RemovedComponents`) |
