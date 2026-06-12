@@ -41,7 +41,7 @@
 //! );
 //! ```
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{Mat3, Mat4, Quat, Vec3};
 
 use crate::{component::Tick, entity::Entity, relations::ChildOf, world::World};
 
@@ -115,6 +115,13 @@ impl LocalTransform {
         }
     }
 
+    /// Трансформация из координат (самый частотный конструктор, 1:1 Bevy
+    /// `Transform::from_xyz`).
+    #[inline]
+    pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
+        Self::from_translation(Vec3::new(x, y, z))
+    }
+
     pub fn from_rotation(r: Quat) -> Self {
         Self {
             rotation: r,
@@ -129,11 +136,112 @@ impl LocalTransform {
         }
     }
 
+    // ── Builders (1:1 Bevy Transform) ────────────────────────────
+
+    /// Заменить translation (builder).
+    #[inline]
+    #[must_use]
+    pub fn with_translation(mut self, translation: Vec3) -> Self {
+        self.translation = translation;
+        self
+    }
+
+    /// Заменить rotation (builder).
+    #[inline]
+    #[must_use]
+    pub fn with_rotation(mut self, rotation: Quat) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// Заменить scale (builder).
+    #[inline]
+    #[must_use]
+    pub fn with_scale(mut self, scale: Vec3) -> Self {
+        self.scale = scale;
+        self
+    }
+
+    /// Повернуть так, чтобы локальный forward (−Z) смотрел на `target`,
+    /// а локальный +Y был выровнен к `up` без крена (1:1 Bevy
+    /// `Transform::looking_at`).
+    ///
+    /// ⚠ Это НЕ `Quat::from_rotation_arc` — тот оставляет произвольный roll
+    /// (горизонт заваливается).
+    #[inline]
+    #[must_use]
+    pub fn looking_at(self, target: Vec3, up: Vec3) -> Self {
+        self.looking_to(target - self.translation, up)
+    }
+
+    /// Повернуть так, чтобы локальный forward (−Z) смотрел вдоль `direction`
+    /// (1:1 Bevy `Transform::looking_to`). См. [`Self::looking_at`].
+    #[inline]
+    #[must_use]
+    pub fn looking_to(mut self, direction: Vec3, up: Vec3) -> Self {
+        self.rotation = look_to_rotation(direction, up);
+        self
+    }
+
+    // ── Направления (мировые оси локального базиса) ──────────────
+
+    /// Локальный forward: −Z в мировых координатах.
+    #[inline]
+    pub fn forward(&self) -> Vec3 {
+        self.rotation * Vec3::NEG_Z
+    }
+
+    /// Локальный back: +Z в мировых координатах.
+    #[inline]
+    pub fn back(&self) -> Vec3 {
+        self.rotation * Vec3::Z
+    }
+
+    /// Локальный right: +X в мировых координатах.
+    #[inline]
+    pub fn right(&self) -> Vec3 {
+        self.rotation * Vec3::X
+    }
+
+    /// Локальный left: −X в мировых координатах.
+    #[inline]
+    pub fn left(&self) -> Vec3 {
+        self.rotation * Vec3::NEG_X
+    }
+
+    /// Локальный up: +Y в мировых координатах.
+    #[inline]
+    pub fn up(&self) -> Vec3 {
+        self.rotation * Vec3::Y
+    }
+
+    /// Локальный down: −Y в мировых координатах.
+    #[inline]
+    pub fn down(&self) -> Vec3 {
+        self.rotation * Vec3::NEG_Y
+    }
+
     /// Преобразовать в аффинную матрицу 4x4.
     #[inline]
     pub fn to_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
+}
+
+/// Кватернион «смотреть вдоль `direction` с `up` без крена» — канонический
+/// look-rotation (1:1 Bevy `Transform::looking_to`): back = −direction,
+/// right = up × back, up' = back × right. Вырожденные входы (нулевой/NaN
+/// direction, up ∥ direction) безопасно фоллбэчатся как у Bevy
+/// (`any_orthonormal_vector`).
+fn look_to_rotation(direction: Vec3, up: Vec3) -> Quat {
+    let back = -direction.try_normalize().unwrap_or(Vec3::NEG_Z);
+    let up = up.try_normalize().unwrap_or(Vec3::Y);
+    let right = up
+        .cross(back)
+        .try_normalize()
+        .unwrap_or_else(|| up.any_orthonormal_vector());
+    let up = back.cross(right);
+    Quat::from_mat3(&Mat3::from_cols(right, up, back))
 }
 
 impl Default for LocalTransform {
@@ -168,9 +276,35 @@ pub struct GlobalTransform(pub Mat4);
 impl GlobalTransform {
     pub const IDENTITY: Self = Self(Mat4::IDENTITY);
 
+    /// Мировая трансформация из координат (для спавна корневых entity,
+    /// которым матрица нужна немедленно — до первого propagate).
+    #[inline]
+    pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
+        Self(Mat4::from_translation(Vec3::new(x, y, z)))
+    }
+
+    /// Мировая трансформация «из `eye`, смотреть на `target`» (тот же
+    /// look-rotation без крена, что [`LocalTransform::looking_at`]).
+    /// Типичный кейс — спавн света/камеры матрицей.
+    #[inline]
+    pub fn looking_at(eye: Vec3, target: Vec3, up: Vec3) -> Self {
+        Self(Mat4::from_rotation_translation(
+            look_to_rotation(target - eye, up),
+            eye,
+        ))
+    }
+
     #[inline]
     pub fn to_matrix(&self) -> &Mat4 {
         &self.0
+    }
+}
+
+impl From<&LocalTransform> for GlobalTransform {
+    /// Мировая матрица корневой entity == её локальная TRS (без родителя).
+    #[inline]
+    fn from(local: &LocalTransform) -> Self {
+        Self(local.to_matrix())
     }
 }
 
@@ -530,6 +664,61 @@ mod tests {
         assert_eq!(lt.translation, Vec3::ZERO);
         assert_eq!(lt.rotation, Quat::IDENTITY);
         assert_eq!(lt.scale, Vec3::ONE);
+    }
+
+    #[test]
+    fn looking_at_points_forward_at_target_without_roll() {
+        let eye = Vec3::new(3.0, 4.0, 5.0);
+        let target = Vec3::new(0.0, 1.0, 0.0);
+        let t = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
+
+        // forward (−Z) смотрит точно на target
+        let expected = (target - eye).normalize();
+        assert!((t.forward() - expected).length() < 1e-6);
+        // без крена: right горизонтален (⊥ мировому Y)
+        assert!(t.right().dot(Vec3::Y).abs() < 1e-6);
+        // ортонормальность базиса
+        assert!((t.up().dot(t.forward())).abs() < 1e-6);
+        assert!((t.rotation.length() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn looking_at_degenerate_inputs_do_not_produce_nan() {
+        // direction == 0 (target == eye) и up ∥ direction — не должны дать NaN.
+        let t = LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::new(1.0, 2.0, 3.0), Vec3::Y);
+        assert!(t.rotation.is_finite());
+        let t = LocalTransform::IDENTITY.looking_to(Vec3::Y, Vec3::Y);
+        assert!(t.rotation.is_finite());
+        assert!((t.forward() - Vec3::Y).length() < 1e-6);
+    }
+
+    #[test]
+    fn global_transform_constructors_match_local() {
+        let eye = Vec3::new(0.0, 10.0, 5.0);
+        let target = Vec3::ZERO;
+        let local = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
+        let global = GlobalTransform::looking_at(eye, target, Vec3::Y);
+        let from_local: GlobalTransform = (&local).into();
+        // Матрицы совпадают (scale=1 у обоих путей).
+        let (sa, ra, ta) = global.0.to_scale_rotation_translation();
+        let (sb, rb, tb) = from_local.0.to_scale_rotation_translation();
+        assert!((sa - sb).length() < 1e-6);
+        assert!((ta - tb).length() < 1e-6);
+        assert!(ra.dot(rb).abs() > 1.0 - 1e-6);
+        assert_eq!(
+            GlobalTransform::from_xyz(1.0, 2.0, 3.0).0,
+            Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0))
+        );
+    }
+
+    #[test]
+    fn direction_accessors_match_rotation() {
+        let t = LocalTransform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        // Поворот на +90° вокруг Y: forward (−Z) → −X.
+        assert!((t.forward() - Vec3::NEG_X).length() < 1e-6);
+        assert!((t.back() + t.forward()).length() < 1e-6);
+        assert!((t.left() + t.right()).length() < 1e-6);
+        assert!((t.down() + t.up()).length() < 1e-6);
     }
 
     #[test]

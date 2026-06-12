@@ -5499,6 +5499,69 @@ mod tests {
         assert_eq!(log.exited_menu, 1);
     }
 
+    // ── Э5: Single<Q> / Option<Single<Q>> — skip-семантика ────
+
+    #[test]
+    fn single_param_skips_unless_exactly_one_match() {
+        use apex_core::prelude::*;
+
+        #[derive(Clone, Copy, Debug, apex_macros::Component)]
+        struct Player(f32);
+        #[derive(Clone, Copy, Debug, Default)]
+        struct Runs {
+            single: u32,
+            optional_some: u32,
+            optional_none: u32,
+        }
+
+        fn with_single(p: Single<&Player>, mut runs: ResMut<Runs>) {
+            assert!(p.0 >= 0.0);
+            runs.single += 1;
+        }
+        fn with_optional(p: Option<Single<&Player>>, mut runs: ResMut<Runs>) {
+            match p {
+                Some(s) => {
+                    let _e = s.entity();
+                    runs.optional_some += 1;
+                }
+                None => runs.optional_none += 1,
+            }
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Runs::default());
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, (with_single, with_optional));
+
+        // 0 матчей: Single пропускается, Option<Single> получает None.
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Runs>().single, 0);
+        assert_eq!(world.resource::<Runs>().optional_none, 1);
+
+        // 1 матч: обе работают.
+        let p1 = world.spawn((Player(1.0),));
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Runs>().single, 1);
+        assert_eq!(world.resource::<Runs>().optional_some, 1);
+
+        // 2 матча: обе пропускаются.
+        world.spawn((Player(2.0),));
+        sched.run(&mut world);
+        let runs = *world.resource::<Runs>();
+        assert_eq!(runs.single, 1, "Single при >1 матче пропускает кадр");
+        assert_eq!(runs.optional_some, 1, "Option<Single> при >1 тоже пропускает");
+        assert_eq!(runs.optional_none, 1);
+
+        // Снова 1 матч — работа возобновляется (мутабельная форма + фильтр).
+        world.despawn(p1);
+        fn bump(mut p: Single<&mut Player, With<Player>>) {
+            p.0 += 1.0;
+        }
+        sched.add_systems(StageLabel::Update, bump);
+        sched.run(&mut world);
+        assert_eq!(world.resource::<Runs>().single, 2);
+    }
+
     // ── W3-4: стресс ASD row-split ────────────────────────────
 
     /// Stateless-система на большом мире ЧАНКУЕТСЯ (ASD row-split):

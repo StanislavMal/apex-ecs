@@ -418,6 +418,13 @@ pub trait SystemParam {
     fn has_deferred() -> bool {
         false
     }
+
+    /// Валидация перед запуском системы (Э5): `false` ⇒ система ПРОПУСКАЕТСЯ
+    /// в этом кадре (skip-семантика `Single<Q>`; Bevy `validate_param`).
+    /// Вызывается планировщиком непосредственно перед [`fetch`](Self::fetch).
+    fn validate(_ctx: &crate::world::SystemContext<'_>) -> bool {
+        true
+    }
 }
 
 // ── impl SystemParam для маркеров ресурсов ────────────────────
@@ -556,6 +563,68 @@ where
     }
 }
 
+/// `Single<Q, F>` — ровно один матч; система пропускается при 0 или >1 (Э5).
+impl<'a, Q, F> SystemParam for crate::query::Single<'a, Q, F>
+where
+    Q: WorldQuery + WorldQuerySystemAccess,
+    F: WorldQuery + WorldQuerySystemAccess,
+{
+    type Item<'w> = crate::query::Single<'w, Q, F>;
+    fn access() -> AccessDescriptor {
+        Q::system_access().merge(&F::system_access())
+    }
+    fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
+        let q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        q.iter().take(2).count() == 1
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
+        let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);
+        match q.single_inner() {
+            Ok((entity, item)) => crate::query::Single {
+                entity,
+                item,
+                _filter: std::marker::PhantomData,
+            },
+            // Недостижимо после validate (планировщик зовёт validate→fetch
+            // атомарно в рамках слота системы); паника — для ручных вызовов
+            // fetch без validate.
+            Err(e) => panic!(
+                "Single<…>: запрос дал не ровно один матч ({e:?});                  системы с Single пропускаются планировщиком"
+            ),
+        }
+    }
+}
+
+/// `Option<Single<Q, F>>` — `None` при нуле матчей; пропуск только при >1 (Э5).
+impl<'a, Q, F> SystemParam for Option<crate::query::Single<'a, Q, F>>
+where
+    Q: WorldQuery + WorldQuerySystemAccess,
+    F: WorldQuery + WorldQuerySystemAccess,
+{
+    type Item<'w> = Option<crate::query::Single<'w, Q, F>>;
+    fn access() -> AccessDescriptor {
+        Q::system_access().merge(&F::system_access())
+    }
+    fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
+        let q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        q.iter().take(2).count() <= 1
+    }
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
+        let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);
+        match q.single_inner() {
+            Ok((entity, item)) => Some(crate::query::Single {
+                entity,
+                item,
+                _filter: std::marker::PhantomData,
+            }),
+            Err(crate::query::QuerySingleError::NoEntities) => None,
+            Err(e) => panic!(
+                "Option<Single<…>>: больше одного матча ({e:?});                  системы пропускаются планировщиком"
+            ),
+        }
+    }
+}
+
 impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::CachedQuery<'a, Q> {
     type Item<'w> = crate::world::CachedQuery<'w, Q>;
     fn access() -> AccessDescriptor {
@@ -626,6 +695,9 @@ macro_rules! impl_system_param_tuple {
             }
             fn has_deferred() -> bool {
                 false $( || $P::has_deferred() )+
+            }
+            fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
+                true $( && $P::validate(ctx) )+
             }
         }
     };

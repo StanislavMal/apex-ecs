@@ -180,6 +180,11 @@ impl SystemConfig {
         let mut f = f;
         let func: Box<dyn FnMut(SystemContext<'_>) + Send + Sync> =
             Box::new(move |ctx: SystemContext<'_>| {
+                // Э5: skip-семантика параметров (Single<Q> и т.п.) — Bevy
+                // validate_param: невалидный параметр тихо пропускает кадр.
+                if !<F::Param as apex_core::SystemParam>::validate(&ctx) {
+                    return;
+                }
                 let item = <F::Param as apex_core::SystemParam>::fetch(&ctx);
                 f.run(item);
             });

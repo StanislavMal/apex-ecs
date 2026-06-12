@@ -341,6 +341,13 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 | `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — condition'ы, а не отдельные schedule (D2-6) |
 | `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` (D2-5) |
 | `RemovedComponents<T>` | то же | трекинг **opt-in**: `world.track_removals::<T>()` — нулевая стоимость по умолчанию |
+| `Single<Q>` / `Option<Single<Q>>` | то же | skip-семантика (система пропускается при ≠1 матче), как Bevy `validate_param` (Э5) |
+| `Transform::from_xyz(…).looking_at(…)` | `LocalTransform::…` — то же | builders `from_xyz`/`looking_at`/`looking_to`/`with_*` + направления `forward()/right()/up()` (Э1) |
+| `commands.insert_resource(r)` | то же | отложенная вставка ресурса в sync-точке |
+| `Srgba::hex("28221B")` | `Color::hex("28221B")` | 3/4/6/8-значные формы, с `#` и без (Э4) |
+| `color.with_alpha(a)` / `.alpha()` | то же | работает для всех вариантов `Color` (Э4) |
+| `..default()` | то же | шорткат в prelude (Э6) |
+| `keys.any_pressed([..])` | то же | + `any_just_pressed` (Э6) |
 
 #### Что называется иначе (и почему)
 
@@ -351,6 +358,11 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 | `Msaa` на камере-компоненте | `Camera.msaa` | поле камеры, не отдельный компонент |
 | `Handle<T>` (Arc-клоны) | `Handle<T>` — **Copy** | дешевле и эргономичнее; авто-unload через `remove_unused` |
 | стадии `PreUpdate`/`Update`/`PostUpdate`/… | те же имена | у нас это `StageLabel`-стадии планировщика, а не вложенные schedule |
+| `mut commands: Commands` | `cmd: &mut Commands` | параметр берётся по `&mut` (bump-arena живёт в контексте системы) |
+| `ButtonInput<KeyCode>` | `Input<KeyCode>` | имя до Bevy 0.13; алиасов не заводим — одна сущность, одно имя |
+| `KeyCode::Digit1` / `KeyA` | `KeyCode::Key1` / `A` | короткие имена; compile-ошибка мигранта очевидна |
+| `time.elapsed_secs()` | `time.seconds_since_startup` | поле, не метод |
+| `Mesh3d(h)` + `MeshMaterial3d(h)` | `MeshRenderer { mesh, material }` | один компонент вместо двух обёрток — осознанное решение (см. ниже) |
 
 #### `Local<T>` — НЕ переносим (намеренно)
 
@@ -1233,7 +1245,10 @@ use apex_scheduler::{Scheduler, StageLabel};
 
 // Plain-fn система — Bevy-стиль 1:1, БЕЗ макроса. Параметры:
 // Res<T> / ResMut<T> / Query<Q> / CachedQuery<Q> / EventReader<E> /
-// EventWriter<E> / &mut Commands. Access выведен, имя — из имени функции.
+// EventWriter<E> / &mut Commands / Single<Q> / Option<Single<Q>>.
+// Access выведен, имя — из имени функции. Single — ровно один матч:
+// система ПРОПУСКАЕТСЯ в кадрах с 0 или >1 матчами (Э5, Bevy 1:1);
+// Option<Single> — None при нуле, пропуск только при >1.
 fn movement(dt: Res<DeltaTime>, q: Query<(&Velocity, &mut Position)>) {
     q.for_each(|_, (vel, mut pos)| pos.x += vel.x * dt.step);
 }

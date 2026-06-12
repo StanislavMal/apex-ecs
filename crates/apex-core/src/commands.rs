@@ -302,6 +302,12 @@ impl Commands {
     }
 
     /// Произвольная команда
+    /// Отложенно вставить ресурс (1:1 Bevy `Commands::insert_resource`).
+    /// Применяется в sync-точке вместе с остальными командами.
+    pub fn insert_resource<T: Send + Sync + 'static>(&mut self, resource: T) {
+        self.add(move |world: &mut World| world.insert_resource(resource));
+    }
+
     pub fn add<F: FnOnce(&mut World) + Send + 'static>(&mut self, f: F) {
         self.queue.push(Command::Apply(Box::new(f)));
     }

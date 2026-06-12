@@ -1363,6 +1363,34 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         self.single()
     }
 
+    /// Потребляющая форма [`single`](Self::single): item живёт `'w` (мировой
+    /// заём), а не заём `&self` — нужна `Single<Q>`-параметру систем (Э5),
+    /// который кладёт извлечённый item в поле и переживает локальный Query.
+    pub fn single_inner(self) -> Result<(Entity, Q::Item<'w>), QuerySingleError> {
+        let mut found: Option<(Entity, Q::Item<'w>)> = None;
+        for a in &self.archetypes {
+            let (row_start, row_end) = self.row_range(a.arch_idx);
+            let end = row_end.min(a.len);
+            if end <= row_start {
+                continue;
+            }
+            let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
+            for (offset, &entity) in entities.iter().enumerate() {
+                let row = row_start + offset;
+                // SAFETY: state хранит указатели колонок, действительные весь
+                // мировой заём 'w; self потребляется — повторного доступа через
+                // этот Query не будет (та же дисциплина алиасинга, что у iter()).
+                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+                    if found.is_some() {
+                        return Err(QuerySingleError::MultipleEntities);
+                    }
+                    found = Some((entity, item));
+                }
+            }
+        }
+        found.ok_or(QuerySingleError::NoEntities)
+    }
+
     #[inline]
     pub fn for_each<Func: FnMut(Entity, Q::Item<'_>)>(&self, mut f: Func) {
         for a in &self.archetypes {
@@ -1580,6 +1608,48 @@ impl<'q, Q: WorldQuery, F: WorldQuery> QueryIter<'q, Q, F> {
             .unwrap_or((0, usize::MAX))
     }
 }
+
+/// Ровно один матч запроса (Э5, 1:1 Bevy `Single`): параметр plain-fn системы;
+/// система ПРОПУСКАЕТСЯ планировщиком в кадрах, где матчей 0 или >1
+/// (skip-семантика, не паника). `Option<Single<Q, F>>` — `None` при нуле
+/// матчей, пропуск только при >1.
+///
+/// ```ignore
+/// fn update(camera: Single<(&mut DistanceFog, &mut LocalTransform), With<Camera>>) {
+///     let (mut fog, mut tf) = camera.into_inner();
+/// }
+/// ```
+pub struct Single<'w, Q: WorldQuery, F: WorldQuery = ()> {
+    pub(crate) entity: Entity,
+    pub(crate) item: Q::Item<'w>,
+    pub(crate) _filter: std::marker::PhantomData<F>,
+}
+
+impl<'w, Q: WorldQuery, F: WorldQuery> Single<'w, Q, F> {
+    /// Entity единственного матча.
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    /// Забрать item (для деструктуризации кортежа: `let (a, b) = s.into_inner()`).
+    pub fn into_inner(self) -> Q::Item<'w> {
+        self.item
+    }
+}
+
+impl<'w, Q: WorldQuery, F: WorldQuery> std::ops::Deref for Single<'w, Q, F> {
+    type Target = Q::Item<'w>;
+    fn deref(&self) -> &Self::Target {
+        &self.item
+    }
+}
+
+impl<'w, Q: WorldQuery, F: WorldQuery> std::ops::DerefMut for Single<'w, Q, F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.item
+    }
+}
+
 
 /// Ошибка [`Query::single`] (D2-2, Bevy-паритет).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

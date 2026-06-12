@@ -71,7 +71,15 @@ pub use world::{
     ArchetypeStats, Bundle, CachedQuery, ParallelWorld, QueryState, SystemContext, World,
 };
 
+/// Шорткат `Default::default()` для struct-update-литералов (Bevy-идиома):
+/// `PbrMaterial { roughness: 0.5, ..default() }` вместо `..Default::default()`.
+#[inline]
+pub fn default<T: Default>() -> T {
+    T::default()
+}
+
 pub mod prelude {
+    pub use crate::default;
     pub use crate::access::AccessDescriptor;
     pub use crate::commands::Commands;
     pub use crate::component::{Component as ComponentTrait, Serializable, Tick};
@@ -83,7 +91,7 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder,
+        Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Single,
         QuerySingleError, Read, Ref, With, Without, WorldQuery, Write,
     };
     pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
