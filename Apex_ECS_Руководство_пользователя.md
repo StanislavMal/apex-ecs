@@ -8,6 +8,7 @@
 
 1. [Введение](#1-введение)
 2. [Основные концепции](#2-основные-концепции)
+   - [2.4 Миграция с Bevy — таблица соответствий](#24-миграция-с-bevy--таблица-соответствий-d2-8)
 3. [Архетипы и хранилище](#3-архетипы-и-хранилище)
 4. [Query API](#4-query-api)
 5. [Ресурсы и события](#5-ресурсы-и-события)
@@ -316,6 +317,73 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
     hp.current -= 10.0;
 }
 ```
+
+### 2.4 Миграция с Bevy — таблица соответствий (D2-8)
+
+Цель D-волны: типичная Bevy-система компилируется после **механической замены имён**.
+Идиомы Bevy работают 1:1, наши преимущества — сверху. В движке начинайте с
+`use apex_engine::prelude::*;` (umbrella-крейт) — он покрывает всё из таблицы.
+
+#### Что переносится 1:1 (только импорты)
+
+| Bevy | Apex | Примечание |
+|---|---|---|
+| `fn sys(time: Res<Time>, q: Query<(&A, &mut B)>)` | то же | plain-fn системы (D2-1); `ResMut<T>`, `&mut Commands`, `EventReader<E>`/`EventWriter<E>` — те же параметры |
+| `Query<(&A, &mut B), (With<C>, Changed<A>)>` | то же | двухпараметрическая форма (D2-2); `Added`/`Changed`/`With`/`Without`/`Or<>` — те же фильтры |
+| `for (a, mut b) in &mut q { … }` | то же | итерация выдаёт item без навязанной entity (П1); `Query<(Entity, &A)>` — entity явной формой |
+| `q.single()` / `q.single_mut()` | то же | `Result<_, QuerySingleError>` (Bevy 0.15+) |
+| `q.get(entity)` / `q.get_mut(entity)` | то же | random-access O(1), фильтры применяются (П3) |
+| `app.add_systems(Update, (a, b))` | то же | bare-метки стадий в prelude; `movement.run_if(in_state(...))` работает на bare-fn (П4) |
+| `#[derive(Component)]` `#[require(A, B)]` | то же | required components (D2-4); плюс у нас derive **авто-регистрирует** компонент (linkme) — `register_component` не нужен |
+| `App::new().add_plugins((DefaultPlugins, MyPlugin))` | то же | группы плагинов и кортежи, включая вложенные (D2-7) |
+| `commands.spawn(bundle)` / `despawn` / `insert` | то же | `Commands` — bump-arena (без per-command Box) |
+| `EventReader::read()`, `EventWriter::send()` | то же | регистрация типов событий не нужна (авто) |
+| `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — condition'ы, а не отдельные schedule (D2-6) |
+| `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` (D2-5) |
+| `RemovedComponents<T>` | то же | трекинг **opt-in**: `world.track_removals::<T>()` — нулевая стоимость по умолчанию |
+
+#### Что называется иначе (и почему)
+
+| Bevy | Apex | Почему |
+|---|---|---|
+| `Transform` | `LocalTransform` | имя честно говорит о паре local/global; `GlobalTransform` — как в Bevy |
+| `time.delta_secs()` | `time.delta_seconds` | поле, не метод |
+| `Msaa` на камере-компоненте | `Camera.msaa` | поле камеры, не отдельный компонент |
+| `Handle<T>` (Arc-клоны) | `Handle<T>` — **Copy** | дешевле и эргономичнее; авто-unload через `remove_unused` |
+| стадии `PreUpdate`/`Update`/`PostUpdate`/… | те же имена | у нас это `StageLabel`-стадии планировщика, а не вложенные schedule |
+
+#### `Local<T>` — НЕ переносим (намеренно)
+
+Вместо Bevy `Local<T>` используйте **state-системы** `system!` — состояние объявляется
+структурой с полями (без обязательного `Default`), доступно как `s: &mut Self`:
+
+```rust
+system! {
+    struct WaveSpawner { cfg: SpawnConfig, timer: f32 = 0.0 }
+    fn run(s: &mut Self, time: Res<Time>, cmd: Cmd) {
+        s.timer += time.delta_seconds;
+        // …
+    }
+}
+app.add_system(Update, WaveSpawner::new(cfg)); // state без Default
+```
+
+Это строго мощнее `Local<T>`: именованные поля вместо кортежа локалов, конструктор
+с параметрами, состояние видно в сигнатуре регистрации. Plain-fn системы остаются
+stateless — это осознанная граница двух диалектов.
+
+#### Чего в Bevy нет (наши козыри)
+
+- **Relations a-la Flecs** (§8): `ChildOf`/wildcard-запросы/cascade delete — иерархии
+  без Parent/Children-компонентов и их рассинхрона.
+- **state-системы `system!`** — см. выше.
+- **`IsolatedWorld` + `WorldBridge`** (§12): настоящий 2-поточный main↔render
+  параллелизм (Bevy делит один поток).
+- **Авто-регистрация** компонентов (derive+linkme) и событий — нет `app.add_event::<E>()`.
+- **Детерминированный compile-time access-вывод**: расписание строится из деклараций,
+  а не рантайм-наблюдения — важно для replay/netcode; конфликты диагностируются
+  именованно (`ConflictKind`).
+- **`EntityTemplate`/prefabs, snapshot/restore, hot-reload** (§9–11).
 
 ---
 
