@@ -89,8 +89,8 @@ fn exclusive_system_full_world_access() {
     world.spawn((Counter(7),));
 
     let mut sched = Scheduler::new();
-    // Регистрация через builder-метод (для .id()/условий).
-    sched.add_exclusive_system(exclusive_spawn);
+    // Bare-идентификатор эксклюзивной system! в едином входе add_systems.
+    sched.add_systems(StageLabel::Update, exclusive_spawn);
     sched.compile_with_world(&world).unwrap();
     sched.run_sequential(&mut world);
 

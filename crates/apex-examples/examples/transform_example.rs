@@ -41,10 +41,9 @@ fn main() {
 
     // ── 2. Создаём Scheduler с propagate_transforms в PostUpdate ─
     let mut sched = Scheduler::new();
-    sched.add_system_to_stage(
-        "propagate_transforms",
-        transform::propagate_transforms,
+    sched.add_systems(
         StageLabel::PostUpdate,
+        apex_scheduler::seq("propagate_transforms", transform::propagate_transforms),
     );
     sched.compile().unwrap();
 

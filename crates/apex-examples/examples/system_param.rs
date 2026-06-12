@@ -13,7 +13,7 @@
 use apex_core::prelude::*;
 use apex_core::SubWorld;
 use apex_macros::Component;
-use apex_scheduler::Scheduler;
+use apex_scheduler::{seq, Scheduler, StageLabel};
 
 // ── Компоненты ────────────────────────────────────────────────
 
@@ -333,7 +333,7 @@ fn test_inside_exclusive_system() {
 
     let mut sched = Scheduler::new();
 
-    sched.add_system("system_param_test", |world: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("system_param_test", |world: &mut World| {
         with_ctx(world, |ctx| {
             type Params = (
                 ResRead<PhysicsConfig>,
@@ -350,7 +350,7 @@ fn test_inside_exclusive_system() {
             assert_eq!(found, 2, "должно быть 2 entity с Position+Velocity");
             println!("  [scheduler] cfg.gravity={}, found {} entities", cfg.gravity, found);
         });
-    });
+    }));
 
     sched.compile_with_world(&world).unwrap();
     sched.run_sequential(&mut world);

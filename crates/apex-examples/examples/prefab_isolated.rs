@@ -274,7 +274,9 @@ fn main() {
     let iso_bridge = CloneableBridge::new(sub_to_main, sub_recv);
 
     // Добавляем AI-систему в IsolatedWorld
-    iso.scheduler_mut().add_par_access(
+    iso.scheduler_mut().add_systems(
+        apex_scheduler::StageLabel::Update,
+        apex_scheduler::par_access(
         "ai_damage",
         access_desc!(write<Health>),
         move |ctx| {
@@ -292,7 +294,7 @@ fn main() {
             // В отличие от send_event, не требует сериализации и регистрации
             iso_bridge.send_action_event("AI: enemy took damage!".to_string());
         },
-    );
+    ));
 
     // Выполняем один тик IsolatedWorld
     iso.tick();

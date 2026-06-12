@@ -1612,21 +1612,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn event_auto_register_via_try_send() {
-        use crate::world::World;
-
-        let mut world = World::new();
-        assert!(
-            world.try_send_event(42u32),
-            "try_send_event должен вернуть true"
-        );
-        world.tick();
-        world.flush_all_events();
-        let queue = world.events::<u32>();
-        assert_eq!(queue.len_readable(), 1);
-    }
-
     /// C7: `advance_frame()` самодостаточен — флашит события (становятся читаемы
     /// на следующем кадре) И продвигает change-tick. Без ручной пары tick+flush.
     #[test]

@@ -1,9 +1,9 @@
 //! Микро-профиль регресса simple_iter: конструктор vs итерация.
 //!
 //! Мир 1:1 с criterion-бенчем simple_iter (10k × 4 компонента), меряем раздельно:
-//!   1. только конструктор CachedQuery (query_typed без итерации);
+//!   1. только конструктор CachedQuery (query без итерации);
 //!   2. только конструктор Query::new;
-//!   3. полный query_typed().for_each (как в бенче);
+//!   3. полный query().for_each (как в бенче);
 //!   4. полный Query::new().for_each.
 //!
 //! Запуск: `cargo run --release -p apex-bench --bin iter_profile`
@@ -38,7 +38,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                let q = world.query_typed::<(Read<Velocity>, Write<Position>)>();
+                let q = world.query::<(Read<Velocity>, Write<Position>)>();
                 black_box(&q);
             }
             t.elapsed().as_secs_f64() * 1e6 / N as f64
@@ -65,7 +65,7 @@ fn main() {
             let t = Instant::now();
             for _ in 0..N {
                 world
-                    .query_typed::<(Read<Velocity>, Write<Position>)>()
+                    .query::<(Read<Velocity>, Write<Position>)>()
                     .for_each(|_, (vel, mut pos)| {
                         pos.0 += vel.0;
                     });
@@ -143,7 +143,7 @@ fn main() {
             let t = Instant::now();
             for _ in 0..N {
                 world
-                    .query_typed::<(Read<Velocity>, Write<Position>)>()
+                    .query::<(Read<Velocity>, Write<Position>)>()
                     .for_each_chunk(|_, (vel, pos)| {
                         for i in 0..pos.len() {
                             pos[i].0 += vel[i].0;

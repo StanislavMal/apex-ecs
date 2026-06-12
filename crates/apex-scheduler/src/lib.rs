@@ -822,10 +822,16 @@ impl Scheduler {
     }
 
     // ── Регистрация ────────────────────────────────────────────
+    //
+    // ЕДИНСТВЕННЫЙ публичный вход — `add_systems(label, …)` (+ конструкторы
+    // `sys`/`seq`/`par`/`par_access` и bare-идентификаторы). Методы ниже —
+    // внутренние строительные блоки и опора внутренних тестов; публичный
+    // зоопарк из 15 add_*-вариантов удалён ревизией API 2026-06-12.
 
     /// Регистрировать Sequential систему (полный &mut World).
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_system<F>(&mut self, name: impl Into<String>, func: F    ) -> SystemBuilder
+    #[cfg(test)]
+    fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -833,7 +839,7 @@ impl Scheduler {
     }
 
     /// Регистрировать Sequential систему в указанном этапе.
-    pub fn add_system_to_stage<F>(
+    pub(crate) fn add_system_to_stage<F>(
         &mut self,
         name: impl Into<String>,
         func: F,
@@ -869,7 +875,8 @@ impl Scheduler {
     }
 
     /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
-    pub fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
+    #[cfg(test)]
+    fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -883,41 +890,10 @@ impl Scheduler {
         self.add_system_to_stage(name_str, func, StageLabel::Startup)
     }
 
-    /// Регистрировать эксклюзивную систему (`system!` с `world: &mut World`).
-    ///
-    /// Имя выводится из самой системы. Этап — `default_stage_label`.
-    /// Возвращает `SystemBuilder` (для `.id()`/`.run_if()`/зависимостей).
-    pub fn add_exclusive_system<S>(&mut self, system: S) -> SystemBuilder
-    where
-        S: apex_core::system_param::ExclusiveSystem,
-    {
-        self.add_exclusive_system_to_stage(system, self.default_stage_label.clone())
-    }
-
-    /// Регистрировать эксклюзивную систему в указанном этапе.
-    pub fn add_exclusive_system_to_stage<S>(
-        &mut self,
-        mut system: S,
-        stage_label: StageLabel,
-    ) -> SystemBuilder
-    where
-        S: apex_core::system_param::ExclusiveSystem,
-    {
-        let name = system.name().to_string();
-        self.add_system_to_stage(name, move |w: &mut World| system.run(w), stage_label)
-    }
-
-    /// Регистрировать эксклюзивную систему в Startup-этапе (один раз).
-    pub fn add_exclusive_startup_system<S>(&mut self, system: S) -> SystemBuilder
-    where
-        S: apex_core::system_param::ExclusiveSystem,
-    {
-        self.add_exclusive_system_to_stage(system, StageLabel::Startup)
-    }
-
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
-    pub fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    #[cfg(test)]
+    fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
     where
         S: AutoSystem + 'static,
     {
@@ -925,7 +901,8 @@ impl Scheduler {
     }
 
     /// Регистрировать AutoSystem в указанном этапе.
-    pub fn add_auto_system_to_stage<S>(
+    #[cfg(test)]
+    fn add_auto_system_to_stage<S>(
         &mut self,
         name: impl Into<String>,
         system: S,
@@ -976,7 +953,8 @@ impl Scheduler {
     }
 
     /// Регистрировать AutoSystem в Startup этапе.
-    pub fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    #[cfg(test)]
+    fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
     where
         S: AutoSystem + 'static,
     {
@@ -1050,83 +1028,6 @@ impl Scheduler {
         self.add_par_system_to_stage(name, system, StageLabel::Startup)
     }
 
-    /// Регистрировать параллельную систему-замыкание без доступа к компонентам.
-    ///
-    /// **Продвинутый низкоуровневый API.** Приоритетный путь — типизированные
-    /// системы через `system!` + [`add_systems`](Self::add_systems); `add_par`/
-    /// [`add_par_access`](Self::add_par_access) нужны для сырых замыканий с
-    /// динамическим доступом и удобны внутри [`staged`](Self::staged).
-    ///
-    /// Для систем, которым не нужен доступ к компонентам/ресурсам/событиям
-    /// (логирование, отладка, пустые хуки).
-    ///
-    /// Этап — `default_stage_label` (по умолчанию `Update`).
-    ///
-    /// Если системе нужен доступ — используй `add_par_access`.
-    pub fn add_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
-    where
-        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-    {
-        self.add_par_to_stage(name, func, self.default_stage_label.clone())
-    }
-
-    /// Регистрировать параллельную систему-замыкание в указанном этапе.
-    /// Без доступа к компонентам.
-    pub fn add_par_to_stage<F>(
-        &mut self,
-        name: impl Into<String>,
-        func: F,
-        stage_label: StageLabel,
-    ) -> SystemBuilder
-    where
-        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-    {
-        let id = SystemId(self.next_id);
-        self.next_id += 1;
-        self.last_added_system_id = Some(id);
-        let mut access = AccessDescriptor::new();
-        // W3-4: замыкание с захватами = состояние → без ASD row-split.
-        if std::mem::size_of::<F>() > 0 {
-            access.stateful = true;
-        }
-        let system = FnParSystem {
-            func: Box::new(func),
-            access: access.clone(),
-        };
-        let index = self.systems.len();
-        self.systems.push(SystemDescriptor {
-            id,
-            name: name.into(),
-            kind: SystemKind::Parallel {
-                system: Box::new(system),
-                access,
-            },
-            after: Vec::new(),
-            before: Vec::new(),
-            stage_label,
-            run_condition: ConditionTree::default(),
-            apply_deferred_after: false,
-            has_deferred: false,
-            condition_access: AccessDescriptor::new(),
-        });
-        self.system_indices.insert(id, index);
-        self.par_system_indices.push(index);
-        self.invalidate_plan();
-        self.merge_scope_condition(id);
-        SystemBuilder {
-            scheduler: self as *mut Scheduler,
-            id,
-        }
-    }
-
-    /// Регистрировать параллельную систему-замыкание в Startup этапе.
-    /// Без доступа к компонентам.
-    pub fn add_startup_par<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
-    where
-        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-    {
-        self.add_par_to_stage(name, func, StageLabel::Startup)
-    }
 
     /// Регистрировать параллельную систему-замыкание с явным доступом.
     ///
@@ -1152,7 +1053,8 @@ impl Scheduler {
     ///     },
     /// );
     /// ```
-    pub fn add_par_access<F>(
+    #[cfg(test)]
+    fn add_par_access<F>(
         &mut self,
         name: impl Into<String>,
         access: AccessDescriptor,
@@ -1166,7 +1068,8 @@ impl Scheduler {
 
     /// Регистрировать параллельную систему-замыкание с явным доступом
     /// в указанном этапе.
-    pub fn add_par_access_to_stage<F>(
+    #[cfg(test)]
+    fn add_par_access_to_stage<F>(
         &mut self,
         name: impl Into<String>,
         access: AccessDescriptor,
@@ -1214,36 +1117,6 @@ impl Scheduler {
         }
     }
 
-    /// Регистрировать параллельную систему-замыкание с явным доступом
-    /// в Startup этапе.
-    pub fn add_startup_par_access<F>(
-        &mut self,
-        name: impl Into<String>,
-        access: AccessDescriptor,
-        func: F,
-    ) -> SystemBuilder
-    where
-        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
-    {
-        self.add_par_access_to_stage(name, access, func, StageLabel::Startup)
-    }
-
-    /// Установить этап по умолчанию для `add_system`, `add_auto_system`,
-    /// `add_par`, `add_par_access`.
-    ///
-    /// Все системы, добавленные без явного `*_to_stage`, попадут в этот этап.
-    /// По умолчанию — `StageLabel::Update`.
-    ///
-    /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel};
-    /// let mut sched = Scheduler::new();
-    /// sched.set_default_stage(StageLabel::tag("update"));
-    /// ```
-    pub fn set_default_stage(&mut self, label: StageLabel) -> &mut Self {
-        self.default_stage_label = label;
-        self
-    }
-
     /// Установить минимальное количество entity для параллельного выполнения Stage.
     ///
     /// Если суммарное количество entity всех систем в Stage меньше этого порога,
@@ -1276,7 +1149,7 @@ impl Scheduler {
 
     /// Пометить AutoSystem (по SystemId) как использующую `par_for_each` внутри.
     /// Планировщик не будет дополнительно чанковать эту систему через ASD.
-    pub fn par_for_each_used(&mut self, id: SystemId) -> &mut Self {
+    fn par_for_each_used(&mut self, id: SystemId) -> &mut Self {
         if let Some(sys) = self
             .system_indices
             .get(&id)
@@ -1331,27 +1204,65 @@ impl Scheduler {
     ///
     /// sched.add_par("particles", |_: SystemContext<'_>| {});
     /// ```
-    pub fn staged<F>(&mut self, label: StageLabel, f: F) -> &mut Self
+    #[cfg(test)]
+    fn staged<F>(&mut self, label: StageLabel, f: F) -> &mut Self
     where
         F: FnOnce(&mut Self),
     {
         let previous = std::mem::replace(&mut self.default_stage_label, label);
+        let saved_condition = self.scope_condition.clone();
         f(self);
         self.default_stage_label = previous;
+        // Скоуп-условие действует только ВНУТРИ блока (раньше «прилипало» ко
+        // всем последующим регистрациям — латентный баг, найден аудитом
+        // 2026-06-12).
+        self.scope_condition = saved_condition;
         self
     }
 
-    /// Установить scope condition — все системы внутри текущего `staged()` блока
-    /// автоматически получат это условие (AND с их собственными condition'ами).
+    /// Скоуп условий: все системы, зарегистрированные внутри замыкания —
+    /// включая через [`add_systems`](Self::add_systems) — получают условия,
+    /// заданные [`run_condition`](Self::run_condition) (AND с их собственными).
+    /// Скоупы вкладываются (условия комбинируются по AND); по выходе из блока
+    /// прежний скоуп восстанавливается.
+    ///
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel, seq};
+    /// # let mut sched = Scheduler::new();
+    /// sched.scoped(|s| {
+    ///     s.run_condition(|w| !w.has_resource::<bool>());
+    ///     s.add_systems(StageLabel::Update, (
+    ///         seq("movement", |_w: &mut apex_core::world::World| {}),
+    ///         seq("ai", |_w: &mut apex_core::world::World| {}),
+    ///     ));
+    ///     // обе системы наследуют условие паузы
+    /// });
+    /// ```
+    pub fn scoped<F>(&mut self, f: F) -> &mut Self
+    where
+        F: FnOnce(&mut Self),
+    {
+        let saved_condition = self.scope_condition.clone();
+        f(self);
+        self.scope_condition = saved_condition;
+        self
+    }
+
+    /// Установить scope condition — все системы, зарегистрированные внутри
+    /// текущего [`scoped`](Self::scoped)-блока, автоматически получат это
+    /// условие (AND с их собственными condition'ами). Повторные вызовы внутри
+    /// блока комбинируются по AND.
     ///
     /// # Пример
     /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # use apex_scheduler::{Scheduler, StageLabel, seq};
     /// # let mut sched = Scheduler::new();
-    /// sched.staged(StageLabel::tag("gameplay"), |s| {
-    ///     s.run_condition(|w: &apex_core::world::World| !w.has_resource::<bool>());
-    ///     s.add_system("movement", |_: &mut apex_core::world::World| {});
-    ///     s.add_system("ai", |_: &mut apex_core::world::World| {});
+    /// sched.scoped(|s| {
+    ///     s.run_condition(|w| !w.has_resource::<bool>());
+    ///     s.add_systems(StageLabel::Update, (
+    ///         seq("movement", |_w: &mut apex_core::world::World| {}),
+    ///         seq("ai", |_w: &mut apex_core::world::World| {}),
+    ///     ));
     ///     // обе системы наследуют условие паузы
     /// });
     /// ```
@@ -1387,7 +1298,7 @@ impl Scheduler {
     }
 
     /// Добавить явную зависимость: `system` выполняется после `after_id`.
-    pub fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
+    pub(crate) fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
             if !s.after.contains(&after_id) {
                 s.after.push(after_id);
@@ -1480,7 +1391,8 @@ impl Scheduler {
     // ── Run Conditions ─────────────────────────────────────────
 
     /// Прикрепить run condition к системе по имени (AND-композиция).
-    pub fn set_run_if<F>(&mut self, name: &str, condition: F) -> Result<(), SchedulerError>
+    #[cfg(test)]
+    pub(crate) fn set_run_if<F>(&mut self, name: &str, condition: F) -> Result<(), SchedulerError>
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
@@ -1501,7 +1413,8 @@ impl Scheduler {
         Ok(())
     }
 
-    pub fn set_run_if_cond<C: Condition>(
+    #[cfg(test)]
+    pub(crate) fn set_run_if_cond<C: Condition>(
         &mut self,
         name: &str,
         condition: C,
@@ -1535,15 +1448,14 @@ impl Scheduler {
     /// При `compile()` Stage будет разбит на под-Stage, и между ними будут
     /// применены все накопленные `Commands` и сброшены события.
     ///
-    /// Типичное использование — внутри `staged()`:
+    /// Типичное использование — между `add_systems`-вызовами:
     /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel};
+    /// # use apex_scheduler::{Scheduler, StageLabel, seq};
     /// # let mut sched = Scheduler::new();
-    /// sched.staged(StageLabel::tag("combat"), |s| {
-    ///     s.add_system("spawner", |_: &mut apex_core::world::World| {});
-    ///     s.apply_deferred();  // ← spawner's commands applied before next systems
-    ///     s.add_system("camera", |_: &mut apex_core::world::World| {});
-    /// });
+    /// let combat = StageLabel::tag("combat");
+    /// sched.add_systems(combat.clone(), seq("spawner", |_w: &mut apex_core::world::World| {}));
+    /// sched.apply_deferred(); // ← команды spawner'а применены до следующих систем
+    /// sched.add_systems(combat, seq("camera", |_w: &mut apex_core::world::World| {}));
     /// ```
     pub fn apply_deferred(&mut self) -> &mut Self {
         if let Some(last_id) = self.last_added_system_id {
@@ -1588,6 +1500,12 @@ impl Scheduler {
 
     /// Внутренняя регистрация одной SystemConfig.
     fn register_system_config(&mut self, cfg: SystemConfig, stage_label: StageLabel) -> SystemId {
+        if stage_label == StageLabel::Startup && self.startup_completed {
+            log::warn!(
+                "add_systems(Startup, …): `{}` добавлена после завершения Startup — не выполнится",
+                cfg.name
+            );
+        }
         let id = SystemId(self.next_id);
         self.next_id += 1;
         self.last_added_system_id = Some(id);
@@ -1650,6 +1568,11 @@ impl Scheduler {
         }
 
         self.system_indices.insert(id, index);
+        // Scope-условия (scoped/run_condition) применяются и к add_systems-пути
+        // (раньше — только к внутренним методам регистрации: документированный
+        // паттерн «scoped + add_systems» молча терял условие — латентный баг,
+        // найден аудитом 2026-06-12).
+        self.merge_scope_condition(id);
         self.invalidate_plan();
         id
     }
@@ -1710,7 +1633,7 @@ impl Scheduler {
     /// Получить AccessDescriptor системы по её SystemId.
     ///
     /// Возвращает `None` если система не найдена или это sequential система.
-    pub fn system_access(&self, id: SystemId) -> Option<&AccessDescriptor> {
+    pub(crate) fn system_access(&self, id: SystemId) -> Option<&AccessDescriptor> {
         self.system_indices
             .get(&id)
             .and_then(|&idx| self.systems.get(idx)?.kind.access())
@@ -4523,6 +4446,47 @@ mod tests {
         sched.run_sequential(&mut world);
 
         assert!(RAN.load(Ordering::SeqCst), "Система должна выполниться когда condition=true");
+    }
+
+    /// Регрессия (аудит 2026-06-12): scope-условие из `scoped`+`run_condition`
+    /// (а) применяется к системам, зарегистрированным через `add_systems`
+    /// (раньше этот путь его молча терял), и (б) НЕ прилипает к системам,
+    /// зарегистрированным ПОСЛЕ блока (раньше скоуп никогда не сбрасывался).
+    #[test]
+    fn scoped_condition_applies_to_add_systems_and_does_not_leak() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static INSIDE_RAN: AtomicBool = AtomicBool::new(false);
+        static OUTSIDE_RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut sched = Scheduler::new();
+        sched.scoped(|s| {
+            s.run_condition(|_| false); // скоуп всегда-false
+            s.add_systems(
+                StageLabel::Update,
+                seq("inside", |_w: &mut World| {
+                    INSIDE_RAN.store(true, Ordering::SeqCst);
+                }),
+            );
+        });
+        // После блока скоуп снят — система выполняется безусловно.
+        sched.add_systems(
+            StageLabel::Update,
+            seq("outside", |_w: &mut World| {
+                OUTSIDE_RAN.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        let mut world = World::new();
+        sched.run_sequential(&mut world);
+
+        assert!(
+            !INSIDE_RAN.load(Ordering::SeqCst),
+            "scoped-условие должно применяться к add_systems-пути"
+        );
+        assert!(
+            OUTSIDE_RAN.load(Ordering::SeqCst),
+            "scope-условие не должно прилипать к системам после блока"
+        );
     }
 
     #[test]

@@ -2259,14 +2259,14 @@ mod tests {
 
         // (Or<(With<A>,)>, With<B>) ≡ With<A> AND With<B> → только both
         let strict: Vec<_> = world
-            .query_typed::<(Entity, Or<(With<A>,)>, With<B>)>()
+            .query::<(Entity, Or<(With<A>,)>, With<B>)>()
             .iter()
             .map(|(e, _, _)| e)
             .collect();
         assert_eq!(strict, vec![both]);
 
         // Or<(With<A>, With<B>)> → обе entity
-        let union_count = world.query_typed::<Or<(With<A>, With<B>)>>().iter().count();
+        let union_count = world.query::<Or<(With<A>, With<B>)>>().iter().count();
         assert_eq!(union_count, 2);
     }
 

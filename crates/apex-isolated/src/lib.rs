@@ -406,9 +406,12 @@ mod tests {
         let invoked = Arc::new(AtomicBool::new(false));
         let inv = invoked.clone();
 
-        iso.scheduler_mut().add_par("test", move |_ctx| {
-            inv.store(true, Ordering::SeqCst);
-        });
+        iso.scheduler_mut().add_systems(
+            apex_scheduler::StageLabel::Update,
+            apex_scheduler::par("test", move |_ctx| {
+                inv.store(true, Ordering::SeqCst);
+            }),
+        );
 
         iso.tick();
         assert_eq!(iso.world.entity_count(), 0);
@@ -574,9 +577,12 @@ mod tests {
         let entity_count = Arc::new(AtomicUsize::new(0));
         let ec = entity_count.clone();
 
-        iso.scheduler_mut().add_par("counter", move |ctx| {
-            ec.store(ctx.entity_count(), Ordering::SeqCst);
-        });
+        iso.scheduler_mut().add_systems(
+            apex_scheduler::StageLabel::Update,
+            apex_scheduler::par("counter", move |ctx| {
+                ec.store(ctx.entity_count(), Ordering::SeqCst);
+            }),
+        );
 
         iso.world_mut().spawn(());
         iso.tick();

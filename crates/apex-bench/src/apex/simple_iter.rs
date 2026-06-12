@@ -3,7 +3,7 @@ use crate::{Transform, Position, Rotation, Velocity};
 use cgmath::{Matrix4, Vector3};
 
 // SimpleIter — итерация по 10K сущностей, Position += Velocity
-// CachedQuery кешируется через QueryCache внутри query_typed()
+// CachedQuery кешируется через QueryCache внутри query()
 pub struct SimpleIter {
     world: World,
     // W2-0/W2-0.5: per-state запрос для chunked-варианта (модель Bevy QueryState)
@@ -31,7 +31,7 @@ impl SimpleIter {
     }
 
     pub fn run(&self) {
-        self.world.query_typed::<(Read<Velocity>, Write<Position>)>()
+        self.world.query::<(Read<Velocity>, Write<Position>)>()
             .for_each(|_, (vel, mut pos)| {
                 pos.0 += vel.0;
             });

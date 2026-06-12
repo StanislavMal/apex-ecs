@@ -190,7 +190,7 @@ fn main() {
 
     println!("\n═══ 7. Query по компонентам из вложенных Bundle ═══\n");
     {
-        let query = world.query_typed::<(Read<Pos>, Read<Hp>)>();
+        let query = world.query::<(Read<Pos>, Read<Hp>)>();
         let mut count = 0;
         query.for_each(|entity, (pos, hp)| {
             count += 1;

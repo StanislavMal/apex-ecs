@@ -12,7 +12,7 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 use apex_scheduler::{
-    conditions, Condition, ConditionTree, Scheduler, StageLabel,
+    conditions, seq, sys, Condition, ConditionTree, Scheduler, StageLabel, SystemConfig,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -81,8 +81,11 @@ system! {
 
 fn setup_s1() -> (Scheduler, World) {
     let mut sched = Scheduler::new();
-    sched.add_exclusive_system(s1_system)
-        .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true));
+    sched.add_systems(
+        StageLabel::Update,
+        SystemConfig::exclusive(s1_system)
+            .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true)),
+    );
 
     let mut world = World::new();
     world.insert_resource(Paused(false));
@@ -117,8 +120,10 @@ system! {
 
 fn check_s2() {
     let mut sched = Scheduler::new();
-    sched.add_auto_system("s2", s2_system)
-        .run_if_cond(conditions::any_with_component::<Player>());
+    sched.add_systems(
+        StageLabel::Update,
+        sys("s2", s2_system).run_if_cond(conditions::any_with_component::<Player>()),
+    );
 
     // No Player entity → system skipped
     let mut world = World::new();
@@ -131,9 +136,10 @@ fn check_s2() {
     let mut world2 = World::new();
     world2.spawn((Player, Pos { x: 0.0, y: 0.0 }));
     let mut sched2 = Scheduler::new();
-    sched2
-        .add_auto_system("s2", s2_system)
-        .run_if_cond(conditions::any_with_component::<Player>());
+    sched2.add_systems(
+        StageLabel::Update,
+        sys("s2", s2_system).run_if_cond(conditions::any_with_component::<Player>()),
+    );
     sched2.compile_with_world(&world2).unwrap();
     sched2.run_sequential(&mut world2);
     assert!(S2_CALLED.load(Ordering::SeqCst), "S2: should run with Player");
@@ -148,11 +154,11 @@ static S3A_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn check_s3a() {
     let mut sched = Scheduler::new();
-    sched.add_system("s3a", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s3a", move |_: &mut World| {
         S3A_FLAG.store(true, Ordering::SeqCst);
     })
     .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true))
-    .run_if(|_: &World| true);
+    .run_if(|_: &World| true));
 
     let mut world = World::new();
     world.insert_resource(Paused(false));
@@ -167,11 +173,11 @@ fn check_s3a() {
     world2.insert_resource(Paused(true));
     S3A_FLAG.store(false, Ordering::SeqCst);
     let mut sched2 = Scheduler::new();
-    sched2.add_system("s3a_b", move |_: &mut World| {
+    sched2.add_systems(StageLabel::Update, seq("s3a_b", move |_: &mut World| {
         S3A_FLAG.store(true, Ordering::SeqCst);
     })
     .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true))
-    .run_if(|_: &World| true);
+    .run_if(|_: &World| true));
     sched2.compile_with_world(&world2).unwrap();
     sched2.run_sequential(&mut world2);
     assert!(!S3A_FLAG.load(Ordering::SeqCst), "S3a: one false → should skip");
@@ -188,13 +194,13 @@ static S3B_FLAG: AtomicBool = AtomicBool::new(false);
 fn check_s3b() {
     // both Paused and Player resources exist → runs
     let mut sched = Scheduler::new();
-    sched.add_system("s3b", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s3b", move |_: &mut World| {
         S3B_FLAG.store(true, Ordering::SeqCst);
     })
     .run_if_cond((
         conditions::resource_exists::<Paused>(),
         conditions::resource_exists::<DebugOverlay>(),
-    ));
+    )));
 
     let mut world = World::new();
     world.insert_resource(Paused(false));
@@ -209,13 +215,13 @@ fn check_s3b() {
     world2.insert_resource(DebugOverlay(false));
     S3B_FLAG.store(false, Ordering::SeqCst);
     let mut sched2 = Scheduler::new();
-    sched2.add_system("s3b_b", move |_: &mut World| {
+    sched2.add_systems(StageLabel::Update, seq("s3b_b", move |_: &mut World| {
         S3B_FLAG.store(true, Ordering::SeqCst);
     })
     .run_if_cond((
         conditions::resource_exists::<Paused>(),
         conditions::resource_exists::<DebugOverlay>(),
-    ));
+    )));
     sched2.compile_with_world(&world2).unwrap();
     sched2.run_sequential(&mut world2);
     assert!(S3B_FLAG.load(Ordering::SeqCst), "S3b: tuple AND, both true → should run");
@@ -227,10 +233,10 @@ fn check_s3b() {
 
 fn check_s4() {
     let mut sched = Scheduler::new();
-    sched.add_system("s4", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s4", move |_: &mut World| {
         S4_CALLED.store(true, Ordering::SeqCst);
     })
-    .run_if_cond(conditions::resource_exists::<Paused>().not());
+    .run_if_cond(conditions::resource_exists::<Paused>().not()));
 
     // No Paused → .not() true → runs
     let mut world = World::new();
@@ -244,10 +250,10 @@ fn check_s4() {
     world2.insert_resource(Paused(true));
     S4_CALLED.store(false, Ordering::SeqCst);
     let mut sched2 = Scheduler::new();
-    sched2.add_system("s4b", move |_: &mut World| {
+    sched2.add_systems(StageLabel::Update, seq("s4b", move |_: &mut World| {
         S4_CALLED.store(true, Ordering::SeqCst);
     })
-    .run_if_cond(conditions::resource_exists::<Paused>().not());
+    .run_if_cond(conditions::resource_exists::<Paused>().not()));
     sched2.compile_with_world(&world2).unwrap();
     sched2.run_sequential(&mut world2);
     assert!(!S4_CALLED.load(Ordering::SeqCst), "S4: .not() when resource exists → should skip");
@@ -266,13 +272,15 @@ system! {
 
 fn check_s5a() {
     let mut sched = Scheduler::new();
-    sched.add_exclusive_system(s5a_spawner);
-    sched.add_system("reader", move |world: &mut World| {
-        let c = Query::<Read<Spawned>>::new(world).iter().count();
-        if c > 0 {
-            S5_SEEN.store(true, Ordering::SeqCst);
-        }
-    });
+    sched.add_systems(StageLabel::Update, (
+        s5a_spawner,
+        seq("reader", move |world: &mut World| {
+            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            if c > 0 {
+                S5_SEEN.store(true, Ordering::SeqCst);
+            }
+        }),
+    ));
     sched.chain(&["s5a_spawner", "reader"]).unwrap();
 
     let mut world = World::new();
@@ -299,8 +307,10 @@ system! {
 fn check_s5b() {
     // Часть A: проверка compile
     let mut sched = Scheduler::new();
-    sched.add_auto_system("spawner_d", s5b_spawner);
-    sched.add_system("reader_d", |_: &mut World| {});
+    sched.add_systems(StageLabel::Update, (
+        sys("spawner_d", s5b_spawner),
+        seq("reader_d", |_: &mut World| {}),
+    ));
     sched.chain(&["spawner_d", "reader_d"]).unwrap();
     sched.compile().unwrap();
     let stages = sched.stages().unwrap();
@@ -312,13 +322,15 @@ fn check_s5b() {
 
     // Часть B: проверка runtime — reader видит заспавненные entity
     let mut sched2 = Scheduler::new();
-    sched2.add_auto_system("spawner_r", s5b_spawner);
-    sched2.add_system("reader_r", move |world: &mut World| {
-        let c = Query::<Read<Spawned>>::new(world).iter().count();
-        if c > 0 {
-            S5B_SEEN.store(true, Ordering::SeqCst);
-        }
-    });
+    sched2.add_systems(StageLabel::Update, (
+        sys("spawner_r", s5b_spawner),
+        seq("reader_r", move |world: &mut World| {
+            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            if c > 0 {
+                S5B_SEEN.store(true, Ordering::SeqCst);
+            }
+        }),
+    ));
     sched2.chain(&["spawner_r", "reader_r"]).unwrap();
 
     let mut world = World::new();
@@ -335,16 +347,18 @@ fn check_s5b() {
 
 fn check_s6() {
     let mut sched = Scheduler::new();
-    sched.staged(StageLabel::tag("s6"), |s| {
+    sched.scoped(|s| {
         s.run_condition(move |w: &World| {
             w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true)
         });
-        s.add_system("s6a", move |_: &mut World| {
-            S6_RAN.store(true, Ordering::SeqCst);
-        });
-        s.add_system("s6b", move |_: &mut World| {
-            // just to have multiple systems in scope
-        });
+        s.add_systems(StageLabel::tag("s6"), (
+            seq("s6a", move |_: &mut World| {
+                S6_RAN.store(true, Ordering::SeqCst);
+            }),
+            seq("s6b", move |_: &mut World| {
+                // just to have multiple systems in scope
+            }),
+        ));
     });
 
     // Not paused → both run
@@ -357,13 +371,13 @@ fn check_s6() {
 
     // Paused → both skip
     let mut sched2 = Scheduler::new();
-    sched2.staged(StageLabel::tag("s6p"), |s| {
+    sched2.scoped(|s| {
         s.run_condition(move |w: &World| {
             w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true)
         });
-        s.add_system("s6a2", move |_: &mut World| {
+        s.add_systems(StageLabel::tag("s6p"), seq("s6a2", move |_: &mut World| {
             S6_RAN.store(true, Ordering::SeqCst);
-        });
+        }));
     });
     let mut world2 = World::new();
     world2.insert_resource(Paused(true));
@@ -380,14 +394,14 @@ fn check_s6() {
 
 fn check_s7() {
     let mut sched = Scheduler::new();
-    sched.staged(StageLabel::tag("s7"), |s| {
+    sched.scoped(|s| {
         s.run_condition(move |w: &World| {
             w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true)
         });
-        s.add_system("s7a", move |_: &mut World| {
+        s.add_systems(StageLabel::tag("s7"), seq("s7a", move |_: &mut World| {
             S7_RAN.store(true, Ordering::SeqCst);
         })
-        .run_if(|_: &World| true);
+        .run_if(|_: &World| true));
     });
 
     // Not paused + local AND true → runs
@@ -405,14 +419,14 @@ fn check_s7() {
 
 fn check_s8() {
     let mut sched = Scheduler::new();
-    sched.add_system("s8", move |_: &mut World| {
-        S8_RAN.store(true, Ordering::SeqCst);
-    })
-    .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true))
-    .run_if_cond(conditions::any_with_component::<Player>());
-    sched
-        .add_system("s8_helper", |_: &mut World| {})
-        .run_if(|_: &World| true);
+    sched.add_systems(StageLabel::Update, (
+        seq("s8", move |_: &mut World| {
+            S8_RAN.store(true, Ordering::SeqCst);
+        })
+        .run_if(|w: &World| w.try_resource::<Paused>().map(|p| !p.0).unwrap_or(true))
+        .run_if_cond(conditions::any_with_component::<Player>()),
+        seq("s8_helper", |_: &mut World| {}).run_if(|_: &World| true),
+    ));
     sched.chain(&["s8_helper", "s8"]).unwrap();
 
     // Paused(false) + Player exists → runs
@@ -431,11 +445,11 @@ fn check_s8() {
 
 fn check_s9() {
     let mut sched = Scheduler::new();
-    sched.add_system("s9", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s9", move |_: &mut World| {
         let mut c = S9_COUNT.lock().unwrap();
         *c += 1;
     })
-    .run_if_cond(conditions::run_until(5));
+    .run_if_cond(conditions::run_until(5)));
 
     let mut world = World::new();
     sched.compile_with_world(&world).unwrap();
@@ -452,11 +466,11 @@ fn check_s9() {
 
 fn check_s10() {
     let mut sched = Scheduler::new();
-    sched.add_system("s10", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s10", move |_: &mut World| {
         let mut c = S10_COUNT.lock().unwrap();
         *c += 1;
     })
-    .run_if_cond(conditions::every_n_frames(60));
+    .run_if_cond(conditions::every_n_frames(60)));
 
     let mut world = World::new();
     sched.compile_with_world(&world).unwrap();
@@ -478,11 +492,11 @@ static S11_RAN: AtomicBool = AtomicBool::new(false);
 
 fn check_s11() {
     let mut sched = Scheduler::new();
-    sched.add_system("s11", move |_: &mut World| {
+    sched.add_systems(StageLabel::Update, seq("s11", move |_: &mut World| {
         S11_RAN.store(true, Ordering::SeqCst);
     })
     .or_else(|w: &World| w.has_resource::<Paused>())
-    .or_else(|w: &World| w.has_resource::<DebugOverlay>());
+    .or_else(|w: &World| w.has_resource::<DebugOverlay>()));
 
     // Paused exists → runs (always-true base + OR Paused)
     let mut world = World::new();
@@ -497,13 +511,13 @@ fn check_s11() {
     // means "run always OR run on condition", which is always.
     // To test true OR skip, set base to a false condition first:
     let mut sched2 = Scheduler::new();
-    sched2.add_system("s11b", move |_: &mut World| {
+    sched2.add_systems(StageLabel::Update, seq("s11b", move |_: &mut World| {
         S11_RAN.store(true, Ordering::SeqCst);
     })
     // Reset: no-op condition always false → pure OR, no always-true baseline
     .condition(ConditionTree::And(vec![ConditionTree::leaf(|_: &World| false)]))
     .or_else(|w: &World| w.has_resource::<Paused>())
-    .or_else(|w: &World| w.has_resource::<DebugOverlay>());
+    .or_else(|w: &World| w.has_resource::<DebugOverlay>()));
 
     let mut world2 = World::new();
     S11_RAN.store(false, Ordering::SeqCst);
@@ -516,11 +530,11 @@ fn check_s11() {
     world3.insert_resource(Paused(true));
     S11_RAN.store(false, Ordering::SeqCst);
     let mut sched3 = Scheduler::new();
-    sched3.add_system("s11c", move |_: &mut World| {
+    sched3.add_systems(StageLabel::Update, seq("s11c", move |_: &mut World| {
         S11_RAN.store(true, Ordering::SeqCst);
     })
     .condition(ConditionTree::And(vec![ConditionTree::leaf(|_: &World| false)]))
-    .or_else(|w: &World| w.has_resource::<Paused>());
+    .or_else(|w: &World| w.has_resource::<Paused>()));
     sched3.compile_with_world(&world3).unwrap();
     sched3.run_sequential(&mut world3);
     assert!(S11_RAN.load(Ordering::SeqCst), "S11c: Paused exists → runs via OR");
@@ -538,11 +552,10 @@ fn bench_run_if_overhead() {
     // Benchmark 1: run_if(true) overhead — 1000 systems, 100 warmup + 300 measured
     let mut sched = Scheduler::new();
     for i in 0..1000 {
-        sched.add_system(
-            format!("b_true_{}", i),
-            |_: &mut World| {},
-        )
-        .run_if(|_: &World| true);
+        sched.add_systems(
+            StageLabel::Update,
+            seq(format!("b_true_{}", i), |_: &mut World| {}).run_if(|_: &World| true),
+        );
     }
 
     let mut world = World::new();
@@ -569,11 +582,10 @@ fn bench_run_if_overhead() {
     // Benchmark 2: run_if(false) savings — systems don't execute
     let mut sched2 = Scheduler::new();
     for i in 0..1000 {
-        sched2.add_system(
-            format!("b_false_{}", i),
-            |_: &mut World| {},
-        )
-        .run_if(|_: &World| false);
+        sched2.add_systems(
+            StageLabel::Update,
+            seq(format!("b_false_{}", i), |_: &mut World| {}).run_if(|_: &World| false),
+        );
     }
 
     // Run once to measure time with conditions false
@@ -582,11 +594,11 @@ fn bench_run_if_overhead() {
     let mut sched3 = Scheduler::new();
     for i in 0..1000 {
         let idx = i;
-        sched3.add_system(
-            format!("b_cnt_{}", i),
-            move |_: &mut World| { B_CALLED.fetch_add(1, Ordering::Relaxed); },
-        )
-        .run_if(move |_: &World| idx >= 1000); // always false
+        sched3.add_systems(
+            StageLabel::Update,
+            seq(format!("b_cnt_{}", i), move |_: &mut World| { B_CALLED.fetch_add(1, Ordering::Relaxed); })
+                .run_if(move |_: &World| idx >= 1000), // always false
+        );
     }
     sched3.compile_with_world(&world).unwrap();
     for _ in 0..100 {
@@ -612,11 +624,11 @@ fn bench_run_if_overhead() {
     // Benchmark 3: run_if_cond typed overhead
     let mut sched4 = Scheduler::new();
     for i in 0..1000 {
-        sched4.add_system(
-            format!("b_typed_{}", i),
-            |_: &mut World| {},
-        )
-        .run_if_cond(conditions::every_n_frames(1)); // always true
+        sched4.add_systems(
+            StageLabel::Update,
+            seq(format!("b_typed_{}", i), |_: &mut World| {})
+                .run_if_cond(conditions::every_n_frames(1)), // always true
+        );
     }
     sched4.compile_with_world(&world).unwrap();
     for _ in 0..100 {
@@ -636,15 +648,17 @@ fn bench_run_if_overhead() {
     // Benchmark 4: chain + auto-apply — 100 entities visible
     static B4_COUNT: AtomicUsize = AtomicUsize::new(0);
     let mut sched5 = Scheduler::new();
-    sched5.add_system("b4_spawn", move |world: &mut World| {
-        for _ in 0..100 {
-            world.spawn((Spawned, Pos { x: 0.0, y: 0.0 }));
-        }
-    });
-    sched5.add_system("b4_read", move |world: &mut World| {
-        let c = Query::<Read<Spawned>>::new(world).iter().count();
-        B4_COUNT.store(c, Ordering::Relaxed);
-    });
+    sched5.add_systems(StageLabel::Update, (
+        seq("b4_spawn", move |world: &mut World| {
+            for _ in 0..100 {
+                world.spawn((Spawned, Pos { x: 0.0, y: 0.0 }));
+            }
+        }),
+        seq("b4_read", move |world: &mut World| {
+            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            B4_COUNT.store(c, Ordering::Relaxed);
+        }),
+    ));
     sched5.chain(&["b4_spawn", "b4_read"]).unwrap();
     sched5.compile_with_world(&world).unwrap();
     sched5.run_sequential(&mut world);
@@ -659,12 +673,12 @@ fn bench_run_if_overhead() {
     // Benchmark 5: scope propagation
     static B5_CALLED: AtomicUsize = AtomicUsize::new(0);
     let mut sched6 = Scheduler::new();
-    sched6.staged(StageLabel::tag("b5"), |s| {
+    sched6.scoped(|s| {
         s.run_condition(|_: &World| false);
         for i in 0..10 {
-            s.add_system(
-                format!("b5_{}", i),
-                move |_: &mut World| { B5_CALLED.fetch_add(1, Ordering::Relaxed); },
+            s.add_systems(
+                StageLabel::tag("b5"),
+                seq(format!("b5_{}", i), move |_: &mut World| { B5_CALLED.fetch_add(1, Ordering::Relaxed); }),
             );
         }
     });
@@ -691,11 +705,11 @@ fn bench_run_if_overhead() {
     ];
     let mut sched7 = Scheduler::new();
     for (i, counter) in B6_COUNTS.iter().enumerate() {
-        sched7.add_system(
-            format!("b6_{}", i),
-            move |_: &mut World| { counter.fetch_add(1, Ordering::Relaxed); },
-        )
-        .run_if_cond(conditions::run_until(50));
+        sched7.add_systems(
+            StageLabel::Update,
+            seq(format!("b6_{}", i), move |_: &mut World| { counter.fetch_add(1, Ordering::Relaxed); })
+                .run_if_cond(conditions::run_until(50)),
+        );
     }
     sched7.compile_with_world(&world).unwrap();
     for _ in 0..100 {

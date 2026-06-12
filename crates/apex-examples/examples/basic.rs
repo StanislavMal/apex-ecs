@@ -13,7 +13,7 @@
 use apex_core::prelude::*;
 
 use apex_macros::Component;
-use apex_scheduler::{Scheduler, StageLabel};
+use apex_scheduler::{sys, Scheduler, StageLabel};
 
 // ── Компоненты ────────────────────────────────────────────────
 
@@ -108,8 +108,8 @@ system! {
         world: &mut World,
     ) {
         let events: Vec<DamageEvent> = {
-            let reader = world.event_reader::<DamageEvent>();
-            reader.iter().to_vec()
+            let mut reader = world.event_reader::<DamageEvent>();
+            reader.read().into_iter().copied().collect()
         };
 
         let mut deaths = Vec::new();
@@ -130,8 +130,8 @@ system! {
         world: &mut World,
     ) {
         let deaths: Vec<DeathEvent> = {
-            let reader = world.event_reader::<DeathEvent>();
-            reader.iter().to_vec()
+            let mut reader = world.event_reader::<DeathEvent>();
+            reader.read().into_iter().copied().collect()
         };
 
         if deaths.is_empty() { return; }
@@ -257,31 +257,29 @@ fn main() {
     // ╔══════════════════════════════════════════════════════════╗
     // ║  Startup — выполняется один раз при первом run()       ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_exclusive_startup_system(init_resources);
-    sched.add_exclusive_startup_system(spawn_player);
+    // Bare-идентификаторы эксклюзивных system! — единый вход add_systems.
+    sched.add_systems(StageLabel::Startup, (init_resources, spawn_player));
 
     // ╔══════════════════════════════════════════════════════════╗
     // ║  PreUpdate — AutoSystem (автовывод доступа)            ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_auto_system_to_stage("movement", movement_system, StageLabel::PreUpdate);
+    sched.add_systems(StageLabel::PreUpdate, sys("movement", movement_system));
     println!("  [Stage:PreUpdate] MovementSystem зарегистрирован как AutoSystem");
 
     // ╔══════════════════════════════════════════════════════════╗
     // ║  Update — AutoSystem (параллельные)                    ║
     // ╚══════════════════════════════════════════════════════════╝
-    sched.add_auto_system_to_stage("physics",      physics_system,      StageLabel::Update);
-    sched.add_auto_system_to_stage("health_clamp", health_clamp_system, StageLabel::Update);
-    sched.add_auto_system_to_stage("enemy_ai",     enemy_ai_system,     StageLabel::Update);
+    sched.add_systems(StageLabel::Update, (
+        sys("physics", physics_system),
+        sys("health_clamp", health_clamp_system),
+        sys("enemy_ai", enemy_ai_system),
+    ));
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  PostUpdate — Sequential системы                        ║
+    // ║  PostUpdate — эксклюзивные системы + явный порядок      ║
     // ╚══════════════════════════════════════════════════════════╝
-    let damage_id  = sched.add_exclusive_system_to_stage(damage_apply,  StageLabel::PostUpdate).id();
-    let despawn_id = sched.add_exclusive_system_to_stage(despawn_dead,  StageLabel::PostUpdate).id();
-    let stats_id   = sched.add_exclusive_system_to_stage(stats_update,  StageLabel::PostUpdate).id();
-
-    sched.add_dependency(despawn_id, damage_id);
-    sched.add_dependency(stats_id,   despawn_id);
+    sched.add_systems(StageLabel::PostUpdate, (damage_apply, despawn_dead, stats_update));
+    sched.chain(&["damage_apply", "despawn_dead", "stats_update"]).unwrap();
 
     sched.compile_with_world(&world).unwrap();
 

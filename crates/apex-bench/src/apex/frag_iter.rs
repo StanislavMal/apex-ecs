@@ -19,7 +19,7 @@ declare_markers!(
 pub struct Data(pub f32);
 
 // FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом
-// CachedQuery кешируется через QueryCache внутри query_typed()
+// CachedQuery кешируется через QueryCache внутри query()
 pub struct FragIter {
     world: World,
 }
@@ -49,7 +49,7 @@ impl FragIter {
     }
 
     pub fn run(&self) {
-        self.world.query_typed::<Write<Data>>()
+        self.world.query::<Write<Data>>()
             .for_each(|_, mut data| {
                 data.0 *= 2.0;
             });

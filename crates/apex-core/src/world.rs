@@ -746,13 +746,6 @@ impl World {
         self.events.get_or_register_mut::<T>().send(event);
     }
 
-    /// Безопасная версия `send_event` — всегда успешна, так как
-    /// при необходимости автоматически регистрирует тип.
-    pub fn try_send_event<T: Send + Sync + 'static>(&mut self, event: T) -> bool {
-        self.events.get_or_register_mut::<T>().send(event);
-        true
-    }
-
     /// Предварительно выделить capacity для событий указанного типа.
     ///
     /// Позволяет избежать многократных реаллокаций при массовой отправке
@@ -1425,15 +1418,22 @@ impl World {
 
     // ── Query API ──────────────────────────────────────────────
 
-    pub fn query_typed<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+    /// Кешированный типизированный запрос (как Bevy `world.query::<Q>()`;
+    /// зеркало `ctx.query` в системах). Список архетипов берётся из
+    /// инкрементального глобального кэша.
+    pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, Tick::ZERO)
     }
 
+    /// То же с явной базой change-detection (`Changed<T>`/`Added<T>` в Q).
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, last_run)
     }
 
-    pub fn query(&self) -> QueryBuilder<'_> {
+    /// Динамический запрос по runtime-`ComponentId` (редкий случай: типы не
+    /// известны статически — скриптинг/инспектор). Для обычного кода —
+    /// типизированный [`query`](Self::query).
+    pub fn query_builder(&self) -> QueryBuilder<'_> {
         QueryBuilder::new(self)
     }
 
@@ -3220,13 +3220,13 @@ mod tests {
         let only_pos = world.spawn((Pos { x: 2.0, y: 0.0 },));
 
         // Сначала прогреваем кэш формой (Read, Read)…
-        let with_vel = world.query_typed::<(Read<Pos>, Read<Vel>)>().len();
+        let with_vel = world.query::<(Read<Pos>, Read<Vel>)>().len();
         assert_eq!(with_vel, 1);
 
         // …затем (Read, Without) обязан увидеть СВОЙ список архетипов.
         let mut seen = Vec::new();
         world
-            .query_typed::<(Read<Pos>, Without<Vel>)>()
+            .query::<(Read<Pos>, Without<Vel>)>()
             .for_each(|e, _| seen.push(e));
         assert_eq!(seen, vec![only_pos], "Without-форма не должна делить запись кэша с Read-формой");
     }
@@ -3239,11 +3239,11 @@ mod tests {
 
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 0.0 },));
-        assert_eq!(world.query_typed::<Read<Pos>>().len(), 1);
+        assert_eq!(world.query::<Read<Pos>>().len(), 1);
 
         // Новый архетип (Pos, Vel) после прогрева кэша.
         world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
-        assert_eq!(world.query_typed::<Read<Pos>>().len(), 2);
+        assert_eq!(world.query::<Read<Pos>>().len(), 2);
     }
 
     /// CR-M2: entity, въехавшая в ОПУСТЕВШИЙ архетип, не теряется кэшем
@@ -3254,17 +3254,17 @@ mod tests {
 
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 3.0, y: 0.0 }));
-        assert_eq!(world.query_typed::<(Read<Pos>, Read<Vel>)>().len(), 1);
+        assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 1);
 
         // Архетип (Pos, Vel) пустеет…
         world.remove::<Vel>(e);
-        assert_eq!(world.query_typed::<(Read<Pos>, Read<Vel>)>().len(), 0);
+        assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 0);
 
         // …и снова наполняется — кэшированный список обязан его видеть.
         world.insert(e, Vel { x: 4.0, y: 0.0 });
         let mut seen = Vec::new();
         world
-            .query_typed::<(Read<Pos>, Read<Vel>)>()
+            .query::<(Read<Pos>, Read<Vel>)>()
             .for_each(|ent, _| seen.push(ent));
         assert_eq!(seen, vec![e]);
     }

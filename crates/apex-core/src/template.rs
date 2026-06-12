@@ -544,7 +544,7 @@ mod tests {
         commands.apply(&mut world);
 
         // Должна быть ровно одна entity с Position
-        let query = world.query_typed::<Read<Position>>();
+        let query = world.query::<Read<Position>>();
         let mut count = 0;
         query.for_each(|_, _| count += 1);
         assert_eq!(count, 1);

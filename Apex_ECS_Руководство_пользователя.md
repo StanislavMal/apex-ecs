@@ -66,7 +66,7 @@
 
 ### 1.3 Установка
 
-Крейты **ещё не опубликованы на crates.io** (версия 0.1.0). Используйте один из способов ниже.
+Крейты **ещё не опубликованы на crates.io**. Используйте один из способов ниже.
 
 **Вариант A — локальный путь (разработка):**
 
@@ -377,7 +377,7 @@ system! {
         // …
     }
 }
-app.add_system(Update, WaveSpawner::new(cfg)); // state без Default
+app.add_systems(Update, WaveSpawner::new(cfg)); // state без Default
 ```
 
 Это строго мощнее `Local<T>`: именованные поля вместо кортежа локалов, конструктор
@@ -614,8 +614,8 @@ let count = Query::<Read<Health>>::new(&world)
 `CachedQuery` кеширует список архетипов и инвалидируется только при изменении состава архетипов мира.
 
 ```rust
-// CachedQuery — переиспользует список архетипов:
-world.query_typed::<Read<Position>>()
+// CachedQuery — переиспользует список архетипов (Bevy: world.query::<Q>()):
+world.query::<Read<Position>>()
     .for_each(|_, pos| { /* ... */ });
 
 // С change detection (Changed<T> как фильтр):
@@ -630,14 +630,14 @@ world.query_changed::<(Read<Velocity>, Changed<Position>)>(last_tick)
         // vel только для изменившегося Position
     });
 
-// Стандартный Iterator через .iter():
-let far = world.query_typed::<Read<Position>>()
+// Стандартный Iterator через .iter() — item-only (П1):
+let far = world.query::<(Entity, Read<Position>)>()
     .iter()
     .filter(|(_, pos)| pos.x > 100.0)
     .count();
 
 // Параллельная итерация (rayon всегда доступен):
-world.query_typed::<Read<Position>>()
+world.query::<Read<Position>>()
     .par_for_each(|_, pos| {
         /* CPU-bound расчёты */
     });
@@ -682,7 +682,7 @@ Query::<(Read<Velocity>, Write<Position>)>::new(&world)
     });
 
 // Параллельно — те же диапазоны, что у par_for_each:
-world.query_typed::<(Read<Velocity>, Write<Position>)>()
+world.query::<(Read<Velocity>, Write<Position>)>()
     .par_for_each_chunk(|_, (vel, pos)| { /* ... */ });
 ```
 
@@ -703,7 +703,7 @@ world.query_typed::<(Read<Velocity>, Write<Position>)>()
 Долгоживущий стейт в духе Bevy `QueryState`: список матчащих архетипов хранится у владельца и
 дополняется **инкрементально** только новыми архетипами. В устоявшемся состоянии вызов —
 одна проверка счётчика: ни локов, ни hash-lookup'ов, ни аллокаций (конструктор ~9ns против
-~32ns у `query_typed` через глобальный кэш).
+~32ns у `world.query::<Q>()` через глобальный кэш).
 
 ```rust
 struct ExtractMeshes {
@@ -747,8 +747,8 @@ Query::<(Added<PhysicsBody>, Read<PhysicsBody>)>::new_with_tick(&world, last_run
 Когда типы компонентов не известны статически — используйте `QueryBuilder`.
 
 ```rust
-// QueryBuilder — runtime запрос:
-let arch_ids = world.query()
+// QueryBuilder — runtime запрос (типы не известны статически):
+let arch_ids = world.query_builder()
     .read::<Position>()
     .write::<Velocity>()
     .exclude::<Enemy>()
@@ -814,7 +814,7 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 Внутренний тип очереди — [`Events<T>`](crates/apex-core/src/events.rs:63). Доступ к нему осуществляется через `world.events::<T>()` (immutable) и `world.events_mut::<T>()` (mutable).
 
-> **Авторегистрация (v0.1.0):** `world.send_event::<T>()` и `world.try_send_event::<T>()` автоматически регистрируют тип события, если он ещё не был зарегистрирован. Явный вызов `world.add_event::<T>()` больше не требуется для отправки. `EventReader::new()` по-прежнему требует предварительной регистрации через `add_event` или `send_event`.
+> **Авторегистрация:** `world.send_event::<T>()` автоматически регистрирует тип события, если он ещё не был зарегистрирован. Явный вызов `world.add_event::<T>()` нужен только до первого создания `EventReader::new()`, когда события ещё ни разу не отправлялись.
 
 #### 5.2.1 Базовая отправка и чтение через `EventReader`
 
@@ -847,9 +847,6 @@ let mut reader = EventReader::new(world.events_mut::<DamageEvent>());
 
 // Отправка события (авторегистрация — add_event не нужен):
 world.send_event(DamageEvent { target: enemy, amount: 35.0 });
-
-// Безопасная отправка (всегда успешна — авторегистрация):
-world.try_send_event(DamageEvent { target: enemy, amount: 35.0 });
 
 // Чтение непрочитанных событий через slice (без продвижения курсора):
 for ev in reader.iter() {
@@ -1043,19 +1040,19 @@ system! {
         writer: &mut Vec<DamageEvent>,
     ) {
         writer.reserve(10000);  // предаллоцировать буфер под 10000 событий
-        for (entity, _) in q.iter() {
+        q.for_each(|entity, _| {
             writer.send(DamageEvent { target: entity, amount: 25.0 });
-        }
+        });
     }
 }
 
-// Для add_par_access — через access_desc!:
-sched.add_par_access(
+// Для par_access — через access_desc!:
+sched.add_systems(StageLabel::Update, par_access(
     "collision",
     access_desc!(write_event::<DamageEvent>)
         .event_reserve::<DamageEvent>(10000),
     |ctx| { /* массовая отправка DamageEvent */ },
-);
+));
 ```
 
 Планировщик вызывает `world.event_reserve::<T>(capacity)` перед выполнением системы, что позволяет `EventWriter::send()` работать без аллокаций внутри цикла. В `system!` макросе можно вызвать `writer.reserve()` напрямую.
@@ -1309,8 +1306,9 @@ sched.add_systems(StageLabel::Update, (
 | `par_access(name, access, closure)` | parallel-замыкание с явным `AccessDescriptor` *(advanced)* |
 
 Кортежи принимают до 12 элементов. Имена используются для `chain()`, `before()`/`after()`, event
-pipeline и `apply_deferred()`. Для эксклюзивных систем с `.id()`/зависимостями есть builder-методы
-`add_exclusive_system[_to_stage|_startup]` (см. §6.2).
+pipeline и `apply_deferred()`. **`add_systems(label, …)` — единственный вход регистрации**
+(ревизия API 2026-06-12: зоопарк `add_auto_system`/`add_par*`/`add_*_to_stage`/`add_startup_*`
+удалён — всё выражается конструкторами `sys`/`seq`/`par`/`par_access` + bare-идентификаторами).
 
 ### 6.0a Run Conditions — условное выполнение систем
 
@@ -1395,10 +1393,11 @@ sys("respawn", respawn_system)
 
 ### 6.0b Scope Conditions — условия на группу систем
 
-Условие применяется ко всем системам внутри `staged()`-блока:
+Условие применяется ко всем системам, зарегистрированным внутри `scoped()`-блока
+(по выходе из блока скоуп восстанавливается; вложенные скоупы комбинируются по AND):
 
 ```rust
-sched.staged(StageLabel::tag("combat"), |s| {
+sched.scoped(|s| {
     // Все системы внутри наследуют это условие (AND с их собственными)
     s.run_condition(|w| !w.resource::<GameState>().paused);
 
@@ -1419,17 +1418,13 @@ sched.staged(StageLabel::tag("combat"), |s| {
 Обычно команды (spawn/despawn/insert) применяются **после** завершения stage'а. `apply_deferred()` создаёт точку синхронизации внутри stage'а:
 
 ```rust
-sched.staged(StageLabel::tag("spawn_pipeline"), |s| {
-    s.add_systems(StageLabel::Update, (
-        seq("spawner", |world| { world.spawn(...); }),
-    ));
-    s.apply_deferred();  // ★ команды spawner'а применены к миру
+sched.add_systems(StageLabel::Update, seq("spawner", |world| { world.spawn(...); }));
+sched.apply_deferred();  // ★ команды spawner'а применены к миру
 
-    s.add_systems(StageLabel::Update, (
-        sys("camera", camera),   // ✅ видит только что созданные entity
-        sys("ai", ai),           // ✅ видит только что созданные entity
-    ));
-});
+sched.add_systems(StageLabel::Update, (
+    sys("camera", camera),   // ✅ видит только что созданные entity
+    sys("ai", ai),           // ✅ видит только что созданные entity
+));
 ```
 
 `apply_deferred()` работает на этапе **compile()** — Stage разбивается на под-Stage. Горячий цикл `run()` не знает о split'е — **ноль runtime overhead**.
@@ -1446,12 +1441,14 @@ system! {
 }
 
 let mut sched = Scheduler::new();
-sched.add_auto_system("spawner", spawner);
-sched.add_system("camera", move |world: &mut World| {
-    // ✅ видит заспавненные Enemy — Commands уже применены
-    let count = Query::<Read<Enemy>>::new(world).iter().count();
-    assert!(count > 0);
-});
+sched.add_systems(StageLabel::Update, (
+    spawner,    // bare-идентификатор system! (имя из fn)
+    seq("camera", move |world: &mut World| {
+        // ✅ видит заспавненные Enemy — Commands уже применены
+        let count = Query::<Read<Enemy>>::new(world).iter().count();
+        assert!(count > 0);
+    }),
+));
 sched.chain(&["spawner", "camera"]).unwrap();
 // ↑ compile() видит has_deferred + explicit_ordering → авто-split
 ```
@@ -1544,7 +1541,7 @@ use apex_core::prelude::*;
 system! {
     fn movement_system(
         q: (Read<Velocity>, Write<Position>),
-        keys: &Input<KeyCode>,
+        keys: Res<Input<KeyCode>>,
     ) {
         // ВАЖНО: Write<T> выдаёт smart-pointer Mut<T> → связка требует `mut`
         // (как `for mut x` в Bevy); на DerefMut стампится change-tick.
@@ -1567,9 +1564,8 @@ system! {
         // полный доступ: world.query::<_>(), world.get_mut::<_>(), world.send_event(...)
     }
 }
-// Регистрация:
-//   sched.add_exclusive_system(load_level);                 // builder (.id()/.run_if())
-//   // или в общем кортеже вместе с параллельными:
+// Регистрация — bare-идентификатором (имя из fn), в т.ч. в общем кортеже
+// с параллельными; условия — через SystemConfig::exclusive(load_level).run_if(…):
 //   sched.add_systems(StageLabel::PostUpdate, (move_player, load_level));
 ```
 
@@ -1584,15 +1580,15 @@ system! {
 system! {
     fn full_featured(
         q: (Read<Position>, Write<Velocity>),   // query
-        keys: &Input<KeyCode>,                   // resource read
-        exit: &mut Exit,                         // resource write
-        events: &[CollisionEvent],               // event reader (&[E])
+        keys: Res<Input<KeyCode>>,               // resource read (П2: bare &T — ошибка)
+        exit: ResMut<Exit>,                      // resource write
+        events: &[CollisionEvent],               // event reader (биндится EventReader'ом)
         out: &mut Vec<DamageEvent>,              // event writer (.send())
         cmd: Cmd,                                // commands (отложенные)
         ctx: Ctx,                                // SystemContext
         __whole: WholeWorld,                     // NEEDS_WHOLE_WORLD
     ) {
-        for ev in events { /* ... */ }
+        for ev in events.iter() { /* ... */ }
         out.send(DamageEvent { target: e, amount: 10.0 });
         cmd.despawn(e);
         log::info!("Entities: {}", ctx.entity_count());
@@ -1616,7 +1612,7 @@ system! {
         }
     }
 }
-// Регистрация: sched.add_systems(Update, WaveSpawner::default());
+// Регистрация: sched.add_systems(StageLabel::Update, WaveSpawner::default());
 
 // Поля БЕЗ дефолтов (U.5) → Default НЕ генерируется, поля `pub` — конструируйте сами.
 system! {
@@ -1625,7 +1621,7 @@ system! {
         cmd.spawn((Enemy, s.cfg.spawn_point));
     }
 }
-// Регистрация: sched.add_systems(Update, Accumulator { cfg });
+// Регистрация: sched.add_systems(StageLabel::Update, Accumulator { cfg });
 ```
 
 #### Полная таблица параметров `system!`
@@ -1673,11 +1669,14 @@ system! {
 // СТАЛО — события/ресурсы читаем напрямую из world, команды не нужны:
 system! {
     fn cleanup(world: &mut World) {
-        let dead: Vec<_> = world.event_reader::<DeathEvent>().iter().to_vec();
+        let dead: Vec<DeathEvent> = {
+            let mut reader = world.event_reader::<DeathEvent>();
+            reader.read().into_iter().copied().collect()
+        };
         for ev in dead { world.despawn(ev.entity); }
     }
 }
-sched.add_exclusive_system_to_stage(cleanup, StageLabel::PostUpdate);
+sched.add_systems(StageLabel::PostUpdate, cleanup);
 ```
 
 **Стейтфул-эксклюзив** (например, Lua-раннер):
@@ -1690,19 +1689,19 @@ system! {
     }
 }
 // let runner = LuaRunner { engine: ScriptEngine::with_dir("scripts/") };
-// sched.add_exclusive_system(runner);
+// sched.add_systems(StageLabel::Update, runner);
 ```
 
-**Методы регистрации эксклюзивных систем** (возвращают `SystemBuilder` — `.id()`/`.run_if()`/зависимости):
-`add_exclusive_system(sys)`, `add_exclusive_system_to_stage(sys, label)`, `add_exclusive_startup_system(sys)`.
-Либо — bare-идентификатором в `add_systems(label, (par_sys, excl_sys))` (имя выводится из fn).
+**Регистрация эксклюзивных систем** — bare-идентификатором в
+`add_systems(label, (par_sys, excl_sys))` (имя выводится из fn); с условиями —
+`SystemConfig::exclusive(sys).run_if(…)`; именованное замыкание — `seq("имя", |world| …)`.
 
-> **Единый вход для эксклюзива.** `add_exclusive_system` принимает **любой `FnMut(&mut World)`**:
-> struct-маркеры из `system!`, обычные функции (`fn name(world: &mut World)` — напр.
-> `propagate_transforms`) и инлайн-замыкания — через blanket `impl ExclusiveSystem for FnMut(&mut World)`.
-> Так `propagate_transforms` регистрируется так же, как макрос-системы:
-> `app.add_exclusive_system(StageLabel::PostUpdate, propagate_transforms)`. (`add_sequential_system`/
-> `seq()` остаются как эквивалент для замыканий.)
+> **Единый вход для эксклюзива.** Bare-идентификатор принимает **любой
+> `FnMut(&mut World)`**: struct-маркеры из `system!`, обычные функции
+> (`fn name(world: &mut World)` — напр. `propagate_transforms`) и инлайн-замыкания —
+> через blanket `impl ExclusiveSystem for FnMut(&mut World)`. Так `propagate_transforms`
+> регистрируется так же, как макрос-системы:
+> `app.add_systems(StageLabel::PostUpdate, propagate_transforms)`.
 
 > Большинство бывших sequential-систем после исправления change-detection (`Changed<T>` достоверен,
 > §C1/TD-9) и `Cmd` становятся **параллельными** `system!`. Оставляйте `world: &mut World` только там,
@@ -1741,15 +1740,15 @@ system! {
     fn movement_system(
         q: (Read<Velocity>, Write<Position>),
     ) {
-        for (_, (vel, mut pos)) in q.iter() {   // Write<Position> → Mut<Position>
+        q.for_each(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
-        }
+        });
     }
 }
 
 let mut sched = Scheduler::new();
-sched.add_auto_system("movement", movement_system);
+sched.add_systems(StageLabel::Update, movement_system);
 ```
 
 **Компоненты + ресурсы + события** (ручная реализация и макрос):
@@ -1776,17 +1775,17 @@ impl AutoSystem for PhysicsSystem {
 system! {
     fn physics_system(
         q: (Read<Mass>, Write<Velocity>, Write<Position>),
-        cfg: &PhysicsConfig,
+        cfg: Res<PhysicsConfig>,
         writer: &mut Vec<CollisionEvent>,
     ) {
-        for (entity, (mass, mut vel, pos)) in q.iter() {
+        q.for_each(|entity, (mass, mut vel, pos)| {
             vel.y -= cfg.gravity * mass.0 * cfg.dt;
             if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
-        }
+        });
     }
 }
 
-sched.add_auto_system("physics", physics_system);
+sched.add_systems(StageLabel::Update, physics_system);
 ```
 
 #### 6.1.1 Глобальный доступ (`NEEDS_WHOLE_WORLD`)
@@ -1823,48 +1822,47 @@ system! {
     }
 }
 
-sched.add_auto_system("grav", orbital_system);
+sched.add_systems(StageLabel::Update, orbital_system);
 // ↑ NEEDS_WHOLE_WORLD выставляется макросом автоматически.
 ```
 
 **Что происходит:** система получает полный SubWorld (все entity), ASD не чанкует. Внутрисистемный `par_for_each` при этом остаётся доступен.
 
-**Для `add_par_access`** — через `.whole_world()`:
+**Для `par_access`-замыканий** — через `.whole_world()`:
 
 ```rust
-sched.add_par_access(
+sched.add_systems(StageLabel::Update, par_access(
     "grav",
     access_desc!(write<Velocity>, read<Position>).whole_world(),
     |ctx| { /* глобальный доступ */ },
-);
+));
 ```
 
 > **Когда включать:** система собирает данные ВСЕХ entity (гравитация, BVH, статистика). **Когда НЕ включать:** каждый entity обрабатывается независимо (физика, рендер) — ASD безопасен.
 
-### 6.4 Параллельная система-замыкание (`add_par` / `add_par_access`) — *advanced*
+### 6.4 Параллельные системы-замыкания (`par` / `par_access`) — *advanced*
 
-> **Низкоуровневый API.** Приоритетный путь — типизированные системы через `system!` +
-> `add_systems` (§6.0–6.1). `add_par`/`add_par_access` нужны для **сырых замыканий с динамическим
-> доступом** и удобны внутри `staged(...)`. Их также можно передать в `add_systems` через
-> конструкторы `par(...)`/`par_access(...)`.
-
-Для быстрых прототипов и простых систем можно использовать замыкания вместо
-отдельного `struct` + `impl AutoSystem`.
+> **Низкоуровневый путь.** Приоритет — типизированные системы (`system!` / plain-fn) через
+> `add_systems` (§6.0–6.1). Конструкторы `par(...)`/`par_access(...)` нужны для **сырых
+> замыканий с динамическим доступом**; регистрируются тем же `add_systems`.
 
 **Без доступа к компонентам** (логирование, отладка):
 
 ```rust
-sched.add_par("debug", |_| {
+use apex_scheduler::par;
+
+sched.add_systems(StageLabel::Update, par("debug", |_| {
     println!("tick");
-});
+}));
 ```
 
 **С явным доступом** — используйте `access_desc!` для компактного `AccessDescriptor`:
 
 ```rust
 use apex_core::access_desc;
+use apex_scheduler::par_access;
 
-sched.add_par_access(
+sched.add_systems(StageLabel::Update, par_access(
     "enemy_ai",
     access_desc!(read<Enemy>, write<Velocity>),
     |ctx| {
@@ -1874,37 +1872,26 @@ sched.add_par_access(
                 vel.y *= 0.99;
             });
     },
-);
+));
 ```
 
-**С этапом:**
-```rust
-sched.add_par_access_to_stage(
-    "enemy_ai",
-    access_desc!(read<Enemy>, write<Velocity>),
-    |ctx| { /* ... */ },
-    StageLabel::Update,
-);
-```
+**Система с внутренним `par_for_each`** — пометьте её, чтобы ASD не создавал
+дополнительных чанков (избегает oversubscribe rayon thread pool):
 
-**Система с внутренним `par_for_each`** — установите флаг `.par_for_each_used()` чтобы ASD не создавал дополнительных чанков (избегает oversubscribe rayon thread pool):
-
-**Для `add_par_access`** — через `AccessDescriptor`:
 ```rust
-sched.add_par_access(
+// Для par_access — флаг прямо на AccessDescriptor:
+sched.add_systems(StageLabel::Update, par_access(
     "heavy_physics",
     access_desc!(write<Pos>, read<Vel>).par_for_each_used(),
     |ctx| {
         ctx.query::<(Read<Vel>, Write<Pos>)>()
             .par_for_each(|_, (v, mut p)| { /* CPU-bound расчёты */ });
     },
-);
-```
+));
 
-**Для `add_auto_system`** — через `Scheduler::par_for_each_used()`:
-```rust
-let id = sched.add_auto_system("heavy_physics", HeavyPhysSys);
-sched.par_for_each_used(id);  // пометить как использующую par_for_each
+// Для типизированных систем — по имени после регистрации:
+sched.add_systems(StageLabel::Update, sys("heavy_physics", HeavyPhysSys));
+sched.par_for_each_used_by_name("heavy_physics").unwrap();
 ```
 
 > **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
@@ -1918,28 +1905,28 @@ sched.par_for_each_used(id);  // пометить как использующу�
 Эксклюзивная система получает `&mut World` и выполняется строго одна в своём Stage — используется для structural changes (spawn/despawn).
 
 ```rust
-// Sequential системы — замыкания fn(&mut World):
-sched.add_system("despawn_dead", |world: &mut World| {
-    use apex_core::system_param::EventReader;
-    let mut reader = EventReader::new(world.events_mut::<DeathEvent>());
-    let deaths: Vec<Entity> = reader
-        .iter()
-        .map(|ev| ev.entity)
-        .collect();
+// Эксклюзивные замыкания — seq("имя", |world| …) в add_systems:
+use apex_scheduler::seq;
+
+sched.add_systems(StageLabel::PostUpdate, seq("despawn_dead", |world: &mut World| {
+    let deaths: Vec<Entity> = {
+        let mut reader = world.event_reader::<DeathEvent>();
+        reader.read().into_iter().map(|ev| ev.entity).collect()
+    };
 
     for entity in deaths {
         world.despawn(entity);
     }
-});
+}));
 ```
 
 > **Автоматическое упорядочивание (v0.1.0):** Планировщик сам:
 > - Группирует параллельные системы в более ранних топологических уровнях, а Sequential — в более поздних, независимо от порядка регистрации.
 > - Обеспечивает порядок событий: все `Emit<E>` выполняются до `Listen<E>` (разные Stage), несколько `Listen<E>` — параллельно.
 > - **Sequential барьеры используют один dummy-узел** (N+M рёбер вместо N×M) — результат тот же, но `debug_plan_verbose()` чище.
-> - **Предупреждение о позднем Startup:** начиная с v0.1.0, при вызове `add_startup_system`/`add_startup_auto_system` после завершения Startup-этапа — `log::warn!`.
+> - **Предупреждение о позднем Startup:** `add_systems(Startup, …)` после завершения Startup-этапа пишет `log::warn!` (система не выполнится).
 >
-> Регистрируйте системы в любом порядке — `compile()` выстроит оптимальную группировку. Явные `add_dependency()` по-прежнему работают и имеют приоритет над автоматическим порядком.
+> Регистрируйте системы в любом порядке — `compile()` выстроит оптимальную группировку. Явный порядок (`chain`/`before`/`after`) имеет приоритет над автоматическим.
 
 ### 6.6 Компиляция и запуск планировщика
 
@@ -1947,19 +1934,14 @@ sched.add_system("despawn_dead", |world: &mut World| {
 let mut sched = Scheduler::new();
 
 // Регистрация — порядок не важен, планировщик сам переупорядочит:
-sched.add_auto_system("physics",      PhysicsSystem);
-sched.add_auto_system("damage_apply", damage_apply);
-sched.add_auto_system("health_clamp", HealthClampSystem);
-sched.add_auto_system("despawn_dead", despawn_dead);
-sched.add_auto_system("movement",    MovementSystem);
-
-// Компиляция расписания:
-sched.compile().unwrap();
-
-// Игровой цикл (v0.1.0 — tick() только инкрементирует, flush в sched.run()):
-world.tick();
-sched.run(&mut world);   // ← автоматически флашит события после каждого Stage
-sched.add_auto_system("stats_update", stats_update);
+sched.add_systems(StageLabel::Update, (
+    sys("physics", PhysicsSystem),
+    sys("health_clamp", HealthClampSystem),
+    sys("movement", MovementSystem),
+    damage_apply,     // bare-идентификаторы system! — имя из fn
+    despawn_dead,
+    stats_update,
+));
 
 // Явное упорядочивание (рекомендуется):
 sched.chain(&["damage_apply", "health_clamp", "despawn_dead", "stats_update"]).unwrap();
@@ -1969,21 +1951,18 @@ sched.chain(&["damage_apply", "health_clamp", "despawn_dead", "stats_update"]).u
 sched.before("ai", "render").unwrap();   // ai до render
 sched.after("render", "input").unwrap(); // render после input
 
-// Низкоуровневое API (по SystemId):
-let despawn_id = sched.add_system("despawn_dead", despawn_dead).id();
-sched.add_dependency(stats_id, despawn_id); // stats после despawn
-
 // Компиляция — строит граф, проверяет циклы, группирует в Stage:
 sched.compile().expect("circular dependency detected");
 
 // Диагностика плана:
 println!("{}", sched.debug_plan());
 
-// Последовательный запуск:
-sched.run_sequential(&mut world);
+// Игровой цикл (tick() только инкрементирует, flush в sched.run()):
+world.tick();
+sched.run(&mut world);   // ← автоматически флашит события после каждого Stage
 
-// Параллельный запуск:
-sched.run(&mut world);
+// Последовательный запуск (тесты/отладка):
+sched.run_sequential(&mut world);
 ```
 
 > **`compile_with_world()`:** Начиная с v0.1.0, доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
@@ -2010,25 +1989,18 @@ StageLabel::Custom("physics".to_string());
 StageLabel::tag("physics");
 ```
 
-**Смена этапа по умолчанию (`set_default_stage()`):**
+**Регистрация в свой этап** — явная метка в `add_systems`:
 
 ```rust
-sched.set_default_stage(StageLabel::tag("update"));
-sched.add_auto_system("particles", Particles); // → этап "update"
-```
+sched.add_systems(StageLabel::tag("input"), (
+    sys("read_keys", ReadKeys),
+    sys("parse", Parse),
+));
 
-**Скоуп-регистрация (`staged()`):** временно подменяет `default_stage_label` внутри замыкания. Все `add_*_system` (без `_to_stage`) внутри closure попадают в указанный этап:
-
-```rust
-sched.staged(StageLabel::tag("input"), |s| {
-    s.add_auto_system("read_keys", ReadKeys);  // → этап "input"
-    s.add_auto_system("parse", Parse);         // → этап "input"
-});
-
-sched.staged(StageLabel::tag("sim"), |s| {
-    s.add_auto_system("physics", Physics);     // → этап "sim"
-    s.add_auto_system("ai", AI);               // → этап "sim"
-});
+sched.add_systems(StageLabel::tag("sim"), (
+    sys("physics", Physics),
+    sys("ai", AI),
+));
 ```
 
 **Порядок этапов (`configure_stages()`):**
@@ -2047,20 +2019,16 @@ sched.configure_stages(vec![
 ```rust
 // Plugin A — знает только свой этап
 fn plugin_a(sched: &mut Scheduler) {
-    sched.staged(StageLabel::tag("input"), |s| {
-        s.add_auto_system("read_keys", ReadKeys);
-    });
-    sched.staged(StageLabel::tag("render"), |s| {
-        s.add_auto_system("draw", Draw);
-    });
+    sched.add_systems(StageLabel::tag("input"), sys("read_keys", ReadKeys));
+    sched.add_systems(StageLabel::tag("render"), sys("draw", Draw));
 }
 
 // Plugin B — тоже знает только свой этап
 fn plugin_b(sched: &mut Scheduler) {
-    sched.staged(StageLabel::tag("sim"), |s| {
-        s.add_auto_system("physics", Physics);
-        s.add_auto_system("ai", AI);
-    });
+    sched.add_systems(StageLabel::tag("sim"), (
+        sys("physics", Physics),
+        sys("ai", AI),
+    ));
 }
 
 // App — одна строка порядка:
@@ -2073,7 +2041,7 @@ sched.configure_stages(vec![
 // Результат: input → sim (physics + ai параллельно) → render
 ```
 
-> **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, FixedUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `staged()` временно подменяет `default_stage_label` на время замыкания и восстанавливает предыдущее значение после выхода. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных.
+> **Как это работает:** `StageLabel` — это enum (Startup, First, PreUpdate, FixedUpdate, Update, PostUpdate, Last, Custom). `StageLabel::tag()` — краткий конструктор для `Custom`. `configure_stages()` задаёт порядок этапов — системы с неуказанными этапами выполняются после всех указанных. Скоуп-условий это не касается — см. `scoped()` (§6.0b).
 
 #### 6.4.2 Явное упорядочивание систем
 
@@ -2082,8 +2050,10 @@ sched.configure_stages(vec![
 Для разрешения конфликтов используется явное упорядочивание, которое имеет **приоритет** над авто-детектом:
 
 ```rust
-sched.add_auto_system("gravity", GravitySystem);
-sched.add_auto_system("physics", PhysicsSystem);
+sched.add_systems(StageLabel::Update, (
+    sys("gravity", GravitySystem),
+    sys("physics", PhysicsSystem),
+));
 
 // Способ 1: .chain() — цепочка систем (рекомендуется)
 sched.chain(&["gravity", "physics"]).unwrap();
@@ -2104,9 +2074,10 @@ sched.after("physics", "gravity").unwrap();
 | `chain(names)` | `sched.chain(&["a", "b", "c"])` | Цепочка: a → b → c (основной способ) |
 | `before(name, name)` | `sched.before("a", "b")` | a выполняется до b |
 | `after(name, name)` | `sched.after("b", "a")` | b выполняется после a |
-| `add_dependency(id, id)` | `sched.add_dependency(b, a)` | Низкоуровневое API по `SystemId` |
 
-Все методы принимают строковые имена систем (те же, что передаются в `add_auto_system` / `add_system`). При отсутствии системы с указанным именем возвращается `SchedulerError::SystemNotFound`.
+Все методы принимают строковые имена систем (имена из `sys("имя", …)`/`seq("имя", …)` или
+выведенные из fn для bare-идентификаторов). При отсутствии системы с указанным именем
+возвращается `SchedulerError::SystemNotFound`.
 
 **Как это работает:** при вызове `.before("a", "b")` планировщик сохраняет пару `(a, b)` во внутреннем множестве `explicit_orderings`. При обнаружении `BidirectionalWriteRead` между `a` и `b` на шаге построения графа — рёбра, противоречащие явному порядку, **подавляются** (не добавляются в граф). Цикл не возникает, системы выполняются в указанном порядке.
 
@@ -2176,8 +2147,8 @@ fn run(&mut self, ctx: SystemContext<'_>) {
         .par_for_each(|_, (v, mut p)| {
             /* выполняется на нескольких потоках */
         });
-    // Для add_auto_system: sched.par_for_each_used(id) после регистрации
-    // Для add_par_access: access_desc!(...).par_for_each_used()
+    // Для типизированных систем: sched.par_for_each_used_by_name("имя")
+    // Для par_access-замыканий: access_desc!(...).par_for_each_used()
 
     // Thread-local Commands (начиная с v0.1.0):
     ctx.commands().despawn(entity);
@@ -2339,7 +2310,7 @@ fn extract_cameras(
     q: Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,
     out: ResWrite<ExtractedCamera>,
 ) {
-    for (_, (cam, transform)) in q.iter() {
+    for (cam, transform) in q.iter() {   // iter() выдаёт item (П1)
         *out = ExtractedCamera::new(cam, transform);
     }
 }
@@ -3123,7 +3094,10 @@ let mut sub = IsolatedWorld::new();
 
 // Зарегистрировать компоненты и системы как в обычном мире:
 sub.world_mut().register_component::<Position>();
-sub.scheduler_mut().add_system("move", |w: &mut World| { /* ... */ });
+sub.scheduler_mut().add_systems(
+    StageLabel::Update,
+    seq("move", |w: &mut World| { /* ... */ }),
+);
 
 // Один кадр: scheduler.run() + world.tick()
 sub.tick();
@@ -3254,9 +3228,9 @@ main_bridge.send_event(&"serialized".to_string());          // с сериали
 main_bridge.apply_incoming(&mut main_world);                // приём
 
 // Система синхронизации — применяет входящие события каждый кадр:
-sched.add_system("sync_bridge", |world: &mut World| {
+sched.add_systems(StageLabel::PreUpdate, seq("sync_bridge", |world: &mut World| {
     sync_bridge_cloneable(world);
-});
+}));
 ```
 
 ### 12.4 Полный пример: два мира
@@ -3353,7 +3327,7 @@ for each system:
 > всегда видят все entity своих архетипов — каждый SubWorld содержит полный набор строк.
 >
 > **Системы с глобальным доступом:** `const NEEDS_WHOLE_WORLD = true` (или `.whole_world()`
-> в `add_par_access`) запрещает ASD-чанкование. Подробнее: [раздел 6.1.1](#611-глобальный-доступ-needs_whole_world).
+> на `AccessDescriptor` у `par_access`) запрещает ASD-чанкование. Подробнее: [раздел 6.1.1](#611-глобальный-доступ-needs_whole_world).
 
 #### 13.1.3 Параметры настройки параллелизма
 
@@ -3442,17 +3416,17 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 });
 ```
 
-> **Флаг `.par_for_each_used()`:** Для `add_par_access` — через `AccessDescriptor`:
+> **Флаг `.par_for_each_used()`:** Для `par_access`-замыканий — через `AccessDescriptor`:
 > ```rust
-> sched.add_par_access("heavy_sys",
+> sched.add_systems(StageLabel::Update, par_access("heavy_sys",
 >     access_desc!(read<A>, write<B>).par_for_each_used(),
 >     |ctx| { ctx.query::<(Read<A>, Write<B>)>().par_for_each(|_, (a, mut b)| { ... }); },
-> );
+> ));
 > ```
-> Для `add_auto_system` — через `Scheduler::par_for_each_used(id)` (метод доступен с v0.1.0):
+> Для типизированных систем — по имени после регистрации:
 > ```rust
-> let id = sched.add_auto_system("heavy_sys", MyAutoSys);
-> sched.par_for_each_used(id);
+> sched.add_systems(StageLabel::Update, sys("heavy_sys", MyAutoSys));
+> sched.par_for_each_used_by_name("heavy_sys").unwrap();
 > ```
 > Планировщик не будет дополнительно чанковать такую систему через ASD, избегая oversubscribe rayon thread pool.
 
@@ -3529,10 +3503,10 @@ system! {
     }
 }
 // Регистрация:
-sched.add_exclusive_system_to_stage(ScriptedSystem::default(), StageLabel::PostUpdate);
+sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 ```
 
-**В параллельной системе (`AutoSystem`/`add_par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте.
+**В параллельной системе (`AutoSystem`/`par_access`) — НЕЛЬЗЯ.** ScriptEngine требует `&mut World`, который недоступен в параллельном контексте.
 
 Подробнее — в [разделе 17](#17-lua-scripting).
 
@@ -3550,8 +3524,8 @@ sched.add_exclusive_system_to_stage(ScriptedSystem::default(), StageLabel::PostU
 
 ### 14.2 Query
 
-- `CachedQuery` (`world.query_typed<Q>()`) переиспользует список архетипов — дешевле `Query::new()` в hot path
-- Для ДОЛГОЖИВУЩИХ горячих запросов (системы, extract) — `QueryState<Q>` (§4.3.2): инкрементальный стейт у владельца, ноль локов/аллокаций на вызов (~9ns конструктор против ~32ns у `query_typed`)
+- `CachedQuery` (`world.query::<Q>()`) переиспользует список архетипов — дешевле `Query::new()` в hot path
+- Для ДОЛГОЖИВУЩИХ горячих запросов (системы, extract) — `QueryState<Q>` (§4.3.2): инкрементальный стейт у владельца, ноль локов/аллокаций на вызов (~9ns конструктор против ~32ns у `world.query::<Q>()`)
 - Массовые не-фильтрующие проходы — `for_each_chunk` (§4.3.1): слайсы колонок, автовекторизация, ~1.4× быстрее per-row `for_each` (W2-0.5)
 - «Изменился любой из» — `Or<(Changed<A>, Changed<B>)>` вместо двух запросов + dedup-set (§4.3)
 - Используйте `With<T>`/`Without<T>` для фильтрации вместо `if` внутри closure
@@ -3565,7 +3539,7 @@ sched.add_exclusive_system_to_stage(ScriptedSystem::default(), StageLabel::PostU
 
 ### 14.4 Планировщик
 
-- **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential. Явные `add_dependency()` имеют приоритет.
+- **Порядок регистрации не важен** — планировщик автоматически группирует параллельные системы перед Sequential. Явный порядок (`chain`/`before`/`after`) имеет приоритет.
 - Один `compile()` при старте, потом только `run()` — повторный `compile()` при `graph_dirty=false` возвращается мгновенно (~0µs)
 - Автоотключение PAR (`set_parallel_auto_disable(true)` по умолчанию, пороги 15K/25K/80K entity/system) защищает от деградации на малых мирах
 - Чем больше параллельных систем без конфликтов — тем лучше масштабируется на N ядер
@@ -3585,7 +3559,7 @@ sched.add_exclusive_system_to_stage(ScriptedSystem::default(), StageLabel::PostU
   });
   ```
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
-- **Флаг `.par_for_each_used()`** — для `add_par_access` через `access_desc!(...).par_for_each_used()`, для `add_auto_system` через `sched.par_for_each_used(id)` после регистрации.
+- **Флаг `.par_for_each_used()`** — для `par_access` через `access_desc!(...).par_for_each_used()`, для типизированных систем — `sched.par_for_each_used_by_name("имя")` после регистрации.
 
 ```rust
 // Хорошо: CPU-bound, много entity
@@ -3753,19 +3727,19 @@ struct DeathEvent { entity: Entity }
 system! {
     fn movement_system(
         q: (Read<Velocity>, Write<Position>),
-        dt: &DeltaTime,
+        dt: Res<DeltaTime>,
     ) {
-        for (_, (vel, mut pos)) in q.iter() {   // Write<Position> → Mut<Position>
+        q.for_each(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
             pos.x += vel.x * dt.0;
             pos.y += vel.y * dt.0;
-        }
+        });
     }
 }
 
 system! {
     fn cleanup_dead(world: &mut World) {
-        let dead: Vec<_> = world
-            .query_typed::<Read<Health>>()
+        let dead: Vec<Entity> = world
+            .query::<(Entity, Read<Health>)>()
             .iter()
             .filter(|(_, hp)| hp.current <= 0.0)
             .map(|(e, _)| e)
@@ -3801,17 +3775,11 @@ fn main() {
         Health   { current: 50.0, max: 50.0 },
     ));
 
-    // Планировщик
+    // Планировщик: единый вход add_systems + явные этапы
     let mut sched = Scheduler::new();
 
-    // Группировка систем по этапам через StageLabel::tag() + staged():
-    sched.staged(StageLabel::tag("sim"), |s| {
-        s.add_auto_system("movement", movement_system);
-    });
-
-    sched.staged(StageLabel::tag("cleanup"), |s| {
-        s.add_exclusive_system(cleanup_dead);   // эксклюзивная (world: &mut World)
-    });
+    sched.add_systems(StageLabel::tag("sim"), movement_system);
+    sched.add_systems(StageLabel::tag("cleanup"), cleanup_dead); // эксклюзивная
 
     // sim → cleanup → остальные
     sched.configure_stages(vec![
@@ -3936,7 +3904,6 @@ fn main() {
 | `remove_resource::<T>()` | Удалить ресурс → `Option<T>` |
 | `add_event::<T>()` | Зарегистрировать тип события (опционально — `send_event` регистрирует сам) |
 | `send_event(event)` | Отправить событие (авторегистрация, не паникует) |
-| `try_send_event(event)` | Безопасная отправка события → `bool` (всегда true) |
 | `event_reserve::<T>(cap)` | Предаллоцировать буфер для событий типа T (избежать реаллокаций) |
 | `event_reserve_by_type(type_id, cap)` | То же по `TypeId` (для планировщика) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
@@ -3944,8 +3911,9 @@ fn main() {
 | `event_reader::<T>()` | Создать `EventReader<T>` (рекомендуется, зеркало `ctx.event_reader()`) |
 | `event_writer::<T>()` | Создать `EventWriter<T>` |
 | `tick()` | Инкрементировать счётчик тика (flush событий — Scheduler) |
-| `query_typed::<Q>()` | CachedQuery — кешированный запрос |
-| `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>` как фильтр в Q) |
+| `query::<Q>()` | CachedQuery — кешированный типизированный запрос (Bevy 1:1) |
+| `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>`/`Added<T>` как фильтр в Q) |
+| `query_builder()` | Динамический запрос по runtime-`ComponentId` (скриптинг/инспектор) |
 | `query_relation::<K, Q>(kind, target)` | Query по relation |
 | `query_wildcard::<K, Q>(kind)` | Query по relation (любой target) |
 | `add_relation(s, kind, t)` | Создать связь subject→target (O(1), без структурных изменений; мёртвые s/t — no-op+warn) |
@@ -4014,34 +3982,24 @@ generation entity не участвует — НЕ использовать дл
 ### Scheduler API
 
 | Метод | Описание |
-|---|---|---|
-| `add_systems(label, systems)` | **Единый вход**: plain-fn системы (D2-1), bare `system!`-идентификаторы, `SystemConfig` и кортежи до 12 — см. §6.0 |
+|---|---|
+| `add_systems(label, systems)` | **Единственный вход регистрации**: plain-fn системы (D2-1), bare `system!`-идентификаторы (параллельные и эксклюзивные), `SystemConfig` (`sys`/`seq`/`par`/`par_access` + `.run_if*`) и кортежи до 12 — см. §6.0 |
 | `FixedTime` (ресурс) | Фиксированный шаг для `StageLabel::FixedUpdate`: `from_hz`/`accumulate`/`overstep_fraction`, кап шагов (D2-5, §6.0d) |
 | `init_state(world, sched, s)` / `in_state`/`on_enter`/`on_exit` | App-состояния поверх run conditions; переход через `NextState<S>` (D2-6, §6.0e) |
-| `add_auto_system(name, sys)` | Добавить AutoSystem (компоненты + ресурсы + события) |
-| `add_par(name, f)` | Добавить параллельную систему-замыкание (без доступа к компонентам) |
-| `add_par_access(name, access, f)` | Добавить параллельную систему-замыкание с явным `AccessDescriptor` |
-| `add_system(name, f)` | Добавить Sequential систему в default_stage_label |
-| `add_system_to_stage(name, f, label)` | Добавить Sequential систему в указанный этап |
-| `add_auto_system_to_stage(name, sys, label)` | Добавить AutoSystem в указанный этап |
-| `add_par_access_to_stage(name, access, f, label)` | Добавить параллельную систему-замыкание с access в указанный этап |
-| `add_startup_system(name, f)` | Добавить Sequential систему в Startup этап |
-| `add_startup_auto_system(name, sys)` | Добавить AutoSystem в Startup этап |
-| `add_dependency(a, b)` | `a` выполняется после `b` (по `SystemId`) |
+| `scoped(\|s\| { ... })` | Скоуп условий: `run_condition` внутри блока применяется ко всем регистрациям; по выходе восстанавливается (§6.0b) |
+| `run_condition(f)` | Scope condition внутри `scoped()` (AND с собственными условиями систем) |
 | `chain(names)` | Цепочка систем: `chain(&["a","b","c"])` — каждая после предыдущей |
 | `before(a, b)` | `a` выполняется до `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
 | `after(a, b)` | `a` выполняется после `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
-| `set_default_stage(label)` | Установить этап по умолчанию (вместо `Update`) |
-| `staged(label, \|s\| { ... })` | Скоуп-регистрация: все `add_*` внутри получают `label` |
 | `configure_stages(order)` | Задать порядок этапов (вместо порядка по приоритету) |
+| `apply_deferred()` | Sync-point после последней зарегистрированной системы (§6.0c) |
 | `compile()` | Скомпилировать план → `Result` (возвращает мгновенно если граф не изменился) |
 | `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `enable_event_ordering(bool)` | Вкл/выкл автоматическое упорядочивание по `Emit`/`Listen` (по умолч. `true`) |
 | `set_parallel_min_entities(n)` | Минимальное total entity в Stage для PAR (по умолч. `0` — без ограничений) |
 | `set_parallel_auto_disable(bool)` | Автоотключение PAR по per-system entity count (по умолч. **`true`**) |
 | `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
-| `par_for_each_used(id)` | Пометить систему (по `SystemId`) как использующую `par_for_each` внутри |
-| `system_access(id)` | Получить `&AccessDescriptor` системы по `SystemId` (для валидации) |
+| `par_for_each_used_by_name(name)` | Пометить систему как использующую `par_for_each` внутри (ASD не чанкует) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |
 | `debug_plan()` | Краткий план выполнения |
@@ -4091,11 +4049,11 @@ generation entity не участвует — НЕ использовать дл
 
 | Метод | Описание |
 |---|---|
-| `add_plugin(plugin)` | Добавить плагин (вызывает `Plugin::build()`) |
-| `add_systems(label, tuple)` | **Рекомендуемо.** Кортеж систем (2-12): bare-идентификаторы `system!` — параллельные и эксклюзивные — имена из fn |
-| `add_exclusive_system[_to_stage\|_startup](sys)` | Эксклюзивная система (`system!` + `world: &mut World`) → `SystemBuilder` |
-| `add_auto_system(name, system)` | Параллельная `AutoSystem` с явным именем |
-| `add_system(name, FnMut(&mut World))` | Эксклюзивное замыкание `FnMut(&mut World)` |
+| `add_plugins(plugins)` | Плагин / кортеж плагинов / группа (`DefaultPlugins`), D2-7 |
+| `add_systems(label, systems)` | **Единственный вход регистрации** — формы те же, что у `Scheduler::add_systems` |
+| `insert_resource(r)` / `init_resource::<T>()` | Вставка ресурсов (1:1 Bevy) |
+| `add_state(initial)` | App-состояния `State<S>`/`NextState<S>` (D2-6) |
+| `chain(names)` / `before(a,b)` / `after(a,b)` | Явный порядок систем по именам |
 | `configure_stages(order)` | Порядок этапов |
 | `world()` / `world_mut()` | Доступ к World |
 | `scheduler_mut()` | Доступ к Scheduler |
@@ -4111,8 +4069,8 @@ generation entity не участвует — НЕ использовать дл
 `name: &[E]`, `name: &mut Vec<E>`, `name: Cmd`, `name: Ctx`, `__whole: WholeWorld`.
 
 **Эксклюзивная** (`impl ExclusiveSystem`, FULL access, alone) — параметр `world: &mut World`
-(**только он**, не комбинируется с другими). Регистрация — `add_exclusive_system(...)` или
-bare-идентификатором в `add_systems(...)`.
+(**только он**, не комбинируется с другими). Регистрация — bare-идентификатором в
+`add_systems(...)`; с условиями — `SystemConfig::exclusive(sys).run_if(…)`.
 
 **Со состоянием** — `struct {…}` + `fn run(s: &mut Self, …)`; поля с `= default` → генерируется
 `Default`; поля без дефолтов (U.5) → `pub`, конструируйте значением.
@@ -4219,12 +4177,13 @@ bare-идентификатором в `add_systems(...)`.
 
 | Метод | Описание |
 |---|---|
-| `sched.add_systems(label, (...))` | Кортеж систем (до 12); bare-идентификаторы `system!` |
-| bare `move_player` / `load_level` | Параллельная / эксклюзивная `system!` — имя из fn |
+| `sched.add_systems(label, (...))` | **Единственный вход**: кортеж систем (до 12); plain-fn, bare-идентификаторы `system!`, `SystemConfig` |
+| bare `movement` (plain-fn) / `move_player` / `load_level` | plain-fn / параллельная / эксклюзивная `system!` — имя из fn |
 | `sys("name", struct)` | Конструктор AutoSystem с явным именем |
 | `seq("name", fn)` | Конструктор эксклюзивного замыкания `FnMut(&mut World)` |
 | `par("name", closure)` | Конструктор parallel-замыкания *(advanced)* |
 | `par_access("name", access, closure)` | parallel-замыкание с `AccessDescriptor` *(advanced)* |
+| `SystemConfig::exclusive(sys)` | Эксклюзивная `system!` как конфиг (для `.run_if*`) |
 
 **Run Conditions**
 
@@ -4235,7 +4194,7 @@ bare-идентификатором в `add_systems(...)`.
 | `.run_if_cond((a, b))` | Tuple AND — оба typed, access мержится |
 | `.or_else(closure)` | Opaque OR-комбинация — хотя бы одно true |
 | `.or_else_cond(typed)` | Typed OR-условие |
-| `s.run_condition(f)` | Scope condition внутри `staged()` — применяется ко всем системам |
+| `s.run_condition(f)` | Scope condition внутри `scoped()` — применяется ко всем системам |
 | `conditions::resource_exists::<T>()` | Ресурс T существует? (typed, `access: read<T>`) |
 | `conditions::resource_equals(val)` | Ресурс равен значению? (typed, `access: read<T>`) |
 | `conditions::any_with_component::<T>()` | Есть entity с компонентом? (typed, `access: read<T>`) |
@@ -4296,7 +4255,7 @@ bare-идентификатором в `add_systems(...)`.
 
 **Назначение — непроизводительные элементы.** Lua-скриптинг однопоточный внутренне
 (скрипты выполняются последовательно) и не может выполняться в параллельных
-системах (`AutoSystem`/`add_par_access`). `ScriptEngine` привязан к потоку создания
+системах (`AutoSystem`/`par_access`). `ScriptEngine` привязан к потоку создания
 (не `Send`). Он идеален для событийно-ориентированной логики (диалоги, квесты,
 триггеры), тюнинга параметров и быстрого прототипирования. Для CPU-bound обработки
 тысяч сущностей оставайтесь на чистых Rust-системах (`AutoSystem`).
@@ -4626,7 +4585,7 @@ impl ScriptableRegistrar for Health {
 | `world.archetypes()` | Список архетипов для итерации |
 | `world.insert_resource(value)` | Вставить ресурс |
 | `world.try_resource::<T>()` | Безопасное чтение ресурса |
-| `world.try_send_event(event)` | Безопасная отправка события |
+| `world.send_event(event)` | Отправка события (авторегистрация типа) |
 | `world.entity_allocator()` | Доступ к аллокатору entity (поиск по индексу) |
 
 ---

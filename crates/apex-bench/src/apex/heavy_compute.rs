@@ -3,7 +3,7 @@ use cgmath::{Matrix4, Rad, Vector3, SquareMatrix, Transform as _};
 use crate::{Position, Rotation, Velocity};
 
 // HeavyCompute — тяжёлые вычисления: invert матрицы + transform_vector
-// CachedQuery кешируется через QueryCache внутри query_typed()
+// CachedQuery кешируется через QueryCache внутри query()
 pub struct HeavyCompute {
     world: World,
 }
@@ -29,7 +29,7 @@ impl HeavyCompute {
     }
 
     pub fn run(&self) {
-        self.world.query_typed::<(Write<Matrix4<f32>>, Write<Position>)>()
+        self.world.query::<(Write<Matrix4<f32>>, Write<Position>)>()
             .par_for_each(|_, (mut mat, mut pos)| {
                 let mut m = *mat;
                 for _ in 0..100 {

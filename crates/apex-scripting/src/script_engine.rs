@@ -271,12 +271,9 @@ impl ScriptEngine {
             name: T::type_name_str(),
             emit: |value: &mlua::Value, world: &mut World| -> bool {
                 if let Some(event) = T::from_lua(value) {
-                    if world.try_send_event(event) {
-                        true
-                    } else {
-                        log::warn!("emit_event: событие '{}' не зарегистрировано в world", T::type_name_str());
-                        false
-                    }
+                    // send_event авторегистрирует тип — отправка всегда успешна.
+                    world.send_event(event);
+                    true
                 } else {
                     log::warn!("emit_event: не удалось конвертировать Lua value в {}", T::type_name_str());
                     false

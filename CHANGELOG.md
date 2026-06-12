@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Changed — ревизия публичного API (2026-06-12, движок не публиковался — без deprecation)
+
+- **`Scheduler::add_systems(label, …)` — единственный вход регистрации систем.**
+  Удалён публичный зоопарк из 15 методов (`add_auto_system[_to_stage]`,
+  `add_system[_to_stage]`, `add_par[_to_stage]`, `add_par_access[_to_stage]`,
+  `add_startup_*`, `add_exclusive_system[_to_stage|_startup]`, `set_default_stage`,
+  `par_for_each_used(id)`, `add_dependency(id,id)`, `system_access(id)`,
+  `set_run_if[_cond]`) — всё выражается `add_systems` + конструкторами
+  `sys`/`seq`/`par`/`par_access`/`SystemConfig::exclusive` + bare-идентификаторами;
+  порядок — `chain`/`before`/`after` по именам, `par_for_each_used_by_name`.
+- **`staged(label, f)` → `scoped(f)`**: скоуп-условия отделены от стадий (стадия
+  теперь всегда явная в `add_systems`). Попутно закрыты ДВА латентных бага:
+  (1) путь `add_systems` молча терял scope-условия (документированный паттерн
+  §6.0b не работал); (2) scope-условие никогда не сбрасывалось и «прилипало»
+  ко всем последующим регистрациям. Регрессионный тест
+  `scoped_condition_applies_to_add_systems_and_does_not_leak`.
+- **`App` (apex-app)**: удалены `add_system`/`add_system_with`/`AppSystemBuilder`/
+  `add_startup_system`/`add_sequential_system`/`add_exclusive_system` —
+  остался единый `add_systems` (формы те же, что у Scheduler).
+- **`World::query_typed::<Q>()` → `World::query::<Q>()`** (Bevy 1:1);
+  динамический билдер `World::query()` → `World::query_builder()`.
+- **Удалён `World::try_send_event`** — дубль `send_event` (всегда возвращал true).
+- `add_systems(Startup, …)` после завершения Startup-этапа теперь предупреждает
+  в лог (раньше предупреждали только удалённые `add_startup_*`).
+
 ### Added
 
 - **`for e in reader.read()` — прямая итерация по событиям (1:1 Bevy, TD-24

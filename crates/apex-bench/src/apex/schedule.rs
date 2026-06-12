@@ -77,9 +77,14 @@ impl Schedule {
         world.spawn_many(10_000, |_| (A(0.0), B(0.0), C(0.0), E(0.0)));
 
         let mut scheduler = Scheduler::new();
-        scheduler.add_auto_system("SysAB", sys_ab);
-        scheduler.add_auto_system("SysCD", sys_cd);
-        scheduler.add_auto_system("SysCE", sys_ce);
+        scheduler.add_systems(
+            apex_scheduler::StageLabel::Update,
+            (
+                apex_scheduler::sys("SysAB", sys_ab),
+                apex_scheduler::sys("SysCD", sys_cd),
+                apex_scheduler::sys("SysCE", sys_ce),
+            ),
+        );
         scheduler.compile().unwrap();
 
         Self { world, scheduler }

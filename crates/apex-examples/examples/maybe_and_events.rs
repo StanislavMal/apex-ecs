@@ -124,9 +124,7 @@ fn main() {
     world.send_event(CollisionEvent { entity: player, damage: 25.0 });
     println!("  ✓ send_event(CollisionEvent) — авто-регистрация");
 
-    // try_send_event теперь тоже всегда успешен
-    assert!(world.try_send_event(ScoreEvent(200)));
-    println!("  ✓ try_send_event — всегда true");
+    world.send_event(ScoreEvent(200));
 
     // Читаем события (world.tick() инкрементирует тик, flush_all_events() продвигает буферы)
     world.tick();
@@ -278,7 +276,6 @@ fn main() {
     println!("✅ Maybe<T> — опциональные компоненты без world.get()");
     println!("✅ MaybeWrite<T> — опциональная мутация");
     println!("✅ send_event — без add_event (авторегистрация)");
-    println!("✅ try_send_event — всегда успешен");
     println!("✅ try_resource — безопасный доступ к ресурсам");
     println!("✅ read_partial — пакетное чтение без потери событий");
     println!("✅ DelayedQueue — отложенная доставка с BinaryHeap + FIFO");

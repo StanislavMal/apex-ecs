@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use apex_core::prelude::*;
 use apex_core::access_desc;
 use apex_macros::Component;
-use apex_scheduler::{Scheduler, SystemId};
+use apex_scheduler::{seq, sys, Scheduler, StageLabel};
 
 // ── Компоненты ─────────────────────────────────────────────────
 
@@ -141,7 +141,7 @@ fn make_world_3comp(n: usize) -> World {
 fn make_world_3comp_with_entities(n: usize) -> (World, Vec<Entity>) {
     let world = make_world_3comp(n);
     let mut entities = Vec::with_capacity(n);
-    world.query_typed::<Read<Position>>().for_each(|e, _| entities.push(e));
+    world.query::<Read<Position>>().for_each(|e, _| entities.push(e));
     (world, entities)
 }
 
@@ -494,14 +494,14 @@ fn bench_scheduler_throughput(n: usize) {
 
     sched_bench!(
         &format!("1 AutoSystem: movement      ({n}k)"),
-        { let mut s = Scheduler::new(); s.add_auto_system("move", move_sys); s },
+        { let mut s = Scheduler::new(); s.add_systems(StageLabel::Update, sys("move", move_sys)); s },
         make_world_3comp(n * 1000)
     );
 
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("move", move_sys);
-        sched.add_auto_system("hp",   hp_sys);
+        sched.add_systems(StageLabel::Update, sys("move", move_sys));
+        sched.add_systems(StageLabel::Update, sys("hp", hp_sys));
         sched.compile().unwrap();
         let stages = sched.stages().unwrap().len();
         debug_assert_eq!(stages, 1, "ожидаем 1 Stage без конфликтов");
@@ -518,14 +518,14 @@ fn bench_scheduler_throughput(n: usize) {
 
     {
         let mut sched = Scheduler::new();
-        sched.add_par_access(
+        sched.add_systems(StageLabel::Update, apex_scheduler::par_access(
             "physics",
             access_desc!(read<PhysicsConfig>, write<Position>),
             |ctx| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
                 ctx.query::<Write<Position>>().for_each(|_, mut pos| { pos.x += dt; });
             },
-        );
+        ));
         sched.compile().unwrap();
         bench_with_setup(
             &format!("FnParSystem + resource     ({n}k)"),
@@ -544,10 +544,10 @@ fn bench_scheduler_throughput(n: usize) {
 
     {
         let mut sched = Scheduler::new();
-        sched.add_system("move", |world: &mut World| {
+        sched.add_systems(StageLabel::Update, seq("move", |world: &mut World| {
             Query::<(Read<Velocity>, Write<Position>)>::new(world)
                 .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
-        });
+        }));
         sched.compile().unwrap();
         bench_with_setup(
             &format!("1 Sequential system        ({n}k)"),
@@ -562,17 +562,17 @@ fn bench_scheduler_throughput(n: usize) {
 
     sched_bench!(
         &format!("1 AutoSystem               ({n}k)"),
-        { let mut s = Scheduler::new(); s.add_auto_system("auto", auto_move_sys); s },
+        { let mut s = Scheduler::new(); s.add_systems(StageLabel::Update, sys("auto", auto_move_sys)); s },
         make_world_3comp(n * 1000)
     );
 
     // Debug plan
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("physics",  move_sys);
-        sched.add_auto_system("hp_clamp", hp_sys);
-        sched.add_system("commands", |_| {});
-        sched.add_auto_system("ai", move_sys);
+        sched.add_systems(StageLabel::Update, sys("physics", move_sys));
+        sched.add_systems(StageLabel::Update, sys("hp_clamp", hp_sys));
+        sched.add_systems(StageLabel::Update, seq("commands", |_w: &mut World| {}));
+        sched.add_systems(StageLabel::Update, sys("ai", move_sys));
         sched.compile().unwrap();
         println!("  Mixed pipeline plan:\n{}", sched.debug_plan());
     }
@@ -608,8 +608,8 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    if i % 2 == 0 { sched.add_auto_system(format!("s{i}"), SimpleSys); }
-                    else           { sched.add_auto_system(format!("s{i}"), OtherSys);  }
+                    if i % 2 == 0 { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), SimpleSys)); }
+                    else           { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys));  }
                 }
                 sched.compile().unwrap();
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -625,7 +625,7 @@ fn bench_compile_overhead() {
             || (),
             |()| {
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), SimpleSys); }
+                for i in 0..n_sys { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), SimpleSys)); }
                 sched.compile().unwrap();
                 debug_assert_eq!(sched.stages().unwrap().len(), n_sys);
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -640,8 +640,8 @@ fn bench_compile_overhead() {
         || (),
         |()| {
             let mut sched = Scheduler::new();
-            for i in 0..5 { sched.add_auto_system(format!("p{i}"), OtherSys); }
-            for i in 0..5 { sched.add_system(format!("s{i}"), |_| {}); }
+            for i in 0..5 { sched.add_systems(StageLabel::Update, sys(format!("p{i}"), OtherSys)); }
+            for i in 0..5 { sched.add_systems(StageLabel::Update, seq(format!("s{i}"), |_w: &mut World| {})); }
             sched.compile().unwrap();
             std::hint::black_box(sched.stages().unwrap().len());
             1
@@ -658,7 +658,7 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    sched.add_auto_system(format!("s{i}"), OtherSys);
+                    sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys));
                     sched.compile().unwrap();
                 }
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -676,7 +676,7 @@ fn bench_compile_overhead() {
             || (),
             |()| {
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), OtherSys); }
+                for i in 0..n_sys { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys)); }
                 sched.compile().unwrap();
                 std::hint::black_box(sched.stages().unwrap().len());
                 1
@@ -688,7 +688,7 @@ fn bench_compile_overhead() {
             |()| {
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys {
-                    sched.add_auto_system(format!("s{i}"), OtherSys);
+                    sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys));
                     sched.compile().unwrap();
                 }
                 std::hint::black_box(sched.stages().unwrap().len());
@@ -707,7 +707,7 @@ fn bench_compile_overhead() {
             || {
                 // setup: первый compile — не входит в измерение
                 let mut sched = Scheduler::new();
-                for i in 0..n_sys { sched.add_auto_system(format!("s{i}"), OtherSys); }
+                for i in 0..n_sys { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys)); }
                 sched.compile().unwrap();
                 sched
             },
@@ -727,12 +727,12 @@ fn bench_compile_overhead() {
         "add 1 system → recompile (N=10 → 11)",
         || {
             let mut sched = Scheduler::new();
-            for i in 0..10 { sched.add_auto_system(format!("s{i}"), OtherSys); }
+            for i in 0..10 { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys)); }
             sched.compile().unwrap();
             sched
         },
         |mut sched: Scheduler| {
-            sched.add_auto_system("s_new", OtherSys);
+            sched.add_systems(StageLabel::Update, sys("s_new", OtherSys));
             sched.compile().unwrap();
             std::hint::black_box(sched.stages().unwrap().len());
             1
@@ -740,17 +740,16 @@ fn bench_compile_overhead() {
     );
 
     bench_with_setup(
-        "add_dependency → recompile (N=5)",
+        "after() → recompile (N=5)",
         || {
             let mut sched = Scheduler::new();
-            let a = sched.add_auto_system("sa", OtherSys).id();
-            let b = sched.add_auto_system("sb", OtherSys).id();
-            for i in 2..5 { sched.add_auto_system(format!("s{i}"), OtherSys); }
+            sched.add_systems(StageLabel::Update, (sys("sa", OtherSys), sys("sb", OtherSys)));
+            for i in 2..5 { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys)); }
             sched.compile().unwrap();
-            (sched, a, b)
+            sched
         },
-        |(mut sched, a, b): (Scheduler, SystemId, SystemId)| {
-            sched.add_dependency(b, a);
+        |mut sched: Scheduler| {
+            sched.after("sb", "sa").unwrap();
             sched.compile().unwrap();
             std::hint::black_box(sched.stages().unwrap().len());
             1
@@ -892,7 +891,7 @@ fn bench_query(n: usize) {
         || make_world_3comp(n * 1000),
         |world: World| {
             let mut sum = 0.0f32;
-            world.query_typed::<Read<Position>>()
+            world.query::<Read<Position>>()
                 .for_each(|_, p| { sum += p.x; });
             std::hint::black_box(sum);
             (n * 1000) as u64
@@ -1051,8 +1050,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("move", move_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("hp",   hp_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("move", move_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("hp", hp_sys)); }
         );
         bench_seq_par(
             &format!("2 лёгких системы ({n}k)  Move+Hp"),
@@ -1064,10 +1063,10 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("move", move_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("hp",   hp_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", temp_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("mana", mana_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("move", move_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("hp", hp_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", temp_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", mana_sys)); }
         );
         // Проверяем 1 Stage
         debug_assert_eq!(seq.stages().unwrap().len(), 1);
@@ -1121,8 +1120,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         bench_seq_par(
             &format!("2 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1134,9 +1133,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         bench_seq_par(
             &format!("3 CPU-bound, изолированные архетипы ({n}k each)"),
@@ -1155,8 +1154,8 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         bench_seq_par(
             &format!("2 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1168,9 +1167,9 @@ fn bench_parallel_scheduler(n: usize) {
 
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         bench_seq_par(
             &format!("3 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
@@ -1254,12 +1253,12 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys).id(); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys).id(); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys)); s.par_for_each_used_by_name("phys").unwrap(); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys)); s.par_for_each_used_by_name("temp").unwrap(); },
         );
         bench_seq_par(
             &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1278,14 +1277,14 @@ fn bench_parallel_scheduler(n: usize) {
     // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
     {
         let (seq_sched, par_sched) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("phys", heavy_phys_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("temp", heavy_temp_sys); },
-            |s: &mut Scheduler| { s.add_auto_system("mana", heavy_mana_sys); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { let id = s.add_auto_system("phys", HeavyPhysParSys).id(); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("temp", HeavyTempParSys).id(); s.par_for_each_used(id); },
-            |s: &mut Scheduler| { let id = s.add_auto_system("mana", HeavyManaParSys).id(); s.par_for_each_used(id); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys)); s.par_for_each_used_by_name("phys").unwrap(); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys)); s.par_for_each_used_by_name("temp").unwrap(); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", HeavyManaParSys)); s.par_for_each_used_by_name("mana").unwrap(); },
         );
         bench_seq_par(
             &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1389,8 +1388,8 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 1: 2 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
-            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); }
         );
         bench_seq_par(
             &format!("2 solo-системы, 2 архетипа ({n}k each)"),
@@ -1403,10 +1402,10 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 2: 4 системы ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
-            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); },
-            |s: &mut Scheduler| { s.add_auto_system("s2", SoloSys2); },
-            |s: &mut Scheduler| { s.add_auto_system("s3", SoloSys3); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); }
         );
         bench_seq_par(
             &format!("4 solo-системы, 4 архетипа ({n}k each)"),
@@ -1419,14 +1418,14 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 3: 8 систем ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("s0", SoloSys0); },
-            |s: &mut Scheduler| { s.add_auto_system("s1", SoloSys1); },
-            |s: &mut Scheduler| { s.add_auto_system("s2", SoloSys2); },
-            |s: &mut Scheduler| { s.add_auto_system("s3", SoloSys3); },
-            |s: &mut Scheduler| { s.add_auto_system("s4", SoloSys4); },
-            |s: &mut Scheduler| { s.add_auto_system("s5", SoloSys5); },
-            |s: &mut Scheduler| { s.add_auto_system("s6", SoloSys6); },
-            |s: &mut Scheduler| { s.add_auto_system("s7", SoloSys7); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", SoloSys4)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", SoloSys5)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", SoloSys6)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", SoloSys7)); }
         );
         bench_seq_par(
             &format!("8 solo-систем, 8 архетипов ({n}k each)"),
@@ -1439,18 +1438,18 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Тест 4: 12 систем (полная загрузка всех ядер) ─────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_auto_system("s0",  SoloSys0); },
-            |s: &mut Scheduler| { s.add_auto_system("s1",  SoloSys1); },
-            |s: &mut Scheduler| { s.add_auto_system("s2",  SoloSys2); },
-            |s: &mut Scheduler| { s.add_auto_system("s3",  SoloSys3); },
-            |s: &mut Scheduler| { s.add_auto_system("s4",  SoloSys4); },
-            |s: &mut Scheduler| { s.add_auto_system("s5",  SoloSys5); },
-            |s: &mut Scheduler| { s.add_auto_system("s6",  SoloSys6); },
-            |s: &mut Scheduler| { s.add_auto_system("s7",  SoloSys7); },
-            |s: &mut Scheduler| { s.add_auto_system("s8",  SoloSys8); },
-            |s: &mut Scheduler| { s.add_auto_system("s9",  SoloSys9); },
-            |s: &mut Scheduler| { s.add_auto_system("s10", SoloSys10); },
-            |s: &mut Scheduler| { s.add_auto_system("s11", SoloSys11); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", SoloSys4)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", SoloSys5)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", SoloSys6)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", SoloSys7)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s8", SoloSys8)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s9", SoloSys9)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s10", SoloSys10)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s11", SoloSys11)); }
         );
         bench_seq_par(
             &format!("12 solo-систем, 12 архетипов ({n}k each)"),
@@ -1466,11 +1465,11 @@ fn bench_parallel_scheduler(n: usize) {
     {
         let build_sched = || {
             let mut s = Scheduler::new();
-            s.add_auto_system("p1", move_sys);
-            s.add_auto_system("h1", hp_sys);
-            s.add_system("barrier", |_: &mut World| {});
-            s.add_auto_system("p2", move_sys);
-            s.add_auto_system("h2", hp_sys);
+            s.add_systems(StageLabel::Update, sys("p1", move_sys));
+            s.add_systems(StageLabel::Update, sys("h1", hp_sys));
+            s.add_systems(StageLabel::Update, seq("barrier", |_: &mut World| {}));
+            s.add_systems(StageLabel::Update, sys("p2", move_sys));
+            s.add_systems(StageLabel::Update, sys("h2", hp_sys));
             s.compile().unwrap();
             s
         };
@@ -1487,13 +1486,13 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Debug plan ────────────────────────────────────────────
     {
         let mut sched = Scheduler::new();
-        sched.add_auto_system("move", move_sys);
-        sched.add_auto_system("hp",   hp_sys);
-        sched.add_auto_system("temp", temp_sys);
-        sched.add_auto_system("mana", mana_sys);
-        sched.add_system("commands", |_| {});
-        sched.add_auto_system("move2", move_sys);
-        sched.add_auto_system("hp2",   hp_sys);
+        sched.add_systems(StageLabel::Update, sys("move", move_sys));
+        sched.add_systems(StageLabel::Update, sys("hp", hp_sys));
+        sched.add_systems(StageLabel::Update, sys("temp", temp_sys));
+        sched.add_systems(StageLabel::Update, sys("mana", mana_sys));
+        sched.add_systems(StageLabel::Update, seq("commands", |_w: &mut World| {}));
+        sched.add_systems(StageLabel::Update, sys("move2", move_sys));
+        sched.add_systems(StageLabel::Update, sys("hp2", hp_sys));
         let test_world = make_world_5comp(n * 1000);
         sched.compile_with_world(&test_world).unwrap();
         println!("\n  Pipeline plan:\n{}", sched.debug_plan());
@@ -1616,13 +1615,13 @@ fn bench_intra_system_parallel(n: usize) {
         make_multiarch,
         |world| {
             let mut s = Scheduler::new();
-            s.add_auto_system("seq", LightSeqSys);
+            s.add_systems(StageLabel::Update, sys("seq", LightSeqSys));
             s.compile().unwrap();
             s.run_sequential(world);
         },
         |world| {
             let mut s = Scheduler::new();
-            s.add_auto_system("par", LightParSys);
+            s.add_systems(StageLabel::Update, sys("par", LightParSys));
             s.compile().unwrap();
             s.run_sequential(world); // intra-sys par через rayon внутри системы
         },
@@ -1634,13 +1633,13 @@ fn bench_intra_system_parallel(n: usize) {
         make_multiarch,
         |world| {
             let mut s = Scheduler::new();
-            s.add_auto_system("seq", HeavySeqSys);
+            s.add_systems(StageLabel::Update, sys("seq", HeavySeqSys));
             s.compile().unwrap();
             s.run_sequential(world);
         },
         |world| {
             let mut s = Scheduler::new();
-            s.add_auto_system("par", HeavyIntraParSys);
+            s.add_systems(StageLabel::Update, sys("par", HeavyIntraParSys));
             s.compile().unwrap();
             s.run_sequential(world);
         },

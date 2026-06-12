@@ -15,7 +15,7 @@
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
 use apex_macros::Component;
-use apex_scheduler::Scheduler;
+use apex_scheduler::{par_access, sys, Scheduler, StageLabel};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // КОМПОНЕНТЫ
@@ -195,16 +195,19 @@ system! {
 #[allow(dead_code)]
 fn register_par_for_each_demo(sched: &mut Scheduler) {
     use apex_core::access_desc;
-    sched.add_par_access(
-        "demo_intra_par",
-        access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
-        |ctx| {
-            ctx.query::<(Read<Velocity>, Write<Position>)>()
-                .par_for_each(|_, (vel, mut pos)| {
-                    pos.x += vel.x * 0.016;
-                    pos.y += vel.y * 0.016;
-                });
-        },
+    sched.add_systems(
+        StageLabel::Update,
+        par_access(
+            "demo_intra_par",
+            access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
+            |ctx| {
+                ctx.query::<(Read<Velocity>, Write<Position>)>()
+                    .par_for_each(|_, (vel, mut pos)| {
+                        pos.x += vel.x * 0.016;
+                        pos.y += vel.y * 0.016;
+                    });
+            },
+        ),
     );
 }
 
@@ -353,9 +356,9 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
         // Sequential
         let mut ws = build_world(n);
         let mut ss = Scheduler::new();
-        ss.add_auto_system("movement_reader", movement_reader_system);
-        ss.add_auto_system("health_reader",   health_reader_system);
-        ss.add_auto_system("physics_reader",  physics_reader_system);
+        ss.add_systems(StageLabel::Update, sys("movement_reader", movement_reader_system));
+        ss.add_systems(StageLabel::Update, sys("health_reader", health_reader_system));
+        ss.add_systems(StageLabel::Update, sys("physics_reader", physics_reader_system));
         ss.compile_with_world(&ws).expect("compile");
         let warmup = ticks_measure / 5;
         for _ in 0..warmup { ws.tick(); ss.run_sequential(&mut ws); }
@@ -371,9 +374,9 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
         // Parallel
         let mut wp = build_world(n);
         let mut sp = Scheduler::new();
-        sp.add_auto_system("movement_reader", movement_reader_system);
-        sp.add_auto_system("health_reader",   health_reader_system);
-        sp.add_auto_system("physics_reader",  physics_reader_system);
+        sp.add_systems(StageLabel::Update, sys("movement_reader", movement_reader_system));
+        sp.add_systems(StageLabel::Update, sys("health_reader", health_reader_system));
+        sp.add_systems(StageLabel::Update, sys("physics_reader", physics_reader_system));
         sp.compile_with_world(&wp).expect("compile");
         let par = measure_scheduler("par", &mut wp, &mut sp, warmup, ticks_measure);
 
@@ -424,7 +427,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             }
             // SEQ
             let mut s = Scheduler::new();
-            s.add_auto_system("movement", movement_writer_system);
+            s.add_systems(StageLabel::Update, sys("movement", movement_writer_system));
             s.compile_with_world(&world).expect("compile");
             for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
             let ec = world.entity_count();
@@ -446,7 +449,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
                 ));
             }
             let mut sp = Scheduler::new();
-            sp.add_auto_system("movement", movement_writer_system);
+            sp.add_systems(StageLabel::Update, sys("movement", movement_writer_system));
             sp.compile_with_world(&world2).expect("compile");
             par_one = measure_scheduler("1arch_par", &mut world2, &mut sp, warmup, ticks_measure);
         }
@@ -475,7 +478,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
             }
             // SEQ
             let mut s = Scheduler::new();
-            s.add_auto_system("movement", movement_writer_system);
+            s.add_systems(StageLabel::Update, sys("movement", movement_writer_system));
             s.compile_with_world(&world).expect("compile");
             for _ in 0..warmup { world.tick(); s.run_sequential(&mut world); }
             let ec = world.entity_count();
@@ -506,7 +509,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
                 world2.spawn((Position { x: f, y: 3.0, z: 0.0 }, Velocity { x: 1.0, y: 0.0, z: 0.0 }, TagD));
             }
             let mut sp = Scheduler::new();
-            sp.add_auto_system("movement", movement_writer_system);
+            sp.add_systems(StageLabel::Update, sys("movement", movement_writer_system));
             sp.compile_with_world(&world2).expect("compile");
             par_four = measure_scheduler("4arch_par", &mut world2, &mut sp, warmup, ticks_measure);
         }
@@ -550,9 +553,11 @@ fn run_event_pipeline() -> Vec<EventResult> {
         }
 
         let mut sched = Scheduler::new();
-        let writer_id   = sched.add_auto_system("health_writer",   health_writer_system).id();
-        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system).id();
-        sched.add_dependency(listener_id, writer_id);
+        sched.add_systems(StageLabel::Update, (
+            sys("health_writer", health_writer_system),
+            sys("damage_listener", damage_listener_system),
+        ));
+        sched.chain(&["health_writer", "damage_listener"]).expect("chain");
         sched.compile_with_world(&world).expect("compile");
 
         let res = measure_scheduler("event", &mut world, &mut sched, warmup, ticks_measure);
@@ -596,13 +601,15 @@ fn run_full_pipeline() -> Vec<FullPipeResult> {
         }
 
         let mut sched = Scheduler::new();
-        sched.add_auto_system("movement_reader", movement_reader_system);
-        sched.add_auto_system("health_reader",   health_reader_system);
-        sched.add_auto_system("physics_reader",  physics_reader_system);
-        let health_id   = sched.add_auto_system("health_writer",   health_writer_system).id();
-        sched.add_auto_system("cooldown",        cooldown_system);
-        let listener_id = sched.add_auto_system("damage_listener", damage_listener_system).id();
-        sched.add_dependency(listener_id, health_id);
+        sched.add_systems(StageLabel::Update, sys("movement_reader", movement_reader_system));
+        sched.add_systems(StageLabel::Update, sys("health_reader", health_reader_system));
+        sched.add_systems(StageLabel::Update, sys("physics_reader", physics_reader_system));
+        sched.add_systems(StageLabel::Update, (
+            sys("health_writer", health_writer_system),
+            sys("cooldown", cooldown_system),
+            sys("damage_listener", damage_listener_system),
+        ));
+        sched.chain(&["health_writer", "damage_listener"]).expect("chain");
         sched.compile_with_world(&world).expect("compile");
 
         let res = measure_scheduler("full", &mut world, &mut sched, warmup, ticks_measure);
