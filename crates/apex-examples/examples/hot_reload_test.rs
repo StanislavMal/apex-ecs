@@ -193,7 +193,7 @@ end
     // Ищем entity с обоими компонентами (Position + Velocity)
     let before_pos = {
         let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
-        q.iter().next().map(|(_, (p, _))| *p)
+        q.iter().next().map(|(p, _)| *p)
     };
 
     // Wait for watcher to detect file change 
@@ -204,7 +204,7 @@ end
 
     let after_pos = {
         let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
-        q.iter().next().map(|(_, (p, _))| *p)
+        q.iter().next().map(|(p, _)| *p)
     };
 
     match (before_pos, after_pos) {
@@ -511,7 +511,7 @@ end
 
     let before = {
         let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
-        q.iter().next().map(|(_, (p, _))| *p)
+        q.iter().next().map(|(p, _)| *p)
     };
 
     std::thread::sleep(Duration::from_millis(200));
@@ -521,7 +521,7 @@ end
 
     let after = {
         let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
-        q.iter().next().map(|(_, (p, _))| *p)
+        q.iter().next().map(|(p, _)| *p)
     };
 
     match (before, after) {

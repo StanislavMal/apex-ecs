@@ -55,9 +55,9 @@ system! {
         writer: &mut Vec<DamageEvent>,
     ) {
         let count = q.len();
-        for (entity, _) in q.iter() {
+        q.for_each(|entity, _| {
             writer.send(DamageEvent { target: entity, amount: 25.0 });
-        }
+        });
         println!("  [CollisionSystem] emitted {}x DamageEvent(25.0)", count);
     }
 }
@@ -89,10 +89,11 @@ system! {
             writer.send(DamageEvent { target: ev.target, amount: reduced });
             println!("  [ArmorSystem]  entity={:?} dmg={:.1} armor={:.0} → reduced={:.1}",
                 ev.target, ev.amount,
-                q.iter()
-                    .find(|(e, _)| *e == ev.target)
-                    .map(|(_, (a, _))| a.0)
-                    .unwrap_or(0.0),
+                {
+                    let mut armor_val = 0.0;
+                    q.for_each(|e, (a, _)| if e == ev.target { armor_val = a.0 });
+                    armor_val
+                },
                 reduced);
         }
         if count == 0 {
@@ -108,9 +109,9 @@ system! {
     fn health_system(
         q: Read<Health>,
     ) {
-        for (entity, hp) in q.iter() {
+        q.for_each(|entity, hp| {
             println!("  [HealthSystem] entity={:?} HP={:.1}/{}", entity, hp.current, hp.max);
-        }
+        });
     }
 }
 

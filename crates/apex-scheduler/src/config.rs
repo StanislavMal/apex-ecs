@@ -321,6 +321,26 @@ where
     }
 }
 
+/// Builder-методы прямо на plain-fn системе (П4, как Bevy `IntoSystemConfigs`):
+/// `movement.run_if(in_state(Game::Playing))` — без обёртки в
+/// `SystemConfig::fn_sys`.
+pub trait FnSystemExt<M>: apex_core::SystemParamFunction<M> + Sized {
+    /// Превратить fn в [`SystemConfig`] (имя — из имени функции).
+    fn into_config(self) -> SystemConfig {
+        SystemConfig::fn_sys(self)
+    }
+
+    /// Условие выполнения (см. [`SystemConfig::run_if`]).
+    fn run_if<C>(self, cond: C) -> SystemConfig
+    where
+        C: Fn(&apex_core::world::World) -> bool + Send + Sync + 'static,
+    {
+        self.into_config().run_if(cond)
+    }
+}
+
+impl<F, M> FnSystemExt<M> for F where F: apex_core::SystemParamFunction<M> {}
+
 macro_rules! impl_into_schedule_configs_tuple {
     ($($T:ident : $M:ident),+) => {
         impl<$($T, $M),+> IntoScheduleConfigs<($($M,)+)> for ($($T,)+)

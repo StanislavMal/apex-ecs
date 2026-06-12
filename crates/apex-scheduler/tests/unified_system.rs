@@ -39,7 +39,7 @@ fn unified_add_systems_bare_identifiers() {
 
     let counters: Vec<u32> = Query::<Read<Counter>>::new(&world)
         .iter()
-        .map(|(_, c)| c.0)
+        .map(|c| c.0)
         .collect();
 
     // exclusive_spawn создал второй entity ⇒ всего 2.
@@ -76,7 +76,7 @@ fn stateful_system_without_default() {
     let v = Query::<Read<Counter>>::new(&world)
         .iter()
         .next()
-        .map(|(_, c)| c.0)
+        .map(|c| c.0)
         .unwrap();
     assert_eq!(v, 10, "state-система без Default должна аккумулировать (2×step)");
 }
@@ -102,7 +102,7 @@ fn exclusive_system_full_world_access() {
 struct ChangedCount(usize);
 
 system! {
-    fn detect_changed(q: (Changed<Counter>, Read<Counter>), out: &mut ChangedCount) {
+    fn detect_changed(q: (Changed<Counter>, Read<Counter>), out: ResMut<ChangedCount>) {
         let mut n = 0;
         q.for_each(|_, _| n += 1);
         out.0 = n;

@@ -78,7 +78,7 @@ struct DamageEvent { target: Entity, amount: f32 }
 system! {
     fn movement_reader_system(
         q: (Read<Position>, Read<Velocity>),
-        dt: &DeltaTime,
+        dt: Res<DeltaTime>,
     ) {
         let mut sum = 0.0f32;
         q.for_each(|_, (pos, vel)| {
@@ -103,7 +103,7 @@ system! {
 system! {
     fn physics_reader_system(
         q: (Read<Mass>, Read<Acceleration>),
-        g: &Gravity,
+        g: Res<Gravity>,
     ) {
         let mut force_sum = 0.0f32;
         q.for_each(|_, (m, a)| {
@@ -116,7 +116,7 @@ system! {
 system! {
     fn movement_writer_system(
         q: (Write<Position>, Read<Velocity>),
-        dt: &DeltaTime,
+        dt: Res<DeltaTime>,
     ) {
         q.for_each(|_, (mut pos, vel)| {
             pos.x += vel.x * dt.0;
@@ -129,7 +129,7 @@ system! {
 system! {
     fn movement_writer_system2(
         q: (Write<Position>, Read<Acceleration>),
-        dt: &DeltaTime,
+        dt: Res<DeltaTime>,
     ) {
         q.for_each(|_, (mut pos, acc)| {
             pos.x += acc.x * dt.0 * dt.0 * 0.5;
@@ -167,7 +167,7 @@ system! {
 system! {
     fn counter_writer_system(
         q: Read<Health>,
-        counter: &mut GlobalCounter,
+        counter: ResMut<GlobalCounter>,
     ) {
         q.for_each(|_, _| { counter.0 += 1; });
     }
@@ -176,7 +176,7 @@ system! {
 system! {
     fn cooldown_system(
         q: Write<Cooldown>,
-        dt: &DeltaTime,
+        dt: Res<DeltaTime>,
     ) {
         q.for_each(|_, mut cd| {
             if cd.0 > 0.0 { cd.0 -= dt.0; }

@@ -166,7 +166,7 @@ fn main() {
                     }
                 }
                 system! {
-                    fn $r(evs: &[$E], sink: &mut Sink) {
+                    fn $r(evs: &[$E], sink: ResMut<Sink>) {
                         sink.0 += evs.len() as u64;
                     }
                 }

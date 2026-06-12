@@ -336,6 +336,46 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &mut T {
     }
 }
 
+// ── Entity как форма запроса (П1/TD-8, Bevy-паритет) ───────────
+
+/// `Entity` — обычная форма запроса: `Query<(Entity, &Pos)>` выдаёт id
+/// сущности в составе item. После П1 `iter()`/for-цикл выдают ТОЛЬКО item —
+/// entity больше не навязана; нужна — запросите явно (как в Bevy).
+impl WorldQuery for Entity {
+    type Item<'w> = Entity;
+    /// Указатель на массив `Archetype::entities` (живёт, пока жив мир и нет
+    /// структурных изменений — стандартный инвариант итерации).
+    type State = *const Entity;
+
+    #[inline]
+    fn component_count() -> usize {
+        0
+    }
+
+    fn fill_ids(_world: &World, _ids: &mut IdBuf) {}
+
+    fn fill_cache_key(_world: &World, _key: &mut smallvec::SmallVec<[u64; 8]>) {}
+
+    fn matches_archetype(_arch: &Archetype, _ids: &[ComponentId]) -> bool {
+        true
+    }
+
+    unsafe fn fetch_state(arch: &Archetype, _: &[ComponentId], _: Tick, _: Tick) -> Self::State {
+        arch.entities().as_ptr()
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+        Some(*state.add(row))
+    }
+}
+
+impl WorldQuerySystemAccess for Entity {
+    fn system_access() -> AccessDescriptor {
+        AccessDescriptor::new()
+    }
+}
+
 // ── With<T> ────────────────────────────────────────────────────
 
 pub struct With<T: Component>(std::marker::PhantomData<T>);
@@ -1266,34 +1306,49 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             .unwrap_or((0, usize::MAX))
     }
 
-    /// Итератор по entity и компонентам.
+    /// Итератор по item'ам запроса (П1: entity — через форму
+    /// `Query<(Entity, …)>`, как в Bevy).
     pub fn iter(&self) -> QueryIter<'_, Q, F> {
         QueryIter {
             archetypes: &self.archetypes,
-            world: self.world,
             arch_cursor: 0,
             row_cursor: 0,
             row_ranges: self.row_ranges,
         }
     }
 
-    /// Consuming итератор — для использования в ParamQuery.
-    #[allow(dead_code)]
-    pub(crate) fn into_iter_owned(self) -> QueryIterOwned<'w, Q, F> {
-        QueryIterOwned {
-            query: self,
-            arch_cursor: 0,
-            row_cursor: 0,
+    /// Item конкретной entity, если она матчит запрос (П3, Bevy-паритет
+    /// `Query::get`). O(1) по location + поиск архетипа среди матчащих
+    /// (их единицы); построчные фильтры (`Changed`/`Added` в Q или F)
+    /// применяются — не прошедшая фильтр entity даёт `None`.
+    pub fn get(&self, entity: Entity) -> Option<Q::Item<'_>> {
+        let loc = self.world.entities.get_location(entity)?;
+        let arch_idx = loc.archetype_id.as_usize();
+        let a = self.archetypes.iter().find(|a| a.arch_idx == arch_idx)?;
+        let row = loc.row as usize;
+        let (r_start, r_end) = self.row_range(arch_idx);
+        if row < r_start || row >= r_end.min(a.len) {
+            return None;
         }
+        unsafe { <(Q, F)>::fetch_item(a.state, row) }.map(|(item, _)| item)
+    }
+
+    /// Алиас [`get`](Self::get) для мутабельных форм (Bevy-паритет;
+    /// item `Write<T>` — это `Mut<T>`, `&self` достаточно).
+    #[inline]
+    pub fn get_mut(&mut self, entity: Entity) -> Option<Q::Item<'_>> {
+        self.get(entity)
     }
 
     /// Ровно одна матчащаяся entity (Bevy-паритет, D2-2).
     ///
-    /// `Err(QuerySingleError)` при нуле или нескольких. Работает и для
-    /// мутабельных форм (item `Write<T>` — это `Mut<T>`), поэтому отдельного
-    /// `&mut self`-варианта не требуется; [`single_mut`](Self::single_mut) —
-    /// алиас для привычки мигранта.
-    pub fn single(&self) -> Result<(Entity, Q::Item<'_>), QuerySingleError> {
+    /// `Err(QuerySingleError)` при нуле или нескольких. Выдаёт `Q::Item`
+    /// (как Bevy); нужна entity — включите её в запрос:
+    /// `Query<(Entity, &Hp)>` (П1). Работает и для мутабельных форм (item
+    /// `Write<T>` — это `Mut<T>`), поэтому отдельного `&mut self`-варианта
+    /// не требуется; [`single_mut`](Self::single_mut) — алиас для привычки
+    /// мигранта.
+    pub fn single(&self) -> Result<Q::Item<'_>, QuerySingleError> {
         let mut it = self.iter();
         let first = it.next().ok_or(QuerySingleError::NoEntities)?;
         if it.next().is_some() {
@@ -1304,7 +1359,7 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
 
     /// Алиас [`single`](Self::single) (Bevy-паритет).
     #[inline]
-    pub fn single_mut(&mut self) -> Result<(Entity, Q::Item<'_>), QuerySingleError> {
+    pub fn single_mut(&mut self) -> Result<Q::Item<'_>, QuerySingleError> {
         self.single()
     }
 
@@ -1484,14 +1539,15 @@ where
     F::State: 'q,
 {
     archetypes: &'q [ArchState<<(Q, F) as WorldQuery>::State>],
-    world: &'q World,
     arch_cursor: usize,
     row_cursor: usize,
     row_ranges: &'q [(usize, usize, usize)],
 }
 
 impl<'q, Q: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, Q, F> {
-    type Item = (Entity, Q::Item<'q>);
+    /// П1 (TD-8): итерация выдаёт ТОЛЬКО `Q::Item` (Bevy 1:1). Entity больше
+    /// не навязана — включайте её в запрос явно: `Query<(Entity, &Pos)>`.
+    type Item = Q::Item<'q>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -1510,8 +1566,7 @@ impl<'q, Q: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, Q, F> {
             let row = self.row_cursor;
             self.row_cursor += 1;
             if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
-                let entity = self.world.archetypes[a.arch_idx].entities[row];
-                return Some((entity, item));
+                return Some(item);
             }
         }
     }
@@ -1544,59 +1599,27 @@ impl std::fmt::Display for QuerySingleError {
 
 impl std::error::Error for QuerySingleError {}
 
-/// `for (entity, item) in &query` (D2-2) — поверх существующего `iter()`:
-/// выдаёт `(Entity, Q::Item)`, как и остальные пути итерации ядра.
+/// `for item in &query` (D2-2/П1) — Bevy 1:1: выдаёт `Q::Item`; entity —
+/// через форму запроса (`for (e, hp) in &Query::<(Entity, &Hp)>::new(&w)`).
 impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q Query<'w, Q, F> {
-    type Item = (Entity, Q::Item<'q>);
+    type Item = Q::Item<'q>;
     type IntoIter = QueryIter<'q, Q, F>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-/// `for (entity, mut item) in &mut query` — привычная Bevy-форма для
-/// мутабельных запросов (наш `iter()` и так выдаёт `Mut<T>` через `&self`,
-/// но `&mut`-форма оставлена для построчного переноса кода).
+/// `for mut item in &mut query` — привычная Bevy-форма для мутабельных
+/// запросов (наш `iter()` и так выдаёт `Mut<T>` через `&self`, но
+/// `&mut`-форма оставлена для построчного переноса кода).
 impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, Q, F> {
-    type Item = (Entity, Q::Item<'q>);
+    type Item = Q::Item<'q>;
     type IntoIter = QueryIter<'q, Q, F>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
-pub struct QueryIterOwned<'w, Q: WorldQuery, F: WorldQuery = ()> {
-    query: Query<'w, Q, F>,
-    arch_cursor: usize,
-    row_cursor: usize,
-}
-
-impl<'w, Q: WorldQuery, F: WorldQuery> Iterator for QueryIterOwned<'w, Q, F> {
-    type Item = (Entity, Q::Item<'w>);
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let a = self.query.archetypes.get(self.arch_cursor)?;
-            let (r_start, r_end) = self.query.row_range(a.arch_idx);
-            let effective_end = r_end.min(a.len);
-            if self.row_cursor < r_start {
-                self.row_cursor = r_start;
-            }
-            if self.row_cursor >= effective_end {
-                self.arch_cursor += 1;
-                self.row_cursor = 0;
-                continue;
-            }
-            let row = self.row_cursor;
-            self.row_cursor += 1;
-            if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
-                let entity = self.query.world.archetypes[a.arch_idx].entities[row];
-                return Some((entity, item));
-            }
-        }
-    }
-}
 
 // ── QueryBuilder ───────────────────────────────────────────────
 
@@ -1680,12 +1703,13 @@ mod query_filter_tests {
         let boss = world.spawn((Hp(100), Mana(50), Boss));
         let _mob = world.spawn((Hp(10), Mana(5)));
 
-        // С фильтром (With<Boss>,): item — только данные.
-        let q = Query::<(Read<Hp>, Read<Mana>), (With<Boss>,)>::new(&world);
-        let got: Vec<(Entity, (&Hp, &Mana))> = q.iter().collect();
+        // С фильтром (With<Boss>,): item — только данные; entity — явной
+        // формой запроса (П1).
+        let q = Query::<(Entity, Read<Hp>, Read<Mana>), (With<Boss>,)>::new(&world);
+        let got: Vec<(Entity, &Hp, &Mana)> = q.iter().collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, boss);
-        assert_eq!(*got[0].1 .0, Hp(100));
+        assert_eq!(*got[0].1, Hp(100));
         drop(q);
 
         // Одиночный фильтр без кортежа тоже работает.
@@ -1706,7 +1730,8 @@ mod query_filter_tests {
         assert_eq!(n, 1);
     }
 
-    /// `for (e, item) in &q` / `&mut q` — IntoIterator поверх iter() (D2-2).
+    /// `for item in &q` / `&mut q` — IntoIterator поверх iter() (D2-2/П1):
+    /// item без навязанной entity (Bevy 1:1); entity — формой запроса.
     #[test]
     fn query_for_loop_iteration() {
         let mut world = World::new();
@@ -1715,20 +1740,23 @@ mod query_filter_tests {
 
         let q = Query::<Read<Hp>>::new(&world);
         let mut sum = 0;
-        for (_e, hp) in &q {
+        for hp in &q {
             sum += hp.0;
         }
         assert_eq!(sum, 3);
 
         let mut q = Query::<Write<Hp>>::new(&world);
-        for (_e, mut hp) in &mut q {
+        for mut hp in &mut q {
             hp.0 *= 10;
         }
-        let total: u32 = Query::<Read<Hp>>::new(&world)
-            .iter()
-            .map(|(_, hp)| hp.0)
-            .sum();
+        let total: u32 = Query::<Read<Hp>>::new(&world).iter().map(|hp| hp.0).sum();
         assert_eq!(total, 30);
+
+        // Entity — явной формой, как в Bevy:
+        let q = Query::<(Entity, Read<Hp>)>::new(&world);
+        let pairs: Vec<(Entity, &Hp)> = q.iter().collect();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(e, _)| world.is_alive(*e)));
     }
 
     /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
@@ -1741,14 +1769,15 @@ mod query_filter_tests {
         );
 
         let e = world.spawn((Hp(42),));
-        let q = Query::<Read<Hp>>::new(&world);
+        // Entity при необходимости — формой запроса (П1).
+        let q = Query::<(Entity, Read<Hp>)>::new(&world);
         let (got_e, hp) = q.single().unwrap();
         assert_eq!((got_e, hp.0), (e, 42));
         drop(q);
 
         // single_mut: мутация через Mut<T>.
         let mut q = Query::<Write<Hp>>::new(&world);
-        let (_, mut hp) = q.single_mut().unwrap();
+        let mut hp = q.single_mut().unwrap();
         hp.0 = 7;
         drop(q);
         assert_eq!(world.get::<Hp>(e), Some(&Hp(7)));
@@ -1758,6 +1787,35 @@ mod query_filter_tests {
             Query::<Read<Hp>>::new(&world).single().unwrap_err(),
             QuerySingleError::MultipleEntities
         );
+    }
+
+    /// `get(entity)` — random-access внутри запроса (П3, Bevy-паритет):
+    /// O(1) по location, фильтры (арх- и построчные) применяются.
+    #[test]
+    fn query_get_by_entity() {
+        let mut world = World::new();
+        let boss = world.spawn((Hp(100), Boss));
+        let mob = world.spawn((Hp(10),));
+
+        let q = Query::<Read<Hp>, With<Boss>>::new(&world);
+        assert_eq!(q.get(boss), Some(&Hp(100)));
+        assert_eq!(q.get(mob), None, "не матчит фильтр With<Boss>");
+        drop(q);
+
+        // Построчный фильтр: Changed применяется и в get().
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        world.get_mut::<Hp>(mob).unwrap().0 += 1;
+        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        assert_eq!(q.get(mob), Some(&Hp(11)));
+        assert_eq!(q.get(boss), None, "boss не менялся");
+        drop(q);
+
+        // get_mut: мутация через Mut<T>.
+        let mut q = Query::<Write<Hp>>::new(&world);
+        q.get_mut(boss).unwrap().0 = 1;
+        drop(q);
+        assert_eq!(world.get::<Hp>(boss), Some(&Hp(1)));
     }
 
     /// Архетипный фильтр совместим с плотной итерацией; данные приходят
@@ -1800,8 +1858,8 @@ mod tests {
         let e3 = world.spawn((B,));
 
         // Query<Read<A>, Without<B>> должен вернуть только e1
-        let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
-        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        let query: Query<'_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
             vec![e1],
@@ -1809,8 +1867,8 @@ mod tests {
         );
 
         // Query<Read<B>, Without<A>> должен вернуть только e3
-        let query: Query<'_, (Read<B>, Without<A>)> = Query::new(&world);
-        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        let query: Query<'_, (Entity, Read<B>, Without<A>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
             vec![e3],
@@ -1838,8 +1896,8 @@ mod tests {
         }
 
         // Query<Read<A>, Without<B>> — должны получить только entities с A без B
-        let query: Query<'_, (Read<A>, Without<B>)> = Query::new(&world);
-        let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
+        let query: Query<'_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
 
         assert_eq!(results.len(), 50, "Должно быть 50 сущностей с A без B");
         for e in &results {
@@ -1879,9 +1937,9 @@ mod tests {
 
         // Changed<Pos> относительно last_run должен вернуть ровно target.
         let changed: Vec<_> =
-            Query::<(crate::query::Changed<Pos>, Read<Pos>)>::new_with_tick(&world, last_run)
+            Query::<(Entity, crate::query::Changed<Pos>, Read<Pos>)>::new_with_tick(&world, last_run)
                 .iter()
-                .map(|(e, _)| e)
+                .map(|(e, _, _)| e)
                 .collect();
         assert_eq!(
             changed,
@@ -1954,7 +2012,7 @@ mod tests {
         let _e3 = world.spawn((A, B));
 
         // Чистый Without<A> — все сущности без A
-        let query: Query<'_, Without<A>> = Query::new(&world);
+        let query: Query<'_, (Entity, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
         assert_eq!(
             results,
@@ -1984,7 +2042,7 @@ mod tests {
         world.spawn((B,));
 
         let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
-        let results: Vec<_> = query.iter().map(|(_, (_, b))| b.is_some()).collect();
+        let results: Vec<_> = query.iter().map(|(_, b)| b.is_some()).collect();
 
         assert_eq!(results.len(), 2, "Должно быть 2 сущности с A");
         // e1 имеет A+B → b.is_some() == true
@@ -2003,7 +2061,7 @@ mod tests {
         let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new(&world);
         let results: Vec<_> = query
             .iter()
-            .map(|(_, (_, b_opt))| b_opt.is_some())
+            .map(|(_, b_opt)| b_opt.is_some())
             .collect();
 
         assert_eq!(results.len(), 2);
@@ -2022,7 +2080,7 @@ mod tests {
         // Должен вернуть entity, но B будет None
         let results: Vec<_> = query.iter().collect();
         assert_eq!(results.len(), 1, "Должна вернуться entity без B");
-        assert!(results[0].1.is_none(), "B должен быть None");
+        assert!(results[0].is_none(), "B должен быть None");
     }
 
     /// Регрессия W2: (Maybe<X>, Read<A>) с НЕзарегистрированным X раньше
@@ -2072,11 +2130,12 @@ mod tests {
         }
 
         let hits: Vec<_> = Query::<(
+            Entity,
             Read<Pos>,
             Or<(Changed<Pos>, Changed<Marker2>)>,
         )>::new_with_tick(&world, last_run)
         .iter()
-        .map(|(e, _)| e)
+        .map(|(e, _, _)| e)
         .collect();
 
         assert!(hits.contains(&ea), "ветка Changed<Pos>");
@@ -2092,9 +2151,9 @@ mod tests {
         let eb = world.spawn((Pos { x: 0.0 }, B));
         let none = world.spawn((Pos { x: 0.0 },));
 
-        let hits: Vec<_> = Query::<(Read<Pos>, Or<(With<A>, With<B>)>)>::new(&world)
+        let hits: Vec<_> = Query::<(Entity, Read<Pos>, Or<(With<A>, With<B>)>)>::new(&world)
             .iter()
-            .map(|(e, _)| e)
+            .map(|(e, _, _)| e)
             .collect();
         assert!(hits.contains(&ea) && hits.contains(&eb));
         assert!(!hits.contains(&none));
@@ -2112,9 +2171,9 @@ mod tests {
         let _e = world.spawn((Pos { x: 0.0 },));
 
         let hits: Vec<_> =
-            Query::<(Read<Pos>, Or<(With<NeverRegistered>, With<A>)>)>::new(&world)
+            Query::<(Entity, Read<Pos>, Or<(With<NeverRegistered>, With<A>)>)>::new(&world)
                 .iter()
-                .map(|(e, _)| e)
+                .map(|(e, _, _)| e)
                 .collect();
         assert_eq!(hits, vec![ea]);
     }
@@ -2130,9 +2189,9 @@ mod tests {
 
         // (Or<(With<A>,)>, With<B>) ≡ With<A> AND With<B> → только both
         let strict: Vec<_> = world
-            .query_typed::<(Or<(With<A>,)>, With<B>)>()
+            .query_typed::<(Entity, Or<(With<A>,)>, With<B>)>()
             .iter()
-            .map(|(e, _)| e)
+            .map(|(e, _, _)| e)
             .collect();
         assert_eq!(strict, vec![both]);
 
@@ -2159,7 +2218,7 @@ mod tests {
         let query: Query<'_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
         let results: Vec<_> = query
             .iter()
-            .map(|(_, (a, c))| (a.is_some(), c.is_some()))
+            .map(|(a, c)| (a.is_some(), c.is_some()))
             .collect();
 
         // Должно быть 2 entity

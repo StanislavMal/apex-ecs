@@ -401,6 +401,7 @@ Query — основной способ итерации по компонент
 
 | Параметр | Алиас (Bevy-стиль) | Выдаёт | Описание |
 |---|---|---|---|
+| `Entity` | — | `Entity` | Id сущности в составе item (П1; iter/for-цикл больше НЕ выдают entity сами) |
 | `Read<T>` | `Ref<T>` / `&T` | `&T` | Чтение компонента |
 | `Write<T>` | `&mut T` | **`Mut<T>`** | Запись (smart-pointer, стампит change-tick) |
 | `With<T>` | — | `()` | Фильтр: entity должен иметь T |
@@ -419,23 +420,35 @@ Query — основной способ итерации по компонент
 >
 > **Bevy-синтаксис `&T`/`&mut T`** работает в прямых `Query::<…>::new(world)`:
 > `Query::<(&Velocity, &mut Position)>::new(&world)`. Внутри `system!` для запросов используйте
-> `Read<T>`/`Write<T>` (там `&T`/`&mut T` зарезервированы под ресурсы).
+> `Read<T>`/`Write<T>` (П2: `&T`-ресурсы в `system!` удалены — ресурсы пишутся `Res<T>`/`ResMut<T>`, как в plain-fn).
 
 ### 4.1.1 Bevy-форма `Query<Data, Filter>`, for-итерация и `single()` (D2-2)
 
-Второй параметр `Query` — фильтр (по умолчанию `()`); item фильтра не попадает в выдачу:
+Второй параметр `Query` — фильтр (по умолчанию `()`); item фильтра не попадает в выдачу.
+После П1 (TD-8) `iter()`/for-цикл/`single()` выдают **только item** — Bevy 1:1; `Entity`
+при необходимости включается в запрос явной формой:
 
 ```rust
 // Данные и фильтрация разнесены (1:1 перенос с Bevy):
 let q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_with_tick(&world, last_run);
+for (hp, mut pos) in &q { /* … */ }              // item без entity — как в Bevy
 
-// for-итерация поверх iter(): выдаёт (Entity, item) — на одну деструктуризацию
-// больше, чем в Bevy (entity всегда первая):
-for (entity, (hp, mut pos)) in &q { /* … */ }
+// Entity — явной формой запроса:
+let q = Query::<(Entity, &Hp)>::new(&world);
+for (e, hp) in &q { /* … */ }
 
 // Ровно одна entity (Result, как Bevy 0.15+):
-let (e, (hp, _)) = q.single()?;        // NoEntities / MultipleEntities
+let hp = q.single()?;                            // NoEntities / MultipleEntities
+
+// Random-access внутри запроса (П3): O(1), фильтры применяются:
+if let Some(hp) = q.get(boss_entity) { /* … */ }
+let mut q = Query::<&mut Hp>::new(&world);
+q.get_mut(boss_entity).unwrap().0 -= 10;
 ```
+
+> `for_each(|entity, item|)` — НАШ диалект (горячий путь, entity всегда передаётся);
+> это не Bevy-API, поэтому конфликта ожиданий нет. Bevy-идиомы (`iter`, for-цикл,
+> `single`, `get`) ведут себя ровно как в Bevy.
 
 Единый кортеж остаётся как вторая форма: `Query<(&Hp, With<Boss>)>` эквивалентен.
 Плотная итерация (`for_each_chunk`) требует **архетипного** фильтра
@@ -1417,8 +1430,10 @@ world.resource_mut::<NextState<GameState>>().set(GameState::Playing);
 
 > **Как выводится доступ:** макрос анализирует типы параметров:
 > - `q: (Read<A>, Write<B>)` → `type Query = (...)`
-> - `name: &T` → `ResRead<T>` · `name: &mut T` → `ResWrite<T>`
-> - `name: &[E]` → `Listen<E>` (чтение) · `name: &mut Vec<E>` → `Emit<E>` (`.send()`)
+> - `name: Res<T>` → `ResRead<T>` · `name: ResMut<T>` → `ResWrite<T>` — **как в plain-fn**
+>   (П2: bare `&T`/`&mut T` как ресурс — compile-ошибка с подсказкой; у Bevy `&T` означает
+>   компонент запроса, двойная семантика была ловушкой мигранта)
+> - `name: &[E]` / `EventReader<E>` → `Listen<E>` (чтение) · `name: &mut Vec<E>` / `EventWriter<E>` → `Emit<E>` (`.send()`)
 > - `name: Cmd` → отложенные команды (`ctx.commands()`), не конфликтует
 > - `world: &mut World` → **эксклюзив (FULL)**
 >
@@ -1498,7 +1513,7 @@ system! {
         wave: u32 = 1,
         enemies_spawned: u32 = 0,
     }
-    fn run(s: &mut Self, cmd: Cmd, dt: &Time) {
+    fn run(s: &mut Self, cmd: Cmd, dt: Res<Time>) {
         if s.wave <= 5 {
             cmd.spawn((Enemy, Position::default()));
             s.enemies_spawned += 1;
@@ -1523,10 +1538,10 @@ system! {
 |----------|------------------------------|------------|
 | `q: (Read<A>, Write<B>, With<C>, Without<D>, MaybeWrite<E>)` | `type Query` | `Write<T>` → итерация `Mut<T>` (нужен `mut`-биндинг) |
 | `q: Read<A>` (bare) | `type Query = (Read<A>)` | одиночный компонент |
-| `name: &T` | `ResRead<T>` | ресурс (чтение) |
-| `name: &mut T` | `ResWrite<T>` | ресурс (запись) |
-| `name: &[E]` | `Listen<E>` | чтение событий (золотой путь) |
-| `name: &mut Vec<E>` | `Emit<E>` | запись событий (`.send()`) |
+| `name: Res<T>` | `ResRead<T>` | ресурс (чтение); bare `&T` — compile-ошибка (П2) |
+| `name: ResMut<T>` | `ResWrite<T>` | ресурс (запись); bare `&mut T` — compile-ошибка (П2) |
+| `name: &[E]` / `EventReader<E>` | `Listen<E>` | чтение событий |
+| `name: &mut Vec<E>` / `EventWriter<E>` | `Emit<E>` | запись событий (`.send()`) |
 | `name: Cmd` | `const HAS_DEFERRED = true` | отложенные команды, не конфликтует |
 | `name: Ctx` | *(none)* | `&SystemContext` |
 | `__whole: WholeWorld` | `const NEEDS_WHOLE_WORLD = true` | весь SubWorld (без ASD-чанков) |
@@ -3882,6 +3897,11 @@ change-tick всему диапазону; `Changed<T>`/`Added<T>` не комп
 **`Added<T>`** (W3-1): фильтр «компонент добавлен после last_run»; переживает archetype
 move, replace не перезапускает; с плотной итерацией не компилируется (§4.3.4).
 
+**Итерация (П1/TD-8):** `iter()`/for-цикл/`single()`/`get(entity)` выдают `Q::Item`
+(Bevy 1:1); entity — формой запроса `Query<(Entity, …)>`; `for_each(|e, item|)` —
+наш диалект с явной entity. `q.get(e)`/`q.get_mut(e)` — random-access O(1) (П3);
+`движение.run_if(...)` работает прямо на bare-fn (`FnSystemExt`, П4).
+
 **Generation-wrap (W3-3):** слот entity, чей generation дошёл до `u32::MAX`, ретируется
 (не переиспользуется) — застрявший хэндл прошлой «жизни» слота никогда не укажет на чужую
 entity (ABA исключён; цена — одна запись на 2³² переиспользований слота).
@@ -3991,7 +4011,7 @@ generation entity не участвует — НЕ использовать дл
 **Единый макрос** для параллельных и эксклюзивных систем (`sequential_system!` удалён).
 
 **Параллельная** (`impl AutoSystem`) — параметры:
-`q: (Read<A>, Write<B>)` (Write→`Mut<T>`, нужен `mut`-биндинг), `q: Read<A>`, `name: &T`, `name: &mut T`,
+`q: (Read<A>, Write<B>)` (Write→`Mut<T>`, нужен `mut`-биндинг), `q: Read<A>`, `name: Res<T>`, `name: ResMut<T>`,
 `name: &[E]`, `name: &mut Vec<E>`, `name: Cmd`, `name: Ctx`, `__whole: WholeWorld`.
 
 **Эксклюзивная** (`impl ExclusiveSystem`, FULL access, alone) — параметр `world: &mut World`

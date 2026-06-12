@@ -198,7 +198,7 @@ fn test_query_param() {
     // Проверяем мутацию
     let q = Query::<Read<Position>>::new(&world);
     let first = q.iter().next().unwrap();
-    assert!((first.1.x - 101.0).abs() < 1e-6, "x should be 101.0 after mutation");
+    assert!((first.x - 101.0).abs() < 1e-6, "x should be 101.0 after mutation");
 
     println!("  ✅ PASSED\n");
 }

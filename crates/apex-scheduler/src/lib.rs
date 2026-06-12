@@ -66,8 +66,8 @@ pub mod pipeline;
 pub mod stage;
 
 pub use config::{
-    par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemMarker,
-    IntoScheduleConfigs, SystemConfig,
+    par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemExt,
+    FnSystemMarker, IntoScheduleConfigs, SystemConfig,
 };
 pub mod fixed;
 pub use fixed::FixedTime;
@@ -5470,12 +5470,14 @@ mod tests {
         let mut sched = Scheduler::new();
         init_state(&mut world, &mut sched, Game::Menu);
 
+        // П4: run_if прямо на bare-fn (FnSystemExt), как в Bevy.
+        use crate::config::FnSystemExt;
         sched.add_systems(
             StageLabel::Update,
             (
-                SystemConfig::fn_sys(menu_ui).run_if(in_state(Game::Menu)),
-                SystemConfig::fn_sys(spawn_level).run_if(on_enter(Game::Playing)),
-                SystemConfig::fn_sys(teardown_menu).run_if(on_exit(Game::Menu)),
+                menu_ui.run_if(in_state(Game::Menu)),
+                spawn_level.run_if(on_enter(Game::Playing)),
+                teardown_menu.run_if(on_exit(Game::Menu)),
             ),
         );
 
@@ -5545,7 +5547,7 @@ mod tests {
 
         system! {
             struct CountRows { seen: u64 = 0 }
-            fn run(s: &mut Self, q: Read<Tag>, out: &mut SeenTotal) {
+            fn run(s: &mut Self, q: Read<Tag>, out: ResMut<SeenTotal>) {
                 s.seen = 0;
                 q.for_each(|_, _| s.seen += 1);
                 out.0 = s.seen;

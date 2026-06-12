@@ -50,8 +50,8 @@ struct DeathEvent { entity: Entity }
 system! {
     fn physics_system(
         q: (Read<Mass>, Write<Velocity>, Write<Position>),
-        cfg: &PhysicsConfig,
-        _dt: &DeltaTime,
+        cfg: Res<PhysicsConfig>,
+        _dt: Res<DeltaTime>,
     ) {
         let dt = cfg.dt;
         let g = cfg.gravity;
@@ -293,10 +293,10 @@ fn main() {
     sched.run(&mut world);
 
     // Находим player и goblin через query (они созданы в startup)
-    let player = Query::<Read<Player>>::new(&world)
+    let player = Query::<(Entity, Read<Player>)>::new(&world)
         .iter().next().map(|(e, _)| e)
         .expect("Player entity not found");
-    let goblin = Query::<Read<Name>>::new(&world)
+    let goblin = Query::<(Entity, Read<Name>)>::new(&world)
         .iter().find(|(_, n)| n.0 == "Goblin")
         .map(|(e, _)| e)
         .expect("Goblin entity not found");

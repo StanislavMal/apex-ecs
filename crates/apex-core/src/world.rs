@@ -2311,7 +2311,6 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             arch_pos: 0,
             row: 0,
             row_end: 0,
-            entities: std::ptr::null(),
             state: None,
             _phantom: std::marker::PhantomData,
         }
@@ -2332,13 +2331,14 @@ pub struct CachedQueryIter<'w, Q: WorldQuery> {
     arch_pos: usize,
     row: usize,
     row_end: usize,
-    entities: *const Entity,
     state: Option<Q::State>,
     _phantom: std::marker::PhantomData<Q>,
 }
 
 impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
-    type Item = (Entity, Q::Item<'w>);
+    /// П1 (TD-8): итерация выдаёт ТОЛЬКО `Q::Item` (как `Query::iter`);
+    /// entity — через форму запроса (`ctx.query::<(Entity, Read<A>)>()`).
+    type Item = Q::Item<'w>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -2353,11 +2353,10 @@ impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
             let row = self.row;
             self.row += 1;
 
-            let entity = unsafe { *self.entities.add(row) };
             let item = unsafe { Q::fetch_item(*self.state.as_ref().unwrap(), row) };
 
             if let Some(item) = item {
-                return Some((entity, item));
+                return Some(item);
             }
         }
     }
@@ -2392,7 +2391,6 @@ impl<'w, Q: WorldQuery> CachedQueryIter<'w, Q> {
             });
             self.row = r_start;
             self.row_end = end;
-            self.entities = arch.entities.as_ptr();
             return true;
         }
         false
@@ -3004,11 +3002,11 @@ mod tests {
             p.0 = 1.0;
         }
 
-        let mut state = QueryState::<(Changed<P>, Read<P>)>::new();
+        let mut state = QueryState::<(Entity, Changed<P>, Read<P>)>::new();
         let hits: Vec<_> = state
             .query_with_tick(&world, last_run)
             .iter()
-            .map(|(e, _)| e)
+            .map(|(e, _, _)| e)
             .collect();
         assert_eq!(hits, vec![target]);
     }
@@ -3188,7 +3186,7 @@ mod tests {
         let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
         let got: Vec<_> = world
-            .query_changed::<Read<Pos>>(Tick::ZERO)
+            .query_changed::<(Entity, Read<Pos>)>(Tick::ZERO)
             .iter()
             .map(|(e, _)| e)
             .collect();
@@ -3198,7 +3196,7 @@ mod tests {
         // Несколько архетипов: (Pos) и (Pos, Vel).
         let c = world.spawn((Pos { x: 3.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         let got2: Vec<_> = world
-            .query_changed::<Read<Pos>>(Tick::ZERO)
+            .query_changed::<(Entity, Read<Pos>)>(Tick::ZERO)
             .iter()
             .map(|(e, _)| e)
             .collect();
@@ -3317,9 +3315,9 @@ mod tests {
         assert!(world.archetype_count() > 128, "тесту нужен кандидат-путь");
 
         // Редкий компонент: кандидаты = 1 архетип, результат корректен.
-        let got: Vec<_> = Query::<(Read<Pos>, Read<Rare>)>::new(&world)
+        let got: Vec<_> = Query::<(Entity, Read<Pos>, Read<Rare>)>::new(&world)
             .iter()
-            .map(|(e, _)| e)
+            .map(|(e, _, _)| e)
             .collect();
         assert_eq!(got, vec![rare_holder.unwrap()]);
 
@@ -3637,9 +3635,9 @@ mod hooks_and_added_tests {
         let e3 = world.spawn((Hp(3),)); // единственный «свежий»
         world.despawn(e0); // swap_remove: e3 переедет на строку 0
 
-        let fresh: Vec<Entity> = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let fresh: Vec<Entity> = Query::<(Entity, Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
-            .map(|(e, _)| e)
+            .map(|(e, _, _)| e)
             .collect();
         assert_eq!(
             fresh,

@@ -6,9 +6,9 @@
 /// system! {
 ///     fn movement_system(
 ///         q: (Read<Velocity>, Write<Position>),
-///         keys: &Input<KeyCode>,
+///         keys: Res<Input<KeyCode>>,
 ///     ) {
-///         for (_, (vel, pos)) in q.iter() {
+///         for (vel, mut pos) in q.iter() {
 ///             if keys.pressed(KeyCode::A) { pos.x -= vel.x; }
 ///         }
 ///     }
@@ -40,10 +40,10 @@
 /// |----------|------------|----------|
 /// | `q: (Read<A>, Write<B>)` | Query (кортеж) | Итерация по компонентам |
 /// | `q: Read<A>` | Query (одиночный) | Итерация по одному компоненту |
-/// | `name: &T` | ResRead\<T\> | Иммутабельный ресурс |
-/// | `name: &mut T` | ResWrite\<T\> | Мутабельный ресурс |
-/// | `name: &[E]` | Listen\<E\> | Чтение событий |
-/// | `name: &mut Vec<E>` | Emit\<E\> | Отправка событий (`.send()`) |
+/// | `name: Res<T>` | ResRead\<T\> | Иммутабельный ресурс (П2; `&T` — compile-ошибка: у Bevy `&T` = компонент) |
+/// | `name: ResMut<T>` | ResWrite\<T\> | Мутабельный ресурс (П2; `&mut T` — compile-ошибка) |
+/// | `name: &[E]` / `EventReader<E>` | Listen\<E\> | Чтение событий |
+/// | `name: &mut Vec<E>` / `EventWriter<E>` | Emit\<E\> | Отправка событий (`.send()`) |
 /// | `name: Cmd` | Commands | Отложенные структурные изменения |
 /// | `name: Ctx` | SystemContext | Прямой доступ к контексту |
 /// | `__whole: WholeWorld` | NEEDS_WHOLE_WORLD | Глобальный доступ ко всем entity |
@@ -240,8 +240,8 @@ macro_rules! __sys_compile_error {
             Expected one of:\n  \
             - q: (Read<A>, Write<B>) — query (tuple)\n  \
             - q: Read<A>             — query (single)\n  \
-            - name: &T               — resource read\n  \
-            - name: &mut T           — resource write\n  \
+            - name: Res<T>           — resource read\n  \
+            - name: ResMut<T>        — resource write\n  \
             - name: &[E]             — event reader\n  \
             - name: &mut Vec<E>      — event writer (use .send())\n  \
             - cmd: Cmd               — commands\n  \
@@ -355,33 +355,93 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // Resource write
+    // Resource write — Res/ResMut-семантика (П2): та же грамматика, что в
+    // plain-fn системах. Bare `&T`/`&mut T` как ресурс БОЛЬШЕ НЕ принимаются
+    // (compile-ошибка ниже) — у Bevy `&T` означает компонент запроса,
+    // двойная семантика была ловушкой мигранта.
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : ResMut < $ty:ty > , $( $rest:tt )* ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
+        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut::<$ty>(); let _ = &mut $pname; ],
+        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // Resource read — Res<T>
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Res < $ty:ty > , $( $rest:tt )* ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
+        @before: [ $( $before )* let $pname: $crate::system_param::Res<'_, $ty> = $ctx.resource::<$ty>(); ],
+        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // EventReader<E> — Bevy-имя для чтения событий (эквивалент `&[E]`)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : EventReader < $ev:ty > , $( $rest:tt )* ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader::<$ev>(); let _ = &mut $pname; ],
+        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // EventWriter<E> — Bevy-имя для записи событий (эквивалент `&mut Vec<E>`)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : EventWriter < $ev:ty > , $( $rest:tt )* ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // ── П2: bare `&T`/`&mut T` как ресурс — БОЛЬШЕ НЕ ПОДДЕРЖИВАЕТСЯ ──
+    // (двойная семантика с Bevy-компонентами была ловушкой №1 мигранта)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
-        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &mut $ty = &mut *$ctx.resource_mut::<$ty>(); ],
-        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
-    }};
+    } => { compile_error!(concat!(
+        "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
+        "` — `&mut T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
+         Используйте `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
+         Запись событий — `имя: &mut Vec<E>` или `имя: EventWriter<E>`."
+    )); };
 
-    // Resource read
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty , $( $rest:tt )* ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
-        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &$ty = &*$ctx.resource::<$ty>(); ],
-        @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
-    }};
+    } => { compile_error!(concat!(
+        "system!: `", stringify!($pname), ": &", stringify!($ty),
+        "` — `&T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
+         Используйте `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
+         Чтение событий — `имя: &[E]` или `имя: EventReader<E>`;\n\
+         компоненты — внутри запроса: `q: (Read<", stringify!($ty), ">, …)`."
+    )); };
 
     // Commands
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
@@ -483,33 +543,89 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // Resource write (last)
+    // Resource write (last) — ResMut<T> (П2)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : ResMut < $ty:ty > ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
+        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut::<$ty>(); let _ = &mut $pname; ],
+        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // Resource read (last) — Res<T> (П2)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : Res < $ty:ty > ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
+        @before: [ $( $before )* let $pname: $crate::system_param::Res<'_, $ty> = $ctx.resource::<$ty>(); ],
+        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // EventReader<E> (last)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : EventReader < $ev:ty > ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader::<$ev>(); let _ = &mut $pname; ],
+        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // EventWriter<E> (last)
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : EventWriter < $ev:ty > ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+    }};
+
+    // ── П2: bare `&T`/`&mut T` как ресурс (last) — compile-ошибка ──
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
-        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &mut $ty = &mut *$ctx.resource_mut::<$ty>(); ],
-        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
-    }};
+    } => { compile_error!(concat!(
+        "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
+        "` — `&mut T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
+         Используйте `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
+         Запись событий — `имя: &mut Vec<E>` или `имя: EventWriter<E>`."
+    )); };
 
-    // Resource read (last)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty ],
         @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
-        @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &$ty = &*$ctx.resource::<$ty>(); ],
-        @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
-    }};
+    } => { compile_error!(concat!(
+        "system!: `", stringify!($pname), ": &", stringify!($ty),
+        "` — `&T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
+         Используйте `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
+         Чтение событий — `имя: &[E]` или `имя: EventReader<E>`;\n\
+         компоненты — внутри запроса: `q: (Read<", stringify!($ty), ">, …)`."
+    )); };
 
     // Commands (last)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
