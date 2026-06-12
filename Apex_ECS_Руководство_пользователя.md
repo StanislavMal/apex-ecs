@@ -337,7 +337,7 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 | `#[derive(Component)]` `#[require(A, B)]` | то же | required components (D2-4); плюс у нас derive **авто-регистрирует** компонент (linkme) — `register_component` не нужен |
 | `App::new().add_plugins((DefaultPlugins, MyPlugin))` | то же | группы плагинов и кортежи, включая вложенные (D2-7) |
 | `commands.spawn(bundle)` / `despawn` / `insert` | то же | `Commands` — bump-arena (без per-command Box) |
-| `EventReader::read()`, `EventWriter::send()` | то же | `read()` возвращает guard: итерация `for e in r.read().iter()`; регистрация типов событий не нужна (авто) |
+| `EventReader::read()`, `EventWriter::send()` | то же | итерация 1:1 Bevy: `for e in r.read()` (guard конвертируется во владеющий `EventIterator`, advance курсора на drop); регистрация типов событий не нужна (авто) |
 | `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — condition'ы, а не отдельные schedule (D2-6) |
 | `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` (D2-5) |
 | `RemovedComponents<T>` | то же | трекинг **opt-in**: `world.track_removals::<T>()` — нулевая стоимость по умолчанию |
@@ -856,11 +856,18 @@ for ev in reader.iter() {
     println!("damage: {} → entity {:?}", ev.amount, ev.target);
 }
 
-// RAII-чтение с авто-продвижением курсора при Drop:
+// RAII-чтение с авто-продвижением курсора — главная идиома (1:1 Bevy):
+for ev in reader.read() {
+    process(ev);
+} // ← курсор автоматически продвинут (drop итератора; break тоже продвигает до конца)
+
+// Эквивалент через guard (когда нужны len()/is_empty() или итерация по ссылке):
 {
     let guard = reader.read();  // -> EventReadGuard<DamageEvent>
-    for ev in guard.iter() {
-        process(ev);
+    if !guard.is_empty() {
+        for ev in &guard {
+            process(ev);
+        }
     }
 } // ← курсор автоматически продвинут
 
@@ -917,10 +924,16 @@ let n = queue.len_pending();
 ```rust
 let queue = world.events_mut::<DamageEvent>();
 
-// read() возвращает EventReadGuard — курсор продвинется при выходе из scope:
+// read() возвращает EventReadGuard — итерация напрямую (IntoIterator →
+// владеющий EventIterator, отдаёт &T; курсор продвигается при дропе):
+for ev in queue.read(&reader_a) {
+    process(ev);
+}
+
+// ...или через scope с guard'ом:
 {
     let guard = queue.read(&reader_a);  // -> EventReadGuard<DamageEvent>
-    for ev in guard.iter() {
+    for ev in &guard {
         process(ev);
     }
 } // ← здесь cursor автоматически продвигается
@@ -991,7 +1004,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
 | `remove_reader(reader_id)` | Удалить читателя |
 | `iter(reader_id) -> &[T]` | Непрочитанные события для reader (без продвижения курсора) |
-| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (весь буфер) |
+| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (весь буфер); guard итерируется напрямую: `for e in queue.read(&c)` (`IntoIterator` → `EventIterator`, TD-24) |
 | `read_partial(reader_id, max_count) -> PartialReadGuard<T>` | Чтение с продвижением ровно на N событий |
 | `advance_reader_mut(reader_id)` | Ручное продвижение курсора до конца буфера |
 | `advance_reader_by(reader_id, count)` | Ручное продвижение курсора на N событий |
@@ -1013,7 +1026,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 |-------|----------|
 | `new(events: &mut Events<T>) -> Self` | Создать читателя (авто-регистрация через `add_reader()`) |
 | `iter(&self) -> &[T]` | Непрочитанные события в виде среза (без продвижения курсора) |
-| `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (рекомендуется) |
+| `read(&mut self) -> EventReadGuard<T>` | Чтение с auto-advance на Drop; итерация напрямую — `for e in reader.read()` (1:1 Bevy, рекомендуется) |
 | `len(&self) -> usize` | Количество непрочитанных событий |
 | `is_empty(&self) -> bool` | Проверить, есть ли непрочитанные события |
 | `Drop` | Автоматически вызывает `remove_reader()` — предотвращает утечку курсоров |
@@ -1114,7 +1127,7 @@ world.track_removals::<PhysicsBody>();   // включить (идемпотен
 
 // Чтение — как любое событие: &[Removed<PhysicsBody>] в system! или reader:
 let mut reader = world.event_reader::<Removed<PhysicsBody>>();
-for r in reader.read().iter() {
+for r in reader.read() {
     physics.remove_body(r.entity);       // при despawn entity уже мертва
 }
 ```

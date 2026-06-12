@@ -5244,7 +5244,8 @@ mod tests {
         }
 
         fn count_moved(mut evs: EventReader<Ping>, mut moved: ResMut<Moved>) {
-            for p in evs.read().iter() {
+            // Главная Bevy-идиома (TD-24): прямая итерация по read().
+            for p in evs.read() {
                 moved.0 += p.0;
             }
         }

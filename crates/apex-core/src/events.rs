@@ -549,6 +549,99 @@ impl<T> Drop for EventReadGuard<'_, T> {
     }
 }
 
+/// `for e in reader.read() { ... }` — главная событийная идиома Bevy (TD-24
+/// движка). Guard конвертируется во владеющий [`EventIterator`]; advance
+/// курсора до конца буфера происходит при дропе итератора (т.е. и при `break`
+/// — частичная итерация пропускает остаток, как и у самого guard'а).
+impl<'q, T> IntoIterator for EventReadGuard<'q, T> {
+    type Item = &'q T;
+    type IntoIter = EventIterator<'q, T>;
+
+    fn into_iter(self) -> EventIterator<'q, T> {
+        let reader_id = self.reader_id;
+        let start = self.start;
+        let queue: *mut Events<T> = &mut *self.queue;
+        // Предотвращаем вызов EventReadGuard::drop — advance переезжает
+        // в Drop итератора.
+        std::mem::forget(self);
+        // SAFETY: queue получен из &'q mut Events<T> guard'а (guard забыт,
+        // его Drop не вызовется — мы единственный владелец заёма). Буфер
+        // `events` не мутируется, пока жив итератор: Drop итератора лишь
+        // продвигает курсор (поля cursors/lagging_count), сам буфер не
+        // трогает — тот же приём, что в `EventReadGuard::peek`.
+        let items = unsafe {
+            let events: &[T] = &(*queue).events;
+            events[start.min(events.len())..].iter()
+        };
+        EventIterator {
+            items,
+            queue,
+            reader_id,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Итерация по ссылке — без потребления guard'а (`for e in &guard`).
+impl<'a, T> IntoIterator for &'a EventReadGuard<'_, T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> std::slice::Iter<'a, T> {
+        self.iter()
+    }
+}
+
+// ── EventIterator ───────────────────────────────────────────────
+
+/// Владеющий итератор по непрочитанным событиям (Bevy `EventIterator`-стиль):
+/// отдаёт `&T` с лайфтаймом исходного заёма `Events`, при дропе продвигает
+/// курсор читателя **до конца буфера** (семантика [`EventReadGuard`]
+/// сохранена: `break` посреди цикла пропускает оставшиеся события).
+///
+/// Создаётся через `IntoIterator` у [`EventReadGuard`]:
+/// `for e in reader.read() { ... }`.
+pub struct EventIterator<'q, T> {
+    items: std::slice::Iter<'q, T>,
+    queue: *mut Events<T>,
+    reader_id: EventCursor,
+    _marker: std::marker::PhantomData<&'q mut Events<T>>,
+}
+
+impl<'q, T> Iterator for EventIterator<'q, T> {
+    type Item = &'q T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'q T> {
+        self.items.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for EventIterator<'_, T> {}
+
+impl<'q, T> DoubleEndedIterator for EventIterator<'q, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<&'q T> {
+        self.items.next_back()
+    }
+}
+
+impl<T> Drop for EventIterator<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: указатель валиден на 'q (см. IntoIterator выше); продвижение
+        // курсора не трогает буфер `events`, на который ссылаются выданные &T.
+        unsafe {
+            (*self.queue).advance_reader_mut(&self.reader_id);
+        }
+    }
+}
+
 // ── PartialReadGuard ────────────────────────────────────────────
 
 /// RAII-обёртка: при дропе продвигает курсор ровно на `count` событий.
@@ -1093,6 +1186,91 @@ mod tests {
         queue.advance_reader_mut(&reader);
         let events = queue.iter(&reader);
         assert_eq!(events.len(), 0, "после advance курсор должен быть в конце");
+    }
+
+    // ── EventIterator (TD-24 движка): for e in read() ──────────
+
+    #[test]
+    fn read_guard_into_iterator_yields_and_advances() {
+        let mut queue = Events::new();
+        let reader = queue.add_reader();
+
+        queue.send(1);
+        queue.send(2);
+        queue.send(3);
+        queue.update();
+
+        // Главная Bevy-идиома: прямая итерация по read() без .iter().
+        let mut got = Vec::new();
+        for e in queue.read(&reader) {
+            got.push(*e);
+        }
+        assert_eq!(got, vec![1, 2, 3]);
+
+        // Дроп итератора продвинул курсор до конца буфера.
+        assert_eq!(queue.iter(&reader).len(), 0);
+    }
+
+    #[test]
+    fn event_iterator_break_advances_to_end() {
+        let mut queue = Events::new();
+        let reader = queue.add_reader();
+
+        queue.send(10);
+        queue.send(20);
+        queue.update();
+
+        for e in queue.read(&reader) {
+            if *e == 10 {
+                break; // частичная итерация
+            }
+        }
+        // Семантика guard'а сохранена: break = пропуск остатка.
+        assert_eq!(
+            queue.iter(&reader).len(),
+            0,
+            "дроп итератора (в т.ч. на break) продвигает курсор до конца"
+        );
+    }
+
+    #[test]
+    fn event_iterator_collect_holds_references() {
+        let mut queue = Events::new();
+        let reader = queue.add_reader();
+
+        queue.send(7);
+        queue.send(8);
+        queue.update();
+
+        // Ссылки переживают сам итератор (лайфтайм исходного заёма Events).
+        let collected: Vec<&i32> = queue.read(&reader).into_iter().collect();
+        assert_eq!(collected, vec![&7, &8]);
+        drop(collected);
+        assert_eq!(queue.iter(&reader).len(), 0);
+    }
+
+    #[test]
+    fn event_iterator_len_and_guard_slice_api() {
+        let mut queue = Events::new();
+        let reader = queue.add_reader();
+
+        queue.send(5);
+        queue.send(6);
+        queue.update();
+
+        {
+            // len()/is_empty() доступны на guard'е через Deref<[T]>.
+            let guard = queue.read(&reader);
+            assert_eq!(guard.len(), 2);
+            assert!(!guard.is_empty());
+            // Итерация по ссылке не потребляет guard.
+            let doubled: Vec<i32> = (&guard).into_iter().map(|e| e * 2).collect();
+            assert_eq!(doubled, vec![10, 12]);
+            // ExactSizeIterator у владеющего итератора.
+            let it = guard.into_iter();
+            assert_eq!(it.len(), 2);
+        }
+        assert_eq!(queue.iter(&reader).len(), 0);
     }
 
     #[test]

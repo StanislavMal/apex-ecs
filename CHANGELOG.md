@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **`for e in reader.read()` — прямая итерация по событиям (1:1 Bevy, TD-24
+  движка, 2026-06-12).** `EventReadGuard` получил `IntoIterator` (владеющий
+  `EventIterator<'q, T>`: отдаёт `&T`, advance курсора до конца буфера на drop —
+  семантика guard'а сохранена, `break` пропускает остаток) и `IntoIterator`
+  по ссылке (`for e in &guard` без потребления). `len()`/`is_empty()` доступны
+  на guard'е через `Deref<[T]>`. `EventIterator`/`EventReadGuard` экспортированы
+  из корня и prelude.
+
 ## [0.1.0] — 2026-05-18
 
 ### Core Stabilization — Phase 0

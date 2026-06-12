@@ -244,7 +244,7 @@ unsafe impl<T: Send + Sync + 'static> Sync for EventWriter<'_, T> {}
 ///
 /// ```ignore
 /// fn cleanup(mut removed: RemovedComponents<PhysicsBody>, mut phys: ResMut<Physics>) {
-///     for r in removed.read().iter() { phys.remove_body(r.entity); }
+///     for r in removed.read() { phys.remove_body(r.entity); }
 /// }
 /// ```
 pub type RemovedComponents<'w, T> = EventReader<'w, crate::events::Removed<T>>;

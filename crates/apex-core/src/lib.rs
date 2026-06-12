@@ -48,7 +48,8 @@ pub use component::{
 };
 pub use entity::Entity;
 pub use events::{
-    DelayedQueue, EventCursor, EventRegistry, Events, PartialReadGuard, PeekGuard, Removed,
+    DelayedQueue, EventCursor, EventIterator, EventReadGuard, EventRegistry, Events,
+    PartialReadGuard, PeekGuard, Removed,
 };
 pub use fn_system::{short_system_name, SystemParamFunction};
 pub use linkme; // re-exported for #[derive(Component)] macro
@@ -85,7 +86,8 @@ pub mod prelude {
     pub use crate::component::{Component as ComponentTrait, Serializable, Tick};
     pub use crate::entity::Entity;
     pub use crate::events::{
-        DelayedQueue, EventCursor, Events, PartialReadGuard, PeekGuard, Removed,
+        DelayedQueue, EventCursor, EventIterator, EventReadGuard, Events, PartialReadGuard,
+        PeekGuard, Removed,
     };
     pub use crate::fn_system::SystemParamFunction;
     pub use crate::impl_entity_template;
