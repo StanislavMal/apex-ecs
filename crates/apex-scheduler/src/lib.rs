@@ -2433,6 +2433,9 @@ impl Scheduler {
             uses_par_for_each: bool,
             needs_whole_world: bool,
             stateful: bool,
+            /// Мутирует ресурс (`ResMut`) или использует `Commands` — нельзя дробить на чанки
+            /// (тело системы выполнялось бы раз на чанк ⇒ умножение сайд-эффекта). См. TD-37.
+            non_query_side_effects: bool,
         }
 
         let mut sys_infos: Vec<SysInfo> = Vec::new();
@@ -2470,6 +2473,11 @@ impl Scheduler {
                     // Нет access (динамическая система) — состояние неизвестно,
                     // консервативно считаем stateful (без row-split).
                     let stateful = access.map(|a| a.stateful).unwrap_or(true);
+                    // Мутация ресурса / Commands (TD-37): сайд-эффект, не локальный для партиции
+                    // запроса ⇒ row-split дублировал бы его. Нет access ⇒ консервативно true.
+                    let non_query_side_effects = access
+                        .map(|a| a.writes_resource || a.uses_commands)
+                        .unwrap_or(true);
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
@@ -2479,6 +2487,7 @@ impl Scheduler {
                         uses_par_for_each,
                         needs_whole_world,
                         stateful,
+                        non_query_side_effects,
                     });
                 } else {
                     // Система без entity (только ресурсы/события) — запускаем сразу
@@ -2520,17 +2529,23 @@ impl Scheduler {
         let mut tasks: Vec<AsdTask> = Vec::new();
 
         for info in &sys_infos {
-            // Per-system scope для:
+            // Per-system scope (БЕЗ row-split — система выполняется ровно один раз) для:
             //   a) Систем с малым entity_count
             //   b) Систем с событиями (Emit/Listen)
             //   c) Систем с par_for_each — избегаем oversubscribe rayon
             //   d) Систем с needs_whole_world — глобальный доступ
             //   e) Систем с состоянием (W3-4) — row-split звал бы
             //      run(&mut self) одного экземпляра конкурентно
+            //   f) Систем с мутацией ресурса / Commands (TD-37) — тело plain-fn выполняется раз
+            //      на чанк, поэтому не-query-локальный сайд-эффект (ResMut-запись, Commands)
+            //      умножился бы на число чанков (+ гонка при параллельных чанках). Декомпозиция
+            //      допустима ТОЛЬКО когда эффекты системы ограничены её per-entity партицией
+            //      запроса (записи компонентов по непересекающимся диапазонам строк).
             if info.has_events
                 || info.uses_par_for_each
                 || info.needs_whole_world
                 || info.stateful
+                || info.non_query_side_effects
                 || info.entity_count <= effective_chunk
             {
                 // Per-system scope: одна задача, все entity целиком
@@ -3561,6 +3576,59 @@ mod tests {
         let conflicts = sched.conflicts_between(a, b);
         assert!(!conflicts.is_empty(), "должен быть конфликт");
         assert!(matches!(conflicts[0], ConflictKind::WriteWrite { .. }));
+    }
+
+    #[test]
+    fn asd_does_not_split_resource_mutating_system_td37() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Имитирует plain-fn `(Query<&Pos>, ResMut<Counter>)`: ШИРОКИЙ запрос (чтение Pos над
+        // многими сущностями) + мутация РЕСУРСА. До фикса TD-37 ASD дробил такую систему на чанки
+        // и звал ТЕЛО раз на чанк ⇒ мутация ресурса умножалась (баг many_foxes@10000: лисы в ~20×
+        // быстрее). С фиксом `resource_write` гейтит ASD ⇒ система = один таск ⇒ ровно один вызов.
+        struct Counter; // только носитель TypeId «ресурса»
+        struct ResourceMutator(Arc<AtomicUsize>);
+        impl ParSystem for ResourceMutator {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new()
+                    .read::<Pos>()
+                    .write::<Counter>()
+                    .resource_write()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut sched = Scheduler::new();
+        sched.add_par_system("res_mutator", ResourceMutator(calls.clone()));
+
+        let mut world = World::new();
+        // Заведомо выше порога чанка — без фикса дало бы row-split на много чанков.
+        for _ in 0..50_000 {
+            world.spawn((Pos { x: 0.0, y: 0.0 },));
+        }
+
+        sched.run(&mut world);
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "система с мутацией ресурса обязана выполняться РОВНО один раз, а не раз на ASD-чанк (TD-37)"
+        );
+    }
+
+    #[test]
+    fn asd_still_splits_pure_query_system() {
+        // Контроль: чистая система (только запрос, без ресурс-мутации/Commands) над многими
+        // сущностями ВСЁ ЕЩЁ декомпозируется (per-entity записи идемпотентны под чанками) —
+        // перф data-parallel путей фикс TD-37 не трогает. Проверяем, что её access НЕ помечен
+        // `writes_resource`/`uses_commands` (значит ASD-eligible).
+        let access = AccessDescriptor::new().read::<Vel>().write::<Pos>();
+        assert!(!access.writes_resource, "чистая query-система не пишет ресурс");
+        assert!(!access.uses_commands, "чистая query-система не использует Commands");
     }
 
     #[test]

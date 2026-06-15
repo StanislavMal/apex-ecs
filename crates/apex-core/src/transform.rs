@@ -298,6 +298,88 @@ impl GlobalTransform {
     pub fn to_matrix(&self) -> &Mat4 {
         &self.0
     }
+
+    /// Мировой forward (−Z), 1:1 Bevy `GlobalTransform::forward`. См. [`TransformDirections`].
+    #[inline]
+    pub fn forward(&self) -> Vec3 {
+        self.0.forward()
+    }
+    /// Мировой back (+Z), 1:1 Bevy `GlobalTransform::back`. См. [`TransformDirections`].
+    #[inline]
+    pub fn back(&self) -> Vec3 {
+        self.0.back()
+    }
+    /// Мировой right (+X), 1:1 Bevy `GlobalTransform::right`.
+    #[inline]
+    pub fn right(&self) -> Vec3 {
+        self.0.right()
+    }
+    /// Мировой left (−X), 1:1 Bevy `GlobalTransform::left`.
+    #[inline]
+    pub fn left(&self) -> Vec3 {
+        self.0.left()
+    }
+    /// Мировой up (+Y), 1:1 Bevy `GlobalTransform::up`.
+    #[inline]
+    pub fn up(&self) -> Vec3 {
+        self.0.up()
+    }
+    /// Мировой down (−Y), 1:1 Bevy `GlobalTransform::down`.
+    #[inline]
+    pub fn down(&self) -> Vec3 {
+        self.0.down()
+    }
+}
+
+/// Семантические аксессоры мировых направлений для матрицы трансформации (local→world),
+/// 1:1 Bevy `Transform`/`GlobalTransform`: **forward = локальный −Z**, back = +Z, right = +X,
+/// left = −X, up = +Y, down = −Y (каждый нормирован).
+///
+/// **Использовать вместо «сырых» `±matrix.z_axis`/`x_axis`/`y_axis`.** Сырой доступ к колонкам
+/// легко перепутать по знаку: например, базис view-матрицы spot-света должен строиться из
+/// `back()` (+Z), а не из forward (−Z) — путаница знака зеркалила теневую карту прожектора
+/// (он самозатенял свой объёмный конус). Именованные направления делают знак невозможным
+/// перепутать (см. `apex-engine/plans/TECH_DEBT.md`, fix 2026-06-15).
+pub trait TransformDirections {
+    /// Локальный −Z в мире (куда «смотрит» объект).
+    fn forward(&self) -> Vec3;
+    /// Локальный +Z в мире.
+    fn back(&self) -> Vec3;
+    /// Локальный +X в мире.
+    fn right(&self) -> Vec3;
+    /// Локальный −X в мире.
+    fn left(&self) -> Vec3;
+    /// Локальный +Y в мире.
+    fn up(&self) -> Vec3;
+    /// Локальный −Y в мире.
+    fn down(&self) -> Vec3;
+}
+
+impl TransformDirections for Mat4 {
+    #[inline]
+    fn forward(&self) -> Vec3 {
+        (-self.z_axis.truncate()).normalize_or_zero()
+    }
+    #[inline]
+    fn back(&self) -> Vec3 {
+        self.z_axis.truncate().normalize_or_zero()
+    }
+    #[inline]
+    fn right(&self) -> Vec3 {
+        self.x_axis.truncate().normalize_or_zero()
+    }
+    #[inline]
+    fn left(&self) -> Vec3 {
+        (-self.x_axis.truncate()).normalize_or_zero()
+    }
+    #[inline]
+    fn up(&self) -> Vec3 {
+        self.y_axis.truncate().normalize_or_zero()
+    }
+    #[inline]
+    fn down(&self) -> Vec3 {
+        (-self.y_axis.truncate()).normalize_or_zero()
+    }
 }
 
 impl From<&LocalTransform> for GlobalTransform {
@@ -1033,5 +1115,29 @@ mod tests {
             Vec3::new(105.0, 0.0, 0.0),
             "изменение родителя должно каскадно пересчитать ребёнка"
         );
+    }
+
+    #[test]
+    fn transform_directions_match_bevy_signs() {
+        // 1:1 Bevy: forward = −Z, back = +Z, right = +X, left = −X, up = +Y, down = −Y. Pins the
+        // sign convention so the spot-shadow basis flip (TECH_DEBT 2026-06-15) can't recur silently.
+        // Identity transform → world axes line up with local.
+        let m = Mat4::IDENTITY;
+        assert!((m.forward() - Vec3::NEG_Z).length() < 1e-6);
+        assert!((m.back() - Vec3::Z).length() < 1e-6);
+        assert!((m.right() - Vec3::X).length() < 1e-6);
+        assert!((m.left() - Vec3::NEG_X).length() < 1e-6);
+        assert!((m.up() - Vec3::Y).length() < 1e-6);
+        assert!((m.down() - Vec3::NEG_Y).length() < 1e-6);
+
+        // forward()/back() are exact opposites; `GlobalTransform` delegates to the same trait and
+        // agrees with `LocalTransform` (built from the same rotation) for an arbitrary orientation.
+        let lt = LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::new(4.0, 0.0, -1.0), Vec3::Y);
+        let gt = GlobalTransform(lt.to_matrix());
+        assert!((gt.forward() - lt.forward()).length() < 1e-5, "GlobalTransform.forward == LocalTransform.forward");
+        assert!((gt.back() - lt.back()).length() < 1e-5);
+        assert!((gt.right() - lt.right()).length() < 1e-5);
+        assert!((gt.up() - lt.up()).length() < 1e-5);
+        assert!((gt.forward() + gt.back()).length() < 1e-5, "forward = -back");
     }
 }

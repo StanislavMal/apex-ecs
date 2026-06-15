@@ -299,10 +299,11 @@ impl<T: Send + Sync + 'static> ResourceAccessList for ResRead<T> {
     }
 }
 
+// NB: write-доступ к ресурсу ставит `resource_write()` (гейт ASD, TD-37).
 impl<T: Send + Sync + 'static> ResourceAccessList for ResWrite<T> {
     #[inline]
     fn resource_accesses() -> crate::access::AccessDescriptor {
-        crate::access::AccessDescriptor::new().write::<T>()
+        crate::access::AccessDescriptor::new().write::<T>().resource_write()
     }
 }
 
@@ -506,7 +507,8 @@ pub struct CommandsParam;
 impl SystemParam for CommandsParam {
     type Item<'w> = &'w mut crate::commands::Commands;
     fn access() -> AccessDescriptor {
-        AccessDescriptor::new()
+        // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
+        AccessDescriptor::new().commands_used()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
         ctx.commands()
@@ -538,7 +540,10 @@ impl<'a, T: Send + Sync + 'static> SystemParam for Res<'a, T> {
 impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
     type Item<'w> = ResMut<'w, T>;
     fn access() -> AccessDescriptor {
-        AccessDescriptor::new().write::<T>()
+        // `write::<T>()` — для конфликт-анализа (две `ResMut<T>` не параллелятся);
+        // `resource_write()` — гейт ASD: систему с мутацией ресурса нельзя дробить на чанки
+        // (тело выполнялось бы раз на чанк ⇒ мутация × число чанков). См. TD-37.
+        AccessDescriptor::new().write::<T>().resource_write()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
         ctx.resource_mut::<T>()
@@ -660,7 +665,8 @@ impl<'a, E: Send + Sync + 'static> SystemParam for EventWriter<'a, E> {
 impl SystemParam for &mut crate::commands::Commands {
     type Item<'w> = &'w mut crate::commands::Commands;
     fn access() -> AccessDescriptor {
-        AccessDescriptor::new()
+        // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
+        AccessDescriptor::new().commands_used()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
         ctx.commands()

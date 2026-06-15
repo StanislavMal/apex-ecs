@@ -118,6 +118,16 @@ pub struct AccessDescriptor {
     /// конкурентно — гонка на состоянии. Ставится планировщиком при
     /// регистрации; параллельность МЕЖДУ системами не ограничивает.
     pub stateful: bool,
+    /// Флаг: система МУТИРУЕТ ресурс (`ResMut`/`ResWrite`). ASD-декомпозиция ЗАПРЕЩЕНА (TD-37):
+    /// тело plain-fn системы выполняется раз на чанк, поэтому мутация ресурса умножилась бы на
+    /// число чанков (молчаливый баг только на масштабе) + гонка при параллельных чанках. Ставится
+    /// `ResMut::access()`/`ResWrite::access()`; параллельность МЕЖДУ системами не ограничивает
+    /// (её решает конфликт по `writes`-TypeId, куда ресурс тоже попадает).
+    pub writes_resource: bool,
+    /// Флаг: система использует `Commands` (отложенные структурные операции). ASD-декомпозиция
+    /// ЗАПРЕЩЕНА (TD-37): не-entity-локальные команды дублировались бы по чанкам. Ставится
+    /// `Commands`/`CommandsParam::access()`.
+    pub uses_commands: bool,
     /// Типы и зарезервированные capacity для event-буферов.
     /// Планировщик вызывает `world.event_reserve::<T>(cap)` перед
     /// выполнением системы, чтобы избежать реаллокаций в hot-пути send().
@@ -169,6 +179,20 @@ impl AccessDescriptor {
         self
     }
 
+    /// Пометить что система МУТИРУЕТ ресурс (`ResMut`/`ResWrite`). Запрещает ASD-декомпозицию
+    /// (тело системы выполнялось бы раз на чанк ⇒ мутация ресурса × число чанков). См. TD-37.
+    pub fn resource_write(mut self) -> Self {
+        self.writes_resource = true;
+        self
+    }
+
+    /// Пометить что система использует `Commands`. Запрещает ASD-декомпозицию (не-entity-локальные
+    /// команды дублировались бы по чанкам). См. TD-37.
+    pub fn commands_used(mut self) -> Self {
+        self.uses_commands = true;
+        self
+    }
+
     /// Декларировать запись событий типа T.
     pub fn write_event<T: 'static>(mut self) -> Self {
         let tid = TypeId::of::<T>();
@@ -203,6 +227,8 @@ impl AccessDescriptor {
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
         self.needs_whole_world = self.needs_whole_world || other.needs_whole_world;
         self.stateful = self.stateful || other.stateful;
+        self.writes_resource = self.writes_resource || other.writes_resource;
+        self.uses_commands = self.uses_commands || other.uses_commands;
         // Сливаем резервирования событий (берём максимум по каждому типу)
         for &(tid, cap) in &other.event_reserves {
             if let Some(entry) = self.event_reserves.iter_mut().find(|(id, _)| *id == tid) {
