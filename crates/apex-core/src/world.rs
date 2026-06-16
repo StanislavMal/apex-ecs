@@ -801,10 +801,43 @@ impl World {
     /// Для единичного компонента — `spawn((MyComponent,))`.
     /// Для нескольких — `spawn((A, B, C))`.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
+        let entity = self.entities.allocate();
+        self.spawn_at(entity, bundle);
+        entity
+    }
+
+    /// Дескриптор-резерватор entity (делит атомарный high-water с аллокатором). Клонируется в
+    /// [`Commands`](crate::commands::Commands), чтобы `commands.spawn().id()` отдавал настоящий
+    /// `Entity` из параллельной системы (1:1 Bevy `Entities::reserve_entity`).
+    #[inline]
+    pub fn entity_reserver(&self) -> crate::entity::EntityReserver {
+        self.entities.reserver()
+    }
+
+    /// Материализовать записи под все зарезервированные через [`World::entity_reserver`] индексы.
+    /// Вызывается [`Commands::apply`](crate::commands::Commands::apply) перед обработкой очереди, до
+    /// того как spawn-команды проставят компоненты зарезервированным entity. Идемпотентно/дёшево.
+    #[inline]
+    pub fn flush_reserved(&mut self) {
+        self.entities.flush();
+    }
+
+    /// Заспавнить компоненты на УЖЕ зарезервированную (через [`World::entity_reserver`]) entity —
+    /// путь `commands.spawn().id()`. Семантически идентичен [`World::spawn`], но не аллоцирует новый
+    /// id, а наполняет переданный (его записи гарантирует [`World::flush_reserved`] на границе apply).
+    #[inline]
+    pub fn spawn_reserved<B: Bundle>(&mut self, entity: Entity, bundle: B) {
+        self.spawn_at(entity, bundle);
+    }
+
+    /// Общее тело спавна: наполнить КОНКРЕТНУЮ entity компонентами `bundle`. Запись entity при
+    /// необходимости создаётся (`ensure_record`) — нужно для зарезервированных id, опередивших flush;
+    /// для прямого `spawn` (аллокатор уже создал запись) это no-op.
+    fn spawn_at<B: Bundle>(&mut self, entity: Entity, bundle: B) {
+        self.entities.ensure_record(entity.index());
         let ids = bundle.component_ids(&mut self.registry);
         if ids.is_empty() {
             // Быстрый путь для пустой entity (spawn(()))
-            let entity = self.entities.allocate();
             let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
             self.entities.set_location(
                 entity,
@@ -813,11 +846,10 @@ impl World {
                     row,
                 },
             );
-            return entity;
+            return;
         }
         // Обычный путь
         let archetype_id = self.get_or_create_archetype(&ids);
-        let entity = self.entities.allocate();
         let row = self.archetypes[archetype_id.0 as usize].entities.len();
         let tick = self.current_tick;
         self.archetypes[archetype_id.0 as usize]
@@ -835,7 +867,6 @@ impl World {
             self.queue_added_hooks(entity, &ids);
             self.flush_hooks();
         }
-        entity
     }
 
     /// Внутренний общий метод для `spawn_many` / `spawn_many_silent`.
@@ -1824,16 +1855,24 @@ impl<'w> SystemContext<'w> {
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub fn commands(&self) -> &mut Commands {
-        if let Some(deferred_cmds) = self.deferred_cmds {
+        let cmds = if let Some(deferred_cmds) = self.deferred_cmds {
             unsafe {
                 let thread_idx = rayon::current_thread_index().unwrap_or(0);
                 let vec = &mut *deferred_cmds;
-                return &mut vec[thread_idx];
+                &mut vec[thread_idx]
             }
+        } else {
+            // SAFETY: inline_cmds используется только когда deferred_cmds не задан
+            // (sequential режим). В этом случае доступ exclusive — один поток.
+            unsafe { &mut *self.inline_cmds.get() }
+        };
+        // Единая точка внедрения резерватора: любой `cmd.spawn().id()` из системы получает
+        // настоящий cross-frame `Entity` (резерватор делит атомарный high-water с аллокатором того
+        // же мира, к которому команды и применятся). Идемпотентно — Arc-clone раз на жизнь Commands.
+        if !cmds.has_reserver() {
+            cmds.set_reserver(self.world().entity_reserver());
         }
-        // SAFETY: inline_cmds используется только когда deferred_cmds не задан
-        // (sequential режим). В этом случае доступ exclusive — один поток.
-        unsafe { &mut *self.inline_cmds.get() }
+        cmds
     }
 
     /// Получить World (для обратной совместимости).

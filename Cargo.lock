@@ -78,6 +78,7 @@ dependencies = [
  "cc",
  "cgmath",
  "criterion",
+ "glam",
  "legion",
  "rayon",
 ]

@@ -78,9 +78,54 @@ impl EntityRecord {
     }
 }
 
-/// Менеджер entity — generational IDs с batch API.
+/// Lock-free резерватор entity-индексов — отделён от [`EntityAllocator`], чтобы
+/// [`Commands`](crate::commands::Commands) могли получить настоящий `Entity` через `&self` (без
+/// `&mut World`), пока система ещё бежит (1:1 Bevy `Entities::reserve_entity`).
+///
+/// Делит атомарный «high-water» счётчик с аллокатором (`Arc<AtomicU32>`). `reserve()` атомарно
+/// выдаёт **свежий** индекс (один `fetch_add` — масштабируется на параллельные системы), всегда
+/// поколения 0: индекс никогда не переиспользуется резервацией, поэтому ABA невозможен и не нужно
+/// читать `records` (его в параллельной фазе никто не трогает). Реальное место в `records` под
+/// зарезервированные индексы создаёт [`EntityAllocator::flush`] на границе apply (под `&mut World`),
+/// после чего spawn-команда проставляет компоненты/локацию. До flush entity «зарезервирована, но не
+/// жива» — `is_alive` = false, в запросах не видна (как `commands.spawn().id()` в Bevy до sync-точки).
+#[derive(Clone)]
+pub struct EntityReserver {
+    next: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl EntityReserver {
+    /// Зарезервировать свежий `Entity` (поколение 0). Lock-free, безопасно из параллельных систем.
+    #[inline]
+    pub fn reserve(&self) -> Entity {
+        let index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Entity {
+            index,
+            generation: 0,
+        }
+    }
+
+    /// Зарезервировать `n` свежих `Entity` ОДНИМ атомарным `fetch_add` (для массового спавна — см.
+    /// [`Commands::spawn_batch`](crate::commands::Commands::spawn_batch)). Индексы непрерывны.
+    #[inline]
+    pub fn reserve_n(&self, n: usize) -> Vec<Entity> {
+        let start = self
+            .next
+            .fetch_add(n as u32, std::sync::atomic::Ordering::Relaxed);
+        (0..n as u32)
+            .map(|i| Entity {
+                index: start + i,
+                generation: 0,
+            })
+            .collect()
+    }
+}
+
+/// Менеджер entity — generational IDs с batch API + атомарной резервацией (см. [`EntityReserver`]).
 pub struct EntityAllocator {
-    next_index: u32,
+    /// High-water счётчик свежих индексов — атомарный, чтобы [`EntityReserver`] (через `&self`)
+    /// и `allocate`/`allocate_batch` (через `&mut self`) делили один монотонный источник индексов.
+    reserve_next: std::sync::Arc<std::sync::atomic::AtomicU32>,
     records: Vec<EntityRecord>,
     free_list: Vec<u32>,
 }
@@ -88,9 +133,45 @@ pub struct EntityAllocator {
 impl EntityAllocator {
     pub fn new() -> Self {
         Self {
-            next_index: 0,
+            reserve_next: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             records: Vec::new(),
             free_list: Vec::new(),
+        }
+    }
+
+    /// Дескриптор-резерватор, делящий high-water счётчик. Клонируется в [`Commands`] (см.
+    /// [`World::entity_reserver`](crate::world::World::entity_reserver)).
+    #[inline]
+    pub fn reserver(&self) -> EntityReserver {
+        EntityReserver {
+            next: std::sync::Arc::clone(&self.reserve_next),
+        }
+    }
+
+    /// Материализовать записи под все зарезервированные индексы (вызывается на границе apply под
+    /// `&mut World`). Идемпотентно: растит `records` до текущего high-water (свежие слоты, поколение
+    /// 0, без локации). После этого `spawn_reserved` проставляет компоненты/локацию.
+    pub fn flush(&mut self) {
+        let target = self.reserve_next.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if self.records.len() < target {
+            self.records.resize_with(target, || EntityRecord {
+                generation: 0,
+                encoded_location: NO_LOCATION,
+            });
+        }
+    }
+
+    /// Убедиться, что `records` покрывает `index` (свежие промежуточные слоты — поколение 0). Нужно,
+    /// т.к. резервации двигают high-water, не трогая `records`; прямой `allocate` свежего индекса
+    /// может опередить flush.
+    #[inline]
+    pub(crate) fn ensure_record(&mut self, index: u32) {
+        let needed = index as usize + 1;
+        if self.records.len() < needed {
+            self.records.resize_with(needed, || EntityRecord {
+                generation: 0,
+                encoded_location: NO_LOCATION,
+            });
         }
     }
 
@@ -103,15 +184,15 @@ impl EntityAllocator {
                 generation: gen,
             }
         } else {
-            let index = self.next_index;
-            self.next_index += 1;
-            self.records.push(EntityRecord {
-                generation: 0,
-                encoded_location: NO_LOCATION,
-            });
+            // Свежий индекс из общего атомарного счётчика (тот же, что у резерватора) — прямой spawn
+            // и `commands.spawn()` никогда не выдадут один индекс.
+            let index = self
+                .reserve_next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.ensure_record(index);
             Entity {
                 index,
-                generation: 0,
+                generation: self.records[index as usize].generation,
             }
         }
     }
@@ -137,16 +218,17 @@ impl EntityAllocator {
             });
         }
 
-        // 2. Новые записи одним resize_with
+        // 2. Новые записи одним resize_with. Свежий диапазон индексов берём из общего атомарного
+        //    high-water (тот же источник, что у резерватора и `allocate`).
         let remaining = count - from_free;
         if remaining > 0 {
-            let start = self.next_index as usize;
-            self.next_index += remaining as u32;
-            self.records
-                .resize_with(start + remaining, || EntityRecord {
-                    generation: 0,
-                    encoded_location: NO_LOCATION,
-                });
+            let start = self
+                .reserve_next
+                .fetch_add(remaining as u32, std::sync::atomic::Ordering::Relaxed)
+                as usize;
+            // `ensure_record` (а не голый resize до start+remaining): если резервации уже опередили
+            // `records`, промежуточные слоты [records.len()..start] тоже создаются (поколение 0).
+            self.ensure_record((start + remaining - 1) as u32);
             for i in 0..remaining {
                 entities.push(Entity {
                     index: (start + i) as u32,
@@ -369,6 +451,73 @@ mod tests {
             None,
             "слот без location (свободный/ретированный) не выдаёт entity"
         );
+    }
+
+    // ── Атомарная резервация (Commands::spawn().id()) ──────────
+
+    #[test]
+    fn reserve_produces_fresh_gen0_ids_then_flush_materializes() {
+        let mut alloc = EntityAllocator::new();
+        let r = alloc.reserver();
+        let a = r.reserve();
+        let b = r.reserve();
+        assert_ne!(a.index, b.index, "резервации дают разные индексы");
+        assert_eq!(a.generation, 0);
+        assert_eq!(b.generation, 0);
+        // До flush слоты не существуют → entity не жива.
+        assert!(!alloc.is_alive(a));
+
+        // flush создаёт записи; spawn_reserved-эквивалент = set_location.
+        alloc.flush();
+        alloc.set_location(a, make_loc());
+        alloc.set_location(b, make_loc());
+        assert!(alloc.is_alive(a));
+        assert!(alloc.is_alive(b));
+    }
+
+    #[test]
+    fn reserve_and_direct_allocate_never_collide() {
+        let mut alloc = EntityAllocator::new();
+        let r = alloc.reserver();
+        let mut indices = std::collections::HashSet::new();
+        // Перемежаем резервацию и прямой allocate — общий high-water не даёт коллизий индексов.
+        for _ in 0..50 {
+            assert!(indices.insert(r.reserve().index));
+            let e = alloc.allocate();
+            alloc.set_location(e, make_loc());
+            assert!(indices.insert(e.index), "прямой allocate не пересекает резервации");
+        }
+        alloc.flush();
+    }
+
+    #[test]
+    fn parallel_reserve_yields_unique_indices() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let alloc = EntityAllocator::new();
+        let r = alloc.reserver();
+        let count = AtomicU32::new(0);
+        // 8 потоков по 1000 резерваций — все индексы уникальны (lock-free fetch_add).
+        let all: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let r = r.clone();
+                let all = &all;
+                let count = &count;
+                s.spawn(move || {
+                    let mut local = Vec::with_capacity(1000);
+                    for _ in 0..1000 {
+                        local.push(r.reserve().index);
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    all.lock().unwrap().extend(local);
+                });
+            }
+        });
+        assert_eq!(count.load(Ordering::Relaxed), 8000);
+        let mut v = all.into_inner().unwrap();
+        v.sort_unstable();
+        v.dedup();
+        assert_eq!(v.len(), 8000, "ни один индекс не выдан дважды");
     }
 
     #[test]

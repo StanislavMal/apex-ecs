@@ -2089,6 +2089,20 @@ grav <-> phys, phys <-> grav
   scheduler.before("a", "b"), or scheduler.after("b", "a")
 ```
 
+**`independent(&[...])` — когда порядок не важен (2026-06-16).** Если перекрёстный конфликт реальный,
+но порядок выполнения для логики **безразличен** (и не хочется выдумывать искусственный
+`before`/`after`), объявите системы порядко-независимыми:
+
+```rust
+sched.independent(&["grav", "phys"]);  // компилируется; порядок детерминирован (по регистрации)
+```
+
+Планировщик не падает, а сериализует пару в **детерминированном порядке регистрации** (конфликт по
+данным всё равно исключает параллельный запуск — гонок нет; `independent` лишь снимает требование
+*явно выбрать* направление). В отличие от Bevy `ambiguous_with` (произвольный порядок) детерминизм
+сохраняется — важно для replay/netcode. Строгость по умолчанию НЕ ослабляется: без явного указания
+`BidirectionalWriteRead` по-прежнему ошибка.
+
 #### 6.5.1 Управление упорядочиванием по событиям
 
 По умолчанию планировщик автоматически гарантирует, что системы с `Emit<E>` выполняются до систем с `Listen<E>`. Это поведение можно отключить:
@@ -2382,6 +2396,41 @@ cmds.add(|world: &mut World| { world.insert_resource(MyRes(42)); });
 ```
 
 > **Совет:** `Commands::with_capacity(n)` — предаллоцирует буфер для `n` команд. Используйте, когда заранее знаете примерное количество команд.
+
+### 7.1.1 `EntityCommands` — id сразу + декларативные иерархии (2026-06-16)
+
+`spawn()` возвращает **`EntityCommands`** — билдер, дающий настоящий `Entity` сразу (через атомарную
+резервацию, 1:1 Bevy `Commands::spawn`) и позволяющий цепочкой довешивать компоненты, связи и
+**детей** — декларативно, в plain-fn системах, без эксклюзивного `&mut World`:
+
+```rust
+fn setup(cmd: &mut Commands) {
+    // id() — настоящий cross-frame Entity (можно сохранить в ресурс/компонент).
+    let player = cmd.spawn((Transform::default(), Health(100))).id();
+
+    // Иерархия декларативно: каждый child получает связь ChildOf → родитель.
+    cmd.spawn((Transform::default(), Name("ring")))
+        .with_children(|c| {
+            c.spawn((Transform::default(), Sprite));
+            c.spawn((Transform::default(), Sprite));
+        })
+        .insert(Visible);             // цепочка: довесить компонент родителю
+
+    // Билдер для уже существующей entity:
+    cmd.entity(player).set_parent(root).insert(Armed);
+}
+```
+
+Методы `EntityCommands`: `id()`, `insert(c)`, `remove::<T>()`, `add_relation(kind, target)`,
+`set_parent(parent)` (связь `ChildOf`), `with_children(|c| …)` (вложенность любой глубины),
+`despawn()`. `ChildSpawner::spawn` внутри `with_children` сам навешивает `ChildOf` → родитель.
+
+> **Когда id валиден.** В системе (через `&mut Commands`/`CommandsParam`) резерватор привязывается
+> автоматически — `id()` отдаёт настоящий `Entity`. У standalone `Commands::new()` (ручной/тестовый
+> путь) привяжите его: `cmds.set_reserver(world.entity_reserver())`; без него `id()` = `Entity::PLACEHOLDER`,
+> а `spawn` аллоцирует id на `apply` (старое поведение; `cmd.spawn(x);` без чтения результата работает
+> всегда). Зарезервированная entity «не жива» до `apply` (как Bevy до sync-точки) — в запросах
+> появится после применения команд.
 
 > **Группировка insert-бёрстов (W2-1).** Бёрст ПОДРЯД идущих `insert`'ов на одну entity
 > (`cmds.insert(e, A); cmds.insert(e, B); cmds.insert(e, C)`) применяется группой — **один**

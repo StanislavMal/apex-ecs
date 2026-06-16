@@ -12,6 +12,7 @@ legion = ["dep:legion"]
 
 [dependencies]
 cgmath = "0.18"
+glam = { workspace = true }
 rayon = "1.4"
 
 # Apex ECS

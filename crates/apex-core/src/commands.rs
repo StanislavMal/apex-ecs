@@ -102,7 +102,9 @@ impl Drop for CommandArena {
 
 // ── Function pointer types ───────────────────────────────────────
 
-type SpawnApply = unsafe fn(*mut u8, &mut World);
+/// Spawn-apply получает зарезервированную `Entity` (либо `PLACEHOLDER` для standalone-Commands без
+/// резерватора) — наполняет её компонентами через `world.spawn_reserved` (или `world.spawn`).
+type SpawnApply = unsafe fn(*mut u8, &mut World, Entity);
 type InsertApply = unsafe fn(*mut u8, &mut World, Entity);
 type RemoveApply = unsafe fn(Entity, &mut World);
 type DropFn = unsafe fn(*mut u8);
@@ -118,8 +120,11 @@ type ComponentIdFn = fn(&mut crate::component::ComponentRegistry) -> ComponentId
 // Despawn / Remove / SpawnFromTemplate — inline, без аллокации.
 
 enum Command {
-    /// Spawn с данными в bump-арене (offset + apply fn)
+    /// Spawn с данными в bump-арене (offset + apply fn). `entity` — заранее зарезервированный id
+    /// (см. [`Commands::spawn`]), либо `Entity::PLACEHOLDER` (standalone-Commands без резерватора —
+    /// тогда apply аллоцирует новый id, поведение как раньше).
     Spawn {
+        entity: Entity,
         offset: u32,
         apply: SpawnApply,
         drop: DropFn,
@@ -174,6 +179,22 @@ enum Command {
     },
 }
 
+/// Apply одной spawn-команды: наполнить зарезервированную `entity` (или аллоцировать новую при
+/// `PLACEHOLDER` — standalone-Commands). Вынесено на уровень модуля для переиспользования в
+/// [`Commands::spawn`] и [`Commands::spawn_batch`].
+unsafe fn spawn_apply<B: Bundle>(ptr: *mut u8, world: &mut World, entity: Entity) {
+    let bundle = std::ptr::read(ptr as *const B);
+    if entity == Entity::PLACEHOLDER {
+        world.spawn(bundle);
+    } else {
+        world.spawn_reserved(entity, bundle);
+    }
+}
+
+unsafe fn spawn_drop<B>(ptr: *mut u8) {
+    std::ptr::drop_in_place(ptr as *mut B);
+}
+
 /// Entity-цель insert-подобной команды — критерий группировки бёрстов (W2-1).
 fn insert_target(cmd: &Command) -> Option<Entity> {
     match cmd {
@@ -200,6 +221,11 @@ fn insert_target(cmd: &Command) -> Option<Entity> {
 pub struct Commands {
     queue: Vec<Command>,
     arena: CommandArena,
+    /// Резерватор entity — позволяет `spawn().id()` отдавать настоящий `Entity` сразу (см.
+    /// [`EntityReserver`](crate::entity::EntityReserver)). Внедряется при доступе к Commands из
+    /// системы (`SystemContext::commands`). `None` у standalone-`Commands::new()` (тесты) — там
+    /// `spawn` аллоцирует id на apply, а `id()` вернёт `PLACEHOLDER`.
+    reserver: Option<crate::entity::EntityReserver>,
 }
 
 impl Commands {
@@ -207,6 +233,7 @@ impl Commands {
         Self {
             queue: Vec::new(),
             arena: CommandArena::new(),
+            reserver: None,
         }
     }
 
@@ -214,7 +241,21 @@ impl Commands {
         Self {
             queue: Vec::with_capacity(cap),
             arena: CommandArena::new(),
+            reserver: None,
         }
+    }
+
+    /// Привязать резерватор entity (вызывается движком из `SystemContext::commands`, идемпотентно).
+    /// После этого `spawn().id()` отдаёт настоящий cross-frame `Entity`.
+    #[inline]
+    pub fn set_reserver(&mut self, reserver: crate::entity::EntityReserver) {
+        self.reserver = Some(reserver);
+    }
+
+    /// Есть ли привязанный резерватор (т.е. отдаёт ли `spawn().id()` настоящий id).
+    #[inline]
+    pub fn has_reserver(&self) -> bool {
+        self.reserver.is_some()
     }
 
     /// Уничтожить entity — без аллокации, хранится inline в enum
@@ -223,21 +264,67 @@ impl Commands {
         self.queue.push(Command::Despawn(entity));
     }
 
-    /// Создать entity из Bundle — typed payload в bump-арене
-    pub fn spawn<B: Bundle + Send + 'static>(&mut self, bundle: B) {
-        unsafe fn apply_spawn<B: Bundle>(ptr: *mut u8, world: &mut World) {
-            let bundle = std::ptr::read(ptr as *const B);
-            world.spawn(bundle);
-        }
-        unsafe fn drop_typed<T>(ptr: *mut u8) {
-            std::ptr::drop_in_place(ptr as *mut T);
-        }
+    /// Создать entity из Bundle. Возвращает [`EntityCommands`] — билдер для довешивания компонентов,
+    /// связей и **дочерних** entity (`with_children`) декларативно, в plain-fn (1:1 Bevy
+    /// `Commands::spawn`). `id()` отдаёт настоящий `Entity` сразу, если Commands привязан к миру
+    /// (системный путь); иначе — `PLACEHOLDER` (standalone-Commands без резерватора). Существующий
+    /// код `cmd.spawn(bundle);` (без чтения результата) работает без изменений.
+    pub fn spawn<B: Bundle + Send + 'static>(&mut self, bundle: B) -> EntityCommands<'_> {
+        let entity = match &self.reserver {
+            Some(r) => r.reserve(),
+            None => Entity::PLACEHOLDER,
+        };
         let offset = self.arena.alloc(bundle);
         self.queue.push(Command::Spawn {
+            entity,
             offset,
-            apply: apply_spawn::<B>,
-            drop: drop_typed::<B>,
+            apply: spawn_apply::<B>,
+            drop: spawn_drop::<B>,
         });
+        EntityCommands {
+            commands: self,
+            entity,
+        }
+    }
+
+    /// Создать множество entity из однотипных Bundle ОДНИМ резервированием (один атомарный
+    /// `fetch_add` на всю пачку — масштабируется на массовый спавн: частицы/стриминг/толпы).
+    /// Возвращает зарезервированные `Entity` (настоящие cross-frame id при системном Commands;
+    /// `PLACEHOLDER` у standalone без резерватора — тогда id аллоцируются на apply). 1:1 Bevy
+    /// `Commands::spawn_batch` (но с возвратом id).
+    ///
+    /// *Перф-заметка:* применяет N отдельных spawn-команд (корректно); bulk-insert в один архетип
+    /// одним проходом (как `World::spawn_many`) — будущая оптимизация apply.
+    pub fn spawn_batch<B, I>(&mut self, bundles: I) -> Vec<Entity>
+    where
+        B: Bundle + Send + 'static,
+        I: IntoIterator<Item = B>,
+    {
+        let bundles: Vec<B> = bundles.into_iter().collect();
+        let entities: Vec<Entity> = match &self.reserver {
+            Some(r) => r.reserve_n(bundles.len()),
+            None => vec![Entity::PLACEHOLDER; bundles.len()],
+        };
+        for (&entity, bundle) in entities.iter().zip(bundles) {
+            let offset = self.arena.alloc(bundle);
+            self.queue.push(Command::Spawn {
+                entity,
+                offset,
+                apply: spawn_apply::<B>,
+                drop: spawn_drop::<B>,
+            });
+        }
+        entities
+    }
+
+    /// Получить билдер [`EntityCommands`] для уже существующей `entity` (1:1 Bevy
+    /// `Commands::entity`) — довесить компоненты/связи/детей отложенно.
+    #[inline]
+    pub fn entity(&mut self, entity: Entity) -> EntityCommands<'_> {
+        EntityCommands {
+            commands: self,
+            entity,
+        }
     }
 
     /// Добавить компонент к entity — typed payload в bump-арене
@@ -396,6 +483,9 @@ impl Commands {
     /// вместо move-на-компонент (W2-1, `World::insert_parts`). Порядок
     /// применения команд сохраняется.
     pub fn apply(&mut self, world: &mut World) {
+        // Материализовать записи под зарезервированные `spawn().id()` entity ДО обработки очереди
+        // (их spawn-команды проставят локацию/компоненты). Идемпотентно и дёшево, если резерваций нет.
+        world.flush_reserved();
         let queue = std::mem::take(&mut self.queue);
         let mut it = queue.into_iter().peekable();
         // Переиспользуемые буферы группы (вне цикла — без реаллокаций).
@@ -467,8 +557,13 @@ impl Commands {
     fn apply_one(&self, cmd: Command, world: &mut World) {
         {
             match cmd {
-                Command::Spawn { offset, apply, .. } => unsafe {
-                    apply(self.arena.get_ptr(offset), world);
+                Command::Spawn {
+                    entity,
+                    offset,
+                    apply,
+                    ..
+                } => unsafe {
+                    apply(self.arena.get_ptr(offset), world, entity);
                 },
                 Command::Insert {
                     entity,
@@ -557,6 +652,148 @@ impl Commands {
     }
 }
 
+/// Билдер entity в очереди [`Commands`] — цепочка компонентов, связей и **детей** декларативно,
+/// в plain-fn (1:1 Bevy `EntityCommands`). Возвращается [`Commands::spawn`]/[`Commands::entity`].
+///
+/// ```ignore
+/// fn setup(cmd: &mut Commands) {
+///     cmd.spawn((Transform::default(), Name("ring")))
+///         .with_children(|c| {
+///             c.spawn((Transform::default(), Fox));   // ChildOf → ring автоматически
+///             c.spawn((Transform::default(), Fox));
+///         });
+/// }
+/// ```
+pub struct EntityCommands<'a> {
+    commands: &'a mut Commands,
+    entity: Entity,
+}
+
+impl EntityCommands<'_> {
+    /// Id этой entity. Настоящий cross-frame `Entity`, если Commands привязан к миру (системный
+    /// путь); иначе `Entity::PLACEHOLDER` (standalone-Commands без резерватора).
+    #[inline]
+    pub fn id(&self) -> Entity {
+        self.entity
+    }
+
+    /// Довесить компонент (отложенно). 1:1 Bevy `EntityCommands::insert`.
+    #[inline]
+    pub fn insert<T: Component + Send + 'static>(self, component: T) -> Self {
+        self.commands.insert(self.entity, component);
+        self
+    }
+
+    /// Снять компонент (отложенно).
+    #[inline]
+    pub fn remove<T: Component + Send + 'static>(self) -> Self {
+        self.commands.remove::<T>(self.entity);
+        self
+    }
+
+    /// Добавить связь `self —kind→ target` (отложенно).
+    #[inline]
+    pub fn add_relation<R: RelationKind>(self, kind: R, target: Entity) -> Self {
+        self.commands.add_relation(self.entity, kind, target);
+        self
+    }
+
+    /// Сделать `self` ребёнком `parent` (связь [`ChildOf`](crate::relations::ChildOf)).
+    #[inline]
+    pub fn set_parent(self, parent: Entity) -> Self {
+        self.commands
+            .add_relation(self.entity, crate::relations::ChildOf, parent);
+        self
+    }
+
+    /// Усыновить УЖЕ существующую `child` (связь `ChildOf` child → self). В отличие от
+    /// [`with_children`](Self::with_children) (спавнит новых), привязывает имеющуюся entity —
+    /// нужно редактору/геймплею для переродительства. 1:1 Bevy `EntityCommands::add_child`.
+    #[inline]
+    pub fn add_child(self, child: Entity) -> Self {
+        self.commands
+            .add_relation(child, crate::relations::ChildOf, self.entity);
+        self
+    }
+
+    /// Усыновить набор существующих entity (см. [`add_child`](Self::add_child)).
+    pub fn add_children(self, children: &[Entity]) -> Self {
+        for &child in children {
+            self.commands
+                .add_relation(child, crate::relations::ChildOf, self.entity);
+        }
+        self
+    }
+
+    /// Отвязать `self` от родителя (снять её связь `ChildOf`). Родитель резолвится на apply (его id
+    /// знать не нужно). 1:1 Bevy `EntityCommands::remove_parent`.
+    pub fn remove_parent(self) -> Self {
+        let entity = self.entity;
+        self.commands.add(move |world: &mut World| {
+            if let Some(parent) = world.get_relation_target(entity, crate::relations::ChildOf) {
+                world.remove_relation(entity, crate::relations::ChildOf, parent);
+            }
+        });
+        self
+    }
+
+    /// Отвязать ВСЕХ детей `self` (снять их связи `ChildOf` → self), не удаляя их. Дети резолвятся
+    /// на apply. 1:1 Bevy `EntityCommands::clear_children`.
+    pub fn clear_children(self) -> Self {
+        let parent = self.entity;
+        self.commands.add(move |world: &mut World| {
+            let kids: Vec<Entity> = world.children_of(crate::relations::ChildOf, parent).collect();
+            for child in kids {
+                world.remove_relation(child, crate::relations::ChildOf, parent);
+            }
+        });
+        self
+    }
+
+    /// Заспавнить детей этой entity декларативно (1:1 Bevy `with_children`). Каждый `c.spawn(...)`
+    /// автоматически получает связь [`ChildOf`](crate::relations::ChildOf) → эта entity. Вложенность
+    /// произвольной глубины (ребёнок тоже отдаёт [`EntityCommands`] со своим `with_children`).
+    pub fn with_children(self, f: impl FnOnce(&mut ChildSpawner)) -> Self {
+        let parent = self.entity;
+        {
+            let mut spawner = ChildSpawner {
+                commands: &mut *self.commands,
+                parent,
+            };
+            f(&mut spawner);
+        }
+        self
+    }
+
+    /// Уничтожить эту entity (отложенно).
+    #[inline]
+    pub fn despawn(self) {
+        self.commands.despawn(self.entity);
+    }
+}
+
+/// Спавнер детей внутри [`EntityCommands::with_children`]. Каждый [`ChildSpawner::spawn`] навешивает
+/// связь `ChildOf` → родитель.
+pub struct ChildSpawner<'a> {
+    commands: &'a mut Commands,
+    parent: Entity,
+}
+
+impl ChildSpawner<'_> {
+    /// Заспавнить ребёнка (связь `ChildOf` → родитель добавляется автоматически). Возвращает
+    /// [`EntityCommands`] ребёнка — можно вложить ещё `with_children`.
+    pub fn spawn<B: Bundle + Send + 'static>(&mut self, bundle: B) -> EntityCommands<'_> {
+        // `.id()` копирует id и роняет временный билдер → борроу освобождён до add_relation.
+        let child = self.commands.spawn(bundle).id();
+        self.commands
+            .add_relation(child, crate::relations::ChildOf, self.parent);
+        EntityCommands {
+            commands: self.commands,
+            entity: child,
+        }
+    }
+}
+
 impl Drop for Commands {
     fn drop(&mut self) {
         // Дропаем typed данные в арене перед деаллокацией буфера
@@ -623,6 +860,99 @@ mod tests {
             assert_eq!(pos.0, 1.0);
         });
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn commands_spawn_id_is_real_entity_and_alive_after_apply() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+
+        // С резерватором `spawn().id()` отдаёт настоящий id сразу.
+        let e = cmds.spawn((Pos(7.0),)).id();
+        assert_ne!(e, Entity::PLACEHOLDER);
+        // До apply — зарезервирована, но не жива (как Bevy до sync-точки).
+        assert!(!world.is_alive(e), "reserved entity не жива до apply");
+
+        cmds.apply(&mut world);
+        assert!(world.is_alive(e), "после apply entity жива");
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 7.0);
+    }
+
+    #[test]
+    fn entity_commands_with_children_wires_childof() {
+        use crate::relations::ChildOf;
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+
+        let parent = cmds
+            .spawn((Pos(0.0),))
+            .with_children(|c| {
+                c.spawn((Vel(1.0),));
+                c.spawn((Vel(2.0),));
+            })
+            .id();
+        cmds.apply(&mut world);
+
+        let kids: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        assert_eq!(kids.len(), 2, "оба ребёнка связаны ChildOf → parent");
+        for k in kids {
+            assert!(world.get::<Vel>(k).is_some(), "ребёнок несёт свой компонент");
+            assert_eq!(
+                world.get_relation_target(k, ChildOf),
+                Some(parent),
+                "target связи ChildOf = родитель"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_batch_reserves_distinct_ids_and_applies() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+
+        let ids = cmds.spawn_batch((0..100).map(|i| (Pos(i as f32),)));
+        assert_eq!(ids.len(), 100);
+        let uniq: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(uniq.len(), 100, "batch id уникальны (одно резервирование)");
+        assert!(ids.iter().all(|&e| e != Entity::PLACEHOLDER));
+
+        cmds.apply(&mut world);
+        for (i, &e) in ids.iter().enumerate() {
+            assert!(world.is_alive(e), "entity {i} жива после apply");
+            assert_eq!(world.get::<Pos>(e).unwrap().0, i as f32);
+        }
+    }
+
+    #[test]
+    fn entity_commands_reparent_existing_entities() {
+        use crate::relations::ChildOf;
+        let mut world = World::new();
+        let parent = world.spawn((Pos(0.0),));
+        let a = world.spawn((Vel(1.0),));
+        let b = world.spawn((Vel(2.0),));
+
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+
+        // Усыновить существующие a, b.
+        cmds.entity(parent).add_children(&[a, b]);
+        cmds.apply(&mut world);
+        assert_eq!(world.get_relation_target(a, ChildOf), Some(parent));
+        assert_eq!(world.get_relation_target(b, ChildOf), Some(parent));
+
+        // Отвязать a от родителя.
+        cmds.entity(a).remove_parent();
+        cmds.apply(&mut world);
+        assert_eq!(world.get_relation_target(a, ChildOf), None);
+
+        // Отвязать всех детей parent (снимет b), не удаляя их.
+        cmds.entity(parent).clear_children();
+        cmds.apply(&mut world);
+        assert_eq!(world.get_relation_target(b, ChildOf), None);
+        assert!(world.is_alive(b), "clear_children НЕ удаляет детей");
     }
 
     #[test]

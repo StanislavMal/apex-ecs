@@ -563,19 +563,67 @@ pub fn propagate_transforms(world: &mut World) {
     //      Поддеревья дизъюнктны по построению (у entity один родитель, корни не
     //      вложены друг в друга), поэтому записи не конфликтуют и порядок фазы B
     //      не важен.
+    //    Стратегия: **widen-then-descend**. Параллельность по КОРНЯМ эффективна (thread-local стек,
+    //    без материализации уровней), но проседает, когда корней мало, а поддеревья огромные (кольцо
+    //    → 10k лис → 260k узлов: 56 корней). Поэтому СНАЧАЛА расширяем фронтир корней дешёвыми
+    //    последовательными уровнями, пока он не станет широким (56 → 10000 лис — обрабатываем лишь
+    //    56 узлов), ПОТОМ — параллельный спуск по независимым поддеревьям широкого фронтира. Если
+    //    фронтир уже широк (10000 анимированных персонажей-корней) — расширение пропускается; если
+    //    дерево узкое и не ширится (цепочка) — выходим и спускаемся как есть.
     let mut visits = 0usize;
+    let gt_id = world.registry.get_id::<GlobalTransform>();
+    // Авто-создание GlobalTransform (entity с одним LocalTransform): в горячем пути пусто (required
+    // components); структурный insert — в конце, не во время параллельного спуска.
+    let mut missing: Vec<(Entity, Mat4)> = Vec::new();
+    let mut frontier: Vec<(Entity, Mat4)> = scratch.stack.drain(..).collect();
+
+    // ── Фаза widen: последовательно обрабатываем верхние (узкие) уровни, пока фронтир не станет
+    //    достаточно широким для хорошей параллельности по поддеревьям. ──
+    const WIDE_ENOUGH: usize = 1024;
+    loop {
+        if frontier.len() >= WIDE_ENOUGH || frontier.is_empty() {
+            break;
+        }
+        let prev_len = frontier.len();
+        let mut next: Vec<(Entity, Mat4)> = Vec::new();
+        for &(entity, pg) in &frontier {
+            if !world.is_alive(entity) {
+                continue;
+            }
+            // Entity без LocalTransform останавливает спуск (каскад идёт только через узлы с трансформом).
+            let local = match world.get::<LocalTransform>(entity) {
+                Some(l) => *l,
+                None => continue,
+            };
+            let global = pg * local.to_matrix();
+            visits += 1;
+            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
+                gt.0 = global;
+            } else {
+                missing.push((entity, global));
+            }
+            for child in world.children_of(ChildOf, entity) {
+                next.push((child, global));
+            }
+        }
+        let grew = next.len() > prev_len;
+        frontier = next;
+        if !grew {
+            // Уровень не расширяется (узкое/цепочечное дерево) — дальше расширять смысла нет.
+            break;
+        }
+    }
+
+    // ── Фаза descend: параллельный спуск по независимым поддеревьям широкого фронтира. ──
     const PAR_MIN_ROOTS: usize = 64;
-    if scratch.stack.len() >= PAR_MIN_ROOTS {
+    if frontier.len() >= PAR_MIN_ROOTS {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // Записи идут ПРЯМО из параллельного спуска по (archetype, row)-указателям — тот же
-        // контракт, что у параллельных Write-запросов (каждая строка колонки пишется ровно
-        // одним потоком): поддеревья дизъюнктны, entity посещается один раз. Структурных
-        // изменений в фазе нет — entity без GlobalTransform откладываются в `missing` и
-        // вставляются последовательно после.
-        let roots: Vec<(Entity, Mat4)> = scratch.stack.drain(..).collect();
-        let gt_id = world.registry.get_id::<GlobalTransform>();
-        let missing: std::sync::Mutex<Vec<(Entity, Mat4)>> = std::sync::Mutex::new(Vec::new());
+        // Записи ПРЯМО из параллельного спуска по (archetype, row)-указателям — тот же контракт, что
+        // у параллельных Write-запросов (строка пишется ровно одним потоком): поддеревья дизъюнктны,
+        // entity посещается один раз; структурных изменений в фазе нет (missing откладываем).
+        let roots = frontier;
+        let missing_par: std::sync::Mutex<Vec<(Entity, Mat4)>> = std::sync::Mutex::new(Vec::new());
         let visited = AtomicUsize::new(0);
         let world_ref: &World = world;
         roots.par_iter().for_each(|&(root, parent_global)| {
@@ -604,42 +652,38 @@ pub fn propagate_transforms(world: &mut World) {
                 visited.fetch_add(n, Ordering::Relaxed);
             }
             if !local_missing.is_empty() {
-                missing.lock().unwrap().extend(local_missing);
+                missing_par.lock().unwrap().extend(local_missing);
             }
         });
-        visits = visited.load(Ordering::Relaxed);
-        // Авто-инициализация отсутствующих GlobalTransform (двойная вставка невозможна —
-        // entity посещается ровно один раз).
-        for (entity, global) in missing.into_inner().unwrap() {
-            world.insert(entity, GlobalTransform(global));
-        }
+        visits += visited.load(Ordering::Relaxed);
+        missing.extend(missing_par.into_inner().unwrap());
     } else {
-        // Последовательный DFS: каждый узел ровно один раз, строго после родителя.
-        while let Some((entity, parent_global)) = scratch.stack.pop() {
+        // Последовательный DFS остатка (узкий фронтир): каждый узел ровно один раз, после родителя.
+        let mut stack = frontier;
+        while let Some((entity, parent_global)) = stack.pop() {
             if !world.is_alive(entity) {
                 continue;
             }
-            // Entity без LocalTransform останавливает спуск (как и раньше: каскад шёл
-            // только через узлы с трансформом).
             let local = match world.get::<LocalTransform>(entity) {
                 Some(l) => *l,
                 None => continue,
             };
             let global = parent_global * local.to_matrix();
             visits += 1;
-
-            // Записываем новый GlobalTransform; если его ещё нет — авто-инициализируем
-            // (DX: достаточно заспавнить entity с одним LocalTransform — issue #3/#17).
             if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
                 gt.0 = global;
             } else {
-                world.insert(entity, GlobalTransform(global));
+                missing.push((entity, global));
             }
-
             for child in world.children_of(ChildOf, entity) {
-                scratch.stack.push((child, global));
+                stack.push((child, global));
             }
         }
+    }
+
+    // Авто-инициализация отсутствующих GlobalTransform (entity посещается ровно один раз).
+    for (entity, global) in missing {
+        world.insert(entity, GlobalTransform(global));
     }
 
     if trace {
@@ -1075,6 +1119,51 @@ mod tests {
                 world.get::<GlobalTransform>(*child).unwrap().0.transform_point3(Vec3::ZERO),
                 Vec3::new(1000.0 + i as f32, 1.0, 0.0),
                 "child {i} должен пересчитаться от свежего родителя в параллельной ветке"
+            );
+        }
+    }
+
+    /// Глубокая/широкая иерархия с НЕМНОГИМИ корнями (кейс ring-parent many_foxes): параллелизм
+    /// должен идти по ШИРИНЕ уровня, а не по числу корней. 1 корень → 300 детей (широкий уровень >
+    /// PAR_MIN_LEVEL → параллельная ветка) → у каждого внук. Сдвиг ТОЛЬКО корня каскадирует на 600
+    /// потомков; родитель уровня передаётся детям по значению через барьер уровня.
+    #[test]
+    fn deep_wide_hierarchy_few_roots_propagates_in_parallel_levels() {
+        use crate::query::Write;
+
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let root = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+        let mut grandkids = Vec::new();
+        for i in 0..300 {
+            let child =
+                world.spawn((LocalTransform::from_translation(Vec3::new(0.0, i as f32, 0.0)),));
+            world.add_relation(child, ChildOf, root);
+            let gk = world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 0.0, 1.0)),));
+            world.add_relation(gk, ChildOf, child);
+            grandkids.push((i, gk));
+        }
+        propagate_transforms(&mut world);
+
+        // Сдвигаем ТОЛЬКО корень → пересчёт каскадирует на 600 потомков через широкие уровни.
+        world.tick();
+        {
+            let q = Query::<Write<LocalTransform>>::new(&world);
+            q.for_each(|e, mut lt| {
+                if e == root {
+                    lt.translation.x = 1000.0;
+                }
+            });
+        }
+        propagate_transforms(&mut world);
+
+        // Внук i: root(1000,0,0) + child(0,i,0) + gk(0,0,1) = (1000, i, 1).
+        for (i, gk) in grandkids {
+            assert_eq!(
+                world.get::<GlobalTransform>(gk).unwrap().0.transform_point3(Vec3::ZERO),
+                Vec3::new(1000.0, i as f32, 1.0),
+                "внук {i} пересчитан от свежего корня через параллельный уровень"
             );
         }
     }

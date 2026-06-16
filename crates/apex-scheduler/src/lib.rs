@@ -1369,6 +1369,47 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Объявить системы взаимно **порядко-независимыми**: при `BidirectionalWriteRead` между ними
+    /// планировщик НЕ роняет компиляцию (`CircularDependency`), а сериализует их в
+    /// **детерминированном порядке регистрации** (порядок воспроизводим между сборками).
+    ///
+    /// Когда применять: две системы имеют перекрёстный конфликт чтения-записи (A пишет T, читаемый
+    /// B; B пишет U, читаемый A), но порядок их выполнения для логики **не важен** — и не хочется
+    /// выдумывать искусственный `before`/`after`. Конфликт по данным всё равно исключает
+    /// параллельный запуск (гонок нет) — `independent` лишь снимает требование *явно выбрать*
+    /// направление, фиксируя его детерминированно (порядок добавления систем).
+    ///
+    /// Отличие от Bevy `ambiguous_with`: тот допускает ПРОИЗВОЛЬНЫЙ порядок (недетерминизм); мы
+    /// сохраняем детерминизм (важно для replay/netcode — см. руководство §6.3).
+    ///
+    /// Для N имён покрывает все пары. Системы указываются по именам (как в `before`/`after`/`chain`).
+    pub fn independent(&mut self, names: &[&str]) -> Result<(), SchedulerError> {
+        let mut ids = Vec::with_capacity(names.len());
+        for n in names {
+            ids.push(self.find_id_by_name(n)?);
+        }
+        // Для каждой пары — ребро в порядке РЕГИСТРАЦИИ (позиция в `self.systems`); собираем пары
+        // заранее, чтобы не держать иммутабельный борроу `self.systems` во время `add_dependency`.
+        let mut ordered: Vec<(SystemId, SystemId)> = Vec::new();
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (a, b) = (ids[i], ids[j]);
+                let pa = self.systems.iter().position(|s| s.id == a);
+                let pb = self.systems.iter().position(|s| s.id == b);
+                let (first, second) = match (pa, pb) {
+                    (Some(pa), Some(pb)) if pb < pa => (b, a),
+                    _ => (a, b),
+                };
+                ordered.push((first, second));
+            }
+        }
+        for (first, second) in ordered {
+            // `first` → `second`: explicit ordering подавляет встречное ребро BidirectionalWriteRead.
+            self.add_dependency(second, first);
+        }
+        Ok(())
+    }
+
     /// Установить пользовательский порядок StageLabel для compile().
     ///
     /// По умолчанию стадии упорядочиваются по приоритету:
@@ -4476,6 +4517,44 @@ mod tests {
             "Компиляция должна пройти без ошибок: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn independent_resolves_bidirectional_write_read_deterministically() {
+        // A: Read<Vel>, Write<Pos>; B: Read<Pos>, Write<Vel> — настоящий BidirectionalWriteRead
+        // (без явного порядка → CircularDependency).
+        struct A;
+        impl ParSystem for A {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Vel>().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct B;
+        impl ParSystem for B {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Pos>().write::<Vel>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        // Без `independent` — цикл.
+        let mut sched = Scheduler::new();
+        sched.add_par_system("a", A);
+        sched.add_par_system("b", B);
+        assert!(
+            matches!(sched.compile(), Err(SchedulerError::CircularDependency { .. })),
+            "перекрёстный write/read без явного порядка = CircularDependency"
+        );
+
+        // С `independent` — компилируется, порядок детерминирован (регистрация: a → b).
+        let mut sched = Scheduler::new();
+        sched.add_par_system("a", A);
+        sched.add_par_system("b", B);
+        sched.independent(&["a", "b"]).unwrap();
+        sched
+            .compile()
+            .expect("independent снимает CircularDependency, сериализуя в порядке регистрации");
     }
 
     #[test]
