@@ -185,6 +185,18 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
                 ids
             }
 
+            // Порядок ПОЛЕЙ (= порядок обхода write_into_batch / write_data_into_batch); БЕЗ сортировки.
+            // col_indices для batch-спавна строится отсюда, иначе компонент пишется в чужую колонку (UB).
+            fn push_component_ids(
+                &self,
+                registry: &mut ::apex_core::ComponentRegistry,
+                out: &mut ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]>,
+            ) {
+                #(
+                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, out);
+                )*
+            }
+
             fn write_into(
                 self,
                 world: &mut ::apex_core::World,
@@ -194,6 +206,24 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
             ) {
                 #(
                     ::apex_core::Bundle::write_into(#field_accessors, world, archetype_id, row, tick);
+                )*
+            }
+
+            fn write_data_into_batch(
+                self,
+                world: &mut ::apex_core::World,
+                archetype_id: ::apex_core::ArchetypeId,
+                row: usize,
+                tick: ::apex_core::Tick,
+                col_indices: &[usize],
+            ) {
+                let mut _offset = 0usize;
+                #(
+                    let _cnt = <#field_types as ::apex_core::Bundle>::component_count();
+                    ::apex_core::Bundle::write_data_into_batch(
+                        #field_accessors, world, archetype_id, row, tick, &col_indices[_offset.._offset + _cnt]
+                    );
+                    _offset += _cnt;
                 )*
             }
 

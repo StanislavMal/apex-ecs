@@ -882,7 +882,13 @@ impl World {
         }
 
         let probe = make_bundle(0);
-        let ids = probe.component_ids(&mut self.registry);
+        // `decl_ids` — порядок ОБЪЯВЛЕНИЯ бандла (= порядок обхода `write_into_batch`); `ids` —
+        // ОТСОРТИРОВАННЫЙ (для архетипа). Их РАЗДЕЛЕНИЕ критично: col_indices ОБЯЗАН быть в порядке
+        // обхода, иначе компонент пишется в чужую колонку (UB).
+        let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
+        probe.push_component_ids(&mut self.registry, &mut decl_ids);
+        let mut ids = decl_ids.clone();
+        ids.sort_unstable();
         drop(probe);
 
         let archetype_id = self.get_or_create_archetype(&ids);
@@ -897,68 +903,38 @@ impl World {
 
         let entities = self.entities.allocate_batch(count);
 
-        // Предвычисляем column indices для всех компонентов бандла,
-        // чтобы избежать повторных вызовов get_or_register и column_index
-        // в write_into для каждой entity (экономит ~40k HashMap lookup'ов при 10k entity).
-        // Храним только позиционный индекс колонки — без ComponentId,
-        // так как порядок col_indices соответствует порядку ids.
-        let col_indices: SmallVec<[usize; 8]> = ids
+        // Предвычисляем column indices в порядке ОБЪЯВЛЕНИЯ (`decl_ids`) — РОВНО как их потребляет
+        // `write_into_batch`. Избегает повторных get_or_register/column_index в write_into для
+        // каждой entity (~40k HashMap lookup'ов при 10k). КРИТИЧНО из `decl_ids`, НЕ из
+        // отсортированных `ids` (иначе при «порядок объявления ≠ порядок id» — запись в чужую колонку).
+        let col_indices: SmallVec<[usize; 8]> = decl_ids
             .iter()
             .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
             .collect();
 
-        // Порог: для 1 компонента per-entity loop быстрее, чем bulk copy.
-        // Для 2+ компонентов bulk copy из первой строки выигрывает за счёт
-        // устранения 10,000 вызовов make_bundle и 40,000 поисков в col_indices.
-        // SAFETY: bulk-copy через copy_nonoverlapping допустим только для типов,
-        // не имеющих Drop (эквивалентно Copy). Для типов с Drop (String, Vec<T>, Arc<T>)
-        // используется per-entity цикл во избежание двойного освобождения.
-        let needs_drop = B::needs_drop();
-        if col_indices.len() <= 1 || needs_drop {
-            // Per-entity loop — старый подход, быстрее для малого числа компонентов.
+        // ВСЕГДА per-entity: `make_bundle(i)` вызывается для КАЖДОЙ сущности (контракт замыкания —
+        // данные per-index). Прежний bulk-copy «копировать строку 0 во все» БЫЛ НЕКОРРЕКТЕН: звал
+        // `make_bundle` лишь для строки 0 ⇒ `spawn_many(n, |i| A(i))` молча давал ВСЕМ A(0) (потеря
+        // per-entity данных). `col_indices` (порядок ОБХОДА) делает запись по колонкам правильной.
+        // Перф: пишем ДАННЫЕ per-entity (`write_data_into_batch`, без тиков/len), а тики/`len`
+        // проставляем ПОКОЛОНОЧНО один раз на пачку (resize вместо count×ncols push'ей).
+        {
             for (i, &entity) in entities.iter().enumerate() {
                 let row = start_row + i;
                 let bundle = make_bundle(i);
                 self.archetypes[arch_idx].entities.push(entity);
-                bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
+                bundle.write_data_into_batch(self, archetype_id, row, tick, &col_indices);
             }
-        } else {
-            // Первая entity — пишем через штатный write_into_batch (создаёт "шаблон" строки).
-            // Для Copy-компонентов это позволяет нам затем bulk-копировать данные из первой
-            // строки во все последующие, избегая 10,000 вызовов make_bundle и 40,000 поисков
-            // в col_indices.iter().find() (как в Legion SOA подходе).
-            let first_entity = entities[0];
-            let first_bundle = make_bundle(0);
-            self.archetypes[arch_idx].entities.push(first_entity);
-            first_bundle.write_into_batch(self, archetype_id, start_row, tick, &col_indices);
-
-            // Остальные count-1 entity — bulk copy из первой строки во все последующие.
-            // Безопасность: данные уже записаны в первую строку через write_into_batch,
-            // память зарезервирована через reserve(count), change_ticks также зарезервированы.
+            // Тики + len — ПОКОЛОНОЧНО, к АБСОЛЮТНОМУ target (start_row+count). Это устойчиво к ОБОИМ
+            // путям записи: для data-only override'ов (leaf/tuple/derive) — заполняет count новых
+            // слотов; для дефолта (ручной impl → write_into_batch уже выставил тики/len) — no-op.
+            let target_len = start_row + count;
             let arch = &mut self.archetypes[arch_idx];
-            // Сущности — один проход (id строки = start_row+1+i).
-            for &entity in &entities[1..] {
-                arch.entities.push(entity);
-            }
-            // Данные + тики — ПОКОЛОНОЧНО: батчим Vec-операции тиков (`resize` диапазоном вместо
-            // (N-1) `push`) и `len` (одним += n), приближаясь к чисто колоночному Legion `into_soa`.
-            let n = entities.len() - 1; // count - 1 (первая строка уже записана)
             for &col_idx in &col_indices {
                 let col = &mut arch.columns[col_idx];
-                if col.item_size > 0 {
-                    // SAFETY: память зарезервирована (reserve(count)), строки [start_row+1 .. +n]
-                    // в пределах capacity; src (строка-шаблон) и dst не пересекаются.
-                    unsafe {
-                        let src = col.get_ptr(start_row);
-                        for i in 0..n {
-                            let dst = col.get_ptr(start_row + 1 + i);
-                            std::ptr::copy_nonoverlapping(src, dst, col.item_size);
-                        }
-                    }
-                }
-                col.change_ticks.resize(col.change_ticks.len() + n, tick);
-                col.added_ticks.resize(col.added_ticks.len() + n, tick);
-                col.len += n;
+                col.change_ticks.resize(target_len, tick);
+                col.added_ticks.resize(target_len, tick);
+                col.len = target_len;
             }
         }
 
@@ -1031,7 +1007,12 @@ impl World {
         };
 
         // Резолв архетипа/ids/колонок — ОДИН раз на пачку (вместо per-spawn в spawn_at).
-        let ids = bundles[0].component_ids(&mut self.registry);
+        // `decl_ids` (порядок объявления = обхода write_into_batch) ОТДЕЛЬНО от `ids` (сорт. для
+        // архетипа) — col_indices строится из decl_ids, иначе компонент пишется в чужую колонку (UB).
+        let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
+        bundles[0].push_component_ids(&mut self.registry, &mut decl_ids);
+        let mut ids = decl_ids.clone();
+        ids.sort_unstable();
         if ids.is_empty() {
             // Пустой бандл (`spawn(())`) — в EMPTY-архетип.
             for (i, _bundle) in bundles.into_iter().enumerate() {
@@ -1055,18 +1036,26 @@ impl World {
         for col in &mut self.archetypes[arch_idx].columns {
             col.reserve(count);
         }
-        let col_indices: SmallVec<[usize; 8]> = ids
+        let col_indices: SmallVec<[usize; 8]> = decl_ids
             .iter()
             .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
             .collect();
 
-        // Бандлы РАЗНЫЕ per-item ⇒ пишем каждый через write_into_batch (с предвычисленными
-        // col_indices — без повторного get_or_register/архетип-поиска).
+        // Бандлы РАЗНЫЕ per-item ⇒ пишем ДАННЫЕ каждого через write_data_into_batch (с предвычисленными
+        // col_indices в порядке обхода — без повторного get_or_register/архетип-поиска); тики/len —
+        // поколоночно к абсолютному target (устойчиво к data-only override и дефолту).
         for (i, bundle) in bundles.into_iter().enumerate() {
             let entity = entities[i];
             let row = start_row + i;
             self.archetypes[arch_idx].entities.push(entity);
-            bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
+            bundle.write_data_into_batch(self, archetype_id, row, tick, &col_indices);
+        }
+        let target_len = start_row + count;
+        for &col_idx in &col_indices {
+            let col = &mut self.archetypes[arch_idx].columns[col_idx];
+            col.change_ticks.resize(target_len, tick);
+            col.added_ticks.resize(target_len, tick);
+            col.len = target_len;
         }
         self.entities
             .set_locations_batch(&entities, archetype_id, start_row as u32);
@@ -2685,6 +2674,24 @@ pub trait Bundle: Sized {
         self.write_into(world, archetype_id, row, tick);
     }
 
+    /// Записать данные компонентов для batch-спавна ([`spawn_many`]). ПЕРЕОПРЕДЕЛЯЕТСЯ (leaf/tuple/
+    /// derive) на data-only: пишет ТОЛЬКО данные (без change/added-тиков и без `col.len`), а тики/`len`
+    /// вызывающий проставляет ПОКОЛОНОЧНО один раз на пачку (резко дешевле `count×ncols` push'ей).
+    /// **Дефолт** (для ручных `impl Bundle`) — полный `write_into_batch` (данные+тики+len). Вызывающий
+    /// устойчив к ОБОИМ: использует АБСОЛЮТНЫЙ target (`start_row+count`) при `resize`/`len`, поэтому
+    /// уже-выставленные дефолтом тики/len — no-op, а для data-only override — заполняются. `tick`
+    /// дефолтом используется, override'ами игнорируется.
+    fn write_data_into_batch(
+        self,
+        world: &mut World,
+        archetype_id: ArchetypeId,
+        row: usize,
+        tick: Tick,
+        col_indices: &[usize],
+    ) {
+        self.write_into_batch(world, archetype_id, row, tick, col_indices);
+    }
+
     /// Возвращает true, если хотя бы один компонент Bundle имеет Drop (нужно для spawn_many).
     ///
     /// Для типов с Drop bulk-copy через `copy_nonoverlapping` небезопасен,
@@ -2768,6 +2775,28 @@ impl<T: Component> Bundle for T {
     }
 
     #[inline(always)]
+    fn write_data_into_batch(
+        self,
+        world: &mut World,
+        archetype_id: ArchetypeId,
+        row: usize,
+        _tick: Tick,
+        col_indices: &[usize],
+    ) {
+        let col_idx = col_indices[0];
+        // SAFETY: ёмкость зарезервирована вызывающим (`reserve(count)`), `row` в пределах; тики/`len`
+        // вызывающий проставит поколоночно ПОСЛЕ записи данных всех строк (data-only).
+        unsafe {
+            let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
+            if col.item_size > 0 {
+                let dst = col.get_ptr(row);
+                std::ptr::copy_nonoverlapping(&self as *const T as *const u8, dst, col.item_size);
+            }
+        }
+        std::mem::forget(self);
+    }
+
+    #[inline(always)]
     fn needs_drop() -> bool {
         std::mem::needs_drop::<T>()
     }
@@ -2795,6 +2824,22 @@ macro_rules! impl_bundle {
                 $( $T.push_component_ids(registry, &mut ids); )+
                 ids.sort_unstable();
                 ids
+            }
+
+            /// ВАЖНО (корректность batch-спавна): пушит id в порядке ОБЪЯВЛЕНИЯ кортежа — том же,
+            /// в котором `write_into_batch` обходит компоненты. `component_ids` СОРТИРУЕТ (для
+            /// архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в порядке обхода, иначе
+            /// компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B колонку). См.
+            /// `spawn_many_inner`/`spawn_bundles_bulk` — они строят `col_indices` ИМЕННО отсюда.
+            #[inline]
+            fn push_component_ids(
+                &self,
+                registry: &mut ComponentRegistry,
+                out: &mut SmallVec<[ComponentId; 8]>,
+            ) {
+                #[allow(non_snake_case)]
+                let ($($T,)+) = self;
+                $( $T.push_component_ids(registry, out); )+
             }
 
             #[inline]
@@ -2825,6 +2870,25 @@ macro_rules! impl_bundle {
                 $(
                     let _cnt = $T::component_count();
                     $T.write_into_batch(world, archetype_id, row, tick, &col_indices[_offset.._offset + _cnt]);
+                    _offset += _cnt;
+                )+
+            }
+
+            #[inline]
+            fn write_data_into_batch(
+                self,
+                world:        &mut World,
+                archetype_id: ArchetypeId,
+                row:          usize,
+                tick:         Tick,
+                col_indices:  &[usize],
+            ) {
+                #[allow(non_snake_case)]
+                let ($($T,)+) = self;
+                let mut _offset = 0usize;
+                $(
+                    let _cnt = $T::component_count();
+                    $T.write_data_into_batch(world, archetype_id, row, tick, &col_indices[_offset.._offset + _cnt]);
                     _offset += _cnt;
                 )+
             }
@@ -3656,6 +3720,40 @@ mod tests {
                 "Entity {:?} missing Armor",
                 e
             );
+        }
+    }
+
+    /// Регресс: `spawn_many`/bulk-path обязан писать компоненты в КОЛОНКУ ПО ИХ ID, а не позиционно
+    /// в порядке объявления. Баг (до фикса col_indices): `col_indices` строился из ОТСОРТИРОВАННЫХ
+    /// id, а `write_into_batch` потреблял их в порядке ОБЪЯВЛЕНИЯ ⇒ при «порядок объявления ≠ порядок
+    /// id» компонент писался в чужую колонку (UB: 64B в 1B-колонку, повреждение данных — проявлялось
+    /// как heavy_compute-регресс). Здесь порядок объявления (Big, Small) ОБРАТЕН порядку id
+    /// (Small зарегистрирован первым ⇒ меньший id).
+    #[test]
+    fn spawn_many_writes_components_by_id_not_declaration_position() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct BigComp([u64; 8]); // 64 байта
+        impl Component for BigComp {}
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        struct SmallComp(u8); // 1 байт
+        impl Component for SmallComp {}
+
+        let mut world = World::new();
+        // Small РАНЬШЕ Big ⇒ id(Small) < id(Big). Порядок объявления бандла — ОБРАТНЫЙ.
+        world.register_component::<SmallComp>();
+        world.register_component::<BigComp>();
+
+        let entities = world.spawn_many(256, |i| (BigComp([i as u64; 8]), SmallComp(0xAB)));
+        assert_eq!(entities.len(), 256);
+
+        for (i, &e) in entities.iter().enumerate() {
+            let big = world.get::<BigComp>(e).expect("BigComp присутствует");
+            let small = world.get::<SmallComp>(e).expect("SmallComp присутствует");
+            assert_eq!(
+                big.0, [i as u64; 8],
+                "BigComp entity[{i}] повреждён — компонент записан в чужую колонку (col_indices order)"
+            );
+            assert_eq!(small.0, 0xAB, "SmallComp entity[{i}] повреждён");
         }
     }
 

@@ -3787,8 +3787,8 @@ cargo run --release
 | **Lazy entity-load в `for_each`** | `entity` грузится только для строк, прошедших фильтр (`Changed`/`Added`), а не по каждой | **changed_iter −36%, обогнал Bevy** (фильтрованные запросы extract'а) |
 | **`CachedQuery.match_verified`** | Пропуск повторного `matches_archetype` для УЖЕ отфильтрованных путей (`QueryState`/`new`); `from_sub_world` оставлен с проверкой | Дешевле итерация по многим архетипам (extract/cull) |
 | **`despawn_recursive` O(n²)→O(поддерева)** | Для cascade-видов делегирует в `despawn` (его `take_subjects` забирает список детей разом); ручная рекурсия удаляла каждого ребёнка из target-списка живого родителя | **×2.6 быстрее Bevy** (было ×2.4 медленнее) |
-| **`allocate_batch` батчинг атомиков** | Один `fetch_add`/`resize` на пачку вместо per-entity 2 атомиков + resize | **simple_insert −40%** |
-| **`spawn_many` поколоночная заливка тиков** | `change_ticks/added_ticks.resize(+n)` вместо (N-1) `push` на компонент | ближе к колоночному Legion |
+| **`allocate_batch` батчинг атомиков** | Один `fetch_add`/`resize` на пачку вместо per-entity 2 атомиков + resize | устранил регресс TD-39 |
+| **`spawn_many` корректность + перф (col_indices)** | **БАГ-ФИКС:** `col_indices` строится в порядке ОБХОДА бандла (`push_component_ids`), НЕ из отсортированных id (иначе компонент в чужую колонку — UB); per-entity данные через `write_data_into_batch` (data-only) с **поколоночной заливкой тиков** (`resize` вместо `count×ncols` push'ей) | корректные per-entity данные + competitive perf |
 
 ### 14.9 Сравнение с Bevy 0.18 и Legion 0.4
 
@@ -3802,11 +3802,11 @@ ergonomic-путь с кэширующим Bevy); фильтрованные/с�
 
 | Бенч | apex | bevy 0.18 | legion 0.4 | Итог |
 |------|:----:|:---------:|:----------:|------|
-| simple_insert (10k×4 comp) | 293 µs | 310 | **201** | 🟢 > Bevy |
+| simple_insert (10k×4 comp) | 357 µs | **316** | **209** | 🟡 ≈ Bevy³ |
 | simple_iter (10k) | 9.2 µs · dense **6.5** | 9.0 | 6.2 | ≈ паритет |
 | fragmented_iter (26 арх) | 181 ns | **134** | 184 | 🔴 < Bevy |
 | schedule (3 sys / 40k) | 42 µs | 39 | **31** | 🔴 < Bevy¹ |
-| heavy_compute (par) | **225 µs** | 542 | 450 | 🟢 **×2.4** |
+| heavy_compute (par) | 595 µs | 628 | **501** | ≈ паритет³ |
 | add_remove (10k) | **495 µs** | 679 | 2707 | 🟢 > обоих |
 | commands_spawn (10k) | **441 µs** | 480 | — | 🟢 > Bevy |
 | despawn (10k) | **245 µs** | 280 | 484 | 🟢 > обоих |
@@ -3817,17 +3817,33 @@ ergonomic-путь с кэширующим Bevy); фильтрованные/с�
 | relations (build+iter 10k ChildOf) | **691 µs** | 736 | — | 🟢 > Bevy |
 | wide_iter (5 comp: 4R+1W) | 3.9 µs | 4.0 | **2.3** | ≈ паритет |
 | commands_insert (10k) | 514 µs | 511 | — | ≈ паритет |
+| or_iter (`Or<(With<B>,With<C>)>`) | 4.65 µs | **2.58** | — | 🔴 < Bevy² |
+| query_relation (10k subjects) | 45 µs | — | — | apex-фича |
 
-**Итог: 10 побед / 3 паритета / 2 микро-отставания** против современного Bevy. Наши уникальные
-возможности (events, relations, despawn_recursive-каскад) — **быстрее Bevy**, а не просто «есть».
-Где Legion впереди (insert/iter) — у него **нет change detection** (мы платим за `Changed<T>`/
-`Added<T>`; Bevy платит ту же цену и медленнее нас).
+**Итог: 8 побед / 5 паритетов / 3 микро-отставания** против современного Bevy (+ `propagate`,
+`query_relation` — apex-фичи без прямого аналога). Наши уникальные возможности (events ×2.2,
+relations, despawn_recursive-каскад) — **быстрее Bevy**. Все 3 отставания — НЕ баги (см. сноски):
+trade-off параллелизма + микро-тюнинг итератора Bevy на тривиальной работе. Где Legion впереди
+(insert/iter) — у него **нет change detection** (мы платим за `Changed<T>`/`Added<T>`; Bevy платит
+ту же цену и медленнее нас).
 
 > ¹ **schedule** — НЕ баг, а оборотная сторона нашего преимущества: ASD дробит каждую систему на
 > чанки по воркерам (тонкая балансировка), что на ТРИВИАЛЬНОЙ работе (swap) дороже Bevy-модели
-> «1 система = 1 таск» на ~8%, но на РЕАЛЬНОЙ неравномерной нагрузке выигрывает (отсюда
-> heavy_compute ×2.4, parallel §14.7 до ×5). **fragmented_iter** — микро-тюнинг Bevy-итератора на
-> искусственном кейсе «много 20-сущностных архетипов» (sub-µs).
+> «1 система = 1 таск» на ~8%, но на РЕАЛЬНОЙ неравномерной нагрузке выигрывает (parallel §14.7 до ×5).
+>
+> ² **fragmented_iter и or_iter** — ОДИН корень: туже per-element итератор Bevy (скипает per-row
+> фильтр для archetype-matching таблиц, «table-level filter») на ТРИВИАЛЬНОЙ работе (count); на
+> реальной нагрузке тонет (simple_iter — паритет). Наш dense-путь (`for_each_chunk`) этот overhead
+> убирает, но фильтры (`Or`/`Changed`) с ним несовместимы. Не баг — точка для изучения bevy-итератора.
+>
+> ³ **Коррекция честности (2026-06-16).** Прежние «heavy_compute ×2.4» и «simple_insert 293µs > Bevy»
+> были АРТЕФАКТОМ латентного UB-бага: `spawn_many` для КОРТЕЖЕЙ строил `col_indices` из ОТСОРТИРОВАННЫХ
+> id, а write писал в порядке ОБЪЯВЛЕНИЯ ⇒ при «объявление ≠ порядок id» компонент уходил в чужую
+> колонку (запись 64B в 12B-колонку), а bulk-copy «строка 0 во все» терял per-entity данные. Матрицы
+> heavy_compute вырождались (det=0) → мгновенная инверсия → фиктивные 225µs. **Исправлено** (col_indices
+> в порядке ОБХОДА бандла через `push_component_ids` + per-entity `write_data_into_batch` с поколоночными
+> тиками): данные корректны, числа честны — heavy_compute ПАРИТЕТ, simple_insert чуть позади (цена
+> корректной per-entity записи). 191 core + 310 render/golden + регресс-тест целы.
 
 ---
 
