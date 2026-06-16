@@ -2074,6 +2074,7 @@ sched.after("physics", "gravity").unwrap();
 | `chain(names)` | `sched.chain(&["a", "b", "c"])` | Цепочка: a → b → c (основной способ) |
 | `before(name, name)` | `sched.before("a", "b")` | a выполняется до b |
 | `after(name, name)` | `sched.after("b", "a")` | b выполняется после a |
+| `independent(names)` | `sched.independent(&["a","b"])` | Порядко-независимы: не падать на BidirectionalWriteRead, сериализовать детерминированно (§6.6) |
 
 Все методы принимают строковые имена систем (имена из `sys("имя", …)`/`seq("имя", …)` или
 выведенные из fn для bare-идентификаторов). При отсутствии системы с указанным именем
@@ -2418,12 +2419,23 @@ fn setup(cmd: &mut Commands) {
 
     // Билдер для уже существующей entity:
     cmd.entity(player).set_parent(root).insert(Armed);
+
+    // Перепривязка СУЩЕСТВУЮЩИХ entity (для редактора/геймплея):
+    cmd.entity(squad).add_children(&[soldier_a, soldier_b]); // усыновить имеющиеся
+    cmd.entity(soldier_a).remove_parent();                   // отвязать от родителя
+    cmd.entity(squad).clear_children();                      // отвязать всех детей (не удаляя)
+
+    // Массовый спавн ОДНИМ резервированием — возвращает id (для частиц/толпы):
+    let bullets: Vec<Entity> = cmd.spawn_batch((0..100).map(|_| (Transform::default(), Bullet)));
 }
 ```
 
 Методы `EntityCommands`: `id()`, `insert(c)`, `remove::<T>()`, `add_relation(kind, target)`,
-`set_parent(parent)` (связь `ChildOf`), `with_children(|c| …)` (вложенность любой глубины),
-`despawn()`. `ChildSpawner::spawn` внутри `with_children` сам навешивает `ChildOf` → родитель.
+`set_parent(parent)` (связь `ChildOf`), `add_child(e)`/`add_children(&[…])` (усыновить существующие),
+`remove_parent()`/`clear_children()` (отвязать; резолв на apply), `with_children(|c| …)` (спавн детей,
+вложенность любой глубины), `despawn()`. `ChildSpawner::spawn` внутри `with_children` сам навешивает
+`ChildOf` → родитель. `Commands::spawn_batch(iter) -> Vec<Entity>` — массовый спавн однотипных Bundle
+одним атомарным резервированием (1:1 Bevy `spawn_batch`, но с возвратом id).
 
 > **Когда id валиден.** В системе (через `&mut Commands`/`CommandsParam`) резерватор привязывается
 > автоматически — `id()` отдаёт настоящий `Entity`. У standalone `Commands::new()` (ручной/тестовый
@@ -2431,6 +2443,12 @@ fn setup(cmd: &mut Commands) {
 > а `spawn` аллоцирует id на `apply` (старое поведение; `cmd.spawn(x);` без чтения результата работает
 > всегда). Зарезервированная entity «не жива» до `apply` (как Bevy до sync-точки) — в запросах
 > появится после применения команд.
+
+> **Резервация переиспользует освобождённые слоты (TD-39).** `cmd.spawn()` не растит память
+> безгранично под churn'ом: резерватор сперва переиспользует слоты, освобождённые `despawn`'ом
+> (аренда свободных слотов, переарендуется на sync-точке), а свежие индексы выдаёт лишь при их
+> исчерпании — `EntityAllocator.records` ≈ ПИК одновременных entity, а не сумма-всех-спавнов. Спавн
+> тысяч пуль/частиц через `Commands` + despawn безопасен по памяти.
 
 > **Группировка insert-бёрстов (W2-1).** Бёрст ПОДРЯД идущих `insert`'ов на одну entity
 > (`cmds.insert(e, A); cmds.insert(e, B); cmds.insert(e, C)`) применяется группой — **один**
@@ -4040,6 +4058,7 @@ generation entity не участвует — НЕ использовать дл
 | `chain(names)` | Цепочка систем: `chain(&["a","b","c"])` — каждая после предыдущей |
 | `before(a, b)` | `a` выполняется до `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
 | `after(a, b)` | `a` выполняется после `b` (по именам). Явный порядок приоритетнее авто-конфликтов |
+| `independent(names)` | Объявить системы порядко-независимыми: при `BidirectionalWriteRead` не падать, сериализовать в порядке регистрации (детерминированно) |
 | `configure_stages(order)` | Задать порядок этапов (вместо порядка по приоритету) |
 | `apply_deferred()` | Sync-point после последней зарегистрированной системы (§6.0c) |
 | `compile()` | Скомпилировать план → `Result` (возвращает мгновенно если граф не изменился) |
@@ -4148,7 +4167,9 @@ generation entity не участвует — НЕ использовать дл
 
 | Метод | Описание |
 |---|---|
-| `spawn(bundle)` | Создать entity с компонентами (отложенно) |
+| `spawn(bundle) -> EntityCommands` | Создать entity; билдер даёт `id()` сразу + `with_children`/связи (§7.1.1) |
+| `spawn_batch(iter) -> Vec<Entity>` | Массовый спавн однотипных Bundle одним резервированием; возвращает id |
+| `entity(e) -> EntityCommands` | Билдер для существующей entity (insert/set_parent/add_child/…) |
 | `despawn(entity)` | Уничтожить entity (отложенно) |
 | `insert(entity, component)` | Добавить компонент (отложенно) |
 | `remove::<T>(entity)` | Удалить компонент (отложенно) |

@@ -78,54 +78,90 @@ impl EntityRecord {
     }
 }
 
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
+
+/// Аренда свободных слотов для резервации: снимок `free_list` (индекс + поколение), переезжающий из
+/// `free_list` на время между flush'ами, плюс убывающий курсор. **Слоты аренды дизъюнктны с текущим
+/// `free_list`** (аренда их оттуда забрала) — поэтому `reserve` (через аренду, `&self`) и прямой
+/// `allocate` (через `free_list`, `&mut`) никогда не выдадут один индекс. `cursor` убывает:
+/// `n = fetch_sub(1)`; `n>0` → переиспользуем `free[n-1]`; `n≤0` → свежий индекс из `high_water`.
+struct ReserveLease {
+    cursor: AtomicI64,
+    free: Box<[(u32, u32)]>,
+}
+
+/// Выдать один `Entity` из аренды (переиспользование) или свежий из high-water. Общий для
+/// [`EntityReserver::reserve`] и фоллбэка [`EntityAllocator::allocate`].
+#[inline]
+fn reserve_from(lease: &ReserveLease, high_water: &AtomicU32) -> Entity {
+    let n = lease.cursor.fetch_sub(1, Ordering::Relaxed);
+    if n > 0 {
+        let (index, generation) = lease.free[(n - 1) as usize];
+        Entity { index, generation }
+    } else {
+        let index = high_water.fetch_add(1, Ordering::Relaxed);
+        Entity { index, generation: 0 }
+    }
+}
+
 /// Lock-free резерватор entity-индексов — отделён от [`EntityAllocator`], чтобы
 /// [`Commands`](crate::commands::Commands) могли получить настоящий `Entity` через `&self` (без
 /// `&mut World`), пока система ещё бежит (1:1 Bevy `Entities::reserve_entity`).
 ///
-/// Делит атомарный «high-water» счётчик с аллокатором (`Arc<AtomicU32>`). `reserve()` атомарно
-/// выдаёт **свежий** индекс (один `fetch_add` — масштабируется на параллельные системы), всегда
-/// поколения 0: индекс никогда не переиспользуется резервацией, поэтому ABA невозможен и не нужно
-/// читать `records` (его в параллельной фазе никто не трогает). Реальное место в `records` под
-/// зарезервированные индексы создаёт [`EntityAllocator::flush`] на границе apply (под `&mut World`),
-/// после чего spawn-команда проставляет компоненты/локацию. До flush entity «зарезервирована, но не
-/// жива» — `is_alive` = false, в запросах не видна (как `commands.spawn().id()` в Bevy до sync-точки).
+/// **Переиспользует свободные слоты** (TD-39): держит общий high-water (`Arc<AtomicU32>`) И текущую
+/// аренду свободных слотов ([`ReserveLease`], `Arc`, переарендуется на каждом flush). `reserve()`
+/// сперва переиспользует слоты аренды (поколение из снимка валидно — слот в аренде не трогается до
+/// потребления), и лишь при исчерпании аренды двигает high-water. Так `records` не растёт на каждый
+/// `cmd.spawn` (раньше резервация была монотонной ⇒ неограниченная утечка под командным churn'ом).
+/// До flush entity «зарезервирована, но не жива» (`is_alive`=false) — как `commands.spawn().id()` в
+/// Bevy до sync-точки.
 #[derive(Clone)]
 pub struct EntityReserver {
-    next: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    high_water: Arc<AtomicU32>,
+    lease: Arc<ReserveLease>,
 }
 
 impl EntityReserver {
-    /// Зарезервировать свежий `Entity` (поколение 0). Lock-free, безопасно из параллельных систем.
+    /// Зарезервировать `Entity` (переиспользует свободный слот или свежий). Lock-free, безопасно из
+    /// параллельных систем (атомарный курсор аренды + high-water).
     #[inline]
     pub fn reserve(&self) -> Entity {
-        let index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Entity {
-            index,
-            generation: 0,
-        }
+        reserve_from(&self.lease, &self.high_water)
     }
 
-    /// Зарезервировать `n` свежих `Entity` ОДНИМ атомарным `fetch_add` (для массового спавна — см.
-    /// [`Commands::spawn_batch`](crate::commands::Commands::spawn_batch)). Индексы непрерывны.
-    #[inline]
+    /// Зарезервировать `n` `Entity` минимумом атомарных операций (один `fetch_sub` аренды + один
+    /// `fetch_add` high-water на пачку) — для массового спавна
+    /// ([`Commands::spawn_batch`](crate::commands::Commands::spawn_batch)).
     pub fn reserve_n(&self, n: usize) -> Vec<Entity> {
-        let start = self
-            .next
-            .fetch_add(n as u32, std::sync::atomic::Ordering::Relaxed);
-        (0..n as u32)
-            .map(|i| Entity {
-                index: start + i,
-                generation: 0,
-            })
-            .collect()
+        if n == 0 {
+            return Vec::new();
+        }
+        let old = self.lease.cursor.fetch_sub(n as i64, Ordering::Relaxed);
+        let reuse = old.max(0).min(n as i64) as usize; // сколько взято из аренды
+        let fresh = n - reuse;
+        let mut out = Vec::with_capacity(n);
+        for k in 0..reuse {
+            let (index, generation) = self.lease.free[old as usize - 1 - k];
+            out.push(Entity { index, generation });
+        }
+        if fresh > 0 {
+            let start = self.high_water.fetch_add(fresh as u32, Ordering::Relaxed);
+            for j in 0..fresh as u32 {
+                out.push(Entity { index: start + j, generation: 0 });
+            }
+        }
+        out
     }
 }
 
-/// Менеджер entity — generational IDs с batch API + атомарной резервацией (см. [`EntityReserver`]).
+/// Менеджер entity — generational IDs с batch API + резервацией с переиспользованием (TD-39).
 pub struct EntityAllocator {
-    /// High-water счётчик свежих индексов — атомарный, чтобы [`EntityReserver`] (через `&self`)
-    /// и `allocate`/`allocate_batch` (через `&mut self`) делили один монотонный источник индексов.
-    reserve_next: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Общий high-water свежих индексов (делится с резерватором и аллокатором) — двигается только
+    /// когда аренда/free_list исчерпаны, поэтому `records.len()` ≈ пик одновременных entity.
+    high_water: Arc<AtomicU32>,
+    /// Текущая аренда свободных слотов для резервации (переарендуется на flush).
+    lease: Arc<ReserveLease>,
     records: Vec<EntityRecord>,
     free_list: Vec<u32>,
 }
@@ -133,32 +169,66 @@ pub struct EntityAllocator {
 impl EntityAllocator {
     pub fn new() -> Self {
         Self {
-            reserve_next: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            high_water: Arc::new(AtomicU32::new(0)),
+            lease: Arc::new(ReserveLease {
+                cursor: AtomicI64::new(0),
+                free: Box::new([]),
+            }),
             records: Vec::new(),
             free_list: Vec::new(),
         }
     }
 
-    /// Дескриптор-резерватор, делящий high-water счётчик. Клонируется в [`Commands`] (см.
+    /// Дескриптор-резерватор, делящий high-water И текущую аренду. Клонируется в [`Commands`] (см.
     /// [`World::entity_reserver`](crate::world::World::entity_reserver)).
     #[inline]
     pub fn reserver(&self) -> EntityReserver {
         EntityReserver {
-            next: std::sync::Arc::clone(&self.reserve_next),
+            high_water: Arc::clone(&self.high_water),
+            lease: Arc::clone(&self.lease),
         }
     }
 
-    /// Материализовать записи под все зарезервированные индексы (вызывается на границе apply под
-    /// `&mut World`). Идемпотентно: растит `records` до текущего high-water (свежие слоты, поколение
-    /// 0, без локации). После этого `spawn_reserved` проставляет компоненты/локацию.
+    /// Пере-арендовать: текущий `free_list` (новые освобождения + возвращённые) → новая аренда; курсор
+    /// = размер аренды. `free_list` опустошается (его слоты теперь в аренде, дизъюнктны с будущими
+    /// освобождениями).
+    fn refresh_lease(&mut self) {
+        let free: Vec<(u32, u32)> = self
+            .free_list
+            .drain(..)
+            .map(|i| (i, self.records[i as usize].generation))
+            .collect();
+        let cursor = free.len() as i64;
+        self.lease = Arc::new(ReserveLease {
+            cursor: AtomicI64::new(cursor),
+            free: free.into_boxed_slice(),
+        });
+    }
+
+    /// Сверка на границе apply (`&mut World`): (1) вернуть НЕ потреблённые слоты аренды в free_list;
+    /// (2) растить `records` до high-water (свежие слоты, поколение 0); (3) пере-арендовать. После
+    /// этого `spawn_reserved` проставляет компоненты/локацию зарезервированным entity.
     pub fn flush(&mut self) {
-        let target = self.reserve_next.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        if self.records.len() < target {
-            self.records.resize_with(target, || EntityRecord {
+        // (2) Свежие индексы (reserve/allocate двигали high-water) — материализовать записи.
+        let hw = self.high_water.load(Ordering::Relaxed) as usize;
+        if self.records.len() < hw {
+            self.records.resize_with(hw, || EntityRecord {
                 generation: 0,
                 encoded_location: NO_LOCATION,
             });
         }
+        // Быстрый путь (типично: только спавны, без despawn'ов): нечего возвращать/переарендовывать.
+        if self.free_list.is_empty() && self.lease.free.is_empty() {
+            return;
+        }
+        // (1) Не потреблённые слоты аренды (free[0..cursor]) ещё свободны — вернуть в free_list.
+        let cursor = self.lease.cursor.load(Ordering::Relaxed).max(0) as usize;
+        let unconsumed = cursor.min(self.lease.free.len());
+        for k in 0..unconsumed {
+            self.free_list.push(self.lease.free[k].0);
+        }
+        // (3) Пере-арендовать из обновлённого free_list (новые освобождения + возвращённые).
+        self.refresh_lease();
     }
 
     /// Убедиться, что `records` покрывает `index` (свежие промежуточные слоты — поколение 0). Нужно,
@@ -175,68 +245,36 @@ impl EntityAllocator {
         }
     }
 
-    /// Выделить одну entity.
+    /// Выделить одну entity. Сперва переиспользует НОВОЕ освобождение (`free_list`, немедленно), иначе
+    /// слот аренды или свежий (через общий курсор/high-water — координирован с резерватором; слоты
+    /// аренды и free_list дизъюнктны ⇒ коллизии нет).
     pub fn allocate(&mut self) -> Entity {
         if let Some(index) = self.free_list.pop() {
-            let gen = self.records[index as usize].generation;
-            Entity {
-                index,
-                generation: gen,
-            }
+            let generation = self.records[index as usize].generation;
+            Entity { index, generation }
         } else {
-            // Свежий индекс из общего атомарного счётчика (тот же, что у резерватора) — прямой spawn
-            // и `commands.spawn()` никогда не выдадут один индекс.
-            let index = self
-                .reserve_next
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.ensure_record(index);
-            Entity {
-                index,
-                generation: self.records[index as usize].generation,
-            }
+            let e = reserve_from(&self.lease, &self.high_water);
+            self.ensure_record(e.index);
+            e
         }
     }
 
     /// Выделить N entity за один проход — batch API.
-    ///
-    /// Алгоритм:
-    /// 1. Сначала берём из free_list (переиспользование индексов)
-    /// 2. Потом один `Vec::resize_with` для новых записей
-    ///
-    /// Возвращает `Vec<Entity>` — один heap alloc вместо N.
     pub fn allocate_batch(&mut self, count: usize) -> Vec<Entity> {
         let mut entities = Vec::with_capacity(count);
-
-        // 1. Дренируем free_list
+        // 1. Дренируем новые освобождения (free_list).
         let from_free = count.min(self.free_list.len());
         for _ in 0..from_free {
             let index = self.free_list.pop().unwrap();
-            let gen = self.records[index as usize].generation;
-            entities.push(Entity {
-                index,
-                generation: gen,
-            });
+            let generation = self.records[index as usize].generation;
+            entities.push(Entity { index, generation });
         }
-
-        // 2. Новые записи одним resize_with. Свежий диапазон индексов берём из общего атомарного
-        //    high-water (тот же источник, что у резерватора и `allocate`).
-        let remaining = count - from_free;
-        if remaining > 0 {
-            let start = self
-                .reserve_next
-                .fetch_add(remaining as u32, std::sync::atomic::Ordering::Relaxed)
-                as usize;
-            // `ensure_record` (а не голый resize до start+remaining): если резервации уже опередили
-            // `records`, промежуточные слоты [records.len()..start] тоже создаются (поколение 0).
-            self.ensure_record((start + remaining - 1) as u32);
-            for i in 0..remaining {
-                entities.push(Entity {
-                    index: (start + i) as u32,
-                    generation: 0,
-                });
-            }
+        // 2. Остаток — из аренды/свежих (тот же курсор/high-water, что у резерватора).
+        for _ in from_free..count {
+            let e = reserve_from(&self.lease, &self.high_water);
+            self.ensure_record(e.index);
+            entities.push(e);
         }
-
         entities
     }
 
@@ -311,7 +349,10 @@ impl EntityAllocator {
     }
 
     pub fn len(&self) -> usize {
-        self.records.len() - self.free_list.len()
+        // Свободны: free_list + НЕ потреблённые слоты аренды (free[0..cursor]).
+        let lease_free = (self.lease.cursor.load(Ordering::Relaxed).max(0) as usize)
+            .min(self.lease.free.len());
+        self.records.len() - self.free_list.len() - lease_free
     }
 
     pub fn is_empty(&self) -> bool {
@@ -488,6 +529,83 @@ mod tests {
             assert!(indices.insert(e.index), "прямой allocate не пересекает резервации");
         }
         alloc.flush();
+    }
+
+    #[test]
+    fn reservation_reuses_freed_slots_after_flush() {
+        let mut alloc = EntityAllocator::new();
+        let r = alloc.reserver();
+        let a = r.reserve();
+        let b = r.reserve();
+        let c = r.reserve();
+        alloc.flush();
+        for e in [a, b, c] {
+            alloc.set_location(e, make_loc());
+        }
+        let records_after_3 = alloc.records.len();
+        assert_eq!(records_after_3, 3);
+
+        // Освобождаем b, переарендуем — слот b попадает в аренду.
+        alloc.free(b);
+        alloc.flush();
+
+        // Следующая резервация ПЕРЕИСПОЛЬЗУЕТ слот b (а не свежий индекс) ⇒ records НЕ растёт.
+        let r2 = alloc.reserver();
+        let d = r2.reserve();
+        assert_eq!(d.index, b.index, "резервация переиспользовала освобождённый слот");
+        assert_ne!(d.generation, b.generation, "новое поколение слота");
+        alloc.flush();
+        alloc.set_location(d, make_loc());
+        assert!(alloc.is_alive(d));
+        assert!(!alloc.is_alive(b), "старый хэндл b мёртв (ABA-safe)");
+        assert_eq!(
+            alloc.records.len(),
+            records_after_3,
+            "records НЕ вырос — резервация переиспользовала слот, а не аллоцировала свежий"
+        );
+    }
+
+    /// Главный тест TD-39: устойчивый churn через РЕЗЕРВАЦИЮ (как `cmd.spawn`) НЕ растит `records`
+    /// безгранично — слоты переиспользуются. Раньше (монотонная резервация) records = суммарно-всех-
+    /// спавнов (неограниченная утечка). 500 «кадров» рефилла-до-пика + despawn половины.
+    #[test]
+    fn reservation_churn_keeps_records_bounded() {
+        let mut alloc = EntityAllocator::new();
+        let peak = 200usize;
+        let mut live: Vec<Entity> = Vec::new();
+        for frame in 0..500 {
+            // Рефилл до пика РЕЗЕРВАЦИЕЙ (переиспользует слоты прошлого кадра).
+            let r = alloc.reserver();
+            while live.len() < peak {
+                live.push(r.reserve());
+            }
+            alloc.flush();
+            for &e in &live {
+                if alloc.get_location(e).is_none() {
+                    alloc.set_location(e, make_loc());
+                }
+            }
+            // Despawn половины (детерминированно), переарендовать.
+            let mut kept = Vec::new();
+            for (i, &e) in live.iter().enumerate() {
+                if i % 2 == frame % 2 {
+                    assert!(alloc.free(e), "free живой entity");
+                } else {
+                    kept.push(e);
+                }
+            }
+            live = kept;
+            alloc.flush();
+            for &e in &live {
+                assert!(alloc.is_alive(e), "выжившая entity осталась живой с верным поколением");
+            }
+        }
+        // records ≈ пик, а НЕ ~кадры×рефилл (≈50k у старой утечки) — доказательство фикса.
+        assert!(
+            alloc.records.len() <= peak * 2,
+            "records ограничен пиком ({peak}) — утечка устранена; got {}",
+            alloc.records.len()
+        );
     }
 
     #[test]
