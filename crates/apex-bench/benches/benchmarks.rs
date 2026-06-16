@@ -237,6 +237,62 @@ fn bench_relations(c: &mut Criterion) {
     });
 }
 
+fn bench_commands_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("commands_insert");
+    group.bench_function("apex", |b| {
+        b.iter_batched(
+            apex::commands_insert::setup,
+            apex::commands_insert::run,
+            BatchSize::SmallInput,
+        );
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        b.iter_batched(
+            bevy::commands_insert::setup,
+            bevy::commands_insert::run,
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_despawn_recursive(c: &mut Criterion) {
+    let mut group = c.benchmark_group("despawn_recursive");
+    group.bench_function("apex", |b| {
+        b.iter_batched(
+            apex::despawn_recursive::setup,
+            apex::despawn_recursive::run,
+            BatchSize::SmallInput,
+        );
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        b.iter_batched(
+            bevy::despawn_recursive::setup,
+            bevy::despawn_recursive::run,
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_wide_iter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wide_iter");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::wide_iter::WideIter::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "legion")]
+    group.bench_function("legion", |b| {
+        let mut bench = legion::wide_iter::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::wide_iter::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
 fn bench_propagate(c: &mut Criterion) {
     // Apex-фокус (наш дифференциатор; bevy propagate — отдельный crate/schedule). Регресс-страж.
     let mut group = c.benchmark_group("propagate");
@@ -261,5 +317,8 @@ criterion_group!(
     bench_events,
     bench_relations,
     bench_propagate,
+    bench_despawn_recursive,
+    bench_wide_iter,
+    bench_commands_insert,
 );
 criterion_main!(benches);

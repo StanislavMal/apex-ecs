@@ -773,6 +773,15 @@ impl World {
     /// Для kind'ов с `cascade_delete_on_target_despawn()` обычный `despawn`
     /// корня делает то же самое автоматически.
     pub fn despawn_recursive<R: RelationKind + Copy>(&mut self, _kind: R, entity: Entity) {
+        // Каскадный kind (напр. ChildOf): обычный `despawn` УЖЕ сносит всё поддерево эффективно —
+        // его внутренний стек делает `take_subjects` (забирает ВЕСЬ список детей разом, O(поддерева)).
+        // Ручная же рекурсия ниже снесла бы детей ПЕРВЫМИ, удаляя каждого из target-списка ещё
+        // живого родителя через linear search+remove ⇒ O(n²) (на 1000 детей было 2.4× медленнее Bevy).
+        if R::cascade_delete_on_target_despawn() {
+            self.despawn(entity);
+            return;
+        }
+        // Не-каскадный kind: связь не сносит subjects автоматически — обходим вручную.
         let children: Vec<Entity> = self.children_of(_kind, entity).collect();
         for child in children {
             self.despawn_recursive(_kind, child);

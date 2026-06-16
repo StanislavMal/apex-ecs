@@ -1,11 +1,14 @@
 pub mod add_remove;
 pub mod changed_iter;
+pub mod commands_insert;
 pub mod commands_spawn;
 pub mod despawn;
+pub mod despawn_recursive;
 pub mod events;
 pub mod frag_iter;
 pub mod get_component;
 pub mod relations;
+pub mod wide_iter;
 pub mod heavy_compute;
 pub mod schedule;
 pub mod simple_insert;

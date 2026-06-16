@@ -11,6 +11,9 @@ pub mod changed_iter;
 pub mod events;
 pub mod relations;
 pub mod propagate;
+pub mod despawn_recursive;
+pub mod wide_iter;
+pub mod commands_insert;
 
 pub use simple_insert::SimpleInsert;
 pub use simple_iter::SimpleIter;

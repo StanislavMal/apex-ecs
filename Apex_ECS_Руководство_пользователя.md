@@ -3659,33 +3659,52 @@ cargo run --release
 
 ### 14.7 Эталонные метрики производительности
 
-Измерения на **i5-12400F (6P+4E, 12 потоков)**, release + LTO:
+Измерения на **i5-12400F (6P+4E, 12 потоков) + RTX 4060 Ti**, release + LTO, пример
+`cargo run --release -p apex-examples --example perf` (медиана из 7 прогонов, warmup).
+Актуализировано **2026-06-16**.
 
-| Операция | Throughput | Масштабирование |
-|----------|:----------:|:---------------:|
-| `spawn_many_silent` (1 comp) | **65 M ops/s** | 🟢 O(N) |
-| `spawn_many_silent` (4 comp) | **32 M ops/s** | 🟢 O(N) |
-| `Query::for_each` | **149 M ops/s** | 🟢 O(N) |
-| `Query<(Read<Vel>, Write<Pos>)>` | **148 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each` | **158 M ops/s** | 🟢 O(N) |
-| insert component | **13.9 M ops/s** | 🟢 O(N) |
-| despawn | **50.8 M ops/s** | 🟢 O(N) |
-| resource read | **381 M ops/s** | 🟢 O(1) |
-| resource write | **378 M ops/s** | 🟢 O(1) |
-| event send → tick → EventReader | **117 M ops/s** | 🟢 O(N) |
-| Commands::despawn + apply | **37.9 M ops/s** | 🟢 O(N) |
+> ⚠ **Разброс машины.** На i5-12400F (P/E-ядра без пиннинга) абсолютные числа гуляют ±20-40%
+> между сессиями в зависимости от фоновой нагрузки. Абсолютная таблица ниже — снимок текущей
+> сессии; **робастный сигнал — относительное сравнение с Bevy/Legion в §14.8** (мерится в одном
+> прогоне на одной машине, поэтому к разбросу устойчиво).
 
-**Параллельное ускорение (speedup = seq/par, 12 потоков):**
+| Операция | ns/op | Throughput | Масштабирование |
+|----------|:-----:|:----------:|:---------------:|
+| `spawn` loop (baseline) | 91.9 | **10.9 M ops/s** | 🟢 O(N) |
+| `spawn_many` (batch+collect) | 31.2 | **32.1 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (1 comp) | 17.1 | **58.5 M ops/s** | 🟢 O(N) |
+| `spawn_many_silent` (4 comp) | 29.2 | **34.3 M ops/s** | 🟢 O(N) |
+| `allocate_batch` (ZST) | 11.6 | **86.5 M ops/s** | 🟢 O(N) |
+| `Query::for_each` | 9.2 | **109 M ops/s** | 🟢 O(N) |
+| `CachedQuery::for_each` | 9.0 | **111 M ops/s** | 🟢 O(N) |
+| `Query<(Read<Vel>, Write<Pos>)>` | 9.2 | **109 M ops/s** | 🟢 O(N) |
+| `Query<With<_>>` 0 результатов | 8.3 | **121 M ops/s** | 🟢 O(N) |
+| insert component (archetype-move) | 78.0 | **12.8 M ops/s** | 🟢 O(N) |
+| despawn | 37.5 | **26.7 M ops/s** | 🟢 O(N) |
+| `Commands::despawn` + apply | 43.0 | **23.2 M ops/s** | 🟢 O(N) |
+| event send → tick → iter | 6.6 | **152 M ops/s** | 🟢 O(N) |
+| resource read | 3.0 | **330 M ops/s** | 🟢 O(1) |
+| resource write | 2.9 | **343 M ops/s** | 🟢 O(1) |
+| `has_resource` | 2.0 | **491 M ops/s** | 🟢 O(1) |
+| `has_relation` (SubjectIndex) | 162 | **6.2 M ops/s** | 🟢 O(1) |
+| Scheduler `run()` 1 система (100k) | 10.3 | **97 M ops/s** | 🟢 O(N) |
+| Scheduler `run()` 2 системы (1 stage) | 8.8 | **114 M ops/s** | 🟢 O(N) |
+
+**Параллельное ускорение (speedup = seq/par, 12 потоков; `parallel_diagnostics` + `perf`,
+2026-06-16; абсолютные speedup'ы зависят от фоновой нагрузки машины — см. caveat §14.7):**
 
 | Сценарий | 25K | 50K | 100K | 200K | Комментарий |
 |----------|:---:|:---:|:----:|:----:|-------------|
-| 3 независимые read-only системы | 1.4x | **2.4x** | **3.9x** | **4.5x** | 🟢 Отлично масштабируется |
-| 1 система MovementWriter (1 arch) | 1.1x | 1.0x | **2.2x** | **2.5x** | 🟢 Row-level split |
-| 1 система MovementWriter (4 arch) | 0.9x | 1.0x | **2.7x** | **2.5x** | 🟢 Фрагментация помогает |
-| 12 solo-систем, 12 архетипов | — | — | **4.5x** | — | 🟡 Насыщение ~8 потоков |
-| CPU-bound par_for_each | — | — | **4.7x** | — | 🟢 Внутрисистемный |
-| Event pipeline (Emit→Listen, 2 системы) | 746 M/s | 686 M/s | 401 M/s | 571 M/s | 🟢 **Production-ready** |
-| Полный пайплайн (6 систем) | 444 M/s | 553 M/s | 692 M/s | 770 M/s | 🟢 **Production-ready** |
+| 3 независимые read-only системы | 1.95x | **2.96x** | **3.03x** | **3.61x** | 🟢 Отлично масштабируется |
+| CPU-bound, изолир. архетипы (2-3 sys) | — | — | **5.0–5.2x** | — | 🟢 Межсистемный, реальная работа |
+| 12 solo-систем, 12 архетипов | — | — | **4.4x** | — | 🟡 Насыщение ~8 потоков |
+| CPU-bound `par_for_each` (внутрисистемный) | — | — | **3.5x** | — | 🟢 atan2+cos, >> PAR_CHUNK |
+| 2 лёгких системы (memory-bound) | — | — | **1.6x** | — | 🟡 Лёгкая работа — overhead заметен |
+
+> **Ключевой вывод (актуально 2026-06-16):** наша модель ASD дробит каждую систему на чанки по
+> воркерам — это даёт **5× на реальной CPU-нагрузке** и тонкую балансировку неравномерных систем.
+> На ТРИВИАЛЬНОЙ работе (swap) такое дробление overhead'но (см. `schedule` в §14.8) — для малых/
+> лёгких миров автоотключатель (ниже) переводит stage на sequential.
 
 **Event pipeline — стабильный throughput (M ops/s):**
 
@@ -3758,6 +3777,57 @@ cargo run --release
 | **EventReadGuard RAII** | Guard автоматически продвигает курсор при Drop, исключая ручное управление курсором | Упрощение кода, устранение забытых `advance_reader_mut()` |
 | **bincode по умолчанию** | `make_serde_fns` и Prefab-десериализация используют bincode вместо JSON | Ускорение runtime-сериализации в ~1.5-2x |
 | **Graph::bfs/dfs buffer reuse** | Переиспользование `visit_order`, `stack`, `visited` между вызовами | Устранение повторных аллокаций в планировщике |
+
+**Оптимизации перф-кампании 2026-06-16** (бенч-кампания против Bevy 0.18 / Legion 0.4, см. §14.9):
+
+| Оптимизация | Суть | Эффект |
+|------------|------|--------|
+| **`Command` enum ≤48 байт** | `TemplateParams` (3×HashMap, ~144 байта) вынесен в `Box` — раньше раздувал ВЕСЬ enum до ~168 байт (Vec<Command> однороден по наибольшему варианту); compile-time страж размера | Запись любой команды в очередь дешевле → **commands_spawn −53%, обогнал Bevy** |
+| **Commands bulk-apply спавнов** | Подряд идущие `spawn` одного типа `B` применяются ОДНИМ резолвом архетипа (`spawn_bundles_bulk`) вместо per-spawn `spawn_at` | commands_spawn в 4.6×→ближе к прямому пути |
+| **Lazy entity-load в `for_each`** | `entity` грузится только для строк, прошедших фильтр (`Changed`/`Added`), а не по каждой | **changed_iter −36%, обогнал Bevy** (фильтрованные запросы extract'а) |
+| **`CachedQuery.match_verified`** | Пропуск повторного `matches_archetype` для УЖЕ отфильтрованных путей (`QueryState`/`new`); `from_sub_world` оставлен с проверкой | Дешевле итерация по многим архетипам (extract/cull) |
+| **`despawn_recursive` O(n²)→O(поддерева)** | Для cascade-видов делегирует в `despawn` (его `take_subjects` забирает список детей разом); ручная рекурсия удаляла каждого ребёнка из target-списка живого родителя | **×2.6 быстрее Bevy** (было ×2.4 медленнее) |
+| **`allocate_batch` батчинг атомиков** | Один `fetch_add`/`resize` на пачку вместо per-entity 2 атомиков + resize | **simple_insert −40%** |
+| **`spawn_many` поколоночная заливка тиков** | `change_ticks/added_ticks.resize(+n)` вместо (N-1) `push` на компонент | ближе к колоночному Legion |
+
+### 14.9 Сравнение с Bevy 0.18 и Legion 0.4
+
+Микро-бенчи `apex-bench` (criterion) против **современных** движков: `bevy_ecs 0.18.1`
+(фича `multi_threaded`) и `legion 0.4.0`. Запуск:
+`cargo bench -p apex-bench --bench benchmarks --features "bevy legion"`. Методология честная:
+apex использует **персистентный `QueryState`** там же, где Bevy (иначе сравнивали бы наш
+ergonomic-путь с кэширующим Bevy); фильтрованные/событийные бенчи имеют **стражи честности**
+(`tests/*_fairness.rs` — apex и Bevy обязаны выполнять одинаковую работу, напр. прочитать
+одинаковое число событий / увидеть одинаковое число changed). Меньше = лучше.
+
+| Бенч | apex | bevy 0.18 | legion 0.4 | Итог |
+|------|:----:|:---------:|:----------:|------|
+| simple_insert (10k×4 comp) | 293 µs | 310 | **201** | 🟢 > Bevy |
+| simple_iter (10k) | 9.2 µs · dense **6.5** | 9.0 | 6.2 | ≈ паритет |
+| fragmented_iter (26 арх) | 181 ns | **134** | 184 | 🔴 < Bevy |
+| schedule (3 sys / 40k) | 42 µs | 39 | **31** | 🔴 < Bevy¹ |
+| heavy_compute (par) | **225 µs** | 542 | 450 | 🟢 **×2.4** |
+| add_remove (10k) | **495 µs** | 679 | 2707 | 🟢 > обоих |
+| commands_spawn (10k) | **441 µs** | 480 | — | 🟢 > Bevy |
+| despawn (10k) | **245 µs** | 280 | 484 | 🟢 > обоих |
+| despawn_recursive (поддерево 1k) | **22.5 µs** | 58 | — | 🟢 **×2.6** |
+| get_component (random ×10k) | **34 µs** | 38 | 54 | 🟢 > обоих |
+| changed_iter (Changed, 10% dirty) | **7.3 µs** | 7.7 | — | 🟢 > Bevy |
+| events (send+read 10k) | **9.8 µs** | 21.9 | — | 🟢 **×2.2** |
+| relations (build+iter 10k ChildOf) | **691 µs** | 736 | — | 🟢 > Bevy |
+| wide_iter (5 comp: 4R+1W) | 3.9 µs | 4.0 | **2.3** | ≈ паритет |
+| commands_insert (10k) | 514 µs | 511 | — | ≈ паритет |
+
+**Итог: 10 побед / 3 паритета / 2 микро-отставания** против современного Bevy. Наши уникальные
+возможности (events, relations, despawn_recursive-каскад) — **быстрее Bevy**, а не просто «есть».
+Где Legion впереди (insert/iter) — у него **нет change detection** (мы платим за `Changed<T>`/
+`Added<T>`; Bevy платит ту же цену и медленнее нас).
+
+> ¹ **schedule** — НЕ баг, а оборотная сторона нашего преимущества: ASD дробит каждую систему на
+> чанки по воркерам (тонкая балансировка), что на ТРИВИАЛЬНОЙ работе (swap) дороже Bevy-модели
+> «1 система = 1 таск» на ~8%, но на РЕАЛЬНОЙ неравномерной нагрузке выигрывает (отсюда
+> heavy_compute ×2.4, parallel §14.7 до ×5). **fragmented_iter** — микро-тюнинг Bevy-итератора на
+> искусственном кейсе «много 20-сущностных архетипов» (sub-µs).
 
 ---
 
