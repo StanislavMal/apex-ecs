@@ -105,6 +105,11 @@ impl Drop for CommandArena {
 /// Spawn-apply получает зарезервированную `Entity` (либо `PLACEHOLDER` для standalone-Commands без
 /// резерватора) — наполняет её компонентами через `world.spawn_reserved` (или `world.spawn`).
 type SpawnApply = unsafe fn(*mut u8, &mut World, Entity);
+/// Батч-apply подряд идущих spawn-команд ОДНОГО типа `B`: читает бандлы из арены по offset'ам и
+/// массово вставляет их в архетип ОДНИМ резолвом (component_ids/архетип/колонки — раз на пачку, а
+/// не на каждый спавн). Закрывает разрыв `commands_spawn` vs Bevy (раньше apply звал одиночный
+/// `spawn_at` на КАЖДУЮ entity ⇒ 10k архетип-поисков + 20k get_or_register на 10k спавнов).
+type SpawnApplyBatch = unsafe fn(&mut World, &[(Entity, u32)], &CommandArena);
 type InsertApply = unsafe fn(*mut u8, &mut World, Entity);
 type RemoveApply = unsafe fn(Entity, &mut World);
 type DropFn = unsafe fn(*mut u8);
@@ -127,6 +132,9 @@ enum Command {
         entity: Entity,
         offset: u32,
         apply: SpawnApply,
+        /// Батч-applier (тот же для всех спавнов одного типа `B`) — группировка подряд идущих
+        /// `Spawn` по равенству этого указателя даёт bulk-apply одним резолвом архетипа.
+        apply_batch: SpawnApplyBatch,
         drop: DropFn,
     },
     /// Insert с данными в bump-арене (offset + apply fn)
@@ -158,10 +166,13 @@ enum Command {
     },
     /// Despawn — inline, без аллокации
     Despawn(Entity),
-    /// SpawnFromTemplate — String уже на heap, но это исключение
+    /// SpawnFromTemplate — редкий вариант; `TemplateParams` (3×HashMap ≈ 144 байта) ВЫНЕСЕН в `Box`,
+    /// чтобы не раздувать размер ВСЕГО enum `Command` (его платит каждый `queue.push`, включая
+    /// массовые Spawn/Insert). Без Box один Command весил бы ~168 байт вместо ~40 ⇒ +300µs на 10k
+    /// спавнов чистого memory-traffic записи очереди.
     SpawnFromTemplate {
         name: String,
-        params: TemplateParams,
+        params: Box<TemplateParams>,
     },
     /// Произвольная команда — Box<dyn FnOnce>
     Apply(Box<dyn FnOnce(&mut World) + Send>),
@@ -179,6 +190,15 @@ enum Command {
     },
 }
 
+// Страж размера: `Command` пишется в очередь миллионами на массовых спавнах/инсертах, поэтому его
+// размер = прямой налог на запись (Vec<Command> однороден по размеру наибольшего варианта). Держим
+// ≤48 байт: крупные/редкие полезные нагрузки (TemplateParams) выносятся в `Box`. Если ассерт упал —
+// новый вариант раздул enum; вынеси его данные в `Box`, а не увеличивай очередь для всех команд.
+const _: () = assert!(
+    std::mem::size_of::<Command>() <= 48,
+    "Command раздут — вынеси крупную полезную нагрузку нового варианта в Box (см. SpawnFromTemplate)"
+);
+
 /// Apply одной spawn-команды: наполнить зарезервированную `entity` (или аллоцировать новую при
 /// `PLACEHOLDER` — standalone-Commands). Вынесено на уровень модуля для переиспользования в
 /// [`Commands::spawn`] и [`Commands::spawn_batch`].
@@ -193,6 +213,27 @@ unsafe fn spawn_apply<B: Bundle>(ptr: *mut u8, world: &mut World, entity: Entity
 
 unsafe fn spawn_drop<B>(ptr: *mut u8) {
     std::ptr::drop_in_place(ptr as *mut B);
+}
+
+/// Bulk-применить пачку подряд идущих spawn'ов ОДНОГО типа `B`: переместить бандлы из арены и
+/// массово вставить (`World::spawn_bundles_bulk` резолвит архетип/ids/колонки один раз на пачку).
+/// `items` — `(entity, offset)`: `entity` либо зарезервирован (системный путь), либо `PLACEHOLDER`
+/// (standalone — id аллоцируются на apply). Семантически = N вызовов [`spawn_apply`], но без
+/// per-spawn архетип-поиска.
+unsafe fn spawn_apply_batch<B: Bundle>(
+    world: &mut World,
+    items: &[(Entity, u32)],
+    arena: &CommandArena,
+) {
+    let mut bundles: Vec<B> = Vec::with_capacity(items.len());
+    let mut entities: Vec<Entity> = Vec::with_capacity(items.len());
+    for &(entity, offset) in items {
+        // SAFETY: offset указывает на валидный `B` (записан в spawn/spawn_batch); читаем
+        // (перемещаем) владение — арена больше его не дропнет (как одиночный spawn_apply).
+        bundles.push(std::ptr::read(arena.get_ptr(offset) as *const B));
+        entities.push(entity);
+    }
+    world.spawn_bundles_bulk(entities, bundles);
 }
 
 /// Entity-цель insert-подобной команды — критерий группировки бёрстов (W2-1).
@@ -279,6 +320,7 @@ impl Commands {
             entity,
             offset,
             apply: spawn_apply::<B>,
+            apply_batch: spawn_apply_batch::<B>,
             drop: spawn_drop::<B>,
         });
         EntityCommands {
@@ -293,8 +335,9 @@ impl Commands {
     /// `PLACEHOLDER` у standalone без резерватора — тогда id аллоцируются на apply). 1:1 Bevy
     /// `Commands::spawn_batch` (но с возвратом id).
     ///
-    /// *Перф-заметка:* применяет N отдельных spawn-команд (корректно); bulk-insert в один архетип
-    /// одним проходом (как `World::spawn_many`) — будущая оптимизация apply.
+    /// *Перф:* подряд идущие spawn-команды ОДНОГО типа `B` применяются bulk-проходом
+    /// (`spawn_apply_batch` → `World::spawn_bundles_bulk`: архетип/ids/колонки резолвятся раз на
+    /// пачку, не на спавн). Остаток разрыва vs Bevy — в per-item записи бандла (`write_into_batch`).
     pub fn spawn_batch<B, I>(&mut self, bundles: I) -> Vec<Entity>
     where
         B: Bundle + Send + 'static,
@@ -311,6 +354,7 @@ impl Commands {
                 entity,
                 offset,
                 apply: spawn_apply::<B>,
+                apply_batch: spawn_apply_batch::<B>,
                 drop: spawn_drop::<B>,
             });
         }
@@ -459,7 +503,7 @@ impl Commands {
     pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
         self.queue.push(Command::SpawnFromTemplate {
             name: name.to_string(),
-            params,
+            params: Box::new(params),
         });
     }
 
@@ -472,7 +516,7 @@ impl Commands {
     pub fn spawn_template(&mut self, name: &str) {
         self.queue.push(Command::SpawnFromTemplate {
             name: name.to_string(),
-            params: TemplateParams::new(),
+            params: Box::new(TemplateParams::new()),
         });
     }
 
@@ -504,6 +548,45 @@ impl Commands {
                     self.apply_insert_group(world, entity, &mut group, &mut parts);
                     continue;
                 }
+            }
+            // Батч подряд идущих spawn'ов ОДНОГО типа `B` (равный `apply_batch`-указатель) — один
+            // bulk-apply с единственным резолвом архетипа вместо per-spawn `spawn_at`. Спавны разных
+            // типов или перемежённые с другими командами (напр. `with_children` → Spawn+AddRelation)
+            // не группируются (`items.len()==1` ⇒ одиночный путь, без регрессии). Закрывает разрыв
+            // `commands_spawn` vs Bevy.
+            if let Command::Spawn {
+                entity,
+                offset,
+                apply,
+                apply_batch,
+                ..
+            } = cmd
+            {
+                let batch_ptr = apply_batch as usize;
+                let mut items: smallvec::SmallVec<[(Entity, u32); 16]> = smallvec::SmallVec::new();
+                items.push((entity, offset));
+                loop {
+                    // `matches!` отпускает заём `peek` ДО `next` (без конфликта borrow).
+                    let same = matches!(
+                        it.peek(),
+                        Some(Command::Spawn { apply_batch: ab, .. }) if *ab as usize == batch_ptr
+                    );
+                    if !same {
+                        break;
+                    }
+                    if let Some(Command::Spawn { entity, offset, .. }) = it.next() {
+                        items.push((entity, offset));
+                    }
+                }
+                if items.len() == 1 {
+                    // Один спавн — одиночный путь без Vec-аллокаций bulk'а.
+                    unsafe { apply(self.arena.get_ptr(offset), world, entity) };
+                } else {
+                    // SAFETY: все items — один тип `B` (равный `apply_batch`-указатель; `component_ids`
+                    // per-type исключает ICF-слияние разных `B`); их бандлы валидны в арене.
+                    unsafe { apply_batch(world, &items, &self.arena) };
+                }
+                continue;
             }
             self.apply_one(cmd, world);
         }

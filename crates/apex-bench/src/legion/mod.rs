@@ -1,5 +1,7 @@
 pub mod add_remove;
+pub mod despawn;
 pub mod frag_iter;
+pub mod get_component;
 pub mod heavy_compute;
 pub mod schedule;
 pub mod simple_insert;

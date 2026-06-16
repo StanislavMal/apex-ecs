@@ -260,20 +260,50 @@ impl EntityAllocator {
     }
 
     /// Выделить N entity за один проход — batch API.
+    ///
+    /// **Перф (TD-39 регресс-фикс):** атомарные операции и рост `records` БАТЧАТСЯ на всю пачку
+    /// (один `cursor.fetch_sub(N)` аренды + один `high_water.fetch_add(N)` + один `resize_with`),
+    /// а не per-entity `reserve_from`/`ensure_record`. Семантика идентична (общий курсор/high-water
+    /// делятся с резерватором; порядок потребления аренды — тот же descending, что у `reserve_n`),
+    /// но 2 атомика + 1 resize на пачку вместо 2×N атомиков + N resize'ов. На `simple_insert`
+    /// (10k) это снимало ~150µs «налога» от 20 000 lock-инструкций.
     pub fn allocate_batch(&mut self, count: usize) -> Vec<Entity> {
         let mut entities = Vec::with_capacity(count);
-        // 1. Дренируем новые освобождения (free_list).
+        // 1. Дренируем новые освобождения (free_list) — немедленно доступны.
         let from_free = count.min(self.free_list.len());
         for _ in 0..from_free {
             let index = self.free_list.pop().unwrap();
             let generation = self.records[index as usize].generation;
             entities.push(Entity { index, generation });
         }
-        // 2. Остаток — из аренды/свежих (тот же курсор/high-water, что у резерватора).
-        for _ in from_free..count {
-            let e = reserve_from(&self.lease, &self.high_water);
-            self.ensure_record(e.index);
-            entities.push(e);
+        let remaining = count - from_free;
+        if remaining == 0 {
+            return entities;
+        }
+        // 2. Остаток из аренды — ОДИН fetch_sub (как reserve_n): consume free[old-1..old-reuse].
+        let old = self.lease.cursor.fetch_sub(remaining as i64, Ordering::Relaxed);
+        let reuse = old.max(0).min(remaining as i64) as usize;
+        for k in 0..reuse {
+            let (index, generation) = self.lease.free[old as usize - 1 - k];
+            entities.push(Entity { index, generation });
+        }
+        // 3. Свежие индексы — ОДИН fetch_add high-water + ОДИН resize records.
+        let fresh = remaining - reuse;
+        if fresh > 0 {
+            let start = self.high_water.fetch_add(fresh as u32, Ordering::Relaxed);
+            let end = start as usize + fresh;
+            if self.records.len() < end {
+                self.records.resize_with(end, || EntityRecord {
+                    generation: 0,
+                    encoded_location: NO_LOCATION,
+                });
+            }
+            for j in 0..fresh as u32 {
+                entities.push(Entity {
+                    index: start + j,
+                    generation: 0,
+                });
+            }
         }
         entities
     }

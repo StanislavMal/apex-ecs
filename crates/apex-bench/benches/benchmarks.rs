@@ -27,7 +27,7 @@ fn bench_simple_insert(c: &mut Criterion) {
 fn bench_simple_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("simple_iter");
     group.bench_function("apex", |b| {
-        let bench = apex::simple_iter::SimpleIter::new();
+        let mut bench = apex::simple_iter::SimpleIter::new();
         b.iter(move || bench.run());
     });
     // W2-0.5: плотная chunk-итерация (графа «скорость Legion + тики Bevy»)
@@ -55,7 +55,7 @@ fn bench_simple_iter(c: &mut Criterion) {
 fn bench_frag_iter(c: &mut Criterion) {
     let mut group = c.benchmark_group("fragmented_iter");
     group.bench_function("apex", |b| {
-        let bench = apex::frag_iter::FragIter::new();
+        let mut bench = apex::frag_iter::FragIter::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "flecs")]
@@ -132,6 +132,83 @@ fn bench_add_remove(c: &mut Criterion) {
         let mut bench = legion::add_remove::Benchmark::new();
         b.iter(move || bench.run());
     });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::add_remove::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_commands_spawn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("commands_spawn");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::commands_spawn::CommandsSpawn::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::commands_spawn::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_despawn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("despawn");
+    // iter_batched: setup (населить мир) — вне измерения; измеряем только despawn.
+    group.bench_function("apex", |b| {
+        b.iter_batched(
+            apex::despawn::setup,
+            apex::despawn::run,
+            BatchSize::SmallInput,
+        );
+    });
+    #[cfg(feature = "legion")]
+    group.bench_function("legion", |b| {
+        b.iter_batched(
+            legion::despawn::setup,
+            legion::despawn::run,
+            BatchSize::SmallInput,
+        );
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        b.iter_batched(
+            bevy::despawn::setup,
+            bevy::despawn::run,
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bench_get_component(c: &mut Criterion) {
+    let mut group = c.benchmark_group("get_component");
+    group.bench_function("apex", |b| {
+        let bench = apex::get_component::GetComponent::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "legion")]
+    group.bench_function("legion", |b| {
+        let bench = legion::get_component::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let bench = bevy::get_component::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_changed_iter(c: &mut Criterion) {
+    let mut group = c.benchmark_group("changed_iter");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::changed_iter::ChangedIter::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::changed_iter::Benchmark::new();
+        b.iter(move || bench.run());
+    });
 }
 
 criterion_group!(
@@ -142,5 +219,9 @@ criterion_group!(
     bench_schedule,
     bench_heavy_compute,
     bench_add_remove,
+    bench_commands_spawn,
+    bench_despawn,
+    bench_get_component,
+    bench_changed_iter,
 );
 criterion_main!(benches);

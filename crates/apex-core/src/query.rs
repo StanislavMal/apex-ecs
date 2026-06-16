@@ -1401,10 +1401,12 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                 continue;
             }
             let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
-            for (offset, &entity) in entities.iter().enumerate() {
+            // Entity грузим ЛЕНИВО — только для прошедших фильтр строк (см. CachedQuery::for_each
+            // в world.rs): убирает загрузку entity на непрошедших строках фильтрованных запросов.
+            for offset in 0..len {
                 let row = row_start + offset;
                 if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
-                    f(entity, item);
+                    f(entities[offset], item);
                 }
             }
         }

@@ -7,7 +7,7 @@ edition.workspace = true
 default = ["apex"]
 apex = ["apex-core/cgmath"]
 flecs = []
-bevy = ["dep:bevy_ecs"]
+bevy = ["dep:bevy_ecs", "dep:bevy_tasks"]
 legion = ["dep:legion"]
 
 [dependencies]
@@ -20,9 +20,10 @@ apex-core = { path = "../apex-core" }
 apex-scheduler = { path = "../apex-scheduler" }
 apex-macros = { path = "../apex-macros" }
 
-# ECS under test
-bevy_ecs = { version = "0.1", optional = true }
-legion = { version = "0.3", optional = true }
+# ECS under test (current released versions — fair comparison vs modern engines)
+bevy_ecs = { version = "0.18", optional = true, features = ["multi_threaded"] }
+bevy_tasks = { version = "0.18", optional = true }
+legion = { version = "0.4", optional = true }
 
 [build-dependencies]
 cc = "1.0"

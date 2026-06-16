@@ -1,47 +1,48 @@
 use bevy_ecs::prelude::*;
+use bevy_tasks::{ComputeTaskPool, TaskPool};
 use cgmath::*;
-use rayon::prelude::*;
 
-#[derive(Copy, Clone)]
+#[derive(Component, Copy, Clone)]
+struct Mat(Matrix4<f32>);
+
+#[derive(Component, Copy, Clone)]
 struct Position(Vector3<f32>);
 
-#[derive(Copy, Clone)]
+#[derive(Component, Copy, Clone)]
 struct Rotation(Vector3<f32>);
 
-#[derive(Copy, Clone)]
+#[derive(Component, Copy, Clone)]
 struct Velocity(Vector3<f32>);
 
-pub struct Benchmark(World);
+pub struct Benchmark(World, QueryState<(&'static Mat, &'static mut Position)>);
 
 impl Benchmark {
     pub fn new() -> Self {
-        let mut world = World::default();
+        ComputeTaskPool::get_or_init(TaskPool::default);
 
+        let mut world = World::new();
         world.spawn_batch((0..1000).map(|_| {
             (
-                Matrix4::<f32>::from_angle_x(Rad(1.2)),
+                Mat(Matrix4::<f32>::from_angle_x(Rad(1.2))),
                 Position(Vector3::unit_x()),
                 Rotation(Vector3::unit_x()),
                 Velocity(Vector3::unit_x()),
             )
         }));
 
-        Self(world)
+        let query = world.query::<(&Mat, &mut Position)>();
+        Self(world, query)
     }
 
     pub fn run(&mut self) {
-        self.0
-            .query::<(&mut Position, &mut Matrix4<f32>)>()
-            .iter_batched(64)
-            .par_bridge()
-            .for_each(|batch| {
-                for (mut pos, mut mat) in batch {
-                    for _ in 0..100 {
-                        *mat = mat.invert().unwrap();
-                    }
-
-                    pos.0 = mat.transform_vector(pos.0);
+        self.1
+            .par_iter_mut(&mut self.0)
+            .for_each(|(mat, mut pos)| {
+                let mut m = mat.0;
+                for _ in 0..100 {
+                    m = m.invert().unwrap_or(m);
                 }
+                pos.0 = m.transform_vector(pos.0);
             });
     }
 }

@@ -935,22 +935,30 @@ impl World {
             // Остальные count-1 entity — bulk copy из первой строки во все последующие.
             // Безопасность: данные уже записаны в первую строку через write_into_batch,
             // память зарезервирована через reserve(count), change_ticks также зарезервированы.
-            for (i, &entity) in entities[1..].iter().enumerate() {
-                let row = start_row + 1 + i;
-                self.archetypes[arch_idx].entities.push(entity);
-                for &col_idx in &col_indices {
+            let arch = &mut self.archetypes[arch_idx];
+            // Сущности — один проход (id строки = start_row+1+i).
+            for &entity in &entities[1..] {
+                arch.entities.push(entity);
+            }
+            // Данные + тики — ПОКОЛОНОЧНО: батчим Vec-операции тиков (`resize` диапазоном вместо
+            // (N-1) `push`) и `len` (одним += n), приближаясь к чисто колоночному Legion `into_soa`.
+            let n = entities.len() - 1; // count - 1 (первая строка уже записана)
+            for &col_idx in &col_indices {
+                let col = &mut arch.columns[col_idx];
+                if col.item_size > 0 {
+                    // SAFETY: память зарезервирована (reserve(count)), строки [start_row+1 .. +n]
+                    // в пределах capacity; src (строка-шаблон) и dst не пересекаются.
                     unsafe {
-                        let col = &mut self.archetypes[arch_idx].columns[col_idx];
-                        if col.item_size > 0 {
-                            let src = col.get_ptr(start_row);
-                            let dst = col.get_ptr(row);
+                        let src = col.get_ptr(start_row);
+                        for i in 0..n {
+                            let dst = col.get_ptr(start_row + 1 + i);
                             std::ptr::copy_nonoverlapping(src, dst, col.item_size);
                         }
-                        col.change_ticks.push(tick);
-                        col.added_ticks.push(tick);
-                        col.len += 1;
                     }
                 }
+                col.change_ticks.resize(col.change_ticks.len() + n, tick);
+                col.added_ticks.resize(col.added_ticks.len() + n, tick);
+                col.len += n;
             }
         }
 
@@ -989,6 +997,95 @@ impl World {
         F: FnMut(usize) -> B,
     {
         self.spawn_many_inner(count, make_bundle);
+    }
+
+    /// Bulk-спавн пачки сущностей с ПО-ЭЛЕМЕНТНЫМИ бандлами одного типа `B` в ОДИН архетип одним
+    /// резолвом (`component_ids`/архетип/колонки — раз на пачку, НЕ на каждый спавн). Путь
+    /// `Commands::apply` для подряд идущих одно-типных spawn-команд (см. `spawn_apply_batch`):
+    /// снимает per-spawn `spawn_at`-налог (10k архетип-поисков на 10k спавнов). `entities` — либо
+    /// все зарезервированы (системный путь; их записи материализовал предшествующий
+    /// `flush_reserved`), либо все `PLACEHOLDER` (standalone-`Commands` — тогда id аллоцируются здесь
+    /// одним `allocate_batch`).
+    pub(crate) fn spawn_bundles_bulk<B: Bundle>(&mut self, entities: Vec<Entity>, bundles: Vec<B>) {
+        let count = bundles.len();
+        if count == 0 {
+            return;
+        }
+        debug_assert_eq!(entities.len(), count);
+
+        // PLACEHOLDER (standalone) ⇒ аллоцируем свежие id; иначе берём зарезервированные.
+        let placeholder = entities[0] == Entity::PLACEHOLDER;
+        debug_assert!(
+            entities
+                .iter()
+                .all(|&e| (e == Entity::PLACEHOLDER) == placeholder),
+            "пачка spawn-команд одного Commands однородна по наличию резерватора"
+        );
+        let entities: Vec<Entity> = if placeholder {
+            self.entities.allocate_batch(count)
+        } else {
+            for &e in &entities {
+                self.entities.ensure_record(e.index());
+            }
+            entities
+        };
+
+        // Резолв архетипа/ids/колонок — ОДИН раз на пачку (вместо per-spawn в spawn_at).
+        let ids = bundles[0].component_ids(&mut self.registry);
+        if ids.is_empty() {
+            // Пустой бандл (`spawn(())`) — в EMPTY-архетип.
+            for (i, _bundle) in bundles.into_iter().enumerate() {
+                let entity = entities[i];
+                let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
+                self.entities.set_location(
+                    entity,
+                    EntityLocation {
+                        archetype_id: ArchetypeId::EMPTY,
+                        row,
+                    },
+                );
+            }
+            return;
+        }
+        let archetype_id = self.get_or_create_archetype(&ids);
+        let arch_idx = archetype_id.0 as usize;
+        let start_row = self.archetypes[arch_idx].entities.len();
+        let tick = self.current_tick;
+        self.archetypes[arch_idx].entities.reserve(count);
+        for col in &mut self.archetypes[arch_idx].columns {
+            col.reserve(count);
+        }
+        let col_indices: SmallVec<[usize; 8]> = ids
+            .iter()
+            .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
+            .collect();
+
+        // Бандлы РАЗНЫЕ per-item ⇒ пишем каждый через write_into_batch (с предвычисленными
+        // col_indices — без повторного get_or_register/архетип-поиска).
+        for (i, bundle) in bundles.into_iter().enumerate() {
+            let entity = entities[i];
+            let row = start_row + i;
+            self.archetypes[arch_idx].entities.push(entity);
+            bundle.write_into_batch(self, archetype_id, row, tick, &col_indices);
+        }
+        self.entities
+            .set_locations_batch(&entities, archetype_id, start_row as u32);
+
+        if self.registry.any_flags() {
+            let flagged: SmallVec<[ComponentId; 8]> = ids
+                .iter()
+                .copied()
+                .filter(|&cid| self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0)
+                .collect();
+            if !flagged.is_empty() {
+                for &entity in &entities {
+                    for &cid in &flagged {
+                        self.hook_queue.push(HookEvent::Added(entity, cid));
+                    }
+                }
+                self.flush_hooks();
+            }
+        }
     }
 
     /// Создать entity из итератора бандлов (как Bevy `spawn_batch`).
@@ -2073,6 +2170,12 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
     last_run: Tick,
     cached_ids: SmallVec<[ComponentId; 8]>,
     row_ranges: &'w [(usize, usize, usize)],
+    /// `true`, если каждый индекс в `arch_indices` УЖЕ прошёл `matches_archetype`
+    /// (конструкторы `new`/`from_state_parts`: список — точный матч). Тогда
+    /// итерация пропускает per-archetype re-check (набор компонентов архетипа
+    /// неизменен ⇒ матч не меняется). `from_sub_world` ставит `false`: его индексы —
+    /// суперсет планировщика, фильтрация обязана происходить при обходе.
+    match_verified: bool,
     _phantom: std::marker::PhantomData<Q>,
 }
 
@@ -2102,6 +2205,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             last_run,
             cached_ids: ids,
             row_ranges: &[],
+            match_verified: true, // get_or_compute отфильтровал по matches_archetype
             _phantom: std::marker::PhantomData,
         }
     }
@@ -2123,6 +2227,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             last_run,
             cached_ids: ids,
             row_ranges: sub.row_ranges(),
+            match_verified: false, // индексы планировщика — суперсет, фильтруем при обходе
             _phantom: std::marker::PhantomData,
         }
     }
@@ -2141,6 +2246,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             last_run,
             cached_ids: ids.iter().copied().collect(),
             row_ranges: &[],
+            match_verified: true, // QueryState.update отфильтровал по matches_archetype
             _phantom: std::marker::PhantomData,
         }
     }
@@ -2161,7 +2267,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if arch.is_empty() {
                 continue;
             }
-            if !Q::matches_archetype(arch, ids) {
+            if !self.match_verified && !Q::matches_archetype(arch, ids) {
                 continue;
             }
             let state = unsafe { Q::fetch_state(arch, ids, self.last_run, self.world.current_tick()) };
@@ -2172,10 +2278,14 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 continue;
             }
             let entities = &arch.entities[row_start..end];
-            for (offset, &entity) in entities.iter().enumerate() {
+            // Entity грузим ЛЕНИВО — только для строк, прошедших фильтр (`fetch_item` вернул
+            // `Some`). Для фильтрованных запросов (`Changed<T>`/`Added<T>`) это убирает загрузку
+            // `entity` на непрошедших строках (второй поток памяти ⇒ ~1.5× на разрежённых
+            // изменениях); для не-фильтрованных запросов поведение идентично (грузим все).
+            for offset in 0..len {
                 let row = row_start + offset;
                 if let Some(item) = unsafe { Q::fetch_item(state, row) } {
-                    f(entity, item);
+                    f(entities[offset], item);
                 }
             }
         }
@@ -2197,6 +2307,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         let world = self.world;
         let last_run = self.last_run;
         let row_ranges = self.row_ranges;
+        let match_verified = self.match_verified;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges
                 .iter()
@@ -2209,7 +2320,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 .iter()
                 .copied()
                 .filter(|&arch_idx| !world.archetypes[arch_idx].is_empty())
-                .filter(|&arch_idx| Q::matches_archetype(&world.archetypes[arch_idx], &ids))
+                .filter(|&arch_idx| match_verified || Q::matches_archetype(&world.archetypes[arch_idx], &ids))
                 .map(|arch_idx| {
                     let s = rr(arch_idx);
                     let effective_len =
@@ -2268,7 +2379,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         let this_run = self.world.current_tick();
         for &arch_idx in self.arch_indices.as_slice() {
             let arch = &self.world.archetypes[arch_idx];
-            if arch.is_empty() || !Q::matches_archetype(arch, ids) {
+            if arch.is_empty() || (!self.match_verified && !Q::matches_archetype(arch, ids)) {
                 continue;
             }
             let (row_start, row_end) = self.row_range(arch_idx);

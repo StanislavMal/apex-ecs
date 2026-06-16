@@ -1,47 +1,54 @@
-use bevy_ecs::{prelude::*, Mut, Schedule};
+use bevy_ecs::prelude::*;
+use bevy_tasks::{ComputeTaskPool, TaskPool};
 
+#[derive(Component)]
 struct A(f32);
+#[derive(Component)]
 struct B(f32);
+#[derive(Component)]
 struct C(f32);
+#[derive(Component)]
 struct D(f32);
+#[derive(Component)]
 struct E(f32);
 
-fn ab(mut a: Mut<A>, mut b: Mut<B>) {
-    std::mem::swap(&mut a.0, &mut b.0);
+fn ab(mut query: Query<(&mut A, &mut B)>) {
+    query.iter_mut().for_each(|(mut a, mut b)| {
+        std::mem::swap(&mut a.0, &mut b.0);
+    });
 }
 
-fn cd(mut c: Mut<C>, mut d: Mut<D>) {
-    std::mem::swap(&mut c.0, &mut d.0);
+fn cd(mut query: Query<(&mut C, &mut D)>) {
+    query.iter_mut().for_each(|(mut c, mut d)| {
+        std::mem::swap(&mut c.0, &mut d.0);
+    });
 }
 
-fn ce(mut c: Mut<C>, mut e: Mut<E>) {
-    std::mem::swap(&mut c.0, &mut e.0);
+fn ce(mut query: Query<(&mut C, &mut E)>) {
+    query.iter_mut().for_each(|(mut c, mut e)| {
+        std::mem::swap(&mut c.0, &mut e.0);
+    });
 }
 
-pub struct Benchmark(World, Resources, Schedule);
+pub struct Benchmark(World, Schedule);
 
 impl Benchmark {
     pub fn new() -> Self {
-        let mut world = World::default();
+        ComputeTaskPool::get_or_init(TaskPool::default);
 
-        world.spawn_batch((0..10000).map(|_| (A(0.0), B(0.0))));
-
-        world.spawn_batch((0..10000).map(|_| (A(0.0), B(0.0), C(0.0))));
-
-        world.spawn_batch((0..10000).map(|_| (A(0.0), B(0.0), C(0.0), D(0.0))));
-
-        world.spawn_batch((0..10000).map(|_| (A(0.0), B(0.0), C(0.0), E(0.0))));
+        let mut world = World::new();
+        world.spawn_batch((0..10_000).map(|_| (A(0.0), B(0.0))));
+        world.spawn_batch((0..10_000).map(|_| (A(0.0), B(0.0), C(0.0))));
+        world.spawn_batch((0..10_000).map(|_| (A(0.0), B(0.0), C(0.0), D(0.0))));
+        world.spawn_batch((0..10_000).map(|_| (A(0.0), B(0.0), C(0.0), E(0.0))));
 
         let mut schedule = Schedule::default();
-        schedule.add_stage("main");
-        schedule.add_system_to_stage("main", ab.system());
-        schedule.add_system_to_stage("main", cd.system());
-        schedule.add_system_to_stage("main", ce.system());
+        schedule.add_systems((ab, cd, ce));
 
-        Self(world, Resources::default(), schedule)
+        Self(world, schedule)
     }
 
     pub fn run(&mut self) {
-        self.2.run(&mut self.0, &mut self.1);
+        self.1.run(&mut self.0);
     }
 }

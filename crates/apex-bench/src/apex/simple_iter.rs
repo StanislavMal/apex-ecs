@@ -30,11 +30,15 @@ impl SimpleIter {
         Self { world, state: QueryState::new() }
     }
 
-    pub fn run(&self) {
-        self.world.query::<(Read<Velocity>, Write<Position>)>()
-            .for_each(|_, (vel, mut pos)| {
-                pos.0 += vel.0;
-            });
+    /// Per-element итерация через ПЕРСИСТЕНТНЫЙ `QueryState` — идиоматичный
+    /// быстрый путь apex, прямой аналог bevy `QueryState::iter_mut` (bevy-бенч
+    /// тоже хранит состояние между вызовами). Прежний вариант звал
+    /// `world.query()` каждую итерацию (пересборка матча архетипов) — это был
+    /// нечестный гандикап apex против кэширующего bevy.
+    pub fn run(&mut self) {
+        self.state.query(&self.world).for_each(|_, (vel, mut pos)| {
+            pos.0 += vel.0;
+        });
     }
 
     /// W2-0.5: плотная chunk-итерация (слайсы колонок + stamp_range).

@@ -18,10 +18,12 @@ declare_markers!(
 #[derive(Component)]
 pub struct Data(pub f32);
 
-// FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом
-// CachedQuery кешируется через QueryCache внутри query()
+// FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом.
+// Персистентный QueryState (идиоматичный путь apex = аналог bevy QueryState) — матч
+// архетипов вычисляется один раз, не каждый вызов.
 pub struct FragIter {
     world: World,
+    state: QueryState<Write<Data>>,
 }
 
 macro_rules! spawn_batches {
@@ -45,13 +47,12 @@ impl FragIter {
         spawn_batches!(world; A, B, C, D, E, F, G, H, I, J, K, L, M,
                             N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-        Self { world }
+        Self { world, state: QueryState::new() }
     }
 
-    pub fn run(&self) {
-        self.world.query::<Write<Data>>()
-            .for_each(|_, mut data| {
-                data.0 *= 2.0;
-            });
+    pub fn run(&mut self) {
+        self.state.query(&self.world).for_each(|_, mut data| {
+            data.0 *= 2.0;
+        });
     }
 }
