@@ -211,6 +211,41 @@ fn bench_changed_iter(c: &mut Criterion) {
     });
 }
 
+fn bench_events(c: &mut Criterion) {
+    let mut group = c.benchmark_group("events");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::events::EventsBench::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::events::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_relations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("relations");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::relations::Relations::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::relations::Benchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_propagate(c: &mut Criterion) {
+    // Apex-фокус (наш дифференциатор; bevy propagate — отдельный crate/schedule). Регресс-страж.
+    let mut group = c.benchmark_group("propagate");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::propagate::Propagate::new();
+        b.iter(move || bench.run());
+    });
+}
+
 criterion_group!(
     benches,
     bench_simple_insert,
@@ -223,5 +258,8 @@ criterion_group!(
     bench_despawn,
     bench_get_component,
     bench_changed_iter,
+    bench_events,
+    bench_relations,
+    bench_propagate,
 );
 criterion_main!(benches);

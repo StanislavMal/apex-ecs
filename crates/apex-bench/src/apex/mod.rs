@@ -8,6 +8,9 @@ pub mod commands_spawn;
 pub mod despawn;
 pub mod get_component;
 pub mod changed_iter;
+pub mod events;
+pub mod relations;
+pub mod propagate;
 
 pub use simple_insert::SimpleInsert;
 pub use simple_iter::SimpleIter;
