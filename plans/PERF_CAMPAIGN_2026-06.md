@@ -11,8 +11,12 @@
 - **Бенчмарк-набор модернизирован и расширен:** сравнение перенесено с **древнего Bevy 0.1.3 (2020,
   ещё hecs-сторадж) → bevy_ecs 0.18 + legion 0.4**; групп стало **6 → 20** (покрыты Commands, despawn,
   relations, events, Changed/Or-фильтры, get/wide-iter, propagate, despawn_recursive).
-- **Итог vs современный Bevy 0.18: 8 побед / 5 паритетов / 3 микро-отставания.** Ядро решительно
-  AAA-конкурентно; наши уникальные фичи (events, relations, despawn-каскад) — **быстрее** Bevy.
+- **Итог vs современный Bevy 0.18 (полный 3-way прогон 2026-06-17, дрейф-иммунный): ~6 побед /
+  5 паритетов / 4 отставания** (детали — §2). Ядро решительно AAA-конкурентно; наши уникальные фичи
+  (events ×1.7, despawn-каскад ×2.6, add_remove ×1.7) — **заметно быстрее** Bevy. Отставания
+  (fragmented/simple_insert — диффузный codegen Bevy; schedule — сознательный ASD-trade-off;
+  commands_insert — archetype-move bound) принципиальны, чистого overtake нет (проверено: bulk-insert
+  дал регресс, см. §3 / память).
 - **Найдено и исправлено 5 реальных багов** (включая латентный UB-баг `spawn_many`, искажавший
   данные ВСЕХ multi-компонентных батч-спавнов и дававший фиктивные числа heavy_compute).
 - **Все правки валидированы:** 191 core + 79 scheduler + 28 serialization тестов, 310 render/GPU +
@@ -67,31 +71,40 @@ simple_insert **357µs** корректно (чуть < bevy 316 — цена pe
 
 ## 2. Текущая картина (vs Bevy 0.18 / Legion 0.4)
 
-⚠ i5-12400F (6P/12T) — абсолютные числа ±10-40% между прогонами; робастно — относительное внутри прогона.
+⚠ Абсолютные числа ±10-40% между прогонами; робастно — **относительное внутри ОДНОГО прогона** (все
+движки в одном процессе ⇒ дрейф машины канселится, ratio apex/bevy надёжен). Таблица ниже — **полный
+3-way прогон 2026-06-17** (after has_row_filter fast-path, на коммите `87b6e2a`).
 
 | Бенч | apex | bevy 0.18 | legion 0.4 | Вердикт |
 |------|:----:|:---------:|:----------:|---------|
-| simple_insert | 357 µs | **316** | **209** | 🟡 ≈ Bevy |
-| simple_iter | 9.2 / dense **6.5** µs | 9.0 | 6.2 | ≈ паритет |
-| fragmented_iter | 181 ns | **134** | 184 | 🔴 |
-| schedule | 42 µs | 39 | **31** | 🔴 |
-| heavy_compute | 610 µs | 628 | **501** | ≈ паритет |
-| add_remove | **495 µs** | 679 | 2707 | 🟢 |
-| commands_spawn | **382 µs** | 483 | — | 🟢 |
-| commands_insert | 514 µs | 511 | — | ≈ паритет |
-| despawn | **245 µs** | 280 | 484 | 🟢 |
-| despawn_recursive | **22.5 µs** | 58 | — | 🟢 ×2.6 |
-| get_component | **36 µs** | 39 | 56 | 🟢 |
-| changed_iter | **7.3 µs** | 7.7 | — | 🟢 |
-| events | **9.8 µs** | 21.9 | — | 🟢 ×2.2 |
-| relations | **691 µs** | 736 | — | 🟢 |
-| or_iter | 4.65 µs | **2.58** | — | 🔴 |
-| wide_iter | 3.9 µs | 4.0 | **2.3** | ≈ паритет |
-| query_relation | 45 µs | — | — | apex-фича |
-| propagate | 339 µs | — | — | apex-страж |
+| simple_insert | 340 µs | **303** | **206** | 🟡 ≈ Bevy (−12%) |
+| simple_iter | 9.22 / dense **6.70** µs | 9.24 | 6.32 | ≈ паритет (dense ≈ legion) |
+| fragmented_iter | 167 ns | **144** | 187 | 🔴 (но бьём legion) |
+| schedule | 44 µs | 39 | **36** | 🔴 trade-off (см. §3.1B) |
+| heavy_compute | 587 µs | 579 | **488** | ≈ паритет |
+| add_remove | **521 µs** | 867 | 2720 | 🟢 ×1.7 (vs legion ×5.2) |
+| commands_spawn | **378 µs** | 479 | — | 🟢 ×1.3 |
+| commands_insert | 534 µs | **490** | — | 🟡 (−9%, archetype-move bound) |
+| despawn | **252 µs** | 305 | 488 | 🟢 ×1.2 |
+| despawn_recursive | **21.3 µs** | 56 | — | 🟢 ×2.6 |
+| get_component | **34.3 µs** | 37 | 55 | 🟢 |
+| changed_iter | **7.59 µs** | 7.61 | — | ≈ паритет (был win; bevy подтянулся) |
+| events | **13.2 µs** | 22.5 | — | 🟢 ×1.7 |
+| relations | 678 µs | 678 | — | ≈ паритет (был win; старый bevy 736 = шум) |
+| wide_iter | 3.77 µs | 3.74 | **2.26** | ≈ паритет |
+| propagate | 304 µs | — | — | apex-страж (bevy — отдельный crate) |
 
-**Где Legion впереди** (insert/iter) — у него **нет change detection** (мы платим за `Changed`/`Added`;
-Bevy платит ту же цену и медленнее нас).
+**Итог vs Bevy 0.18: ~6 побед / 5 паритетов / 4 отставания** (победы крупные: events/add_remove ×1.7,
+despawn_recursive ×2.6). `changed_iter`/`relations` сползли win→паритет — НЕ регресс apex (числа
+стабильны: relations 691→678, changed 7.3→7.59), а bevy в этом прогоне измерился чуть быстрее/прежние
+его числа были неблагоприятным шумом. *Прим.: `or_iter`/`query_relation` из прежней таблицы НЕ
+подключены в текущем `benchmarks.rs` — убраны.*
+
+**Где Legion впереди** (simple_insert/simple_iter/wide_iter/heavy_compute) — у него **нет change
+detection** (мы платим за `Changed`/`Added`; Bevy платит ту же цену и ≈равен нам). И apex **уже
+захватывает** iter-выигрыш legion своим dense-путём `for_each_chunk` (simple_iter dense 6.70 ≈
+legion 6.32). На **структурных** операциях apex рушит legion (add_remove ×5.2, despawn ×1.9,
+get_component ×1.6) — цена его cross-archetype packed storage.
 
 ---
 
