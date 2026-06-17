@@ -2251,6 +2251,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         let ids = &self.cached_ids;
         debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
+        let this_run = self.world.current_tick();
         for &arch_idx in self.arch_indices.as_slice() {
             let arch = &self.world.archetypes[arch_idx];
             if arch.is_empty() {
@@ -2259,7 +2260,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if !self.match_verified && !Q::matches_archetype(arch, ids) {
                 continue;
             }
-            let state = unsafe { Q::fetch_state(arch, ids, self.last_run, self.world.current_tick()) };
+            let state = unsafe { Q::fetch_state(arch, ids, self.last_run, this_run) };
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
@@ -2267,13 +2268,23 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 continue;
             }
             let entities = &arch.entities[row_start..end];
-            // Entity грузим ЛЕНИВО — только для строк, прошедших фильтр (`fetch_item` вернул
-            // `Some`). Для фильтрованных запросов (`Changed<T>`/`Added<T>`) это убирает загрузку
-            // `entity` на непрошедших строках (второй поток памяти ⇒ ~1.5× на разрежённых
-            // изменениях); для не-фильтрованных запросов поведение идентично (грузим все).
-            for offset in 0..len {
-                let row = row_start + offset;
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+            if Q::has_row_filter() {
+                // Построчный фильтр (`Changed`/`Added`/`Or` с ними): entity грузим ЛЕНИВО —
+                // только для прошедших строк (`fetch_item` вернул `Some`). Убирает второй
+                // поток памяти на непрошедших строках (~1.5× на разрежённых изменениях).
+                for offset in 0..len {
+                    let row = row_start + offset;
+                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                        f(entities[offset], item);
+                    }
+                }
+            } else {
+                // Архетип-уровневая форма: `fetch_item` инфаллибелен для совпавшего
+                // архетипа ⇒ плотный цикл без per-row Option-ветки (перф-кампания §3.1A,
+                // Bevy «archetype-level filter» fast-path). Семантика не меняется
+                // (`Mut<T>` по-прежнему стампит change-tick на `DerefMut`).
+                for offset in 0..len {
+                    let item = unsafe { Q::fetch_item_unchecked(state, row_start + offset) };
                     f(entities[offset], item);
                 }
             }
@@ -2331,9 +2342,17 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
             let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
-            for (offset, &entity) in entities.iter().enumerate() {
-                let row = clamped_start + offset;
-                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+            if Q::has_row_filter() {
+                for (offset, &entity) in entities.iter().enumerate() {
+                    let row = clamped_start + offset;
+                    if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                        f(entity, item);
+                    }
+                }
+            } else {
+                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
+                for (offset, &entity) in entities.iter().enumerate() {
+                    let item = unsafe { Q::fetch_item_unchecked(state, clamped_start + offset) };
                     f(entity, item);
                 }
             }
@@ -2492,10 +2511,14 @@ impl<'w, Q: WorldQuery> Iterator for CachedQueryIter<'w, Q> {
             let row = self.row;
             self.row += 1;
 
-            let item = unsafe { Q::fetch_item(*self.state.as_ref().unwrap(), row) };
-
-            if let Some(item) = item {
-                return Some(item);
+            let state = *self.state.as_ref().unwrap();
+            if Q::has_row_filter() {
+                if let Some(item) = unsafe { Q::fetch_item(state, row) } {
+                    return Some(item);
+                }
+            } else {
+                // Инфаллибельная форма: строка всегда выдаётся (§3.1A).
+                return Some(unsafe { Q::fetch_item_unchecked(state, row) });
             }
         }
     }

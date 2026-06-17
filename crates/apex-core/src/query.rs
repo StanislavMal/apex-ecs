@@ -80,7 +80,37 @@ pub trait WorldQuery: Sized {
         last_run: Tick,
         this_run: Tick,
     ) -> Self::State;
+
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
+
+    /// `true`, если `fetch_item` может вернуть `None` на НЕКОТОРЫХ строках уже
+    /// совпавшего архетипа — т.е. форма несёт **построчный** фильтр
+    /// (`Changed`/`Added`/`Or`/кортеж с такими). `false` ⇒ для совпавшего
+    /// архетипа `fetch_item` ВСЕГДА `Some`, поэтому итерация вправе пропустить
+    /// per-row Option-проверку и идти плотным циклом через
+    /// [`fetch_item_unchecked`](Self::fetch_item_unchecked) (Bevy
+    /// «archetype-level filter» fast-path; перф-кампания §3.1A). Это **чисто
+    /// перф-флаг**: семантика не меняется (`Mut<T>` по-прежнему стампит
+    /// change-tick на `DerefMut`, ленивая entity для row-фильтров сохранена).
+    ///
+    /// Дефолт `false` — большинство форм (`Read`/`Write`/`With`/`Without`/
+    /// `Maybe`/`Entity`/`()`) инфаллибельны. Переопределяют ровно построчные
+    /// фильтры и комбинаторы над ними.
+    #[inline(always)]
+    fn has_row_filter() -> bool {
+        false
+    }
+
+    /// Инфаллибл-вариант [`fetch_item`](Self::fetch_item) для архетип-уровневых
+    /// форм. Вызывать ТОЛЬКО когда [`has_row_filter`](Self::has_row_filter)
+    /// ложно — иначе UB (`unwrap_unchecked` на построчно-отфильтрованной
+    /// строке). Дефолт делегирует в `fetch_item().unwrap_unchecked()`: для
+    /// инфаллибельных форм оптимизатор инлайнит конструкцию `Some(..)` и
+    /// устраняет Option целиком.
+    #[inline(always)]
+    unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
+        Self::fetch_item(state, row).unwrap_unchecked()
+    }
 
     fn is_filter() -> bool {
         false
@@ -707,6 +737,10 @@ impl<T: Component> WorldQuery for Changed<T> {
     fn is_filter() -> bool {
         true
     }
+    #[inline(always)]
+    fn has_row_filter() -> bool {
+        true
+    }
 
     fn fill_ids(world: &World, ids: &mut IdBuf) {
         ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
@@ -784,6 +818,10 @@ impl<T: Component> WorldQuery for Added<T> {
     }
     #[inline]
     fn is_filter() -> bool {
+        true
+    }
+    #[inline(always)]
+    fn has_row_filter() -> bool {
         true
     }
 
@@ -866,6 +904,12 @@ macro_rules! impl_or_query {
             fn component_count() -> usize { 0 $( + $F::component_count() )+ }
             #[inline]
             fn is_filter() -> bool { true }
+            /// Дизъюнкция построчна, если построчна ХОТЯ БЫ одна ветка: ветка-
+            /// row-фильтр (`Changed`/`Added`) может занулить строку даже в
+            /// совпавшем архетипе (когда совпала только она). Консервативно-
+            /// корректно: при `false` все ветки инфаллибельны ⇒ `Or` инфаллибелен.
+            #[inline(always)]
+            fn has_row_filter() -> bool { false $( || $F::has_row_filter() )+ }
 
             /// Ветка с незарегистрированным компонентом несёт INVALID-сентинел
             /// (инвариант `fill_ids`) — мёртвая ветка не опустошает запрос.
@@ -967,6 +1011,10 @@ macro_rules! impl_world_query_tuple {
 
             #[inline]
             fn component_count() -> usize { 0 $( + $Q::component_count() )+ }
+            /// Кортеж построчен, если построчен ХОТЯ БЫ один элемент: `fetch_item`
+            /// кортежа возвращает `None`, как только любой элемент дал `None`.
+            #[inline(always)]
+            fn has_row_filter() -> bool { false $( || $Q::has_row_filter() )+ }
 
             fn fill_ids(world: &World, ids: &mut IdBuf) {
                 $( $Q::fill_ids(world, ids); )+
@@ -1008,6 +1056,7 @@ macro_rules! impl_world_query_tuple {
                 )+)
             }
 
+
             #[inline(always)]
             unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
                 Some(( $( {
@@ -1015,6 +1064,15 @@ macro_rules! impl_world_query_tuple {
                     if item.is_none() { return None; }
                     item.unwrap_unchecked()
                 }, )+ ))
+            }
+
+            /// Плотный fetch без Option: каждый элемент инфаллибелен (вызывать
+            /// только при `has_row_filter() == false`), поэтому строим кортеж
+            /// напрямую через `fetch_item_unchecked` элементов — ни одной
+            /// per-элементной Option-проверки.
+            #[inline(always)]
+            unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
+                ( $( $Q::fetch_item_unchecked(state.$idx, row), )+ )
             }
         }
 
@@ -1401,11 +1459,19 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                 continue;
             }
             let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
-            // Entity грузим ЛЕНИВО — только для прошедших фильтр строк (см. CachedQuery::for_each
-            // в world.rs): убирает загрузку entity на непрошедших строках фильтрованных запросов.
-            for offset in 0..len {
-                let row = row_start + offset;
-                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+            if <(Q, F)>::has_row_filter() {
+                // Построчный фильтр: entity грузим ЛЕНИВО — только для прошедших строк
+                // (см. CachedQuery::for_each в world.rs).
+                for offset in 0..len {
+                    let row = row_start + offset;
+                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+                        f(entities[offset], item);
+                    }
+                }
+            } else {
+                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
+                for offset in 0..len {
+                    let (item, _) = unsafe { <(Q, F)>::fetch_item_unchecked(a.state, row_start + offset) };
                     f(entities[offset], item);
                 }
             }
@@ -1458,9 +1524,18 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
             let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
-            for (offset, &entity) in entities.iter().enumerate() {
-                let row = clamped_start + offset;
-                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, row) } {
+            if <(Q, F)>::has_row_filter() {
+                for (offset, &entity) in entities.iter().enumerate() {
+                    let row = clamped_start + offset;
+                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, row) } {
+                        f(entity, item);
+                    }
+                }
+            } else {
+                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
+                for (offset, &entity) in entities.iter().enumerate() {
+                    let (item, _) =
+                        unsafe { <(Q, F)>::fetch_item_unchecked(state, clamped_start + offset) };
                     f(entity, item);
                 }
             }
@@ -1595,7 +1670,13 @@ impl<'q, Q: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, Q, F> {
             }
             let row = self.row_cursor;
             self.row_cursor += 1;
-            if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+            if <(Q, F)>::has_row_filter() {
+                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+                    return Some(item);
+                }
+            } else {
+                // Инфаллибельная форма: строка всегда выдаётся (§3.1A).
+                let (item, _) = unsafe { <(Q, F)>::fetch_item_unchecked(a.state, row) };
                 return Some(item);
             }
         }
