@@ -221,9 +221,10 @@ impl PrefabLoader {
                 }),
             };
 
-            // Сериализуем JSON Value → JSON строка → байты → deserialize_fn
+            // Сериализуем JSON Value → JSON строка → байты → deserialize_fn. Префаб-путь пока без
+            // контекста (TD-44 follow-up); обычные компоненты `ctx` игнорируют.
             let json_bytes = serde_json::to_vec(json_value)?;
-            let component_bytes = (serde_fns.deserialize_fn)(&json_bytes)
+            let component_bytes = (serde_fns.deserialize_fn)(&json_bytes, &mut apex_core::NoContext)
                 .map_err(|e| PrefabError::Serialization(
                     SerializationError::DeserializeFailed {
                         type_name: (*type_name).to_string(),

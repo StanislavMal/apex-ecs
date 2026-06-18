@@ -44,7 +44,7 @@ pub use archetype::ArchetypeId;
 pub use commands::Commands;
 pub use component::{
     make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentHookFn, ComponentId,
-    ComponentRegistry, ComponentSerdeFns, Serializable, Tick,
+    ComponentRegistry, ComponentSerdeFns, NoContext, Serializable, SerdeContext, Tick,
 };
 pub use entity::Entity;
 pub use events::{

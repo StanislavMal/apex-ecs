@@ -415,6 +415,17 @@ impl World {
         self.registry.register_serde_json::<T>()
     }
 
+    /// Зарегистрировать компонент с **контекст-зависимыми** serde-функциями (TD-44): компонент с внешней
+    /// ссылкой (Handle ассета, Entity-референс) (де)сериализуется через [`SerdeContext`](crate::SerdeContext),
+    /// который передаётся в `WorldSerializer::snapshot_with`/`restore_with`. Резолвер живёт в движке/
+    /// редакторе ⇒ apex-ecs остаётся ассет-агностичным. См. [`ComponentRegistry::register_serde_with`].
+    pub fn register_component_serde_with<T: Component>(
+        &mut self,
+        fns: crate::component::ComponentSerdeFns,
+    ) -> ComponentId {
+        self.registry.register_serde_with::<T>(fns)
+    }
+
     // ── Хуки состава (W3-1) ────────────────────────────────────
 
     /// Зарегистрировать `on_add`-хук компонента `T`: вызывается после того,

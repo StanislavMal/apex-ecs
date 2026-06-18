@@ -69,8 +69,19 @@ pub struct WorldSerializer;
 impl WorldSerializer {
     // ── Snapshot ───────────────────────────────────────────────
 
-    /// Создать полный снэпшот мира в формате JSON (компоненты → JSON Value).
+    /// Создать полный снэпшот мира. Обычная (де)сериализация без резолва внешних ссылок — для сцен с
+    /// компонентами, ссылающимися на ассеты/entity, используйте [`snapshot_with`](Self::snapshot_with).
     pub fn snapshot(world: &World) -> Result<WorldSnapshot, SerializationError> {
+        Self::snapshot_with(world, &mut apex_core::NoContext)
+    }
+
+    /// Снэпшот с **контекстом (де)сериализации** (TD-44): контекст-зависимые компоненты (Handle ассета,
+    /// Entity-референс) резолвят ссылки через `ctx` (его реализует движок/редактор). Обычные компоненты
+    /// `ctx` игнорируют ⇒ результат идентичен [`snapshot`](Self::snapshot).
+    pub fn snapshot_with(
+        world: &World,
+        ctx: &mut dyn apex_core::SerdeContext,
+    ) -> Result<WorldSnapshot, SerializationError> {
         let tick = world.current_tick().0;
         let mut snap = WorldSnapshot::new(tick);
 
@@ -100,7 +111,7 @@ impl WorldSerializer {
                     // ZST — нечего сериализовать
                     if info.size == 0 { continue; }
 
-                    let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row)) }
+                    let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row), ctx) }
                         .map_err(|e| SerializationError::SerializeFailed {
                             type_name: info.name.to_string(),
                             reason:    e.to_string(),
@@ -149,12 +160,23 @@ impl WorldSerializer {
 
     // ── Restore ────────────────────────────────────────────────
 
-    /// Восстановить мир из снэпшота.
+    /// Восстановить мир из снэпшота. Обычная (де)сериализация — для компонентов с внешними ссылками см.
+    /// [`restore_with`](Self::restore_with).
     ///
     /// Перед вызовом можно вызвать `snapshot.migrate()` если версия устарела.
     pub fn restore(
         world:    &mut World,
         snapshot: &WorldSnapshot,
+    ) -> Result<RestoreEntityMap, SerializationError> {
+        Self::restore_with(world, snapshot, &mut apex_core::NoContext)
+    }
+
+    /// Восстановить мир из снэпшота с **контекстом (де)сериализации** (TD-44): контекст-зависимые
+    /// компоненты резолвят внешние ссылки через `ctx`. Обычные компоненты `ctx` игнорируют.
+    pub fn restore_with(
+        world:    &mut World,
+        snapshot: &WorldSnapshot,
+        ctx:      &mut dyn apex_core::SerdeContext,
     ) -> Result<RestoreEntityMap, SerializationError> {
         if snapshot.version != WorldSnapshot::CURRENT_VERSION {
             return Err(SerializationError::VersionMismatch {
@@ -197,7 +219,7 @@ impl WorldSerializer {
                     // Данные уже в нужном формате — используем как есть
                     let raw = &comp_snap.data;
 
-                    (serde_fns.deserialize_fn)(raw)
+                    (serde_fns.deserialize_fn)(raw, ctx)
                         .map_err(|e| SerializationError::DeserializeFailed {
                             type_name: comp_snap.type_name.clone(),
                             reason:    e.to_string(),
@@ -530,12 +552,14 @@ impl WorldSerializer {
                 continue;
             }
 
-            // Сериализуем сырые данные компонента в байты
-            let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize)) }
-                .map_err(|e| SerializationError::SerializeFailed {
-                    type_name: info.name.to_string(),
-                    reason: e.to_string(),
-                })?;
+            // Сериализуем сырые данные компонента в байты. Префаб-путь пока без контекста (TD-44 follow-up:
+            // контекст-зависимые префабы — `to_prefab_with`); обычные компоненты `ctx` игнорируют.
+            let raw_bytes =
+                unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize), &mut apex_core::NoContext) }
+                    .map_err(|e| SerializationError::SerializeFailed {
+                        type_name: info.name.to_string(),
+                        reason: e.to_string(),
+                    })?;
 
             // Парсим JSON-байты в serde_json::Value
             let json_value: serde_json::Value = serde_json::from_slice(&raw_bytes)?;
@@ -839,5 +863,79 @@ mod tests {
 
         let result = WorldSerializer::restore(&mut restored_world, &snap);
         assert!(result.is_ok());
+    }
+
+    /// TD-44: a component holding an **external reference** (here an id remapped by the host) is
+    /// (de)serialised through a host-provided [`SerdeContext`] — the mechanism a scene editor uses to
+    /// turn a `Handle<Asset>` into a stable path and back. apex-ecs stays asset-agnostic: the context
+    /// type lives here (== the engine/editor in production); the core only threads `&mut dyn SerdeContext`.
+    #[test]
+    fn context_aware_component_resolves_via_serde_context() {
+        use apex_core::{ComponentSerdeFns, SerdeContext};
+        use std::any::Any;
+
+        // Host-side context: remaps the external id by an offset (stands in for Handle↔path resolution).
+        struct OffsetCtx {
+            offset: u64,
+        }
+        impl SerdeContext for OffsetCtx {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+
+        #[derive(Component, Debug, PartialEq)]
+        struct ExternalRef(u64);
+
+        let fns = ComponentSerdeFns {
+            serialize_fn: |ptr, ctx| {
+                let r = unsafe { &*(ptr as *const ExternalRef) };
+                let off = ctx.as_any().downcast_ref::<OffsetCtx>().map_or(0, |c| c.offset);
+                Ok((r.0 + off).to_le_bytes().to_vec()) // store the host-resolved id
+            },
+            deserialize_fn: |bytes, ctx| {
+                let off = ctx.as_any().downcast_ref::<OffsetCtx>().map_or(0, |c| c.offset);
+                let stored = u64::from_le_bytes(bytes.try_into().unwrap());
+                let r = ExternalRef(stored - off); // resolve back via the same context
+                let size = std::mem::size_of::<ExternalRef>();
+                let mut buf = vec![0u8; size];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        &r as *const ExternalRef as *const u8,
+                        buf.as_mut_ptr(),
+                        size,
+                    );
+                }
+                std::mem::forget(r);
+                Ok(buf)
+            },
+            format: "bincode",
+        };
+
+        let mut world = World::new();
+        world.register_component_serde_with::<ExternalRef>(fns.clone());
+        let e = world.spawn((ExternalRef(7),));
+
+        // Snapshot WITH a context that offsets by 1000 ⇒ the stored value is the resolved id (1007),
+        // proving the context reached the component's serialize_fn.
+        let mut sctx = OffsetCtx { offset: 1000 };
+        let snap = WorldSerializer::snapshot_with(&world, &mut sctx).unwrap();
+        let stored = u64::from_le_bytes(snap.entities[0].components[0].data[..8].try_into().unwrap());
+        assert_eq!(stored, 1007, "serialize_fn saw the SerdeContext (resolved 7 → 1007)");
+
+        // Restore WITH the same context ⇒ resolves back to 7 (context threaded both directions).
+        let mut rworld = World::new();
+        rworld.register_component_serde_with::<ExternalRef>(fns);
+        let mut rctx = OffsetCtx { offset: 1000 };
+        let map = WorldSerializer::restore_with(&mut rworld, &snap, &mut rctx).unwrap();
+        let restored = map[&e.index()];
+        assert_eq!(
+            rworld.get::<ExternalRef>(restored),
+            Some(&ExternalRef(7)),
+            "restore_with threaded the context ⇒ external ref resolved back to 7"
+        );
     }
 }

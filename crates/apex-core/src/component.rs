@@ -103,12 +103,37 @@ impl std::fmt::Display for ComponentSerdeError {
 ///   пригодные для записи в Column через `write_component`.
 ///
 /// Вызывающий обязан гарантировать что `src_ptr` указывает на живой T правильного типа.
+/// Непрозрачный **контекст (де)сериализации**, прокидываемый в [`ComponentSerdeFns`] (TD-44). Ядро НЕ
+/// знает его содержимого — потребитель (движок/редактор) реализует свой тип и **даункастит** через
+/// [`as_any_mut`](SerdeContext::as_any_mut). Так компонент с внешней ссылкой (Handle ассета,
+/// Entity-референс при ремапе) резолвит её при (де)сериализации, а apex-ecs остаётся **самостоятельным**
+/// — НИ ОДНОГО движкового/ассетного типа в сигнатурах ядра. Обычные компоненты контекст игнорируют.
+pub trait SerdeContext: std::any::Any {
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Пустой контекст по умолчанию — для обычной (де)сериализации без резолва внешних ссылок. Старые
+/// `WorldSerializer::snapshot/restore` используют его, поэтому существующие компоненты не затрагиваются.
+pub struct NoContext;
+impl SerdeContext for NoContext {
+    #[inline]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    #[inline]
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct ComponentSerdeFns {
-    /// Сериализовать компонент по raw-указателю в байты.
-    pub serialize_fn: unsafe fn(*const u8) -> SerializeResult,
-    /// Десериализовать байты обратно в выровненный буфер с данными T.
-    pub deserialize_fn: fn(&[u8]) -> DeserializeResult,
+    /// Сериализовать компонент по raw-указателю в байты. `ctx` — опциональный резолвер внешних ссылок
+    /// (обычные компоненты его игнорируют; контекст-зависимые даункастят, см. [`SerdeContext`]).
+    pub serialize_fn: unsafe fn(*const u8, &mut dyn SerdeContext) -> SerializeResult,
+    /// Десериализовать байты обратно в выровненный буфер с данными T (с тем же `ctx`).
+    pub deserialize_fn: fn(&[u8], &mut dyn SerdeContext) -> DeserializeResult,
     /// Человекочитаемое имя формата: "json", "bincode", "ron".
     pub format: &'static str,
 }
@@ -211,13 +236,13 @@ pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
 /// Формат можно сменить — достаточно поменять реализацию двух замыканий.
 pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
-        serialize_fn: |ptr| {
+        serialize_fn: |ptr, _ctx| {
             // SAFETY: вызывающий гарантирует валидность ptr как *const T
             let val = unsafe { &*(ptr as *const T) };
             bincode::serialize(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
         },
-        deserialize_fn: |bytes| {
+        deserialize_fn: |bytes, _ctx| {
             let val: T = bincode::deserialize(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
             // Упаковываем T в выровненный байтовый буфер для записи в Column.
@@ -244,12 +269,12 @@ pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
 /// с использованием `serde_json` (текстовый формат для отладки/логов).
 pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
-        serialize_fn: |ptr| {
+        serialize_fn: |ptr, _ctx| {
             let val = unsafe { &*(ptr as *const T) };
             serde_json::to_vec(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
         },
-        deserialize_fn: |bytes| {
+        deserialize_fn: |bytes, _ctx| {
             let val: T = serde_json::from_slice(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
             let size = std::mem::size_of::<T>();
@@ -412,6 +437,19 @@ impl ComponentRegistry {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
             }
+        }
+        id
+    }
+
+    /// Зарегистрировать компонент с **контекст-зависимыми** serde-функциями (TD-44): компонент с
+    /// внешней ссылкой (Handle ассета, Entity-референс) (де)сериализуется через [`SerdeContext`],
+    /// который даёт `WorldSerializer::*_with` / `PrefabLoader`. В отличие от [`register_serde`], **всегда
+    /// заменяет** serde-функции (контекст-зависимые важнее дефолтных bincode/json). Сам резолвер живёт в
+    /// движке/редакторе — ядро остаётся ассет-агностичным.
+    pub fn register_serde_with<T: Component>(&mut self, fns: ComponentSerdeFns) -> ComponentId {
+        let id = self.register::<T>();
+        if let Some(info) = self.by_id.get_mut(&id.0) {
+            info.serde = Some(fns);
         }
         id
     }
