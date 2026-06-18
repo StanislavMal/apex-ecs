@@ -158,7 +158,23 @@ impl PrefabLoader {
         parent: Option<Entity>,
         params: Option<&TemplateParams>,
     ) -> Result<Entity, PrefabError> {
-        let entity = self.spawn_entity(world, manifest, overrides)?;
+        self.instantiate_with(world, manifest, overrides, parent, params, &mut apex_core::NoContext)
+    }
+
+    /// `instantiate` с **контекстом (де)сериализации** (TD-44): компоненты префаба с внешними ссылками
+    /// (Handle ассета и т.п.) резолвят их через `ctx` — консистентно со снэпшотами. Контекст
+    /// прокидывается во всю иерархию. Обычные компоненты `ctx` игнорируют.
+    #[allow(clippy::only_used_in_recursion, clippy::too_many_arguments)]
+    pub fn instantiate_with(
+        &self,
+        world: &mut World,
+        manifest: &PrefabManifest,
+        overrides: &[PrefabComponent],
+        parent: Option<Entity>,
+        params: Option<&TemplateParams>,
+        ctx: &mut dyn apex_core::SerdeContext,
+    ) -> Result<Entity, PrefabError> {
+        let entity = self.spawn_entity(world, manifest, overrides, ctx)?;
 
         // Parent relation
         if let Some(parent_entity) = parent {
@@ -171,18 +187,19 @@ impl PrefabLoader {
                 PrefabError::SubPrefabNotFound { name: child.prefab.clone() }
             })?;
 
-            self.instantiate(world, child_manifest, &child.overrides, Some(entity), params)?;
+            self.instantiate_with(world, child_manifest, &child.overrides, Some(entity), params, ctx)?;
         }
 
         Ok(entity)
     }
 
-    /// Внутренний метод: создаёт одну entity с компонентами из manifest + overrides.
+    /// Внутренний метод: создаёт одну entity с компонентами из manifest + overrides (через `ctx`).
     fn spawn_entity(
         &self,
         world: &mut World,
         manifest: &PrefabManifest,
         overrides: &[PrefabComponent],
+        ctx: &mut dyn apex_core::SerdeContext,
     ) -> Result<Entity, PrefabError> {
         let entity = world.spawn(());
         let tick = world.current_tick();
@@ -221,10 +238,10 @@ impl PrefabLoader {
                 }),
             };
 
-            // Сериализуем JSON Value → JSON строка → байты → deserialize_fn. Префаб-путь пока без
-            // контекста (TD-44 follow-up); обычные компоненты `ctx` игнорируют.
+            // Сериализуем JSON Value → JSON строка → байты → deserialize_fn через контекст (TD-44):
+            // компоненты с внешними ссылками резолвят их; обычные компоненты `ctx` игнорируют.
             let json_bytes = serde_json::to_vec(json_value)?;
-            let component_bytes = (serde_fns.deserialize_fn)(&json_bytes, &mut apex_core::NoContext)
+            let component_bytes = (serde_fns.deserialize_fn)(&json_bytes, ctx)
                 .map_err(|e| PrefabError::Serialization(
                     SerializationError::DeserializeFailed {
                         type_name: (*type_name).to_string(),
@@ -544,5 +561,89 @@ mod tests {
 
         let child_name = world.get::<Name>(child).unwrap();
         assert_eq!(child_name.0, "OverriddenChild", "Name должен быть из overrides");
+    }
+
+    /// TD-44 gap-close: `SerdeContext` threads through BOTH the **diff** path (`diff_with`) and the
+    /// **prefab** path (`entity_to_prefab_with` + `instantiate_with`) — consistently with `snapshot_with`,
+    /// no silent `NoContext`. A context-aware (JSON, host-resolved) component is verified end-to-end on
+    /// both: a component with an external ref resolves in a diff-save and round-trips through a prefab.
+    #[test]
+    fn context_threads_through_diff_and_prefab() {
+        use crate::WorldSerializer;
+        use apex_core::{ComponentSerdeFns, SerdeContext};
+        use std::any::Any;
+
+        struct Shift {
+            by: i64,
+        }
+        impl SerdeContext for Shift {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+        #[derive(Component, Debug, PartialEq)]
+        struct CtxRef(i64);
+
+        // JSON-format context-aware fns (compatible with snapshot AND prefab paths).
+        fn make_fns() -> ComponentSerdeFns {
+            ComponentSerdeFns {
+                serialize_fn: |ptr, ctx| {
+                    let r = unsafe { &*(ptr as *const CtxRef) };
+                    let by = ctx.as_any().downcast_ref::<Shift>().map_or(0, |s| s.by);
+                    Ok(serde_json::to_vec(&(r.0 + by)).unwrap())
+                },
+                deserialize_fn: |bytes, ctx| {
+                    let by = ctx.as_any().downcast_ref::<Shift>().map_or(0, |s| s.by);
+                    let stored: i64 = serde_json::from_slice(bytes).unwrap();
+                    let r = CtxRef(stored - by);
+                    let size = std::mem::size_of::<CtxRef>();
+                    let mut buf = vec![0u8; size];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            &r as *const CtxRef as *const u8,
+                            buf.as_mut_ptr(),
+                            size,
+                        );
+                    }
+                    std::mem::forget(r);
+                    Ok(buf)
+                },
+                format: "json",
+            }
+        }
+
+        // ── diff path: diff_with serialises the added component THROUGH the context ──
+        let mut world = World::new();
+        world.register_component_serde_with::<CtxRef>(make_fns());
+        let empty = WorldSerializer::snapshot_with(&world, &mut Shift { by: 0 }).unwrap();
+        world.spawn((CtxRef(7),));
+        let diff = WorldSerializer::diff_with(&empty, &world, &mut Shift { by: 1000 }).unwrap();
+        let added = &diff.added_entities[0].components[0].data;
+        let stored: i64 = serde_json::from_slice(added).unwrap();
+        assert_eq!(stored, 1007, "diff_with threaded the context (7 → 1007)");
+
+        // ── prefab path: entity_to_prefab_with serialises, instantiate_with deserialises, via context ──
+        let e = world.spawn((CtxRef(7),));
+        let manifest = WorldSerializer::entity_to_prefab_with(&world, e, &mut Shift { by: 1000 }).unwrap();
+        assert_eq!(
+            manifest.components[0].value,
+            serde_json::json!(1007),
+            "entity_to_prefab_with resolved the ref via context"
+        );
+
+        let mut rworld = World::new();
+        rworld.register_component_serde_with::<CtxRef>(make_fns());
+        let loader = PrefabLoader::new();
+        let inst = loader
+            .instantiate_with(&mut rworld, &manifest, &[], None, None, &mut Shift { by: 1000 })
+            .unwrap();
+        assert_eq!(
+            rworld.get::<CtxRef>(inst),
+            Some(&CtxRef(7)),
+            "instantiate_with threaded the context ⇒ ref resolved back to 7"
+        );
     }
 }

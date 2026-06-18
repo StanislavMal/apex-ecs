@@ -276,7 +276,18 @@ impl WorldSerializer {
         old_snapshot: &WorldSnapshot,
         new_world:    &World,
     ) -> Result<WorldDiff, SerializationError> {
-        let new_snapshot = Self::snapshot(new_world)?;
+        Self::diff_with(old_snapshot, new_world, &mut apex_core::NoContext)
+    }
+
+    /// `diff` с **контекстом (де)сериализации** (TD-44): внутренний снэпшот строится через
+    /// [`snapshot_with`](Self::snapshot_with), поэтому контекст-зависимые компоненты резолвят внешние
+    /// ссылки и в инкрементальном сейве — консистентно с полным `snapshot_with` (нет тихого `NoContext`).
+    pub fn diff_with(
+        old_snapshot: &WorldSnapshot,
+        new_world:    &World,
+        ctx:          &mut dyn apex_core::SerdeContext,
+    ) -> Result<WorldDiff, SerializationError> {
+        let new_snapshot = Self::snapshot_with(new_world, ctx)?;
         Self::diff_snapshots(old_snapshot, &new_snapshot)
     }
 
@@ -526,6 +537,16 @@ impl WorldSerializer {
         world: &World,
         entity: Entity,
     ) -> Result<PrefabManifest, SerializationError> {
+        Self::entity_to_prefab_with(world, entity, &mut apex_core::NoContext)
+    }
+
+    /// `entity_to_prefab` с **контекстом (де)сериализации** (TD-44): компоненты с внешними ссылками
+    /// резолвят их в префаб через `ctx` — консистентно со снэпшотами. Обычные компоненты `ctx` игнорируют.
+    pub fn entity_to_prefab_with(
+        world: &World,
+        entity: Entity,
+        ctx: &mut dyn apex_core::SerdeContext,
+    ) -> Result<PrefabManifest, SerializationError> {
         let location = world
             .entity_allocator()
             .get_location(entity)
@@ -552,10 +573,9 @@ impl WorldSerializer {
                 continue;
             }
 
-            // Сериализуем сырые данные компонента в байты. Префаб-путь пока без контекста (TD-44 follow-up:
-            // контекст-зависимые префабы — `to_prefab_with`); обычные компоненты `ctx` игнорируют.
+            // Сериализуем сырые данные компонента в байты через контекст (TD-44) — консистентно со снэпшотами.
             let raw_bytes =
-                unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize), &mut apex_core::NoContext) }
+                unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize), ctx) }
                     .map_err(|e| SerializationError::SerializeFailed {
                         type_name: info.name.to_string(),
                         reason: e.to_string(),
@@ -585,12 +605,22 @@ impl WorldSerializer {
         world: &World,
         root: Entity,
     ) -> Result<PrefabManifest, SerializationError> {
-        let mut manifest = Self::entity_to_prefab(world, root)?;
+        Self::hierarchy_to_prefab_with(world, root, &mut apex_core::NoContext)
+    }
+
+    /// `hierarchy_to_prefab` с **контекстом (де)сериализации** (TD-44): контекст прокидывается во всю
+    /// иерархию (каждый узел — через [`entity_to_prefab_with`](Self::entity_to_prefab_with)).
+    pub fn hierarchy_to_prefab_with(
+        world: &World,
+        root: Entity,
+        ctx: &mut dyn apex_core::SerdeContext,
+    ) -> Result<PrefabManifest, SerializationError> {
+        let mut manifest = Self::entity_to_prefab_with(world, root, ctx)?;
 
         // Рекурсивно собираем детей
         let children: Vec<Entity> = world.children_of(ChildOf, root).collect();
         for child in children {
-            let child_manifest = Self::hierarchy_to_prefab(world, child)?;
+            let child_manifest = Self::hierarchy_to_prefab_with(world, child, ctx)?;
             manifest.children.push(PrefabChild {
                 prefab: child_manifest.name.clone(),
                 overrides: Vec::new(),
