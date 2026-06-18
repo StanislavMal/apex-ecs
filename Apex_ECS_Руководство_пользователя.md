@@ -197,7 +197,10 @@ world.require_component::<Camera, LocalTransform>();
   spawn/insert — к моменту пользовательского `on_add` и к возврату из `spawn`
   состав уже полный;
 - движок объявляет requires для `MeshRenderer`/`Camera`/светов
-  (LocalTransform + GlobalTransform) в `RenderPlugin::build`.
+  (LocalTransform + GlobalTransform) в `RenderPlugin::build`;
+- **работает на всех платформах, включая wasm** — требования регистрируются через
+  `Component::register_requires` при первой регистрации типа (`linkme`-авторегистрация
+  на нативе — лишь оптимизация старта; на wasm требования дотягиваются лениво, без linker-магии).
 
 ### 2.3 World
 
@@ -2943,6 +2946,17 @@ WorldSerializer::restore_with(&mut new_world, &snap, &mut ctx)?;
 
 Обычные компоненты (`register_component_serde`) контекст **игнорируют** — `WorldSerializer::snapshot`/
 `restore` это обёртки над `*_with` с пустым `NoContext`, поэтому существующий код не меняется.
+
+Контекст прокинут **консистентно через ВСЕ пути сериализации** — у каждого есть `*_with`-вариант
+(без него — обёртка с `NoContext`), так что контекст-зависимый компонент резолвит ссылки одинаково везде:
+
+```rust
+// Инкрементальный diff:
+let diff = WorldSerializer::diff_with(&old_snapshot, &world, &mut ctx)?;
+// Префабы (сериализация и инстанцирование):
+let manifest = WorldSerializer::entity_to_prefab_with(&world, entity, &mut ctx)?;       // + hierarchy_to_prefab_with
+loader.instantiate_with(&mut world, &manifest, &[], None, None, &mut ctx)?;
+```
 
 ### 10.4 Prefabs (файловые префабы)
 
