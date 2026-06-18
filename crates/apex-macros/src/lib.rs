@@ -98,18 +98,31 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         }
     }
 
-    let requires_calls = required.iter().map(|ty| {
+    // Тело `Component::register_requires` — по одному `register_required::<Self, R>()` на каждый `#[require]`.
+    // Эмитим метод ТОЛЬКО когда требования есть (иначе работает дефолт трейта = нет требований).
+    let register_requires_impl = if required.is_empty() {
+        quote! {}
+    } else {
+        let calls = required.iter().map(|ty| {
+            quote! { registry.register_required::<#name, #ty>(); }
+        });
         quote! {
-            registry.register_required::<#name, #ty>();
+            fn register_requires(registry: &mut ::apex_core::component::ComponentRegistry) {
+                #( #calls )*
+            }
         }
-    });
+    };
 
     let expanded = quote! {
-        impl ::apex_core::component::Component for #name {}
+        impl ::apex_core::component::Component for #name {
+            #register_requires_impl
+        }
 
-        // linkme не реализован на wasm32: регистратор не эмитится, компонент
-        // регистрируется лениво (get_or_register), #[require] не применяется —
-        // TD-25 (apex-engine/plans/TECH_DEBT.md).
+        // Авторегистрация на старте `World::new()` через `linkme::distributed_slice` (линкер собирает
+        // регистраторы из всех крейтов). На wasm32 linkme не эмитится — но это лишь ОПТИМИЗАЦИЯ
+        // (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО при первом
+        // использовании (`register` → `Component::register_requires`), поэтому `#[require]` работает и
+        // на wasm. TD-25.
         #[allow(non_upper_case_globals)]
         #[cfg(not(target_arch = "wasm32"))]
         #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
@@ -117,7 +130,6 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
             |registry: &mut ::apex_core::component::ComponentRegistry| {
                 registry.get_or_register::<#name>();
-                #( #requires_calls )*
             };
     };
     expanded.into()

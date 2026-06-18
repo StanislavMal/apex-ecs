@@ -168,7 +168,15 @@ pub struct ComponentInfo {
 
 // ── Component trait ────────────────────────────────────────────
 
-pub trait Component: Send + Sync + 'static {}
+pub trait Component: Send + Sync + 'static {
+    /// Регистрация **required-компонентов** (`#[require(...)]`, D2-4). Дефолт — требований нет;
+    /// `#[derive(Component)]` переопределяет его, вызывая `register_required::<Self, R>()` для каждого
+    /// `R`. Вызывается из [`ComponentRegistry::register`] РОВНО ОДИН РАЗ при первой регистрации типа —
+    /// поэтому `#[require]` работает на **ВСЕХ** платформах (включая wasm) через ленивую регистрацию,
+    /// **без** `linkme`/linker-магии: на нативе требования регистрирует distributed-slice-регистратор
+    /// (через `register`), на wasm — первое использование компонента (тоже через `register`). TD-25.
+    fn register_requires(_registry: &mut ComponentRegistry) {}
+}
 
 #[cfg(feature = "cgmath")]
 impl Component for cgmath::Matrix4<f32> {}
@@ -387,6 +395,10 @@ impl ComponentRegistry {
             },
         );
         self.type_to_id.insert(type_id, id);
+        // Зарегистрировать required-компоненты (`#[require]`) РОВНО ОДИН РАЗ — здесь, на первой
+        // регистрации типа (re-entrant `register::<T>` из `register_required` выйдет рано, т.к. T уже
+        // в `type_to_id`). Платформо-независимо: работает и без distributed-slice (wasm — TD-25).
+        T::register_requires(self);
         id
     }
 
@@ -457,5 +469,46 @@ impl ComponentRegistry {
 impl Default for ComponentRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TD-25: `#[require]` works **without** the `linkme` distributed-slice (the wasm path). Registering
+    /// a component **lazily** (a bare `register::<T>()`, as a first spawn would on wasm where no startup
+    /// registrar runs) must register its required components too — driven by `Component::register_requires`
+    /// from inside `register`, not by the registrar. Proven here at registry level (platform-independent).
+    #[test]
+    fn lazy_register_applies_required_components_without_linkme() {
+        #[derive(Default)]
+        struct Req;
+        impl Component for Req {}
+
+        struct Host; // emulates a `#[derive(Component)] #[require(Req)]` type
+        impl Component for Host {
+            fn register_requires(reg: &mut ComponentRegistry) {
+                reg.register_required::<Host, Req>();
+            }
+        }
+
+        // Bare registry — NO `register_all_auto` / distributed-slice (exactly the wasm situation).
+        let mut reg = ComponentRegistry::new();
+        let host_id = reg.register::<Host>(); // lazy first-use registration
+
+        // The require fired from inside `register`: Host has a required-insert closure, and Req is registered.
+        assert!(
+            reg.requires(host_id).is_some_and(|r| r.len() == 1),
+            "register::<Host> must register its #[require] (Req) via Component::register_requires"
+        );
+        assert!(
+            reg.type_to_id.contains_key(&TypeId::of::<Req>()),
+            "the required component Req must be registered transitively"
+        );
+
+        // Idempotent: re-registering Host does NOT duplicate the require closure.
+        reg.register::<Host>();
+        assert_eq!(reg.requires(host_id).map(|r| r.len()), Some(1), "no duplicate require on re-register");
     }
 }
