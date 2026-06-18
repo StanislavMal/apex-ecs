@@ -164,6 +164,12 @@ pub struct EntityAllocator {
     lease: Arc<ReserveLease>,
     records: Vec<EntityRecord>,
     free_list: Vec<u32>,
+    /// Число **живых** (located) записей — поддерживается O(1) на переходах локации (как `Entities::len`
+    /// в Bevy). [`len`](Self::len) возвращает его напрямую: это и дешевле формулы `records − free − lease`,
+    /// и КОНСИСТЕНТНО с [`is_alive`](Self::is_alive) — резервации, материализованные `flush`'ем как
+    /// location-less записи (например осиротевшие при дропе `Commands` без `apply`), сюда НЕ попадают
+    /// (раньше они завышали счёт — TD-40).
+    live: u32,
 }
 
 impl EntityAllocator {
@@ -176,6 +182,7 @@ impl EntityAllocator {
             }),
             records: Vec::new(),
             free_list: Vec::new(),
+            live: 0,
         }
     }
 
@@ -322,10 +329,14 @@ impl EntityAllocator {
             let record = &mut self.records[entity.index as usize];
             // Проверяем generation только в debug
             debug_assert_eq!(record.generation, entity.generation);
+            let became_live = !record.has_location(); // location-less → located ⇒ +1 живой
             record.set_location(EntityLocation {
                 archetype_id,
                 row: start_row + i as u32,
             });
+            if became_live {
+                self.live += 1;
+            }
         }
     }
 
@@ -337,8 +348,12 @@ impl EntityAllocator {
         if record.generation != entity.generation {
             return false;
         }
+        let was_live = record.has_location(); // located → location-less ⇒ −1 живой
         record.generation = record.generation.wrapping_add(1);
         record.clear_location();
+        if was_live {
+            self.live -= 1;
+        }
         // W3-3: защита от ABA при wrap'е generation. free_list — LIFO, т.е.
         // churn концентрируется на ОДНОМ слоте (spawn+despawn временной entity
         // каждый кадр ≈ 2³² переиспользований за ~198 дней @250Hz). Слот,
@@ -371,18 +386,23 @@ impl EntityAllocator {
 
     #[inline]
     pub fn set_location(&mut self, entity: Entity, location: EntityLocation) {
+        let mut became_live = false;
         if let Some(record) = self.records.get_mut(entity.index as usize) {
             if record.generation == entity.generation {
+                became_live = !record.has_location(); // location-less → located ⇒ +1 живой
                 record.set_location(location);
             }
         }
+        if became_live {
+            self.live += 1;
+        }
     }
 
+    /// Число **живых** (located) entity — консистентно с [`is_alive`](Self::is_alive). O(1): возвращает
+    /// поддерживаемый счётчик `live` (не считает зарезервированные-но-не-материализованные записи,
+    /// которые `flush` создаёт location-less — TD-40). Дешевле прежней формулы `records − free − lease`.
     pub fn len(&self) -> usize {
-        // Свободны: free_list + НЕ потреблённые слоты аренды (free[0..cursor]).
-        let lease_free = (self.lease.cursor.load(Ordering::Relaxed).max(0) as usize)
-            .min(self.lease.free.len());
-        self.records.len() - self.free_list.len() - lease_free
+        self.live as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -544,6 +564,36 @@ mod tests {
         alloc.set_location(b, make_loc());
         assert!(alloc.is_alive(a));
         assert!(alloc.is_alive(b));
+    }
+
+    /// TD-40 регресс: `len()` (= `entity_count`) считает только ЖИВЫЕ (located) entity и КОНСИСТЕНТЕН с
+    /// `is_alive` — зарезервированные-но-не-материализованные записи (осиротевшие, как при дропе
+    /// `Commands` без `apply`) НЕ завышают счёт, даже после того как `flush` создаст их как location-less.
+    #[test]
+    fn len_counts_only_located_ignoring_orphaned_reservations() {
+        let mut alloc = EntityAllocator::new();
+        // Две настоящие entity.
+        let a = alloc.allocate();
+        alloc.set_location(a, make_loc());
+        let b = alloc.allocate();
+        alloc.set_location(b, make_loc());
+        assert_eq!(alloc.len(), 2);
+
+        // Три резервации, которые НИКОГДА не материализуются (как дропнутый Commands-буфер): двигают
+        // общий high-water, но локацию им никто не проставит.
+        let r = alloc.reserver();
+        let orphans = [r.reserve(), r.reserve(), r.reserve()];
+        // flush растит `records` до high-water → осиротевшие становятся location-less записями.
+        alloc.flush();
+
+        assert_eq!(alloc.len(), 2, "осиротевшие резервации не должны завышать entity_count (TD-40)");
+        for o in orphans {
+            assert!(!alloc.is_alive(o), "осиротевшая резервация не жива");
+        }
+        // Despawn реальной entity → счёт уменьшается; свободный слот тоже не считается.
+        assert!(alloc.free(a));
+        assert_eq!(alloc.len(), 1, "len консистентен с is_alive после despawn");
+        assert!(!alloc.is_alive(a) && alloc.is_alive(b));
     }
 
     #[test]
