@@ -21,7 +21,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Хэширование
-rustc-hash = "1.1"
+rustc-hash = "2.1"
 
 # Маленькие vec на стеке
 smallvec = { version = "1.11", features = ["union"] }
@@ -39,7 +39,7 @@ rayon = "1.8"
 log = "0.4"
 
 # Ошибки
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Сериализация
 serde      = { version = "1.0", features = ["derive"] }
