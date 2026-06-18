@@ -2904,6 +2904,46 @@ println!("modified components: {}", diff.modified_components.len());
 
 > **Преимущество:** При частичных изменениях (например, изменилось 10% entity) размер диффа в ~10× меньше полного snapshot. Поле `modified_components` содержит только побайтово изменённые компоненты.
 
+### 10.3.2 Контекст-зависимая (де)сериализация — `SerdeContext` (TD-44)
+
+Компонент с **внешней ссылкой** (хэндл ассета, `Entity`-референс, путь ресурса) нужно (де)сериализовать
+**через резолвер**: при сохранении ссылка → стабильный идентификатор (например путь), при загрузке обратно.
+Для этого serde-функции принимают непрозрачный **контекст** `&mut dyn SerdeContext`. Ядро **не знает** его
+содержимого — хост (движок/редактор) реализует свой тип и **даункастит** его. Так apex-ecs остаётся
+самостоятельным (никаких внешних типов в ядре).
+
+```rust
+use apex_core::{ComponentSerdeFns, SerdeContext};
+use std::any::Any;
+
+// Контекст хоста (например резолвер Handle↔путь). Живёт в движке/редакторе, не в ядре.
+struct AssetCtx { /* resolver … */ }
+impl SerdeContext for AssetCtx {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+}
+
+// Компонент с внешней ссылкой — регистрируем КОНТЕКСТ-ЗАВИСИМЫЕ serde-функции:
+world.register_component_serde_with::<MyRef>(ComponentSerdeFns {
+    serialize_fn: |ptr, ctx| {
+        let me = unsafe { &*(ptr as *const MyRef) };
+        let ctx = ctx.as_any().downcast_ref::<AssetCtx>().unwrap(); // резолвим ссылку
+        /* … вернуть байты со стабильным идентификатором … */
+        Ok(bytes)
+    },
+    deserialize_fn: |bytes, ctx| { /* резолвим обратно через ctx */ Ok(buf) },
+    format: "bincode",
+});
+
+// Снэпшот/восстановление С контекстом:
+let mut ctx = AssetCtx { /* … */ };
+let snap = WorldSerializer::snapshot_with(&world, &mut ctx)?;
+WorldSerializer::restore_with(&mut new_world, &snap, &mut ctx)?;
+```
+
+Обычные компоненты (`register_component_serde`) контекст **игнорируют** — `WorldSerializer::snapshot`/
+`restore` это обёртки над `*_with` с пустым `NoContext`, поэтому существующий код не меняется.
+
 ### 10.4 Prefabs (файловые префабы)
 
 Prefabs — это JSON-формат для описания и переиспользования entity и их иерархий. В отличие от `EntityTemplate`, префабы загружаются из файлов и могут изменяться без перекомпиляции.
