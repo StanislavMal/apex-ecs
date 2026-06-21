@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use apex_core::{
-    component::{ComponentId, Tick},
+    component::ComponentId,
     entity::Entity,
     relations::ChildOf,
     world::World,
@@ -201,7 +201,14 @@ impl WorldSerializer {
         }
 
         let mut entity_map: RestoreEntityMap = HashMap::with_capacity(snapshot.entities.len());
-        let tick = Tick(snapshot.tick);
+        // Mark all restored data as **freshly changed at load time**: bump the change tick and stamp the
+        // inserted components with the new current tick. Otherwise restore stamped them with the SAVED
+        // snapshot tick (older), which a change-detecting consumer (transform propagation, render
+        // extract, picking) whose `last_run` is already past it would skip — e.g. transforms staying at
+        // the world origin (and lights mis-aimed) after loading a scene into a long-running world. This
+        // touches only the (rare) load path; the per-frame change-detection model is unchanged.
+        world.advance_change_tick();
+        let tick = world.current_tick();
 
         // Строим маппинг type_name → ComponentId из зарегистрированных компонентов.
         let name_to_id: HashMap<String, ComponentId> = world
