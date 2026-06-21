@@ -893,6 +893,33 @@ mod tests {
     }
 
     #[test]
+    fn restored_components_are_added_and_changed_for_a_prior_base() {
+        // Picking/extract consumers gate rebuilds on Changed<T>/Added<T> with a base captured before a
+        // scene load. Loading OVER a same-count scene leaves the cheap "count" signal unchanged, so
+        // correctness hinges on restore making the loaded data look freshly Added+Changed against that
+        // prior base (TD-52 restore-tick fix). Mirror of the picking BVH gate, minus the BVH.
+        use apex_core::query::{Added, Changed, Query};
+
+        let mut world = setup_world();
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Long-running editor: a consumer's base sits high before the load.
+        for _ in 0..10 {
+            world.advance_change_tick();
+        }
+        let base = world.current_tick();
+
+        // File→Open over the current scene: clear + restore (same component set ⇒ same count).
+        world.clear_entities();
+        WorldSerializer::restore(&mut world, &snap).unwrap();
+
+        let changed = Query::<(Changed<Position>,)>::new_with_tick(&world, base).iter().count();
+        let added = Query::<(Added<Position>,)>::new_with_tick(&world, base).iter().count();
+        assert!(changed > 0, "restored components must be Changed for a base predating the load");
+        assert!(added > 0, "restored components must be Added for a base predating the load");
+    }
+
+    #[test]
     fn restore_with_migration() {
         let world = setup_world();
         let mut snap = WorldSerializer::snapshot(&world).unwrap();
