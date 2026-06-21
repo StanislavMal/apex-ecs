@@ -28,8 +28,9 @@
 
 use apex_core::entity::Entity;
 use apex_core::prelude::*;
+use apex_core::query::{Changed, Query};
 use apex_core::transform::{self, GlobalTransform, LocalTransform, TransformPlugin};
-use apex_scheduler::{Scheduler, StageLabel};
+use apex_scheduler::{seq, Scheduler, StageLabel};
 use glam::Vec3;
 
 fn main() {
@@ -103,6 +104,53 @@ fn main() {
     assert_eq!(c_pos2, Vec3::new(170.0, 0.0, 0.0), "Child должен быть на (170,0,0) каскадно");
 
     println!("\n✅ Изменение LocalTransform родителя каскадно распространилось на детей!\n");
+
+    // ── 7. Cross-stage change detection (TD-52) ─────────────────
+    //     `GlobalTransform` пишется в PostUpdate (`propagate_transforms`), а потребитель часто читает
+    //     `Changed<GlobalTransform>` в более РАННЕЙ стадии (PreUpdate — пикинг/BVH, экстракт). Запись
+    //     поздней стадии кадра N обязана быть видна ранней стадии кадра N+1. Раньше per-frame change-tick
+    //     это терял; per-stage change-window (планировщик) — чинит. Самодостаточная проверка:
+    println!("--- Cross-stage change detection (PostUpdate → PreUpdate next frame, TD-52) ---\n");
+    {
+        #[derive(Default)]
+        struct Detected(u32); // сколько изменений GlobalTransform увидел PreUpdate-наблюдатель
+
+        let mut w = World::new();
+        TransformPlugin::register_components(&mut w);
+        w.insert_resource(Detected::default());
+        let ent = w.spawn((LocalTransform::from_translation(Vec3::ZERO),));
+
+        let mut s = Scheduler::new();
+        // PreUpdate: считаем сущности с Changed<GlobalTransform> с прошлого запуска ЭТОЙ стадии.
+        s.add_systems(
+            StageLabel::PreUpdate,
+            seq("observe_global", |w: &mut World| {
+                let last = w.last_run_tick();
+                let n = Query::<(Changed<GlobalTransform>,)>::new_with_tick(w, last).iter().count();
+                w.resource_mut::<Detected>().0 += n as u32;
+            }),
+        );
+        // PostUpdate: пересчёт мировых трансформов (пишет GlobalTransform).
+        s.add_systems(StageLabel::PostUpdate, seq("propagate", transform::propagate_transforms));
+
+        s.run(&mut w); // кадр 0: PostUpdate создаёт GlobalTransform
+        s.run(&mut w); // кадр 1: PreUpdate видит новый GlobalTransform из кадра 0 → база стабилизируется
+        let baseline = w.resource::<Detected>().0;
+
+        // Двигаем объект: LocalTransform меняется СЕЙЧАС, GlobalTransform обновится в PostUpdate кадра A.
+        if let Some(lt) = w.get_mut::<LocalTransform>(ent) {
+            lt.translation = Vec3::new(7.0, 0.0, 0.0);
+        }
+        s.run(&mut w); // кадр A: PreUpdate (GT ещё старый) → PostUpdate propagate пишет новый GT
+        let mid = w.resource::<Detected>().0;
+        s.run(&mut w); // кадр B: PreUpdate ДЕТЕКТИТ GT, записанный в PostUpdate кадра A (cross-stage!)
+        let end = w.resource::<Detected>().0;
+
+        println!("  GlobalTransform-изменений увидел PreUpdate: baseline={baseline}, кадр A={mid}, кадр B={end}");
+        assert_eq!(mid, baseline, "PreUpdate кадра-движения идёт ДО записи GT в PostUpdate того же кадра");
+        assert_eq!(end, baseline + 1, "PreUpdate СЛЕДУЮЩЕГО кадра обязан увидеть тот GT (cross-stage, TD-52)");
+        println!("\n✅ Cross-stage change detection: запись PostUpdate кадра A видна PreUpdate кадра B.\n");
+    }
 
     println!("=== Done ===");
     println!("Final entities:   {}", world.entity_count());

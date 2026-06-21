@@ -330,6 +330,17 @@ impl World {
         self.last_run_tick
     }
 
+    /// Выставить базу change-detection (`Changed<T>`/`Added<T>` сравнивают change-tick строки с ней).
+    /// **Внутренний API планировщика:** он ставит её перед каждой СТАДИЕЙ равной тику, на котором эта
+    /// стадия выполнялась в прошлый раз. Вместе с продвижением `current_tick` между стадиями ([`tick`])
+    /// это даёт **cross-stage change detection**: запись в поздней стадии кадра N видна более ранней
+    /// стадии кадра N+1 (закрывает слепую зону per-frame-тика, TD-52). Прямое использование вне
+    /// планировщика обычно не нужно.
+    #[inline]
+    pub fn set_last_run_tick(&mut self, tick: Tick) {
+        self.last_run_tick = tick;
+    }
+
     /// Flush конкретных типов событий (по TypeId). Используется Scheduler для per-Stage flush.
     pub fn flush_events_by_type(&mut self, type_ids: &[std::any::TypeId]) {
         self.events.flush_by_type_id(type_ids);

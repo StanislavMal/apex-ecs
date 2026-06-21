@@ -692,6 +692,11 @@ pub struct Scheduler {
     system_indices: FxHashMap<SystemId, usize>,
     next_id: u32,
     execution_plan: Option<ExecutionPlan>,
+    /// Per-stage change-detection base (TD-52): the change tick at which each stage last ran. Set as
+    /// `world.last_run_tick` before running a stage (with `current_tick` advanced between stages), so a
+    /// `Changed<T>` reader in stage X sees writes made by a later stage of the **previous** frame —
+    /// cross-stage change detection that the old per-frame tick missed.
+    stage_last_run: FxHashMap<StageLabel, apex_core::Tick>,
 
     // ── Конфигурация параллелизма ───────────────────────────────
     /// Минимальное количество систем в Stage для параллельного выполнения
@@ -795,6 +800,7 @@ impl Scheduler {
             system_indices: FxHashMap::default(),
             next_id: 0,
             execution_plan: None,
+            stage_last_run: FxHashMap::default(),
             parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             parallel_min_entities: 0, // 0 = без ограничений
             auto_disable_parallel: true, // true = автоотключение по умолчанию
@@ -2311,6 +2317,21 @@ impl Scheduler {
     /// Использует Rayon для параллельного выполнения.
     ///
     /// Startup этап выполняется только при первом вызове `run()`.
+    /// Open a stage's change-detection window (TD-52 cross-stage fix). Advances `current_tick` so this
+    /// stage's writes get a fresh, higher tick, then sets the base (`last_run_tick`) to the tick at
+    /// which this stage last ran. A `Changed<T>`/`Added<T>` reader in the stage therefore sees
+    /// everything written since the stage **itself** last ran — including writes by later stages of the
+    /// previous frame, which the old per-frame tick missed. Hot path is untouched (the per-row change
+    /// comparison is unchanged); this is O(1) per stage.
+    #[inline]
+    fn open_stage_change_window(&mut self, label: &StageLabel, world: &mut World) {
+        world.tick();
+        let this_run = world.current_tick();
+        let base = self.stage_last_run.get(label).copied().unwrap_or(apex_core::Tick::ZERO);
+        world.set_last_run_tick(base);
+        self.stage_last_run.insert(label.clone(), this_run);
+    }
+
     pub fn run(&mut self, world: &mut World) {
         if main_prof_enabled() {
             main_prof_world_stats(world);
@@ -2380,6 +2401,8 @@ impl Scheduler {
             // D2-5: FixedUpdate — 0..N шагов по аккумулятору FixedTime.
             let steps = Self::stage_steps(w, label);
             for _step in 0..steps {
+                // TD-52: per-stage change-detection window (cross-stage `Changed<T>` correctness).
+                self.open_stage_change_window(label, w);
                 for &sys_id in system_ids {
                     if let Some(&index) = self.system_indices.get(&sys_id) {
                         let system = &self.systems[index];
@@ -2763,6 +2786,8 @@ impl Scheduler {
             // ШАГОВЫЙ цикл — семантика шагов сохраняется.
             let steps = Self::stage_steps(unsafe { &mut *world_ptr }, label);
             for _step in 0..steps {
+            // TD-52: per-stage change-detection window (cross-stage `Changed<T>` correctness).
+            self.open_stage_change_window(label, unsafe { &mut *world_ptr });
             if !*all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
@@ -3551,6 +3576,69 @@ mod tests {
         });
         assert!((result.0 - 3.0).abs() < 1e-6);
         assert!((result.1 - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cross_stage_change_detection_postupdate_to_preupdate_next_frame() {
+        // TD-52 regression: a write in PostUpdate of frame N must be visible to a PreUpdate
+        // `Changed<T>` reader in frame N+1. The old per-frame change tick made every reader's base
+        // "the end of the previous frame", so a PostUpdate-N write was NOT newer than a PreUpdate-(N+1)
+        // reader's base and got skipped. The per-stage change-detection window fixes it (each stage's
+        // base = the tick at which THAT stage last ran).
+        use apex_core::query::Changed;
+
+        #[derive(Component, Clone, Copy)]
+        struct Marked(u32);
+        #[derive(Default)]
+        struct Seen(Vec<bool>);
+        #[derive(Default)]
+        struct FrameNo(u32);
+
+        let mut world = World::new();
+        world.insert_resource(Seen::default());
+        world.insert_resource(FrameNo::default());
+        let e = world.spawn((Marked(0),));
+
+        let mut sched = Scheduler::new();
+        // PreUpdate observer: did `Marked` change since this stage last ran?
+        sched.add_systems(
+            StageLabel::PreUpdate,
+            seq("observe", move |w: &mut World| {
+                let last = w.last_run_tick();
+                let changed = Query::<(Changed<Marked>,)>::new_with_tick(w, last).iter().count() > 0;
+                w.resource_mut::<Seen>().0.push(changed);
+            }),
+        );
+        // PostUpdate writer: mutate `Marked` only on frame 2 — a LATER stage of that frame.
+        sched.add_systems(
+            StageLabel::PostUpdate,
+            seq("write", move |w: &mut World| {
+                if w.resource::<FrameNo>().0 == 2 {
+                    if let Some(m) = w.get_mut::<Marked>(e) {
+                        m.0 += 1; // mutable access stamps the change tick at the PostUpdate tick
+                    }
+                }
+                w.resource_mut::<FrameNo>().0 += 1;
+            }),
+        );
+
+        for _ in 0..5 {
+            sched.run(&mut world);
+        }
+
+        // Frame 0: the freshly spawned `Marked` is a change ⇒ seen (true).
+        // Frame 1: nothing new ⇒ false.
+        // Frame 2: PostUpdate writes AFTER PreUpdate already ran ⇒ not seen that frame ⇒ false.
+        // Frame 3: PreUpdate sees the previous-frame PostUpdate write — the cross-stage detection the
+        //          old per-frame model MISSED (this index would be `false` without the fix).
+        // Frame 4: nothing new ⇒ false.
+        let seen = &world.resource::<Seen>().0;
+        assert_eq!(
+            seen,
+            &vec![true, false, false, true, false],
+            "PreUpdate(N+1) must see PostUpdate(N) write (cross-stage change detection, TD-52)"
+        );
+        assert!(seen[3], "the cross-stage write of frame 2 must be visible to PreUpdate in frame 3");
     }
 
     #[test]
