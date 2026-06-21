@@ -692,11 +692,15 @@ pub struct Scheduler {
     system_indices: FxHashMap<SystemId, usize>,
     next_id: u32,
     execution_plan: Option<ExecutionPlan>,
-    /// Per-stage change-detection base (TD-52): the change tick at which each stage last ran. Set as
-    /// `world.last_run_tick` before running a stage (with `current_tick` advanced between stages), so a
-    /// `Changed<T>` reader in stage X sees writes made by a later stage of the **previous** frame —
-    /// cross-stage change detection that the old per-frame tick missed.
-    stage_last_run: FxHashMap<StageLabel, apex_core::Tick>,
+    /// Per-execution-stage change-detection base (TD-52), indexed by position in `execution_plan.stages`.
+    /// The change tick at which each EXECUTION stage last ran; set as `world.last_run_tick` before running
+    /// that stage (with `current_tick` advanced between stages). Keyed by execution-stage **index** (not
+    /// `StageLabel`) because the planner splits conflicting systems of one label into several execution
+    /// stages — keying by label would let them clobber one another's base. So a `Changed<T>` reader sees
+    /// writes made since ITS OWN stage last ran, including later stages of the previous frame (and it is
+    /// effectively per-system for systems the planner sequenced into their own stage). Cleared on
+    /// `compile` (the plan — and thus indices — can change).
+    stage_last_run: Vec<apex_core::Tick>,
 
     // ── Конфигурация параллелизма ───────────────────────────────
     /// Минимальное количество систем в Stage для параллельного выполнения
@@ -800,7 +804,7 @@ impl Scheduler {
             system_indices: FxHashMap::default(),
             next_id: 0,
             execution_plan: None,
-            stage_last_run: FxHashMap::default(),
+            stage_last_run: Vec::new(),
             parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             parallel_min_entities: 0, // 0 = без ограничений
             auto_disable_parallel: true, // true = автоотключение по умолчанию
@@ -1719,6 +1723,10 @@ impl Scheduler {
             return Ok(());
         }
 
+        // План (а значит и индексы execution-стадий) перестраивается — сбрасываем per-stage базы
+        // change-detection (TD-52). Одно лишнее «всё изменилось» на следующем кадре — безопасно.
+        self.stage_last_run.clear();
+
         if self.type_names.is_empty() {
             log::debug!(
                 "Scheduler::compile: type_names пуст. \
@@ -2324,12 +2332,15 @@ impl Scheduler {
     /// previous frame, which the old per-frame tick missed. Hot path is untouched (the per-row change
     /// comparison is unchanged); this is O(1) per stage.
     #[inline]
-    fn open_stage_change_window(&mut self, label: &StageLabel, world: &mut World) {
+    fn open_stage_change_window(&mut self, stage_idx: usize, world: &mut World) {
         world.tick();
         let this_run = world.current_tick();
-        let base = self.stage_last_run.get(label).copied().unwrap_or(apex_core::Tick::ZERO);
+        if self.stage_last_run.len() <= stage_idx {
+            self.stage_last_run.resize(stage_idx + 1, apex_core::Tick::ZERO);
+        }
+        let base = self.stage_last_run[stage_idx];
         world.set_last_run_tick(base);
-        self.stage_last_run.insert(label.clone(), this_run);
+        self.stage_last_run[stage_idx] = this_run;
     }
 
     pub fn run(&mut self, world: &mut World) {
@@ -2393,7 +2404,7 @@ impl Scheduler {
             .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone()))
             .collect();
 
-        for (label, system_ids, emit_event_types) in &stages_meta {
+        for (stage_idx, (label, system_ids, emit_event_types)) in stages_meta.iter().enumerate() {
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
@@ -2401,8 +2412,8 @@ impl Scheduler {
             // D2-5: FixedUpdate — 0..N шагов по аккумулятору FixedTime.
             let steps = Self::stage_steps(w, label);
             for _step in 0..steps {
-                // TD-52: per-stage change-detection window (cross-stage `Changed<T>` correctness).
-                self.open_stage_change_window(label, w);
+                // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
+                self.open_stage_change_window(stage_idx, w);
                 for &sys_id in system_ids {
                     if let Some(&index) = self.system_indices.get(&sys_id) {
                         let system = &self.systems[index];
@@ -2731,17 +2742,14 @@ impl Scheduler {
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
-        let stages: Vec<(StageLabel, Vec<SystemId>, bool, Vec<TypeId>)> = plan
+        let stages: Vec<(usize, StageLabel, Vec<SystemId>, bool, Vec<TypeId>)> = plan
             .stages
             .iter()
-            .filter(|stage| {
-                if stage.label == StageLabel::Startup && self.startup_completed {
-                    return false;
-                }
-                true
-            })
-            .map(|s| {
+            .enumerate()
+            .filter(|(_, stage)| !(stage.label == StageLabel::Startup && self.startup_completed))
+            .map(|(i, s)| {
                 (
+                    i, // original execution-stage index (stable change-detection key, TD-52)
                     s.label.clone(),
                     s.system_ids.clone(),
                     s.all_parallel,
@@ -2779,15 +2787,15 @@ impl Scheduler {
             .map(|a| a.len())
             .collect();
 
-        for (label, stage_ids, all_parallel, emit_event_types) in &stages {
+        for (stage_idx, label, stage_ids, all_parallel, emit_event_types) in &stages {
             // D2-5: FixedUpdate исполняется 0..N раз по аккумулятору FixedTime
             // (каждый шаг — своё применение команд и флаш событий); остальные
             // стадии — ровно один раз. `continue` внутри тела продолжает
             // ШАГОВЫЙ цикл — семантика шагов сохраняется.
             let steps = Self::stage_steps(unsafe { &mut *world_ptr }, label);
             for _step in 0..steps {
-            // TD-52: per-stage change-detection window (cross-stage `Changed<T>` correctness).
-            self.open_stage_change_window(label, unsafe { &mut *world_ptr });
+            // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
+            self.open_stage_change_window(*stage_idx, unsafe { &mut *world_ptr });
             if !*all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
@@ -3576,6 +3584,60 @@ mod tests {
         });
         assert!((result.0 - 3.0).abs() < 1e-6);
         assert!((result.1 - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cross_stage_change_detection_for_later_system_in_multi_system_stage() {
+        // Regression for the per-EXECUTION-stage keying: a `Changed<T>` reader the planner sequenced
+        // AFTER another system of the same `StageLabel` must use ITS OWN stage's base — not the base
+        // advanced by the earlier system. Mirrors picking (a non-first PreUpdate system reading
+        // Changed<GlobalTransform>). Keying the base by `StageLabel` (instead of execution-stage index)
+        // broke this: the later system saw "changed since the earlier system", missing cross-frame writes.
+        use apex_core::query::Changed;
+        #[derive(Component, Clone, Copy)]
+        struct V(u32);
+        #[derive(Default)]
+        struct Saw(Vec<bool>);
+        #[derive(Default)]
+        struct FrameNo(u32);
+
+        let mut world = World::new();
+        world.insert_resource(Saw::default());
+        world.insert_resource(FrameNo::default());
+        let e = world.spawn((V(0),));
+
+        let mut s = Scheduler::new();
+        // Two PreUpdate systems — Sequential systems run in their own execution stages, so `observe` is a
+        // LATER execution stage than `lead` (same `StageLabel::PreUpdate`).
+        s.add_systems(StageLabel::PreUpdate, seq("lead", |_w: &mut World| {}));
+        s.add_systems(
+            StageLabel::PreUpdate,
+            seq("observe", move |w: &mut World| {
+                let base = w.last_run_tick();
+                let changed = Query::<(Changed<V>,)>::new_with_tick(w, base).iter().count() > 0;
+                w.resource_mut::<Saw>().0.push(changed);
+            }),
+        );
+        s.add_systems(
+            StageLabel::PostUpdate,
+            seq("write", move |w: &mut World| {
+                if w.resource::<FrameNo>().0 == 2 {
+                    if let Some(v) = w.get_mut::<V>(e) {
+                        v.0 += 1;
+                    }
+                }
+                w.resource_mut::<FrameNo>().0 += 1;
+            }),
+        );
+
+        for _ in 0..5 {
+            s.run(&mut world);
+        }
+        // `observe` (the later PreUpdate system) must see the PostUpdate-frame-2 write on frame 3.
+        assert!(
+            world.resource::<Saw>().0[3],
+            "a later reader in a multi-system stage must still see the cross-stage write"
+        );
     }
 
     #[test]
