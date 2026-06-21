@@ -82,6 +82,18 @@ impl WorldSerializer {
         world: &World,
         ctx: &mut dyn apex_core::SerdeContext,
     ) -> Result<WorldSnapshot, SerializationError> {
+        Self::snapshot_with_filter(world, ctx, &|_| true)
+    }
+
+    /// [`snapshot_with`](Self::snapshot_with), restricted to the entities `keep` returns `true` for.
+    /// The caller decides what belongs in the document — e.g. a scene editor keeps only entities that
+    /// carry its stable-id component, excluding editor infrastructure (camera/grid) that shares the
+    /// scene world but is not saved content. apex-ecs stays policy-free: `keep` is host-supplied.
+    pub fn snapshot_with_filter(
+        world: &World,
+        ctx: &mut dyn apex_core::SerdeContext,
+        keep: &dyn Fn(apex_core::Entity) -> bool,
+    ) -> Result<WorldSnapshot, SerializationError> {
         let tick = world.current_tick().0;
         let mut snap = WorldSnapshot::new(tick);
 
@@ -90,6 +102,9 @@ impl WorldSerializer {
             if arch.is_empty() { continue; }
 
             for (row, &entity) in arch.entities().iter().enumerate() {
+                if !keep(entity) {
+                    continue;
+                }
                 let mut entity_snap = EntitySnapshot {
                     original_index: entity.index(),
                     components:     Vec::new(),
