@@ -2993,8 +2993,8 @@ world.register_component_serde_json::<Health>();
 
 - `name` — уникальное имя префаба
 - `components` — список компонентов с типом (полное имя) и значением
-- `children` — дочерние префабы (вложенность, `ChildOf` связь)
-- `overrides` — переопределение полей дочерних префабов
+- `children` — дочерние элементы (вложенность через `ChildOf`). Каждый ребёнок — **либо ссылка** на именованный под-префаб `{ "prefab": "Weapon", "overrides": [...] }` (под-префаб должен быть загружен в `PrefabLoader`), **либо встроенный (inline)** манифест `{ "name", "components", "children" }` — самодостаточное поддерево. Формат `untagged`: ссылку отличает поле `prefab`, встроенный — `name`+`components`. Обратно совместимо со старыми файлами-ссылками.
+- `overrides` — переопределение полей у ссылочных детей (для inline не нужно — манифест и так буквальный)
 - Для unit-компонентов (маркеров) указывать `"value": null`
 
 #### 10.4.2 `PrefabLoader`
@@ -3036,11 +3036,18 @@ use apex_serialization::WorldSerializer;
 // Экспорт одного entity:
 let prefab = WorldSerializer::entity_to_prefab(&world, entity).unwrap();
 
-// Экспорт entity с иерархией:
+// Экспорт entity с иерархией (дети встроены inline — префаб самодостаточен):
 let hierarchy = WorldSerializer::hierarchy_to_prefab(&world, root).unwrap();
 ```
 
-Сохраните полученный `PrefabManifest` в файл с расширением `.prefab` для последующей загрузки через `PrefabLoader`.
+`hierarchy_to_prefab` встраивает всех детей как **inline**-манифесты, поэтому полученный префаб **самодостаточен**: его можно сохранить в один `.prefab`-файл и инстанцировать через `PrefabLoader` **без предзагрузки** под-префабов:
+
+```rust
+let loader = PrefabLoader::new();            // пустой кэш — под-префабы не нужны
+let root = loader.instantiate(&mut world, &hierarchy, &[], None, None).unwrap();
+```
+
+Сохраните полученный `PrefabManifest` в файл с расширением `.prefab` для последующей загрузки через `PrefabLoader`. (Обходится только `ChildOf`; ZST-компоненты-маркеры `entity_to_prefab` пропускает.)
 
 ---
 

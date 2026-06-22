@@ -639,14 +639,13 @@ impl WorldSerializer {
     ) -> Result<PrefabManifest, SerializationError> {
         let mut manifest = Self::entity_to_prefab_with(world, root, ctx)?;
 
-        // Рекурсивно собираем детей
+        // Рекурсивно собираем детей как ВСТРОЕННЫЕ (inline) поддеревья — так префаб самодостаточен:
+        // один файл инстанцируется без предзагрузки под-префабов (раньше клалось только имя ребёнка, и
+        // сам суб-манифест терялся ⇒ `instantiate` падал с `SubPrefabNotFound`).
         let children: Vec<Entity> = world.children_of(ChildOf, root).collect();
         for child in children {
             let child_manifest = Self::hierarchy_to_prefab_with(world, child, ctx)?;
-            manifest.children.push(PrefabChild {
-                prefab: child_manifest.name.clone(),
-                overrides: Vec::new(),
-            });
+            manifest.children.push(PrefabChild::Inline(child_manifest));
         }
 
         Ok(manifest)

@@ -44,14 +44,27 @@ pub struct PrefabComponent {
     pub value:     serde_json::Value,
 }
 
-/// Ребёнок в иерархии префаба.
+/// Ребёнок в иерархии префаба — либо ссылка на именованный под-префаб (композиция; должен быть
+/// загружен в [`PrefabLoader`]), либо **встроенный** манифест поддерева (самодостаточный).
+///
+/// `untagged`: ссылка сериализуется как `{ "prefab": "...", "overrides": [...] }`, а встроенный — как
+/// обычный [`PrefabManifest`] (`{ "name", "components", "children" }`). Поля не пересекаются (`prefab`
+/// vs `name`+`components`), поэтому формат однозначен и **обратно совместим** со старыми файлами-ссылками.
+/// [`hierarchy_to_prefab`](crate::WorldSerializer::hierarchy_to_prefab) строит `Inline`-детей, так что
+/// иерархический префаб — один самодостаточный файл (инстанцируется без предзагрузки под-префабов).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PrefabChild {
-    /// Имя под-префаба (должен быть загружен в `PrefabLoader`).
-    pub prefab:    String,
-    /// Переопределения компонентов для этого ребёнка.
-    #[serde(default)]
-    pub overrides: Vec<PrefabComponent>,
+#[serde(untagged)]
+pub enum PrefabChild {
+    /// Ссылка на под-префаб по имени (+ переопределения компонентов).
+    Ref {
+        /// Имя под-префаба (должен быть загружен в `PrefabLoader`).
+        prefab:    String,
+        /// Переопределения компонентов для этого ребёнка.
+        #[serde(default)]
+        overrides: Vec<PrefabComponent>,
+    },
+    /// Встроенное самодостаточное поддерево.
+    Inline(PrefabManifest),
 }
 
 /// Манифест префаба — JSON-файл, описывающий entity и его детей.
@@ -181,13 +194,20 @@ impl PrefabLoader {
             world.add_relation(entity, ChildOf, parent_entity);
         }
 
-        // Children
+        // Children — a named reference resolves from the loader cache; an inline child is a self-contained
+        // sub-manifest instantiated directly (no cache lookup, no pre-loading).
         for child in &manifest.children {
-            let child_manifest = self.cache.get(&child.prefab).ok_or_else(|| {
-                PrefabError::SubPrefabNotFound { name: child.prefab.clone() }
-            })?;
-
-            self.instantiate_with(world, child_manifest, &child.overrides, Some(entity), params, ctx)?;
+            match child {
+                PrefabChild::Ref { prefab, overrides } => {
+                    let child_manifest = self.cache.get(prefab).ok_or_else(|| {
+                        PrefabError::SubPrefabNotFound { name: prefab.clone() }
+                    })?;
+                    self.instantiate_with(world, child_manifest, overrides, Some(entity), params, ctx)?;
+                }
+                PrefabChild::Inline(child_manifest) => {
+                    self.instantiate_with(world, child_manifest, &[], Some(entity), params, ctx)?;
+                }
+            }
         }
 
         Ok(entity)
@@ -398,6 +418,41 @@ mod tests {
 
         let child_name = world.get::<Name>(children[0]).unwrap();
         assert_eq!(child_name.0, "Child");
+    }
+
+    #[test]
+    fn hierarchy_to_prefab_is_self_contained() {
+        // Export a parent→child hierarchy to a SINGLE prefab, then instantiate it in a fresh world with an
+        // EMPTY loader (no sub-prefabs pre-loaded). Inline children make the file self-contained — before
+        // this fix the export kept only child *names* and instantiate failed with `SubPrefabNotFound`.
+        use crate::WorldSerializer;
+
+        let mut world = setup_world();
+        let parent = world.spawn(());
+        world.insert(parent, Name("Parent".to_string()));
+        let child = world.spawn(());
+        world.insert(child, Name("Child".to_string()));
+        world.insert(child, Health { current: 30.0, max: 30.0 });
+        world.add_relation(child, ChildOf, parent);
+
+        let manifest = WorldSerializer::hierarchy_to_prefab(&world, parent).unwrap();
+        // The child is INLINE (a full sub-manifest), not a name reference.
+        assert_eq!(manifest.children.len(), 1);
+        assert!(matches!(manifest.children[0], PrefabChild::Inline(_)));
+
+        // Round-trip through JSON, then instantiate into a fresh world with an empty loader cache.
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: PrefabManifest = serde_json::from_str(&json).unwrap();
+
+        let mut world2 = setup_world();
+        let loader = PrefabLoader::new(); // empty cache — proves self-containment
+        let new_parent = loader.instantiate(&mut world2, &restored, &[], None, None).unwrap();
+
+        assert_eq!(world2.get::<Name>(new_parent).unwrap().0, "Parent");
+        let kids: Vec<Entity> = world2.children_of(ChildOf, new_parent).collect();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(world2.get::<Name>(kids[0]).unwrap().0, "Child");
+        assert_eq!(world2.get::<Health>(kids[0]).unwrap().current, 30.0);
     }
 
     #[test]

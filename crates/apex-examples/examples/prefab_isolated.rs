@@ -21,7 +21,7 @@ use apex_core::prelude::*;
 use apex_core::access_desc;
 use apex_isolated::{CloneableBridge, IsolatedWorld, sync_bridge_cloneable};
 use apex_macros::Component;
-use apex_serialization::prefab::PrefabLoader;
+use apex_serialization::prefab::{PrefabChild, PrefabLoader};
 use apex_serialization::WorldSerializer;
 
 use serde::{Deserialize, Serialize};
@@ -336,20 +336,44 @@ fn main() {
     });
     world.add_relation(child, ChildOf, player);
 
-    // Экспортируем иерархию начиная с игрока
-    // hierarchy_to_prefab(&World, Entity) -> PrefabManifest
+    // Экспортируем иерархию начиная с игрока.
+    // hierarchy_to_prefab(&World, Entity) -> PrefabManifest — дети встроены (inline), так что префаб
+    // самодостаточен: инстанцируется без предзагрузки под-префабов.
     match WorldSerializer::hierarchy_to_prefab(&world, player) {
         Ok(hier) => {
             let json = serde_json::to_string_pretty(&hier).unwrap();
             println!("  Иерархический префаб:\n{}", json);
             println!("  Дочерних элементов: {}", hier.children.len());
             for (i, child) in hier.children.iter().enumerate() {
-                println!(
-                    "    Ребёнок {}: префаб='{}', {} overrides",
-                    i + 1,
-                    child.prefab,
-                    child.overrides.len()
-                );
+                match child {
+                    PrefabChild::Inline(m) => println!(
+                        "    Ребёнок {}: inline '{}', {} компонент(ов), {} вложенных",
+                        i + 1,
+                        m.name,
+                        m.components.len(),
+                        m.children.len()
+                    ),
+                    PrefabChild::Ref { prefab, overrides } => println!(
+                        "    Ребёнок {}: ссылка '{}', {} overrides",
+                        i + 1,
+                        prefab,
+                        overrides.len()
+                    ),
+                }
+            }
+
+            // Round-trip: инстанцируем экспортированный префаб обратно в тот же мир. Loader пуст — ничего
+            // не предзагружаем, и всё равно работает, потому что дети встроены (самодостаточный префаб).
+            let loader2 = PrefabLoader::new();
+            match loader2.instantiate(&mut world, &hier, &[], None, None) {
+                Ok(new_root) => {
+                    let kids = world.children_of(ChildOf, new_root).count();
+                    println!(
+                        "  ✓ Round-trip: префаб инстанцирован (entity={}, детей={})",
+                        new_root, kids
+                    );
+                }
+                Err(e) => println!("  Ошибка инстанцирования: {:?}", e),
             }
         }
         Err(e) => {

@@ -29,6 +29,16 @@
 
 ### Added
 
+- **Самодостаточные иерархические префабы (2026-06-22).** `PrefabChild` стал
+  `#[serde(untagged)] enum { Ref { prefab, overrides } | Inline(PrefabManifest) }`:
+  ребёнок — либо ссылка на именованный под-префаб (как раньше), либо **встроенное**
+  поддерево. `WorldSerializer::hierarchy_to_prefab[_with]` теперь встраивает детей
+  inline (раньше клалось только ИМЯ ребёнка, а суб-манифест терялся ⇒ `instantiate`
+  падал с `SubPrefabNotFound`). Итог: иерархический префаб — один self-contained
+  файл, инстанцируется через `PrefabLoader` без предзагрузки под-префабов. Формат
+  обратно совместим со старыми файлами-ссылками. Тест
+  `hierarchy_to_prefab_is_self_contained`; пример `prefab_isolated` теперь
+  инстанцирует экспортированную иерархию (round-trip).
 - **`for e in reader.read()` — прямая итерация по событиям (1:1 Bevy, TD-24
   движка, 2026-06-12).** `EventReadGuard` получил `IntoIterator` (владеющий
   `EventIterator<'q, T>`: отдаёт `&T`, advance курсора до конца буфера на drop —
