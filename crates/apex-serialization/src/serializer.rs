@@ -6,7 +6,7 @@
 //! - Инкрементальные diff-сохранения
 //! - Файловый I/O с произвольным форматом
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use apex_core::{
@@ -96,6 +96,9 @@ impl WorldSerializer {
     ) -> Result<WorldSnapshot, SerializationError> {
         let tick = world.current_tick().0;
         let mut snap = WorldSnapshot::new(tick);
+        // Entity indices that made it into the snapshot — used to drop relations whose subject/target was
+        // filtered out (e.g. a scene instance's inner nodes), which would otherwise warn + skip on restore.
+        let mut kept: HashSet<u32> = HashSet::new();
 
         // ── Entities + Components ──────────────────────────────
         for arch in world.archetypes() {
@@ -105,6 +108,7 @@ impl WorldSerializer {
                 if !keep(entity) {
                     continue;
                 }
+                kept.insert(entity.index());
                 let mut entity_snap = EntitySnapshot {
                     original_index: entity.index(),
                     components:     Vec::new(),
@@ -123,8 +127,15 @@ impl WorldSerializer {
                         None    => continue,
                     };
 
-                    // ZST — нечего сериализовать
-                    if info.size == 0 { continue; }
+                    // ZST-маркер (Folder/Model/Hidden/…): байтов нет, но его ПРИСУТСТВИЕ и есть данные —
+                    // пишем пустой снэпшот, чтобы restore переинсертил компонент. (Раньше `continue`
+                    // молча терял маркер-компоненты на save/load.)
+                    if info.size == 0 {
+                        entity_snap
+                            .components
+                            .push(ComponentSnapshot::new_json(info.name.to_string(), Vec::new()));
+                        continue;
+                    }
 
                     let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row), ctx) }
                         .map_err(|e| SerializationError::SerializeFailed {
@@ -158,6 +169,11 @@ impl WorldSerializer {
         // SubjectIndex — источник истины: записи чистятся при despawn,
         // поэтому iter_relations отдаёт только связи живых entity.
         for (subject_index, kind_idx, target) in world.iter_relations() {
+            // Only keep relations between snapshotted entities — a relation to a filtered-out entity
+            // (e.g. a scene instance's inner node) can't restore, so don't save it (avoids restore warns).
+            if !kept.contains(&subject_index) || !kept.contains(&target.index()) {
+                continue;
+            }
             let kind_name = world.relation_registry()
                 .get_name(kind_idx)
                 .unwrap_or("<unknown>")
@@ -229,6 +245,13 @@ impl WorldSerializer {
                         type_name: comp_snap.type_name.clone(),
                     }),
                 };
+
+                // ZST-маркер: байтов нет, восстанавливаем по присутствию (пустой инсерт), не вызывая
+                // deserialize_fn (данные пусты — парсить нечего). Парный к ZST-ветке в snapshot.
+                if world.registry().get_info(component_id).map(|i| i.size).unwrap_or(0) == 0 {
+                    world.insert_raw_pub(new_entity, component_id, Vec::new(), tick);
+                    continue;
+                }
 
                 // Десериализуем в отдельном scope
                 let component_bytes = {
@@ -553,8 +576,8 @@ impl WorldSerializer {
     /// Создать [`PrefabManifest`] из одной entity.
     ///
     /// Сериализуются только компоненты, зарегистрированные через
-    /// `world.register_component_serde::<T>()`. Relation-компоненты
-    /// и ZST пропускаются.
+    /// `world.register_component_serde::<T>()`. Relation-компоненты пропускаются; ZST-маркеры
+    /// сохраняются по присутствию (`value: null`) и переинсертятся при instantiate.
     pub fn entity_to_prefab(
         world: &World,
         entity: Entity,
@@ -590,8 +613,14 @@ impl WorldSerializer {
                 None => continue,
             };
 
-            // ZST — нечего сериализовать
+            // ZST-маркер (Folder/Model/Hidden/…): данных нет, но присутствие значимо — пишем `null`,
+            // чтобы instantiate переинсертил компонент (его deserialize_fn даёт unit из `null`). Раньше
+            // `continue` молча терял маркеры на prefab/capture-пути (как и в снэпшотах).
             if info.size == 0 {
+                components.push(PrefabComponent {
+                    type_name: info.name.to_string(),
+                    value: serde_json::Value::Null,
+                });
                 continue;
             }
 
@@ -670,6 +699,31 @@ mod tests {
     #[derive(Component)]
     #[allow(dead_code)]
     struct RenderHandle(u64);
+
+    /// Zero-sized marker (like the editor's `Folder`/`Model`/`Hidden`): presence is the only state.
+    #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    struct Marker;
+
+    #[test]
+    fn zst_marker_survives_snapshot_restore() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Marker>();
+        world.register_component_serde_json::<Position>();
+        let e = world.spawn((Marker, Position { x: 1.0, y: 2.0 }));
+
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<Marker>();
+        w2.register_component_serde_json::<Position>();
+        let map = WorldSerializer::restore(&mut w2, &snap).unwrap();
+
+        let restored = map[&e.index()];
+        assert!(
+            w2.get::<Marker>(restored).is_some(),
+            "a zero-sized marker component must survive snapshot/restore by presence"
+        );
+        assert_eq!(w2.get::<Position>(restored).map(|p| p.x), Some(1.0));
+    }
 
     fn setup_world() -> World {
         let mut world = World::new();
