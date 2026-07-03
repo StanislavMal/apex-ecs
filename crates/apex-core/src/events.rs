@@ -36,6 +36,7 @@
 
 use rustc_hash::FxHashMap;
 use std::any::{Any, TypeId};
+use std::cell::UnsafeCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::{Mutex, OnceLock};
@@ -1036,9 +1037,24 @@ impl<T: crate::component::Component> std::fmt::Debug for Removed<T> {
 
 // ── EventRegistry ───────────────────────────────────────────────
 
+/// A queue slot behind `UnsafeCell` so `get_raw_ptr` can hand out a
+/// `*mut Events<T>` whose provenance is the cell interior — writing through it
+/// (the `EventWriter` push path and `EventReader` cursor registration) is legal
+/// — instead of laundering a `*mut` out of a shared `downcast_ref`, which is
+/// undefined behavior (Tree Borrows: write through a pointer derived from a
+/// frozen shared reference). Same class as the resources fix (A3). The scheduler
+/// serializes mutable access to any one event queue via `AccessDescriptor`, so
+/// the interior mutation never actually races.
+#[repr(transparent)]
+struct EventQueueCell(UnsafeCell<Box<dyn AnyEventQueue>>);
+
+// SAFETY: the inner queue is `Send + Sync`; concurrent access is serialized by
+// the scheduler's AccessDescriptor discipline, so exposing `Sync` is sound.
+unsafe impl Sync for EventQueueCell {}
+
 /// Реестр очередей событий — карта `TypeId → Events<T>`.
 pub struct EventRegistry {
-    queues: FxHashMap<TypeId, Box<dyn AnyEventQueue>>,
+    queues: FxHashMap<TypeId, EventQueueCell>,
 }
 
 impl EventRegistry {
@@ -1050,7 +1066,9 @@ impl EventRegistry {
 
     /// Зарегистрировать тип события.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
-        self.queues.entry(TypeId::of::<T>()).or_insert_with(|| Box::new(Events::<T>::new()));
+        self.queues
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| EventQueueCell(UnsafeCell::new(Box::new(Events::<T>::new()))));
     }
 
     /// Получить очередь событий по типу (паникует если не зарегистрирована).
@@ -1058,7 +1076,9 @@ impl EventRegistry {
     pub fn get<T: Send + Sync + 'static>(&self) -> &Events<T> {
         self.queues
             .get(&TypeId::of::<T>())
-            .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
+            // SAFETY: shared read of the cell interior; the scheduler guarantees
+            // no concurrent mutable access to this queue.
+            .and_then(|c| unsafe { (*c.0.get()).as_any().downcast_ref::<Events<T>>() })
             .unwrap_or_else(|| {
                 panic!(
                     "Event `{}` not registered. Call world.add_event::<{0}>()",
@@ -1072,7 +1092,8 @@ impl EventRegistry {
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
         self.queues
             .get_mut(&TypeId::of::<T>())
-            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
+            // `&mut self` — exclusive; take the cell interior without unsafe.
+            .and_then(|c| c.0.get_mut().as_any_mut().downcast_mut::<Events<T>>())
             .unwrap_or_else(|| {
                 panic!(
                     "Event `{}` not registered. Call world.add_event::<{0}>()",
@@ -1085,14 +1106,15 @@ impl EventRegistry {
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&Events<T>> {
         self.queues
             .get(&TypeId::of::<T>())
-            .and_then(|q| q.as_any().downcast_ref::<Events<T>>())
+            // SAFETY: shared read of the cell interior (see `get`).
+            .and_then(|c| unsafe { (*c.0.get()).as_any().downcast_ref::<Events<T>>() })
     }
 
     /// Попробовать получить мутабельный доступ к очереди.
     pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut Events<T>> {
         self.queues
             .get_mut(&TypeId::of::<T>())
-            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
+            .and_then(|c| c.0.get_mut().as_any_mut().downcast_mut::<Events<T>>())
     }
 
     /// Получить мутабельный доступ к очереди, автоматически регистрируя тип.
@@ -1102,7 +1124,7 @@ impl EventRegistry {
         }
         self.queues
             .get_mut(&TypeId::of::<T>())
-            .and_then(|q| q.as_any_mut().downcast_mut::<Events<T>>())
+            .and_then(|c| c.0.get_mut().as_any_mut().downcast_mut::<Events<T>>())
             .unwrap()
     }
 
@@ -1112,22 +1134,27 @@ impl EventRegistry {
     /// Вызывающий гарантирует уникальный доступ. Данные на куче (Box)
     /// не перемещаются при реаллокации HashMap.
     pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut Events<T>> {
-        let queue = self.queues.get(&TypeId::of::<T>())?;
-        let eref = queue.as_any().downcast_ref::<Events<T>>()?;
-        Some(eref as *const Events<T> as *mut Events<T>)
+        let cell = self.queues.get(&TypeId::of::<T>())?;
+        // SAFETY: the `*mut` provenance is the `UnsafeCell` interior (via
+        // `get()`), so writing through it is legal — unlike laundering a `*mut`
+        // out of a shared `downcast_ref` (UB). The scheduler guarantees exclusive
+        // access to this queue while the pointer is live.
+        let erased: &mut Box<dyn AnyEventQueue> = unsafe { &mut *cell.0.get() };
+        let events = erased.as_any_mut().downcast_mut::<Events<T>>()?;
+        Some(events as *mut Events<T>)
     }
 
     /// Предварительно выделить capacity для очереди событий по TypeId.
     pub fn reserve_by_type(&mut self, type_id: TypeId, capacity: usize) {
-        if let Some(queue) = self.queues.get_mut(&type_id) {
-            queue.reserve(capacity);
+        if let Some(cell) = self.queues.get_mut(&type_id) {
+            cell.0.get_mut().reserve(capacity);
         }
     }
 
     /// Обновить все очереди (вызывается в конце тика).
     pub fn update_all(&mut self) {
-        for queue in self.queues.values_mut() {
-            queue.update();
+        for cell in self.queues.values_mut() {
+            cell.0.get_mut().update();
         }
     }
 
@@ -1135,8 +1162,8 @@ impl EventRegistry {
     /// Используется Scheduler для per-Stage flush.
     pub fn flush_by_type_id(&mut self, type_ids: &[TypeId]) {
         for tid in type_ids {
-            if let Some(queue) = self.queues.get_mut(tid) {
-                queue.update();
+            if let Some(cell) = self.queues.get_mut(tid) {
+                cell.0.get_mut().update();
             }
         }
     }
@@ -1149,7 +1176,9 @@ impl EventRegistry {
 
     /// Получить мутабельный доступ к очереди по TypeId.
     pub fn get_mut_by_typeid(&mut self, type_id: TypeId) -> Option<&mut dyn AnyEventQueue> {
-        self.queues.get_mut(&type_id).map(|q| &mut **q)
+        self.queues
+            .get_mut(&type_id)
+            .map(|c| &mut **c.0.get_mut())
     }
 
     /// Проверить, зарегистрирован ли тип события.
@@ -1164,7 +1193,11 @@ impl EventRegistry {
 
     /// Общее количество событий во всех очередях.
     pub fn total_event_count(&self) -> usize {
-        self.queues.values().map(|q| q.len()).sum()
+        // SAFETY: shared read of each cell interior (see `get`).
+        self.queues
+            .values()
+            .map(|c| unsafe { (*c.0.get()).len() })
+            .sum()
     }
 }
 
