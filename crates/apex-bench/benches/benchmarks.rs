@@ -302,8 +302,23 @@ fn bench_propagate(c: &mut Criterion) {
     });
 }
 
+// Wave-5 §7: perf-guard for the adaptive-split par_for_each on skewed and
+// uniform archetype distributions (the split-vs-fixed A/B is archived in the plan).
+fn bench_par_split(c: &mut Criterion) {
+    let mut group = c.benchmark_group("par_split");
+    group.bench_function("skew", |b| {
+        let bench = apex::par_skew::ParSkew::new();
+        b.iter(|| bench.run());
+    });
+    group.bench_function("uniform", |b| {
+        let bench = apex::par_skew::ParSkew::new_uniform();
+        b.iter(|| bench.run());
+    });
+}
+
 criterion_group!(
     benches,
+    bench_par_split,
     bench_simple_insert,
     bench_simple_iter,
     bench_frag_iter,

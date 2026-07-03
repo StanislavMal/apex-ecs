@@ -4,9 +4,10 @@
 > (apex-engine: CLAUDE.md, docs/CONVENTIONS.md §0.2a/§0.2b/§0.9): корректность/soundness,
 > сырые места, производительность, профессионализм. Итог — план работ волнами.
 > **Дата:** 2026-07-03. **Статус:** 🔄 в работе. Все 10 развилок §10 РЕШЕНЫ 2026-07-03
-> (критерий — золотой путь, см. §10). **Волны 0-3 ✅ СМЕРЖЕНЫ в main локально** (`2210b53`, не
-> запушено). **Волна 4 ✅ (громкость §0.2a + гигиена + мёртвый код) — гейт пройден целиком**
-> (ветка `core-audit-wave4`; подробности в «Журнале волн»). Дальше — волна 5 (перф).
+> (критерий — золотой путь, см. §10). **Волны 0-4 ✅ СМЕРЖЕНЫ и ЗАПУШЕНЫ**. **Волна 5 ✅ ГОТОВА**
+> (перф + ложные Changed): A13 (get_mut→Mut) + split par_for_each (§7, +7%) + O(R²)→O(R) diff;
+> пулинг/ленивая-entity/bulk обоснованно отклонены, string-table отложена. Ветка `core-audit-wave5`.
+> **Волна 6 🔜** (архитектура: В1(в) borrow-модель + В3 query-консолидация; самый тяжёлый заход).
 
 ## Журнал волн (ход исполнения)
 
@@ -199,8 +200,65 @@ main):**
   type_complexity ×1; библиотеки чисты, снятый `allow(missing_safety_doc)` варнингов не дал);
   движок собирается (`cargo build --workspace` apex-engine ок); **Miri Tree Borrows apex-core
   --lib = 214 passed, 0 failed, 0 UB, 1 ignored** (`-Zmiri-disable-isolation -Zmiri-tree-borrows
-  -Zmiri-ignore-leaks`); **goldens движка 656/656 байт-идентично** (рендер не изменён). Готова к
-  мержу `--no-ff` в main (локально; пуш делает пользователь).
+  -Zmiri-ignore-leaks`); **goldens движка 656/656 байт-идентично** (рендер не изменён). Волны 0-4
+  СМЕРЖЕНЫ и ЗАПУШЕНЫ (пользователь, 2026-07-03).
+
+**Волна 5 🔄 — ПЕРФ + ложные Changed (ветка `core-audit-wave5` от main; правило кампании: каждый
+пункт — A/B в одном прогоне, НЕ лендить неподтверждённую сложность):**
+- `43a8fde` (apex-ecs) + `0abe27b` (apex-engine) **A13 ✅** — `World::get_mut`/`get_mut_by_id`/
+  `EntityMut::get_mut` теперь возвращают `Mut<T>` с ЛЕНИВОЙ change-detection: тик стампится только
+  при реальной мутации (DerefMut/set_changed), не на доступ. Раньше стамп был ЖАДНЫЙ → ложные
+  `Changed<T>` для read-only get_mut (лишняя работа extract/propagate/picking каждый кадр).
+  `Mut<T>` дерефается в `&mut T`: мутирующие сайты получили `mut`-биндинг (compiler-driven правка
+  rustc-подсказками), read-only сайты не тронуты и теперь корректно НЕ метят Changed. Регресс-тест
+  `a13_get_mut_is_lazy_about_change_detection`. Конструирование Mut — cell-провенанс как A2.
+  **Гейт A13:** workspace зелёный; **goldens 656/656 байт-идентично** (A13 не изменил рендер —
+  жадный стамп был чистым ложным срабатыванием); **Miri ЦЕЛЕВОЙ = 9 passed, 0 UB, 12.78с** (см.
+  ниже про политику).
+- **Miri-политика (решение пользователя 2026-07-03):** точечная правка (тип-обёртка, не трогает
+  Column/Archetype/storage/планировщик) → Miri ТОЛЬКО на затронутых тестах (`-- <фильтры имён>`,
+  ~секунды), а не полный `--lib` (~25 мин из-за rayon `dense_par_chunk`). Полный прогон — лишь при
+  правке unsafe-ФУНДАМЕНТА (storage/Column/archetype/ASD/events/Resources). Детали в памяти
+  `apex-miri-targeted-run`.
+- **split-par_for_each (§7 headline) ✅ ВОССТАНОВЛЕН — эмпирика ОПРОВЕРГЛА предв. анализ:** предв.
+  анализ ожидал нейтральности (равномерные бенчи), НО прямой A/B показал ВЫИГРЫШ. Реализован
+  `par_utils::par_split_run_ranges` — рекурсивный divide-and-conquer поперёк архетипов через
+  `rayon::join` (делит объединённое пространство строк пополам до листа=`adaptive_chunk_size`,
+  process-замыкание инкапсулирует fetch → один runner для Query И CachedQuery). A/B в одном
+  прогоне (дрейф-иммунно, `par_skew`-харнесс, ×3 воспроизв.): **uniform 7000 = +6.6…7.7%**
+  (интервалы РАЗДЕЛЕНЫ), **skew ~7000 = +2…3%**, **heavy_compute 1000 = нейтрально** (±2% шум).
+  КОРЕНЬ выигрыша — НЕ гранулярность (она та же), а бинарное `join`-дерево work-steal'ит
+  эффективнее `par_iter`-над-коллекцией. Никогда не хуже: для `N<serial_threshold(192)` split =
+  один лист = последовательный проход (0 overhead). Движок `par_for_each` НЕ использует → goldens
+  вне риска. Корректность: `par_split_write_matches_sequential` + `visits_every_entity_once` на
+  скошенном мире; целевой Miri TB на split-путь = 0 UB. compute_par_chunks остаётся (chunk/
+  SubWorld-пути). Метод `par_for_each` теперь split; отдельного `par_for_each_split` НЕТ (слит).
+- **Остаток волны 5 — вердикты (честно домерено/оценено):**
+  - `36324ea` **O(R²)→O(R) relations diff** ✅ — `diff_snapshots` сравнивал relations `Vec::contains`
+    в циклах (O(R²)); теперь HashSet-членство → O(R). Порядок вывода тот же (циклы по исходным Vec).
+    Регресс-тест `diff_detects_added_and_removed_relations`. Вне criterion (сериализация — редкий путь).
+  - **Пулинг per-frame буферов планировщика — ОТКЛОНЁН** (реализован, замерен, откачен): `Commands::new()`
+    НЕ аллоцирует (арена `null_mut`/`capacity:0`, ленивая до первого `alloc`), поэтому per-frame цена
+    `thread_commands` = 1 `Vec` + N дешёвых пустых структур; в schedule-бенче Commands не наполняются →
+    арены null → пулинг даёт ~0. При этом пулинг через поле `Scheduler` ломает `Scheduler: Send`
+    (Commands держит `*mut u8` арены → нужен `unsafe impl Send for CommandArena`, а `pool.install(||
+    sched.run())` требует Send). Сложность без замеренного выигрыша → §0.2b не лендить.
+  - **Ленивая entity в par — НЕ делаю:** seq-путь `for_each` ТОЖЕ читает `entities[offset]` безусловно
+    (не ленив), т.е. расхождения par vs seq для устранения НЕТ; entity — Copy u64, эффект ничтожен.
+  - **bulk без двойного копирования — НЕ переоткрываю:** отвергнут замером ранее (память §7,
+    commands_insert = archetype-move bound); без нового симптома не трогаем.
+  - **string-table снапшота — ОТЛОЖЕНА:** формат v2 + migration + свип сериализатора; выигрыш только
+    в РАЗМЕРЕ сейва (не игровой цикл, редкий путь) → отдельный focused-заход, вне перф-волны.
+- **Финальный 3-way стендинг волны 5 (baseline `wave5split`, apex/bevy/legion; split УЖЕ в нём):**
+  simple_insert 358/348/230 (🟡−3%) · simple_iter 9.34 dense **6.66**/9.40/6.15 (паритет bevy) ·
+  fragmented_iter 172/**139**/197ns (🔴−24% vs bevy, structural=packed/SoA В2; бьём legion) ·
+  schedule 40.77/40.29/29.4 (≈паритет bevy) · **heavy_compute 578/586/467 (apex БЫСТРЕЕ bevy —
+  split!)** · add_remove **574**/867/2851 (🟢) · commands_spawn **398**/486 (🟢) · despawn **288**/309/517
+  (🟢) · get_component **37**/39/56 (🟢) · changed_iter **7.33**/7.93 (🟢) · events **13.3**/28.5 (🟢×2) ·
+  relations 914/**684** (🔴−34%, наш дифференциатор архитектурно, не 1:1) · despawn_recursive **24.6**/56.6
+  (🟢×2.3) · wide_iter 3.81/3.74/2.23 (паритет bevy) · commands_insert 514/**501** (🟡−3%). Волна 5
+  НОВЫХ регрессий не внесла; split улучшил heavy_compute. Отставания — structural (fragmented/
+  relations) либо −3% шум (simple_insert/commands_insert).
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).

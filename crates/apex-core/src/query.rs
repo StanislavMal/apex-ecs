@@ -1596,21 +1596,18 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     }
 
     /// Параллельная итерация.
+    /// Параллельная итерация через adaptive-split (wave 5, §7) — единый механизм
+    /// с [`CachedQuery::par_for_each`](crate::world::CachedQuery::par_for_each):
+    /// рекурсивный `rayon::join` поперёк архетипов. Порядок недетерминирован.
     pub fn par_for_each<Func>(&self, f: Func)
     where
         Q: Send,
         F: Send,
         Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
     {
-        use rayon::prelude::*;
-
         let num_threads = rayon::current_num_threads();
-
-        // Предварительно вычисляем ID компонентов (как в new_with_tick)
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(self.world, &mut ids);
-
-        // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
         let row_ranges = self.row_ranges;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges
@@ -1618,47 +1615,47 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                 .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
                 .unwrap_or((0, usize::MAX))
         };
-        let chunks = compute_par_chunks(
-            self.archetypes.iter().map(|a| {
-                let s = rr(a.arch_idx);
-                let effective_len = s.1.min(a.len).saturating_sub(s.0);
-                (a.arch_idx, effective_len)
-            }),
-            num_threads,
-            self.world.chunk_config(),
-        );
-
         let last_run = self.last_run;
         let world = self.world;
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let (r_start, r_end) = rr(arch_idx);
-            let clamped_start = r_start + start;
-            let clamped_end = (r_start + end).min(r_end);
-            if clamped_start >= clamped_end {
-                return;
-            }
-            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
-            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+        let this_run = world.current_tick();
+        // Absolute disjoint (arch, start, end) row ranges honoring row_ranges.
+        let items: smallvec::SmallVec<[(usize, usize, usize); 32]> = self
+            .archetypes
+            .iter()
+            .filter_map(|a| {
+                let (s, e) = rr(a.arch_idx);
+                let start = s;
+                let end = e.min(a.len);
+                if start >= end {
+                    None
+                } else {
+                    Some((a.arch_idx, start, end))
+                }
+            })
+            .collect();
+        let total: usize = items.iter().map(|&(_, s, e)| e - s).sum();
+        let threshold = crate::world::adaptive_chunk_size(total, num_threads, world.chunk_config());
+        // SAFETY: each leaf gets a disjoint row range of a matched archetype, so
+        // `&mut` access never aliases across the parallel `join`.
+        let process = |arch_idx: usize, start: usize, end: usize| {
             let arch = &world.archetypes[arch_idx];
-            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
-            let entities = &arch.entities[clamped_start..clamped_end];
+            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, this_run) };
+            let entities = &arch.entities[start..end];
             if <(Q, F)>::has_row_filter() {
                 for (offset, &entity) in entities.iter().enumerate() {
-                    let row = clamped_start + offset;
-                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, row) } {
+                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, start + offset) } {
                         f(entity, item);
                     }
                 }
             } else {
-                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
                 for (offset, &entity) in entities.iter().enumerate() {
                     let (item, _) =
-                        unsafe { <(Q, F)>::fetch_item_unchecked(state, clamped_start + offset) };
+                        unsafe { <(Q, F)>::fetch_item_unchecked(state, start + offset) };
                     f(entity, item);
                 }
             }
-        });
+        };
+        crate::par_utils::par_split_run_ranges(&items, threshold, &process);
     }
 
     /// Число матчей запроса.
@@ -2541,10 +2538,10 @@ mod tests {
         world.tick();
 
         // Мутируем Pos у ea и Marker2 у em — ловим Or<(Changed<Pos>, Changed<Marker2>)>.
-        if let Some(p) = world.get_mut::<Pos>(ea) {
+        if let Some(mut p) = world.get_mut::<Pos>(ea) {
             p.x = 1.0;
         }
-        if let Some(m) = world.get_mut::<Marker2>(em) {
+        if let Some(mut m) = world.get_mut::<Marker2>(em) {
             m.0 = 1.0;
         }
 
@@ -2561,6 +2558,46 @@ mod tests {
         assert!(hits.contains(&em), "ветка Changed<Marker2>");
         assert!(!hits.contains(&eb), "B не менялся");
         assert_eq!(hits.len(), 2);
+    }
+
+    /// A13: `World::get_mut` hands out a `Mut<T>` that stamps the change-tick
+    /// LAZILY — read-only access does NOT mark the component `Changed`, only an
+    /// actual mutation does. Before the fix `get_mut` stamped eagerly, so merely
+    /// touching a component produced a false `Changed<T>`.
+    #[test]
+    fn a13_get_mut_is_lazy_about_change_detection() {
+        let mut world = World::new();
+        let e_read = world.spawn((Pos { x: 5.0 },));
+        let e_write = world.spawn((Pos { x: 5.0 },));
+
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        // Read-only: obtain the Mut and Deref-read it, but never DerefMut.
+        if let Some(m) = world.get_mut::<Pos>(e_read) {
+            assert_eq!(m.x, 5.0); // Deref (read) — must NOT mark Changed
+        }
+        // Mutating: DerefMut stamps the change-tick.
+        if let Some(mut m) = world.get_mut::<Pos>(e_write) {
+            m.x = 9.0;
+        }
+
+        let changed: Vec<_> = Query::<(Entity, Read<Pos>, Changed<Pos>)>::new_with_tick(
+            &world, last_run,
+        )
+        .iter()
+        .map(|(e, _, _)| e)
+        .collect();
+
+        assert!(
+            changed.contains(&e_write),
+            "a mutated component must be Changed"
+        );
+        assert!(
+            !changed.contains(&e_read),
+            "read-only get_mut must NOT mark Changed (A13)"
+        );
     }
 
     #[test]

@@ -114,7 +114,7 @@ system! {
 
         let mut deaths = Vec::new();
         for ev in &events {
-            if let Some(hp) = world.get_mut::<Health>(ev.target) {
+            if let Some(mut hp) = world.get_mut::<Health>(ev.target) {
                 hp.current -= ev.amount;
                 if hp.current <= 0.0 { deaths.push(ev.target); }
             }
