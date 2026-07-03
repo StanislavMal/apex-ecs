@@ -435,6 +435,23 @@ struct SysInfo {
     non_query_side_effects: bool,
 }
 
+// ── Ш2: cost-model thresholds ──────────────────────────────────
+//
+// The scheduler decides SEQ vs PAR from MEASURED work (µs), not entity count
+// (Д1/Д2): entity thresholds cannot tell light work (1 ns/entity) from heavy
+// (500 ns/entity), so they mis-fire both ways. A stage whose dispatch-time EMA
+// is below `T_STAGE_SEQ_NS` runs sequentially — below it, rayon scope + per-task
+// overhead exceeds the parallel speedup ("valley of death", parallel_diagnostics).
+// Defaults are tuned on a 12-thread machine; `ParallelPolicy::Fixed` (entity
+// heuristic only) remains available as a fallback.
+
+/// Below this measured stage EMA (ns), run the stage sequentially.
+const T_STAGE_SEQ_NS: f64 = 40_000.0; // 40µs
+/// Hysteresis band (±20%) around the threshold to prevent SEQ↔PAR flapping.
+const STAGE_HYSTERESIS: f64 = 0.2;
+/// EMA smoothing factor (higher = faster adaptation, noisier).
+const STAGE_EMA_ALPHA: f64 = 0.2;
+
 // ── ParSystem trait ────────────────────────────────────────────
 
 /// Параллельная система с явным AccessDescriptor.
@@ -723,6 +740,18 @@ pub struct Scheduler {
     /// `compile` (the plan — and thus indices — can change).
     stage_last_run: Vec<apex_core::Tick>,
 
+    // ── Ш2: cost-model telemetry (per-execution-stage), keyed like stage_last_run ──
+    /// EMA of measured stage dispatch time (ns). Drives the cost-based SEQ/PAR
+    /// decision (Д1/Д2): a parallel-eligible stage whose EMA is below the threshold
+    /// is run sequentially, because rayon scope + per-task overhead exceeds the
+    /// parallel win on light work (the "valley of death"). `0.0` = no history yet
+    /// (first frames fall back to the entity-count heuristic). Lazily sized;
+    /// cleared on `compile` (indices can change).
+    stage_cost_ema_ns: Vec<f64>,
+    /// Whether the stage ran sequentially last time — hysteresis to avoid SEQ↔PAR
+    /// flapping at the threshold. Lazily sized; cleared on `compile`.
+    stage_ran_seq: Vec<bool>,
+
     // ── Конфигурация параллелизма ───────────────────────────────
     /// Минимальное количество entity в Stage для параллельного выполнения.
     /// Если суммарное entity_count систем Stage меньше этого порога —
@@ -824,6 +853,8 @@ impl Scheduler {
             next_id: 0,
             execution_plan: None,
             stage_last_run: Vec::new(),
+            stage_cost_ema_ns: Vec::new(),
+            stage_ran_seq: Vec::new(),
             parallel_min_entities: 0, // 0 = без ограничений
             auto_disable_parallel: true, // true = автоотключение по умолчанию
             dependency_graph: Graph::new(),
@@ -1745,6 +1776,10 @@ impl Scheduler {
         // План (а значит и индексы execution-стадий) перестраивается — сбрасываем per-stage базы
         // change-detection (TD-52). Одно лишнее «всё изменилось» на следующем кадре — безопасно.
         self.stage_last_run.clear();
+        // Ш2: stage indices changed — drop the cost-model history (it re-learns in a
+        // couple of frames; a stale index would mis-classify a different stage).
+        self.stage_cost_ema_ns.clear();
+        self.stage_ran_seq.clear();
 
         if self.type_names.is_empty() {
             log::debug!(
@@ -2341,6 +2376,45 @@ impl Scheduler {
         let base = self.stage_last_run[stage_idx];
         world.set_last_run_tick(base);
         self.stage_last_run[stage_idx] = this_run;
+    }
+
+    /// Ш2: cost-model verdict — should this parallel-eligible stage run sequentially?
+    /// Uses the measured dispatch-time EMA with a ±hysteresis band around
+    /// `T_STAGE_SEQ_NS` to avoid flapping. `None`-history (EMA 0) → `false` (let the
+    /// caller's entity heuristic decide the first frames).
+    fn cost_model_prefers_seq(&self, stage_idx: usize) -> bool {
+        let ema = self.stage_cost_ema_ns.get(stage_idx).copied().unwrap_or(0.0);
+        if ema == 0.0 {
+            return false;
+        }
+        let was_seq = self.stage_ran_seq.get(stage_idx).copied().unwrap_or(false);
+        // Hysteresis: once SEQ, stay SEQ until clearly above the band; once PAR,
+        // switch to SEQ only when clearly below it.
+        let threshold = if was_seq {
+            T_STAGE_SEQ_NS * (1.0 + STAGE_HYSTERESIS)
+        } else {
+            T_STAGE_SEQ_NS * (1.0 - STAGE_HYSTERESIS)
+        };
+        ema < threshold
+    }
+
+    /// Ш2: fold a measured stage dispatch time into the per-stage EMA and record the
+    /// mode that produced it (for hysteresis). Lazily grows the buffers.
+    fn record_stage_cost(&mut self, stage_idx: usize, elapsed: std::time::Duration, ran_seq: bool) {
+        let ns = elapsed.as_nanos() as f64;
+        if self.stage_cost_ema_ns.len() <= stage_idx {
+            self.stage_cost_ema_ns.resize(stage_idx + 1, 0.0);
+        }
+        if self.stage_ran_seq.len() <= stage_idx {
+            self.stage_ran_seq.resize(stage_idx + 1, false);
+        }
+        let ema = &mut self.stage_cost_ema_ns[stage_idx];
+        *ema = if *ema == 0.0 {
+            ns
+        } else {
+            *ema * (1.0 - STAGE_EMA_ALPHA) + ns * STAGE_EMA_ALPHA
+        };
+        self.stage_ran_seq[stage_idx] = ran_seq;
     }
 
     pub fn run(&mut self, world: &mut World) {
@@ -2956,9 +3030,19 @@ impl Scheduler {
                 continue;
             }
 
-            let should_fallback = if self.parallel_min_entities > 0 || self.auto_disable_parallel {
+            // Ş2: SEQ/PAR decision. Priority:
+            //   1. explicit user floor (`parallel_min_entities`) always wins;
+            //   2. else, once the cost-model has measured this stage (EMA>0), it
+            //      FULLY decides — measured work supersedes entity count. This is the
+            //      point of the model: it parallelizes heavy-low-entity stages the
+            //      entity heuristic would serialize, and serializes light-high-entity
+            //      stages it would parallelize (Д1/Д2);
+            //   3. else (cold start, no history yet) fall back to the entity heuristic.
+            let stage_entity_count: usize = if self.parallel_min_entities > 0
+                || self.auto_disable_parallel
+            {
                 let total_entities: usize = arch_lengths.iter().sum();
-                let stage_entity_count: usize = stage_ids
+                stage_ids
                     .iter()
                     .filter_map(|&sys_id| self.system_archetype_indices.get(&sys_id))
                     .map(|indices| match indices {
@@ -2970,19 +3054,26 @@ impl Scheduler {
                             .map(|ai| arch_lengths[ai])
                             .sum(),
                     })
-                    .sum();
-                let below_hard_limit = self.parallel_min_entities > 0
-                    && stage_entity_count < self.parallel_min_entities;
-                let below_auto_limit = self.auto_disable_parallel && {
-                    let sys_count = stage_ids.len();
-                    let per_system = stage_entity_count / sys_count.max(1);
-                    per_system < Self::min_entities_for_parallelism(sys_count)
-                };
-                
-                below_hard_limit || below_auto_limit
+                    .sum()
+            } else {
+                0
+            };
+            let below_hard_limit = self.parallel_min_entities > 0
+                && stage_entity_count < self.parallel_min_entities;
+            let has_cost_history =
+                self.stage_cost_ema_ns.get(stage_idx).copied().unwrap_or(0.0) > 0.0;
+            let should_fallback = if below_hard_limit {
+                true
+            } else if has_cost_history {
+                self.cost_model_prefers_seq(stage_idx)
+            } else if self.auto_disable_parallel {
+                let sys_count = stage_ids.len();
+                let per_system = stage_entity_count / sys_count.max(1);
+                per_system < Self::min_entities_for_parallelism(sys_count)
             } else {
                 false
             };
+            let stage_t0 = std::time::Instant::now();
 
             if should_fallback {
                 {
@@ -3027,31 +3118,30 @@ impl Scheduler {
                 for cmds in &mut thread_commands {
                     *cmds = Commands::new();
                 }
-                if !emit_event_types.is_empty() {
-                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
-                }
-                continue;
-            }
+            } else {
+                self.run_stage_parallel(stage_ids, unsafe { &*const_ptr }, cmds_ptr);
 
-            self.run_stage_parallel(stage_ids, unsafe { &*const_ptr }, cmds_ptr);
-
-            {
-                let w = unsafe { &mut *world_ptr };
-                for cmds in &mut thread_commands {
-                    cmds.apply(w);
+                {
+                    let w = unsafe { &mut *world_ptr };
+                    for cmds in &mut thread_commands {
+                        cmds.apply(w);
+                    }
                 }
-            }
-            {
-                let w = unsafe { &*const_ptr };
-                let cur = w.archetypes().len();
-                if cur != prev_arch_count {
-                    prev_arch_count = cur;
-                    self.compute_archetype_indices(w);
+                {
+                    let w = unsafe { &*const_ptr };
+                    let cur = w.archetypes().len();
+                    if cur != prev_arch_count {
+                        prev_arch_count = cur;
+                        self.compute_archetype_indices(w);
+                    }
                 }
             }
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
+            // Ш2: fold the measured stage time into the per-stage cost EMA (drives
+            // the SEQ/PAR decision next frame). `should_fallback` = the mode we ran.
+            self.record_stage_cost(stage_idx, stage_t0.elapsed(), should_fallback);
         }
 
         // Ш1: return the plan and pooled buffers to `self` (capacity retained).
@@ -3536,6 +3626,44 @@ mod tests {
     use super::*;
     use apex_core::access_desc;
     use apex_core::{prelude::*, query::Query, world::World};
+
+    // ── Ш2: cost-model EMA + hysteresis (deterministic, no timing) ──────────
+    #[test]
+    fn cost_model_ema_and_hysteresis() {
+        use std::time::Duration;
+        let mut s = Scheduler::new();
+
+        // No history → never prefers seq (caller uses the entity heuristic).
+        assert!(!s.cost_model_prefers_seq(0));
+
+        // A cheap stage (10µs < 0.8·40µs band) → prefers sequential.
+        s.record_stage_cost(0, Duration::from_micros(10), false);
+        assert!(s.cost_model_prefers_seq(0), "10us stage should run sequentially");
+
+        // An expensive stage (feed 200µs repeatedly so the EMA climbs above the
+        // upper band) → prefers parallel.
+        for _ in 0..20 {
+            s.record_stage_cost(1, Duration::from_micros(200), false);
+        }
+        assert!(
+            !s.cost_model_prefers_seq(1),
+            "200us stage should run in parallel"
+        );
+
+        // Hysteresis: a stage sitting at 45µs. From SEQ it stays SEQ (upper band
+        // 48µs); from PAR it would stay PAR (lower band 32µs). Verify the SEQ side.
+        for _ in 0..20 {
+            s.record_stage_cost(2, Duration::from_micros(45), true); // ran seq
+        }
+        assert!(
+            s.cost_model_prefers_seq(2),
+            "45us with seq-history stays sequential (hysteresis upper band 48us)"
+        );
+
+        // Distinct indices are independent.
+        assert!(s.cost_model_prefers_seq(0));
+        assert!(!s.cost_model_prefers_seq(1));
+    }
 
     #[derive(Component, Clone, Copy)]
     struct Pos {

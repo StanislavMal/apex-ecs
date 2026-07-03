@@ -469,3 +469,49 @@ serial-фолбэк, гистерезис, `ParallelPolicy` (+Fixed-фолбэк
 - Взаимодействие cost-model с `uses_par_for_each`-системами (nested rayon): сегодня гейт
   «не row-split'ить» сохраняется; стоит ли скармливать их EMA в стадийный предикат — да
   (стоимость стадии = все системы), проверить на perf-примере.
+
+---
+
+## 11. Журнал выполнения (2026-07-03/04)
+
+Ветка `parallelism-perf` от main (apex-ecs). Числа — back-to-back на прогретой машине,
+12 rayon-потоков; ratio apex/bevy дрейф-иммунен.
+
+### Ш0 — базлайн `par_perf_pre` (3-way, снят 2026-07-03)
+Медианы (ns): relations 834260 vs bevy 620066 = **0.74x** (топ-сигнал, стабилен). schedule 46203
+vs 38428 = 0.83x. heavy_compute 552795 vs 455006 = 0.82x. simple_insert 331380 vs 305111 = 0.92x
+(vs legion 224084 = 0.68x). Победы целы: add_remove 1.64x, despawn_recursive 2.11x, events 1.85x,
+commands_spawn 1.16x. Полная таблица — в scratchpad `baseline_par_perf_pre.md` (продублировать сюда
+при закрытии). Релейшн-бисект (87b6e2a↔a90c752) отложен на Ш3 (старый регресс).
+
+### Ш1 — устранение per-frame аллокаций диспетчера ✅ (commit 080102e)
+`run_hybrid_parallel`/`run_stage_parallel` пересобирали буферы каждый кадр (Д3). Устранено:
+`mem::take` плана вместо клона метаданных стадий; пул `arch_lengths`/`schedule`/`sys_infos`/`tasks`/
+`skipped` (scratch-поля, capacity удержана); `SysInfo` держит `sys_id` вместо клона arch-индексов
+(слайс берётся из `system_archetype_indices` при сборке задач). `Vec<Commands>` оставлен локалью
+(`Commands: !Send` → поле сломало бы `Scheduler: Send`).
+**Результат: schedule −13.5% apex → 0.832x → 0.990x (паритет).** Без регрессов (simple_iter,
+commands_spawn 1.16x держатся). Гейты: workspace 424/0, clippy net-neutral, **Miri TB чист**
+(targeted parallel-path test). Пулинг из PERF_CAMPAIGN §3.1B закрыт.
+
+### Ş2 — cost-model (стадийный serial-фолбэк) ✅ (Ş2a)
+Планировщик ведёт per-execution-stage EMA замеренного времени диспетча (α=0.2) + гистерезис ±20%
+вокруг `T_STAGE_SEQ_NS=40µs`. Решение SEQ/PAR: жёсткий пользовательский пол `parallel_min_entities`
+→ иначе, при наличии истории (EMA>0), **cost-model полностью решает** (замеренная работа
+СУПЕРСЕДИТ entity-count: параллелит heavy-low-entity, что entity-эвристика сериализовала бы, и
+сериализует light-high-entity, что она параллелила бы) → иначе (холодный старт) entity-эвристика.
+Замер: `Instant` вокруг диспетча стадии, `record_stage_cost` сворачивает в EMA.
+**Результат: schedule 39952 → 28018 ns apex = 1.366x vs Bevy** (0.83x→0.99x Ш1→**1.37x Ş2** —
+apex ОБГОНЯЕТ Bevy: тривиальные swap-стадии больше не платят rayon-оверхед, Д2). heavy-паритет цел
+(perf-пример: 2-3 CPU-bound изолир. 3.7–4.7x, solo до 4.67x). parallel_diagnostics улучшен на
+измеримых масштабах (25k 1.33→1.84x, 100k 3.42→4.00x); sub-µs — шум. Тесты: детерминистичный
+EMA/гистерезис-юнит + integration-страж «heavy-low-entity параллелится» (оба зелёные, 426/0
+workspace, clippy net-neutral). **Ş2b (per-system leaf sizing) — по необходимости после валидации.**
+
+### Развилки, закрытые по ходу (→ ADR при ротации)
+- **Р-1 (cost-model)**: стадийный wall-time EMA оказался достаточным предиктором (heavy→высокое
+  время→PAR; light→низкое→SEQ). Per-system ns/entity (Ş2b) — отложено; открыть только если leaf
+  sizing даст измеримый выигрыш.
+- **Commands !Send**: per-worker буфер остаётся локалью (не полем) — иначе `Scheduler: !Send`.
+- **cost SUPERSEDES entity**: entity-эвристика только cold-start; иначе теряется весь value-add
+  cost-модели (heavy-low-entity).
