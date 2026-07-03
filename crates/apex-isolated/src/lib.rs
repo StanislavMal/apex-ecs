@@ -371,17 +371,15 @@ impl CloneableBridge {
 /// scheduler.add_system("sync_bridge", sync_bridge_cloneable);
 /// ```
 pub fn sync_bridge_cloneable(world: &mut World) {
-    // Извлекаем CloneableBridge через сырой указатель, чтобы обойти borrow checker.
-    let bridge_ptr: *const CloneableBridge = match world.resources.try_get::<CloneableBridge>() {
-        Some(b) => b,
+    // Клонируем мост (его каналы/реестр — Arc-разделяемые, клон драйвит ТЕ ЖЕ
+    // очереди) и отпускаем заём ресурса ДО дренажа. Входящий Action может
+    // удалить/заменить ресурс CloneableBridge — заём, удержанный через
+    // apply_incoming, тогда бы повис (UAF, E2). Клон делает это безопасно.
+    let bridge = match world.resources.try_get::<CloneableBridge>() {
+        Some(b) => b.clone(),
         None => return,
     };
-
-    // SAFETY: apply_incoming(&self, &mut World) не конфликтует — bridge живёт
-    // дольше world, и мы не держим заимствование на world после вызова.
-    unsafe {
-        (*bridge_ptr).apply_incoming(world);
-    }
+    bridge.apply_incoming(world);
 }
 
 // ---------------------------------------------------------------------------
@@ -588,5 +586,31 @@ mod tests {
         iso.tick();
 
         assert_eq!(iso.world.entity_count(), 1);
+    }
+
+    /// E2: an incoming Action that removes the CloneableBridge resource must not
+    /// leave `sync_bridge_cloneable` dereferencing freed memory. The system now
+    /// clones the bridge (Arc-shared channels) before draining, so the removal is
+    /// safe.
+    #[test]
+    fn sync_bridge_action_removing_bridge_resource_does_not_uaf() {
+        let (to_sub_tx, _to_sub_rx) = crossbeam_channel::unbounded();
+        let (from_sub_tx, from_sub_rx) = crossbeam_channel::unbounded();
+        let bridge = CloneableBridge::new(to_sub_tx, from_sub_rx);
+
+        let mut world = World::new();
+        world.insert_resource(bridge);
+
+        from_sub_tx
+            .send(BridgeEvent::Action(Box::new(|w: &mut World| {
+                w.remove_resource::<CloneableBridge>();
+            })))
+            .unwrap();
+
+        sync_bridge_cloneable(&mut world); // must not crash / UAF
+        assert!(
+            world.resources.try_get::<CloneableBridge>().is_none(),
+            "the incoming Action removed the bridge resource"
+        );
     }
 }

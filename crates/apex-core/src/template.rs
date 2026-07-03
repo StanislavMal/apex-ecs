@@ -51,6 +51,7 @@ use crate::{entity::Entity, relations::ChildOf, world::World};
 use serde::Serialize;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ── TemplateParam trait ──────────────────────────────────────────
 
@@ -218,10 +219,13 @@ pub trait EntityTemplate: Send + Sync {
 
 /// Реестр именованных шаблонов.
 ///
-/// Хранит `HashMap<String, Box<dyn EntityTemplate>>`.
+/// Хранит `HashMap<String, Arc<dyn EntityTemplate>>`. `Arc` (а не `Box`)
+/// позволяет клонировать хэндл шаблона и отпустить заём реестра ДО вызова
+/// `spawn` — иначе шаблон, перерегистрирующий себя из своего же `spawn`,
+/// освободил бы `Box` под живым указателем (UAF, B4).
 /// Каждый шаблон можно вызвать по имени через [`World::spawn_from_template`].
 pub struct TemplateRegistry {
-    templates: HashMap<String, Box<dyn EntityTemplate>>,
+    templates: HashMap<String, Arc<dyn EntityTemplate>>,
 }
 
 impl TemplateRegistry {
@@ -233,7 +237,7 @@ impl TemplateRegistry {
 
     /// Зарегистрировать именованный шаблон.
     pub fn register(&mut self, name: &str, template: impl EntityTemplate + 'static) {
-        self.templates.insert(name.to_string(), Box::new(template));
+        self.templates.insert(name.to_string(), Arc::new(template));
     }
 
     /// Создать entity из зарегистрированного шаблона.
@@ -255,14 +259,11 @@ impl TemplateRegistry {
         })
     }
 
-    /// Получить raw pointer на шаблон по имени (для обхода borrow checker).
-    ///
-    /// # Safety
-    /// Вызывающий должен гарантировать, что шаблон жив на момент вызова `spawn`.
-    pub(crate) fn get_raw(&self, name: &str) -> Option<*const dyn EntityTemplate> {
-        self.templates
-            .get(name)
-            .map(|t| t.as_ref() as *const dyn EntityTemplate)
+    /// Клонировать хэндл шаблона по имени. Клон `Arc` отвязывает шаблон от
+    /// заёма реестра, поэтому вызывающий может держать `&mut World` во время
+    /// `spawn` без риска UAF, даже если шаблон перерегистрирует сам себя (B4).
+    pub(crate) fn get_arc(&self, name: &str) -> Option<Arc<dyn EntityTemplate>> {
+        self.templates.get(name).cloned()
     }
 
     /// Проверить, зарегистрирован ли шаблон.

@@ -448,6 +448,12 @@ pub struct TransformScratch {
 /// # Ресурсы
 ///
 /// Использует [`TransformScratch`] для переиспользования буферов между кадрами.
+///
+/// Defensive bound on the ChildOf ancestor walk. `add_relation` rejects
+/// cycle-forming edges, so a real hierarchy never approaches this; it only stops
+/// a pathological/corrupt cycle from hanging the frame.
+const MAX_PROPAGATE_DEPTH: usize = 1 << 20;
+
 pub fn propagate_transforms(world: &mut World) {
     // Извлекаем scratch-буфер из ресурсов (или создаём новый при первом вызове)
     // remove_resource перемещает значение в локальную переменную, освобождая
@@ -520,11 +526,23 @@ pub fn propagate_transforms(world: &mut World) {
         let seed = |world: &World, entity: Entity| -> Option<(Entity, Mat4)> {
             let parent = world.get_relation_target(entity, ChildOf);
             let mut ancestor = parent;
+            let mut depth = 0usize;
             while let Some(p) = ancestor {
                 if dirty.contains(p.index) {
                     return None; // покрыта dirty-предком — пересчитается его спуском
                 }
                 ancestor = world.get_relation_target(p, ChildOf);
+                depth += 1;
+                if depth > MAX_PROPAGATE_DEPTH {
+                    // Defensive: a ChildOf cycle would loop here forever.
+                    // `add_relation` now rejects cycle-forming edges, so this is
+                    // unreachable in practice — treat the chain as a clean root
+                    // rather than hanging the frame.
+                    log::error!(
+                        "propagate_transforms: ChildOf ancestor chain for {entity} exceeds depth limit — possible cycle"
+                    );
+                    break;
+                }
             }
             // Родитель чист (или отсутствует) — его мировая матрица валидна с прошлых
             // кадров; отсутствие GlobalTransform трактуем как identity (прежняя семантика).

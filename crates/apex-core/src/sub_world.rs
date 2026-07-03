@@ -38,8 +38,11 @@ pub struct SubWorld<'w> {
 }
 
 impl<'w> SubWorld<'w> {
+    /// Все входные ссылки привязаны к `'w`: сырые указатели внутри не могут
+    /// пережить заимствованные данные (иначе можно было бы получить
+    /// `SubWorld<'static>` из временных ссылок и разыменовать висячий указатель).
     #[inline]
-    pub fn new(world: &World, archetype_indices: &[usize]) -> Self {
+    pub fn new(world: &'w World, archetype_indices: &'w [usize]) -> Self {
         Self {
             world: world as *const World,
             archetype_indices: archetype_indices as *const [usize],
@@ -51,13 +54,53 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// Создать SubWorld с row-level range ограничениями.
-    ///
-    /// # Safety
-    /// Переданные срезы должны жить не меньше самого SubWorld.
-    /// SubWorld хранит сырые указатели на данные.
+    /// Создать SubWorld с row-level range ограничениями. Все входные ссылки
+    /// привязаны к `'w` — конструктор безопасен (лайфтаймы гарантируют, что
+    /// сырые указатели не переживут данные).
     #[inline]
     pub fn with_ranges(
+        world: &'w World,
+        archetype_indices: &'w [usize],
+        row_ranges: &'w [(usize, usize, usize)],
+    ) -> Self {
+        Self {
+            world: world as *const World,
+            archetype_indices: archetype_indices as *const [usize],
+            row_ranges: row_ranges as *const [(usize, usize, usize)],
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Собрать SubWorld из ссылок, лайфтаймы которых НЕ привязаны к `'w`.
+    ///
+    /// # Safety
+    /// Вызывающий гарантирует, что `world` и `archetype_indices` живут не меньше
+    /// возвращённого SubWorld, и что во время его использования нет активного
+    /// `&mut World`, алиасящего покрытые архетипы. Предназначено для планировщика,
+    /// который держит `*mut World` под дисциплиной «во время исполнения систем
+    /// структурных изменений нет» и чередует `&World`/`&mut World` вручную —
+    /// поэтому не может пройти через безопасный [`new`](Self::new) (заём `&World`
+    /// конфликтовал бы с последующим `&mut World`).
+    #[inline]
+    pub unsafe fn from_raw(world: &World, archetype_indices: &[usize]) -> Self {
+        Self {
+            world: world as *const World,
+            archetype_indices: archetype_indices as *const [usize],
+            row_ranges: std::ptr::slice_from_raw_parts(
+                std::ptr::null::<(usize, usize, usize)>(),
+                0,
+            ),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// [`from_raw`](Self::from_raw) с row-level range ограничениями.
+    ///
+    /// # Safety
+    /// См. [`from_raw`](Self::from_raw); дополнительно `row_ranges` должен жить
+    /// не меньше SubWorld.
+    #[inline]
+    pub unsafe fn from_raw_with_ranges(
         world: &World,
         archetype_indices: &[usize],
         row_ranges: &[(usize, usize, usize)],

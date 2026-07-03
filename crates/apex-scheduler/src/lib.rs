@@ -201,6 +201,11 @@ pub enum ConflictKind {
     /// Обе системы пишут в компоненты, которые другая читает
     /// (A writes Pos that B reads, B writes Vel that A reads).
     BidirectionalWriteRead { a_name: String, b_name: String },
+    /// Two systems read the SAME event type. They must be serialized because each
+    /// `EventReader` mutates the event queue's shared cursor registry on register
+    /// / advance / drop — running them in parallel is a data race (F2). Reader
+    /// parallelism is restored by the per-system cursor model (wave 6).
+    SharedEventReaders { event_name: &'static str },
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -219,6 +224,9 @@ impl std::fmt::Display for ConflictKind {
             }
             ConflictKind::EventWriteRead { event_name, .. } => {
                 write!(f, "Event Write+Read conflict on `{}`", event_name)
+            }
+            ConflictKind::SharedEventReaders { event_name } => {
+                write!(f, "shared EventReader cursor race on `{}`", event_name)
             }
             ConflictKind::BidirectionalWriteRead { a_name, b_name } => write!(
                 f,
@@ -538,18 +546,21 @@ struct SystemDescriptor {
 
 // ── SystemBuilder ──────────────────────────────────────────────
 
-pub struct SystemBuilder {
-    scheduler: *mut Scheduler,
+/// Билдер держит `&'a mut Scheduler` (а не сырой `*mut`): лайфтайм гарантирует,
+/// что билдер не переживёт планировщик — сохранённый билдер + уничтоженный
+/// `Scheduler` = UB был бы возможен с сырым указателем (D10).
+pub struct SystemBuilder<'a> {
+    scheduler: &'a mut Scheduler,
     id: SystemId,
 }
 
-impl SystemBuilder {
+impl<'a> SystemBuilder<'a> {
     pub fn id(self) -> SystemId {
         self.id
     }
 
     fn add_condition_leaf(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
@@ -572,7 +583,7 @@ impl SystemBuilder {
     }
 
     fn add_condition_or(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
@@ -628,7 +639,7 @@ impl SystemBuilder {
 
     /// Установить всё дерево условий целиком (заменяет существующие).
     pub fn condition(self, tree: ConditionTree) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.run_condition = tree;
@@ -841,7 +852,7 @@ impl Scheduler {
     /// Регистрировать Sequential систему (полный &mut World).
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     #[cfg(test)]
-    fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
+    fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -854,7 +865,7 @@ impl Scheduler {
         name: impl Into<String>,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -879,14 +890,14 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
 
     /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
     #[cfg(test)]
-    fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
+    fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -903,7 +914,7 @@ impl Scheduler {
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     #[cfg(test)]
-    fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -917,7 +928,7 @@ impl Scheduler {
         name: impl Into<String>,
         system: S,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -957,14 +968,14 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
 
     /// Регистрировать AutoSystem в Startup этапе.
     #[cfg(test)]
-    fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -1069,7 +1080,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1085,7 +1096,7 @@ impl Scheduler {
         access: AccessDescriptor,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1122,7 +1133,7 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
@@ -2187,6 +2198,7 @@ impl Scheduler {
                 ) {
                     let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
                         || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. })
+                        || matches!(conflict_kind, ConflictKind::SharedEventReaders { .. })
                         || matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
                     let is_bidirectional =
                         matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
@@ -2254,6 +2266,20 @@ impl Scheduler {
                     };
 
                     if is_symmetric && from_idx > to_idx {
+                        continue;
+                    }
+
+                    // D5: for a symmetric conflict (WriteWrite / EventWriteWrite),
+                    // an explicit ordering in EITHER direction already serializes
+                    // the two systems, satisfying the conflict. Adding a
+                    // registration-oriented edge on top could contradict it and
+                    // fabricate a false CircularDependency (e.g. `before("b","a")`
+                    // while `a` registered first). Respect the explicit ordering —
+                    // its edge is already in the graph — and skip the conflict edge.
+                    if is_symmetric
+                        && (self.explicit_orderings.contains(&(from_id, to_id))
+                            || self.explicit_orderings.contains(&(to_id, from_id)))
+                    {
                         continue;
                     }
 
@@ -2390,9 +2416,6 @@ impl Scheduler {
             }
         }
 
-        let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-        let sub_world = apex_core::SubWorld::new(w, &all_indices);
-
         let mut thread_commands: Vec<Commands> = vec![Commands::new()];
         let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
 
@@ -2404,14 +2427,51 @@ impl Scheduler {
             .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone()))
             .collect();
 
-        for (stage_idx, (label, system_ids, emit_event_types)) in stages_meta.iter().enumerate() {
+        // Same FixedUpdate grouping as run_hybrid_parallel (D1): the contiguous
+        // FixedUpdate block drains the accumulator ONCE and runs `steps` times as
+        // (A;B;…)×N, so no later FixedUpdate stage is starved and the order is
+        // correct. Every other stage runs once.
+        let mut schedule: Vec<usize> = Vec::with_capacity(stages_meta.len());
+        let mut si = 0;
+        while si < stages_meta.len() {
+            if stages_meta[si].0 == StageLabel::FixedUpdate {
+                let mut end = si;
+                while end < stages_meta.len() && stages_meta[end].0 == StageLabel::FixedUpdate {
+                    end += 1;
+                }
+                let steps = Self::stage_steps(w, &StageLabel::FixedUpdate);
+                for _ in 0..steps {
+                    schedule.extend(si..end);
+                }
+                si = end;
+            } else {
+                schedule.push(si);
+                si += 1;
+            }
+        }
+
+        for &stage_idx in &schedule {
+            let (label, system_ids, emit_event_types) = &stages_meta[stage_idx];
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
-
-            // D2-5: FixedUpdate — 0..N шагов по аккумулятору FixedTime.
-            let steps = Self::stage_steps(w, label);
-            for _step in 0..steps {
+            // D6: skip the stage (and the change window) when every system is
+            // disabled by run_if, so stage_last_run doesn't advance past changes
+            // made during the pause.
+            let any_active = system_ids.iter().any(|&sys_id| {
+                self.system_indices
+                    .get(&sys_id)
+                    .is_some_and(|&idx| self.systems[idx].run_condition.evaluate(w))
+            });
+            if !any_active {
+                continue;
+            }
+            // D4: rebuild the SubWorld per stage so a Parallel system sees new
+            // archetypes created by an earlier stage this frame (it was built once
+            // before the loop and went stale).
+            let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
+            let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
+            {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
                 for &sys_id in system_ids {
@@ -2521,6 +2581,16 @@ impl Scheduler {
                 continue;
             }
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                // Only systems with a concrete component filter (Filtered) have a
+                // per-entity partition to split by rows. A system with `All` / no
+                // record declares no component access (only resources / events /
+                // whole-world), so it has nothing to partition — chunking it would
+                // run its whole body (and any side effects) once per chunk (D2).
+                // Such systems run inline as a single task.
+                let is_filtered = matches!(
+                    self.system_archetype_indices.get(&sys_id),
+                    Some(SystemArchetypes::Filtered(_))
+                );
                 let arch_indices = match self.system_archetype_indices.get(&sys_id) {
                     Some(SystemArchetypes::Filtered(v)) => v.clone(),
                     // All или нет записи — система видит все архетипы
@@ -2538,7 +2608,7 @@ impl Scheduler {
                     })
                     .sum();
 
-                if entity_count > 0 {
+                if entity_count > 0 && is_filtered {
                     let access = self.systems[sys_idx].kind.access();
                     let has_events = access
                         .map(|a| !a.reads_event.is_empty() || !a.writes_event.is_empty())
@@ -2569,7 +2639,7 @@ impl Scheduler {
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
-                        let sw = apex_core::SubWorld::new(world, &all_indices);
+                        let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
                         // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
                         // указывает на thread_commands, который жив до конца run_hybrid_parallel.
                         sys.run(SystemContext::with_commands(
@@ -2710,14 +2780,14 @@ impl Scheduler {
                         if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                             if task.chunk_ranges.is_empty() {
                                 // Полный SubWorld — все архетипы системы без ограничений
-                                let sub = apex_core::SubWorld::new(world, &task.arch_indices);
+                                let sub = apex_core::SubWorld::from_raw(world, &task.arch_indices);
                                 // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
                                 // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
                                 // Каждый поток обращается к своему индексу через current_thread_index().
                                 sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                             } else {
                                 // SubWorld с range-ограничениями и суженными arch_indices
-                                let sub = apex_core::SubWorld::with_ranges(
+                                let sub = apex_core::SubWorld::from_raw_with_ranges(
                                     world,
                                     &task.arch_indices,
                                     &task.chunk_ranges,
@@ -2787,20 +2857,71 @@ impl Scheduler {
             .map(|a| a.len())
             .collect();
 
-        for (stage_idx, label, stage_ids, all_parallel, emit_event_types) in &stages {
-            // D2-5: FixedUpdate исполняется 0..N раз по аккумулятору FixedTime
-            // (каждый шаг — своё применение команд и флаш событий); остальные
-            // стадии — ровно один раз. `continue` внутри тела продолжает
-            // ШАГОВЫЙ цикл — семантика шагов сохраняется.
-            let steps = Self::stage_steps(unsafe { &mut *world_ptr }, label);
-            for _step in 0..steps {
+        // Build the execution order (D2-5). Stages sharing a StageLabel are
+        // contiguous, so the FixedUpdate stages form one block. That block steps
+        // as a GROUP: the FixedTime accumulator is drained ONCE and the whole
+        // block runs `steps` times as (A; B; …) × N. This fixes D1 — draining
+        // per stage let the first FixedUpdate stage consume all the steps, so any
+        // later FixedUpdate stage (a conflict split the label across several
+        // execution stages) ran zero times, and the order was A×N then B×N rather
+        // than the correct (A;B)×N. Every non-FixedUpdate stage runs exactly once.
+        let mut schedule: Vec<usize> = Vec::with_capacity(stages.len());
+        let mut si = 0;
+        while si < stages.len() {
+            if stages[si].1 == StageLabel::FixedUpdate {
+                let mut end = si;
+                while end < stages.len() && stages[end].1 == StageLabel::FixedUpdate {
+                    end += 1;
+                }
+                let steps = Self::stage_steps(unsafe { &mut *world_ptr }, &StageLabel::FixedUpdate);
+                for _ in 0..steps {
+                    schedule.extend(si..end);
+                }
+                si = end;
+            } else {
+                schedule.push(si);
+                si += 1;
+            }
+        }
+
+        for &stage_pos in &schedule {
+            // D4: an earlier stage may have spawned entities into NEW archetypes.
+            // Refresh the cached per-system archetype indices before this stage so
+            // a Filtered parallel system sees them. Previously only the parallel
+            // branch refreshed (in its tail), so new archetypes created by a
+            // non-parallel / fallback stage were missed until the next frame.
+            {
+                let w = unsafe { &*const_ptr };
+                let cur = w.archetypes().len();
+                if cur != prev_arch_count {
+                    prev_arch_count = cur;
+                    self.compute_archetype_indices(w);
+                    self.sub_worlds_dirty = true;
+                    self.prepare_sub_worlds(w);
+                }
+            }
+            let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
+            // D6: skip the whole stage — including opening the change window — when
+            // every system is disabled by its run_condition. Otherwise the window
+            // would advance stage_last_run past changes made during a run_if pause,
+            // and a system resuming later would miss Changed<T> from those frames.
+            let any_active = stage_ids.iter().any(|&sys_id| {
+                self.system_indices.get(&sys_id).is_some_and(|&idx| {
+                    self.systems[idx]
+                        .run_condition
+                        .evaluate(unsafe { &*const_ptr })
+                })
+            });
+            if !any_active {
+                continue;
+            }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
             self.open_stage_change_window(*stage_idx, unsafe { &mut *world_ptr });
             if !*all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
                     let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
@@ -2871,7 +2992,7 @@ impl Scheduler {
                 {
                     let w = unsafe { &*const_ptr };
                     let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
@@ -2931,7 +3052,6 @@ impl Scheduler {
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
-            } // конец шагового цикла (D2-5)
         }
     }
 
@@ -2957,10 +3077,12 @@ impl Scheduler {
     fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
         let arch_indices = &self.archetype_indices_storage[storage_idx];
         let ranges = &self.row_ranges_storage[storage_idx];
+        // SAFETY: SubWorld borrows Scheduler storage that is not mutated while any
+        // SubWorld is live (documented invariant of the row-split machinery).
         if ranges.is_empty() {
-            apex_core::SubWorld::new(world, arch_indices)
+            unsafe { apex_core::SubWorld::from_raw(world, arch_indices) }
         } else {
-            apex_core::SubWorld::with_ranges(world, arch_indices, ranges)
+            unsafe { apex_core::SubWorld::from_raw_with_ranges(world, arch_indices, ranges) }
         }
     }
 
@@ -3339,6 +3461,32 @@ fn detect_conflict_kind(
     type_names: &FxHashMap<TypeId, &'static str>,
     event_ordering: bool,
 ) -> Option<(ConflictKind, bool)> {
+    // ── Whole-world access (F3) ─────────────────────────────────
+    // A whole-world system (e.g. a `Ctx` param — SystemContext can reach any
+    // resource / component / event) declares no specific access, so the TypeId
+    // checks below would find no conflict and let it run in parallel with a
+    // writer — a data race. Treat it conservatively: it conflicts with any other
+    // system that touches any data (or is itself whole-world). Symmetric, so it
+    // serializes in registration order and an explicit ordering can override it
+    // (see D5).
+    if ai.needs_whole_world || aj.needs_whole_world {
+        let has_access = |a: &AccessDescriptor| {
+            a.needs_whole_world
+                || !a.reads.is_empty()
+                || !a.writes.is_empty()
+                || !a.reads_event.is_empty()
+                || !a.writes_event.is_empty()
+        };
+        if has_access(ai) && has_access(aj) {
+            return Some((
+                ConflictKind::WriteWrite {
+                    component_name: "<whole-world>",
+                },
+                true,
+            ));
+        }
+    }
+
     // ── Компонентные конфликты ──────────────────────────────────
 
     // Write+Write: оба пишут в один компонент
@@ -3431,6 +3579,16 @@ fn detect_conflict_kind(
                     false,
                 )); // j→i
             }
+        }
+    }
+
+    // ── Shared event-reader cursor race (F2) ────────────────────
+    // NOT gated by event_ordering: two systems reading the same event type each
+    // mutate that queue's shared cursor registry (register/advance/drop), so they
+    // must be serialized regardless of ordering policy or the data race is real.
+    for (id, name) in &ai.reads_event {
+        if aj.reads_event.iter().any(|(oid, _)| oid == id) {
+            return Some((ConflictKind::SharedEventReaders { event_name: name }, true));
         }
     }
 
@@ -4285,22 +4443,31 @@ mod tests {
         );
     }
 
+    /// F2: two systems reading the SAME event must be serialized — each
+    /// EventReader mutates the queue's shared cursor registry, so running them in
+    /// parallel is a data race. (They used to share a stage — the racy old
+    /// behavior; reader parallelism returns with the per-system cursor model,
+    /// wave 6.)
     #[test]
-    fn event_read_read_no_conflict() {
+    fn same_event_readers_are_serialized() {
         let mut sched = Scheduler::new();
 
-        sched.add_par_system("reader_a", EventReaderForTest);
-        sched.add_par_system("reader_b", EventReaderForTest);
+        let a = sched.add_par_system("reader_a", EventReaderForTest);
+        let b = sched.add_par_system("reader_b", EventReaderForTest);
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // Два EventReader одного типа → НЕТ конфликта, могут быть в одном Stage
-        // Проверяем что есть хотя бы один Stage с обеими системами
-        let found = stages.iter().any(|s| s.system_ids.len() >= 2);
+        let sa = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
+        let sb = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
+        assert_ne!(sa, sb, "two readers of the same event must be serialized (F2)");
+
+        let conflicts = sched.conflicts_between(a, b);
         assert!(
-            found,
-            "EventRead не должны конфликтовать: ожидается Stage с обеими системами"
+            conflicts
+                .iter()
+                .any(|c| matches!(c, ConflictKind::SharedEventReaders { .. })),
+            "the conflict must be SharedEventReaders, got {conflicts:?}"
         );
     }
 
@@ -4541,11 +4708,15 @@ mod tests {
         assert!(pos_armor < pos_health, "armor должен быть до health");
     }
 
+    /// Both consumers of the same event run after the producer and each receives
+    /// the event. They are SERIALIZED with respect to each other (F2: reading the
+    /// same event mutates its shared cursor registry, so parallel reads race);
+    /// reader parallelism returns with the per-system cursor model (wave 6).
     #[test]
-    fn pipeline_parallel_consumers() {
+    fn pipeline_consumers_run_after_producer_and_are_serialized() {
         let mut sched = Scheduler::new();
 
-        let _physics_id = sched.add_par_system("physics", EmitDamage);
+        let physics_id = sched.add_par_system("physics", EmitDamage);
         let health_id = sched.add_par_system("health", ListenDamage);
         let sound_id = sched.add_par_system("sound", ListenDamage2);
 
@@ -4557,15 +4728,12 @@ mod tests {
 
         sched.compile().unwrap();
 
-        // health и sound — параллельные Consumer, должны оказаться в одном Stage
         let stages = sched.stages().unwrap();
-        let parallel_stage = stages
-            .iter()
-            .find(|s| s.system_ids.contains(&health_id) && s.system_ids.contains(&sound_id));
-        assert!(
-            parallel_stage.is_some(),
-            "health и sound должны быть в одном параллельном Stage"
-        );
+        let stage_of = |id| stages.iter().position(|s| s.system_ids.contains(&id)).unwrap();
+        let (p, h, s) = (stage_of(physics_id), stage_of(health_id), stage_of(sound_id));
+        // Producer before both consumers; the two consumers serialized (F2).
+        assert!(p < h && p < s, "producer must run before both consumers");
+        assert_ne!(h, s, "consumers of the same event are serialized (F2)");
     }
 
     #[test]
@@ -4705,6 +4873,222 @@ mod tests {
         sched
             .compile()
             .expect("independent снимает CircularDependency, сериализуя в порядке регистрации");
+    }
+
+    /// D5: a symmetric (WriteWrite) conflict plus an explicit ordering that runs
+    /// against registration order must NOT fabricate a CircularDependency — the
+    /// explicit ordering wins and serializes the two systems.
+    #[test]
+    fn symmetric_conflict_respects_reverse_explicit_order() {
+        struct WriteA;
+        impl ParSystem for WriteA {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct WriteB;
+        impl ParSystem for WriteB {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("a", WriteA); // registered first
+        sched.add_par_system("b", WriteB);
+        // Explicit ordering against registration: b before a.
+        sched.before("b", "a").unwrap();
+
+        // Old code: conflict edge a->b plus explicit b->a = false cycle.
+        sched
+            .compile()
+            .expect("explicit ordering must resolve the symmetric conflict without a false cycle");
+
+        let a = sched.find_id_by_name("a").unwrap();
+        let b = sched.find_id_by_name("b").unwrap();
+        let stages = sched.stages().unwrap();
+        let a_stage = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
+        let b_stage = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
+        assert!(b_stage < a_stage, "explicit before(\"b\",\"a\") must run b before a");
+    }
+
+    /// D2: a system with no component access (only side effects / whole-world)
+    /// has nothing to partition by rows. On a large world the old code gave it
+    /// entity_count = whole world and let ASD chunk it, running its body once per
+    /// chunk. It must run exactly once.
+    #[test]
+    fn empty_access_system_runs_once_not_chunked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(apex_macros::Component)]
+        struct Marker;
+
+        let mut world = World::new();
+        for _ in 0..100_000 {
+            world.spawn((Marker,));
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            par("tick", move |_ctx: SystemContext<'_>| {
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        sched.run(&mut world);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "an empty-access system must run once, not once per ASD chunk"
+        );
+    }
+
+    /// D6: a stage whose systems are all disabled by run_if must NOT advance its
+    /// change-detection window, so a system resuming after the pause still sees
+    /// Changed<T> made while it was paused.
+    #[test]
+    fn run_if_paused_stage_does_not_lose_changed() {
+        use apex_core::prelude::*;
+
+        #[derive(apex_macros::Component)]
+        struct Mark(u32);
+        struct Ctl {
+            active: bool,
+            mutate: bool,
+            entity: Entity,
+            seen: u32,
+        }
+
+        let mut world = World::new();
+        let e = world.spawn((Mark(0),));
+        world.insert_resource(Ctl {
+            active: false,
+            mutate: false,
+            entity: e,
+            seen: 0,
+        });
+
+        fn mutator(w: &mut World) {
+            let (mutate, e) = {
+                let c = w.resource::<Ctl>();
+                (c.mutate, c.entity)
+            };
+            if mutate {
+                if let Some(mut m) = w.get_mut::<Mark>(e) {
+                    m.0 += 1;
+                }
+            }
+        }
+        fn reader(w: &mut World) {
+            let mut n = 0u32;
+            let q = w.query::<(Read<Mark>, Changed<Mark>)>();
+            q.for_each(|_, _| n += 1);
+            w.resource_mut::<Ctl>().seen += n;
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_system_to_stage("mutator", mutator, StageLabel::Update);
+        sched
+            .add_system_to_stage("reader", reader, StageLabel::PostUpdate)
+            .run_if(|w: &World| w.resource::<Ctl>().active);
+
+        sched.run(&mut world); // frame 1: paused, no mutation
+        world.resource_mut::<Ctl>().mutate = true;
+        sched.run(&mut world); // frame 2: Mark mutated, reader still paused
+        world.resource_mut::<Ctl>().mutate = false;
+        world.resource_mut::<Ctl>().active = true;
+        sched.run(&mut world); // frame 3: reader resumes — must see the frame-2 change
+
+        assert_eq!(
+            world.resource::<Ctl>().seen,
+            1,
+            "reader must see Changed<Mark> produced while its stage was paused"
+        );
+    }
+
+    /// D4: a Filtered system in a later stage must see archetypes an earlier stage
+    /// spawned THIS frame — the cached per-system archetype indices are refreshed
+    /// before each stage (a non-parallel stage's new archetypes used to be missed
+    /// by a later parallel stage until the next frame).
+    #[test]
+    fn later_stage_sees_archetype_spawned_earlier_this_frame() {
+        use apex_core::prelude::*;
+
+        #[derive(apex_macros::Component)]
+        struct Fresh;
+        #[derive(Default)]
+        struct Count(usize);
+        #[derive(Default)]
+        struct Done(bool);
+
+        fn spawner(w: &mut World) {
+            if !w.resource::<Done>().0 {
+                for _ in 0..5 {
+                    w.spawn((Fresh,));
+                }
+                w.resource_mut::<Done>().0 = true;
+            }
+        }
+        fn counter(q: Query<Read<Fresh>>, mut count: ResMut<Count>) {
+            let mut n = 0;
+            q.for_each(|_, _| n += 1);
+            count.0 = n;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Count::default());
+        world.insert_resource(Done::default());
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, spawner);
+        sched.add_systems(StageLabel::PostUpdate, counter);
+
+        sched.run(&mut world); // frame 1: Update spawns Fresh, PostUpdate must count them
+        assert_eq!(
+            world.resource::<Count>().0,
+            5,
+            "counter must see the archetype spawned by an earlier stage this frame"
+        );
+    }
+
+    /// F3: a whole-world system (SystemContext / `Ctx` can touch any data but
+    /// declares no specific access) must conflict with — and be serialized
+    /// against — a writer, not run in parallel with it.
+    #[test]
+    fn whole_world_system_is_serialized_against_a_writer() {
+        struct Whole;
+        impl ParSystem for Whole {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().whole_world()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct Writer;
+        impl ParSystem for Writer {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("whole", Whole);
+        sched.add_par_system("writer", Writer);
+        sched.compile().unwrap();
+
+        let whole = sched.find_id_by_name("whole").unwrap();
+        let writer = sched.find_id_by_name("writer").unwrap();
+        let stages = sched.stages().unwrap();
+        let ws = stages.iter().position(|s| s.system_ids.contains(&whole)).unwrap();
+        let rs = stages.iter().position(|s| s.system_ids.contains(&writer)).unwrap();
+        assert_ne!(
+            ws, rs,
+            "a whole-world system must be serialized against a writer, not parallel with it"
+        );
     }
 
     #[test]
@@ -5653,6 +6037,46 @@ mod tests {
         assert_eq!(world.resource::<Counts>().update, 3);
     }
 
+    /// D1: two CONFLICTING FixedUpdate systems (the planner splits them into
+    /// separate execution stages) must both run on every fixed step, interleaved
+    /// as (A;B)×N — not A×N then B×N, and the second must never be starved by the
+    /// first draining the accumulator.
+    #[test]
+    fn fixed_update_conflicting_systems_all_run_each_step_interleaved() {
+        #[derive(Default)]
+        struct Log(Vec<char>);
+
+        fn step_a(mut log: ResMut<Log>) {
+            log.0.push('A');
+        }
+        fn step_b(mut log: ResMut<Log>) {
+            log.0.push('B');
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        world.insert_resource(crate::FixedTime::from_dt(0.010));
+
+        let mut sched = Scheduler::new();
+        // Both take ResMut<Log> → WriteWrite → separate execution stages.
+        sched.add_systems(StageLabel::FixedUpdate, step_a);
+        sched.add_systems(StageLabel::FixedUpdate, step_b);
+
+        // 35ms / 10ms = 3 fixed steps.
+        world.resource_mut::<crate::FixedTime>().accumulate(0.035);
+        sched.run(&mut world);
+
+        let log: String = world.resource::<Log>().0.iter().collect();
+        let a = log.chars().filter(|&c| c == 'A').count();
+        let b = log.chars().filter(|&c| c == 'B').count();
+        assert_eq!(a, 3, "system A must run every fixed step, got log {log:?}");
+        assert_eq!(b, 3, "system B must NOT be starved — runs every step too, got {log:?}");
+        assert!(
+            !log.contains("AA") && !log.contains("BB"),
+            "steps must interleave as (A;B)×N, not A×N then B×N, got {log:?}"
+        );
+    }
+
     /// Защита от спирали смерти: шаги капятся, излишек отбрасывается.
     #[test]
     fn fixed_update_death_spiral_cap() {
@@ -5759,6 +6183,75 @@ mod tests {
         let log = world.resource::<Log>();
         assert_eq!(log.entered_playing, 1);
         assert_eq!(log.exited_menu, 1);
+    }
+
+    /// D7: on_enter(initial) must be visible to Update (and later) systems on the
+    /// first frame, not only Startup — the transition system used to clear it in
+    /// First before Update ran.
+    #[test]
+    fn on_enter_initial_visible_to_update_on_first_frame() {
+        use crate::config::FnSystemExt;
+        use crate::states::{init_state, on_enter};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum S {
+            A,
+        }
+        #[derive(Default)]
+        struct Log(u32);
+        fn on_enter_a(mut log: ResMut<Log>) {
+            log.0 += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        let mut sched = Scheduler::new();
+        init_state(&mut world, &mut sched, S::A);
+        sched.add_systems(StageLabel::Update, on_enter_a.run_if(on_enter(S::A)));
+
+        sched.run(&mut world); // frame 1
+        assert_eq!(
+            world.resource::<Log>().0,
+            1,
+            "on_enter(initial) must fire for Update systems on frame 1"
+        );
+        sched.run(&mut world); // frame 2 — no longer entering
+        assert_eq!(world.resource::<Log>().0, 1, "on_enter lasts one frame only");
+    }
+
+    /// D7: a second init_state for the same state is ignored, so transitions keep
+    /// working (a second transition system would clear the flags the first sets).
+    #[test]
+    fn double_init_state_is_ignored() {
+        use crate::config::FnSystemExt;
+        use crate::states::{init_state, on_enter, NextState};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum S {
+            A,
+            B,
+        }
+        #[derive(Default)]
+        struct Log(u32);
+        fn on_enter_b(mut log: ResMut<Log>) {
+            log.0 += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        let mut sched = Scheduler::new();
+        init_state(&mut world, &mut sched, S::A);
+        init_state(&mut world, &mut sched, S::A); // ignored
+        sched.add_systems(StageLabel::Update, on_enter_b.run_if(on_enter(S::B)));
+
+        sched.run(&mut world); // frame 1
+        world.resource_mut::<NextState<S>>().set(S::B);
+        sched.run(&mut world); // transition to B
+        assert_eq!(
+            world.resource::<Log>().0,
+            1,
+            "transitions still work despite a double init_state"
+        );
     }
 
     // ── Э5: Single<Q> / Option<Single<Q>> — skip-семантика ────

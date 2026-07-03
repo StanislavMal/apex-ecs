@@ -34,3 +34,6 @@ desktop.ini
 cargo_error.txt
 bench_final.txt
 project_context*.txt
+results.txt
+perf.txt
+apex-benc.txt

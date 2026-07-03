@@ -254,7 +254,7 @@ end
 | `query(descs) → iterator` | Итератор entity с компонентами |
 | `commit(entity_table)` | Фиксирует Write-изменения в ECS |
 | `spawn_entity(table)` | Создать entity с компонентами (отложено) |
-| `despawn(entity_index)` | Уничтожить entity по индексу (отложено) |
+| `despawn(entity_id)` | Уничтожить entity по id `entity.entity` (отложено; несовпадение поколения = no-op) |
 | `read_resource(type_name) → value/nil` | Прочитать глобальный ресурс по имени типа |
 | `write_resource(type_name, value)` | Записать глобальный ресурс |
 | `emit_event(type_name, value)` | Отправить событие |
@@ -298,7 +298,7 @@ query({"Read:Position", "Write:Velocity", "With:Player"})  -- комбиниро
 
 ```lua
 for entity in query({"Read:Position", "Write:Velocity"}) do
-    entity.entity       -- integer: индекс entity
+    entity.entity       -- string "index:generation": непрозрачный id entity (передавать в despawn как есть)
     entity.position     -- table: { x = float, y = float } (Read-only)
     entity.velocity     -- table: { x = float, y = float } (Write-доступ)
 end

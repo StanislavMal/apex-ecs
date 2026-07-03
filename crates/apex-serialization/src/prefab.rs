@@ -98,9 +98,20 @@ pub enum PrefabError {
     #[error("sub-prefab `{name}` not found in cache")]
     SubPrefabNotFound { name: String },
 
+    #[error("prefab reference cycle: {chain}")]
+    CycleDetected { chain: String },
+
+    #[error("prefab nesting exceeds the depth limit ({limit})")]
+    DepthLimitExceeded { limit: usize },
+
     #[error("serialization error: {0}")]
     Serialization(#[from] SerializationError),
 }
+
+/// Defensive cap on inline prefab nesting. A hand-authored manifest deeper than
+/// this is almost certainly a mistake; named `Ref` cycles are caught separately
+/// by the instantiation chain.
+const MAX_PREFAB_DEPTH: usize = 256;
 
 // ── PrefabLoader ──────────────────────────────────────────────────
 
@@ -177,7 +188,7 @@ impl PrefabLoader {
     /// `instantiate` с **контекстом (де)сериализации** (TD-44): компоненты префаба с внешними ссылками
     /// (Handle ассета и т.п.) резолвят их через `ctx` — консистентно со снэпшотами. Контекст
     /// прокидывается во всю иерархию. Обычные компоненты `ctx` игнорируют.
-    #[allow(clippy::only_used_in_recursion, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn instantiate_with(
         &self,
         world: &mut World,
@@ -187,6 +198,31 @@ impl PrefabLoader {
         params: Option<&TemplateParams>,
         ctx: &mut dyn apex_core::SerdeContext,
     ) -> Result<Entity, PrefabError> {
+        let mut chain: Vec<String> = Vec::new();
+        self.instantiate_rec(world, manifest, overrides, parent, params, ctx, &mut chain, 0)
+    }
+
+    /// Recursive worker for [`instantiate_with`]. `chain` is the stack of named
+    /// `Ref` prefabs currently being instantiated — a `Ref` back to any of them
+    /// is a cycle (A -> B -> A) and would otherwise recurse until the stack
+    /// overflowed and aborted the process (E5). `depth` bounds inline nesting.
+    #[allow(clippy::only_used_in_recursion, clippy::too_many_arguments)]
+    fn instantiate_rec(
+        &self,
+        world: &mut World,
+        manifest: &PrefabManifest,
+        overrides: &[PrefabComponent],
+        parent: Option<Entity>,
+        params: Option<&TemplateParams>,
+        ctx: &mut dyn apex_core::SerdeContext,
+        chain: &mut Vec<String>,
+        depth: usize,
+    ) -> Result<Entity, PrefabError> {
+        if depth > MAX_PREFAB_DEPTH {
+            return Err(PrefabError::DepthLimitExceeded {
+                limit: MAX_PREFAB_DEPTH,
+            });
+        }
         let entity = self.spawn_entity(world, manifest, overrides, ctx)?;
 
         // Parent relation
@@ -199,13 +235,41 @@ impl PrefabLoader {
         for child in &manifest.children {
             match child {
                 PrefabChild::Ref { prefab, overrides } => {
-                    let child_manifest = self.cache.get(prefab).ok_or_else(|| {
-                        PrefabError::SubPrefabNotFound { name: prefab.clone() }
-                    })?;
-                    self.instantiate_with(world, child_manifest, overrides, Some(entity), params, ctx)?;
+                    if chain.iter().any(|n| n == prefab) {
+                        let mut c = chain.clone();
+                        c.push(prefab.clone());
+                        return Err(PrefabError::CycleDetected {
+                            chain: c.join(" -> "),
+                        });
+                    }
+                    let child_manifest = self
+                        .cache
+                        .get(prefab)
+                        .ok_or_else(|| PrefabError::SubPrefabNotFound { name: prefab.clone() })?;
+                    chain.push(prefab.clone());
+                    self.instantiate_rec(
+                        world,
+                        child_manifest,
+                        overrides,
+                        Some(entity),
+                        params,
+                        ctx,
+                        chain,
+                        depth + 1,
+                    )?;
+                    chain.pop();
                 }
                 PrefabChild::Inline(child_manifest) => {
-                    self.instantiate_with(world, child_manifest, &[], Some(entity), params, ctx)?;
+                    self.instantiate_rec(
+                        world,
+                        child_manifest,
+                        &[],
+                        Some(entity),
+                        params,
+                        ctx,
+                        chain,
+                        depth + 1,
+                    )?;
                 }
             }
         }
@@ -699,6 +763,43 @@ mod tests {
             rworld.get::<CtxRef>(inst),
             Some(&CtxRef(7)),
             "instantiate_with threaded the context ⇒ ref resolved back to 7"
+        );
+    }
+
+    /// E5: two prefabs referencing each other must not recurse until the stack
+    /// overflows — the cycle is detected and reported.
+    #[test]
+    fn instantiate_rejects_ref_cycle() {
+        let mut loader = PrefabLoader::new();
+        loader.cache.insert(
+            "A".into(),
+            PrefabManifest {
+                name: "A".into(),
+                components: vec![],
+                children: vec![PrefabChild::Ref {
+                    prefab: "B".into(),
+                    overrides: vec![],
+                }],
+            },
+        );
+        loader.cache.insert(
+            "B".into(),
+            PrefabManifest {
+                name: "B".into(),
+                components: vec![],
+                children: vec![PrefabChild::Ref {
+                    prefab: "A".into(),
+                    overrides: vec![],
+                }],
+            },
+        );
+
+        let mut world = World::new();
+        let a = loader.get("A").unwrap().clone();
+        let res = loader.instantiate(&mut world, &a, &[], None, None);
+        assert!(
+            matches!(res, Err(PrefabError::CycleDetected { .. })),
+            "a Ref cycle must be rejected, got {res:?}"
         );
     }
 }

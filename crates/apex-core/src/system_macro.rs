@@ -47,6 +47,26 @@
 /// | `name: Cmd` | Commands | Отложенные структурные изменения |
 /// | `name: Ctx` | SystemContext | Прямой доступ к контексту |
 /// | `__whole: WholeWorld` | NEEDS_WHOLE_WORLD | Глобальный доступ ко всем entity |
+///
+/// # Only one Query parameter (F6)
+///
+/// Every query parameter accumulates into one `Self::Query`, so a second query
+/// would silently become the same joined AND query rather than an independent
+/// one. Two query parameters are therefore a compile error — combine them:
+///
+/// ```compile_fail
+/// use apex_core::system;
+/// use apex_core::query::Read;
+/// struct A;
+/// impl apex_core::component::Component for A {}
+/// struct B;
+/// impl apex_core::component::Component for B {}
+/// system! {
+///     fn two_queries(q1: (Read<A>,), q2: (Read<B>,)) {
+///         let _ = (q1, q2);
+///     }
+/// }
+/// ```
 #[macro_export]
 macro_rules! system {
     // ═══════════════════════════════════════════════════════════════
@@ -296,7 +316,7 @@ macro_rules! __system_impl {
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$crate::SystemContext<'_> = &$ctx; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // WholeWorld
@@ -312,6 +332,24 @@ macro_rules! __system_impl {
         @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
+
+    // F6: a SECOND Query parameter is rejected. All query params accumulate into
+    // `@q` and every one binds to `$ctx.query::<Self::Query>()` — the tuple of ALL
+    // of them — so two query params would silently become the same joined AND
+    // query, not two independent queries. Matches when `@q` already holds one
+    // query and another arrives (trailing comma optional). Tried before the
+    // general query arms below, so the FIRST query (empty `@q`) falls through.
+    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @q: [ ( $($q0:tt)+ ) $( ( $($qn:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [ $pname:ident : ( $( $qty:tt )* ) $( , $( $rest:tt )* )? ],
+        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => {
+        compile_error!(
+            "system! supports only one Query parameter — combine components into a single tuple query, e.g. `q: (Read<A>, Write<B>)`"
+        );
+    };
 
     // Query tuple
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,

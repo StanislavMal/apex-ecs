@@ -549,12 +549,29 @@ impl World {
 
     #[cold]
     fn flush_hooks_slow(&mut self) {
+        // RAII: reset the dispatch flag and drop any undelivered hooks on the way
+        // out — INCLUDING a panic in a user hook. Otherwise a panicking hook would
+        // leave `hook_dispatch_active` set forever, silently disabling all future
+        // hook dispatch and letting the queue grow unbounded (A7).
+        struct DispatchGuard<'a> {
+            world: &'a mut World,
+        }
+        impl Drop for DispatchGuard<'_> {
+            fn drop(&mut self) {
+                self.world.hook_queue.clear();
+                self.world.hook_dispatch_active = false;
+            }
+        }
+
         self.hook_dispatch_active = true;
+        let guard = DispatchGuard { world: self };
+        let world = &mut *guard.world;
+
         let mut i = 0;
         // Хуки могут дописывать события в хвост очереди (вложенные структурные
         // операции) — обычный while по растущему Vec, без рекурсии.
-        while i < self.hook_queue.len() {
-            let ev = self.hook_queue[i];
+        while i < world.hook_queue.len() {
+            let ev = world.hook_queue[i];
             i += 1;
             match ev {
                 HookEvent::Added(entity, cid) => {
@@ -562,25 +579,25 @@ impl World {
                     // on_add: хук видит entity уже с полным составом.
                     // Транзитивные requires идут через эту же очередь
                     // (вставка R ставит своё Added-событие).
-                    if self.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
-                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = self
+                    if world.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
+                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = world
                             .registry
                             .requires(cid)
                             .map(|s| s.iter().copied().collect())
                             .unwrap_or_default();
                         for f in fns {
-                            f(self, entity);
+                            f(world, entity);
                         }
                     }
-                    let hook = self.registry.hooks(cid).and_then(|h| h.on_add);
+                    let hook = world.registry.hooks(cid).and_then(|h| h.on_add);
                     if let Some(f) = hook {
-                        f(self, entity);
+                        f(world, entity);
                     }
                 }
                 HookEvent::Removed(entity, cid) => {
-                    let hook = self.registry.hooks(cid).and_then(|h| h.on_remove);
+                    let hook = world.registry.hooks(cid).and_then(|h| h.on_remove);
                     if let Some(f) = hook {
-                        f(self, entity);
+                        f(world, entity);
                     }
                 }
                 HookEvent::RelationAdded {
@@ -588,8 +605,8 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = self.relations.on_add_hook(kind_idx) {
-                        f(self, subject, target);
+                    if let Some(f) = world.relations.on_add_hook(kind_idx) {
+                        f(world, subject, target);
                     }
                 }
                 HookEvent::RelationRemoved {
@@ -597,14 +614,13 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = self.relations.on_remove_hook(kind_idx) {
-                        f(self, subject, target);
+                    if let Some(f) = world.relations.on_remove_hook(kind_idx) {
+                        f(world, subject, target);
                     }
                 }
             }
         }
-        self.hook_queue.clear();
-        self.hook_dispatch_active = false;
+        // `guard` drops here → clears the queue and resets the flag (also on panic).
     }
 
     /// Поставить `Added`-хуки для свежесозданной entity по списку её
@@ -1186,16 +1202,42 @@ impl World {
     }
 
     /// Вставить компонент по raw данным.
+    ///
+    /// `data` — байтовое представление владеемого `T` (источник `forget`-нут
+    /// вызывающим). Длина ОБЯЗАНА совпадать с размером компонента.
     pub(crate) fn insert_raw(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-        data: Vec<u8>,
+        mut data: Vec<u8>,
         tick: Tick,
     ) {
+        // The raw bytes must match the component's storage layout exactly — a
+        // short buffer would make the column copy read past the Vec (OOB) (B8).
+        let info_size = self
+            .registry
+            .get_info(component_id)
+            .map(|i| i.size)
+            .unwrap_or_else(|| panic!("insert_raw: component {component_id:?} is not registered"));
+        assert!(
+            data.len() == info_size,
+            "insert_raw: data length {} != component size {info_size} for {component_id:?}",
+            data.len(),
+        );
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None => {
+                // Entity is dead: `data` is a moved-out `T`, so dropping the raw
+                // `Vec<u8>` would free the buffer without running `T::drop`,
+                // leaking owned fields (String/Arc/Vec). Run drop_fn so ownership
+                // is honored exactly once (A9); the column never received a copy.
+                if !data.is_empty() {
+                    if let Some(info) = self.registry.get_info(component_id) {
+                        unsafe { (info.drop_fn)(data.as_mut_ptr()) };
+                    }
+                }
+                return;
+            }
         };
         let current_idx = location.archetype_id.0 as usize;
 
@@ -1635,6 +1677,26 @@ impl World {
         // Borrow<[ComponentId]> — zero-copy lookup без создания ArchetypeKey
         if let Some(&id) = self.archetype_index.get(components) {
             return id;
+        }
+        // A duplicate component id means the same component was listed twice
+        // (e.g. once in a tuple and again inside a nested Bundle, or an insert of
+        // a component the entity already has). Building an archetype from it would
+        // create a phantom second column that later drops through a null pointer
+        // on despawn — reject loudly (§0.2a; Bevy panics the same way). All callers
+        // pass a sorted list, so duplicates are adjacent.
+        debug_assert!(
+            components.windows(2).all(|w| w[0] <= w[1]),
+            "get_or_create_archetype requires a sorted component list"
+        );
+        if let Some(dup) = components.windows(2).find_map(|w| (w[0] == w[1]).then_some(w[0])) {
+            let name = self
+                .registry
+                .get_info(dup)
+                .map(|i| i.name)
+                .unwrap_or("<unknown>");
+            panic!(
+                "duplicate component `{name}` in bundle — a component may appear only once per entity"
+            );
         }
         let id = ArchetypeId(self.archetypes.len() as u32);
         let infos: Vec<&ComponentInfo> = components
@@ -3108,19 +3170,14 @@ impl World {
         name: &str,
         params: &crate::template::TemplateParams,
     ) -> Option<crate::entity::Entity> {
-        // Используем raw pointer, чтобы избежать borrow conflict:
-        // `self.templates` (immut) и `self` (mut) одновременно.
-        let raw = self.templates.get_raw(name)?;
-        // SAFETY: шаблон жив, пока жив World (мы его не удаляем),
-        // и get_raw возвращает корректный указатель.
-        unsafe {
-            let template = &*raw;
-            let entity = template.spawn(self, params);
-            if let Some(parent) = template.parent() {
-                self.add_relation(entity, crate::relations::ChildOf, parent);
-            }
-            Some(entity)
+        // Клонируем Arc и отпускаем заём реестра — теперь `&mut World` свободен
+        // для `spawn`, а шаблон переживает даже собственную перерегистрацию (B4).
+        let template = self.templates.get_arc(name)?;
+        let entity = template.spawn(self, params);
+        if let Some(parent) = template.parent() {
+            self.add_relation(entity, crate::relations::ChildOf, parent);
         }
+        Some(entity)
     }
 
     /// Создать entity из шаблона с параметрами по умолчанию.
@@ -3721,9 +3778,9 @@ mod tests {
     #[test]
     fn bundle_mixed_tuple_of_components_and_bundles() {
         let mut world = World::new();
-        // Смесь: одиночные компоненты + Bundle-структура + ещё компонент
+        // Смесь: одиночные компоненты + Bundle-структура + ещё компонент (без
+        // дублирующих компонентов между кортежем и вложенным Bundle).
         let e = world.spawn((
-            Hp(200.0),
             PlayerBase {
                 pos: Pos { x: 7.0, y: 8.0 },
                 hp: Hp(80.0),
@@ -3733,12 +3790,26 @@ mod tests {
         ));
 
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 7.0, y: 8.0 }));
-        // У Hp двусмысленность: один в кортеже отдельно, другой внутри PlayerBase
-        // Колонка одна — побеждает последний записанный (PlayerBase.hp = 80).
-        // Проверяем что все компоненты присутствуют
-        assert!(world.get::<Hp>(e).is_some());
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(80.0)));
         assert_eq!(world.get::<Armor>(e), Some(&Armor(30.0)));
         assert_eq!(world.get::<Team>(e), Some(&Team(2)));
+    }
+
+    /// A1: a component appearing both in the tuple AND inside a nested Bundle is
+    /// a duplicate — the old behavior silently built a phantom second column that
+    /// dropped through a null pointer on despawn. It must be rejected loudly.
+    #[test]
+    #[should_panic(expected = "duplicate component")]
+    fn bundle_duplicate_across_tuple_and_nested_bundle_panics() {
+        let mut world = World::new();
+        let _ = world.spawn((
+            Hp(200.0), // <- also inside PlayerBase below
+            PlayerBase {
+                pos: Pos { x: 7.0, y: 8.0 },
+                hp: Hp(80.0),
+            },
+            Armor(30.0),
+        ));
     }
 
     #[test]
@@ -3968,6 +4039,34 @@ mod hooks_and_added_tests {
         assert_eq!(world.resource::<HookLog>().added, spawned);
     }
 
+    /// A7: a panic in a user hook must not leave dispatch permanently disabled —
+    /// the guard resets the flag and clears the queue on unwind, so later hooks
+    /// still fire.
+    #[test]
+    fn panicking_hook_does_not_permanently_disable_dispatch() {
+        let mut world = log_world();
+        world.on_add::<Hp>(|_w, _e| panic!("boom in hook"));
+        world.on_add::<Armor>(|w, e| w.resource_mut::<HookLog>().added.push(e));
+
+        // Spawning Hp fires the panicking hook.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.spawn((Hp(1),));
+        }));
+        assert!(res.is_err(), "the on_add hook panicked");
+        assert!(
+            !world.hook_dispatch_active,
+            "dispatch flag must be reset after the panic (A7)"
+        );
+
+        // A later hook must still fire — dispatch is not permanently disabled.
+        let a = world.spawn((Armor(0),));
+        assert_eq!(
+            world.resource::<HookLog>().added,
+            vec![a],
+            "hooks must still work after a prior hook panicked"
+        );
+    }
+
     #[test]
     fn on_add_hook_can_do_structural_changes() {
         // Хук дотягивает Armor каждому, кто получил Hp (прообраз required
@@ -4176,5 +4275,87 @@ mod hooks_and_added_tests {
         world.flush_all_events();
         let mut reader = world.event_reader::<crate::events::Removed<Hp>>();
         assert_eq!(reader.read().iter().count(), 0);
+    }
+
+    // ── Soundness regressions (CORE_AUDIT wave 1) ──────────────
+
+    /// A1: a bundle listing the same component twice would build an archetype
+    /// with a phantom second column (`len=0, data=null`) that drops through a
+    /// null pointer on despawn. Must panic loudly at spawn instead.
+    #[test]
+    #[should_panic(expected = "duplicate component")]
+    fn spawn_duplicate_component_in_bundle_panics() {
+        let mut world = World::new();
+        let _ = world.spawn((Hp(1), Hp(2)));
+    }
+
+    /// B8: `insert_raw` copies `component.size` bytes from the buffer — a short
+    /// buffer would read past it (OOB). The length is validated loudly.
+    #[test]
+    #[should_panic(expected = "component size")]
+    fn insert_raw_wrong_size_panics() {
+        let mut world = World::new();
+        let cid = world.register_component::<Hp>();
+        let e = world.spawn((Armor(0),));
+        let tick = world.current_tick();
+        world.insert_raw(e, cid, vec![0u8; 1], tick); // Hp is 4 bytes
+    }
+
+    /// A9: `insert_raw` on a dead entity must run the component's drop_fn — the
+    /// bytes are a moved-out `T`; dropping the raw `Vec<u8>` alone would leak
+    /// `T`'s owned fields.
+    #[test]
+    fn insert_raw_on_dead_entity_drops_value_not_leaks() {
+        use std::sync::Arc;
+        struct DropComp(#[allow(dead_code)] Arc<()>);
+        impl Component for DropComp {}
+
+        let mut world = World::new();
+        let cid = world.register_component::<DropComp>();
+
+        let dead = world.spawn((Armor(0),));
+        world.despawn(dead); // handle is now stale → insert_raw takes the dead path
+
+        let probe = Arc::new(());
+        let comp = DropComp(probe.clone());
+        let size = std::mem::size_of::<DropComp>();
+        let bytes = unsafe {
+            let mut v = vec![0u8; size];
+            std::ptr::copy_nonoverlapping(&comp as *const DropComp as *const u8, v.as_mut_ptr(), size);
+            std::mem::forget(comp); // ownership moves into the bytes
+            v
+        };
+        assert_eq!(Arc::strong_count(&probe), 2);
+        let tick = world.current_tick();
+        world.insert_raw(dead, cid, bytes, tick);
+        assert_eq!(
+            Arc::strong_count(&probe),
+            1,
+            "insert_raw on a dead entity must drop the value, not leak it"
+        );
+    }
+
+    /// B4: a template that re-registers itself from inside its own `spawn` must
+    /// not free the handle underfoot. The registry hands out an `Arc` clone, so
+    /// the running template stays alive across the re-registration.
+    #[test]
+    fn template_can_reregister_itself_during_spawn() {
+        use crate::template::{EntityTemplate, TemplateParams};
+
+        struct SelfReplacing;
+        impl EntityTemplate for SelfReplacing {
+            fn spawn(&self, world: &mut World, _p: &TemplateParams) -> Entity {
+                // Replaces the map entry mid-spawn — with the old Box+raw-pointer
+                // path this dropped `self` underfoot (UAF).
+                world.register_template("t", SelfReplacing);
+                world.spawn((Hp(7),))
+            }
+        }
+
+        let mut world = World::new();
+        world.register_template("t", SelfReplacing);
+        let e = world.spawn_template("t").unwrap();
+        assert!(world.is_alive(e));
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(7)));
     }
 }
