@@ -705,10 +705,27 @@ impl Commands {
                     world.insert_raw(entity, component_id, data, tick);
                 }
                 Command::Despawn(entity) => {
-                    world.despawn(entity);
+                    // §0.2a (B7): a queued despawn whose target is already gone by
+                    // apply time (double-despawn, or a cascade removed it first)
+                    // silently no-ops. Surface it — the caller queued a despawn
+                    // that did nothing.
+                    if !world.despawn(entity) {
+                        crate::warn_once!(
+                            "Commands::despawn on dead entity {}:{} — no-op (already despawned?)",
+                            entity.index,
+                            entity.generation,
+                        );
+                    }
                 }
                 Command::SpawnFromTemplate { name, params } => {
-                    world.spawn_from_template(&name, &params);
+                    // §0.2a (B10): a queued spawn of an unregistered template name
+                    // (typo, or the template was never registered) silently spawns
+                    // nothing. Surface it.
+                    if world.spawn_from_template(&name, &params).is_none() {
+                        crate::warn_once!(
+                            "Commands::spawn_template(\"{name}\") — no template registered under that name; nothing spawned",
+                        );
+                    }
                 }
                 Command::Apply(f) => {
                     f(world);

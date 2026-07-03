@@ -903,6 +903,28 @@ impl World {
     /// необходимости создаётся (`ensure_record`) — нужно для зарезервированных id, опередивших flush;
     /// для прямого `spawn` (аллокатор уже создал запись) это no-op.
     fn spawn_at<B: Bundle>(&mut self, entity: Entity, bundle: B) {
+        // §0.2a (A10): spawning onto an entity that is ALREADY located would
+        // orphan its current row (a phantom duplicate that later iterations walk
+        // over uninitialised/stale storage). Reserved-but-unflushed ids are
+        // location-less, so they pass; only a genuinely live entity trips this.
+        // In debug it is a hard error (developer bug); in release we refuse
+        // loudly and drop `bundle` rather than corrupt storage.
+        if self.entities.get_location(entity).is_some() {
+            #[cfg(debug_assertions)]
+            panic!(
+                "spawn_at on already-live entity {}:{} — would orphan its row",
+                entity.index, entity.generation,
+            );
+            #[cfg(not(debug_assertions))]
+            {
+                crate::warn_once!(
+                    "World::spawn_at on already-live entity {}:{} — refused (bundle dropped) to avoid orphaning its row",
+                    entity.index,
+                    entity.generation,
+                );
+                return;
+            }
+        }
         self.entities.ensure_record(entity.index());
         let ids = bundle.component_ids(&mut self.registry);
         if ids.is_empty() {
@@ -1216,7 +1238,18 @@ impl World {
         let component_id = self.registry.get_or_register::<T>();
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None => {
+                // §0.2a: inserting into a dead entity is a no-op — `component` is
+                // dropped here (no leak), but the write is silently lost. Surface
+                // it so the caller learns the entity was already despawned.
+                crate::warn_once!(
+                    "World::insert::<{}> on dead entity {}:{} — component dropped, not inserted",
+                    std::any::type_name::<T>(),
+                    entity.index,
+                    entity.generation,
+                );
+                return;
+            }
         };
         let current_idx = location.archetype_id.0 as usize;
 
@@ -1295,6 +1328,12 @@ impl World {
                 // `Vec<u8>` would free the buffer without running `T::drop`,
                 // leaking owned fields (String/Arc/Vec). Run drop_fn so ownership
                 // is honored exactly once (A9); the column never received a copy.
+                // §0.2a: the insert is silently lost — surface the dead-entity hit.
+                crate::warn_once!(
+                    "World::insert_raw for {component_id:?} on dead entity {}:{} — data dropped, not inserted",
+                    entity.index,
+                    entity.generation,
+                );
                 if !data.is_empty() {
                     if let Some(info) = self.registry.get_info(component_id) {
                         // `data` is a `Vec<u8>` (alignment 1), but `drop_fn` runs
@@ -1378,7 +1417,18 @@ impl World {
     ) -> bool {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return false,
+            None => {
+                // §0.2a: batch insert onto a dead entity — the caller owns the
+                // payloads and frees them (see `apply_insert_group`), but the
+                // write is lost. Surface the dead-entity hit.
+                crate::warn_once!(
+                    "World::insert_parts on dead entity {}:{} — {} component(s) dropped, not inserted",
+                    entity.index,
+                    entity.generation,
+                    parts.len(),
+                );
+                return false;
+            }
         };
 
         // Финальный архетип — цепочкой add_edges, БЕЗ перемещения данных.
@@ -1428,7 +1478,15 @@ impl World {
     pub(crate) fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return,
+            None => {
+                // §0.2a: remove targeting a dead entity is a no-op — surface it.
+                crate::warn_once!(
+                    "World::remove_raw for {component_id:?} on dead entity {}:{} — no-op",
+                    entity.index,
+                    entity.generation,
+                );
+                return;
+            }
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
             return;
@@ -1456,7 +1514,18 @@ impl World {
         };
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
-            None => return false,
+            None => {
+                // §0.2a: remove targeting a dead entity is a no-op. `false` is
+                // returned (as for "component absent"), but most callers ignore
+                // it — surface the dead-entity case explicitly.
+                crate::warn_once!(
+                    "World::remove::<{}> on dead entity {}:{} — no-op",
+                    std::any::type_name::<T>(),
+                    entity.index,
+                    entity.generation,
+                );
+                return false;
+            }
         };
         if !self.archetypes[location.archetype_id.0 as usize].has_component(component_id) {
             return false;
@@ -4493,5 +4562,119 @@ mod hooks_and_added_tests {
         let e = world.spawn_template("t").unwrap();
         assert!(world.is_alive(e));
         assert_eq!(world.get::<Hp>(e), Some(&Hp(7)));
+    }
+}
+
+#[cfg(test)]
+mod loudness_wave4 {
+    //! Regression tests for the wave-4 §0.2a loudness pass: misuse paths that
+    //! used to be silent no-ops now surface a throttled `warn_once!`, and the
+    //! A10 re-spawn footgun refuses instead of orphaning a row.
+    use super::*;
+    use crate::commands::Commands;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Debug, PartialEq)]
+    struct Comp(u32);
+    impl Component for Comp {}
+
+    // ── Capturing logger (Warn level), keyed by unique markers ─────────────
+    // `warn_once!` fires once per process per call site, so tests can't rely on
+    // ordering — instead each assertion greps for a marker only it emits.
+    static LOG_BUF: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    fn log_buf() -> &'static Mutex<Vec<String>> {
+        LOG_BUF.get_or_init(|| Mutex::new(Vec::new()))
+    }
+    struct CapLogger;
+    impl log::Log for CapLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record) {
+            if r.level() == log::Level::Warn {
+                log_buf().lock().unwrap().push(r.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+    static CAP_LOGGER: CapLogger = CapLogger;
+    fn install_logger() {
+        static INIT: OnceLock<bool> = OnceLock::new();
+        INIT.get_or_init(|| {
+            log::set_max_level(log::LevelFilter::Warn);
+            log::set_logger(&CAP_LOGGER).is_ok()
+        });
+    }
+    fn count(needle: &str) -> usize {
+        log_buf()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    }
+
+    /// `warn_once!` emits exactly once per call site regardless of hit count.
+    #[test]
+    fn warn_once_throttles_to_single_emission() {
+        install_logger();
+        for _ in 0..8 {
+            crate::warn_once!("APEX_LOUD_MARKER_c1p7 repeated");
+        }
+        assert_eq!(
+            count("APEX_LOUD_MARKER_c1p7"),
+            1,
+            "warn_once must fire at most once per call site"
+        );
+    }
+
+    /// A10 (debug): spawning onto an already-live entity is rejected by the
+    /// guard. Without it, the second spawn silently orphans the entity's row.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "already-live")]
+    fn a10_spawn_at_on_live_entity_is_rejected() {
+        let mut world = World::new();
+        let e = world.spawn((Comp(1),));
+        world.spawn_reserved(e, (Comp(2),));
+    }
+
+    /// A10 (release): the guard refuses without corrupting the world — the live
+    /// entity keeps its original component and the entity count is unchanged.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn a10_spawn_at_on_live_entity_refused_release() {
+        let mut world = World::new();
+        let e = world.spawn((Comp(1),));
+        let before = world.entity_count();
+        world.spawn_reserved(e, (Comp(2),));
+        assert_eq!(world.entity_count(), before);
+        assert_eq!(world.get::<Comp>(e), Some(&Comp(1)));
+    }
+
+    /// B7: a double-despawn queued in Commands applies cleanly — the second
+    /// despawn is a no-op and leaves the world consistent.
+    #[test]
+    fn b7_commands_double_despawn_is_clean_noop() {
+        let mut world = World::new();
+        let e = world.spawn((Comp(1),));
+        let mut cmds = Commands::new();
+        cmds.despawn(e);
+        cmds.despawn(e);
+        cmds.apply(&mut world);
+        assert!(!world.is_alive(e));
+        assert_eq!(world.entity_count(), 0);
+    }
+
+    /// B10: a queued spawn of an unregistered template name spawns nothing and
+    /// does not disturb the world.
+    #[test]
+    fn b10_commands_unknown_template_spawns_nothing() {
+        let mut world = World::new();
+        let before = world.entity_count();
+        let mut cmds = Commands::new();
+        cmds.spawn_template("does-not-exist");
+        cmds.apply(&mut world);
+        assert_eq!(world.entity_count(), before);
     }
 }

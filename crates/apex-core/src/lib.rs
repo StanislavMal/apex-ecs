@@ -17,6 +17,25 @@
 // типах ВНУТРИ самого apex-core (transform и пр.).
 extern crate self as apex_core;
 
+/// Emit a `log::warn!` at most once per call site (§0.2a "loud, not silent").
+///
+/// Misuse paths — operating on a dead entity, an unknown template name, a
+/// dropped component — must be surfaced, but they can recur every frame and
+/// would flood the log. This macro logs the first hit at a given call site and
+/// suppresses the rest (a per-site `AtomicBool` latch, `Relaxed` — no ordering
+/// requirement, we only need eventual single emission). Mirrors Bevy's
+/// `warn_once!`. Re-exported so downstream crates share one loudness style.
+#[macro_export]
+macro_rules! warn_once {
+    ($($arg:tt)*) => {{
+        static WARNED: ::std::sync::atomic::AtomicBool =
+            ::std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, ::std::sync::atomic::Ordering::Relaxed) {
+            ::log::warn!($($arg)*);
+        }
+    }};
+}
+
 pub mod access;
 pub mod archetype;
 pub mod commands;

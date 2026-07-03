@@ -144,8 +144,17 @@ impl TemplateParams {
         let name = P::component_type_name();
         if !name.is_empty() {
             self.type_names.insert(type_id, name.to_string());
-            if let Ok(json) = serde_json::to_value(&value) {
-                self.json_overrides.insert(type_id, json);
+            match serde_json::to_value(&value) {
+                Ok(json) => {
+                    self.json_overrides.insert(type_id, json);
+                }
+                // §0.2a (B10): a param that fails to serialise silently produced
+                // no override — the prefab would spawn with the default value and
+                // the caller's `.set(...)` would look ignored. Surface it.
+                Err(e) => crate::warn_once!(
+                    "TemplateParams::set::<{}>: value failed to serialise ({e}) — override for '{name}' dropped",
+                    std::any::type_name::<P>(),
+                ),
             }
         }
         self.params.insert(type_id, Box::new(value));
