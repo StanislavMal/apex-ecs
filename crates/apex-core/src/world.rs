@@ -475,6 +475,57 @@ impl World {
         self.registry.register_serde_with::<T>(fns)
     }
 
+    /// Зарегистрировать ремап Entity-ссылок компонента `T` (E6): при `restore`
+    /// snapshot старые Entity-id ВНУТРИ `T` (напр. `Target(Entity)`) обновляются
+    /// на новые вторым проходом restore через [`MapEntities::map_entities`]. Без
+    /// этого Entity-ссылки после restore указывают в пустоту.
+    pub fn register_map_entities<T: Component + crate::component::MapEntities>(
+        &mut self,
+    ) -> ComponentId {
+        let id = self.registry.get_or_register::<T>();
+        let map_fn: crate::component::MapEntitiesFn = |ptr, f| {
+            // SAFETY: `ptr` is a valid `*mut T` of a live component (restore contract).
+            let val = unsafe { &mut *(ptr as *mut T) };
+            val.map_entities(f);
+        };
+        self.registry.set_map_entities(id, map_fn);
+        id
+    }
+
+    /// E6: ремапнуть Entity-ссылки внутри всех компонентов `entity`, которые
+    /// зарегистрировали [`MapEntitiesFn`](crate::component::MapEntitiesFn), через
+    /// `f`. Вызывается `restore` ПОСЛЕ построения полной карты old→new (в т.ч.
+    /// forward-ссылки). No-op для мёртвой entity / компонентов без ремапа.
+    pub fn map_entity_refs(&mut self, entity: Entity, f: &mut dyn FnMut(Entity) -> Entity) {
+        let Some(loc) = self.entities.get_location(entity) else {
+            return;
+        };
+        let arch_idx = loc.archetype_id.0 as usize;
+        let row = loc.row as usize;
+        // Snapshot (component_id, map_fn) first — avoids holding a shared borrow
+        // of the archetype while taking a mutable one below.
+        let mapped: SmallVec<[(ComponentId, crate::component::MapEntitiesFn); 8]> = self.archetypes
+            [arch_idx]
+            .component_ids
+            .iter()
+            .filter_map(|&cid| {
+                self.registry
+                    .get_info(cid)
+                    .and_then(|i| i.map_entities)
+                    .map(|mf| (cid, mf))
+            })
+            .collect();
+        for (cid, map_fn) in mapped {
+            let arch = &mut self.archetypes[arch_idx];
+            if let Some(col_idx) = arch.column_index(cid) {
+                // SAFETY: `row` is live in this archetype; `map_fn` was registered
+                // for the type stored in column `cid`.
+                let ptr = unsafe { arch.columns[col_idx].get_ptr(row) };
+                unsafe { map_fn(ptr, f) };
+            }
+        }
+    }
+
     // ── Хуки состава (W3-1) ────────────────────────────────────
 
     /// Зарегистрировать `on_add`-хук компонента `T`: вызывается после того,
@@ -4814,5 +4865,30 @@ mod wave6_bundle {
         for (i, &e) in entities.iter().enumerate() {
             assert_eq!(world.get::<C>(e), Some(&C(i as u32)));
         }
+    }
+
+    /// E6: `map_entity_refs` rewrites the registered component's Entity fields in
+    /// place through the raw `MapEntitiesFn` path (Miri-checked unsafe).
+    #[test]
+    fn e6_map_entity_refs_remaps_in_place() {
+        #[derive(Debug, PartialEq)]
+        struct Link(Entity);
+        impl Component for Link {}
+        impl crate::component::MapEntities for Link {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        world.register_map_entities::<Link>();
+        let a = world.spawn(());
+        let b = world.spawn(());
+        let e = world.spawn((Link(a),));
+        assert_eq!(world.get::<Link>(e).unwrap().0, a);
+
+        let mut remap = |old: Entity| if old == a { b } else { old };
+        world.map_entity_refs(e, &mut remap);
+        assert_eq!(world.get::<Link>(e).unwrap().0, b, "ref remapped a -> b");
     }
 }

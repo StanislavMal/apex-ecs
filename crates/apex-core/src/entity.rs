@@ -1,5 +1,8 @@
 /// Entity — generational index.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// `Serialize`/`Deserialize` so components holding `Entity` refs can be
+/// snapshotted; on restore those refs are remapped via [`MapEntities`](crate::MapEntities) (E6).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Entity {
     pub(crate) index: u32,
     pub(crate) generation: u32,

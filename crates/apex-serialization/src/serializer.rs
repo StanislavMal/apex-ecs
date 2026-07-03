@@ -286,6 +286,21 @@ impl WorldSerializer {
             }
         }
 
+        // ── Шаг 1.5: E6 — ремап Entity-ссылок внутри компонентов ───
+        // Карта old→new теперь ПОЛНА (все entity созданы, forward-ссылки тоже),
+        // поэтому обновляем Entity-поля компонентов (напр. `Target(Entity)`),
+        // зарегистрировавших `MapEntities`. Внешние (не из snapshot) ссылки
+        // остаются как есть.
+        {
+            let new_entities: Vec<apex_core::Entity> = entity_map.values().copied().collect();
+            let mut remap = |old: apex_core::Entity| -> apex_core::Entity {
+                entity_map.get(&old.index()).copied().unwrap_or(old)
+            };
+            for e in new_entities {
+                world.map_entity_refs(e, &mut remap);
+            }
+        }
+
         // ── Шаг 2: Relations ───────────────────────────────────
         for rel_snap in &snapshot.relations {
             let subject = match entity_map.get(&rel_snap.subject_index) {
@@ -1069,6 +1084,47 @@ mod tests {
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
         assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
         assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
+    }
+
+    /// E6: a component holding an `Entity` ref is remapped on restore — the ref
+    /// points at the NEW entity, not the stale snapshot id.
+    #[test]
+    fn e6_map_entities_remaps_entity_refs_on_restore() {
+        use apex_core::{Entity, MapEntities};
+
+        #[derive(Component, Clone, Copy, Serialize, Deserialize)]
+        struct Target(Entity);
+        impl MapEntities for Target {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component_serde_json::<Target>();
+        world.register_map_entities::<Target>();
+        let a = world.spawn(());
+        let b = world.spawn(());
+        world.insert(a, Target(b)); // a.target -> b
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Restore into a world whose fresh ids differ (decoys shift them).
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<Target>();
+        w2.register_map_entities::<Target>();
+        for _ in 0..3 {
+            w2.spawn(());
+        }
+        let map = WorldSerializer::restore(&mut w2, &snap).unwrap();
+
+        let a2 = map[&a.index()];
+        let b2 = map[&b.index()];
+        let target = w2.get::<Target>(a2).expect("Target restored");
+        assert_eq!(target.0, b2, "Entity ref must be remapped to the new b");
+        assert_ne!(
+            target.0, b,
+            "the stale snapshot id must not survive (decoys shifted ids)"
+        );
     }
 
     /// Relations diff (O(R) HashSet path): a removed and an added relation are

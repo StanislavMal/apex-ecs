@@ -141,6 +141,33 @@ pub struct ComponentSerdeFns {
     pub format: &'static str,
 }
 
+/// Ремап `Entity`-ссылок ВНУТРИ компонента (E6, MapEntities-аналог Bevy). После
+/// `restore` snapshot все старые `Entity` пересоздаются с НОВЫМИ id; компонент,
+/// хранящий `Entity` (напр. `Target(Entity)`), обязан обновить свои ссылки, иначе
+/// они указывают в пустоту. Вызывается ВТОРЫМ проходом restore, когда карта
+/// old→new полна (в т.ч. forward-ссылки).
+///
+/// # Safety
+/// `ptr` — валидный `*mut T` живого компонента этого типа; `f` применяется к
+/// каждой `Entity`-ссылке и возвращает её новый id.
+pub type MapEntitiesFn = unsafe fn(*mut u8, f: &mut dyn FnMut(crate::Entity) -> crate::Entity);
+
+/// Компонент, хранящий `Entity`-ссылки, которые нужно ремапить при restore
+/// snapshot (E6). Регистрируется через
+/// [`World::register_map_entities`](crate::World::register_map_entities).
+///
+/// ```ignore
+/// struct Target(Entity);
+/// impl MapEntities for Target {
+///     fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+///         self.0 = f(self.0);
+///     }
+/// }
+/// ```
+pub trait MapEntities {
+    fn map_entities(&mut self, f: &mut dyn FnMut(crate::Entity) -> crate::Entity);
+}
+
 // ── Хуки компонентов (W3-1) ────────────────────────────────────
 
 /// Хук состава: вызывается ПОСЛЕ завершения структурной операции, когда мир
@@ -192,6 +219,9 @@ pub struct ComponentInfo {
     /// Функции сериализации — `None` если компонент не помечен как Serializable.
     /// Заполняется при вызове `register_component_serde::<T>()`.
     pub serde: Option<ComponentSerdeFns>,
+    /// Ремап Entity-ссылок при restore (E6) — `None`, если компонент их не
+    /// хранит. Заполняется `register_map_entities::<T>()`.
+    pub map_entities: Option<MapEntitiesFn>,
 }
 
 // ── Component trait ────────────────────────────────────────────
@@ -420,6 +450,7 @@ impl ComponentRegistry {
                 align: std::mem::align_of::<T>(),
                 drop_fn: drop_ptr::<T>,
                 serde: None,
+                map_entities: None,
             },
         );
         self.type_to_id.insert(type_id, id);
@@ -455,6 +486,14 @@ impl ComponentRegistry {
             info.serde = Some(fns);
         }
         id
+    }
+
+    /// Установить [`MapEntitiesFn`] компонента (E6). Компонент должен быть уже
+    /// зарегистрирован (`id` из `get_or_register`).
+    pub(crate) fn set_map_entities(&mut self, id: ComponentId, f: MapEntitiesFn) {
+        if let Some(info) = self.by_id.get_mut(&id.0) {
+            info.map_entities = Some(f);
+        }
     }
 
     /// Зарегистрировать компонент с поддержкой сериализации (JSON-формат).
