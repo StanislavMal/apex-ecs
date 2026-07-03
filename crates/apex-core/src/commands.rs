@@ -19,6 +19,11 @@ struct CommandArena {
     data: *mut u8,
     capacity: usize,
     cursor: usize,
+    /// Alignment the current backing allocation was made with — a running max of
+    /// every payload alignment seen. The base MUST honor the strictest payload
+    /// alignment: `base + offset` is only aligned when `base` is a multiple of
+    /// the payload's alignment, even though `offset` is a multiple of it too.
+    align: usize,
 }
 
 impl CommandArena {
@@ -27,6 +32,7 @@ impl CommandArena {
             data: std::ptr::null_mut(),
             capacity: 0,
             cursor: 0,
+            align: mem::align_of::<usize>(),
         }
     }
 
@@ -42,6 +48,12 @@ impl CommandArena {
     fn alloc<T>(&mut self, val: T) -> u32 {
         let align = mem::align_of::<T>();
         let size = mem::size_of::<T>();
+        // A payload stricter than the current base alignment forces a realloc so
+        // the base honors it (glam's SIMD types are 16-aligned; the old fixed
+        // 8-byte base produced misaligned reads/writes for `cmd.spawn((Transform,…))`).
+        if align > self.align {
+            self.reallocate(self.capacity, align);
+        }
         if size == 0 {
             return 0;
         }
@@ -49,23 +61,7 @@ impl CommandArena {
         let end = start + size;
         if end > self.capacity {
             let new_cap = end.max(self.capacity * 2).max(4096);
-            let new_data = unsafe {
-                let ptr =
-                    alloc(Layout::from_size_align(new_cap, mem::align_of::<usize>()).unwrap());
-                assert!(!ptr.is_null(), "CommandArena allocation failed");
-                ptr
-            };
-            if !self.data.is_null() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(self.data, new_data, self.cursor);
-                    dealloc(
-                        self.data,
-                        Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap(),
-                    );
-                }
-            }
-            self.data = new_data;
-            self.capacity = new_cap;
+            self.reallocate(new_cap, self.align);
         }
         let ptr = unsafe { self.data.add(start) as *mut T };
         unsafe {
@@ -75,9 +71,35 @@ impl CommandArena {
         start as u32
     }
 
+    /// (Re)allocate the backing buffer to hold at least `new_cap` bytes with
+    /// alignment `new_align` (>= current), preserving the first `self.cursor`
+    /// bytes. Both `new_cap >= self.cursor` and power-of-two `new_align` hold.
+    fn reallocate(&mut self, new_cap: usize, new_align: usize) {
+        let new_size = new_cap.max(self.cursor).max(1);
+        let layout =
+            Layout::from_size_align(new_size, new_align).expect("CommandArena: layout overflow");
+        let new_data = unsafe { alloc(layout) };
+        assert!(!new_data.is_null(), "CommandArena allocation failed");
+        if !self.data.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data, new_data, self.cursor);
+                dealloc(
+                    self.data,
+                    Layout::from_size_align(self.capacity, self.align).unwrap(),
+                );
+            }
+        }
+        self.data = new_data;
+        self.capacity = new_size;
+        self.align = new_align;
+    }
+
     fn get_ptr(&self, offset: u32) -> *mut u8 {
         if self.data.is_null() {
-            return std::ptr::NonNull::<u8>::dangling().as_ptr();
+            // Empty arena (only align-<=self.align ZST payloads were "stored"):
+            // return a non-null pointer aligned to `self.align` so ZST reads —
+            // which never touch memory — still satisfy the alignment contract.
+            return std::ptr::without_provenance_mut(self.align);
         }
         unsafe { self.data.add(offset as usize) }
     }
@@ -93,7 +115,7 @@ impl Drop for CommandArena {
             unsafe {
                 dealloc(
                     self.data,
-                    Layout::from_size_align(self.capacity, mem::align_of::<usize>()).unwrap(),
+                    Layout::from_size_align(self.capacity, self.align).unwrap(),
                 );
             }
         }
@@ -448,7 +470,12 @@ impl Commands {
     /// Выполняется отложенно при `apply()` — безопасно в параллельных системах.
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
-            // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
+            // A plain fn pointer cannot capture `_kind`, so the ZST value is
+            // rematerialized. SAFETY: the const assert enforces R is a ZST, for
+            // which `zeroed` is the unique (trivially valid) value; a non-ZST
+            // RelationKind would zero a real value (e.g. a null reference = UB),
+            // so it is a compile error rather than a silent footgun.
+            const { assert!(std::mem::size_of::<R>() == 0, "RelationKind must be a zero-sized type") };
             let kind: R = unsafe { std::mem::zeroed() };
             world.add_relation(subject, kind, target);
         }
@@ -464,7 +491,8 @@ impl Commands {
     /// Выполняется отложенно при `apply()`.
     pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         fn apply<R: RelationKind>(world: &mut World, subject: Entity, target: Entity) {
-            // SAFETY: R is a ZST (all RelationKind impls are unit structs with Copy)
+            // See `add_relation`: const assert makes the ZST rematerialization sound.
+            const { assert!(std::mem::size_of::<R>() == 0, "RelationKind must be a zero-sized type") };
             let kind: R = unsafe { std::mem::zeroed() };
             world.remove_relation(subject, kind, target);
         }
@@ -481,11 +509,11 @@ impl Commands {
     pub fn add_relation_batch<R: RelationKind + Send + 'static>(
         &mut self,
         subjects: Vec<Entity>,
-        _kind: R,
+        kind: R,
         target: Entity,
     ) {
+        // The closure can capture `kind` (RelationKind: Copy), so no `zeroed`.
         self.add(move |world| {
-            let kind: R = unsafe { std::mem::zeroed() };
             world.add_relation_batch(&subjects, kind, target);
         });
     }
@@ -1387,5 +1415,69 @@ mod tests {
 
         let vel = world.get::<Vel>(entity).unwrap();
         assert_eq!(vel.0, 5.0);
+    }
+
+    // ── Arena alignment (B1) ───────────────────────────────────
+
+    #[repr(align(16))]
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Aligned16([f32; 4]);
+    impl Component for Aligned16 {}
+
+    /// Direct arena check: a 16-aligned payload placed after a 1-aligned one must
+    /// still come back 16-aligned. Deterministic (no Miri needed): `align_offset`
+    /// is exact. On the pre-fix 8-aligned base this returned a base ≡ 8 (mod 16).
+    #[test]
+    fn arena_honors_payload_alignment_over_eight() {
+        let mut arena = CommandArena::new();
+        // A 1-byte payload first, so the next 16-aligned one lands at a non-trivial base.
+        let _o0 = arena.alloc::<u8>(0xAB);
+        let o16 = arena.alloc::<Aligned16>(Aligned16([1.0, 2.0, 3.0, 4.0]));
+        let ptr = arena.get_ptr(o16);
+        assert_eq!(
+            ptr.align_offset(16),
+            0,
+            "16-aligned payload must be stored at a 16-aligned address"
+        );
+        // Value round-trips through the read path apply() uses.
+        let v = unsafe { std::ptr::read(ptr as *const Aligned16) };
+        assert_eq!(v, Aligned16([1.0, 2.0, 3.0, 4.0]));
+    }
+
+    /// Growing the alignment mid-stream must relocate earlier payloads to a base
+    /// that still honors their (smaller) alignment.
+    #[test]
+    fn arena_alignment_growth_preserves_earlier_payloads() {
+        let mut arena = CommandArena::new();
+        let o_a = arena.alloc::<u64>(0x0102_0304_0506_0708);
+        let o_b = arena.alloc::<Aligned16>(Aligned16([9.0, 8.0, 7.0, 6.0])); // forces base to 16
+        let pa = arena.get_ptr(o_a);
+        let pb = arena.get_ptr(o_b);
+        assert_eq!(pa.align_offset(8), 0);
+        assert_eq!(pb.align_offset(16), 0);
+        assert_eq!(unsafe { std::ptr::read(pa as *const u64) }, 0x0102_0304_0506_0708);
+        assert_eq!(
+            unsafe { std::ptr::read(pb as *const Aligned16) },
+            Aligned16([9.0, 8.0, 7.0, 6.0])
+        );
+    }
+
+    /// End-to-end: an over-aligned component travels through the Commands arena
+    /// (spawn + insert) and lands in the world intact. Under Miri this exercises
+    /// the arena's alignment contract on the real apply path.
+    #[test]
+    fn commands_spawn_and_insert_over_aligned_component() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+
+        let e = cmds.spawn((Pos(1.0), Aligned16([1.0, 2.0, 3.0, 4.0]))).id();
+        cmds.apply(&mut world);
+        assert_eq!(world.get::<Aligned16>(e), Some(&Aligned16([1.0, 2.0, 3.0, 4.0])));
+
+        let e2 = world.spawn((Vel(0.0),));
+        cmds.insert(e2, Aligned16([5.0, 6.0, 7.0, 8.0]));
+        cmds.apply(&mut world);
+        assert_eq!(world.get::<Aligned16>(e2), Some(&Aligned16([5.0, 6.0, 7.0, 8.0])));
     }
 }
