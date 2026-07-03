@@ -43,7 +43,25 @@ apex-benc.txt) + .gitignore; план заведён в репо ядра; Miri-
   (волна 1 + волна 2). Изменения ядра поведение рендера не изменили. Движок собирается
   против ветки (apex-render build ок). Ветка готова к мержу/пушу (`core-audit-fixes`).
 
-**Волна 2 🔄 — КОРРЕКТНОСТЬ поведения (флагманские 🔴 закрыты; 6 фиксов + регресс-тесты):**
+**Волна 2 ✅ — КОРРЕКТНОСТЬ поведения (ВЫПОЛНЕНА 2026-07-03; 20 фиксов + регресс-тесты; 3
+агента параллелили независимые крейты). Гейт: воркспейс+примеры зелёные, clippy net-neutral,
+движок собирается, goldens 656/656 байт-идентично.**
+Дополнительно к 6 флагманам (ниже): D5 (ложный CircularDependency при обратном before) ·
+D7 (states: on_enter(initial) в Update + отказ двойного init_state) · D2 (empty-access система
+исполняется раз, не по чанкам) · D6 (change-окно не двигается на полностью run_if-пропущенной
+стадии) · E3 (Lua Box::leak → String-ключи) · E10 (Lua entity id «index:generation» с
+generation) · E4 (reapply префаба сохраняет N инстансов с parent/overrides) · E9 (watch_config
+регистрирует loader до первичной загрузки + настоящий дебаунс) · F7 (derive Scriptable
+tuple/enum компилируется+roundtrip) · F3 (Ctx-система = whole-world; whole-world конфликтует со
+всеми в конфликт-детекте) · F6 (второй query-параметр в system! = compile_error) · F2 (гонка
+Listen‖Listen: конкурентные читатели одного события сериализуются — SharedEventReaders) ·
+D4 (Filtered-индексы обновляются между стадиями в кадре) · C5 (задокументирован reparent-
+контракт; редактор уже компенсирует).
+**Отложено (не correctness): D9** (дедуп 3 копий исполнителя стадии — код-качество) ·
+**F4** (персистентные per-system курсоры событий — архитектурно, в волну 6 с borrow-моделью В1;
+F2 закрыл лишь гонку, семантика катчапа FixedUpdate/Removed<T> остаётся). **C2** — в волне 3.
+
+Флагманские 🔴 (6 фиксов + регресс-тесты):
 - `8c878f0` F1 (Events: при отстающем читателе новые события терялись для всех — layout
   `[old,new]` без сдвига курсоров).
 - `707fcb8` D1 (FixedUpdate: 2-я+ exec-стадия старвалась — обе исполнителя (run_hybrid_parallel
@@ -52,15 +70,10 @@ apex-benc.txt) + .gitignore; план заведён в репо ядра; Miri-
   отвергаются в add_relation_by_kind_idx + depth-guard в propagate против зависания).
 - `0e20a70` A7 (паника в хуке больше не заклинивает диспетчер хуков навсегда — RAII-guard).
 - `c1a4880` E5 (циклы Ref-префабов → CycleDetected вместо stack overflow; + depth-лимит).
-- **Гейт волны 2 (частичный):** весь воркспейс + примеры зелёные, clippy net-neutral,
-  **goldens движка 656/656 байт-идентично**.
-- **Остаток волны 2 (не начато):** D2+F3 (пустой access/Ctx footgun), D5 (ложный
-  CircularDependency при обратном before()), D6 (change-окно на пропущенной run_if-стадии),
-  D7 (states: on_enter(initial)/двойной init_state), D9+D4 (унификация исполнителя стадии),
-  C5 (reparent-dirty — проверить, компенсирует ли редактор), E3 (Lua Box::leak), E4 (reapply
-  per-instance префаба), E9 (watch_config регистрация loader'а), E10 (Lua id с generation),
-  F2+F4 (курсор-per-system Events — гонка Listen‖Listen), F6 (два query-параметра в system!),
-  F7 (Scriptable tuple/enum).
+- **Гейт волны 2 (ФИНАЛЬНЫЙ, пройден):** весь воркспейс + примеры зелёные, clippy net-neutral,
+  движок собирается против ветки, **goldens движка 656/656 байт-идентично** (рендер не изменён).
+  Все correctness/soundness-пункты волны 2 закрыты; отложены только D9 (косметика) и F4
+  (архитектурно, волна 6). Ветка `core-audit-fixes` (26 коммитов) готова к мержу/пушу.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
