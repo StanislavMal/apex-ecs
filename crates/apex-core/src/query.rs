@@ -99,6 +99,11 @@ pub unsafe trait WorldQuery: Sized {
     /// `last_run` — тик предыдущего запуска (для `Changed<T>`-фильтрации).
     /// `this_run` — текущий тик мира; `Write<T>`/`MaybeWrite<T>` стампят его в
     /// change-tick строки при `DerefMut` через возвращаемый `Mut<T>`.
+    ///
+    /// # Safety
+    /// `arch` must have matched this query (`matches_archetype`), and `ids` must
+    /// be this query's component-id list. The returned state holds raw pointers
+    /// into `arch` valid only until the next structural change.
     unsafe fn fetch_state(
         arch: &Archetype,
         ids: &[ComponentId],
@@ -106,6 +111,10 @@ pub unsafe trait WorldQuery: Sized {
         this_run: Tick,
     ) -> Self::State;
 
+    /// # Safety
+    /// `state` must come from [`fetch_state`](Self::fetch_state) on the same
+    /// archetype and `row` must be a valid row of it. For write-forms the row
+    /// must be accessed exclusively (no aliasing across parallel chunks).
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
     /// `true`, если `fetch_item` может вернуть `None` на НЕКОТОРЫХ строках уже
@@ -132,6 +141,11 @@ pub unsafe trait WorldQuery: Sized {
     /// строке). Дефолт делегирует в `fetch_item().unwrap_unchecked()`: для
     /// инфаллибельных форм оптимизатор инлайнит конструкцию `Some(..)` и
     /// устраняет Option целиком.
+    ///
+    /// # Safety
+    /// Same contract as [`fetch_item`](Self::fetch_item), AND
+    /// [`has_row_filter`](Self::has_row_filter) must be `false` for this shape —
+    /// otherwise the internal `unwrap_unchecked` hits a `None` (UB).
     #[inline(always)]
     unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
         Self::fetch_item(state, row).unwrap_unchecked()

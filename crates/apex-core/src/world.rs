@@ -2361,6 +2361,10 @@ unsafe impl Send for ParallelWorld<'_> {}
 unsafe impl Sync for ParallelWorld<'_> {}
 
 impl<'w> ParallelWorld<'w> {
+    /// # Safety
+    /// The caller must ensure no `&mut World` to the same world is live for the
+    /// duration of the returned `&'w World` (the scheduler guarantees this for
+    /// read-only parallel access).
     #[inline]
     pub unsafe fn get(&self) -> &'w World {
         &*self.world

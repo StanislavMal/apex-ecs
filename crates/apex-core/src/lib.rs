@@ -5,7 +5,6 @@
 // внутренним примитивам, чьи safety-контракты документированы на уровне типов.
 // Корректность важнее: `unsafe`-инварианты покрыты тестами и debug_assert.
 #![allow(
-    clippy::missing_safety_doc,    // внутренние storage-примитивы (Column и пр.)
     clippy::needless_range_loop,   // индексные циклы в горячих путях — намеренно
     clippy::nonminimal_bool,       // явные булевы выражения ради читаемости
     clippy::question_mark,         // явный if-let ради ясности control-flow

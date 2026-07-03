@@ -106,7 +106,8 @@ pub struct ResMut<'w, T: Send + Sync + 'static> {
 }
 
 impl<'w, T: Send + Sync + 'static> ResMut<'w, T> {
-    /// # Safety: ptr валиден на 'w, уникальный доступ гарантирован планировщиком.
+    /// # Safety
+    /// `ptr` is valid for `'w`; the scheduler guarantees exclusive access.
     pub unsafe fn from_ptr(ptr: *mut T) -> Self {
         Self {
             ptr,
@@ -201,7 +202,8 @@ pub struct EventWriter<'w, T: Send + Sync + 'static> {
 }
 
 impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
-    /// # Safety: ptr валиден на 'w, уникальный доступ гарантирован планировщиком.
+    /// # Safety
+    /// `ptr` is valid for `'w`; the scheduler guarantees exclusive access.
     pub unsafe fn from_ptr(ptr: *mut Events<T>) -> Self {
         Self {
             ptr,
