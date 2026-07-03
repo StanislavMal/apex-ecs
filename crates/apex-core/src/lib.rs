@@ -5,7 +5,6 @@
 // внутренним примитивам, чьи safety-контракты документированы на уровне типов.
 // Корректность важнее: `unsafe`-инварианты покрыты тестами и debug_assert.
 #![allow(
-    clippy::missing_safety_doc,    // внутренние storage-примитивы (Column и пр.)
     clippy::needless_range_loop,   // индексные циклы в горячих путях — намеренно
     clippy::nonminimal_bool,       // явные булевы выражения ради читаемости
     clippy::question_mark,         // явный if-let ради ясности control-flow
@@ -16,6 +15,25 @@
 // Позволяет `#[derive(Component)]` (эмитит пути `::apex_core::…`) работать на
 // типах ВНУТРИ самого apex-core (transform и пр.).
 extern crate self as apex_core;
+
+/// Emit a `log::warn!` at most once per call site (§0.2a "loud, not silent").
+///
+/// Misuse paths — operating on a dead entity, an unknown template name, a
+/// dropped component — must be surfaced, but they can recur every frame and
+/// would flood the log. This macro logs the first hit at a given call site and
+/// suppresses the rest (a per-site `AtomicBool` latch, `Relaxed` — no ordering
+/// requirement, we only need eventual single emission). Mirrors Bevy's
+/// `warn_once!`. Re-exported so downstream crates share one loudness style.
+#[macro_export]
+macro_rules! warn_once {
+    ($($arg:tt)*) => {{
+        static WARNED: ::std::sync::atomic::AtomicBool =
+            ::std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, ::std::sync::atomic::Ordering::Relaxed) {
+            ::log::warn!($($arg)*);
+        }
+    }};
+}
 
 pub mod access;
 pub mod archetype;
@@ -29,7 +47,6 @@ pub mod par_utils;
 pub mod query;
 pub mod relations;
 pub mod resources;
-pub mod storage;
 pub mod sub_world;
 pub mod system_macro;
 pub mod system_param;

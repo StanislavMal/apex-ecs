@@ -1,78 +1,10 @@
 use std::any::TypeId;
 
-/// Битовая маска компонентов — до 512 компонентов (8 × u64 = 512 бит).
-///
-/// Заменяет `Vec<TypeId>` в AccessDescriptor для O(1) операций:
-/// - `contains` → бит-проверка vs O(N) linear scan
-/// - `conflicts_with` → битовый AND vs двойной linear scan
-/// - `merge` → битовый OR vs dedup loop
-///
-/// Размер 64 байта = одна кэш-линия на x86-64, что минимизирует промахи.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct ComponentMask {
-    bits: [u64; 8], // 8 × 64 = 512 бит
-}
-
-impl ComponentMask {
-    pub const EMPTY: Self = Self { bits: [0u64; 8] };
-
-    const MASK_64: u64 = 0x3F; // маска для idx % 64
-
-    #[inline]
-    fn word_idx(idx: u16) -> usize {
-        (idx >> 6) as usize // idx / 64
-    }
-
-    #[inline]
-    fn bit_idx(idx: u16) -> u64 {
-        1u64 << (idx as u64 & Self::MASK_64)
-    }
-
-    #[inline]
-    pub fn set(&mut self, idx: u16) {
-        self.bits[Self::word_idx(idx)] |= Self::bit_idx(idx);
-    }
-
-    #[inline]
-    pub fn get(&self, idx: u16) -> bool {
-        self.bits[Self::word_idx(idx)] & Self::bit_idx(idx) != 0
-    }
-
-    #[inline]
-    pub fn and(&self, other: &Self) -> Self {
-        let mut bits = [0u64; 8];
-        for i in 0..8 {
-            bits[i] = self.bits[i] & other.bits[i];
-        }
-        Self { bits }
-    }
-
-    #[inline]
-    pub fn or(&self, other: &Self) -> Self {
-        let mut bits = [0u64; 8];
-        for i in 0..8 {
-            bits[i] = self.bits[i] | other.bits[i];
-        }
-        Self { bits }
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.bits.iter().all(|&b| b == 0)
-    }
-
-    /// Пересекается ли маска с другой?
-    #[inline]
-    pub fn overlaps(&self, other: &Self) -> bool {
-        for i in 0..8 {
-            if self.bits[i] & other.bits[i] != 0 {
-                return true;
-            }
-        }
-        false
-    }
-}
-
+// ComponentMask (512-bit O(1) conflict mask) removed in the wave-4 dead-code
+// pass: `assign_masks` was never called, so the masks stayed EMPTY and
+// `conflicts_with` always took the linear-scan fallback — the whole mask
+// fast-path (struct, fields, assign_masks, conflicts_with_fast) was dead (C8).
+//
 // ArchetypeMask (фикс 1024 бита) удалена в CR-M4: единственным живым
 // потребителем был exclude_mask в Query::new (избыточен после CR-M2 —
 // Without корректно фильтруется в matches_archetype), а за пределом 1024
@@ -80,9 +12,9 @@ impl ComponentMask {
 
 /// Декларация Read/Write доступа системы к данным мира.
 ///
-/// Использует два уровня представления:
-/// - `TypeId` вектора — для регистрации компонентов/событий (до первого compile)
-/// - `ComponentMask` — для O(1) проверки конфликтов после назначения индексов
+/// Хранит `TypeId`-векторы читаемых/записываемых компонентов и событий.
+/// Конфликты между системами определяются линейным сравнением этих векторов
+/// (число компонентов на систему мало).
 ///
 /// Правила конфликтов — аналог Rust borrow checker:
 /// - Write + Read  → конфликт
@@ -102,9 +34,6 @@ pub struct AccessDescriptor {
     pub reads_event: Vec<(TypeId, &'static str)>,
     /// Типы событий, которые система пишет (TypeId, имя_типа).
     pub writes_event: Vec<(TypeId, &'static str)>,
-    /// Битовые маски — заполняются планировщиком через `assign_masks`.
-    pub read_mask: ComponentMask,
-    pub write_mask: ComponentMask,
     /// Флаг: система использует `par_for_each` внутри себя.
     /// Планировщик не будет чанковать такую систему через ASD
     /// (избегает oversubscribe rayon thread pool).
@@ -220,9 +149,6 @@ impl AccessDescriptor {
         Self::dedup_push(&mut self.writes, &other.writes);
         Self::dedup_push_event(&mut self.reads_event, &other.reads_event);
         Self::dedup_push_event(&mut self.writes_event, &other.writes_event);
-        // Маски сливаем битовым OR
-        self.read_mask = self.read_mask.or(&other.read_mask);
-        self.write_mask = self.write_mask.or(&other.write_mask);
         // Передаём флаг par_for_each
         self.uses_par_for_each = self.uses_par_for_each || other.uses_par_for_each;
         self.needs_whole_world = self.needs_whole_world || other.needs_whole_world;
@@ -240,53 +166,12 @@ impl AccessDescriptor {
         self
     }
 
-    /// Назначить битовые маски на основе маппинга TypeId → индекс компонента.
+    /// O(N) проверка конфликта данных линейным сравнением write/read-векторов.
     ///
-    /// Вызывается планировщиком один раз после регистрации всех компонентов.
-    /// После этого `conflicts_with_fast` даёт O(1) проверку.
-    pub fn assign_masks(&mut self, type_to_idx: &std::collections::HashMap<TypeId, u16>) {
-        self.read_mask = ComponentMask::EMPTY;
-        self.write_mask = ComponentMask::EMPTY;
-        for tid in &self.reads {
-            if let Some(&idx) = type_to_idx.get(tid) {
-                self.read_mask.set(idx);
-            }
-        }
-        for tid in &self.writes {
-            if let Some(&idx) = type_to_idx.get(tid) {
-                self.write_mask.set(idx);
-            }
-        }
-        // Освобождаем векторы — после назначения масок они больше не нужны.
-        // Маски содержат всю информацию в O(1) доступе.
-        self.reads.clear();
-        self.reads.shrink_to_fit();
-        self.writes.clear();
-        self.writes.shrink_to_fit();
-        // reads_event / writes_event пока оставляем — они нужны для event-конфликтов.
-        // Если event конфликты тоже переведены на маски — можно очистить и их.
-    }
-
-    /// O(1) проверка конфликта через битовые маски.
-    ///
-    /// Требует предварительного вызова `assign_masks`.
-    #[inline]
-    pub fn conflicts_with_fast(&self, other: &AccessDescriptor) -> bool {
-        // Write(self) ∩ (Read(other) | Write(other)) != ∅
-        // или Write(other) ∩ Read(self) != ∅
-        self.write_mask.overlaps(&other.read_mask)
-            || self.write_mask.overlaps(&other.write_mask)
-            || other.write_mask.overlaps(&self.read_mask)
-    }
-
-    /// Fallback O(N) проверка — используется если маски не назначены.
+    /// Write(self) ∩ (Read(other) ∪ Write(other)) ≠ ∅, либо
+    /// Write(other) ∩ Read(self) ≠ ∅. Число компонентов на систему мало,
+    /// поэтому линейного скана достаточно.
     pub fn conflicts_with(&self, other: &AccessDescriptor) -> bool {
-        // Если маски не пусты — используем быстрый путь по битовым маскам
-        if !self.write_mask.is_empty() || !other.write_mask.is_empty() {
-            return self.conflicts_with_fast(other);
-        }
-        // Если маски пусты, но есть writes в векторах — значит assign_masks() не вызывался,
-        // используем fallback (linear scan)
         if !self.writes.is_empty() || !other.writes.is_empty() {
             for w in &self.writes {
                 if other.reads.contains(w) || other.writes.contains(w) {

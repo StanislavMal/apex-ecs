@@ -4,9 +4,9 @@
 > (apex-engine: CLAUDE.md, docs/CONVENTIONS.md §0.2a/§0.2b/§0.9): корректность/soundness,
 > сырые места, производительность, профессионализм. Итог — план работ волнами.
 > **Дата:** 2026-07-03. **Статус:** 🔄 в работе. Все 10 развилок §10 РЕШЕНЫ 2026-07-03
-> (критерий — золотой путь, см. §10). **Волна 0 ✅ + Волна 1 ✅ (SOUNDNESS) выполнены**
-> 2026-07-03 на ветке `core-audit-fixes` (11 фиксов + регресс-тесты; ниже «Журнал волн»).
-> Дальше — волна 2 (корректность поведения).
+> (критерий — золотой путь, см. §10). **Волны 0-3 ✅ СМЕРЖЕНЫ в main локально** (`2210b53`, не
+> запушено). **Волна 4 ✅ (громкость §0.2a + гигиена + мёртвый код) — гейт пройден целиком**
+> (ветка `core-audit-wave4`; подробности в «Журнале волн»). Дальше — волна 5 (перф).
 
 ## Журнал волн (ход исполнения)
 
@@ -145,6 +145,62 @@ main; гейт пройден, готова к мержу `--no-ff` в main):**
     не джойнит их) — это НЕ наш UB (как и crossbeam-false-positive из SB), снимается
     `-Zmiri-ignore-leaks`. Гейт зачтён по отсутствию UB (все 211 тестов зелены). Движок собирается
     + goldens 656/656 байт-идентично.
+
+**Волна 4 🔄 — §0.2a ГРОМКОСТЬ + гигиена + мёртвый код (В РАБОТЕ; ветка `core-audit-wave4` от
+main):**
+- `6f562c3` **A11** ✅ — checked column alloc size на realloc-пути.
+- `003e45b` **A12** ✅ — `len`/`is_empty` честны к row-ranges и построчным фильтрам.
+- **Warn-волна §0.2a (ВЫПОЛНЕНА; единый `warn_once!` — лог один раз на call-site, AtomicBool-
+  латч, стиль Bevy; re-export из apex-core для всех крейтов):**
+  - `4e376b8` **A9/A10/B7/B10** ✅ — apex-core: `warn_once!` + громкие misuse-пути. A9 —
+    insert/insert_raw/insert_parts/remove_raw/remove на мёртвой entity (no-op → warn, значение
+    дропается не течёт). A10 — `spawn_at` на УЖЕ живую entity (осиротил бы строку): debug =
+    panic, release = громкий refuse+drop bundle; reserved-but-unflushed id (location-less)
+    проходят. B7 — `Commands::despawn` на уже-мёртвую (двойной/каскад) громко. B10 —
+    `Commands::spawn_template` с незарег. именем + `TemplateParams::set` с ошибкой сериализации.
+    Регресс `loudness_wave4`: throttle single-emission, A10 refusal, B7 clean double-despawn,
+    B10 no-op.
+  - `25cea06` **E8 (serde)** ✅ — restore дропает компонент, зарег. БЕЗ serde-fns (version skew) —
+    теперь warn. Регресс `restore_drops_component_registered_without_serde`.
+  - `86c6c82` **E12 (isolated)** ✅ — WorldBridge/CloneableBridge громко о дропе события на
+    ошибке bincode-serialize и о закрытом канале (был `let _ = send`). Регресс: closed-channel +
+    serialize-failure дропают без паники.
+  - `f6883a3` **E8 (scripting)** ✅ — Lua-query по незарег. data/With → пустой результат громко;
+    незарег. Without (over-match) громко; исчезнувший binding mid-iter громко. Тестов нет
+    (харнесс скриптинга — волна 7).
+- **Гигиена (ВЫПОЛНЕНА):**
+  - `bf441c3` — лишний unsafe ×4 (`&*archetypes.as_ptr().add(i)` → safe indexing в par-циклах);
+    QueryCache poison-толерантность (`unwrap_or_else(into_inner)` — append-only кэш не бьётся
+    паникой); `Pipeline::build` с незарег. системой — громкий `log::error`+skip вместо opaque
+    unwrap-паники (регресс-тест).
+  - `fb7630a` — атомарная запись сейвов (`WorldSerializer::atomic_write` temp+fsync+rename);
+    `PrefabManifest::spawn` — громкая паника с именем префаба+причиной (trait возвращает Entity;
+    try-путь = волна 6), `instantiate` get_info→Result. 2 регресс-теста.
+  - `96a1d01` **E7** — `migrate()` на load-пути (`read_from_file`: read→migrate→restore); старый
+    снапшот апгрейдится на загрузке или падает громко. Регресс-тест.
+  - `4ca4865` — крейт-wide `allow(clippy::missing_safety_doc)` СНЯТ; 24 точечных `# Safety`-дока
+    на каждую экспортируемую `unsafe fn` (Column/Archetype примитивы, WorldQuery/DenseQuery,
+    from_ptr, ParallelWorld::get). Docs-only.
+- **Мёртвый код (ВЫПОЛНЕН; каждое удаление под полный сьют, ~760 строк):**
+  - `d2230ed` — SparseSet (весь storage-модуль, 0 консумеров, §10.3); ComponentMask+read/write_mask+
+    assign_masks+conflicts_with_fast (C8 — assign_masks НИКОГДА не звался ⇒ маски всегда EMPTY ⇒
+    conflicts_with всегда линейный fallback; поведение сохранено); Scheduler::
+    archetype_indices_for_conflict_detection (C8, 0 консумеров, лживый rustdoc).
+  - `cf822fd` **§10.5** — row-split 5.7 (prepare_sub_worlds/make_sub_world/*_storage/sub_worlds_dirty):
+    ДОКАЗАНО мёртвым — storage читался ТОЛЬКО из make_sub_world, у которого НЕТ вызовов; prepare_sub_worlds
+    молол вхолостую каждый рост мира. ЖИВОЙ row-split (ASD/run_stage_parallel через
+    `SubWorld::from_raw_with_ranges`) НЕ тронут.
+  - `51883b4` — allow(dead_code) sweep: SendPtr::as_mut/as_ref (deref прямой `&mut *task.ptr.0`),
+    stale-allow min_entities_for_parallelism (жив), мёртвое поле parallel_threshold. Оставлены
+    (не мёртвые): ParSystem static access()/name() (trait-API), AsdTask, add_par_system* (test-only).
+  - QueryBuilder НЕ тронут (волна 6, §10.4).
+- **ГЕЙТ волны 4 (ПРОЙДЕН ЦЕЛИКОМ 2026-07-03):** `cargo test --workspace` зелёный (0 падений);
+  `cargo clippy --workspace` net-neutral (только 3 pre-existing apex-bench: unused_mut ×2 +
+  type_complexity ×1; библиотеки чисты, снятый `allow(missing_safety_doc)` варнингов не дал);
+  движок собирается (`cargo build --workspace` apex-engine ок); **Miri Tree Borrows apex-core
+  --lib = 214 passed, 0 failed, 0 UB, 1 ignored** (`-Zmiri-disable-isolation -Zmiri-tree-borrows
+  -Zmiri-ignore-leaks`); **goldens движка 656/656 байт-идентично** (рендер не изменён). Готова к
+  мержу `--no-ff` в main (локально; пуш делает пользователь).
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).

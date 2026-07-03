@@ -129,9 +129,25 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         if self.entries.len() < 2 {
             return;
         }
-        let ids: Vec<SystemId> = self.entries.iter()
-            .map(|e| sched.find_id_by_name(&e.name).unwrap())
-            .collect();
+        // §0.2a: a pipeline naming an unregistered system used to panic with an
+        // opaque `unwrap` message. Report which system is missing and skip
+        // wiring (the ordering constraints are simply not added) rather than
+        // aborting the whole app for a config typo. `build_validated` returns a
+        // structured `Result` for callers that want to handle it.
+        let mut ids: Vec<SystemId> = Vec::with_capacity(self.entries.len());
+        for e in &self.entries {
+            match sched.find_id_by_name(&e.name) {
+                Ok(id) => ids.push(id),
+                Err(_) => {
+                    log::error!(
+                        "Pipeline::build: system '{}' is not registered — pipeline not wired \
+                         (register it before .build(), or use build_validated for a checked Result)",
+                        e.name,
+                    );
+                    return;
+                }
+            }
+        }
 
         let mut last_barrier: Option<SystemId> = None;
         let mut prev_consumer: Option<SystemId> = None;

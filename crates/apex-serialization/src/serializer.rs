@@ -258,7 +258,18 @@ impl WorldSerializer {
                     let info = world.registry().get_info(component_id).unwrap();
                     let serde_fns = match &info.serde {
                         Some(s) => s,
-                        None    => continue,
+                        // §0.2a (E8): the type is registered but has no serde
+                        // functions, so its snapshot bytes are silently dropped
+                        // on restore — the entity comes back missing this
+                        // component. Surface it (throttled) so the data loss is
+                        // visible; register serde for the type to fix.
+                        None => {
+                            apex_core::warn_once!(
+                                "restore: component '{}' is registered without serde functions — snapshot data dropped, entity restored without it",
+                                comp_snap.type_name,
+                            );
+                            continue;
+                        }
                     };
 
                     // Данные уже в нужном формате — используем как есть
@@ -508,6 +519,31 @@ impl WorldSerializer {
 
     // ── Сохранение на диск ────────────────────────────────────
 
+    /// Atomically write `data` to `path` (§0.2a hygiene).
+    ///
+    /// A plain `fs::write` truncates the target first, so a crash or interrupt
+    /// mid-write leaves a corrupt (partial) save. Instead write to a sibling
+    /// `.tmp` file, flush it, then rename over the target — a reader never
+    /// observes a half-written file, and rename is atomic within one directory.
+    fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        // std::fs::rename replaces an existing destination atomically on both
+        // Unix and Windows (MOVEFILE_REPLACE_EXISTING).
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp); // don't leak the temp on failure
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Сохранить снэпшот в файл в указанном формате.
     pub fn write_to_file(
         path:   &Path,
@@ -518,7 +554,7 @@ impl WorldSerializer {
             SaveFormat::Json => snap.to_json()?,
             SaveFormat::Bincode => snap.to_bincode()?,
         };
-        std::fs::write(path, &data)?;
+        Self::atomic_write(path, &data)?;
         Ok(())
     }
 
@@ -533,34 +569,36 @@ impl WorldSerializer {
             .and_then(|e| e.to_str())
             .unwrap_or("json");
 
-        match ext {
-            "json" => {
-                let snap = WorldSnapshot::from_json(&data)?;
-                Ok(snap)
-            }
-            "bin" => {
-                let snap = WorldSnapshot::from_bincode(&data)?;
-                Ok(snap)
-            }
+        let mut snap = match ext {
+            "json" => WorldSnapshot::from_json(&data)?,
+            "bin" => WorldSnapshot::from_bincode(&data)?,
             _ => {
                 // Пробуем JSON, потом Bincode
                 if let Ok(snap) = WorldSnapshot::from_json(&data) {
-                    return Ok(snap);
+                    snap
+                } else if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
+                    snap
+                } else {
+                    return Err(SerializationError::Migration(format!(
+                        "unknown file extension '{ext}' and couldn't detect format"
+                    )));
                 }
-                if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
-                    return Ok(snap);
-                }
-                Err(SerializationError::Migration(
-                    format!("unknown file extension '{}' and couldn't detect format", ext)
-                ))
             }
-        }
+        };
+
+        // §0.2a (E7): centralise versioning on the load path (read → migrate →
+        // restore). migrate() used to never run here, so an older-version save
+        // parsed fine but was then rejected by restore's version check with no
+        // migration attempted. Bring it to CURRENT_VERSION now (or fail loudly
+        // if it is too old to migrate) so callers get a restorable snapshot.
+        snap.migrate().map_err(SerializationError::Migration)?;
+        Ok(snap)
     }
 
     /// Сохранить diff в файл (всегда в бинарном формате).
     pub fn write_diff_to_file(path: &Path, diff: &WorldDiff) -> Result<(), SerializationError> {
         let data = diff.to_bincode()?;
-        std::fs::write(path, &data)?;
+        Self::atomic_write(path, &data)?;
         Ok(())
     }
 
@@ -725,6 +763,42 @@ mod tests {
         assert_eq!(w2.get::<Position>(restored).map(|p| p.x), Some(1.0));
     }
 
+    /// §0.2a (E8): if a component's type is registered on the restore side but
+    /// WITHOUT serde functions (e.g. version skew), its snapshot bytes are
+    /// dropped and the entity comes back missing it. The drop must be loud
+    /// (`warn_once!`, verified by the apex-core macro test) rather than silent;
+    /// here we pin the data-loss contract — restore still succeeds, serde-backed
+    /// components come back, the serde-less one is absent.
+    #[test]
+    fn restore_drops_component_registered_without_serde() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Position>();
+        world.register_component_serde_json::<Health>();
+        let e = world.spawn((
+            Position { x: 5.0, y: 6.0 },
+            Health { current: 50.0, max: 100.0 },
+        ));
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Restore side: Position has serde, Health is registered as a plain
+        // component (no serde) — the E8 branch.
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<Position>();
+        w2.register_component::<Health>();
+        let map = WorldSerializer::restore(&mut w2, &snap).unwrap();
+
+        let restored = map[&e.index()];
+        assert_eq!(
+            w2.get::<Position>(restored),
+            Some(&Position { x: 5.0, y: 6.0 }),
+            "serde-backed component must restore",
+        );
+        assert!(
+            w2.get::<Health>(restored).is_none(),
+            "component registered without serde must be dropped on restore (E8)",
+        );
+    }
+
     fn setup_world() -> World {
         let mut world = World::new();
         world.register_component::<RenderHandle>();
@@ -876,6 +950,57 @@ mod tests {
             "bin={} should be < json={}", bin_meta.len(), json_meta.len());
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atomic save: replacing an existing file works and leaves no `.tmp`
+    /// sibling behind (the write goes through temp+rename).
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let world = setup_world();
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        let dir = std::env::temp_dir().join("apex_serialization_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("save.json");
+
+        // Pre-existing content that must be atomically replaced.
+        std::fs::write(&path, b"STALE PARTIAL DATA").unwrap();
+        WorldSerializer::write_to_file(&path, &snap, SaveFormat::Json).unwrap();
+
+        let loaded = WorldSerializer::read_from_file(&path).unwrap();
+        assert_eq!(loaded.entities.len(), snap.entities.len());
+        assert!(
+            !dir.join("save.json.tmp").exists(),
+            "atomic write must not leave a .tmp file behind on success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §0.2a (E7): versioning is centralised on the load path — read_from_file
+    /// runs migrate(), so an older snapshot comes back at CURRENT_VERSION and is
+    /// directly restorable. Previously migrate() never ran here and the loaded
+    /// snapshot kept its stale version, only to be rejected later by restore.
+    #[test]
+    fn read_from_file_runs_migrate_on_load() {
+        let dir = std::env::temp_dir().join("apex_serialization_migrate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.json");
+
+        let mut snap = WorldSnapshot::new(0);
+        snap.version = 0; // older format; a v0 -> v1 migration is registered
+        std::fs::write(&path, snap.to_json().unwrap()).unwrap();
+
+        let loaded = WorldSerializer::read_from_file(&path).unwrap();
+        assert_eq!(
+            loaded.version,
+            WorldSnapshot::CURRENT_VERSION,
+            "read_from_file must migrate an older snapshot to the current version on load"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

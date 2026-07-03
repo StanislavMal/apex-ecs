@@ -37,6 +37,11 @@ pub trait DenseQuery: WorldQuery {
 
     /// Выдать слайсы колонок диапазона `[start, start+len)` архетипа.
     /// Write-формы стампят change-tick диапазону ЗДЕСЬ.
+    ///
+    /// # Safety
+    /// `arch` must have matched this query and `ids` be its component-id list;
+    /// `start + len <= arch` row count. For write-forms the `[start, start+len)`
+    /// range must be accessed exclusively (disjoint across parallel chunks).
     unsafe fn fetch_slices<'w>(
         arch: &'w Archetype,
         ids: &[ComponentId],

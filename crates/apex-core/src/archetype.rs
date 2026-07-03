@@ -99,6 +99,10 @@ impl<'a> ColumnView<'a> {
     pub fn id(&self) -> ComponentId {
         self.col.component_id
     }
+    /// # Safety
+    /// `row` must be `< len` of the viewed column. The returned pointer aliases
+    /// column storage and is invalidated by any structural change; the caller
+    /// must interpret it as the column's component type.
     pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 {
         self.col.get_ptr(row)
     }
@@ -137,6 +141,9 @@ impl Column {
         }
     }
 
+    /// # Safety
+    /// `row < self.len`, and no other reference to this row's change-tick may be
+    /// live (interior mutation through `&self`).
     #[inline]
     pub unsafe fn set_change_tick(&self, row: usize, tick: Tick) {
         debug_assert!(row < self.len);
@@ -165,6 +172,10 @@ impl Column {
         }
     }
 
+    /// # Safety
+    /// `row < self.len` (for ZST columns the returned pointer is a non-null
+    /// dangling sentinel and must not be dereferenced). The pointer aliases
+    /// column storage and is invalidated by `grow`/reallocation.
     pub unsafe fn get_ptr(&self, row: usize) -> *mut u8 {
         if self.item_size == 0 {
             self.item_align as *mut u8
@@ -173,16 +184,24 @@ impl Column {
         }
     }
 
+    /// # Safety
+    /// Same contract as [`get_ptr`](Self::get_ptr).
     #[inline]
     pub unsafe fn get_raw_ptr(&self, row: usize) -> *const u8 {
         self.get_ptr(row)
     }
 
+    /// # Safety
+    /// `row < self.len` and `T` must be the column's component type. Returns a
+    /// shared reference — no live exclusive reference to the row may exist.
     #[inline]
     pub unsafe fn get<T>(&self, row: usize) -> &T {
         &*(self.get_ptr(row) as *const T)
     }
 
+    /// # Safety
+    /// `row < self.len` and `T` must be the column's component type. Returns an
+    /// exclusive reference — no other reference to the row may be live.
     #[inline]
     pub unsafe fn get_mut<T>(&mut self, row: usize) -> &mut T {
         &mut *(self.get_ptr(row) as *mut T)
@@ -193,6 +212,11 @@ impl Column {
     /// `push` — путь СВЕЖЕГО значения (spawn / insert нового компонента):
     /// added-tick == change-tick == `tick`. Для переноса строки между
     /// архетипами с сохранением тиков см. [`push_moved`](Self::push_moved).
+    ///
+    /// # Safety
+    /// `src` must point to an initialized value of the column's component type
+    /// (`item_size` bytes); ownership is moved into the column (the caller must
+    /// not drop the source). Ignored for ZST columns.
     pub unsafe fn push(&mut self, src: *const u8, tick: Tick) {
         if self.len >= self.capacity {
             self.grow();
@@ -244,6 +268,12 @@ impl Column {
     /// НЕ дропает прежнее значение — для строк, чьё содержимое уже вынесено
     /// (move) либо тривиально. Для перезаписи ЖИВОГО значения используйте
     /// [`replace_at`](Self::replace_at), иначе Drop-типы текут.
+    ///
+    /// # Safety
+    /// `row < self.len`; `src` points to an initialized value of the column's
+    /// component type (`item_size` bytes), whose ownership is moved in. The row's
+    /// previous value is NOT dropped — the caller must ensure it was already
+    /// moved out or is trivially droppable.
     pub unsafe fn write_at(&mut self, row: usize, src: *const u8, tick: Tick) {
         if self.item_size > 0 {
             std::ptr::copy_nonoverlapping(src, self.get_ptr(row), self.item_size);
@@ -257,6 +287,11 @@ impl Column {
     ///
     /// Закрывает утечку `insert` поверх существующего компонента (W2-1):
     /// старое значение Drop-типа (String, Vec, Arc…) раньше молча терялось.
+    ///
+    /// # Safety
+    /// `row < self.len`; the row currently holds a live, initialized value of
+    /// the column's component type (it is dropped here); `src` points to an
+    /// initialized replacement value of that type, moved in.
     pub unsafe fn replace_at(&mut self, row: usize, src: *const u8, tick: Tick) {
         debug_assert!(row < self.len);
         (self.drop_fn)(self.get_ptr(row));
@@ -273,6 +308,8 @@ impl Column {
         }
     }
 
+    /// # Safety
+    /// `row < self.len`. The removed value is dropped exactly once.
     pub unsafe fn swap_remove_and_drop(&mut self, row: usize) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
@@ -296,6 +333,9 @@ impl Column {
         (self.drop_fn)(self.get_ptr(last));
     }
 
+    /// # Safety
+    /// `row < self.len`. The removed value is NOT dropped — its ownership is
+    /// considered moved out and the caller is responsible for it.
     pub unsafe fn swap_remove_no_drop(&mut self, row: usize) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
@@ -339,9 +379,11 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
+            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
+            // (A11: соседний путь раньше умножал без проверки переполнения).
             let old_layout = self.layout_for(self.capacity);
-            let new_size = self.item_size * new_cap;
+            let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
                 let ptr = realloc(self.data, old_layout, new_size);
                 assert!(!ptr.is_null(), "reallocation failed");
@@ -376,9 +418,11 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
+            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
+            // (A11: соседний путь раньше умножал без проверки переполнения).
             let old_layout = self.layout_for(self.capacity);
-            let new_size = self.item_size * new_cap;
+            let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
                 let ptr = realloc(self.data, old_layout, new_size);
                 assert!(!ptr.is_null(), "reallocation failed");
@@ -523,11 +567,19 @@ impl Archetype {
         }
     }
 
+    /// # Safety
+    /// `row < self.len` and `T` must be the component type registered under
+    /// `component_id`. Returns a shared reference; no exclusive reference to the
+    /// row may be live. `None` if the archetype lacks the component.
     pub unsafe fn get_component<T>(&self, row: usize, component_id: ComponentId) -> Option<&T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get::<T>(row))
     }
 
+    /// # Safety
+    /// `row < self.len` and `T` must be the component type registered under
+    /// `component_id`. Returns an exclusive reference; no other reference to the
+    /// row may be live. `None` if the archetype lacks the component.
     pub unsafe fn get_component_mut<T>(
         &mut self,
         row: usize,
@@ -551,12 +603,24 @@ impl Archetype {
         }
     }
 
+    /// Reserve a fresh entity row (columns are filled separately). Returns the
+    /// new row index.
+    ///
+    /// # Safety
+    /// The caller must initialise every column at the returned row (via
+    /// [`write_component`](Self::write_component)) before the row is read, so the
+    /// archetype's parallel `entities`/columns stay length-consistent.
     pub unsafe fn allocate_row(&mut self, entity: Entity) -> usize {
         let row = self.entities.len();
         self.entities.push(entity);
         row
     }
 
+    /// # Safety
+    /// `src` points to an initialized value of the component type registered
+    /// under `component_id`, moved into the column; `row` is either `col.len`
+    /// (append) or `< col.len` (overwrite of an already moved-out/trivial slot —
+    /// the old value is NOT dropped). No-op if the archetype lacks the component.
     pub unsafe fn write_component(
         &mut self,
         row: usize,
@@ -576,6 +640,12 @@ impl Archetype {
 
     /// Записать компонент: в новую строку — push, поверх живого значения —
     /// replace (с дропом старого). Используется групповым `insert_parts` (W2-1).
+    ///
+    /// # Safety
+    /// `src` points to an initialized value of the component type registered
+    /// under `component_id`, moved in. For `row < col.len` the existing live
+    /// value is dropped and replaced; for `row == col.len` it is appended.
+    /// No-op if the archetype lacks the component.
     pub unsafe fn write_or_replace_component(
         &mut self,
         row: usize,
@@ -593,6 +663,12 @@ impl Archetype {
         }
     }
 
+    /// Remove `row` from every column (dropping its values) and swap-remove the
+    /// entity slot. Returns the entity that was relocated into `row` (the ex-last
+    /// row), or `None` if `row` was already last.
+    ///
+    /// # Safety
+    /// `row < self.len` and all columns share that length (row-consistent).
     pub unsafe fn remove_row(&mut self, row: usize) -> Option<Entity> {
         let last = self.entities.len() - 1;
         for col in &mut self.columns {
@@ -798,6 +874,28 @@ mod tests {
             3,
             "removed value dropped once + two live values — no double-drop"
         );
+    }
+
+    /// A11: the column allocation size must go through `checked_mul`
+    /// (`layout_for`) on every path — a huge `item_size` that overflows
+    /// `item_size * capacity` must panic loudly, not silently wrap into a
+    /// too-small allocation (heap corruption). The realloc path now reuses the
+    /// same `layout_for` as the alloc path, so both are covered.
+    #[test]
+    #[should_panic(expected = "overflow in layout_for")]
+    fn column_alloc_size_overflow_panics_loudly() {
+        let info = ComponentInfo {
+            id: ComponentId(0),
+            name: "huge",
+            type_id: std::any::TypeId::of::<u8>(),
+            size: usize::MAX / 2,
+            align: 1,
+            drop_fn: noop_drop,
+            serde: None,
+        };
+        let mut col = Column::new(&info);
+        // new_cap == 4 → item_size * 4 overflows usize → checked_mul panics.
+        col.reserve(4);
     }
 
     #[test]

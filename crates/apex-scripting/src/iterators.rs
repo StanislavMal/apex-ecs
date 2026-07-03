@@ -165,7 +165,16 @@ pub(crate) fn build_arch_states(
         .filter_map(|d| ctx.binding(&d.type_name).map(|b| (b.id, *d)))
         .collect();
     if resolved_data.len() != data_descs.len() {
-        return Vec::new(); // не все data-компоненты зарегистрированы
+        // §0.2a (E8): an unregistered data component makes the whole query
+        // silently yield nothing — the script sees an empty result and no
+        // reason why. Name the first missing type (throttled).
+        if let Some(d) = data_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
+            apex_core::warn_once!(
+                "script query: data component '{}' is not registered — query yields no results",
+                d.type_name,
+            );
+        }
+        return Vec::new();
     }
 
     // Разрешаем With/Without в ComponentId
@@ -173,12 +182,28 @@ pub(crate) fn build_arch_states(
         .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
         .collect();
     if with_ids.len() != with_descs.len() {
-        return Vec::new(); // не все With-компоненты зарегистрированы
+        // §0.2a (E8): an unregistered With filter also empties the query.
+        if let Some(d) = with_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
+            apex_core::warn_once!(
+                "script query: With filter component '{}' is not registered — query yields no results",
+                d.type_name,
+            );
+        }
+        return Vec::new();
     }
     let without_ids: Vec<ComponentId> = without_descs.iter()
         .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
         .collect();
-    // Without — если не зарегистрирован, фильтр не применяется
+    // §0.2a (E8): an unregistered Without component silently disables that
+    // filter (the query then over-matches). Surface it (throttled).
+    if without_ids.len() != without_descs.len() {
+        if let Some(d) = without_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
+            apex_core::warn_once!(
+                "script query: Without filter component '{}' is not registered — filter ignored, query may over-match",
+                d.type_name,
+            );
+        }
+    }
 
     world.archetypes()
         .iter()
@@ -261,7 +286,16 @@ pub(crate) fn build_entity_table(
     for comp in components {
         let binding = match ctx.binding(&comp.type_name) {
             Some(b) => b,
-            None => continue,
+            // §0.2a (E8): the binding was present when the archetype state was
+            // built but is gone now — the component silently vanishes from the
+            // table the script sees. Should not happen; surface it (throttled).
+            None => {
+                apex_core::warn_once!(
+                    "script query: binding for '{}' disappeared mid-iteration — component omitted from entity table",
+                    comp.type_name,
+                );
+                continue;
+            }
         };
 
         let val = unsafe {
