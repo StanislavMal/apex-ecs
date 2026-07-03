@@ -538,18 +538,21 @@ struct SystemDescriptor {
 
 // ── SystemBuilder ──────────────────────────────────────────────
 
-pub struct SystemBuilder {
-    scheduler: *mut Scheduler,
+/// Билдер держит `&'a mut Scheduler` (а не сырой `*mut`): лайфтайм гарантирует,
+/// что билдер не переживёт планировщик — сохранённый билдер + уничтоженный
+/// `Scheduler` = UB был бы возможен с сырым указателем (D10).
+pub struct SystemBuilder<'a> {
+    scheduler: &'a mut Scheduler,
     id: SystemId,
 }
 
-impl SystemBuilder {
+impl<'a> SystemBuilder<'a> {
     pub fn id(self) -> SystemId {
         self.id
     }
 
     fn add_condition_leaf(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
@@ -572,7 +575,7 @@ impl SystemBuilder {
     }
 
     fn add_condition_or(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
@@ -628,7 +631,7 @@ impl SystemBuilder {
 
     /// Установить всё дерево условий целиком (заменяет существующие).
     pub fn condition(self, tree: ConditionTree) -> Self {
-        unsafe {
+        {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
                 sys.run_condition = tree;
@@ -841,7 +844,7 @@ impl Scheduler {
     /// Регистрировать Sequential систему (полный &mut World).
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     #[cfg(test)]
-    fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
+    fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -854,7 +857,7 @@ impl Scheduler {
         name: impl Into<String>,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -879,14 +882,14 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
 
     /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
     #[cfg(test)]
-    fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder
+    fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
         F: FnMut(&mut World) + Send + 'static,
     {
@@ -903,7 +906,7 @@ impl Scheduler {
     /// Регистрировать AutoSystem.
     /// Этап — `default_stage_label` (по умолчанию `Update`).
     #[cfg(test)]
-    fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -917,7 +920,7 @@ impl Scheduler {
         name: impl Into<String>,
         system: S,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -957,14 +960,14 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
 
     /// Регистрировать AutoSystem в Startup этапе.
     #[cfg(test)]
-    fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder
+    fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
         S: AutoSystem + 'static,
     {
@@ -1069,7 +1072,7 @@ impl Scheduler {
         name: impl Into<String>,
         access: AccessDescriptor,
         func: F,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1085,7 +1088,7 @@ impl Scheduler {
         access: AccessDescriptor,
         func: F,
         stage_label: StageLabel,
-    ) -> SystemBuilder
+    ) -> SystemBuilder<'_>
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -1122,7 +1125,7 @@ impl Scheduler {
         self.invalidate_plan();
         self.merge_scope_condition(id);
         SystemBuilder {
-            scheduler: self as *mut Scheduler,
+            scheduler: self,
             id,
         }
     }
@@ -2391,7 +2394,7 @@ impl Scheduler {
         }
 
         let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-        let sub_world = apex_core::SubWorld::new(w, &all_indices);
+        let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
 
         let mut thread_commands: Vec<Commands> = vec![Commands::new()];
         let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
@@ -2569,7 +2572,7 @@ impl Scheduler {
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
-                        let sw = apex_core::SubWorld::new(world, &all_indices);
+                        let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
                         // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
                         // указывает на thread_commands, который жив до конца run_hybrid_parallel.
                         sys.run(SystemContext::with_commands(
@@ -2710,14 +2713,14 @@ impl Scheduler {
                         if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                             if task.chunk_ranges.is_empty() {
                                 // Полный SubWorld — все архетипы системы без ограничений
-                                let sub = apex_core::SubWorld::new(world, &task.arch_indices);
+                                let sub = apex_core::SubWorld::from_raw(world, &task.arch_indices);
                                 // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
                                 // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
                                 // Каждый поток обращается к своему индексу через current_thread_index().
                                 sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                             } else {
                                 // SubWorld с range-ограничениями и суженными arch_indices
-                                let sub = apex_core::SubWorld::with_ranges(
+                                let sub = apex_core::SubWorld::from_raw_with_ranges(
                                     world,
                                     &task.arch_indices,
                                     &task.chunk_ranges,
@@ -2800,7 +2803,7 @@ impl Scheduler {
                 {
                     let w = unsafe { &*const_ptr };
                     let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
@@ -2871,7 +2874,7 @@ impl Scheduler {
                 {
                     let w = unsafe { &*const_ptr };
                     let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = apex_core::SubWorld::new(w, &all_indices);
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             let system = &self.systems[sys_idx];
@@ -2957,10 +2960,12 @@ impl Scheduler {
     fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
         let arch_indices = &self.archetype_indices_storage[storage_idx];
         let ranges = &self.row_ranges_storage[storage_idx];
+        // SAFETY: SubWorld borrows Scheduler storage that is not mutated while any
+        // SubWorld is live (documented invariant of the row-split machinery).
         if ranges.is_empty() {
-            apex_core::SubWorld::new(world, arch_indices)
+            unsafe { apex_core::SubWorld::from_raw(world, arch_indices) }
         } else {
-            apex_core::SubWorld::with_ranges(world, arch_indices, ranges)
+            unsafe { apex_core::SubWorld::from_raw_with_ranges(world, arch_indices, ranges) }
         }
     }
 
