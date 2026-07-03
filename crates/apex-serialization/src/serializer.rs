@@ -569,28 +569,30 @@ impl WorldSerializer {
             .and_then(|e| e.to_str())
             .unwrap_or("json");
 
-        match ext {
-            "json" => {
-                let snap = WorldSnapshot::from_json(&data)?;
-                Ok(snap)
-            }
-            "bin" => {
-                let snap = WorldSnapshot::from_bincode(&data)?;
-                Ok(snap)
-            }
+        let mut snap = match ext {
+            "json" => WorldSnapshot::from_json(&data)?,
+            "bin" => WorldSnapshot::from_bincode(&data)?,
             _ => {
                 // Пробуем JSON, потом Bincode
                 if let Ok(snap) = WorldSnapshot::from_json(&data) {
-                    return Ok(snap);
+                    snap
+                } else if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
+                    snap
+                } else {
+                    return Err(SerializationError::Migration(format!(
+                        "unknown file extension '{ext}' and couldn't detect format"
+                    )));
                 }
-                if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
-                    return Ok(snap);
-                }
-                Err(SerializationError::Migration(
-                    format!("unknown file extension '{}' and couldn't detect format", ext)
-                ))
             }
-        }
+        };
+
+        // §0.2a (E7): centralise versioning on the load path (read → migrate →
+        // restore). migrate() used to never run here, so an older-version save
+        // parsed fine but was then rejected by restore's version check with no
+        // migration attempted. Bring it to CURRENT_VERSION now (or fail loudly
+        // if it is too old to migrate) so callers get a restorable snapshot.
+        snap.migrate().map_err(SerializationError::Migration)?;
+        Ok(snap)
     }
 
     /// Сохранить diff в файл (всегда в бинарном формате).
@@ -972,6 +974,31 @@ mod tests {
         assert!(
             !dir.join("save.json.tmp").exists(),
             "atomic write must not leave a .tmp file behind on success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §0.2a (E7): versioning is centralised on the load path — read_from_file
+    /// runs migrate(), so an older snapshot comes back at CURRENT_VERSION and is
+    /// directly restorable. Previously migrate() never ran here and the loaded
+    /// snapshot kept its stale version, only to be rejected later by restore.
+    #[test]
+    fn read_from_file_runs_migrate_on_load() {
+        let dir = std::env::temp_dir().join("apex_serialization_migrate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.json");
+
+        let mut snap = WorldSnapshot::new(0);
+        snap.version = 0; // older format; a v0 -> v1 migration is registered
+        std::fs::write(&path, snap.to_json().unwrap()).unwrap();
+
+        let loaded = WorldSerializer::read_from_file(&path).unwrap();
+        assert_eq!(
+            loaded.version,
+            WorldSnapshot::CURRENT_VERSION,
+            "read_from_file must migrate an older snapshot to the current version on load"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
