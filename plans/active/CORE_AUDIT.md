@@ -3,8 +3,42 @@
 > **Назначение.** Полный аудит ядра ECS на соответствие «золотому пути» проекта
 > (apex-engine: CLAUDE.md, docs/CONVENTIONS.md §0.2a/§0.2b/§0.9): корректность/soundness,
 > сырые места, производительность, профессионализм. Итог — план работ волнами.
-> **Дата:** 2026-07-03. **Статус:** 📋 план составлен; все 10 развилок §10 РЕШЕНЫ
-> 2026-07-03 (критерий — золотой путь, см. §10). Работы не начаты.
+> **Дата:** 2026-07-03. **Статус:** 🔄 в работе. Все 10 развилок §10 РЕШЕНЫ 2026-07-03
+> (критерий — золотой путь, см. §10). **Волна 0 ✅ + Волна 1 ✅ (SOUNDNESS) выполнены**
+> 2026-07-03 на ветке `core-audit-fixes` (11 фиксов + регресс-тесты; ниже «Журнал волн»).
+> Дальше — волна 2 (корректность поведения).
+
+## Журнал волн (ход исполнения)
+
+**Волна 0 ✅** (`138f0c1`): удалён мусор из корня репо (results.txt UTF-16 / perf.txt /
+apex-benc.txt) + .gitignore; план заведён в репо ядра; Miri-компонент установлен.
+
+**Волна 1 ✅ — SOUNDNESS (достижимый UB из safe-кода), 11 фиксов + регресс-тесты:**
+- `19df31f` B1 (CommandArena выравнивание align>8 — glam-типы) + B3 (mem::zeroed для
+  не-ZST RelationKind → compile-ассерт ZST / захват kind).
+- `0e1d2c1` A1 (дубликат компонента в bundle → panic+dedup в choke point) + B8 (insert_raw
+  валидация размера) + A9-leak (drop T на мёртвой entity) + B4 (template Arc, UAF при
+  само-перерегистрации).
+- `87ec817` C1 (SubWorld лайфтаймы: безопасный new/with_ranges + unsafe from_raw для
+  планировщика) + D10 (SystemBuilder держит &'a mut Scheduler, не *mut).
+- `6b9b4ad` C7 (WorldQuery → unsafe trait с контрактом).
+- `de474c5` E2 (IsolatedWorld мост: clone-then-drain, UAF при само-удалении ресурса; unsafe
+  убран целиком).
+- `4787d6e` E1 (скриптинг: валидация `_meta` из Lua — bounds+identity+ре-резолв col; закрыта
+  UB-дыра песочницы; первый тест крейта).
+- `2dff9b7` B2 (единая разделяемая ячейка аренды `Arc<RwLock<Arc<ReserveLease>>>` — устаревший
+  снимок аренды невозможен; двойная выдача Entity закрыта).
+- **C2 перенесена в волну 3** (co-located с В1(б) runtime borrow-чекером — полная детекция
+  write-write+write-read, см. §4).
+- **Гейт волны 1:** весь воркспейс зелёный (тесты + примеры), clippy net-neutral (только 3
+  pre-existing warning в apex-bench), frag_world 5 архетипов, criterion без регресса
+  (commands_spawn 395µs, despawn 246µs). **Miri подтвердил B1 (арена) и B2 (lease) —
+  UB-чисто.** ⚠ **Блокер Miri-гейта для волны 3:** `linkme-0.3.36` (авто-регистрация
+  компонентов) даёт `subtract with overflow` в distributed_slice под Miri на ЛЮБОМ тесте,
+  строящем `World` → полный Miri-сьют не зелёный. Волна 3 обязана добавить `cfg(miri)`-путь,
+  форсирующий ленивую регистрацию (как wasm-путь TD-25), прежде чем делать Miri обязательным
+  гейтом. ⏳ **НЕ верифицированы goldens движка** (apex-engine, GPU) — обязательный pre-push
+  гейт перед мержем ветки/пушем apex-ecs.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
@@ -489,12 +523,9 @@ version-путь; IsolatedWorld: Entity-ремаппинг, bounded-каналы
 крейтам; внутри волны порядок = приоритет. Каждая волна — один или несколько коммитов ядра;
 пуш apex-ecs ДО движка; после КАЖДОЙ волны — гейт.
 
-**Волна 0 — инфраструктура гейтов (S, полдня).**
-Miri-smoke таргет (`cargo +nightly miri test -p apex-core --lib` на выделенном smoke-сьюте;
-UB-находки волны 1 чинятся до его включения в обязательный гейт); удалить из корня
-results.txt/perf.txt/apex-benc.txt (+.gitignore); зафиксировать criterion-бейзлайн этого
-аудита как référence.
-*Гейт: воркспейс зелёный, мусор удалён.*
+**Волна 0 ✅ — инфраструктура гейтов** (выполнено `138f0c1`; Miri-smoke как обязательный гейт
+отложен до волны 3 из-за блокера linkme↔Miri, см. Журнал волн). Мусор удалён, план в репо,
+Miri установлен.
 
 **Волна 1 — SOUNDNESS: достижимый UB из safe-кода (P0; S/M-фиксы).**
 A1 dup-bundle → panic+dedup · B1 арена-align · B3 zeroed-ZST assert · B2 stale-lease
@@ -521,8 +552,10 @@ A6 drop-guard spawn-путей · A8 swap_remove порядок · A2 TickCell(U
 UnsafeCell · D3 ASD без алиасящихся &mut · F5 EventIterator (по вердикту Miri) · B-Н17 арена
 panic-guard · **В1(б) runtime borrow-флаги per-ComponentId (debug-режим)** — инструмент,
 делающий aliasing-нарушения ловимыми тестами до целевой модели В1(в) · catch_unwind-тест-пакет.
-*Гейт: Miri-smoke становится ОБЯЗАТЕЛЬНЫМ гейтом коммита ядра (расширенный сьют: query/dense/
-transform/events/commands); goldens движка.*
+*Предусловие гейта: снять блокер linkme↔Miri — `cfg(miri)` форсирует ленивую регистрацию
+компонентов (как wasm-путь TD-25), иначе distributed_slice даёт overflow на любом тесте с
+`World`. Гейт: Miri-smoke становится ОБЯЗАТЕЛЬНЫМ гейтом коммита ядра (расширенный сьют:
+query/dense/transform/events/commands); goldens движка.*
 
 **Волна 4 — §0.2a ГРОМКОСТЬ + мёртвый код (P2).**
 Warn-волна: B7/B10/A9/A10/E8/E12(bincode-drop)/S15/S23/D-«молчаливые» — единый стиль
