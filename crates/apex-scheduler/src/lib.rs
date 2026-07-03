@@ -370,7 +370,6 @@ pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
 // ── SendPtr ────────────────────────────────────────────────────
 
-#[allow(dead_code)]
 struct SendPtr<T: ?Sized>(*mut T);
 
 // SAFETY: использование строго ограничено run_hybrid_parallel где
@@ -384,21 +383,9 @@ impl<T: ?Sized> Clone for SendPtr<T> {
 }
 impl<T: ?Sized> Copy for SendPtr<T> {}
 
-impl<T: ?Sized> SendPtr<T> {
-    #[inline]
-    #[allow(dead_code)]
-    // Обёртка над сырым `*mut T`; уникальность гарантируется вызывающим
-    // (каждая ASD-задача держит свой уникальный указатель).
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn as_mut(&self) -> &mut T {
-        &mut *self.0
-    }
-    #[inline]
-    #[allow(dead_code)]
-    unsafe fn as_ref(&self) -> &T {
-        &*self.0
-    }
-}
+// `SendPtr` is dereferenced directly at the ASD task site (`&mut *task.ptr.0`);
+// the former `as_mut`/`as_ref` helpers were never called and were removed in the
+// wave-4 dead-code pass.
 
 /// Задача для ASD (Adaptive Scope Distribution).
 ///
@@ -719,11 +706,6 @@ pub struct Scheduler {
     stage_last_run: Vec<apex_core::Tick>,
 
     // ── Конфигурация параллелизма ───────────────────────────────
-    /// Минимальное количество систем в Stage для параллельного выполнения
-    /// Если систем меньше этого значения — выполняется последовательно
-    #[allow(dead_code)]
-    parallel_threshold: usize,
-
     /// Минимальное количество entity в Stage для параллельного выполнения.
     /// Если суммарное entity_count систем Stage меньше этого порога —
     /// Stage выполняется последовательно (rayon overhead > выигрыша).
@@ -809,7 +791,6 @@ impl Scheduler {
             next_id: 0,
             execution_plan: None,
             stage_last_run: Vec::new(),
-            parallel_threshold: 2, // Минимум 2 системы для параллельного выполнения
             parallel_min_entities: 0, // 0 = без ограничений
             auto_disable_parallel: true, // true = автоотключение по умолчанию
             dependency_graph: Graph::new(),
@@ -1179,7 +1160,6 @@ impl Scheduler {
     /// Пороги определены эмпирически через `parallel_diagnostics` scaling benchmark
     /// (12 ядер, release). «Valley of death» (PAR медленнее SEQ в 2-3x) находится
     /// в диапазоне 5,000-10,000 entity для multi-system и до 50,000 для single-system.
-    #[allow(dead_code)]
     fn min_entities_for_parallelism(num_systems: usize) -> usize {
         if num_systems >= 3 {
             15_000 // 3+ систем — амортизация rayon overhead на 25K+ entity
