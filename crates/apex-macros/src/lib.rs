@@ -184,28 +184,16 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
                 0usize #( + <#field_types as ::apex_core::Bundle>::component_count() )*
             }
 
-            fn component_ids(
-                &self,
-                registry: &mut ::apex_core::ComponentRegistry,
-            ) -> ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> {
-                let mut ids: ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> =
-                    ::apex_core::smallvec::SmallVec::new();
-                #(
-                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, &mut ids);
-                )*
-                ids.sort_unstable();
-                ids
-            }
-
             // Порядок ПОЛЕЙ (= порядок обхода write_into_batch / write_data_into_batch); БЕЗ сортировки.
             // col_indices для batch-спавна строится отсюда, иначе компонент пишется в чужую колонку (UB).
-            fn push_component_ids(
-                &self,
+            // Отсортированный ключ архетипа даёт дефолтный `component_ids` trait'а. Статический (по
+            // ТИПАМ полей) — не требует значения бандла (§10.10, убирает make_bundle-probe footgun).
+            fn static_component_ids(
                 registry: &mut ::apex_core::ComponentRegistry,
                 out: &mut ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]>,
             ) {
                 #(
-                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, out);
+                    <#field_types as ::apex_core::Bundle>::static_component_ids(registry, out);
                 )*
             }
 

@@ -979,15 +979,15 @@ impl World {
             return Vec::new();
         }
 
-        let probe = make_bundle(0);
         // `decl_ids` — порядок ОБЪЯВЛЕНИЯ бандла (= порядок обхода `write_into_batch`); `ids` —
         // ОТСОРТИРОВАННЫЙ (для архетипа). Их РАЗДЕЛЕНИЕ критично: col_indices ОБЯЗАН быть в порядке
-        // обхода, иначе компонент пишется в чужую колонку (UB).
+        // обхода, иначе компонент пишется в чужую колонку (UB). §10.10: состав берётся СТАТИЧЕСКИ
+        // (по типу `B`), без `make_bundle(0)`-probe — замыкание больше не зовётся лишний раз ради
+        // состава и не обязано быть чистым.
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        probe.push_component_ids(&mut self.registry, &mut decl_ids);
+        B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
         ids.sort_unstable();
-        drop(probe);
 
         let archetype_id = self.get_or_create_archetype(&ids);
         let arch_idx = archetype_id.0 as usize;
@@ -1124,7 +1124,7 @@ impl World {
         // `decl_ids` (порядок объявления = обхода write_into_batch) ОТДЕЛЬНО от `ids` (сорт. для
         // архетипа) — col_indices строится из decl_ids, иначе компонент пишется в чужую колонку (UB).
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        bundles[0].push_component_ids(&mut self.registry, &mut decl_ids);
+        B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
         ids.sort_unstable();
         if ids.is_empty() {
@@ -2942,15 +2942,36 @@ impl<Q: WorldQuery> QueryState<Q> {
 // ── Bundle ─────────────────────────────────────────────────────
 
 pub trait Bundle: Sized {
-    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]>;
+    /// Состав бандла в порядке ОБЪЯВЛЕНИЯ (declaration order) БЕЗ конструирования
+    /// значения (§10.10): derive/кортежи знают его статически по типам. Это
+    /// устраняет footgun `make_bundle(0)`-probe в `spawn_many` (замыкание больше
+    /// не обязано быть чистым и не зовётся лишний раз ради состава).
+    ///
+    /// Порядок — ОБЪЯВЛЕНИЯ, НЕ сортированный: `col_indices` для
+    /// `write_into_batch` обязан быть в порядке обхода (иначе запись в чужую
+    /// колонку — UB). Отсортированный ключ архетипа даёт [`component_ids`].
+    fn static_component_ids(
+        registry: &mut ComponentRegistry,
+        out: &mut SmallVec<[ComponentId; 8]>,
+    );
 
-    /// Записать ComponentId'ы напрямую в `out` — без создания промежуточных SmallVec.
+    /// Состав как ОТСОРТИРОВАННЫЙ владеемый `SmallVec` — ключ архетипа. Делегирует
+    /// к [`static_component_ids`](Bundle::static_component_ids) + `sort_unstable`.
+    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
+        let mut out = SmallVec::new();
+        Self::static_component_ids(registry, &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    /// Записать ComponentId'ы в порядке ОБЪЯВЛЕНИЯ в `out` (без промежуточного
+    /// SmallVec) — для обхода `write_into_batch`.
     fn push_component_ids(
         &self,
         registry: &mut ComponentRegistry,
         out: &mut SmallVec<[ComponentId; 8]>,
     ) {
-        out.extend(self.component_ids(registry));
+        Self::static_component_ids(registry, out);
     }
 
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
@@ -3010,13 +3031,7 @@ impl<T: Component> Bundle for T {
     }
 
     #[inline(always)]
-    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-        smallvec::smallvec![registry.get_or_register::<T>()]
-    }
-
-    #[inline(always)]
-    fn push_component_ids(
-        &self,
+    fn static_component_ids(
         registry: &mut ComponentRegistry,
         out: &mut SmallVec<[ComponentId; 8]>,
     ) {
@@ -3116,30 +3131,17 @@ macro_rules! impl_bundle {
                 0usize $( + $T::component_count() )+
             }
 
-            #[inline]
-            fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-                let mut ids = smallvec::SmallVec::<[ComponentId; 8]>::new();
-                #[allow(non_snake_case)]
-                let ($($T,)+) = self;
-                $( $T.push_component_ids(registry, &mut ids); )+
-                ids.sort_unstable();
-                ids
-            }
-
             /// ВАЖНО (корректность batch-спавна): пушит id в порядке ОБЪЯВЛЕНИЯ кортежа — том же,
-            /// в котором `write_into_batch` обходит компоненты. `component_ids` СОРТИРУЕТ (для
-            /// архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в порядке обхода, иначе
-            /// компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B колонку). См.
-            /// `spawn_many_inner`/`spawn_bundles_bulk` — они строят `col_indices` ИМЕННО отсюда.
+            /// в котором `write_into_batch` обходит компоненты. `component_ids` (дефолт trait'а)
+            /// СОРТИРУЕТ (ключ архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в
+            /// порядке обхода, иначе компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B
+            /// колонку). См. `spawn_many_inner`/`spawn_bundles_bulk` — строят `col_indices` отсюда.
             #[inline]
-            fn push_component_ids(
-                &self,
+            fn static_component_ids(
                 registry: &mut ComponentRegistry,
                 out: &mut SmallVec<[ComponentId; 8]>,
             ) {
-                #[allow(non_snake_case)]
-                let ($($T,)+) = self;
-                $( $T.push_component_ids(registry, out); )+
+                $( $T::static_component_ids(registry, out); )+
             }
 
             #[inline]
@@ -3220,8 +3222,10 @@ impl Bundle for () {
         0
     }
 
-    fn component_ids(&self, _registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-        SmallVec::new()
+    fn static_component_ids(
+        _registry: &mut ComponentRegistry,
+        _out: &mut SmallVec<[ComponentId; 8]>,
+    ) {
     }
 
     fn write_into(self, _world: &mut World, _archetype_id: ArchetypeId, _row: usize, _tick: Tick) {
@@ -3892,15 +3896,12 @@ mod tests {
             2
         }
 
-        fn component_ids(
-            &self,
+        fn static_component_ids(
             registry: &mut crate::ComponentRegistry,
-        ) -> SmallVec<[crate::ComponentId; 8]> {
-            let mut ids = SmallVec::new();
-            crate::Bundle::push_component_ids(&self.pos, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.hp, registry, &mut ids);
-            ids.sort_unstable();
-            ids
+            out: &mut SmallVec<[crate::ComponentId; 8]>,
+        ) {
+            <Pos as crate::Bundle>::static_component_ids(registry, out);
+            <Hp as crate::Bundle>::static_component_ids(registry, out);
         }
 
         fn write_into(
@@ -3930,16 +3931,13 @@ mod tests {
             4
         }
 
-        fn component_ids(
-            &self,
+        fn static_component_ids(
             registry: &mut crate::ComponentRegistry,
-        ) -> SmallVec<[crate::ComponentId; 8]> {
-            let mut ids = SmallVec::new();
-            crate::Bundle::push_component_ids(&self.base, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.weapon, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.armor, registry, &mut ids);
-            ids.sort_unstable();
-            ids
+            out: &mut SmallVec<[crate::ComponentId; 8]>,
+        ) {
+            <PlayerBase as crate::Bundle>::static_component_ids(registry, out);
+            <Vel as crate::Bundle>::static_component_ids(registry, out);
+            <Armor as crate::Bundle>::static_component_ids(registry, out);
         }
 
         fn write_into(
@@ -4784,5 +4782,37 @@ mod wave5_par_split {
             par, seq,
             "split par_for_each must mutate each entity exactly like sequential"
         );
+    }
+}
+
+#[cfg(test)]
+mod wave6_bundle {
+    //! §10.10: `spawn_many` takes the bundle composition STATICALLY
+    //! (`Bundle::static_component_ids`), so the `make_bundle` closure is called
+    //! exactly `count` times — no extra `make_bundle(0)` probe. This removes the
+    //! footgun that the closure had to be pure.
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct C(u32);
+    impl Component for C {}
+
+    #[test]
+    fn spawn_many_calls_make_bundle_exactly_count_times() {
+        let mut world = World::new();
+        let mut calls = 0usize;
+        let entities = world.spawn_many(5, |i| {
+            calls += 1;
+            C(i as u32)
+        });
+        assert_eq!(entities.len(), 5);
+        assert_eq!(
+            calls, 5,
+            "make_bundle must run exactly `count` times (no make_bundle(0) probe)"
+        );
+        // Per-entity data is intact (probe removal did not disturb the loop).
+        for (i, &e) in entities.iter().enumerate() {
+            assert_eq!(world.get::<C>(e), Some(&C(i as u32)));
+        }
     }
 }
