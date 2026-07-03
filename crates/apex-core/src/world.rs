@@ -549,12 +549,29 @@ impl World {
 
     #[cold]
     fn flush_hooks_slow(&mut self) {
+        // RAII: reset the dispatch flag and drop any undelivered hooks on the way
+        // out — INCLUDING a panic in a user hook. Otherwise a panicking hook would
+        // leave `hook_dispatch_active` set forever, silently disabling all future
+        // hook dispatch and letting the queue grow unbounded (A7).
+        struct DispatchGuard<'a> {
+            world: &'a mut World,
+        }
+        impl Drop for DispatchGuard<'_> {
+            fn drop(&mut self) {
+                self.world.hook_queue.clear();
+                self.world.hook_dispatch_active = false;
+            }
+        }
+
         self.hook_dispatch_active = true;
+        let guard = DispatchGuard { world: self };
+        let world = &mut *guard.world;
+
         let mut i = 0;
         // Хуки могут дописывать события в хвост очереди (вложенные структурные
         // операции) — обычный while по растущему Vec, без рекурсии.
-        while i < self.hook_queue.len() {
-            let ev = self.hook_queue[i];
+        while i < world.hook_queue.len() {
+            let ev = world.hook_queue[i];
             i += 1;
             match ev {
                 HookEvent::Added(entity, cid) => {
@@ -562,25 +579,25 @@ impl World {
                     // on_add: хук видит entity уже с полным составом.
                     // Транзитивные requires идут через эту же очередь
                     // (вставка R ставит своё Added-событие).
-                    if self.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
-                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = self
+                    if world.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
+                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = world
                             .registry
                             .requires(cid)
                             .map(|s| s.iter().copied().collect())
                             .unwrap_or_default();
                         for f in fns {
-                            f(self, entity);
+                            f(world, entity);
                         }
                     }
-                    let hook = self.registry.hooks(cid).and_then(|h| h.on_add);
+                    let hook = world.registry.hooks(cid).and_then(|h| h.on_add);
                     if let Some(f) = hook {
-                        f(self, entity);
+                        f(world, entity);
                     }
                 }
                 HookEvent::Removed(entity, cid) => {
-                    let hook = self.registry.hooks(cid).and_then(|h| h.on_remove);
+                    let hook = world.registry.hooks(cid).and_then(|h| h.on_remove);
                     if let Some(f) = hook {
-                        f(self, entity);
+                        f(world, entity);
                     }
                 }
                 HookEvent::RelationAdded {
@@ -588,8 +605,8 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = self.relations.on_add_hook(kind_idx) {
-                        f(self, subject, target);
+                    if let Some(f) = world.relations.on_add_hook(kind_idx) {
+                        f(world, subject, target);
                     }
                 }
                 HookEvent::RelationRemoved {
@@ -597,14 +614,13 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = self.relations.on_remove_hook(kind_idx) {
-                        f(self, subject, target);
+                    if let Some(f) = world.relations.on_remove_hook(kind_idx) {
+                        f(world, subject, target);
                     }
                 }
             }
         }
-        self.hook_queue.clear();
-        self.hook_dispatch_active = false;
+        // `guard` drops here → clears the queue and resets the flag (also on panic).
     }
 
     /// Поставить `Added`-хуки для свежесозданной entity по списку её
@@ -4021,6 +4037,34 @@ mod hooks_and_added_tests {
         world.on_add::<Hp>(|w, e| w.resource_mut::<HookLog>().added.push(e));
         let spawned = world.spawn_many(3, |i| (Hp(i as u32),));
         assert_eq!(world.resource::<HookLog>().added, spawned);
+    }
+
+    /// A7: a panic in a user hook must not leave dispatch permanently disabled —
+    /// the guard resets the flag and clears the queue on unwind, so later hooks
+    /// still fire.
+    #[test]
+    fn panicking_hook_does_not_permanently_disable_dispatch() {
+        let mut world = log_world();
+        world.on_add::<Hp>(|_w, _e| panic!("boom in hook"));
+        world.on_add::<Armor>(|w, e| w.resource_mut::<HookLog>().added.push(e));
+
+        // Spawning Hp fires the panicking hook.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.spawn((Hp(1),));
+        }));
+        assert!(res.is_err(), "the on_add hook panicked");
+        assert!(
+            !world.hook_dispatch_active,
+            "dispatch flag must be reset after the panic (A7)"
+        );
+
+        // A later hook must still fire — dispatch is not permanently disabled.
+        let a = world.spawn((Armor(0),));
+        assert_eq!(
+            world.resource::<HookLog>().added,
+            vec![a],
+            "hooks must still work after a prior hook panicked"
+        );
     }
 
     #[test]
