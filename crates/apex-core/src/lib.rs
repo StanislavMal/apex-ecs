@@ -47,7 +47,6 @@ pub mod par_utils;
 pub mod query;
 pub mod relations;
 pub mod resources;
-pub mod storage;
 pub mod sub_world;
 pub mod system_macro;
 pub mod system_param;

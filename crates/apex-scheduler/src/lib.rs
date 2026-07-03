@@ -79,8 +79,8 @@ use crate::config::SystemConfigKind;
 
 use apex_core::commands::Commands;
 use apex_core::{
-    archetype::Archetype, component::ComponentRegistry, system_param::WorldQuerySystemAccess,
-    world::World, AccessDescriptor,
+    component::ComponentRegistry, system_param::WorldQuerySystemAccess, world::World,
+    AccessDescriptor,
 };
 use apex_graph::Graph;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1976,43 +1976,6 @@ impl Scheduler {
         }
 
         self.cached_archetype_count = arch_count;
-    }
-
-    /// Возвращает индексы архетипов, к которым система имеет WRITE-доступ.
-    ///
-    /// Критерий: `all()` write-компоненты присутствуют в архетипе.
-    /// Используется для точного определения конфликтов между системами
-    /// в `detect_conflict_kind` и `add_new_nodes_and_edges`.
-    ///
-    /// В отличие от `compute_archetype_indices` (где используется `any()`
-    /// для SubWorld), здесь требуется, чтобы архетип содержал **все**
-    /// компоненты, которые система **пишет**. Это устраняет ложные
-    /// конфликты между системами, работающими с разными архетипами,
-    /// но имеющими общие компоненты в `AccessDescriptor`.
-    ///
-    /// Если у системы нет write-компонентов — возвращает пустой вектор
-    /// (такая система не конфликтует по данным с другими).
-    pub fn archetype_indices_for_conflict_detection(
-        write_type_ids: &[TypeId],
-        archetypes: &[Archetype],
-        registry: &ComponentRegistry,
-    ) -> Vec<usize> {
-        if write_type_ids.is_empty() {
-            return vec![];
-        }
-        archetypes
-            .iter()
-            .enumerate()
-            .filter(|(_, arch)| {
-                write_type_ids.iter().all(|tid| {
-                    registry
-                        .get_id_by_type(tid)
-                        .map(|cid| arch.has_component(cid))
-                        .unwrap_or(false)
-                })
-            })
-            .map(|(i, _)| i)
-            .collect()
     }
 
     /// Проверяет, существует ли ребро между двумя узлами.
