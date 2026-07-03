@@ -119,12 +119,12 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         }
 
         // Авторегистрация на старте `World::new()` через `linkme::distributed_slice` (линкер собирает
-        // регистраторы из всех крейтов). На wasm32 linkme не эмитится — но это лишь ОПТИМИЗАЦИЯ
-        // (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО при первом
-        // использовании (`register` → `Component::register_requires`), поэтому `#[require]` работает и
-        // на wasm. TD-25.
+        // регистраторы из всех крейтов). На wasm32 и под Miri linkme не эмитится — но это лишь
+        // ОПТИМИЗАЦИЯ (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО
+        // при первом использовании (`register` → `Component::register_requires`), поэтому `#[require]`
+        // работает и там. TD-25 (wasm); Miri — linkme distributed-slice даёт overflow, тот же путь.
         #[allow(non_upper_case_globals)]
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), not(miri)))]
         #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
         #[linkme(crate = ::apex_core::linkme)]
         static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
