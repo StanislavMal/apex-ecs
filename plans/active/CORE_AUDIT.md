@@ -73,7 +73,34 @@ F2 закрыл лишь гонку, семантика катчапа FixedUpda
 - **Гейт волны 2 (ФИНАЛЬНЫЙ, пройден):** весь воркспейс + примеры зелёные, clippy net-neutral,
   движок собирается против ветки, **goldens движка 656/656 байт-идентично** (рендер не изменён).
   Все correctness/soundness-пункты волны 2 закрыты; отложены только D9 (косметика) и F4
-  (архитектурно, волна 6). Ветка `core-audit-fixes` (26 коммитов) готова к мержу/пушу.
+  (архитектурно, волна 6). **Волны 0-2 СМЕРЖЕНЫ в main** (`b3fb9ed`, локально, не запушено —
+  пуш делает пользователь).
+
+**Волна 3 🔄 — PANIC-SAFETY + формальный UB (В ПРОЦЕССЕ; ветка `core-audit-wave3` от main):**
+- `a614c04` — снят блокер Miri↔linkme: `cfg(miri)` → ленивая регистрация компонентов (как wasm),
+  distributed_slice под Miri не итерируется; тесты со `World` проходят Miri. **Вторая Miri-нота
+  (не наш баг):** `crossbeam-epoch`/rayon даёт ложное Stacked-Borrows-срабатывание на
+  `par`-тестах → гейт идёт через `-Zmiri-tree-borrows` (crossbeam проходит; реальный UB ловит).
+- `06e7145` A3 — Resources в `UnsafeCell` (провенанс `*mut` от cell, не отмытый из `&T`; N19
+  двойной Box убран). **Подтверждено: Miri Tree Borrows находил A3 как реальный UB, после фикса
+  тест зелёный.**
+- **ОСТАТОК волны 3 (спроектировано/подтверждено, к чистой реализации в фокус-сессии):**
+  - **A2** — тики Column через `&self→*mut` (set_change_tick/stamp_range + query Write hot-path
+    ticks_ptr). ТОТ ЖЕ подтверждённый класс, что A3 (Miri Tree Borrows). Фикс: `change_ticks/
+    added_ticks: Vec<TickCell>` (TickCell=UnsafeCell<Tick>+unsafe Sync); ticks_ptr отдаёт `*mut`
+    с cell-провенансом. Инвазивно (archetype.rs + query.rs + dense.rs, тонкость провенанса
+    base-pointer'а) → делать с Miri-валидацией query-Write пути, не в раздутой сессии.
+  - **A6/A8/B-Н17** — panic-safety: drop-guard в spawn_many/spawn_bundles_bulk (unwind →
+    entities>col.len); swap_remove_and_drop swap-then-shrink-then-drop (double-drop при панике
+    Drop — **A8 УЖЕ СПРОЕКТИРОВАН**); арена apply panic-guard. Гейт: catch_unwind-тесты.
+  - **D3** — ASD-таски материализуют алиасящиеся `&mut SystemDescriptor` (SendPtr на весь
+    дескриптор; split-системы ZST, но дескриптор с String/Box не ZST). Фикс: указатель на
+    `dyn ParSystem`, не на дескриптор (apex-scheduler; Miri-валидация отдельным прогоном).
+  - **В1(б)+C2** — runtime borrow-флаги per-ComponentId (debug) → ловят write-write+write-read
+    из safe-кода (Query<(&mut T,&mut T)>, q.get дважды); C2 co-located здесь.
+  - **F5** — EventIterator::Drop создаёт `&mut Events` при живых `&T` (по вердикту Miri).
+  - Гейт волны 3: Miri-smoke (Tree Borrows) обязателен на query/dense/transform/events/commands/
+    entity/relations; goldens движка.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
