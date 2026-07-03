@@ -2559,6 +2559,16 @@ impl Scheduler {
                 continue;
             }
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                // Only systems with a concrete component filter (Filtered) have a
+                // per-entity partition to split by rows. A system with `All` / no
+                // record declares no component access (only resources / events /
+                // whole-world), so it has nothing to partition — chunking it would
+                // run its whole body (and any side effects) once per chunk (D2).
+                // Such systems run inline as a single task.
+                let is_filtered = matches!(
+                    self.system_archetype_indices.get(&sys_id),
+                    Some(SystemArchetypes::Filtered(_))
+                );
                 let arch_indices = match self.system_archetype_indices.get(&sys_id) {
                     Some(SystemArchetypes::Filtered(v)) => v.clone(),
                     // All или нет записи — система видит все архетипы
@@ -2576,7 +2586,7 @@ impl Scheduler {
                     })
                     .sum();
 
-                if entity_count > 0 {
+                if entity_count > 0 && is_filtered {
                     let access = self.systems[sys_idx].kind.access();
                     let has_events = access
                         .map(|a| !a.reads_event.is_empty() || !a.writes_event.is_empty())
@@ -4805,6 +4815,40 @@ mod tests {
         let a_stage = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
         let b_stage = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
         assert!(b_stage < a_stage, "explicit before(\"b\",\"a\") must run b before a");
+    }
+
+    /// D2: a system with no component access (only side effects / whole-world)
+    /// has nothing to partition by rows. On a large world the old code gave it
+    /// entity_count = whole world and let ASD chunk it, running its body once per
+    /// chunk. It must run exactly once.
+    #[test]
+    fn empty_access_system_runs_once_not_chunked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(apex_macros::Component)]
+        struct Marker;
+
+        let mut world = World::new();
+        for _ in 0..100_000 {
+            world.spawn((Marker,));
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            par("tick", move |_ctx: SystemContext<'_>| {
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        sched.run(&mut world);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "an empty-access system must run once, not once per ASD chunk"
+        );
     }
 
     #[test]
