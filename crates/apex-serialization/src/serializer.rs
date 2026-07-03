@@ -519,6 +519,31 @@ impl WorldSerializer {
 
     // ── Сохранение на диск ────────────────────────────────────
 
+    /// Atomically write `data` to `path` (§0.2a hygiene).
+    ///
+    /// A plain `fs::write` truncates the target first, so a crash or interrupt
+    /// mid-write leaves a corrupt (partial) save. Instead write to a sibling
+    /// `.tmp` file, flush it, then rename over the target — a reader never
+    /// observes a half-written file, and rename is atomic within one directory.
+    fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        // std::fs::rename replaces an existing destination atomically on both
+        // Unix and Windows (MOVEFILE_REPLACE_EXISTING).
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp); // don't leak the temp on failure
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Сохранить снэпшот в файл в указанном формате.
     pub fn write_to_file(
         path:   &Path,
@@ -529,7 +554,7 @@ impl WorldSerializer {
             SaveFormat::Json => snap.to_json()?,
             SaveFormat::Bincode => snap.to_bincode()?,
         };
-        std::fs::write(path, &data)?;
+        Self::atomic_write(path, &data)?;
         Ok(())
     }
 
@@ -571,7 +596,7 @@ impl WorldSerializer {
     /// Сохранить diff в файл (всегда в бинарном формате).
     pub fn write_diff_to_file(path: &Path, diff: &WorldDiff) -> Result<(), SerializationError> {
         let data = diff.to_bincode()?;
-        std::fs::write(path, &data)?;
+        Self::atomic_write(path, &data)?;
         Ok(())
     }
 
@@ -923,6 +948,32 @@ mod tests {
             "bin={} should be < json={}", bin_meta.len(), json_meta.len());
 
         // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Atomic save: replacing an existing file works and leaves no `.tmp`
+    /// sibling behind (the write goes through temp+rename).
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let world = setup_world();
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        let dir = std::env::temp_dir().join("apex_serialization_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("save.json");
+
+        // Pre-existing content that must be atomically replaced.
+        std::fs::write(&path, b"STALE PARTIAL DATA").unwrap();
+        WorldSerializer::write_to_file(&path, &snap, SaveFormat::Json).unwrap();
+
+        let loaded = WorldSerializer::read_from_file(&path).unwrap();
+        assert_eq!(loaded.entities.len(), snap.entities.len());
+        assert!(
+            !dir.join("save.json.tmp").exists(),
+            "atomic write must not leave a .tmp file behind on success"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -314,7 +314,14 @@ impl PrefabLoader {
                 }),
             };
 
-            let info = world.registry().get_info(component_id).unwrap();
+            let info = match world.registry().get_info(component_id) {
+                Some(i) => i,
+                // component_id_by_name resolved above, so this should hold; return
+                // a proper error rather than unwrap-panic if the invariant breaks.
+                None => return Err(PrefabError::ComponentNotRegistered {
+                    type_name: (*type_name).to_string(),
+                }),
+            };
             let serde_fns = match &info.serde {
                 Some(s) => s,
                 None => return Err(PrefabError::ComponentNotSerializable {
@@ -363,8 +370,16 @@ impl apex_core::template::EntityTemplate for PrefabManifest {
         // NOTE: дочерние префабы из self.children не будут найдены
         // если они не были загружены в этот loader. Это известное ограничение —
         // EntityTemplate::spawn() не имеет доступа к оригинальному PrefabLoader.
-        loader.instantiate(world, self, &overrides, None, Some(params))
-            .expect("PrefabManifest::spawn failed")
+        // §0.2a: the `EntityTemplate` trait returns `Entity`, so a failed
+        // instantiation cannot propagate a `Result` here (a `try_spawn` on the
+        // trait is a wave-6 API change). Until then, panic LOUDLY with the
+        // prefab name and the underlying cause instead of an opaque "spawn
+        // failed" — the caller sees exactly which prefab and why.
+        loader
+            .instantiate(world, self, &overrides, None, Some(params))
+            .unwrap_or_else(|e| {
+                panic!("PrefabManifest::spawn: instantiating prefab '{}' failed: {e}", self.name)
+            })
     }
 }
 
@@ -420,6 +435,22 @@ mod tests {
         assert_eq!(restored.name, "Test");
         assert_eq!(restored.components.len(), 1);
         assert_eq!(restored.components[0].type_name, "apex_core::Health");
+    }
+
+    /// §0.2a: `EntityTemplate::spawn` cannot return a Result, but a failed
+    /// instantiation must still be LOUD and name the prefab + cause rather than
+    /// panic with an opaque "spawn failed".
+    #[test]
+    #[should_panic(expected = "instantiating prefab 'Broken'")]
+    fn prefab_spawn_panics_loudly_with_name() {
+        use apex_core::template::{EntityTemplate, TemplateParams};
+        let mut world = World::new();
+        // "Nonexistent" is never registered in `world`.
+        let manifest = PrefabLoader::new()
+            .load_json(r#"{ "name": "Broken", "components": [ { "type_name": "Nonexistent", "value": {} } ] }"#)
+            .unwrap()
+            .clone();
+        let _ = manifest.spawn(&mut world, &TemplateParams::new());
     }
 
     #[test]
