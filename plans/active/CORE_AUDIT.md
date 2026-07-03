@@ -145,6 +145,35 @@ main; гейт пройден, готова к мержу `--no-ff` в main):**
     не джойнит их) — это НЕ наш UB (как и crossbeam-false-positive из SB), снимается
     `-Zmiri-ignore-leaks`. Гейт зачтён по отсутствию UB (все 211 тестов зелены). Движок собирается
     + goldens 656/656 байт-идентично.
+
+**Волна 4 🔄 — §0.2a ГРОМКОСТЬ + гигиена + мёртвый код (В РАБОТЕ; ветка `core-audit-wave4` от
+main):**
+- `6f562c3` **A11** ✅ — checked column alloc size на realloc-пути.
+- `003e45b` **A12** ✅ — `len`/`is_empty` честны к row-ranges и построчным фильтрам.
+- **Warn-волна §0.2a (ВЫПОЛНЕНА; единый `warn_once!` — лог один раз на call-site, AtomicBool-
+  латч, стиль Bevy; re-export из apex-core для всех крейтов):**
+  - `4e376b8` **A9/A10/B7/B10** ✅ — apex-core: `warn_once!` + громкие misuse-пути. A9 —
+    insert/insert_raw/insert_parts/remove_raw/remove на мёртвой entity (no-op → warn, значение
+    дропается не течёт). A10 — `spawn_at` на УЖЕ живую entity (осиротил бы строку): debug =
+    panic, release = громкий refuse+drop bundle; reserved-but-unflushed id (location-less)
+    проходят. B7 — `Commands::despawn` на уже-мёртвую (двойной/каскад) громко. B10 —
+    `Commands::spawn_template` с незарег. именем + `TemplateParams::set` с ошибкой сериализации.
+    Регресс `loudness_wave4`: throttle single-emission, A10 refusal, B7 clean double-despawn,
+    B10 no-op.
+  - `25cea06` **E8 (serde)** ✅ — restore дропает компонент, зарег. БЕЗ serde-fns (version skew) —
+    теперь warn. Регресс `restore_drops_component_registered_without_serde`.
+  - `86c6c82` **E12 (isolated)** ✅ — WorldBridge/CloneableBridge громко о дропе события на
+    ошибке bincode-serialize и о закрытом канале (был `let _ = send`). Регресс: closed-channel +
+    serialize-failure дропают без паники.
+  - `f6883a3` **E8 (scripting)** ✅ — Lua-query по незарег. data/With → пустой результат громко;
+    незарег. Without (over-match) громко; исчезнувший binding mid-iter громко. Тестов нет
+    (харнесс скриптинга — волна 7).
+- **ОСТАЛОСЬ в волне 4:** гигиена (лишний unsafe ×4, QueryCache poison, pipeline unwrap→Result,
+  prefab expect→Result, атомарная запись сейвов temp+rename, migrate()-путь на restore, крейт-wide
+  `allow(missing_safety_doc)` → точечные SAFETY-доки) → потом мёртвый код (SparseSet, row-split
+  5.7, assign_masks+ComponentMask, archetype_indices_for_conflict_detection, ~13 allow(dead_code),
+  протухшие атрибуты; каждое удаление под полный прогон тестов+goldens). QueryBuilder НЕ трогаем
+  (волна 6).
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
