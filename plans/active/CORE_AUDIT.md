@@ -259,6 +259,33 @@ main):**
   (🟢×2.3) · wide_iter 3.81/3.74/2.23 (паритет bevy) · commands_insert 514/**501** (🟡−3%). Волна 5
   НОВЫХ регрессий не внесла; split улучшил heavy_compute. Отставания — structural (fragmented/
   relations) либо −3% шум (simple_insert/commands_insert).
+
+**Волна 6 🔄 — АРХИТЕКТУРА/API (ветка `core-audit-wave6` от main; порядок: самостоятельные
+менее-рискованные пункты СНАЧАЛА, В1(в)+В3 borrow-migration — осторожнее всего, ломает API движка):**
+- **make_bundle → `Bundle::static_component_ids` (§10.10) ✅** — состав бандла берётся СТАТИЧЕСКИ
+  (по типу, associated fn), а не через `make_bundle(0)`-probe. `spawn_many` зовёт замыкание РОВНО
+  `count` раз (footgun «замыкание должно быть чистым» убран). Trait: `static_component_ids`
+  (required, decl order) + `component_ids` (default, sorted — ключ архетипа) + `push_component_ids`
+  (default, decl order). Мигрированы single/tuple/()/derive/ручные impl. Регресс-тест
+  `spawn_many_calls_make_bundle_exactly_count_times`. Гейт: workspace зелёный (219 apex-core),
+  clippy чист, движок собирается, goldens 656/656 байт-идентично.
+- **D8a детерминизм порядка Custom-стадий ✅** — несколько `Custom(_)` делят priority 7, порядок шёл
+  от FxHashMap-итерации (нестабилен, иной на wasm32). Сортировка label'ов (StageLabel: Ord, Custom
+  по имени) в двух местах compile → воспроизводимый порядок стадий. Регресс-тест
+  `custom_stages_ordered_by_name_deterministically`. **D8b** (детерминизм Entity id через per-system
+  command-буферы) ОТЛОЖЕН в В1(в)/F4 (та же thread_commands→per-system переработка + Commands сейчас
+  !Send).
+- **E6 MapEntities ✅** (§0.9 дифференциатор) — snapshot компонента с `Entity`-ссылкой (напр.
+  `Target(Entity)`) на restore ремапит её на НОВЫЙ id (иначе ссылка в пустоту). Механизм: трейт
+  `MapEntities` + `MapEntitiesFn` в `ComponentInfo` (регистрируется `register_map_entities::<T>()`);
+  `World::map_entity_refs` (raw-путь) + ВТОРОЙ проход restore после полной карты old→new (forward-
+  ссылки тоже). `Entity` теперь `Serialize`/`Deserialize`. Регресс-тесты: e6 в serialization
+  (end-to-end restore-ремап) + apex-core (raw map_entity_refs), целевой Miri TB 0 UB. Гейт: workspace
+  зелёный, clippy чист, движок собирается, goldens 656/656 байт-идентично.
+- **Очередь волны 6:** E7 ресурсы в snapshot (формат v2 + string-table) · F7 generics в derive
+  (низкий спрос) · **В1(в)+В3** (UnsafeWorldCell + `&mut World`-конструкторы write + единый Query
+  поверх per-system QueryState — САМЫЙ тяжёлый, ломает API движка; осторожнее всего, детальный план +
+  инкрементально) · QueryBuilder dynamic query · SystemContext ужатие (F3).
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
