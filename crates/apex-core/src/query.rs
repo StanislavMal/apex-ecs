@@ -1645,12 +1645,25 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         });
     }
 
+    /// Число матчей запроса.
+    ///
+    /// A12: раньше суммировались ПОЛНЫЕ длины архетипов, что завышало счёт для
+    /// SubWorld-запросов (row_ranges ограничивают строки) и построчных фильтров
+    /// (`Changed`/`Added`/`Or` пропускают часть строк). Fast-path (нет
+    /// row_ranges И нет построчного фильтра) точен по сумме длин; иначе считаем
+    /// фактические матчи (`iter().count()`, как Bevy).
     pub fn len(&self) -> usize {
-        self.archetypes.iter().map(|a| a.len).sum()
+        if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
+            return self.archetypes.iter().map(|a| a.len).sum();
+        }
+        self.iter().count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.archetypes.iter().all(|a| a.len == 0)
+        if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
+            return self.archetypes.iter().all(|a| a.len == 0);
+        }
+        self.iter().next().is_none()
     }
 
     /// Плотная (chunk) итерация (W2-0.5): колбэк получает entities-слайс и
@@ -2116,6 +2129,35 @@ mod query_filter_tests {
         let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new(&world); // filter over written comp
         let _ = Query::<Write<Hp>, Changed<Hp>>::new(&world); // Changed filter is not a data borrow
         let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new(&world); // write + optional distinct
+    }
+
+    /// A12: `len`/`is_empty` must honor per-row filters (and row ranges), not
+    /// just sum full archetype lengths. A `Changed<T>` query over unchanged rows
+    /// has length 0, not the archetype size.
+    #[test]
+    fn a12_len_honors_row_filters() {
+        let mut world = World::new();
+        let e1 = world.spawn((Hp(1),));
+        let _e2 = world.spawn((Hp(2),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        // Nothing changed since the advance → the Changed query is empty.
+        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        assert_eq!(q.len(), 0, "no rows changed — len must be 0, not the archetype size");
+        assert!(q.is_empty());
+        drop(q);
+
+        // Change exactly one row → len == 1.
+        world.get_mut::<Hp>(e1).unwrap().0 += 10;
+        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        assert_eq!(q.len(), 1);
+        assert!(!q.is_empty());
+        assert_eq!(q.iter().count(), 1, "len must agree with the actual iteration");
+        drop(q);
+
+        // Control: the unfiltered query still counts every row via the fast path.
+        assert_eq!(Query::<Read<Hp>>::new(&world).len(), 2);
     }
 
     /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.

@@ -2523,19 +2523,34 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
         });
     }
 
+    /// Число матчей запроса.
+    ///
+    /// A12: суммирование ПОЛНЫХ длин `arch_indices` завышало счёт — индексы
+    /// могут быть суперсетом (`match_verified == false`: SubWorld/планировщик),
+    /// `row_ranges` ограничивают строки, а построчные фильтры (`Changed`/`Added`)
+    /// пропускают часть строк. Fast-path точен, только когда всех трёх нет;
+    /// иначе считаем фактические матчи (`iter().count()`).
     pub fn len(&self) -> usize {
-        self.arch_indices
-            .as_slice()
-            .iter()
-            .map(|&i| self.world.archetypes[i].len())
-            .sum()
+        if self.match_verified && self.row_ranges.is_empty() && !Q::has_row_filter() {
+            return self
+                .arch_indices
+                .as_slice()
+                .iter()
+                .map(|&i| self.world.archetypes[i].len())
+                .sum();
+        }
+        self.iter().count()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.arch_indices
-            .as_slice()
-            .iter()
-            .all(|&i| self.world.archetypes[i].is_empty())
+        if self.match_verified && self.row_ranges.is_empty() && !Q::has_row_filter() {
+            return self
+                .arch_indices
+                .as_slice()
+                .iter()
+                .all(|&i| self.world.archetypes[i].is_empty());
+        }
+        self.iter().next().is_none()
     }
 
     /// Плотная (chunk) итерация (W2-0.5) — см. [`Query::for_each_chunk`]
