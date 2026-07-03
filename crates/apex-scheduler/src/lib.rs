@@ -2449,6 +2449,17 @@ impl Scheduler {
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
+            // D6: skip the stage (and the change window) when every system is
+            // disabled by run_if, so stage_last_run doesn't advance past changes
+            // made during the pause.
+            let any_active = system_ids.iter().any(|&sys_id| {
+                self.system_indices
+                    .get(&sys_id)
+                    .is_some_and(|&idx| self.systems[idx].run_condition.evaluate(w))
+            });
+            if !any_active {
+                continue;
+            }
             {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
@@ -2864,6 +2875,20 @@ impl Scheduler {
 
         for &stage_pos in &schedule {
             let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
+            // D6: skip the whole stage — including opening the change window — when
+            // every system is disabled by its run_condition. Otherwise the window
+            // would advance stage_last_run past changes made during a run_if pause,
+            // and a system resuming later would miss Changed<T> from those frames.
+            let any_active = stage_ids.iter().any(|&sys_id| {
+                self.system_indices.get(&sys_id).is_some_and(|&idx| {
+                    self.systems[idx]
+                        .run_condition
+                        .evaluate(unsafe { &*const_ptr })
+                })
+            });
+            if !any_active {
+                continue;
+            }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
             self.open_stage_change_window(*stage_idx, unsafe { &mut *world_ptr });
             if !*all_parallel {
@@ -4848,6 +4873,69 @@ mod tests {
             calls.load(Ordering::Relaxed),
             1,
             "an empty-access system must run once, not once per ASD chunk"
+        );
+    }
+
+    /// D6: a stage whose systems are all disabled by run_if must NOT advance its
+    /// change-detection window, so a system resuming after the pause still sees
+    /// Changed<T> made while it was paused.
+    #[test]
+    fn run_if_paused_stage_does_not_lose_changed() {
+        use apex_core::prelude::*;
+
+        #[derive(apex_macros::Component)]
+        struct Mark(u32);
+        struct Ctl {
+            active: bool,
+            mutate: bool,
+            entity: Entity,
+            seen: u32,
+        }
+
+        let mut world = World::new();
+        let e = world.spawn((Mark(0),));
+        world.insert_resource(Ctl {
+            active: false,
+            mutate: false,
+            entity: e,
+            seen: 0,
+        });
+
+        fn mutator(w: &mut World) {
+            let (mutate, e) = {
+                let c = w.resource::<Ctl>();
+                (c.mutate, c.entity)
+            };
+            if mutate {
+                if let Some(mut m) = w.get_mut::<Mark>(e) {
+                    m.0 += 1;
+                }
+            }
+        }
+        fn reader(w: &mut World) {
+            let mut n = 0u32;
+            let q = w.query::<(Read<Mark>, Changed<Mark>)>();
+            q.for_each(|_, _| n += 1);
+            w.resource_mut::<Ctl>().seen += n;
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_system_to_stage("mutator", mutator, StageLabel::Update);
+        sched
+            .add_system_to_stage("reader", reader, StageLabel::PostUpdate)
+            .run_if(|w: &World| w.resource::<Ctl>().active);
+
+        sched.run(&mut world); // frame 1: paused, no mutation
+        world.resource_mut::<Ctl>().mutate = true;
+        sched.run(&mut world); // frame 2: Mark mutated, reader still paused
+        world.resource_mut::<Ctl>().mutate = false;
+        world.resource_mut::<Ctl>().active = true;
+        sched.run(&mut world); // frame 3: reader resumes — must see the frame-2 change
+
+        assert_eq!(
+            world.resource::<Ctl>().seen,
+            1,
+            "reader must see Changed<Mark> produced while its stage was paused"
         );
     }
 
