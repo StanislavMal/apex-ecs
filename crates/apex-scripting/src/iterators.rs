@@ -266,18 +266,56 @@ pub(crate) fn commit_entity_table(
 
     let arch_idx: i32 = meta.get("arch")?;
     let row: i32 = meta.get("row")?;
+    let meta_entity: i32 = meta.get("entity")?;
     let writes: mlua::Table = meta.get("writes")?;
 
-    let world_ptr = world as *const World;
+    // Никогда НЕ доверяем `_meta` из Lua: скрипт может подделать arch/row/col
+    // или сохранить таблицу до следующего кадра, где строку уже swap-removed'нули.
+    // Валидируем всё против ЖИВОГО мира до любого unsafe-доступа (E1).
+    if arch_idx < 0 || row < 0 {
+        log::warn!("commit: negative _meta arch/row, skipped");
+        return Ok(());
+    }
+    let arch_idx = arch_idx as usize;
+    let row = row as usize;
+    let arch = match world.archetypes().get(arch_idx) {
+        Some(a) => a,
+        None => {
+            log::warn!("commit: _meta.arch {arch_idx} out of range, skipped");
+            return Ok(());
+        }
+    };
+    if row >= arch.len() {
+        log::warn!("commit: _meta.row {row} out of range for archetype {arch_idx}, skipped");
+        return Ok(());
+    }
+    // Строка обязана всё ещё нести ту entity, для которой построена таблица —
+    // иначе отложенное структурное изменение переселило её, и мы бы записали
+    // в ЧУЖУЮ entity (порча данных).
+    if arch.entities()[row].index() as i32 != meta_entity {
+        log::warn!(
+            "commit: entity at archetype {arch_idx} row {row} no longer matches table entity, skipped"
+        );
+        return Ok(());
+    }
 
     for pair in writes.clone().pairs::<String, i32>() {
-        let (type_name, col_idx): (String, i32) = pair?;
-        log::debug!("commit: writing component '{type_name}' col={col_idx}");
+        let (type_name, _lua_col): (String, i32) = pair?;
 
         let binding = match ctx.binding(&type_name) {
             Some(b) => b,
             None => {
                 log::warn!("commit: no binding for '{}'", type_name);
+                continue;
+            }
+        };
+
+        // РЕ-резолвим колонку из архетипа по ComponentId биндинга — Lua-значению
+        // col_idx не верим (подделка = OOB или type confusion в write).
+        let col_idx = match arch.column_index(binding.id) {
+            Some(i) => i,
+            None => {
+                log::warn!("commit: component '{type_name}' not present in archetype, skipped");
                 continue;
             }
         };
@@ -291,13 +329,14 @@ pub(crate) fn commit_entity_table(
             }
         };
 
+        // SAFETY: arch_idx/row/col_idx проверены выше против живого мира, row в
+        // границах архетипа, а `binding.write` соответствует `binding.id` = типу
+        // колонки (col_idx резолвнут именно по нему) — type confusion исключена.
         unsafe {
-            let w = world_ptr.as_ref().unwrap_unchecked();
-            let arch = &w.archetypes()[arch_idx as usize];
-            let col = &arch.columns_raw()[col_idx as usize];
-            let ptr = col.get_raw_ptr(row as usize) as *mut u8;
+            let col = &arch.columns_raw()[col_idx];
+            let ptr = col.get_raw_ptr(row) as *mut u8;
             (binding.write)(ptr, &val);
-            arch.set_change_tick(row as usize, binding.id, w.current_tick());
+            arch.set_change_tick(row, binding.id, world.current_tick());
         }
     }
 
@@ -368,4 +407,48 @@ pub(crate) fn create_query_iter_fn(
             return Ok(mlua::Value::Table(table));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apex_core::component::Component;
+
+    struct Marker;
+    impl Component for Marker {}
+
+    fn forged_meta(lua: &mlua::Lua, arch: i32, row: i32, entity: i32) -> mlua::Table {
+        let t = lua.create_table().unwrap();
+        let meta = lua.create_table().unwrap();
+        meta.set("arch", arch).unwrap();
+        meta.set("row", row).unwrap();
+        meta.set("entity", entity).unwrap();
+        meta.set("writes", lua.create_table().unwrap()).unwrap();
+        t.set("_meta", meta).unwrap();
+        t
+    }
+
+    /// E1: a forged `_meta` (out-of-range archetype/row, or a row that no longer
+    /// holds the table's entity) must be rejected cleanly — never dereferenced
+    /// into an OOB / wrong-entity write.
+    #[test]
+    fn commit_rejects_forged_meta() {
+        let lua = mlua::Lua::new();
+        let ctx = ScriptContext::new();
+        let mut world = World::new();
+        let _e = world.spawn((Marker,)); // archetype 0, one row
+
+        // Out-of-range archetype.
+        let t = forged_meta(&lua, 9999, 0, 0);
+        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+
+        // Valid archetype, out-of-range row.
+        let t = forged_meta(&lua, 0, 9999, 0);
+        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+
+        // Valid archetype/row, but the table claims a different entity than the
+        // one currently occupying that row.
+        let t = forged_meta(&lua, 0, 0, 424242);
+        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+    }
 }
