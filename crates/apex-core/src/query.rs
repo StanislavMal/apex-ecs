@@ -1624,7 +1624,9 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             if clamped_start >= clamped_end {
                 return;
             }
-            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
+            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+            let arch = &world.archetypes[arch_idx];
             let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
             if <(Q, F)>::has_row_filter() {
@@ -1744,7 +1746,9 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             if clamped_start >= clamped_end {
                 return;
             }
-            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
+            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+            let arch = &world.archetypes[arch_idx];
             let len = clamped_end - clamped_start;
             let slices = unsafe { Q::fetch_slices(arch, &ids, clamped_start, len, this_run) };
             f(&arch.entities[clamped_start..clamped_end], slices);

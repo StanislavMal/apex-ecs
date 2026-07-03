@@ -4718,6 +4718,21 @@ mod tests {
         assert!(pos_armor < pos_health, "armor должен быть до health");
     }
 
+    /// §0.2a hygiene: `Pipeline::build` naming an unregistered system used to
+    /// panic on an opaque `unwrap`. It must now log an error and skip wiring —
+    /// the scheduler still compiles.
+    #[test]
+    fn pipeline_build_unregistered_system_does_not_panic() {
+        let mut sched = Scheduler::new();
+        let _physics = sched.add_par_system("physics", EmitDamage);
+        // "ghost" is never registered.
+        Scheduler::event_pipeline::<DamageEvent>()
+            .produced_by("physics")
+            .consumed_by("ghost")
+            .build(&mut sched);
+        sched.compile().unwrap();
+    }
+
     /// Both consumers of the same event run after the producer and each receives
     /// the event. They are SERIALIZED with respect to each other (F2: reading the
     /// same event mutates its shared cursor registry, so parallel reads race);

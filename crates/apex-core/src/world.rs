@@ -81,7 +81,11 @@ impl QueryCache {
         // Hit path: запись актуальна, если видела все текущие архетипы.
         // Lookup по &[u64] — без построения владеющего ключа.
         {
-            let map = self.entries.read().unwrap();
+            // Poison is benign here: the map is an append-only cache of derived
+            // data — a panic elsewhere while holding the lock cannot leave it in
+            // a logically corrupt state, so recover the guard instead of
+            // propagating an unrelated panic across every future query.
+            let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = map.get(key.as_slice()) {
                 if entry.seen_arch_count == total {
                     return entry.arch_indices.clone();
@@ -89,7 +93,7 @@ impl QueryCache {
             }
         }
 
-        let mut map = self.entries.write().unwrap();
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         // Двойная проверка: другой поток мог дополнить между read и write lock.
         let (mut indices, start) = match map.get(key.as_slice()) {
             Some(entry) if entry.seen_arch_count == total => {
@@ -125,7 +129,10 @@ impl QueryCache {
     /// когда-нибудь появится.
     #[allow(dead_code)]
     pub fn invalidate(&self) {
-        self.entries.write().unwrap().clear();
+        self.entries
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -2572,7 +2579,9 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if clamped_start >= clamped_end {
                 return;
             }
-            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
+            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+            let arch = &world.archetypes[arch_idx];
             let state = unsafe { Q::fetch_state(arch, &ids, last_run, world.current_tick()) };
             let entities = &arch.entities[clamped_start..clamped_end];
             if Q::has_row_filter() {
@@ -2695,7 +2704,9 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             if clamped_start >= clamped_end {
                 return;
             }
-            let arch = unsafe { &*world.archetypes.as_ptr().add(arch_idx) };
+            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
+            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+            let arch = &world.archetypes[arch_idx];
             let len = clamped_end - clamped_start;
             let slices = unsafe { Q::fetch_slices(arch, &ids, clamped_start, len, this_run) };
             f(&arch.entities[clamped_start..clamped_end], slices);
