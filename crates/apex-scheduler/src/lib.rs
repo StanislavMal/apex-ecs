@@ -3435,6 +3435,32 @@ fn detect_conflict_kind(
     type_names: &FxHashMap<TypeId, &'static str>,
     event_ordering: bool,
 ) -> Option<(ConflictKind, bool)> {
+    // ── Whole-world access (F3) ─────────────────────────────────
+    // A whole-world system (e.g. a `Ctx` param — SystemContext can reach any
+    // resource / component / event) declares no specific access, so the TypeId
+    // checks below would find no conflict and let it run in parallel with a
+    // writer — a data race. Treat it conservatively: it conflicts with any other
+    // system that touches any data (or is itself whole-world). Symmetric, so it
+    // serializes in registration order and an explicit ordering can override it
+    // (see D5).
+    if ai.needs_whole_world || aj.needs_whole_world {
+        let has_access = |a: &AccessDescriptor| {
+            a.needs_whole_world
+                || !a.reads.is_empty()
+                || !a.writes.is_empty()
+                || !a.reads_event.is_empty()
+                || !a.writes_event.is_empty()
+        };
+        if has_access(ai) && has_access(aj) {
+            return Some((
+                ConflictKind::WriteWrite {
+                    component_name: "<whole-world>",
+                },
+                true,
+            ));
+        }
+    }
+
     // ── Компонентные конфликты ──────────────────────────────────
 
     // Write+Write: оба пишут в один компонент
@@ -4936,6 +4962,42 @@ mod tests {
             world.resource::<Ctl>().seen,
             1,
             "reader must see Changed<Mark> produced while its stage was paused"
+        );
+    }
+
+    /// F3: a whole-world system (SystemContext / `Ctx` can touch any data but
+    /// declares no specific access) must conflict with — and be serialized
+    /// against — a writer, not run in parallel with it.
+    #[test]
+    fn whole_world_system_is_serialized_against_a_writer() {
+        struct Whole;
+        impl ParSystem for Whole {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().whole_world()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct Writer;
+        impl ParSystem for Writer {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("whole", Whole);
+        sched.add_par_system("writer", Writer);
+        sched.compile().unwrap();
+
+        let whole = sched.find_id_by_name("whole").unwrap();
+        let writer = sched.find_id_by_name("writer").unwrap();
+        let stages = sched.stages().unwrap();
+        let ws = stages.iter().position(|s| s.system_ids.contains(&whole)).unwrap();
+        let rs = stages.iter().position(|s| s.system_ids.contains(&writer)).unwrap();
+        assert_ne!(
+            ws, rs,
+            "a whole-world system must be serialized against a writer, not parallel with it"
         );
     }
 
