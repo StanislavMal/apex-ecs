@@ -258,6 +258,18 @@ Per-system командные буферы (в per-system state-слоте из 
   резерв должен УЛУЧШИТЬ (убирает contention общего атомика); `commands_insert`/`par_split` — D8b не
   должен регрессировать; `simple_iter`/`schedule` — В3 трогает plain-fn dispatch, держать. Отставания от
   Legion (simple/wide_iter, schedule) — известный packed-storage долг В2 (ROI-гейт, вне 6б).
+
+  **⚠ МЕТОДОЛОГИЧЕСКИЙ УРОК (2026-07-03, проверено A/B).** Первое сравнение `wave5split`→`wave6b_pre`
+  показало `schedule` +10% и вызвало тревогу «волна 6 регрессировала». **Это оказалось артефактом
+  устаревшего базлайна**, а не регрессом кода: `wave5split` снят намного раньше, в другом тепловом/
+  нагрузочном состоянии машины. КОНТРОЛИРУЕМЫЙ A/B (pre-wave-6 `a90c752` vs wave-6, back-to-back на
+  прогретой машине) дал: `schedule` −3.5%, `commands_spawn` −2.7%, `simple_iter` −4.4% — всё **в пределах
+  шумового пола ±4%** (тот же код run-to-run колеблется на ±4%). Отдельно проверено: удаление
+  добавленного в B1(в) чека `assert_no_self_alias` из `from_sub_world` НЕ восстанавливает перф (первый
+  «−10.9%»-замер был шумом) → чек НЕ причина, оставлен always-on (стоит ~0 измеримо, закрывает C2-дыру).
+  **ВЫВОД: реального перф-регресса от волны 6 нет.** ПРАВИЛО для 6б: перф сравнивать ТОЛЬКО back-to-back
+  на одной прогретой машине (не против stale-базлайна); дельты < ±5% на µs-микробенчах — шум, не сигнал;
+  значимость подтверждать повторным прогоном.
 - **Каждый пункт:** `cargo test --workspace` зелёный · `cargo clippy --workspace` net-neutral (3
   pre-existing apex-bench) · движок `cargo build --workspace` · **`cargo bench -p apex-bench --bench benchmarks --features
   "bevy legion" --no-run`** (criterion-харнесс `benches/*.rs` компилируется ТОЛЬКО `cargo bench`, не
