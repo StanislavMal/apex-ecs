@@ -60,17 +60,33 @@ impl<S: States> NextState<S> {
 pub struct StateTransitions<S: States> {
     pub entered: Option<S>,
     pub exited: Option<S>,
+    /// True until `apply_state_transition` has run once. On that first run the
+    /// initial-enter is preserved (not cleared) so `on_enter(initial)` is true
+    /// for the whole first frame, including Update and later stages (D7).
+    first_apply: bool,
 }
 
 /// Зарегистрировать состояние: ресурсы `State`/`NextState`/`StateTransitions`
 /// плюс эксклюзивная система применения переходов в `StageLabel::First`;
 /// `on_enter(initial)` сработает на первом кадре.
 pub fn init_state<S: States>(world: &mut World, sched: &mut Scheduler, initial: S) {
+    // Registering the state twice would add a second transition system that
+    // clears the flags the first one sets — on_enter/on_exit would then never be
+    // true. Reject the second call loudly (D7).
+    if world.try_resource::<State<S>>().is_some() {
+        log::warn!(
+            "init_state called twice for state {} — ignored",
+            std::any::type_name::<S>()
+        );
+        return;
+    }
+
     world.insert_resource(State(initial));
     world.insert_resource(NextState::<S>(None));
     world.insert_resource(StateTransitions::<S> {
         entered: Some(initial),
         exited: None,
+        first_apply: true,
     });
 
     sched.add_system_to_stage(
@@ -82,11 +98,18 @@ pub fn init_state<S: States>(world: &mut World, sched: &mut Scheduler, initial: 
 
 /// Система применения перехода (эксклюзивная, начало кадра).
 fn apply_state_transition<S: States>(world: &mut World) {
-    // Сначала гасим переходы прошлого кадра (on_enter/on_exit — один кадр).
+    // Clear the previous frame's transitions (on_enter/on_exit last one frame) —
+    // EXCEPT on the very first run, where the initial-enter set by init_state must
+    // survive the whole first frame so on_enter(initial) is visible to Update and
+    // later stages, not just Startup (D7).
     {
         let tr = world.resource_mut::<StateTransitions<S>>();
-        tr.entered = None;
-        tr.exited = None;
+        if tr.first_apply {
+            tr.first_apply = false;
+        } else {
+            tr.entered = None;
+            tr.exited = None;
+        }
     }
     let Some(next) = world.resource_mut::<NextState<S>>().0.take() else {
         return;

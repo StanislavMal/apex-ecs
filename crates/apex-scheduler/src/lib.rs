@@ -5901,6 +5901,75 @@ mod tests {
         assert_eq!(log.exited_menu, 1);
     }
 
+    /// D7: on_enter(initial) must be visible to Update (and later) systems on the
+    /// first frame, not only Startup — the transition system used to clear it in
+    /// First before Update ran.
+    #[test]
+    fn on_enter_initial_visible_to_update_on_first_frame() {
+        use crate::config::FnSystemExt;
+        use crate::states::{init_state, on_enter};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum S {
+            A,
+        }
+        #[derive(Default)]
+        struct Log(u32);
+        fn on_enter_a(mut log: ResMut<Log>) {
+            log.0 += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        let mut sched = Scheduler::new();
+        init_state(&mut world, &mut sched, S::A);
+        sched.add_systems(StageLabel::Update, on_enter_a.run_if(on_enter(S::A)));
+
+        sched.run(&mut world); // frame 1
+        assert_eq!(
+            world.resource::<Log>().0,
+            1,
+            "on_enter(initial) must fire for Update systems on frame 1"
+        );
+        sched.run(&mut world); // frame 2 — no longer entering
+        assert_eq!(world.resource::<Log>().0, 1, "on_enter lasts one frame only");
+    }
+
+    /// D7: a second init_state for the same state is ignored, so transitions keep
+    /// working (a second transition system would clear the flags the first sets).
+    #[test]
+    fn double_init_state_is_ignored() {
+        use crate::config::FnSystemExt;
+        use crate::states::{init_state, on_enter, NextState};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum S {
+            A,
+            B,
+        }
+        #[derive(Default)]
+        struct Log(u32);
+        fn on_enter_b(mut log: ResMut<Log>) {
+            log.0 += 1;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        let mut sched = Scheduler::new();
+        init_state(&mut world, &mut sched, S::A);
+        init_state(&mut world, &mut sched, S::A); // ignored
+        sched.add_systems(StageLabel::Update, on_enter_b.run_if(on_enter(S::B)));
+
+        sched.run(&mut world); // frame 1
+        world.resource_mut::<NextState<S>>().set(S::B);
+        sched.run(&mut world); // transition to B
+        assert_eq!(
+            world.resource::<Log>().0,
+            1,
+            "transitions still work despite a double init_state"
+        );
+    }
+
     // ── Э5: Single<Q> / Option<Single<Q>> — skip-семантика ────
 
     #[test]
