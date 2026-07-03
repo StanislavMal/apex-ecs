@@ -339,9 +339,11 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
+            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
+            // (A11: соседний путь раньше умножал без проверки переполнения).
             let old_layout = self.layout_for(self.capacity);
-            let new_size = self.item_size * new_cap;
+            let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
                 let ptr = realloc(self.data, old_layout, new_size);
                 assert!(!ptr.is_null(), "reallocation failed");
@@ -376,9 +378,11 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc
+            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
+            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
+            // (A11: соседний путь раньше умножал без проверки переполнения).
             let old_layout = self.layout_for(self.capacity);
-            let new_size = self.item_size * new_cap;
+            let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
                 let ptr = realloc(self.data, old_layout, new_size);
                 assert!(!ptr.is_null(), "reallocation failed");
@@ -798,6 +802,28 @@ mod tests {
             3,
             "removed value dropped once + two live values — no double-drop"
         );
+    }
+
+    /// A11: the column allocation size must go through `checked_mul`
+    /// (`layout_for`) on every path — a huge `item_size` that overflows
+    /// `item_size * capacity` must panic loudly, not silently wrap into a
+    /// too-small allocation (heap corruption). The realloc path now reuses the
+    /// same `layout_for` as the alloc path, so both are covered.
+    #[test]
+    #[should_panic(expected = "overflow in layout_for")]
+    fn column_alloc_size_overflow_panics_loudly() {
+        let info = ComponentInfo {
+            id: ComponentId(0),
+            name: "huge",
+            type_id: std::any::TypeId::of::<u8>(),
+            size: usize::MAX / 2,
+            align: 1,
+            drop_fn: noop_drop,
+            serde: None,
+        };
+        let mut col = Column::new(&info);
+        // new_cap == 4 → item_size * 4 overflows usize → checked_mul panics.
+        col.reserve(4);
     }
 
     #[test]
