@@ -24,7 +24,7 @@ pub struct SnapshotVersion {
 }
 
 impl SnapshotVersion {
-    pub const CURRENT: Self = Self { major: 1, minor: 0 };
+    pub const CURRENT: Self = Self { major: 2, minor: 0 };
 
     pub fn new(major: u32, minor: u32) -> Self {
         Self { major, minor }
@@ -56,6 +56,13 @@ pub enum DataFormat {
 
 // ── WorldSnapshot ────────────────────────────────────────────────
 
+/// Сериализованный ресурс (E7): `type_name` + bincode-байты.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceSnapshot {
+    pub type_name: String,
+    pub data:      Vec<u8>,
+}
+
 /// Полный снимок мира — всё что нужно для восстановления state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSnapshot {
@@ -67,10 +74,15 @@ pub struct WorldSnapshot {
     pub entities:  Vec<EntitySnapshot>,
     /// Relations между entity.
     pub relations: Vec<RelationSnapshot>,
+    /// Зарегистрированные ресурсы (E7, формат v2). `serde(default)` — JSON-снимки
+    /// v1 (без поля) читаются как пустой список. Bincode v1 несовместим с v2
+    /// (dev-снимки эфемерны; версия читается и мигрируется на load-пути).
+    #[serde(default)]
+    pub resources: Vec<ResourceSnapshot>,
 }
 
 impl WorldSnapshot {
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = 2;
 
     pub fn new(tick: u32) -> Self {
         Self {
@@ -78,6 +90,7 @@ impl WorldSnapshot {
             tick,
             entities:  Vec::new(),
             relations: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
@@ -213,6 +226,8 @@ type MigrationFn = fn(&mut WorldSnapshot) -> Result<(), String>;
 fn migration_for(version: u32) -> Option<MigrationFn> {
     match version {
         0 => Some(|_data| Ok(())), // no-op: формат данных не менялся между v0 и v1
+        // v1 → v2 (E7): `resources` добавлено; для v1 оно `serde(default)` пустое.
+        1 => Some(|_data| Ok(())),
         _ => None,
     }
 }
@@ -303,13 +318,18 @@ mod tests {
 
     #[test]
     fn version_compatible() {
+        // CURRENT is v2 (E7 added resources). v2 is directly compatible; v2.1
+        // (same major, newer minor) too; v1 is not directly compatible (it is
+        // brought up via `migrate`), and a future v3 is not.
         let v1 = SnapshotVersion::new(1, 0);
-        let v1_1 = SnapshotVersion::new(1, 1);
         let v2 = SnapshotVersion::new(2, 0);
+        let v2_1 = SnapshotVersion::new(2, 1);
+        let v3 = SnapshotVersion::new(3, 0);
 
-        assert!(v1.is_compatible_with(SnapshotVersion::CURRENT));
-        assert!(v1_1.is_compatible_with(SnapshotVersion::CURRENT));
-        assert!(!v2.is_compatible_with(SnapshotVersion::CURRENT));
+        assert!(v2.is_compatible_with(SnapshotVersion::CURRENT));
+        assert!(v2_1.is_compatible_with(SnapshotVersion::CURRENT));
+        assert!(!v1.is_compatible_with(SnapshotVersion::CURRENT));
+        assert!(!v3.is_compatible_with(SnapshotVersion::CURRENT));
     }
 
     #[test]

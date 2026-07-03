@@ -186,6 +186,14 @@ impl WorldSerializer {
             });
         }
 
+        // ── Resources (E7) ─────────────────────────────────────
+        // Only resources opted in via `register_resource_serde` (a world may
+        // hold non-serializable resources — GPU handles etc.).
+        for (type_name, data) in world.resources.snapshot_serde() {
+            snap.resources
+                .push(crate::snapshot::ResourceSnapshot { type_name, data });
+        }
+
         Ok(snap)
     }
 
@@ -331,6 +339,23 @@ impl WorldSerializer {
                     "restore: relation kind '{}' not registered, skipping",
                     rel_snap.kind_name
                 );
+            }
+        }
+
+        // ── Шаг 3: Resources (E7) ──────────────────────────────
+        for res in &snapshot.resources {
+            match world.resources.restore_serde(&res.type_name, &res.data) {
+                Ok(true) => {}
+                // §0.2a: a resource in the snapshot whose type is not registered
+                // for serde on this world is silently lost otherwise.
+                Ok(false) => log::warn!(
+                    "restore: resource '{}' not registered for serde — dropped",
+                    res.type_name
+                ),
+                Err(e) => log::warn!(
+                    "restore: resource '{}' failed to deserialize ({e}) — dropped",
+                    res.type_name
+                ),
             }
         }
 
@@ -1084,6 +1109,37 @@ mod tests {
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
         assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
         assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
+    }
+
+    /// E7: a resource opted into serde survives snapshot/restore into a fresh
+    /// world; a non-registered resource is simply absent (no panic).
+    #[test]
+    fn e7_resource_survives_snapshot_restore() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Config {
+            level: u32,
+            name: String,
+        }
+
+        let mut world = World::new();
+        world.register_resource_serde::<Config>();
+        world.insert_resource(Config {
+            level: 7,
+            name: "prod".into(),
+        });
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+        assert_eq!(snap.resources.len(), 1, "resource included in snapshot");
+
+        let mut w2 = World::new();
+        w2.register_resource_serde::<Config>();
+        WorldSerializer::restore(&mut w2, &snap).unwrap();
+        assert_eq!(
+            w2.try_resource::<Config>(),
+            Some(&Config {
+                level: 7,
+                name: "prod".into()
+            })
+        );
     }
 
     /// E6: a component holding an `Entity` ref is remapped on restore — the ref

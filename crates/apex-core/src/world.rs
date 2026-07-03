@@ -823,6 +823,18 @@ impl World {
         self.resources.insert(value);
     }
 
+    /// E7: включить ресурс `R` в snapshot (opt-in, bincode). После этого
+    /// `WorldSerializer::snapshot` сохраняет присутствующий ресурс `R`, а
+    /// `restore` его восстанавливает. Без регистрации ресурсы в snapshot НЕ
+    /// попадают (мир может содержать не-сериализуемые ресурсы — GPU-хэндлы и пр.).
+    pub fn register_resource_serde<
+        R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    >(
+        &mut self,
+    ) {
+        self.resources.register_serde::<R>();
+    }
+
     #[track_caller]
     pub fn resource<T: Send + Sync + 'static>(&self) -> &T {
         self.resources.get::<T>()
