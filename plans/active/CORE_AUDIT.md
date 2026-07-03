@@ -294,13 +294,22 @@ main):**
   (обобщённые регистрируются лениво). Scriptable-generics опущен (Lua-типы конкретные — нет спроса;
   tuple/enum закрыты волной 2). Регресс `f7_generic_derive_component_and_bundle`. Гейт: workspace,
   clippy, движок, goldens 656/656.
-- **ОЧЕРЕДЬ волны 6 (следующая сессия, ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):**
-  (1) **QueryBuilder → dynamic query (§10.4)** — СНАЧАЛА: runtime by ComponentId/имени + untyped
-  итерация (DynItem{entity,arch,row}+get_ptr(id)+typed get::<T>); READ самостоятелен (safe, shared
-  &World; консумер — inspector редактора/скриптинг/agent-IPC); WRITE — с В1(в). QueryBuilder сейчас
-  рудиментарен (query.rs:1908). API готов: `world.component_id_by_name`, `arch.column_index`,
-  `Column::get_raw_ptr`, `arch.entities()`, `arch.columns_raw()`.
-  (2) **В1(в)+В3 одним migration-проходом** — ЗАТЕМ, доделать волну 6 ПОЛНОСТЬЮ: UnsafeWorldCell +
+- **QueryBuilder → dynamic query (§10.4) ✅** — READ-путь целиком, safe поверх shared `&World`
+  (консумеры: инспектор редактора, скриптинг, agent-IPC). Билдер: `read/with/exclude` типом,
+  `*_id` по ComponentId, `*_name` по полному имени типа; `build()` → `DynQuery` с итерацией
+  `DynItem{entity, archetype, row}` (`get_ptr(id)` untyped + `get::<T>(id)` typed с runtime-сверкой
+  TypeId по реестру) и точечным `get(entity)` (liveness + фильтр архетипа). Громкость §0.2a:
+  неизвестное имя = `DynQueryError::UnknownComponent` на build; write-термы =
+  `WriteNotSupported` (динамический WRITE — только с эксклюзивностью В1(в)); mismatch T↔id =
+  throttled warn + None. Багфикс: незарегистрированный типовой терм раньше МОЛЧА выпадал из
+  фильтра (запрос матчил больше запрошенного) — теперь `ComponentId::INVALID`-сентинел (конвенция
+  typed-пути): read/with матчат ничего, exclude вакуумно истинен. Экспорт DynQuery/DynItem/DynIter/
+  DynQueryError (+prelude); руководство §4.4 переписано. Регресс: 9 тестов `dyn_query_tests`
+  (имя/id/тип, unknown-имя громко, unregistered-регрессия, фильтры, point-get, write-отказ,
+  type-mismatch, ZST, мульти-архетип). Гейт: workspace зелёный, clippy net-neutral, движок
+  собирается, целевой Miri TB dyn_query 9/9 0 UB, goldens 656/656 байт-идентично.
+- **ОЧЕРЕДЬ волны 6 (ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):**
+  **В1(в)+В3 одним migration-проходом** — доделать волну 6 ПОЛНОСТЬЮ: UnsafeWorldCell +
   `&mut World`-конструкторы write (query::<Write>/get_mut/iter_mut) + единый `Query<'w,'s>` поверх
   per-system QueryState + SystemContext-ужатие(F3) + QueryBuilder-write + D8b. ~250 ядро + ~50 движок
   call-sites, adoption-стиль, ОБА репо одним заходом, Miri ОБЯЗАТЕЛЕН, goldens байт-идентичны. §10.1
