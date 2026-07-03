@@ -276,20 +276,24 @@ impl Column {
     pub unsafe fn swap_remove_and_drop(&mut self, row: usize) {
         debug_assert!(row < self.len);
         let last = self.len - 1;
-        if row != last {
-            let remove_ptr = self.get_ptr(row);
-            (self.drop_fn)(remove_ptr);
-            if self.item_size > 0 {
-                std::ptr::copy_nonoverlapping(self.get_ptr(last), remove_ptr, self.item_size);
-            }
-            self.change_ticks.swap(row, last);
-            self.added_ticks.swap(row, last);
-        } else {
-            (self.drop_fn)(self.get_ptr(row));
+        // Panic-safety (A8): move the value being removed into the LAST slot and
+        // shrink `len`/ticks BEFORE dropping it, so the value lives outside the
+        // live range `[0, len)` when its `Drop` runs. If that `Drop` panics
+        // mid-unwind, `Drop for Column` (which only walks `[0, len)`) will not
+        // drop the slot a second time — the old order (drop-then-shrink) left a
+        // dropped value inside the live range → double-drop / double-panic-abort.
+        if row != last && self.item_size > 0 {
+            // Swap the two rows' bytes: the ex-last value fills the hole at
+            // `row`, the removed value lands at `last`.
+            std::ptr::swap_nonoverlapping(self.get_ptr(row), self.get_ptr(last), self.item_size);
         }
+        self.change_ticks.swap(row, last);
+        self.added_ticks.swap(row, last);
         self.change_ticks.pop();
         self.added_ticks.pop();
         self.len -= 1;
+        // `last == old len - 1 == new len`, i.e. outside the live range now.
+        (self.drop_fn)(self.get_ptr(last));
     }
 
     pub unsafe fn swap_remove_no_drop(&mut self, row: usize) {
@@ -730,6 +734,70 @@ mod tests {
             }
             assert_eq!(col.get_tick(i).0, i as u32);
         }
+    }
+
+    /// A8 regression: if a component's `Drop` panics during
+    /// `swap_remove_and_drop`, the removed value must be dropped exactly once
+    /// and no live value double-dropped. The fix shrinks `len` before running
+    /// the drop, so the panicking slot sits outside the live range and
+    /// `Drop for Column` skips it. Pre-fix this dropped the value while it was
+    /// still inside `[0, len)`, so column teardown dropped it again (a second
+    /// panic during unwind = process abort).
+    #[test]
+    fn swap_remove_and_drop_panic_no_double_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        static PANIC_ON: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        unsafe fn counting_panic_drop(ptr: *mut u8) {
+            let v = *(ptr as *const u32) as usize;
+            DROPS.fetch_add(1, Ordering::SeqCst);
+            if v == PANIC_ON.load(Ordering::SeqCst) {
+                panic!("drop panicked on {v}");
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+        PANIC_ON.store(10, Ordering::SeqCst);
+
+        let info = ComponentInfo {
+            id: ComponentId(0),
+            name: "panicky",
+            type_id: std::any::TypeId::of::<u32>(),
+            size: std::mem::size_of::<u32>(),
+            align: std::mem::align_of::<u32>(),
+            drop_fn: counting_panic_drop,
+            serde: None,
+        };
+        let mut col = Column::new(&info);
+        for v in [10u32, 20, 30] {
+            unsafe { col.push(&v as *const u32 as *const u8, Tick(1)) };
+        }
+
+        // Remove row 0 (value 10) — its Drop panics. Contained by catch_unwind.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            col.swap_remove_and_drop(0);
+        }));
+        assert!(result.is_err(), "the panicking Drop must propagate");
+
+        // Exactly one drop so far: the removed value, dropped once. The hole was
+        // filled by the ex-last value (30); nothing else has been dropped.
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        assert_eq!(col.len, 2);
+        unsafe {
+            assert_eq!(*col.get::<u32>(0), 30, "last value filled the hole");
+            assert_eq!(*col.get::<u32>(1), 20);
+        }
+
+        // Tearing down the column drops only the two live values (20, 30),
+        // neither of which is PANIC_ON — so no second drop of value 10.
+        PANIC_ON.store(usize::MAX, Ordering::SeqCst);
+        drop(col);
+        assert_eq!(
+            DROPS.load(Ordering::SeqCst),
+            3,
+            "removed value dropped once + two live values — no double-drop"
+        );
     }
 
     #[test]
