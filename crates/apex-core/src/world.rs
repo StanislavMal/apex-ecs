@@ -1860,11 +1860,19 @@ impl World {
         CachedQuery::new_mut(self, last_run)
     }
 
-    /// Динамический запрос по runtime-`ComponentId` (редкий случай: типы не
-    /// известны статически — скриптинг/инспектор). Для обычного кода —
-    /// типизированный [`query`](Self::query).
+    /// Динамический READ-запрос по runtime-`ComponentId`/имени (редкий случай:
+    /// типы не известны статически — скриптинг/инспектор/agent-IPC). Для
+    /// обычного кода — типизированный [`query`](Self::query). Мутация —
+    /// [`query_builder_mut`](Self::query_builder_mut).
     pub fn query_builder(&self) -> QueryBuilder<'_> {
         QueryBuilder::new(self)
+    }
+
+    /// Динамический READ/WRITE-запрос (эксклюзивный заём мира ⇒ выдаваемые
+    /// `&mut T` заведомо не алиасят — B1(в)). См.
+    /// [`QueryBuilderMut`](crate::query::QueryBuilderMut).
+    pub fn query_builder_mut(&mut self) -> crate::query::QueryBuilderMut<'_> {
+        crate::query::QueryBuilderMut::new(self)
     }
 
     // ── Внутренние методы ──────────────────────────────────────

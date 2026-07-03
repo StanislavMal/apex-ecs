@@ -74,9 +74,9 @@ pub use fn_system::{short_system_name, SystemParamFunction};
 pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
-    Added, ArchetypeFilter, Changed, DynItem, DynIter, DynQuery, DynQueryError, Maybe, MaybeWrite,
-    Mut, Or, Query, QueryBuilder, QuerySingleError, Read, ReadOnlyWorldQuery, Ref, With, Without,
-    WorldQuery, Write,
+    Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
+    DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QuerySingleError,
+    Read, ReadOnlyWorldQuery, Ref, With, Without, WorldQuery, Write,
 };
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
@@ -114,9 +114,9 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Added, ArchetypeFilter, Changed, DynItem, DynIter, DynQuery, DynQueryError, Maybe,
-        MaybeWrite, Mut, Or, Query, QueryBuilder, QuerySingleError, Read, ReadOnlyWorldQuery, Ref,
-        Single, With, Without, WorldQuery, Write,
+        Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
+        DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut,
+        QuerySingleError, Read, ReadOnlyWorldQuery, Ref, Single, With, Without, WorldQuery, Write,
     };
     pub use crate::unsafe_world_cell::UnsafeWorldCell;
     pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};

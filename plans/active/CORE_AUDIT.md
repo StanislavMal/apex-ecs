@@ -308,12 +308,40 @@ main):**
   (имя/id/тип, unknown-имя громко, unregistered-регрессия, фильтры, point-get, write-отказ,
   type-mismatch, ZST, мульти-архетип). Гейт: workspace зелёный, clippy net-neutral, движок
   собирается, целевой Miri TB dyn_query 9/9 0 UB, goldens 656/656 байт-идентично.
-- **ОЧЕРЕДЬ волны 6 (ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):**
-  **В1(в)+В3 одним migration-проходом** — доделать волну 6 ПОЛНОСТЬЮ: UnsafeWorldCell +
-  `&mut World`-конструкторы write (query::<Write>/get_mut/iter_mut) + единый `Query<'w,'s>` поверх
-  per-system QueryState + SystemContext-ужатие(F3) + QueryBuilder-write + D8b. ~250 ядро + ~50 движок
-  call-sites, adoption-стиль, ОБА репо одним заходом, Miri ОБЯЗАТЕЛЕН, goldens байт-идентичны. §10.1
-  целевая модель (в) целиком. При закрытии — правило ротации + мерж --no-ff в main обоих репо.
+- **В1(в) borrow-модель ✅** (soundness — целевая Bevy-модель, §10.1) — безопасность выражена в
+  типах, не в дисциплине планировщика. `UnsafeWorldCell<'w>` = единственный явный эскейп
+  (Copy-токен над `*mut World`; readonly-ячейка в debug отказывается выдавать `&mut World`);
+  `World::as_unsafe_world_cell`/`_readonly`. Новый `unsafe trait ReadOnlyWorldQuery` (маркер форм
+  без мутабельного доступа: Read/&T/Entity/With/Without/Maybe/Changed/Added/()/кортежи/Or из
+  read-only; Write/&mut/MaybeWrite его НЕ реализуют). `Query::new`/`new_with_tick` теперь требуют
+  `ReadOnlyWorldQuery` для data+filter; write-формы — `Query::new_mut(&mut World)` (эксклюзив
+  доказывает отсутствие алиаса) либо `unsafe new_unchecked(UnsafeWorldCell)` (эскейп планировщика).
+  `Query::from_sub_world` теперь unsafe. То же для остальных путей: `World::query`/`query_changed`
+  (read-only) + `query_mut`/`query_mut_changed`; `CachedQuery::new` (read-only) + `new_mut`/
+  `unsafe new_unchecked`/`unsafe from_sub_world`; `QueryState::query`/`query_with_tick` (read-only)
+  + `query_mut`/`query_mut_with_tick`/`unsafe query_unchecked_with_tick`. `SubWorld::new`/`with_ranges`
+  и `SystemContext::with_commands` теперь unsafe (контракт эксклюзивности там, где он живёт). C2
+  (само-алиас `(&mut T,&mut T)`) вынесен в общий `assert_no_self_alias` и теперь гейтит И CachedQuery/
+  SubWorld-путь (раньше только `Query`; `ctx.query` его обходил). `Extract<QueryParam<Q>>` требует
+  read-only (extract не пишет в main-мир — контракт в типах). Мигрированы все call-sites (ядро+движок).
+  Гейт: workspace зелёный, clippy net-neutral, движок собирается, целевой Miri TB (cell+write+alias+
+  dense) 0 UB, goldens 656/656 байт-идентично.
+- **QueryBuilder-write (динамический §10.4) ✅** — разблокирован B1(в). `World::query_builder_mut`
+  (`&mut World`) → `QueryBuilderMut` (термы `read/write/with/exclude` типом/`_id`/`_name`) →
+  `DynQueryMut` с `for_each_mut(|item|)` (lending — по одному item, `&mut T` не алиасят) и точечным
+  `get_mut(entity)`. `DynItemMut`: read (`get`/`get_ptr`) + write (`get_mut::<T>(id)`/`get_mut_ptr`,
+  берут `&mut self` ⇒ один `&mut` за раз; запись помечает `Changed`). Громкость: unknown-имя =
+  `UnknownComponent`, повтор write-id = `AliasedWrite` (аналог C2); read-`build()` по-прежнему
+  отвергает write-термы (`WriteNotSupported` → указывает на `query_builder_mut`). Общий `DynTerms`
+  для read/write билдеров (без дублирования). Экспорт DynQueryMut/DynItemMut/QueryBuilderMut
+  (+prelude); руководство §4.4 дополнено. Регресс: +7 тестов (typed/untyped for_each_mut, Changed-
+  стамп, aliased/unknown громко, read-build-отказ, point-get+фильтр, mixed read+write). Гейт:
+  workspace, clippy net-neutral, движок собирается, Miri TB dyn_query 16/16 0 UB, goldens 656/656.
+- **ОЧЕРЕДЬ волны 6 (ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):** **В3** (единый
+  `Query<'w,'s>` поверх per-system QueryState — plain-fn системы пересобирают state каждый вызов) +
+  **F3** (SystemContext-ужатие: убрать resource_mut/event_writer/произвольный query из публичного
+  ctx — доступ только через декларированные SystemParam) + **D8b** (per-system command-буферы,
+  детерминизм Entity id). При закрытии — правило ротации + мерж --no-ff в main обоих репо.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).

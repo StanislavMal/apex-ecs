@@ -785,11 +785,32 @@ if let Some(item) = q.get(entity) { /* ... */ }
 ничего (никто не может иметь незарегистрированный компонент); несоответствие
 `T` и `id` в `item.get::<T>(id)` — throttled-warn + `None`.
 
-Динамическая ЗАПИСЬ через `build()` недоступна (нужен эксклюзивный доступ к
-миру — `DynQueryError::WriteNotSupported`); для мутаций используйте
-типизированный `Query<Write<T>>`. Метод `matching_archetype_ids()` (индексы
-подходящих архетипов) работает и с write-термами — для низкоуровневых
-консумеров.
+**Динамическая ЗАПИСЬ** — через `query_builder_mut()` (эксклюзивный заём мира
+⇒ выдаваемые `&mut T` заведомо не алиасят, B1(в)):
+
+```rust
+let mut q = world.query_builder_mut()
+    .read_id(hp_id)          // чтение по id
+    .write_id(mana_id)       // мутация по id (write_name / write::<T> — тоже)
+    .with::<Boss>()
+    .build()?;               // Err: неизвестное имя / компонент записан дважды
+
+q.for_each_mut(|mut item| {
+    let hp = item.get::<Hp>(hp_id).unwrap().0;          // read
+    item.get_mut::<Mana>(mana_id).unwrap().0 *= hp;     // &mut T — помечает Changed
+    // item.get_mut_ptr(id) — untyped *mut для биндингов
+});
+
+// Точечная мутация (инспектор редактора):
+if let Some(mut item) = q.get_mut(entity) { /* item.get_mut::<T>(id) */ }
+```
+
+`DynItemMut` выдаёт мутабельный доступ по одному за раз (аксессоры берут
+`&mut self`), запись помечает компонент `Changed`, повтор write-id ловится как
+`DynQueryError::AliasedWrite` (аналог C2). Read-`build()` по-прежнему отвергает
+write-термы (`WriteNotSupported`, указывает на `query_builder_mut`).
+`matching_archetype_ids()` (индексы подходящих архетипов) работает у обоих
+билдеров — для низкоуровневых консумеров.
 
 ---
 
