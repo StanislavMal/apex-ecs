@@ -2260,6 +2260,20 @@ impl Scheduler {
                         continue;
                     }
 
+                    // D5: for a symmetric conflict (WriteWrite / EventWriteWrite),
+                    // an explicit ordering in EITHER direction already serializes
+                    // the two systems, satisfying the conflict. Adding a
+                    // registration-oriented edge on top could contradict it and
+                    // fabricate a false CircularDependency (e.g. `before("b","a")`
+                    // while `a` registered first). Respect the explicit ordering —
+                    // its edge is already in the graph — and skip the conflict edge.
+                    if is_symmetric
+                        && (self.explicit_orderings.contains(&(from_id, to_id))
+                            || self.explicit_orderings.contains(&(to_id, from_id)))
+                    {
+                        continue;
+                    }
+
                     if let (Some(&from), Some(&to)) =
                         (self.graph_nodes.get(&from_id), self.graph_nodes.get(&to_id))
                     {
@@ -4752,6 +4766,45 @@ mod tests {
         sched
             .compile()
             .expect("independent снимает CircularDependency, сериализуя в порядке регистрации");
+    }
+
+    /// D5: a symmetric (WriteWrite) conflict plus an explicit ordering that runs
+    /// against registration order must NOT fabricate a CircularDependency — the
+    /// explicit ordering wins and serializes the two systems.
+    #[test]
+    fn symmetric_conflict_respects_reverse_explicit_order() {
+        struct WriteA;
+        impl ParSystem for WriteA {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+        struct WriteB;
+        impl ParSystem for WriteB {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().write::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system("a", WriteA); // registered first
+        sched.add_par_system("b", WriteB);
+        // Explicit ordering against registration: b before a.
+        sched.before("b", "a").unwrap();
+
+        // Old code: conflict edge a->b plus explicit b->a = false cycle.
+        sched
+            .compile()
+            .expect("explicit ordering must resolve the symmetric conflict without a false cycle");
+
+        let a = sched.find_id_by_name("a").unwrap();
+        let b = sched.find_id_by_name("b").unwrap();
+        let stages = sched.stages().unwrap();
+        let a_stage = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
+        let b_stage = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
+        assert!(b_stage < a_stage, "explicit before(\"b\",\"a\") must run b before a");
     }
 
     #[test]
