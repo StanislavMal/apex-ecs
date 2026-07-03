@@ -1273,7 +1273,7 @@ impl World {
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-        mut data: Vec<u8>,
+        data: Vec<u8>,
         tick: Tick,
     ) {
         // The raw bytes must match the component's storage layout exactly — a
@@ -1297,7 +1297,23 @@ impl World {
                 // is honored exactly once (A9); the column never received a copy.
                 if !data.is_empty() {
                     if let Some(info) = self.registry.get_info(component_id) {
-                        unsafe { (info.drop_fn)(data.as_mut_ptr()) };
+                        // `data` is a `Vec<u8>` (alignment 1), but `drop_fn` runs
+                        // `drop_in_place::<T>`, which requires a `T`-aligned
+                        // pointer — dropping straight off the `Vec` is unaligned
+                        // UB for any `T` with `align > 1`. Move the bytes into a
+                        // correctly-aligned scratch allocation and drop there.
+                        let layout =
+                            std::alloc::Layout::from_size_align(info.size, info.align).unwrap();
+                        unsafe {
+                            let aligned = std::alloc::alloc(layout);
+                            assert!(!aligned.is_null(), "insert_raw: allocation failed");
+                            std::ptr::copy_nonoverlapping(data.as_ptr(), aligned, info.size);
+                            // Ownership now lives in `aligned`; drop it exactly
+                            // once. The original `data` buffer is freed as raw
+                            // bytes when it drops at end of scope (no `T::drop`).
+                            (info.drop_fn)(aligned);
+                            std::alloc::dealloc(aligned, layout);
+                        }
                     }
                 }
                 return;
