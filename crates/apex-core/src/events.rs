@@ -299,6 +299,13 @@ impl<T> Events<T> {
     }
 
     /// Мутабельная версия продвижения курсора до конца буфера.
+    ///
+    /// ⚠ INVARIANT (F5): this must mutate ONLY cursor state (`cursors`,
+    /// `lagging_count`) and never the `events` buffer. `EventIterator::Drop`
+    /// calls it while `&events[i]` references it handed out may still be live;
+    /// soundness relies on the mutated fields being disjoint from `events`
+    /// (Tree Borrows is location-precise). Touching `events` here would make
+    /// that drop undefined behavior.
     #[inline]
     pub fn advance_reader_mut(&mut self, reader_id: &EventCursor) {
         let idx = reader_id.0 as usize;
@@ -629,8 +636,18 @@ impl<'q, T> DoubleEndedIterator for EventIterator<'q, T> {
 
 impl<T> Drop for EventIterator<'_, T> {
     fn drop(&mut self) {
-        // SAFETY: указатель валиден на 'q (см. IntoIterator выше); продвижение
-        // курсора не трогает буфер `events`, на который ссылаются выданные &T.
+        // SAFETY: the pointer is valid for 'q (see `IntoIterator` above). This
+        // reborrows `&mut Events<T>` while `&'q T` references handed out by
+        // `next()` may still be live (they carry lifetime 'q, so a caller can
+        // `collect()` them and keep them past this drop). That is sound because
+        // `advance_reader_mut` mutates ONLY the cursor state (`cursors`,
+        // `lagging_count`) and NEVER the `events` buffer the outstanding `&T`
+        // point into: Tree Borrows is location-precise, so the `&mut Events`
+        // and the live `&events[i]` cover disjoint bytes and never conflict.
+        // ⚠ INVARIANT (F5): if `advance_reader_mut` is ever changed to touch the
+        // `events` buffer, this becomes undefined behavior — verified sound by
+        // `cargo miri test -Zmiri-tree-borrows` (e.g. the
+        // `event_iterator_collect_holds_references` test).
         unsafe {
             (*self.queue).advance_reader_mut(&self.reader_id);
         }
@@ -1228,6 +1245,12 @@ mod tests {
         );
     }
 
+    /// F5 witness: the `&i32` outlive the `EventIterator`, whose `Drop` reborrows
+    /// `&mut Events` to advance the cursor. Under `cargo miri test
+    /// -Zmiri-tree-borrows` this proves the reborrow does not invalidate the
+    /// still-live event references (cursor mutation is disjoint from the `events`
+    /// buffer). See the INVARIANT notes on `EventIterator::Drop` /
+    /// `advance_reader_mut`.
     #[test]
     fn event_iterator_collect_holds_references() {
         let mut queue = Events::new();
@@ -1239,6 +1262,8 @@ mod tests {
 
         // Ссылки переживают сам итератор (лайфтайм исходного заёма Events).
         let collected: Vec<&i32> = queue.read(&reader).into_iter().collect();
+        // Read the still-live references AFTER the iterator has dropped (its
+        // Drop ran when `into_iter().collect()` consumed it).
         assert_eq!(collected, vec![&7, &8]);
         drop(collected);
         assert_eq!(queue.iter(&reader).len(), 0);
