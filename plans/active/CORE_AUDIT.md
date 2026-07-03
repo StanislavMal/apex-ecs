@@ -37,8 +37,30 @@ apex-benc.txt) + .gitignore; план заведён в репо ядра; Miri-
   компонентов) даёт `subtract with overflow` в distributed_slice под Miri на ЛЮБОМ тесте,
   строящем `World` → полный Miri-сьют не зелёный. Волна 3 обязана добавить `cfg(miri)`-путь,
   форсирующий ленивую регистрацию (как wasm-путь TD-25), прежде чем делать Miri обязательным
-  гейтом. ⏳ **НЕ верифицированы goldens движка** (apex-engine, GPU) — обязательный pre-push
-  гейт перед мержем ветки/пушем apex-ecs.
+  гейтом.
+- **✅ Goldens движка ПРОЙДЕНЫ** (2026-07-03): `cargo test -p apex-render --lib
+  --features visual_tests` = **656 passed / 0 failed, байт-идентично** против всей ветки
+  (волна 1 + волна 2). Изменения ядра поведение рендера не изменили. Движок собирается
+  против ветки (apex-render build ок). Ветка готова к мержу/пушу (`core-audit-fixes`).
+
+**Волна 2 🔄 — КОРРЕКТНОСТЬ поведения (флагманские 🔴 закрыты; 6 фиксов + регресс-тесты):**
+- `8c878f0` F1 (Events: при отстающем читателе новые события терялись для всех — layout
+  `[old,new]` без сдвига курсоров).
+- `707fcb8` D1 (FixedUpdate: 2-я+ exec-стадия старвалась — обе исполнителя (run_hybrid_parallel
+  + run_sequential) дренируют группу FixedUpdate раз и гоняют `(A;B)×N`).
+- `f47d481` B9+C4 (ChildOf эксклюзивен → фикс torn-write мульти-родителя; self/cycle-рёбра
+  отвергаются в add_relation_by_kind_idx + depth-guard в propagate против зависания).
+- `0e20a70` A7 (паника в хуке больше не заклинивает диспетчер хуков навсегда — RAII-guard).
+- `c1a4880` E5 (циклы Ref-префабов → CycleDetected вместо stack overflow; + depth-лимит).
+- **Гейт волны 2 (частичный):** весь воркспейс + примеры зелёные, clippy net-neutral,
+  **goldens движка 656/656 байт-идентично**.
+- **Остаток волны 2 (не начато):** D2+F3 (пустой access/Ctx footgun), D5 (ложный
+  CircularDependency при обратном before()), D6 (change-окно на пропущенной run_if-стадии),
+  D7 (states: on_enter(initial)/двойной init_state), D9+D4 (унификация исполнителя стадии),
+  C5 (reparent-dirty — проверить, компенсирует ли редактор), E3 (Lua Box::leak), E4 (reapply
+  per-instance префаба), E9 (watch_config регистрация loader'а), E10 (Lua id с generation),
+  F2+F4 (курсор-per-system Events — гонка Listen‖Listen), F6 (два query-параметра в system!),
+  F7 (Scriptable tuple/enum).
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
