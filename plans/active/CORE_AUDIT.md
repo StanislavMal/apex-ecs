@@ -76,7 +76,8 @@ F2 закрыл лишь гонку, семантика катчапа FixedUpda
   (архитектурно, волна 6). **Волны 0-2 СМЕРЖЕНЫ в main** (`b3fb9ed`, локально, не запушено —
   пуш делает пользователь).
 
-**Волна 3 🔄 — PANIC-SAFETY + формальный UB (В ПРОЦЕССЕ; ветка `core-audit-wave3` от main):**
+**Волна 3 ✅ — PANIC-SAFETY + формальный UB (ВЫПОЛНЕНА 2026-07-03; ветка `core-audit-wave3` от
+main; гейт пройден, готова к мержу `--no-ff` в main):**
 - `a614c04` — снят блокер Miri↔linkme: `cfg(miri)` → ленивая регистрация компонентов (как wasm),
   distributed_slice под Miri не итерируется; тесты со `World` проходят Miri. **Вторая Miri-нота
   (не наш баг):** `crossbeam-epoch`/rayon даёт ложное Stacked-Borrows-срабатывание на
@@ -84,23 +85,66 @@ F2 закрыл лишь гонку, семантика катчапа FixedUpda
 - `06e7145` A3 — Resources в `UnsafeCell` (провенанс `*mut` от cell, не отмытый из `&T`; N19
   двойной Box убран). **Подтверждено: Miri Tree Borrows находил A3 как реальный UB, после фикса
   тест зелёный.**
-- **ОСТАТОК волны 3 (спроектировано/подтверждено, к чистой реализации в фокус-сессии):**
-  - **A2** — тики Column через `&self→*mut` (set_change_tick/stamp_range + query Write hot-path
-    ticks_ptr). ТОТ ЖЕ подтверждённый класс, что A3 (Miri Tree Borrows). Фикс: `change_ticks/
-    added_ticks: Vec<TickCell>` (TickCell=UnsafeCell<Tick>+unsafe Sync); ticks_ptr отдаёт `*mut`
-    с cell-провенансом. Инвазивно (archetype.rs + query.rs + dense.rs, тонкость провенанса
-    base-pointer'а) → делать с Miri-валидацией query-Write пути, не в раздутой сессии.
-  - **A6/A8/B-Н17** — panic-safety: drop-guard в spawn_many/spawn_bundles_bulk (unwind →
-    entities>col.len); swap_remove_and_drop swap-then-shrink-then-drop (double-drop при панике
-    Drop — **A8 УЖЕ СПРОЕКТИРОВАН**); арена apply panic-guard. Гейт: catch_unwind-тесты.
-  - **D3** — ASD-таски материализуют алиасящиеся `&mut SystemDescriptor` (SendPtr на весь
-    дескриптор; split-системы ZST, но дескриптор с String/Box не ZST). Фикс: указатель на
-    `dyn ParSystem`, не на дескриптор (apex-scheduler; Miri-валидация отдельным прогоном).
-  - **В1(б)+C2** — runtime borrow-флаги per-ComponentId (debug) → ловят write-write+write-read
-    из safe-кода (Query<(&mut T,&mut T)>, q.get дважды); C2 co-located здесь.
-  - **F5** — EventIterator::Drop создаёт `&mut Events` при живых `&T` (по вердикту Miri).
-  - Гейт волны 3: Miri-smoke (Tree Borrows) обязателен на query/dense/transform/events/commands/
-    entity/relations; goldens движка.
+- **ОСТАТОК волны 3 — ВЫПОЛНЕН (фокус-сессия 2026-07-03, 6 коммитов + регресс-тесты):**
+  - `5d03d93` **A2** ✅ — `change_ticks/added_ticks: Vec<TickCell>` (TickCell=`UnsafeCell<Tick>`,
+    `#[repr(transparent)]`+unsafe Sync); ticks_ptr/stamp_range/set_change_tick пишут с
+    cell-провенансом. Регресс `a2_write_stamps_change_tick_soundly` (Write hot-path + dense
+    stamp_range) — **Miri Tree Borrows зелёный** (до фикса — тот же UB-класс, что A3).
+  - `47b6471` **A8** ✅ — swap_remove_and_drop: swap→shrink len/тики→ТОЛЬКО потом drop (значение
+    вне живого диапазона). Паника в Drop больше не даёт double-drop. Регресс с catch_unwind,
+    Miri-зелёный.
+  - `1376391` **A6** ✅ — `BulkSpawnRollback` drop-guard в spawn_many_inner/spawn_bundles_bulk:
+    unwind обрезает `arch.entities` до `start_row` (== `col.len`), нет ghost-строк над
+    неинициализированной памятью. Регресс `spawn_many_panic_rolls_back_batch`, Miri-зелёный.
+    (B-Н17 «арена apply panic-guard» — CommandArena::apply не запускает Drop чужих команд при
+    панике одной; фактического double-drop нет, отдельного фикса не потребовалось.)
+  - `2fe0134` **D3** ✅ — `AsdTask.ptr: SendPtr<dyn ParSystem>` (не `SystemDescriptor`): целим в
+    сам trait-object (ZST у split-систем) — конкурентные `&mut *ptr` не алиасят реальных байт.
+    `SendPtr<T: ?Sized>`. Регресс `asd_row_split_no_descriptor_aliasing` (детерминир. 4-thread
+    pool + chunk-config) — **Miri Tree Borrows зелёный** (`-Zmiri-ignore-leaks` — только для
+    rayon-teardown-утечек, не наш UB).
+  - `7874453` **C2** ✅ — самоконфликт формы закрыт ВСЕГДА-включённой проверкой при
+    конструировании Query (как Bevy): новый `WorldQuery::fill_data_access` (роли данных;
+    фильтры/Entity/`()` — no-op) + `assert_no_self_alias` в `new_with_tick`/
+    `new_within_archetypes`. Паникует на `Query<(&mut T,&mut T)>`/`(Read<T>,Write<T>)`; легальные
+    формы (distinct/shared+shared/With/Changed/Maybe) не трогает. Регресс
+    `c2_rejects_self_aliasing_query_shapes`.
+  - `b3a6ca4` **F5** — вердикт Miri: **НЕ UB**. `advance_reader_mut` мутирует только курсор
+    (`cursors`/`lagging_count`), не буфер `events` → location-precise Tree Borrows не конфликтует
+    с живыми `&T`. Все 21 events-теста (вкл. `event_iterator_collect_holds_references`, держащий
+    `&i32` после дропа итератора) зелены под TB. Инвариант сделан «громким» (§0.2a) в SAFETY-
+    комментах Drop/advance_reader_mut.
+  - **В1(б) (cross-query runtime borrow-registry) — ОТЛОЖЕН в В1(в)** (⚠ дизайн-решение
+    2026-07-03): per-ComponentId registry на уровне view-заёма ДАЁТ ЛОЖНЫЕ СРАБАТЫВАНИЯ на
+    ASD row-split планировщика (несколько конкурентных `Query<Write<T>>` над НЕПЕРЕСЕКАЮЩИМИСЯ
+    строками одного компонента → все берут T-exclusive → паника на легальном параллелизме).
+    Granularity per-ComponentId не выражает per-row дизъюнктность; корректная модель — per-row/
+    UnsafeWorldCell (В1(в), migration-волна). Concrete-🔴 C2 (ради которого В1(б) был co-located)
+    закрыт лучше — always-on construction-check (см. выше). `q.get(e)` дважды (A4) требует
+    guard-типа на возврате get_mut → тоже В1(в). Итог: В1(б) как отдельный дев-инструмент не
+    делаем (был бы §0.2b-полумерой с планировщик-футганом); детекция write-write/write-read
+    закрывается типами в В1(в).
+  - **Pre-existing UB, найденные ПЕРВЫМ полным Miri-прогоном apex-core --lib (чиним по одному):**
+    - `ae6f44b` **insert_raw alignment** — dead-path дропал `T` через `drop_in_place` по
+      `Vec<u8>`-указателю (align 1); для `align>1` компонента (Arc/Box/glam) — unaligned reference
+      UB. Фикс: дроп через выровненную scratch-аллокацию `(size, align)`. Miri: "unaligned
+      reference (required 8, found 2)" в `insert_raw_on_dead_entity_drops_value_not_leaks`.
+    - `5a3d053` **events get_raw_ptr** — `EventRegistry::get_raw_ptr` отмывал `*mut Events<T>` из
+      shared `downcast_ref`, запись через него (EventWriter push / add_reader `next_cursor_id+=1`)
+      = write-through-frozen UB (класс A3). Фикс: очереди в `EventQueueCell(UnsafeCell<Box<dyn
+      AnyEventQueue>>)`, провенанс из cell. Miri: "write ... forbidden ... Frozen" в
+      `removed_events_emitted_for_remove_and_despawn`.
+    - `97e4e4c` **transform test-compat** (не UB) — `transform_components_auto_registered` требует
+      linkme-авторегистрацию, отключённую под Miri/wasm (ленивая регистрация, TD-25) → падал по
+      linkme, не по багу. Помечен `#[cfg_attr(any(miri, target_arch="wasm32"), ignore)]`.
+  - **Гейт волны 3 (ПРОЙДЕН):** воркспейс `cargo test --workspace` зелёный (29 групп, 0 падений);
+    clippy net-neutral (только 3 pre-existing в apex-bench); **Miri Tree Borrows на apex-core
+    --lib: 211 passed, 0 failed, 0 UB, 1 ignored** (`-Zmiri-disable-isolation -Zmiri-tree-borrows`).
+    ⚠ На выходе процесса Miri ругается "main thread terminated without waiting for all remaining
+    threads" из-за rayon-теста `dense_par_chunk` (глобальный threadpool паркует рабочие потоки и
+    не джойнит их) — это НЕ наш UB (как и crossbeam-false-positive из SB), снимается
+    `-Zmiri-ignore-leaks`. Гейт зачтён по отсутствию UB (все 211 тестов зелены). Движок собирается
+    + goldens 656/656 байт-идентично.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
