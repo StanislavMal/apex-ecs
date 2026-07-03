@@ -2407,14 +2407,35 @@ impl Scheduler {
             .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone()))
             .collect();
 
-        for (stage_idx, (label, system_ids, emit_event_types)) in stages_meta.iter().enumerate() {
+        // Same FixedUpdate grouping as run_hybrid_parallel (D1): the contiguous
+        // FixedUpdate block drains the accumulator ONCE and runs `steps` times as
+        // (A;B;…)×N, so no later FixedUpdate stage is starved and the order is
+        // correct. Every other stage runs once.
+        let mut schedule: Vec<usize> = Vec::with_capacity(stages_meta.len());
+        let mut si = 0;
+        while si < stages_meta.len() {
+            if stages_meta[si].0 == StageLabel::FixedUpdate {
+                let mut end = si;
+                while end < stages_meta.len() && stages_meta[end].0 == StageLabel::FixedUpdate {
+                    end += 1;
+                }
+                let steps = Self::stage_steps(w, &StageLabel::FixedUpdate);
+                for _ in 0..steps {
+                    schedule.extend(si..end);
+                }
+                si = end;
+            } else {
+                schedule.push(si);
+                si += 1;
+            }
+        }
+
+        for &stage_idx in &schedule {
+            let (label, system_ids, emit_event_types) = &stages_meta[stage_idx];
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
-
-            // D2-5: FixedUpdate — 0..N шагов по аккумулятору FixedTime.
-            let steps = Self::stage_steps(w, label);
-            for _step in 0..steps {
+            {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
                 for &sys_id in system_ids {
@@ -2790,13 +2811,35 @@ impl Scheduler {
             .map(|a| a.len())
             .collect();
 
-        for (stage_idx, label, stage_ids, all_parallel, emit_event_types) in &stages {
-            // D2-5: FixedUpdate исполняется 0..N раз по аккумулятору FixedTime
-            // (каждый шаг — своё применение команд и флаш событий); остальные
-            // стадии — ровно один раз. `continue` внутри тела продолжает
-            // ШАГОВЫЙ цикл — семантика шагов сохраняется.
-            let steps = Self::stage_steps(unsafe { &mut *world_ptr }, label);
-            for _step in 0..steps {
+        // Build the execution order (D2-5). Stages sharing a StageLabel are
+        // contiguous, so the FixedUpdate stages form one block. That block steps
+        // as a GROUP: the FixedTime accumulator is drained ONCE and the whole
+        // block runs `steps` times as (A; B; …) × N. This fixes D1 — draining
+        // per stage let the first FixedUpdate stage consume all the steps, so any
+        // later FixedUpdate stage (a conflict split the label across several
+        // execution stages) ran zero times, and the order was A×N then B×N rather
+        // than the correct (A;B)×N. Every non-FixedUpdate stage runs exactly once.
+        let mut schedule: Vec<usize> = Vec::with_capacity(stages.len());
+        let mut si = 0;
+        while si < stages.len() {
+            if stages[si].1 == StageLabel::FixedUpdate {
+                let mut end = si;
+                while end < stages.len() && stages[end].1 == StageLabel::FixedUpdate {
+                    end += 1;
+                }
+                let steps = Self::stage_steps(unsafe { &mut *world_ptr }, &StageLabel::FixedUpdate);
+                for _ in 0..steps {
+                    schedule.extend(si..end);
+                }
+                si = end;
+            } else {
+                schedule.push(si);
+                si += 1;
+            }
+        }
+
+        for &stage_pos in &schedule {
+            let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
             self.open_stage_change_window(*stage_idx, unsafe { &mut *world_ptr });
             if !*all_parallel {
@@ -2934,7 +2977,6 @@ impl Scheduler {
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
-            } // конец шагового цикла (D2-5)
         }
     }
 
@@ -5656,6 +5698,46 @@ mod tests {
         sched.run(&mut world);
         assert_eq!(world.resource::<Counts>().fixed, 4);
         assert_eq!(world.resource::<Counts>().update, 3);
+    }
+
+    /// D1: two CONFLICTING FixedUpdate systems (the planner splits them into
+    /// separate execution stages) must both run on every fixed step, interleaved
+    /// as (A;B)×N — not A×N then B×N, and the second must never be starved by the
+    /// first draining the accumulator.
+    #[test]
+    fn fixed_update_conflicting_systems_all_run_each_step_interleaved() {
+        #[derive(Default)]
+        struct Log(Vec<char>);
+
+        fn step_a(mut log: ResMut<Log>) {
+            log.0.push('A');
+        }
+        fn step_b(mut log: ResMut<Log>) {
+            log.0.push('B');
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Log::default());
+        world.insert_resource(crate::FixedTime::from_dt(0.010));
+
+        let mut sched = Scheduler::new();
+        // Both take ResMut<Log> → WriteWrite → separate execution stages.
+        sched.add_systems(StageLabel::FixedUpdate, step_a);
+        sched.add_systems(StageLabel::FixedUpdate, step_b);
+
+        // 35ms / 10ms = 3 fixed steps.
+        world.resource_mut::<crate::FixedTime>().accumulate(0.035);
+        sched.run(&mut world);
+
+        let log: String = world.resource::<Log>().0.iter().collect();
+        let a = log.chars().filter(|&c| c == 'A').count();
+        let b = log.chars().filter(|&c| c == 'B').count();
+        assert_eq!(a, 3, "system A must run every fixed step, got log {log:?}");
+        assert_eq!(b, 3, "system B must NOT be starved — runs every step too, got {log:?}");
+        assert!(
+            !log.contains("AA") && !log.contains("BB"),
+            "steps must interleave as (A;B)×N, not A×N then B×N, got {log:?}"
+        );
     }
 
     /// Защита от спирали смерти: шаги капятся, излишек отбрасывается.
