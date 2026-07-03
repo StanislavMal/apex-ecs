@@ -422,12 +422,13 @@ impl WorldSerializer {
             }
         }
 
-        // Relations
-        let old_relations: Vec<(u32, u32, &str)> = old.relations.iter()
+        // Relations — HashSet membership makes the added/removed scan O(R)
+        // instead of O(R²) (`Vec::contains` was linear inside each loop).
+        let old_relations: HashSet<(u32, u32, &str)> = old.relations.iter()
             .map(|r| (r.subject_index, r.target_index, r.kind_name.as_str()))
             .collect();
 
-        let new_relations: Vec<(u32, u32, &str)> = new.relations.iter()
+        let new_relations: HashSet<(u32, u32, &str)> = new.relations.iter()
             .map(|r| (r.subject_index, r.target_index, r.kind_name.as_str()))
             .collect();
 
@@ -1068,6 +1069,29 @@ mod tests {
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
         assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
         assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
+    }
+
+    /// Relations diff (O(R) HashSet path): a removed and an added relation are
+    /// both detected, and unchanged relations are excluded.
+    #[test]
+    fn diff_detects_added_and_removed_relations() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Position>();
+        let a = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let b = world.spawn((Position { x: 1.0, y: 1.0 },));
+        let c = world.spawn((Position { x: 2.0, y: 2.0 },));
+        world.add_relation(a, apex_core::relations::ChildOf, b);
+        let old = WorldSerializer::snapshot(&world).unwrap();
+
+        // Swap the relation target: drop a->b, add a->c.
+        world.remove_relation(a, apex_core::relations::ChildOf, b);
+        world.add_relation(a, apex_core::relations::ChildOf, c);
+        let diff = WorldSerializer::diff(&old, &world).unwrap();
+
+        assert_eq!(diff.removed_relations.len(), 1, "a->b must be removed");
+        assert_eq!(diff.added_relations.len(), 1, "a->c must be added");
+        assert_eq!(diff.removed_relations[0].target_index, b.index());
+        assert_eq!(diff.added_relations[0].target_index, c.index());
     }
 
     #[test]
