@@ -50,7 +50,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 fn animate(world: &mut World, list: &[Entity]) {
     world.tick();
     for &e in list {
-        if let Some(l) = world.get_mut::<LocalTransform>(e) {
+        if let Some(mut l) = world.get_mut::<LocalTransform>(e) {
             l.translation.x += 0.001;
         }
     }
@@ -278,7 +278,7 @@ fn main() {
     let (s_all, _) = median_of(|| {
         for &e in &all_nodes {
             let slot = entity_to_slot[e.index() as usize] as usize;
-            if let Some(g) = world.get_mut::<GlobalTransform>(e) {
+            if let Some(mut g) = world.get_mut::<GlobalTransform>(e) {
                 g.0 = global_mat[slot];
             }
         }
@@ -287,7 +287,7 @@ fn main() {
     let (s_few, _) = median_of(|| {
         for &e in &leaves {
             let slot = entity_to_slot[e.index() as usize] as usize;
-            if let Some(g) = world.get_mut::<GlobalTransform>(e) {
+            if let Some(mut g) = world.get_mut::<GlobalTransform>(e) {
                 g.0 = global_mat[slot];
             }
         }

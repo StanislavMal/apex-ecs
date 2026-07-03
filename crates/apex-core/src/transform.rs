@@ -615,7 +615,7 @@ pub fn propagate_transforms(world: &mut World) {
             };
             let global = pg * local.to_matrix();
             visits += 1;
-            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
+            if let Some(mut gt) = world.get_mut::<GlobalTransform>(entity) {
                 gt.0 = global;
             } else {
                 missing.push((entity, global));
@@ -688,7 +688,7 @@ pub fn propagate_transforms(world: &mut World) {
             };
             let global = parent_global * local.to_matrix();
             visits += 1;
-            if let Some(gt) = world.get_mut::<GlobalTransform>(entity) {
+            if let Some(mut gt) = world.get_mut::<GlobalTransform>(entity) {
                 gt.0 = global;
             } else {
                 missing.push((entity, global));

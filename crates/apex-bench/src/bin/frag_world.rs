@@ -305,7 +305,7 @@ fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
         for &e in &entities {
-            if let Some(p) = w.get_mut::<Position>(e) {
+            if let Some(mut p) = w.get_mut::<Position>(e) {
                 p.0.x += 0.001;
                 acc = acc.wrapping_add(p.0.x as u64);
             }
@@ -320,7 +320,7 @@ fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
         for &e in &entities {
-            if let Some(p) = w.get_mut_by_id::<Position>(e, pos_id) {
+            if let Some(mut p) = w.get_mut_by_id::<Position>(e, pos_id) {
                 p.0.y += 0.001;
                 acc = acc.wrapping_add(p.0.y as u64);
             }
@@ -362,7 +362,7 @@ fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
         let prev = w.current_tick();
         w.tick();
         for &r in &roots {
-            if let Some(p) = w.get_mut::<Position>(r) {
+            if let Some(mut p) = w.get_mut::<Position>(r) {
                 p.0.x += 0.01;
             }
         }

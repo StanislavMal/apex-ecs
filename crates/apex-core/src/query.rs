@@ -2541,10 +2541,10 @@ mod tests {
         world.tick();
 
         // Мутируем Pos у ea и Marker2 у em — ловим Or<(Changed<Pos>, Changed<Marker2>)>.
-        if let Some(p) = world.get_mut::<Pos>(ea) {
+        if let Some(mut p) = world.get_mut::<Pos>(ea) {
             p.x = 1.0;
         }
-        if let Some(m) = world.get_mut::<Marker2>(em) {
+        if let Some(mut m) = world.get_mut::<Marker2>(em) {
             m.0 = 1.0;
         }
 
@@ -2561,6 +2561,46 @@ mod tests {
         assert!(hits.contains(&em), "ветка Changed<Marker2>");
         assert!(!hits.contains(&eb), "B не менялся");
         assert_eq!(hits.len(), 2);
+    }
+
+    /// A13: `World::get_mut` hands out a `Mut<T>` that stamps the change-tick
+    /// LAZILY — read-only access does NOT mark the component `Changed`, only an
+    /// actual mutation does. Before the fix `get_mut` stamped eagerly, so merely
+    /// touching a component produced a false `Changed<T>`.
+    #[test]
+    fn a13_get_mut_is_lazy_about_change_detection() {
+        let mut world = World::new();
+        let e_read = world.spawn((Pos { x: 5.0 },));
+        let e_write = world.spawn((Pos { x: 5.0 },));
+
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        // Read-only: obtain the Mut and Deref-read it, but never DerefMut.
+        if let Some(m) = world.get_mut::<Pos>(e_read) {
+            assert_eq!(m.x, 5.0); // Deref (read) — must NOT mark Changed
+        }
+        // Mutating: DerefMut stamps the change-tick.
+        if let Some(mut m) = world.get_mut::<Pos>(e_write) {
+            m.x = 9.0;
+        }
+
+        let changed: Vec<_> = Query::<(Entity, Read<Pos>, Changed<Pos>)>::new_with_tick(
+            &world, last_run,
+        )
+        .iter()
+        .map(|(e, _, _)| e)
+        .collect();
+
+        assert!(
+            changed.contains(&e_write),
+            "a mutated component must be Changed"
+        );
+        assert!(
+            !changed.contains(&e_read),
+            "read-only get_mut must NOT mark Changed (A13)"
+        );
     }
 
     #[test]

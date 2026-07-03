@@ -3562,7 +3562,7 @@ mod tests {
             StageLabel::PostUpdate,
             seq("write", move |w: &mut World| {
                 if w.resource::<FrameNo>().0 == 2 {
-                    if let Some(v) = w.get_mut::<V>(e) {
+                    if let Some(mut v) = w.get_mut::<V>(e) {
                         v.0 += 1;
                     }
                 }
@@ -3616,7 +3616,7 @@ mod tests {
             StageLabel::PostUpdate,
             seq("write", move |w: &mut World| {
                 if w.resource::<FrameNo>().0 == 2 {
-                    if let Some(m) = w.get_mut::<Marked>(e) {
+                    if let Some(mut m) = w.get_mut::<Marked>(e) {
                         m.0 += 1; // mutable access stamps the change tick at the PostUpdate tick
                     }
                 }
@@ -4776,7 +4776,7 @@ mod tests {
                 (c.mutate, c.entity)
             };
             if mutate {
-                if let Some(m) = w.get_mut::<Mark>(e) {
+                if let Some(mut m) = w.get_mut::<Mark>(e) {
                     m.0 += 1;
                 }
             }

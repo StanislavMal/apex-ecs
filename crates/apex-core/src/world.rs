@@ -1674,7 +1674,14 @@ impl World {
     /// Стампит текущий тик мира → `Changed<T>` срабатывает (как и при мутации
     /// через `Query<&mut T>`/`Write<T>`, C1).
     #[inline]
-    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+    /// Mutable access with LAZY change-detection (A13): the returned [`Mut<T>`]
+    /// stamps the change-tick only when the caller actually mutates it (via
+    /// `DerefMut` / `set_changed`), not on mere access. Previously `get_mut`
+    /// stamped eagerly, marking components `Changed<T>` even for read-only
+    /// access (false positives → wasted downstream work). `Mut<T>` derefs to
+    /// `&mut T`, so most call sites are unchanged; use `bypass_change_detection`
+    /// to opt out or `&mut *m` where a `&mut T` is required explicitly.
+    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<crate::query::Mut<'_, T>> {
         let component_id = self.registry.get_id::<T>()?;
         self.get_mut_by_id(entity, component_id)
     }
@@ -1708,30 +1715,39 @@ impl World {
         }
     }
 
-    /// `get_mut` по заранее взятому ComponentId — со стампом change-tick,
-    /// как и [`get_mut`](Self::get_mut).
+    /// `get_mut` по заранее взятому ComponentId — с ЛЕНИВОЙ change-detection
+    /// через [`Mut<T>`](crate::query::Mut) (A13; см. [`get_mut`](Self::get_mut)).
     #[inline]
     pub fn get_mut_by_id<T: Component>(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-    ) -> Option<&mut T> {
+    ) -> Option<crate::query::Mut<'_, T>> {
         debug_assert_eq!(
             self.registry.get_id::<T>(),
             Some(component_id),
             "get_mut_by_id: ComponentId не соответствует T"
         );
         let location = self.entities.get_location(entity)?;
-        let tick = self.current_tick;
+        let this_run = self.current_tick;
         let row = location.row as usize;
 
         let arch = &mut self.archetypes[location.archetype_id.0 as usize];
         let col_idx = arch.column_index(component_id)?;
         let col = &mut arch.columns[col_idx];
-        if row < col.change_ticks.len() {
-            col.change_ticks[row] = TickCell::new(tick);
-        }
-        unsafe { Some(col.get_mut::<T>(row)) }
+        // A13: hand out a `Mut<T>` that stamps the change-tick lazily on
+        // mutation, instead of eagerly here. `change_ticks` is `Vec<TickCell>`
+        // (interior-mutable), so the base cast to `*mut Tick` carries cell
+        // provenance (A2); the tick pointer and the `&mut T` value point into
+        // disjoint buffers (ticks vs data), so they do not alias.
+        debug_assert!(row < col.change_ticks.len());
+        let change_tick = unsafe { (col.change_ticks.as_ptr() as *mut Tick).add(row) };
+        let value = unsafe { col.get_mut::<T>(row) };
+        Some(crate::query::Mut {
+            value,
+            change_tick,
+            this_run,
+        })
     }
 
     #[inline]
@@ -3261,8 +3277,9 @@ impl<'w> EntityRef<'w> {
         self.world.get::<T>(self.entity)
     }
 
-    /// Прочитать компонент T мутабельно.
-    pub fn get_mut<T: Component>(&mut self) -> Option<&mut T> {
+    /// Прочитать компонент T мутабельно (ленивая change-detection — [`Mut<T>`],
+    /// A13).
+    pub fn get_mut<T: Component>(&mut self) -> Option<crate::query::Mut<'_, T>> {
         self.world.get_mut::<T>(self.entity)
     }
 
@@ -3534,7 +3551,7 @@ mod tests {
         let last_run = world.current_tick();
         world.tick();
 
-        if let Some(p) = world.get_mut::<P>(target) {
+        if let Some(mut p) = world.get_mut::<P>(target) {
             p.0 = 1.0;
         }
 

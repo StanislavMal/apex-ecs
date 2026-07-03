@@ -88,7 +88,7 @@ fn main() {
     // Модель кадра: тик продвигается В НАЧАЛЕ кадра (до мутаций). В реальном
     // приложении это делает планировщик (C7); здесь — вручную.
     world.tick();
-    if let Some(lt) = world.get_mut::<LocalTransform>(parent) {
+    if let Some(mut lt) = world.get_mut::<LocalTransform>(parent) {
         lt.translation = Vec3::new(100.0, 0.0, 0.0);
     }
     transform::propagate_transforms(&mut world);
@@ -138,7 +138,7 @@ fn main() {
         let baseline = w.resource::<Detected>().0;
 
         // Двигаем объект: LocalTransform меняется СЕЙЧАС, GlobalTransform обновится в PostUpdate кадра A.
-        if let Some(lt) = w.get_mut::<LocalTransform>(ent) {
+        if let Some(mut lt) = w.get_mut::<LocalTransform>(ent) {
             lt.translation = Vec3::new(7.0, 0.0, 0.0);
         }
         s.run(&mut w); // кадр A: PreUpdate (GT ещё старый) → PostUpdate propagate пишет новый GT
