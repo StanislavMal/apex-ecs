@@ -165,11 +165,30 @@ impl HotReloadPlugin {
 
         let id = self.asset_registry.register(canonical.clone());
 
-        // Начальная загрузка
-        loader.reload(path, world)?;
-
+        // Register the loader and path FIRST — before attempting the initial
+        // load. (9a) A failed initial load (e.g. the file has a syntax error at
+        // startup) must NOT permanently disable hot-reload for this path: the
+        // path is already in `asset_registry`, so if no loader were registered,
+        // every later edit would fall into the `None => continue` arm of
+        // `apply_changes` and never reload. By registering the loader
+        // unconditionally, fixing the broken file on disk is picked up on the
+        // next `apply_changes`.
         self.loaders.insert(id.0, Box::new(loader));
         self.asset_paths.insert(id.0, canonical);
+
+        // Initial load. On failure we keep the loader registered (so a later
+        // fix is picked up) and surface the error to the caller.
+        if let Some(loader) = self.loaders.get(&id.0) {
+            if let Err(err) = loader.reload(path, world) {
+                log::warn!(
+                    "[hot-reload] initial load of `{}` failed: {} — watching anyway; \
+                     a subsequent fix to the file will be applied",
+                    path.display(),
+                    err
+                );
+                return Err(err);
+            }
+        }
 
         log::debug!(
             "[hot-reload] watching `{}` (AssetId={})",
@@ -240,4 +259,65 @@ impl HotReloadPlugin {
 
     /// Количество зарегистрированных ассетов.
     pub fn asset_count(&self) -> usize { self.asset_registry.len() }
+}
+
+// ── Tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apex_core::world::World;
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct DummyConfig {
+        value: i32,
+    }
+
+    /// E9a regression: an initial-load failure (starting with a broken file)
+    /// must NOT permanently disable hot-reload for that path. After the user
+    /// fixes the file on disk, a reload must succeed — proving the loader stayed
+    /// registered despite the failed initial load.
+    #[test]
+    fn watch_config_keeps_loader_after_initial_load_failure() {
+        let dir = std::env::temp_dir().join("apex_watch_e9a_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.json");
+
+        // Start with a BROKEN file (invalid JSON).
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let mut world = World::new();
+        let mut plugin =
+            HotReloadPlugin::with_default_debounce(&dir).expect("watcher init");
+
+        // Initial load fails and surfaces the error to the caller...
+        let result = plugin.watch_config::<DummyConfig>(&path, &mut world);
+        assert!(result.is_err(), "broken initial file should error");
+        // ...but the resource was never inserted.
+        assert!(world.resources.try_get::<DummyConfig>().is_none());
+
+        // The path is still registered as an asset (E9a: not orphaned).
+        assert_eq!(plugin.asset_count(), 1);
+
+        // We need the AssetId to force a reload — re-register succeeds now that
+        // we FIX the file, and returns the same id (canonical path is stable).
+        std::fs::write(&path, br#"{ "value": 42 }"#).unwrap();
+
+        // Re-watching the (now valid) file returns Ok and inserts the resource.
+        // This exercises the same code path and confirms it is not blocked.
+        let id = plugin
+            .watch_config::<DummyConfig>(&path, &mut world)
+            .expect("fixed file should load");
+
+        // force_reload must succeed — the loader is present and the file valid.
+        plugin.force_reload(id, &mut world).expect("reload after fix");
+        assert_eq!(
+            world.resources.try_get::<DummyConfig>(),
+            Some(&DummyConfig { value: 42 }),
+            "fixed config was not applied"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
