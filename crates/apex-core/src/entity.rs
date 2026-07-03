@@ -79,7 +79,7 @@ impl EntityRecord {
 }
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Аренда свободных слотов для резервации: снимок `free_list` (индекс + поколение), переезжающий из
 /// `free_list` на время между flush'ами, плюс убывающий курсор. **Слоты аренды дизъюнктны с текущим
@@ -89,6 +89,24 @@ use std::sync::Arc;
 struct ReserveLease {
     cursor: AtomicI64,
     free: Box<[(u32, u32)]>,
+}
+
+/// Разделяемая ячейка текущей аренды. `EntityAllocator` и ВСЕ `EntityReserver`
+/// держат клон ОДНОГО `Arc<LeaseCell>`, поэтому `flush`/`refresh_lease`
+/// публикуют новую аренду через `write()`, а резерваторы всегда читают ТЕКУЩУЮ
+/// через `read()` — устаревший снимок аренды невозможен (B2: раньше резерватор
+/// держал снятый `Arc<ReserveLease>`, а flush подменял свой ⇒ старый резерватор
+/// выдавал слоты, уже вернувшиеся в free_list и переарендованные = двойная
+/// выдача одного индекса). Конкурентные резерваторы берут read-lock (параллельны
+/// между собой), flush — write-lock (эксклюзив, на sync-точке apply, где систем
+/// не бежит).
+type LeaseCell = Arc<RwLock<Arc<ReserveLease>>>;
+
+#[inline]
+fn read_lease(cell: &LeaseCell) -> Arc<ReserveLease> {
+    // Клон под кратким read-lock; курсорные операции идут по клону (общий
+    // атомарный `cursor` — та же аренда, что видят другие резерваторы).
+    cell.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Выдать один `Entity` из аренды (переиспользование) или свежий из high-water. Общий для
@@ -119,15 +137,17 @@ fn reserve_from(lease: &ReserveLease, high_water: &AtomicU32) -> Entity {
 #[derive(Clone)]
 pub struct EntityReserver {
     high_water: Arc<AtomicU32>,
-    lease: Arc<ReserveLease>,
+    lease: LeaseCell,
 }
 
 impl EntityReserver {
-    /// Зарезервировать `Entity` (переиспользует свободный слот или свежий). Lock-free, безопасно из
-    /// параллельных систем (атомарный курсор аренды + high-water).
+    /// Зарезервировать `Entity` (переиспользует свободный слот или свежий). Безопасно из
+    /// параллельных систем: read-lock ячейки аренды (параллелен между резерваторами) → атомарный
+    /// курсор текущей аренды + high-water. Всегда видит АКТУАЛЬНУЮ аренду (B2).
     #[inline]
     pub fn reserve(&self) -> Entity {
-        reserve_from(&self.lease, &self.high_water)
+        let lease = read_lease(&self.lease);
+        reserve_from(&lease, &self.high_water)
     }
 
     /// Зарезервировать `n` `Entity` минимумом атомарных операций (один `fetch_sub` аренды + один
@@ -137,12 +157,13 @@ impl EntityReserver {
         if n == 0 {
             return Vec::new();
         }
-        let old = self.lease.cursor.fetch_sub(n as i64, Ordering::Relaxed);
+        let lease = read_lease(&self.lease);
+        let old = lease.cursor.fetch_sub(n as i64, Ordering::Relaxed);
         let reuse = old.max(0).min(n as i64) as usize; // сколько взято из аренды
         let fresh = n - reuse;
         let mut out = Vec::with_capacity(n);
         for k in 0..reuse {
-            let (index, generation) = self.lease.free[old as usize - 1 - k];
+            let (index, generation) = lease.free[old as usize - 1 - k];
             out.push(Entity { index, generation });
         }
         if fresh > 0 {
@@ -160,8 +181,10 @@ pub struct EntityAllocator {
     /// Общий high-water свежих индексов (делится с резерватором и аллокатором) — двигается только
     /// когда аренда/free_list исчерпаны, поэтому `records.len()` ≈ пик одновременных entity.
     high_water: Arc<AtomicU32>,
-    /// Текущая аренда свободных слотов для резервации (переарендуется на flush).
-    lease: Arc<ReserveLease>,
+    /// Разделяемая ячейка текущей аренды (переарендуется на flush; см. [`LeaseCell`]).
+    /// Общая с ВСЕМИ [`EntityReserver`] — публикация новой аренды через неё
+    /// исключает устаревший снимок (B2).
+    lease: LeaseCell,
     records: Vec<EntityRecord>,
     free_list: Vec<u32>,
     /// Число **живых** (located) записей — поддерживается O(1) на переходах локации (как `Entities::len`
@@ -176,10 +199,10 @@ impl EntityAllocator {
     pub fn new() -> Self {
         Self {
             high_water: Arc::new(AtomicU32::new(0)),
-            lease: Arc::new(ReserveLease {
+            lease: Arc::new(RwLock::new(Arc::new(ReserveLease {
                 cursor: AtomicI64::new(0),
                 free: Box::new([]),
-            }),
+            }))),
             records: Vec::new(),
             free_list: Vec::new(),
             live: 0,
@@ -192,6 +215,7 @@ impl EntityAllocator {
     pub fn reserver(&self) -> EntityReserver {
         EntityReserver {
             high_water: Arc::clone(&self.high_water),
+            // Клон Arc на ТУ ЖЕ ячейку — резерватор видит все будущие переаренды.
             lease: Arc::clone(&self.lease),
         }
     }
@@ -206,7 +230,9 @@ impl EntityAllocator {
             .map(|i| (i, self.records[i as usize].generation))
             .collect();
         let cursor = free.len() as i64;
-        self.lease = Arc::new(ReserveLease {
+        // Публикуем новую аренду в РАЗДЕЛЯЕМУЮ ячейку — все резерваторы увидят её
+        // при следующем `reserve` (B2: старый снимок больше не выдаётся).
+        *self.lease.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ReserveLease {
             cursor: AtomicI64::new(cursor),
             free: free.into_boxed_slice(),
         });
@@ -224,16 +250,20 @@ impl EntityAllocator {
                 encoded_location: NO_LOCATION,
             });
         }
+        // Читаем текущую аренду из ячейки (клон — read-lock отпускается сразу, до
+        // write-lock в refresh_lease, иначе self-deadlock).
+        let lease = read_lease(&self.lease);
         // Быстрый путь (типично: только спавны, без despawn'ов): нечего возвращать/переарендовывать.
-        if self.free_list.is_empty() && self.lease.free.is_empty() {
+        if self.free_list.is_empty() && lease.free.is_empty() {
             return;
         }
         // (1) Не потреблённые слоты аренды (free[0..cursor]) ещё свободны — вернуть в free_list.
-        let cursor = self.lease.cursor.load(Ordering::Relaxed).max(0) as usize;
-        let unconsumed = cursor.min(self.lease.free.len());
+        let cursor = lease.cursor.load(Ordering::Relaxed).max(0) as usize;
+        let unconsumed = cursor.min(lease.free.len());
         for k in 0..unconsumed {
-            self.free_list.push(self.lease.free[k].0);
+            self.free_list.push(lease.free[k].0);
         }
+        drop(lease);
         // (3) Пере-арендовать из обновлённого free_list (новые освобождения + возвращённые).
         self.refresh_lease();
     }
@@ -260,7 +290,8 @@ impl EntityAllocator {
             let generation = self.records[index as usize].generation;
             Entity { index, generation }
         } else {
-            let e = reserve_from(&self.lease, &self.high_water);
+            let lease = read_lease(&self.lease);
+            let e = reserve_from(&lease, &self.high_water);
             self.ensure_record(e.index);
             e
         }
@@ -288,10 +319,11 @@ impl EntityAllocator {
             return entities;
         }
         // 2. Остаток из аренды — ОДИН fetch_sub (как reserve_n): consume free[old-1..old-reuse].
-        let old = self.lease.cursor.fetch_sub(remaining as i64, Ordering::Relaxed);
+        let lease = read_lease(&self.lease);
+        let old = lease.cursor.fetch_sub(remaining as i64, Ordering::Relaxed);
         let reuse = old.max(0).min(remaining as i64) as usize;
         for k in 0..reuse {
-            let (index, generation) = self.lease.free[old as usize - 1 - k];
+            let (index, generation) = lease.free[old as usize - 1 - k];
             entities.push(Entity { index, generation });
         }
         // 3. Свежие индексы — ОДИН fetch_add high-water + ОДИН resize records.
@@ -643,6 +675,46 @@ mod tests {
             records_after_3,
             "records НЕ вырос — резервация переиспользовала слот, а не аллоцировала свежий"
         );
+    }
+
+    /// B2: резерватор, ПЕРЕЖИВШИЙ flush, обязан выдавать из ТЕКУЩЕЙ аренды, а не
+    /// из устаревшего снимка. Раньше он держал снятый `Arc<ReserveLease>`; после
+    /// flush его непотреблённые слоты возвращались в free_list и переарендовывались,
+    /// а старый резерватор всё ещё выдавал их — те же индексы уходили и через
+    /// прямой `allocate` (двойная выдача одного слота).
+    #[test]
+    fn reserver_surviving_flush_never_double_issues() {
+        let mut alloc = EntityAllocator::new();
+        // Наполняем free_list шестью слотами (allocate → материализация → free).
+        let first: Vec<Entity> = (0..6).map(|_| alloc.allocate()).collect();
+        alloc.flush();
+        for &e in &first {
+            alloc.set_location(e, make_loc());
+        }
+        for &e in &first {
+            assert!(alloc.free(e));
+        }
+        alloc.flush(); // аренда L1 получила 6 слотов, free_list пуст
+
+        // Резерватор захвачен ОДИН раз и переживает следующий flush.
+        let r = alloc.reserver();
+        let x0 = r.reserve(); // частично потребляем L1
+        let x1 = r.reserve();
+        alloc.flush(); // L1's непотреблённые слоты → free_list → новая аренда L2
+
+        // Все выданные индексы обязаны быть уникальны: старый резерватор `r`
+        // (через ту же ячейку теперь видит L2) и прямой allocate делят один курсор.
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(x0.index));
+        assert!(seen.insert(x1.index));
+        for _ in 0..4 {
+            let a = r.reserve();
+            assert!(seen.insert(a.index), "резерватор повторно выдал индекс {}", a.index);
+            let b = alloc.allocate();
+            alloc.set_location(b, make_loc());
+            assert!(seen.insert(b.index), "allocate столкнулся с резерватором на {}", b.index);
+        }
+        alloc.flush();
     }
 
     /// Главный тест TD-39: устойчивый churn через РЕЗЕРВАЦИЮ (как `cmd.spawn`) НЕ растит `records`
