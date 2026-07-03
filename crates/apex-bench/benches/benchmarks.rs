@@ -96,7 +96,7 @@ fn bench_schedule(c: &mut Criterion) {
 fn bench_heavy_compute(c: &mut Criterion) {
     let mut group = c.benchmark_group("heavy_compute");
     group.bench_function("apex", |b| {
-        let bench = apex::heavy_compute::HeavyCompute::new();
+        let mut bench = apex::heavy_compute::HeavyCompute::new();
         b.iter(move || bench.run());
     });
     #[cfg(feature = "flecs")]
@@ -307,11 +307,11 @@ fn bench_propagate(c: &mut Criterion) {
 fn bench_par_split(c: &mut Criterion) {
     let mut group = c.benchmark_group("par_split");
     group.bench_function("skew", |b| {
-        let bench = apex::par_skew::ParSkew::new();
+        let mut bench = apex::par_skew::ParSkew::new();
         b.iter(|| bench.run());
     });
     group.bench_function("uniform", |b| {
-        let bench = apex::par_skew::ParSkew::new_uniform();
+        let mut bench = apex::par_skew::ParSkew::new_uniform();
         b.iter(|| bench.run());
     });
 }
