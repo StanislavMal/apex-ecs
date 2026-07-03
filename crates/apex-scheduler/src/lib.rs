@@ -761,21 +761,9 @@ pub struct Scheduler {
     /// Для каждой системы — индексы архетипов, которые ей нужны.
     /// Заполняется в compile() и используется в run_hybrid_parallel().
     system_archetype_indices: FxHashMap<SystemId, SystemArchetypes>,
-    /// Owned storage для Vec<usize>, используемых SubWorld.
-    /// Позволяет избежать Box::leak — данные живут в Scheduler.
-    archetype_indices_storage: Vec<Vec<usize>>,
-    /// Owned storage для row-level range ограничений SubWorld (5.7).
-    /// Каждый элемент: `(arch_idx, start, end)` — если не пусто, то
-    /// итерация по этому архетипу ограничена строками [start, end).
-    /// Позволяет нескольким системам с одинаковым набором архетипов
-    /// параллельно обрабатывать разные строки одного архетипа.
-    row_ranges_storage: Vec<Vec<(usize, usize, usize)>>,
     /// Количество архетипов в World на момент последнего compute_archetype_indices().
     /// Используется для кеширования — пересчёт только при изменении.
     cached_archetype_count: usize,
-    /// Флаг: изменились ли archetype indices после последнего prepare_sub_worlds().
-    /// Позволяет избежать клонирования storage каждый кадр.
-    sub_worlds_dirty: bool,
 
     /// Флаг: был ли уже выполнен Startup этап.
     startup_completed: bool,
@@ -833,10 +821,7 @@ impl Scheduler {
             seq_system_indices: Vec::new(),
             par_system_indices: Vec::new(),
             system_archetype_indices: FxHashMap::default(),
-            archetype_indices_storage: Vec::new(),
-            row_ranges_storage: Vec::new(),
             cached_archetype_count: 0,
-            sub_worlds_dirty: true,
             startup_completed: false,
             stage_order: None,
             default_stage_label: StageLabel::Update,
@@ -1905,12 +1890,6 @@ impl Scheduler {
             self.cached_archetype_count.min(arch_count)
         };
 
-        self.archetype_indices_storage.clear();
-        self.row_ranges_storage.clear();
-
-        // Данные изменились — prepare_sub_worlds нужно пересоздать storage
-        self.sub_worlds_dirty = true;
-
         if arch_count == 0 {
             self.cached_archetype_count = 0;
             return;
@@ -2781,7 +2760,8 @@ impl Scheduler {
     ///
     /// Для stage с исключительно параллельными системами используется
     /// [`run_stage_parallel`] (ASD). Stage с sequential системами или
-    /// смешанные выполняются последовательно через `make_sub_world`.
+    /// смешанные выполняются последовательно, каждая система получает
+    /// полный `SubWorld` над всеми архетипами.
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
         let plan = self.execution_plan.as_ref().unwrap();
@@ -2813,10 +2793,6 @@ impl Scheduler {
         }
 
         let const_ptr = world_ptr as *const World;
-        {
-            let w = unsafe { &*const_ptr };
-            self.prepare_sub_worlds(w);
-        }
         let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
         let num_threads = rayon::current_num_threads();
@@ -2869,8 +2845,6 @@ impl Scheduler {
                 if cur != prev_arch_count {
                     prev_arch_count = cur;
                     self.compute_archetype_indices(w);
-                    self.sub_worlds_dirty = true;
-                    self.prepare_sub_worlds(w);
                 }
             }
             let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
@@ -3018,8 +2992,6 @@ impl Scheduler {
                 if cur != prev_arch_count {
                     prev_arch_count = cur;
                     self.compute_archetype_indices(w);
-                    self.sub_worlds_dirty = true;
-                    self.prepare_sub_worlds(w);
                 }
             }
             if !emit_event_types.is_empty() {
@@ -3039,149 +3011,6 @@ impl Scheduler {
             .try_resource_mut::<crate::fixed::FixedTime>()
             .map(|ft| ft.drain_steps())
             .unwrap_or(1)
-    }
-
-    /// Создать SubWorld для системы на основе предвычисленных archetype_indices
-    /// и row_ranges (5.7).
-    ///
-    /// SubWorld хранит сырые указатели на данные из Scheduler storage,
-    /// безопасность гарантируется тем что storage не мутирует пока живы SubWorld.
-    #[allow(dead_code)]
-    fn make_sub_world<'w>(&self, storage_idx: usize, world: &'w World) -> apex_core::SubWorld<'w> {
-        let arch_indices = &self.archetype_indices_storage[storage_idx];
-        let ranges = &self.row_ranges_storage[storage_idx];
-        // SAFETY: SubWorld borrows Scheduler storage that is not mutated while any
-        // SubWorld is live (documented invariant of the row-split machinery).
-        if ranges.is_empty() {
-            unsafe { apex_core::SubWorld::from_raw(world, arch_indices) }
-        } else {
-            unsafe { apex_core::SubWorld::from_raw_with_ranges(world, arch_indices, ranges) }
-        }
-    }
-
-    /// Подготовить storage для SubWorld — заполняет `archetype_indices_storage`
-    /// и `row_ranges_storage` для всех систем. Вызывается перед `run_hybrid_parallel()`.
-    /// Позволяет избежать `Box::leak` в `make_sub_world`.
-    ///
-    /// # Row-level splits (5.7)
-    ///
-    /// Если несколько систем имеют одинаковый набор архетипов (одинаковые
-    /// `system_archetype_indices`), строки этих архетипов равномерно
-    /// распределяются между ними. Это позволяет системам в одном Stage
-    /// параллельно обрабатывать разные строки одних и тех же архетипов.
-    ///
-    /// Использует `sub_worlds_dirty` для кеширования: если данные не изменились
-    /// с прошлого вызова, пересоздание storage пропускается.
-    fn prepare_sub_worlds(&mut self, world: &World) {
-        // Если данные не изменились — пропускаем клонирование
-        if !self.sub_worlds_dirty {
-            return;
-        }
-
-        self.archetype_indices_storage.clear();
-        self.row_ranges_storage.clear();
-        let arch_count = world.archetypes().len();
-
-        // ── 1. Заполняем archetype_indices_storage ────────────────
-        // (SubWorld требует материализованный список — для All/fallback он
-        // строится здесь, один раз на prepare, а не хранится постоянно.)
-        for system in &self.systems {
-            let indices = self.system_archetype_indices.get(&system.id);
-            match indices {
-                Some(SystemArchetypes::Filtered(v)) if !v.is_empty() => {
-                    self.archetype_indices_storage.push(v.clone());
-                }
-                _ => {
-                    // All / пустой список / нет записи — все архетипы
-                    self.archetype_indices_storage
-                        .push((0..arch_count).collect());
-                }
-            }
-        }
-
-        // ── 2. Row-level split (5.7) ─────────────────────────────
-        // Группируем системы по одинаковым наборам индексов архетипов
-        // через Hash & Eq по содержимому &[usize] (без клонирования Vec).
-        // Если в группе 2+ системы, распределяем строки архетипов между ними.
-        //
-        // Row-level split имеет смысл только для систем, которые
-        // выполняются в ОДНОМ all_parallel Stage — они работают
-        // параллельно и делят сущности без конфликтов.
-        // Системы из разных Stage выполняются последовательно
-        // и каждая должна видеть ВСЕ entity целиком.
-        let plan = self.execution_plan.as_ref().unwrap();
-        let mut sys_idx_to_stage_idx: FxHashMap<usize, usize> = FxHashMap::default();
-        for (stage_idx, stage) in plan.stages.iter().enumerate() {
-            for &sys_id in &stage.system_ids {
-                if let Some(&idx) = self.system_indices.get(&sys_id) {
-                    sys_idx_to_stage_idx.insert(idx, stage_idx);
-                }
-            }
-        }
-
-        let num_threads = rayon::current_num_threads();
-        let mut groups: FxHashMap<&[usize], Vec<usize>> = FxHashMap::default();
-
-        for (sys_idx, storage) in self.archetype_indices_storage.iter().enumerate() {
-            if storage.len() >= 2 {
-                groups.entry(storage.as_slice()).or_default().push(sys_idx);
-            }
-        }
-
-        // Инициализируем пустыми Vec для всех систем
-        let mut row_ranges: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); self.systems.len()];
-
-        for (_sig, sys_indices) in &groups {
-            let group_size = sys_indices.len().min(num_threads);
-            if group_size < 2 {
-                continue; // Только группы с реальным conflict (2+ системы)
-            }
-
-            // Row-level split только для систем одного all_parallel Stage.
-            // Системы из разных Stage выполняются последовательно —
-            // каждая должна видеть все entity, иначе симуляция ломается.
-            let stages: Vec<usize> = sys_indices
-                .iter()
-                .filter_map(|idx| sys_idx_to_stage_idx.get(idx).copied())
-                .collect();
-            let all_same_stage = stages
-                .first()
-                .map(|&first| stages.iter().all(|&s| s == first))
-                .unwrap_or(false);
-            let stage_is_parallel = stages.first().is_some_and(|&stage_idx| {
-                plan.stages.get(stage_idx).is_some_and(|s| s.all_parallel)
-            });
-            if !all_same_stage || !stage_is_parallel {
-                continue;
-            }
-
-            for &arch_idx in _sig.iter() {
-                if arch_idx >= arch_count {
-                    continue;
-                }
-                let arch_len = world.archetypes()[arch_idx].len();
-                if arch_len < group_size {
-                    continue; // Слишком мало entity для разделения
-                }
-
-                // Равномерно распределяем строки архетипа между системами группы
-                let chunk_size = arch_len / group_size;
-                for (i, &sys_idx) in sys_indices.iter().enumerate().take(group_size) {
-                    let start = i * chunk_size;
-                    let end = if i == group_size - 1 {
-                        arch_len
-                    } else {
-                        start + chunk_size
-                    };
-                    row_ranges[sys_idx].push((arch_idx, start, end));
-                }
-            }
-        }
-
-        self.row_ranges_storage = row_ranges;
-
-        // Storage актуален до следующего изменения archetype indices
-        self.sub_worlds_dirty = false;
     }
 
     // ── Инспекция ──────────────────────────────────────────────
