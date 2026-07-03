@@ -417,6 +417,24 @@ struct AsdTask {
 unsafe impl Send for AsdTask {}
 unsafe impl Sync for AsdTask {}
 
+/// Per-system dispatch info collected once per parallel stage (Ш1: pooled in a
+/// Scheduler scratch buffer, reused across frames). Holds the system's `sys_id`
+/// rather than a clone of its archetype-index list — the slice is fetched from
+/// `system_archetype_indices` at task-build time, so no per-system `Vec` is
+/// allocated per frame. Main-thread only (not sent to rayon), so no `Send`.
+struct SysInfo {
+    ptr: SendPtr<dyn ParSystem>,
+    sys_id: SystemId,
+    entity_count: usize,
+    has_events: bool,
+    uses_par_for_each: bool,
+    needs_whole_world: bool,
+    stateful: bool,
+    /// Mutates a resource (`ResMut`) or uses `Commands` — cannot be row-split
+    /// (the body would run once per chunk ⇒ side-effect multiplied). See TD-37.
+    non_query_side_effects: bool,
+}
+
 // ── ParSystem trait ────────────────────────────────────────────
 
 /// Параллельная система с явным AccessDescriptor.
@@ -781,6 +799,21 @@ pub struct Scheduler {
     /// Scope condition: все системы, зарегистрированные внутри `staged()` пока этот
     /// condition активен, наследуют его (автоматически AND-ится с их условиями).
     scope_condition: Option<std::sync::Arc<dyn Fn(&World) -> bool + Send + Sync>>,
+
+    // ── Ш1: pooled per-frame scratch buffers (zero steady-state alloc) ──────────
+    // NOTE: per-worker `Vec<Commands>` is intentionally NOT pooled here — `Commands`
+    // is `!Send`, and a `Vec<Commands>` field would make `Scheduler: !Send` (breaks
+    // `ThreadPool::install`). Its outer-Vec alloc is negligible; it stays a local.
+    /// Reused `arch_lengths` snapshot (cleared + refilled per frame).
+    scratch_arch_lengths: Vec<usize>,
+    /// Reused execution schedule (FixedUpdate expansion) index list.
+    scratch_schedule: Vec<usize>,
+    /// Reused per-parallel-stage system-info buffer.
+    scratch_sys_infos: Vec<SysInfo>,
+    /// Reused per-parallel-stage ASD task buffer.
+    scratch_tasks: Vec<AsdTask>,
+    /// Reused per-parallel-stage skipped-system set.
+    scratch_skipped: FxHashSet<SystemId>,
 }
 
 impl Scheduler {
@@ -810,6 +843,11 @@ impl Scheduler {
             event_ordering_enabled: true,
             last_added_system_id: None,
             scope_condition: None,
+            scratch_arch_lengths: Vec::new(),
+            scratch_schedule: Vec::new(),
+            scratch_sys_infos: Vec::new(),
+            scratch_tasks: Vec::new(),
+            scratch_skipped: FxHashSet::default(),
         }
     }
 
@@ -2491,8 +2529,12 @@ impl Scheduler {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
 
-        // 0. Evaluate run conditions on main thread BEFORE any ASD task setup
-        let mut skipped_systems: FxHashSet<SystemId> = FxHashSet::default();
+        // 0. Evaluate run conditions on main thread BEFORE any ASD task setup.
+        //    Ш1: buffers pooled in Scheduler scratch fields (detached via mem::take
+        //    so `&mut self` method calls below don't alias them; restored at the end
+        //    to retain capacity — zero steady-state allocation).
+        let mut skipped_systems = std::mem::take(&mut self.scratch_skipped);
+        skipped_systems.clear();
         for &sys_id in stage_ids {
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                 if !self.systems[sys_idx].run_condition.evaluate(world) {
@@ -2501,21 +2543,9 @@ impl Scheduler {
             }
         }
 
-        // 1. Собираем per-system информацию
-        struct SysInfo {
-            ptr: SendPtr<dyn ParSystem>,
-            arch_indices: Vec<usize>,
-            entity_count: usize,
-            has_events: bool,
-            uses_par_for_each: bool,
-            needs_whole_world: bool,
-            stateful: bool,
-            /// Мутирует ресурс (`ResMut`) или использует `Commands` — нельзя дробить на чанки
-            /// (тело системы выполнялось бы раз на чанк ⇒ умножение сайд-эффекта). См. TD-37.
-            non_query_side_effects: bool,
-        }
-
-        let mut sys_infos: Vec<SysInfo> = Vec::new();
+        // 1. Собираем per-system информацию (SysInfo — module-level, pooled).
+        let mut sys_infos = std::mem::take(&mut self.scratch_sys_infos);
+        sys_infos.clear();
         let mut total_entity_count: usize = 0;
 
         for &sys_id in stage_ids {
@@ -2533,22 +2563,17 @@ impl Scheduler {
                     self.system_archetype_indices.get(&sys_id),
                     Some(SystemArchetypes::Filtered(_))
                 );
-                let arch_indices = match self.system_archetype_indices.get(&sys_id) {
-                    Some(SystemArchetypes::Filtered(v)) => v.clone(),
-                    // All или нет записи — система видит все архетипы
-                    _ => (0..archetypes.len()).collect(),
+                // Ш1: entity_count without materializing an arch-index Vec — the
+                // slice is fetched from `system_archetype_indices` at task-build time.
+                let entity_count: usize = match self.system_archetype_indices.get(&sys_id) {
+                    Some(SystemArchetypes::Filtered(v)) => v
+                        .iter()
+                        .filter(|&&ai| ai < archetypes.len())
+                        .map(|&ai| archetypes[ai].len())
+                        .sum(),
+                    // All / no record — system sees all archetypes.
+                    _ => archetypes.iter().map(|a| a.len()).sum(),
                 };
-
-                let entity_count: usize = arch_indices
-                    .iter()
-                    .filter_map(|&ai| {
-                        if ai < archetypes.len() {
-                            Some(archetypes[ai].len())
-                        } else {
-                            None
-                        }
-                    })
-                    .sum();
 
                 if entity_count > 0 && is_filtered {
                     let access = self.systems[sys_idx].kind.access();
@@ -2576,7 +2601,7 @@ impl Scheduler {
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
                         ptr: SendPtr(par_ptr),
-                        arch_indices,
+                        sys_id,
                         entity_count,
                         has_events,
                         uses_par_for_each,
@@ -2604,6 +2629,8 @@ impl Scheduler {
         }
 
         if sys_infos.is_empty() {
+            self.scratch_skipped = skipped_systems;
+            self.scratch_sys_infos = sys_infos;
             return;
         }
 
@@ -2622,10 +2649,16 @@ impl Scheduler {
         let aligned_chunk = (target_chunk / CACHE_ALIGN_ENTITIES) * CACHE_ALIGN_ENTITIES;
         let effective_chunk = aligned_chunk.max(CACHE_ALIGN_ENTITIES);
 
-        // 3. Создаём чанки для всех систем
-        let mut tasks: Vec<AsdTask> = Vec::new();
+        // 3. Создаём чанки для всех систем (Ш1: pooled task buffer)
+        let mut tasks = std::mem::take(&mut self.scratch_tasks);
+        tasks.clear();
 
         for info in &sys_infos {
+            // Ш1: fetch the arch-index slice from the cached map (no per-system clone).
+            let arch_slice: &[usize] = match self.system_archetype_indices.get(&info.sys_id) {
+                Some(SystemArchetypes::Filtered(v)) => v.as_slice(),
+                _ => &[],
+            };
             // Per-system scope (БЕЗ row-split — система выполняется ровно один раз) для:
             //   a) Систем с малым entity_count
             //   b) Систем с событиями (Emit/Listen)
@@ -2648,13 +2681,13 @@ impl Scheduler {
                 // Per-system scope: одна задача, все entity целиком
                 tasks.push(AsdTask {
                     ptr: info.ptr,
-                    arch_indices: SmallVec::from_slice(&info.arch_indices),
+                    arch_indices: SmallVec::from_slice(arch_slice),
                     chunk_ranges: SmallVec::new(), // пусто = весь SubWorld
                 });
             } else {
                 // Multi-архетипная крупная система — ASD разбивка
                 let mut remaining = info.entity_count;
-                let mut arch_iter = info.arch_indices.iter().copied();
+                let mut arch_iter = arch_slice.iter().copied();
                 let mut current_arch = arch_iter.next();
                 let mut arch_offset: usize = 0;
 
@@ -2751,6 +2784,13 @@ impl Scheduler {
                 });
             }
         });
+
+        // Ш1: return pooled buffers to the Scheduler to retain capacity next frame.
+        // `sys_infos` holds raw `SendPtr`s into `self.systems`; they are cleared and
+        // rebuilt each frame before any use, never dereferenced while stale.
+        self.scratch_skipped = skipped_systems;
+        self.scratch_sys_infos = sys_infos;
+        self.scratch_tasks = tasks;
     }
 
     /// Параллельное выполнение через ASD (Adaptive Scope Distribution).
@@ -2761,22 +2801,18 @@ impl Scheduler {
     /// полный `SubWorld` над всеми архетипами.
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
-        let plan = self.execution_plan.as_ref().unwrap();
-        let stages: Vec<(usize, StageLabel, Vec<SystemId>, bool, Vec<TypeId>)> = plan
-            .stages
-            .iter()
-            .enumerate()
-            .filter(|(_, stage)| !(stage.label == StageLabel::Startup && self.startup_completed))
-            .map(|(i, s)| {
-                (
-                    i, // original execution-stage index (stable change-detection key, TD-52)
-                    s.label.clone(),
-                    s.system_ids.clone(),
-                    s.all_parallel,
-                    s.emit_event_types.clone(),
-                )
-            })
-            .collect();
+        // Ш1: move the plan OUT of `self` (mem::take) so its stages can be borrowed
+        // while `&mut self` methods run in the loop — no per-frame clone of the stage
+        // metadata (labels, `system_ids`, `emit_event_types`). Restored at the end.
+        // If a system panics mid-run the plan is lost → recompiled on the next run
+        // (a panicking system is already a bug; correctness is preserved).
+        // Stages are NOT pre-filtered for Startup here: startup stages are skipped
+        // in-loop, so `stage_pos` equals the plan-stage index (the stable TD-52
+        // change-detection key), exactly as the old `i` did.
+        let plan = self
+            .execution_plan
+            .take()
+            .expect("execution_plan present before run");
 
         {
             let w = unsafe { &mut *world_ptr };
@@ -2793,15 +2829,15 @@ impl Scheduler {
         let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
         let num_threads = rayon::current_num_threads();
+        // Per-worker command buffers — a local (Commands is !Send; see the field note).
         let mut thread_commands: Vec<Commands> =
             (0..num_threads).map(|_| Commands::new()).collect();
         let cmds_ptr: usize = &mut thread_commands as *mut Vec<Commands> as usize;
 
-        let arch_lengths: Vec<usize> = unsafe { &*const_ptr }
-            .archetypes()
-            .iter()
-            .map(|a| a.len())
-            .collect();
+        // Ш1: pooled arch-length snapshot (cleared + refilled, capacity retained).
+        let mut arch_lengths = std::mem::take(&mut self.scratch_arch_lengths);
+        arch_lengths.clear();
+        arch_lengths.extend(unsafe { &*const_ptr }.archetypes().iter().map(|a| a.len()));
 
         // Build the execution order (D2-5). Stages sharing a StageLabel are
         // contiguous, so the FixedUpdate stages form one block. That block steps
@@ -2811,12 +2847,13 @@ impl Scheduler {
         // later FixedUpdate stage (a conflict split the label across several
         // execution stages) ran zero times, and the order was A×N then B×N rather
         // than the correct (A;B)×N. Every non-FixedUpdate stage runs exactly once.
-        let mut schedule: Vec<usize> = Vec::with_capacity(stages.len());
+        let mut schedule = std::mem::take(&mut self.scratch_schedule);
+        schedule.clear();
         let mut si = 0;
-        while si < stages.len() {
-            if stages[si].1 == StageLabel::FixedUpdate {
+        while si < plan.stages.len() {
+            if plan.stages[si].label == StageLabel::FixedUpdate {
                 let mut end = si;
-                while end < stages.len() && stages[end].1 == StageLabel::FixedUpdate {
+                while end < plan.stages.len() && plan.stages[end].label == StageLabel::FixedUpdate {
                     end += 1;
                 }
                 let steps = Self::stage_steps(unsafe { &mut *world_ptr }, &StageLabel::FixedUpdate);
@@ -2831,6 +2868,11 @@ impl Scheduler {
         }
 
         for &stage_pos in &schedule {
+            let stage = &plan.stages[stage_pos];
+            // Startup runs only on the first frame (was a pre-loop filter on `stages`).
+            if stage.label == StageLabel::Startup && self.startup_completed {
+                continue;
+            }
             // D4: an earlier stage may have spawned entities into NEW archetypes.
             // Refresh the cached per-system archetype indices before this stage so
             // a Filtered parallel system sees them. Previously only the parallel
@@ -2844,7 +2886,11 @@ impl Scheduler {
                     self.compute_archetype_indices(w);
                 }
             }
-            let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
+            // `stage_idx` (plan-stage index) is the stable TD-52 change key.
+            let stage_idx = stage_pos;
+            let stage_ids = &stage.system_ids;
+            let all_parallel = stage.all_parallel;
+            let emit_event_types = &stage.emit_event_types;
             // D6: skip the whole stage — including opening the change window — when
             // every system is disabled by its run_condition. Otherwise the window
             // would advance stage_last_run past changes made during a run_if pause,
@@ -2860,8 +2906,8 @@ impl Scheduler {
                 continue;
             }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
-            self.open_stage_change_window(*stage_idx, unsafe { &mut *world_ptr });
-            if !*all_parallel {
+            self.open_stage_change_window(stage_idx, unsafe { &mut *world_ptr });
+            if !all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
                     let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
@@ -3007,6 +3053,11 @@ impl Scheduler {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
         }
+
+        // Ш1: return the plan and pooled buffers to `self` (capacity retained).
+        self.execution_plan = Some(plan);
+        self.scratch_arch_lengths = arch_lengths;
+        self.scratch_schedule = schedule;
     }
 
     /// Число исполнений стадии в этом кадре (D2-5): FixedUpdate — по
