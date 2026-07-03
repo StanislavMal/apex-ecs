@@ -201,6 +201,11 @@ pub enum ConflictKind {
     /// Обе системы пишут в компоненты, которые другая читает
     /// (A writes Pos that B reads, B writes Vel that A reads).
     BidirectionalWriteRead { a_name: String, b_name: String },
+    /// Two systems read the SAME event type. They must be serialized because each
+    /// `EventReader` mutates the event queue's shared cursor registry on register
+    /// / advance / drop — running them in parallel is a data race (F2). Reader
+    /// parallelism is restored by the per-system cursor model (wave 6).
+    SharedEventReaders { event_name: &'static str },
 }
 
 impl std::fmt::Display for ConflictKind {
@@ -219,6 +224,9 @@ impl std::fmt::Display for ConflictKind {
             }
             ConflictKind::EventWriteRead { event_name, .. } => {
                 write!(f, "Event Write+Read conflict on `{}`", event_name)
+            }
+            ConflictKind::SharedEventReaders { event_name } => {
+                write!(f, "shared EventReader cursor race on `{}`", event_name)
             }
             ConflictKind::BidirectionalWriteRead { a_name, b_name } => write!(
                 f,
@@ -2190,6 +2198,7 @@ impl Scheduler {
                 ) {
                     let is_symmetric = matches!(conflict_kind, ConflictKind::WriteWrite { .. })
                         || matches!(conflict_kind, ConflictKind::EventWriteWrite { .. })
+                        || matches!(conflict_kind, ConflictKind::SharedEventReaders { .. })
                         || matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
                     let is_bidirectional =
                         matches!(conflict_kind, ConflictKind::BidirectionalWriteRead { .. });
@@ -3556,6 +3565,16 @@ fn detect_conflict_kind(
         }
     }
 
+    // ── Shared event-reader cursor race (F2) ────────────────────
+    // NOT gated by event_ordering: two systems reading the same event type each
+    // mutate that queue's shared cursor registry (register/advance/drop), so they
+    // must be serialized regardless of ordering policy or the data race is real.
+    for (id, name) in &ai.reads_event {
+        if aj.reads_event.iter().any(|(oid, _)| oid == id) {
+            return Some((ConflictKind::SharedEventReaders { event_name: name }, true));
+        }
+    }
+
     None
 }
 
@@ -4407,22 +4426,31 @@ mod tests {
         );
     }
 
+    /// F2: two systems reading the SAME event must be serialized — each
+    /// EventReader mutates the queue's shared cursor registry, so running them in
+    /// parallel is a data race. (They used to share a stage — the racy old
+    /// behavior; reader parallelism returns with the per-system cursor model,
+    /// wave 6.)
     #[test]
-    fn event_read_read_no_conflict() {
+    fn same_event_readers_are_serialized() {
         let mut sched = Scheduler::new();
 
-        sched.add_par_system("reader_a", EventReaderForTest);
-        sched.add_par_system("reader_b", EventReaderForTest);
+        let a = sched.add_par_system("reader_a", EventReaderForTest);
+        let b = sched.add_par_system("reader_b", EventReaderForTest);
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // Два EventReader одного типа → НЕТ конфликта, могут быть в одном Stage
-        // Проверяем что есть хотя бы один Stage с обеими системами
-        let found = stages.iter().any(|s| s.system_ids.len() >= 2);
+        let sa = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
+        let sb = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
+        assert_ne!(sa, sb, "two readers of the same event must be serialized (F2)");
+
+        let conflicts = sched.conflicts_between(a, b);
         assert!(
-            found,
-            "EventRead не должны конфликтовать: ожидается Stage с обеими системами"
+            conflicts
+                .iter()
+                .any(|c| matches!(c, ConflictKind::SharedEventReaders { .. })),
+            "the conflict must be SharedEventReaders, got {conflicts:?}"
         );
     }
 
@@ -4663,11 +4691,15 @@ mod tests {
         assert!(pos_armor < pos_health, "armor должен быть до health");
     }
 
+    /// Both consumers of the same event run after the producer and each receives
+    /// the event. They are SERIALIZED with respect to each other (F2: reading the
+    /// same event mutates its shared cursor registry, so parallel reads race);
+    /// reader parallelism returns with the per-system cursor model (wave 6).
     #[test]
-    fn pipeline_parallel_consumers() {
+    fn pipeline_consumers_run_after_producer_and_are_serialized() {
         let mut sched = Scheduler::new();
 
-        let _physics_id = sched.add_par_system("physics", EmitDamage);
+        let physics_id = sched.add_par_system("physics", EmitDamage);
         let health_id = sched.add_par_system("health", ListenDamage);
         let sound_id = sched.add_par_system("sound", ListenDamage2);
 
@@ -4679,15 +4711,12 @@ mod tests {
 
         sched.compile().unwrap();
 
-        // health и sound — параллельные Consumer, должны оказаться в одном Stage
         let stages = sched.stages().unwrap();
-        let parallel_stage = stages
-            .iter()
-            .find(|s| s.system_ids.contains(&health_id) && s.system_ids.contains(&sound_id));
-        assert!(
-            parallel_stage.is_some(),
-            "health и sound должны быть в одном параллельном Stage"
-        );
+        let stage_of = |id| stages.iter().position(|s| s.system_ids.contains(&id)).unwrap();
+        let (p, h, s) = (stage_of(physics_id), stage_of(health_id), stage_of(sound_id));
+        // Producer before both consumers; the two consumers serialized (F2).
+        assert!(p < h && p < s, "producer must run before both consumers");
+        assert_ne!(h, s, "consumers of the same event are serialized (F2)");
     }
 
     #[test]
