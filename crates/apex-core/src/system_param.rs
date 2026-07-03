@@ -566,7 +566,10 @@ where
         // как у ctx.query() (TD-9).
         let sub = &ctx.sub_worlds[0];
         let last_run = sub.world().last_run_tick();
-        crate::query::Query::from_sub_world(sub, last_run)
+        // SAFETY: `ctx` (and its SubWorlds) is vended by the scheduler for a
+        // system whose declared access (`Self::access()`) covers exactly this
+        // shape; conflicting systems never run concurrently.
+        unsafe { crate::query::Query::from_sub_world(sub, last_run) }
     }
 }
 
@@ -884,8 +887,12 @@ where
 /// После extract-стадии `MainWorld` удаляется из render-мира и возвращается main-потоку.
 pub struct Extract<P>(PhantomData<P>);
 
-// Extract<QueryParam<Q>> — читает компоненты из MainWorld
-impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for Extract<QueryParam<Q>> {
+// Extract<QueryParam<Q>> — читает компоненты из MainWorld. Форма обязана
+// быть read-only: extract по контракту НЕ пишет в main-мир (write-форма
+// теперь и не скомпилируется — ReadOnlyWorldQuery).
+impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> SystemParam
+    for Extract<QueryParam<Q>>
+{
     type Item<'w> = crate::world::CachedQuery<'w, Q>;
 
     fn access() -> AccessDescriptor {

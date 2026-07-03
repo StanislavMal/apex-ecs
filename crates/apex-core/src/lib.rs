@@ -52,6 +52,7 @@ pub mod system_macro;
 pub mod system_param;
 pub mod template;
 pub mod transform;
+pub mod unsafe_world_cell;
 pub mod world;
 
 pub use access::AccessDescriptor;
@@ -61,7 +62,8 @@ pub use archetype::ArchetypeId;
 pub use commands::Commands;
 pub use component::{
     make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentHookFn, ComponentId,
-    ComponentRegistry, ComponentSerdeFns, NoContext, Serializable, SerdeContext, Tick,
+    ComponentRegistry, ComponentSerdeFns, MapEntities, MapEntitiesFn, NoContext, Serializable,
+    SerdeContext, Tick,
 };
 pub use entity::Entity;
 pub use events::{
@@ -72,8 +74,9 @@ pub use fn_system::{short_system_name, SystemParamFunction};
 pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
-    Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QuerySingleError, Read,
-    Ref, With, Without, WorldQuery, Write,
+    Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
+    DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QuerySingleError,
+    Read, ReadOnlyWorldQuery, Ref, With, Without, WorldQuery, Write,
 };
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
@@ -85,6 +88,7 @@ pub use system_param::{
     SystemParam, WorldQuerySystemAccess,
 };
 pub use transform::IndexStamp;
+pub use unsafe_world_cell::UnsafeWorldCell;
 pub use world::{
     ArchetypeStats, Bundle, CachedQuery, ParallelWorld, QueryState, SystemContext, World,
 };
@@ -110,9 +114,11 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Single,
-        QuerySingleError, Read, Ref, With, Without, WorldQuery, Write,
+        Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
+        DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut,
+        QuerySingleError, Read, ReadOnlyWorldQuery, Ref, Single, With, Without, WorldQuery, Write,
     };
+    pub use crate::unsafe_world_cell::UnsafeWorldCell;
     pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
     pub use crate::resources::Resources;
     pub use crate::system;

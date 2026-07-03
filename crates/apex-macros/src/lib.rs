@@ -84,6 +84,10 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let registrar_ident = quote::format_ident!("__COMPONENT_REGISTRAR_{}", name);
+    // F7: support generic components. `split_for_impl` yields the `<..>` for the
+    // impl header, the type args, and the `where` clause.
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let is_generic = !input.generics.params.is_empty();
 
     // #[require(A, B, …)] — список типов через запятую (атрибутов может быть несколько).
     let mut required: Vec<Type> = Vec::new();
@@ -104,7 +108,7 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         quote! {}
     } else {
         let calls = required.iter().map(|ty| {
-            quote! { registry.register_required::<#name, #ty>(); }
+            quote! { registry.register_required::<#name #ty_generics, #ty>(); }
         });
         quote! {
             fn register_requires(registry: &mut ::apex_core::component::ComponentRegistry) {
@@ -113,24 +117,36 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         }
     };
 
+    // Авторегистрация на старте `World::new()` через `linkme::distributed_slice` (линкер собирает
+    // регистраторы из всех крейтов). На wasm32 и под Miri linkme не эмитится — но это лишь
+    // ОПТИМИЗАЦИЯ (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО
+    // при первом использовании (`register` → `Component::register_requires`), поэтому `#[require]`
+    // работает и там. TD-25 (wasm); Miri — linkme distributed-slice даёт overflow, тот же путь.
+    //
+    // F7: для ОБОБЩЁННОГО компонента статический регистратор невозможен (нет
+    // конкретного типа для `get_or_register`), поэтому опускаем его — обобщённый
+    // тип регистрируется ЛЕНИВО при первом использовании конкретной подстановки.
+    let registrar = if is_generic {
+        quote! {}
+    } else {
+        quote! {
+            #[allow(non_upper_case_globals)]
+            #[cfg(all(not(target_arch = "wasm32"), not(miri)))]
+            #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
+            #[linkme(crate = ::apex_core::linkme)]
+            static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
+                |registry: &mut ::apex_core::component::ComponentRegistry| {
+                    registry.get_or_register::<#name>();
+                };
+        }
+    };
+
     let expanded = quote! {
-        impl ::apex_core::component::Component for #name {
+        impl #impl_generics ::apex_core::component::Component for #name #ty_generics #where_clause {
             #register_requires_impl
         }
 
-        // Авторегистрация на старте `World::new()` через `linkme::distributed_slice` (линкер собирает
-        // регистраторы из всех крейтов). На wasm32 и под Miri linkme не эмитится — но это лишь
-        // ОПТИМИЗАЦИЯ (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО
-        // при первом использовании (`register` → `Component::register_requires`), поэтому `#[require]`
-        // работает и там. TD-25 (wasm); Miri — linkme distributed-slice даёт overflow, тот же путь.
-        #[allow(non_upper_case_globals)]
-        #[cfg(all(not(target_arch = "wasm32"), not(miri)))]
-        #[::apex_core::linkme::distributed_slice(::apex_core::component::COMPONENT_REGISTRARS)]
-        #[linkme(crate = ::apex_core::linkme)]
-        static #registrar_ident: ::apex_core::component::ComponentRegistrarFn =
-            |registry: &mut ::apex_core::component::ComponentRegistry| {
-                registry.get_or_register::<#name>();
-            };
+        #registrar
     };
     expanded.into()
 }
@@ -178,34 +194,25 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
 
     let field_types: Vec<&syn::Type> = fields.iter().map(|f| &f.ty).collect();
 
+    // F7: support generic bundles.
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+
     let expanded = quote! {
-        impl ::apex_core::Bundle for #name {
+        impl #impl_generics ::apex_core::Bundle for #name #ty_generics #where_clause {
             fn component_count() -> usize {
                 0usize #( + <#field_types as ::apex_core::Bundle>::component_count() )*
             }
 
-            fn component_ids(
-                &self,
-                registry: &mut ::apex_core::ComponentRegistry,
-            ) -> ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> {
-                let mut ids: ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]> =
-                    ::apex_core::smallvec::SmallVec::new();
-                #(
-                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, &mut ids);
-                )*
-                ids.sort_unstable();
-                ids
-            }
-
             // Порядок ПОЛЕЙ (= порядок обхода write_into_batch / write_data_into_batch); БЕЗ сортировки.
             // col_indices для batch-спавна строится отсюда, иначе компонент пишется в чужую колонку (UB).
-            fn push_component_ids(
-                &self,
+            // Отсортированный ключ архетипа даёт дефолтный `component_ids` trait'а. Статический (по
+            // ТИПАМ полей) — не требует значения бандла (§10.10, убирает make_bundle-probe footgun).
+            fn static_component_ids(
                 registry: &mut ::apex_core::ComponentRegistry,
                 out: &mut ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]>,
             ) {
                 #(
-                    ::apex_core::Bundle::push_component_ids(&#field_accessors, registry, out);
+                    <#field_types as ::apex_core::Bundle>::static_component_ids(registry, out);
                 )*
             }
 

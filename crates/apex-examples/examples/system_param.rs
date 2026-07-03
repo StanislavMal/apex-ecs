@@ -46,9 +46,11 @@ struct CollisionEvent { a: Entity, b: Entity }
 // Helper: создаёт SystemContext для World (все архетипы)
 // ══════════════════════════════════════════════════════════════
 
-fn with_ctx<T>(world: &World, f: impl FnOnce(SystemContext<'_>) -> T) -> T {
+fn with_ctx<T>(world: &mut World, f: impl FnOnce(SystemContext<'_>) -> T) -> T {
     let all_indices: Vec<usize> = (0..world.archetype_count()).collect();
-    let sub = SubWorld::new(world, &all_indices);
+    // SAFETY: `&mut World` proves exclusivity — nothing else can access the
+    // world while the SubWorld (and the context built on it) is live.
+    let sub = unsafe { SubWorld::new(world, &all_indices) };
     let ctx = SystemContext::from_sub_world(&sub);
     f(ctx)
 }
@@ -64,7 +66,7 @@ fn test_resources() {
     world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
     world.insert_resource(FrameStats { frame: 0, entities: 0 });
 
-    with_ctx(&world, |ctx| {
+    with_ctx(&mut world, |ctx| {
         type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>);
         let (cfg, mut stats) = ctx.fetch::<P>();
 
@@ -103,7 +105,7 @@ fn test_events() {
     let b = world.spawn((Position { x: 1.0, y: 0.0 },));
 
     // Emit
-    with_ctx(&world, |ctx| {
+    with_ctx(&mut world, |ctx| {
         type P = Emit<CollisionEvent>;
         let mut writer = P::fetch(&ctx);
         writer.send(CollisionEvent { a, b });
@@ -117,7 +119,7 @@ fn test_events() {
     // Listen — нужно flush чтобы увидеть
     world.flush_all_events();
 
-    with_ctx(&world, |ctx| {
+    with_ctx(&mut world, |ctx| {
         type P = Listen<CollisionEvent>;
         let reader = P::fetch(&ctx);
         let events: Vec<_> = reader.iter().to_vec();
@@ -145,7 +147,7 @@ fn test_query_param() {
     world.spawn((Position { x: 5.0, y: 6.0 }, Velocity { x: 7.0, y: 8.0 }, Mass(20.0)));
     world.spawn((Position { x: 0.0, y: 0.0 }, Health { current: 100.0, max: 100.0 }));
 
-    with_ctx(&world, |ctx| {
+    with_ctx(&mut world, |ctx| {
         // Read<T> один
         {
             type P = QueryParam<Read<Position>>;
@@ -217,7 +219,7 @@ fn test_commands_and_empty() {
 
         let count_before = world.entity_count();
 
-        with_ctx(&world, |ctx| {
+        with_ctx(&mut world, |ctx| {
             type P = CommandsParam;
             let cmds = P::fetch(&ctx);
             // Просто проверяем что можем вызвать spawn
@@ -238,8 +240,8 @@ fn test_commands_and_empty() {
 
     // () — пустой набор
     {
-        let world = World::new();
-        with_ctx(&world, |ctx| {
+        let mut world = World::new();
+        with_ctx(&mut world, |ctx| {
             type P = ();
             ctx.fetch::<P>(); // () — фетч ничего не возвращает
 
@@ -266,7 +268,7 @@ fn test_tuples() {
     world.add_event::<CollisionEvent>();
     world.spawn((Position { x: 1.0, y: 2.0 }, Velocity { x: 3.0, y: 4.0 }));
 
-    with_ctx(&world, |ctx| {
+    with_ctx(&mut world, |ctx| {
         // Кортеж 2: ResRead + ResWrite
         {
             type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>);

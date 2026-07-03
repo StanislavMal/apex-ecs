@@ -253,7 +253,7 @@ mod tests {
         }
 
         let mut total = 0usize;
-        Query::<(Read<V>, Write<P>)>::new(&world).for_each_chunk(|entities, (v, p)| {
+        Query::<(Read<V>, Write<P>)>::new_mut(&mut world).for_each_chunk(|entities, (v, p)| {
             assert_eq!(entities.len(), v.len());
             assert_eq!(v.len(), p.len());
             for i in 0..p.len() {
@@ -283,7 +283,7 @@ mod tests {
 
         // Берём слайс на запись, но НИЧЕГО не пишем — по контракту dense-write
         // весь диапазон всё равно становится changed.
-        Query::<Write<P>>::new(&world).for_each_chunk(|_, _p| {});
+        Query::<Write<P>>::new_mut(&mut world).for_each_chunk(|_, _p| {});
 
         let changed = Query::<Changed<P>>::new_with_tick(&world, last_run)
             .iter()
@@ -311,7 +311,7 @@ mod tests {
         for i in 0..10_000 {
             world.spawn((P(i as f32), V(1.0)));
         }
-        Query::<(Read<V>, Write<P>)>::new(&world).par_for_each_chunk(|_, (v, p)| {
+        Query::<(Read<V>, Write<P>)>::new_mut(&mut world).par_for_each_chunk(|_, (v, p)| {
             for i in 0..p.len() {
                 p[i].0 += v[i].0;
             }

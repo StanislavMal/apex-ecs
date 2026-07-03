@@ -186,6 +186,14 @@ impl WorldSerializer {
             });
         }
 
+        // ── Resources (E7) ─────────────────────────────────────
+        // Only resources opted in via `register_resource_serde` (a world may
+        // hold non-serializable resources — GPU handles etc.).
+        for (type_name, data) in world.resources.snapshot_serde() {
+            snap.resources
+                .push(crate::snapshot::ResourceSnapshot { type_name, data });
+        }
+
         Ok(snap)
     }
 
@@ -286,6 +294,21 @@ impl WorldSerializer {
             }
         }
 
+        // ── Шаг 1.5: E6 — ремап Entity-ссылок внутри компонентов ───
+        // Карта old→new теперь ПОЛНА (все entity созданы, forward-ссылки тоже),
+        // поэтому обновляем Entity-поля компонентов (напр. `Target(Entity)`),
+        // зарегистрировавших `MapEntities`. Внешние (не из snapshot) ссылки
+        // остаются как есть.
+        {
+            let new_entities: Vec<apex_core::Entity> = entity_map.values().copied().collect();
+            let mut remap = |old: apex_core::Entity| -> apex_core::Entity {
+                entity_map.get(&old.index()).copied().unwrap_or(old)
+            };
+            for e in new_entities {
+                world.map_entity_refs(e, &mut remap);
+            }
+        }
+
         // ── Шаг 2: Relations ───────────────────────────────────
         for rel_snap in &snapshot.relations {
             let subject = match entity_map.get(&rel_snap.subject_index) {
@@ -316,6 +339,23 @@ impl WorldSerializer {
                     "restore: relation kind '{}' not registered, skipping",
                     rel_snap.kind_name
                 );
+            }
+        }
+
+        // ── Шаг 3: Resources (E7) ──────────────────────────────
+        for res in &snapshot.resources {
+            match world.resources.restore_serde(&res.type_name, &res.data) {
+                Ok(true) => {}
+                // §0.2a: a resource in the snapshot whose type is not registered
+                // for serde on this world is silently lost otherwise.
+                Ok(false) => log::warn!(
+                    "restore: resource '{}' not registered for serde — dropped",
+                    res.type_name
+                ),
+                Err(e) => log::warn!(
+                    "restore: resource '{}' failed to deserialize ({e}) — dropped",
+                    res.type_name
+                ),
             }
         }
 
@@ -1069,6 +1109,109 @@ mod tests {
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
         assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
         assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
+    }
+
+    /// F7: `#[derive(Component)]` and `#[derive(Bundle)]` work on GENERIC types
+    /// (impl uses split_for_impl; the linkme registrar is dropped for generics,
+    /// which register lazily on first use of a concrete substitution).
+    #[test]
+    fn f7_generic_derive_component_and_bundle() {
+        #[derive(Component, Clone, Copy, Debug, PartialEq)]
+        struct Wrapper<T: Send + Sync + 'static>(T);
+
+        #[derive(Component, Clone, Copy, Debug, PartialEq)]
+        struct Tag;
+
+        #[derive(Bundle)]
+        struct GenBundle<T: Send + Sync + 'static> {
+            w: Wrapper<T>,
+            t: Tag,
+        }
+
+        let mut world = World::new();
+        let e = world.spawn(GenBundle {
+            w: Wrapper(42u32),
+            t: Tag,
+        });
+        assert_eq!(world.get::<Wrapper<u32>>(e), Some(&Wrapper(42u32)));
+        assert!(world.get::<Tag>(e).is_some());
+
+        // A different substitution is a distinct component type.
+        let e2 = world.spawn((Wrapper(1.5f32),));
+        assert_eq!(world.get::<Wrapper<f32>>(e2), Some(&Wrapper(1.5f32)));
+        assert!(world.get::<Wrapper<u32>>(e2).is_none());
+    }
+
+    /// E7: a resource opted into serde survives snapshot/restore into a fresh
+    /// world; a non-registered resource is simply absent (no panic).
+    #[test]
+    fn e7_resource_survives_snapshot_restore() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Config {
+            level: u32,
+            name: String,
+        }
+
+        let mut world = World::new();
+        world.register_resource_serde::<Config>();
+        world.insert_resource(Config {
+            level: 7,
+            name: "prod".into(),
+        });
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+        assert_eq!(snap.resources.len(), 1, "resource included in snapshot");
+
+        let mut w2 = World::new();
+        w2.register_resource_serde::<Config>();
+        WorldSerializer::restore(&mut w2, &snap).unwrap();
+        assert_eq!(
+            w2.try_resource::<Config>(),
+            Some(&Config {
+                level: 7,
+                name: "prod".into()
+            })
+        );
+    }
+
+    /// E6: a component holding an `Entity` ref is remapped on restore — the ref
+    /// points at the NEW entity, not the stale snapshot id.
+    #[test]
+    fn e6_map_entities_remaps_entity_refs_on_restore() {
+        use apex_core::{Entity, MapEntities};
+
+        #[derive(Component, Clone, Copy, Serialize, Deserialize)]
+        struct Target(Entity);
+        impl MapEntities for Target {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component_serde_json::<Target>();
+        world.register_map_entities::<Target>();
+        let a = world.spawn(());
+        let b = world.spawn(());
+        world.insert(a, Target(b)); // a.target -> b
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Restore into a world whose fresh ids differ (decoys shift them).
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<Target>();
+        w2.register_map_entities::<Target>();
+        for _ in 0..3 {
+            w2.spawn(());
+        }
+        let map = WorldSerializer::restore(&mut w2, &snap).unwrap();
+
+        let a2 = map[&a.index()];
+        let b2 = map[&b.index()];
+        let target = w2.get::<Target>(a2).expect("Target restored");
+        assert_eq!(target.0, b2, "Entity ref must be remapped to the new b");
+        assert_ne!(
+            target.0, b,
+            "the stale snapshot id must not survive (decoys shifted ids)"
+        );
     }
 
     /// Relations diff (O(R) HashSet path): a removed and an added relation are

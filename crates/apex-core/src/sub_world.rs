@@ -41,8 +41,15 @@ impl<'w> SubWorld<'w> {
     /// Все входные ссылки привязаны к `'w`: сырые указатели внутри не могут
     /// пережить заимствованные данные (иначе можно было бы получить
     /// `SubWorld<'static>` из временных ссылок и разыменовать висячий указатель).
+    ///
+    /// # Safety
+    /// A `SubWorld` vends mutable views (`resource_mut`, `event_writer`, write
+    /// queries via `Query::from_sub_world`) out of the shared `&'w World`.
+    /// The caller must guarantee that, for the SubWorld's lifetime, no other
+    /// live access conflicts with the accesses performed through it (the
+    /// scheduler guarantees this by validating declared system accesses).
     #[inline]
-    pub fn new(world: &'w World, archetype_indices: &'w [usize]) -> Self {
+    pub unsafe fn new(world: &'w World, archetype_indices: &'w [usize]) -> Self {
         Self {
             world: world as *const World,
             archetype_indices: archetype_indices as *const [usize],
@@ -55,10 +62,13 @@ impl<'w> SubWorld<'w> {
     }
 
     /// Создать SubWorld с row-level range ограничениями. Все входные ссылки
-    /// привязаны к `'w` — конструктор безопасен (лайфтаймы гарантируют, что
-    /// сырые указатели не переживут данные).
+    /// привязаны к `'w` (лайфтаймы гарантируют, что сырые указатели не
+    /// переживут данные).
+    ///
+    /// # Safety
+    /// Same contract as [`new`](Self::new).
     #[inline]
-    pub fn with_ranges(
+    pub unsafe fn with_ranges(
         world: &'w World,
         archetype_indices: &'w [usize],
         row_ranges: &'w [(usize, usize, usize)],

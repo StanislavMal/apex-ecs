@@ -761,6 +761,7 @@ mod tests {
             align: std::mem::align_of::<f32>(),
             drop_fn: noop_drop,
             serde: None,
+            map_entities: None,
         }
     }
 
@@ -844,6 +845,7 @@ mod tests {
             align: std::mem::align_of::<u32>(),
             drop_fn: counting_panic_drop,
             serde: None,
+            map_entities: None,
         };
         let mut col = Column::new(&info);
         for v in [10u32, 20, 30] {
@@ -892,6 +894,7 @@ mod tests {
             align: 1,
             drop_fn: noop_drop,
             serde: None,
+            map_entities: None,
         };
         let mut col = Column::new(&info);
         // new_cap == 4 → item_size * 4 overflows usize → checked_mul panics.
@@ -998,6 +1001,7 @@ mod tests {
             align: 1,
             drop_fn: noop_drop,
             serde: None,
+            map_entities: None,
         };
         let mut col = Column::new(&info);
         unsafe {

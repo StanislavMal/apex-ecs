@@ -502,8 +502,16 @@ Query — основной способ итерации по компонент
 > чтение через `Write<T>` без мутации **не** помечает изменённым (стамп — только на `DerefMut`).
 >
 > **Bevy-синтаксис `&T`/`&mut T`** работает в прямых `Query::<…>::new(world)`:
-> `Query::<(&Velocity, &mut Position)>::new(&world)`. Внутри `system!` для запросов используйте
+> `Query::<(&Velocity, &mut Position)>::new_mut(&mut world)`. Внутри `system!` для запросов используйте
 > `Read<T>`/`Write<T>` (П2: `&T`-ресурсы в `system!` удалены — ресурсы пишутся `Res<T>`/`ResMut<T>`, как в plain-fn).
+
+> **Борроу-модель (В1в, как Bevy):** прямые конструкторы write-форм требуют
+> эксклюзивный заём — `Query::new_mut(&mut world)` / `new_mut_with_tick`;
+> `Query::new(&world)` доступен только read-only-формам (`ReadOnlyWorldQuery`).
+> Внутри систем ничего не меняется: `Query`-параметр и `ctx.query` выдаёт
+> планировщик, который уже проверил доступы систем на конфликты. Аналогично
+> `world.query::<Q>()` (read-only) / `world.query_mut::<Q>()` (любая форма) и
+> `QueryState::query` / `query_mut`.
 
 ### 4.1.1 Bevy-форма `Query<Data, Filter>`, for-итерация и `single()` (D2-2)
 
@@ -513,7 +521,7 @@ Query — основной способ итерации по компонент
 
 ```rust
 // Данные и фильтрация разнесены (1:1 перенос с Bevy):
-let q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_with_tick(&world, last_run);
+let q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_mut_with_tick(&mut world, last_run);
 for (hp, mut pos) in &q { /* … */ }              // item без entity — как в Bevy
 
 // Entity — явной формой запроса:
@@ -525,7 +533,7 @@ let hp = q.single()?;                            // NoEntities / MultipleEntitie
 
 // Random-access внутри запроса (П3): O(1), фильтры применяются:
 if let Some(hp) = q.get(boss_entity) { /* … */ }
-let mut q = Query::<&mut Hp>::new(&world);
+let mut q = Query::<&mut Hp>::new_mut(&mut world);
 q.get_mut(boss_entity).unwrap().0 -= 10;
 ```
 
@@ -550,7 +558,7 @@ Query::<Read<Position>>::new(&world)
     });
 
 // Запрос с Entity + мутацией (Write<Position> → Mut<Position> → `mut pos`):
-Query::<(Read<Velocity>, Write<Position>)>::new(&world)
+Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
     .for_each(|entity, (vel, mut pos)| {
         pos.x += vel.x * 0.016;   // DerefMut → стампит change-tick
         pos.y += vel.y * 0.016;
@@ -558,7 +566,7 @@ Query::<(Read<Velocity>, Write<Position>)>::new(&world)
     });
 
 // То же в Bevy-синтаксисе (&T / &mut T) — для прямых Query:
-Query::<(&Velocity, &mut Position)>::new(&world)
+Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
     .for_each(|_, (vel, mut pos)| { pos.x += vel.x * 0.016; });
 
 // Фильтрация по маркерному компоненту:
@@ -606,7 +614,7 @@ let count = Query::<Read<Health>>::new(&world)
 >     });
 > 
 > // MaybeWrite<T> — опциональная мутация:
-> Query::<(Read<Position>, MaybeWrite<Speed>)>::new(&world)
+> Query::<(Read<Position>, MaybeWrite<Speed>)>::new_mut(&mut world)
 >     .for_each(|_, (pos, speed)| {
 >         if let Some(mut speed) = speed {   // Option<Mut<Speed>>
 >             speed.0 *= 0.9;  // замедлить, если есть Speed
@@ -679,13 +687,13 @@ Query::<(Read<Position>, Or<(With<Player>, With<Npc>)>)>::new(&world)
 
 ```rust
 // |entities, (vel: &[Velocity], pos: &mut [Position])|
-Query::<(Read<Velocity>, Write<Position>)>::new(&world)
+Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
     .for_each_chunk(|_entities, (vel, pos)| {
         for (p, v) in pos.iter_mut().zip(vel) { p.x += v.x * 0.016; }
     });
 
 // Параллельно — те же диапазоны, что у par_for_each:
-world.query::<(Read<Velocity>, Write<Position>)>()
+world.query_mut::<(Read<Velocity>, Write<Position>)>()
     .par_for_each_chunk(|_, (vel, pos)| { /* ... */ });
 ```
 
@@ -747,18 +755,62 @@ Query::<(Added<PhysicsBody>, Read<PhysicsBody>)>::new_with_tick(&world, last_run
 
 ### 4.4 `QueryBuilder` (динамический запрос)
 
-Когда типы компонентов не известны статически — используйте `QueryBuilder`.
+Когда типы компонентов не известны статически (инспектор редактора, скриптинг,
+agent-IPC) — используйте `QueryBuilder`. Компоненты выбираются на этапе
+выполнения: типом (`read::<T>()`), по `ComponentId` (`read_id`) или по полному
+имени типа (`read_name` — то же разрешение, что `world.component_id_by_name`).
 
 ```rust
-// QueryBuilder — runtime запрос (типы не известны статически):
-let arch_ids = world.query_builder()
-    .read::<Position>()
-    .write::<Velocity>()
-    .exclude::<Enemy>()
-    .matching_archetype_ids();
+// Собрать запрос и пройтись по результатам без знания типов на этапе компиляции:
+let hp_id = world.component_id_by_name("my_game::Hp").unwrap();
+let q = world.query_builder()
+    .read_id(hp_id)                     // доступ на чтение по runtime-id
+    .with_name("my_game::Boss")         // фильтр наличия по имени
+    .exclude::<Dead>()                  // фильтр отсутствия типом
+    .build()?;                          // Err: неизвестное имя / write-термы
 
-println!("Подходящих архетипов: {}", arch_ids.len());
+for item in &q {
+    // DynItem { entity, archetype, row } + untyped/typed доступ:
+    let entity = item.entity();
+    let hp: &Hp = item.get::<Hp>(hp_id).unwrap();      // typed (тип сверяется с реестром)
+    let ptr: *const u8 = item.get_ptr(hp_id).unwrap(); // untyped (для биндингов)
+}
+
+// Точечный lookup (инспектор): None если entity мертва или не матчится.
+if let Some(item) = q.get(entity) { /* ... */ }
 ```
+
+Правила громкости (§0.2a): неизвестное имя — `DynQueryError::UnknownComponent`
+при `build()`; НЕзарегистрированный *типовой* терм — запрос честно не матчит
+ничего (никто не может иметь незарегистрированный компонент); несоответствие
+`T` и `id` в `item.get::<T>(id)` — throttled-warn + `None`.
+
+**Динамическая ЗАПИСЬ** — через `query_builder_mut()` (эксклюзивный заём мира
+⇒ выдаваемые `&mut T` заведомо не алиасят, B1(в)):
+
+```rust
+let mut q = world.query_builder_mut()
+    .read_id(hp_id)          // чтение по id
+    .write_id(mana_id)       // мутация по id (write_name / write::<T> — тоже)
+    .with::<Boss>()
+    .build()?;               // Err: неизвестное имя / компонент записан дважды
+
+q.for_each_mut(|mut item| {
+    let hp = item.get::<Hp>(hp_id).unwrap().0;          // read
+    item.get_mut::<Mana>(mana_id).unwrap().0 *= hp;     // &mut T — помечает Changed
+    // item.get_mut_ptr(id) — untyped *mut для биндингов
+});
+
+// Точечная мутация (инспектор редактора):
+if let Some(mut item) = q.get_mut(entity) { /* item.get_mut::<T>(id) */ }
+```
+
+`DynItemMut` выдаёт мутабельный доступ по одному за раз (аксессоры берут
+`&mut self`), запись помечает компонент `Changed`, повтор write-id ловится как
+`DynQueryError::AliasedWrite` (аналог C2). Read-`build()` по-прежнему отвергает
+write-термы (`WriteNotSupported`, указывает на `query_builder_mut`).
+`matching_archetype_ids()` (индексы подходящих архетипов) работает у обоих
+билдеров — для низкоуровневых консумеров.
 
 ---
 

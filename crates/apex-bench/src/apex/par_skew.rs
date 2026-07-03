@@ -86,9 +86,9 @@ impl ParSkew {
     /// Run `par_for_each` (adaptive-split since wave 5). Perf-guard for the
     /// split path — the wave-5 A/B that justified split (fixed vs split, ~7%
     /// uniform / ~2-3% skew) is archived in the plan; this monitors regressions.
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         self.world
-            .query::<(Read<Matrix4<f32>>, Write<Position>)>()
+            .query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
             .par_for_each(|_, (mat, mut pos)| Self::heavy(mat, &mut pos));
     }
 }

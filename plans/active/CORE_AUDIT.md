@@ -7,7 +7,11 @@
 > (критерий — золотой путь, см. §10). **Волны 0-4 ✅ СМЕРЖЕНЫ и ЗАПУШЕНЫ**. **Волна 5 ✅ ГОТОВА**
 > (перф + ложные Changed): A13 (get_mut→Mut) + split par_for_each (§7, +7%) + O(R²)→O(R) diff;
 > пулинг/ленивая-entity/bulk обоснованно отклонены, string-table отложена. Ветка `core-audit-wave5`.
-> **Волна 6 🔜** (архитектура: В1(в) borrow-модель + В3 query-консолидация; самый тяжёлый заход).
+> **Волна 6 ✅** (архитектура): make_bundle/D8a/E6/E7/F7 + QueryBuilder dynamic query (read+write) +
+> **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery + `&mut World`/`new_mut` write-
+> конструкторы — soundness в типах). Ветка `core-audit-wave6`, готова к мержу.
+> **Волна 6б 🔜** (scheduler/SystemParam overhaul): В3 per-system QueryState (⚠ ROI-гейт) + F3-target
+> (ctx-ужатие) + D8b (per-system commands). Переоценка §0.2b — см. «Журнал волн».
 
 ## Журнал волн (ход исполнения)
 
@@ -259,6 +263,107 @@ main):**
   (🟢×2.3) · wide_iter 3.81/3.74/2.23 (паритет bevy) · commands_insert 514/**501** (🟡−3%). Волна 5
   НОВЫХ регрессий не внесла; split улучшил heavy_compute. Отставания — structural (fragmented/
   relations) либо −3% шум (simple_insert/commands_insert).
+
+**Волна 6 🔄 — АРХИТЕКТУРА/API (ветка `core-audit-wave6` от main; порядок: самостоятельные
+менее-рискованные пункты СНАЧАЛА, В1(в)+В3 borrow-migration — осторожнее всего, ломает API движка):**
+- **make_bundle → `Bundle::static_component_ids` (§10.10) ✅** — состав бандла берётся СТАТИЧЕСКИ
+  (по типу, associated fn), а не через `make_bundle(0)`-probe. `spawn_many` зовёт замыкание РОВНО
+  `count` раз (footgun «замыкание должно быть чистым» убран). Trait: `static_component_ids`
+  (required, decl order) + `component_ids` (default, sorted — ключ архетипа) + `push_component_ids`
+  (default, decl order). Мигрированы single/tuple/()/derive/ручные impl. Регресс-тест
+  `spawn_many_calls_make_bundle_exactly_count_times`. Гейт: workspace зелёный (219 apex-core),
+  clippy чист, движок собирается, goldens 656/656 байт-идентично.
+- **D8a детерминизм порядка Custom-стадий ✅** — несколько `Custom(_)` делят priority 7, порядок шёл
+  от FxHashMap-итерации (нестабилен, иной на wasm32). Сортировка label'ов (StageLabel: Ord, Custom
+  по имени) в двух местах compile → воспроизводимый порядок стадий. Регресс-тест
+  `custom_stages_ordered_by_name_deterministically`. **D8b** (детерминизм Entity id через per-system
+  command-буферы) ОТЛОЖЕН в В1(в)/F4 (та же thread_commands→per-system переработка + Commands сейчас
+  !Send).
+- **E6 MapEntities ✅** (§0.9 дифференциатор) — snapshot компонента с `Entity`-ссылкой (напр.
+  `Target(Entity)`) на restore ремапит её на НОВЫЙ id (иначе ссылка в пустоту). Механизм: трейт
+  `MapEntities` + `MapEntitiesFn` в `ComponentInfo` (регистрируется `register_map_entities::<T>()`);
+  `World::map_entity_refs` (raw-путь) + ВТОРОЙ проход restore после полной карты old→new (forward-
+  ссылки тоже). `Entity` теперь `Serialize`/`Deserialize`. Регресс-тесты: e6 в serialization
+  (end-to-end restore-ремап) + apex-core (raw map_entity_refs), целевой Miri TB 0 UB. Гейт: workspace
+  зелёный, clippy чист, движок собирается, goldens 656/656 байт-идентично.
+- **E7 ресурсы в snapshot ✅** (opt-in, формат v2) — snapshot теперь включает глобальные ресурсы
+  (§0.9 дифференциатор). `Resources` хранит serde-реестр; `World::register_resource_serde::<R>()`
+  включает тип (bincode; мир может держать не-сериализуемые ресурсы — GPU-хэндлы). `snapshot_serde`/
+  `restore_serde` (громкий warn на unknown/fail). `WorldSnapshot.resources` (`serde(default)` — JSON
+  v1 читается пустым); CURRENT_VERSION 1→2 + v1→v2 no-op migration; `SnapshotVersion::CURRENT`=2.
+  Регресс `e7_resource_survives_snapshot_restore`. Гейт: workspace зелёный (41 serde), clippy чист,
+  движок собирается, goldens 656/656.
+- **F7 generics в derive ✅** — `#[derive(Component)]`/`#[derive(Bundle)]` через `split_for_impl`
+  работают на обобщённых типах (`Wrapper<T>`, `GenBundle<T>`); linkme-registrar только для non-generic
+  (обобщённые регистрируются лениво). Scriptable-generics опущен (Lua-типы конкретные — нет спроса;
+  tuple/enum закрыты волной 2). Регресс `f7_generic_derive_component_and_bundle`. Гейт: workspace,
+  clippy, движок, goldens 656/656.
+- **QueryBuilder → dynamic query (§10.4) ✅** — READ-путь целиком, safe поверх shared `&World`
+  (консумеры: инспектор редактора, скриптинг, agent-IPC). Билдер: `read/with/exclude` типом,
+  `*_id` по ComponentId, `*_name` по полному имени типа; `build()` → `DynQuery` с итерацией
+  `DynItem{entity, archetype, row}` (`get_ptr(id)` untyped + `get::<T>(id)` typed с runtime-сверкой
+  TypeId по реестру) и точечным `get(entity)` (liveness + фильтр архетипа). Громкость §0.2a:
+  неизвестное имя = `DynQueryError::UnknownComponent` на build; write-термы =
+  `WriteNotSupported` (динамический WRITE — только с эксклюзивностью В1(в)); mismatch T↔id =
+  throttled warn + None. Багфикс: незарегистрированный типовой терм раньше МОЛЧА выпадал из
+  фильтра (запрос матчил больше запрошенного) — теперь `ComponentId::INVALID`-сентинел (конвенция
+  typed-пути): read/with матчат ничего, exclude вакуумно истинен. Экспорт DynQuery/DynItem/DynIter/
+  DynQueryError (+prelude); руководство §4.4 переписано. Регресс: 9 тестов `dyn_query_tests`
+  (имя/id/тип, unknown-имя громко, unregistered-регрессия, фильтры, point-get, write-отказ,
+  type-mismatch, ZST, мульти-архетип). Гейт: workspace зелёный, clippy net-neutral, движок
+  собирается, целевой Miri TB dyn_query 9/9 0 UB, goldens 656/656 байт-идентично.
+- **В1(в) borrow-модель ✅** (soundness — целевая Bevy-модель, §10.1) — безопасность выражена в
+  типах, не в дисциплине планировщика. `UnsafeWorldCell<'w>` = единственный явный эскейп
+  (Copy-токен над `*mut World`; readonly-ячейка в debug отказывается выдавать `&mut World`);
+  `World::as_unsafe_world_cell`/`_readonly`. Новый `unsafe trait ReadOnlyWorldQuery` (маркер форм
+  без мутабельного доступа: Read/&T/Entity/With/Without/Maybe/Changed/Added/()/кортежи/Or из
+  read-only; Write/&mut/MaybeWrite его НЕ реализуют). `Query::new`/`new_with_tick` теперь требуют
+  `ReadOnlyWorldQuery` для data+filter; write-формы — `Query::new_mut(&mut World)` (эксклюзив
+  доказывает отсутствие алиаса) либо `unsafe new_unchecked(UnsafeWorldCell)` (эскейп планировщика).
+  `Query::from_sub_world` теперь unsafe. То же для остальных путей: `World::query`/`query_changed`
+  (read-only) + `query_mut`/`query_mut_changed`; `CachedQuery::new` (read-only) + `new_mut`/
+  `unsafe new_unchecked`/`unsafe from_sub_world`; `QueryState::query`/`query_with_tick` (read-only)
+  + `query_mut`/`query_mut_with_tick`/`unsafe query_unchecked_with_tick`. `SubWorld::new`/`with_ranges`
+  и `SystemContext::with_commands` теперь unsafe (контракт эксклюзивности там, где он живёт). C2
+  (само-алиас `(&mut T,&mut T)`) вынесен в общий `assert_no_self_alias` и теперь гейтит И CachedQuery/
+  SubWorld-путь (раньше только `Query`; `ctx.query` его обходил). `Extract<QueryParam<Q>>` требует
+  read-only (extract не пишет в main-мир — контракт в типах). Мигрированы все call-sites (ядро+движок).
+  Гейт: workspace зелёный, clippy net-neutral, движок собирается, целевой Miri TB (cell+write+alias+
+  dense) 0 UB, goldens 656/656 байт-идентично.
+- **QueryBuilder-write (динамический §10.4) ✅** — разблокирован B1(в). `World::query_builder_mut`
+  (`&mut World`) → `QueryBuilderMut` (термы `read/write/with/exclude` типом/`_id`/`_name`) →
+  `DynQueryMut` с `for_each_mut(|item|)` (lending — по одному item, `&mut T` не алиасят) и точечным
+  `get_mut(entity)`. `DynItemMut`: read (`get`/`get_ptr`) + write (`get_mut::<T>(id)`/`get_mut_ptr`,
+  берут `&mut self` ⇒ один `&mut` за раз; запись помечает `Changed`). Громкость: unknown-имя =
+  `UnknownComponent`, повтор write-id = `AliasedWrite` (аналог C2); read-`build()` по-прежнему
+  отвергает write-термы (`WriteNotSupported` → указывает на `query_builder_mut`). Общий `DynTerms`
+  для read/write билдеров (без дублирования). Экспорт DynQueryMut/DynItemMut/QueryBuilderMut
+  (+prelude); руководство §4.4 дополнено. Регресс: +7 тестов (typed/untyped for_each_mut, Changed-
+  стамп, aliased/unknown громко, read-build-отказ, point-get+фильтр, mixed read+write). Гейт:
+  workspace, clippy net-neutral, движок собирается, Miri TB dyn_query 16/16 0 UB, goldens 656/656.
+- **⚠ ПЕРЕОЦЕНКА (§0.2b): В3+F3+D8b выделены в «Волну 6б — scheduler/SystemParam overhaul»**
+  (2026-07-03). Обоснование: флагманский soundness-🔴 (мутабельный алиас из safe-кода) ЗАКРЫТ
+  B1(в) — безопасность выражена в типах. Оставшиеся три — качественно иная работа (переработка
+  ядра планировщика + трейта `SystemParam`), НЕ хвост borrow-migration, и полу-приземлять её
+  нельзя (§0.2b):
+  - **В3** (единый `Query<'w,'s>` поверх per-system QueryState) — требует `State`/`init_state`/
+    `get_param` на ВСЕХ 19 impl'ах `SystemParam` + threading состояния кортежей (макро) +
+    per-system хранилище (в замыкании `fn_sys` либо в слоте планировщика). ⚠ ROI СОМНИТЕЛЕН:
+    arch-индексы УЖЕ предвычислены планировщиком per-system и заимствуются zero-alloc через
+    SubWorld — «пересборка state каждый вызов» на деле = только `fill_ids` (~8 lookup'ов) +
+    `assert_no_self_alias` (~8). Это класс arch_cols (реализовано→замерено→отклонено,
+    [[apex-ecs-benchmark-standing]]): делать ТОЛЬКО с A/B-замером, доказывающим выигрыш, иначе
+    не трогать. Оценить по факту, не по «главный горячий выигрыш» на веру.
+  - **F3-target** (убрать resource_mut/event_writer/произвольный-Q query из публичного
+    SystemContext) — 23 движковых `ctx.*`-сайта + внутренние; «правильная» форма = миграция
+    AutoSystem'ов на декларированные SystemParam ИЛИ debug-валидация запрошенного access против
+    декларированного (более слабая, но громкая — §0.2a). F3-минимум (Ctx⇒NEEDS_WHOLE_WORLD)
+    уже сделан (волна 2).
+  - **D8b** (per-system command-буферы, детерминизм Entity id) — замена 16 связок
+    `thread_commands`/`current_thread_index` на per-system буферы + apply в порядке систем;
+    Commands сейчас per-thread, apply per-stage.
+  **Волна 6 (borrow-модель + dynamic query) готова к мержу; 6б — отдельным заходом (свой промпт
+  в памяти).** При закрытии 6б — правило ротации + мерж --no-ff в main обоих репо.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
@@ -802,17 +907,23 @@ allow(missing_safety_doc) → точечные SAFETY-доки.
 *Гейт: criterion 3-way — нет регресса ни в одной группе >5% (шум), целевые группы улучшены
 воспроизводимо; frag_world; many_foxes движка A/B; goldens.*
 
-**Волна 6 — АРХИТЕКТУРА/API (P3; все развилки решены — §10).**
-**В1(в)+В3 одним migration-проходом** (UnsafeWorldCell + `&mut World`-конструкторы write-путей
-+ единый `Query<'w,'s>` поверх per-system QueryState) · В4 дифференциаторы: snapshot
-(E6 MapEntities + E7 ресурсы/версии) И IsolatedWorld (ремаппинг, bounded-каналы,
-кросс-поточные тесты) · QueryBuilder → полноценный dynamic query (консумеры: инспектор
-редактора, скриптинг, agent-IPC) · D8 детерминизм (per-system command-буферы + сортировка
-Custom-стадий) · F7 generics в derive · make_bundle → честный `Bundle::static_component_ids` ·
-D6-полное (per-system last_run — оценить по факту после D6-минимума) · SystemContext ужатие
-(F3 целевое).
-*Гейт: migration-проход движка одним заходом, adoption-стиль; полный сьют оба репо; goldens;
-руководство ядра актуализировано.*
+**Волна 6 ✅ — АРХИТЕКТУРА/API (P3; все развилки решены — §10).** СДЕЛАНО:
+make_bundle→`Bundle::static_component_ids` · D8a детерминизм Custom-стадий · E6 MapEntities +
+E7 ресурсы/версии (snapshot-дифференциатор) · F7 generics в derive · **QueryBuilder → dynamic
+query (read+write)** · **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery +
+`&mut World`/`new_mut`/`unsafe new_unchecked` write-конструкторы — soundness в типах, §10.1
+целиком). Ветка `core-audit-wave6`. *Гейт каждого пункта пройден: workspace+clippy net-neutral+
+целевой Miri TB 0 UB+goldens 656/656.* ОСТАЛОСЬ (В4 IsolatedWorld-дифференциатор) — не входило в
+исходный wave-6 scope этой сессии.
+
+**Волна 6б 🔜 — SCHEDULER/SYSTEMPARAM OVERHAUL (P3; переоценка §0.2b — см. «Журнал волн»).**
+В3 единый `Query<'w,'s>` поверх per-system QueryState (⚠ ROI-гейт: A/B перед внедрением —
+класс arch_cols; arch-индексы уже кэшируются, выигрыш = только fill_ids) · F3-target SystemContext
+ужатие (убрать resource_mut/event_writer/произвольный-Q из публичного ctx — миграция AutoSystem'ов
+или debug-валидация access) · D8b per-system command-буферы (детерминизм Entity id) · D6-полное
+(per-system last_run).
+*Гейт: A/B-замер для В3 ОБЯЗАТЕЛЕН до внедрения; migration adoption-стиль; полный сьют оба репо;
+goldens; руководство актуализировано.*
 
 **Волна 7 — EN-МИГРАЦИЯ + ТЕСТ-КАМПАНИЯ + ДОКИ (P3/P4).**
 Кириллица ≈6.3k строк: (1) user-facing литералы (compile_error!/panic/expect/log) — сразу;

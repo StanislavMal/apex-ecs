@@ -1752,7 +1752,14 @@ impl Scheduler {
                     }
                 }
             }
-            for (label, ids) in level_by_label {
+            // D8: determinism — several `Custom(_)` labels share priority 7, so
+            // their relative order would come from the FxHashMap iteration
+            // (unstable, and different on wasm32). Sort labels (StageLabel: Ord,
+            // Custom ordered by name) so stage order is reproducible run-to-run.
+            let mut labeled: Vec<(StageLabel, Vec<SystemId>)> =
+                level_by_label.into_iter().collect();
+            labeled.sort_by(|a, b| a.0.cmp(&b.0));
+            for (label, ids) in labeled {
                 let prio = label.priority();
                 // Разбиваем на под-Stage'и по маркерам apply_deferred_after
                 let sub_groups = split_at_apply_boundaries(&ids, &self.systems, &self.explicit_orderings);
@@ -1791,8 +1798,10 @@ impl Scheduler {
                     stages.append(&mut s_stages);
                 }
             }
-            // Стадии не указанные в порядке — добавляем в конец
+            // Стадии не указанные в порядке — добавляем в конец, детерминированно
+            // (D8: по label, иначе FxHashMap-порядок непредсказуем).
             let mut remaining: Vec<Stage> = stage_map.into_values().flatten().collect();
+            remaining.sort_by(|a, b| a.label.cmp(&b.label));
             stages.append(&mut remaining);
         } else {
             // Стандартный порядок по priority (Startup → First → ... → Last → Custom)
@@ -2412,10 +2421,16 @@ impl Scheduler {
                         match &mut system.kind {
                             SystemKind::Sequential(f) => f(w),
                             SystemKind::Parallel { system, .. } => {
-                                system.run(SystemContext::with_commands(
-                                    std::slice::from_ref(&sub_world),
-                                    cmds_ptr,
-                                ));
+                                // SAFETY: `cmds_ptr` points at `thread_commands`
+                                // (one slot per rayon worker), alive until the
+                                // end of the run.
+                                let ctx = unsafe {
+                                    SystemContext::with_commands(
+                                        std::slice::from_ref(&sub_world),
+                                        cmds_ptr,
+                                    )
+                                };
+                                system.run(ctx);
                             }
                         }
                         if let Some(t) = prof_t {
@@ -2576,11 +2591,13 @@ impl Scheduler {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
                         let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
                         // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
-                        // указывает на thread_commands, который жив до конца run_hybrid_parallel.
-                        sys.run(SystemContext::with_commands(
-                            &[sw],
-                            cmds_ptr as *mut Vec<Commands>,
-                        ));
+                        // указывает на thread_commands (по слоту на rayon-поток),
+                        // который жив до конца run_hybrid_parallel.
+                        let sws = [sw];
+                        let ctx = unsafe {
+                            SystemContext::with_commands(&sws, cmds_ptr as *mut Vec<Commands>)
+                        };
+                        sys.run(ctx);
                     }
                 }
             }
@@ -2860,10 +2877,16 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::with_commands(
-                                        std::slice::from_ref(&sub_world),
-                                        cmds_ptr as *mut Vec<Commands>,
-                                    ));
+                                    // SAFETY: `cmds_ptr` points at `thread_commands`
+                                    // (one slot per rayon worker), alive until the
+                                    // end of the run.
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_ptr as *mut Vec<Commands>,
+                                        )
+                                    };
+                                    system.run(ctx);
                                 }
                             }
                             if let Some(t) = prof_t {
@@ -2931,10 +2954,16 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::with_commands(
-                                        std::slice::from_ref(&sub_world),
-                                        cmds_ptr as *mut Vec<Commands>,
-                                    ));
+                                    // SAFETY: `cmds_ptr` points at `thread_commands`
+                                    // (one slot per rayon worker), alive until the
+                                    // end of the run.
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_ptr as *mut Vec<Commands>,
+                                        )
+                                    };
+                                    system.run(ctx);
                                 }
                             }
                             if let Some(t) = prof_t {
@@ -4365,6 +4394,35 @@ mod tests {
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
             "Update должен быть перед PreUpdate при configure_stages"
+        );
+    }
+
+    /// D8: multiple Custom stages (all priority 7) are ordered by NAME, not by
+    /// FxHashMap iteration — reproducible run-to-run and across platforms.
+    #[test]
+    fn custom_stages_ordered_by_name_deterministically() {
+        let mut sched = Scheduler::new();
+        sched.add_system_to_stage("z", |_| {}, StageLabel::Custom("zebra".to_string()));
+        sched.add_system_to_stage("a", |_| {}, StageLabel::Custom("alpha".to_string()));
+        sched.add_system_to_stage("m", |_| {}, StageLabel::Custom("mango".to_string()));
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        let custom: Vec<String> = stages
+            .iter()
+            .filter_map(|s| match &s.label {
+                StageLabel::Custom(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            custom,
+            vec![
+                "alpha".to_string(),
+                "mango".to_string(),
+                "zebra".to_string()
+            ],
+            "Custom stages must be ordered by name"
         );
     }
 

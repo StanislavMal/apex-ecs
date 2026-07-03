@@ -28,13 +28,13 @@ impl HeavyCompute {
         Self { world }
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         // Матрица читается (Read), а не пишется обратно: иначе результат вырождается за ~1M
         // инверсий (random-walk FP-дрейф → NaN/денормалы → cgmath None / на x86 денормальная
         // арифметика ~100× медленнее → недетерминированный death-spiral). Чтение healthy-seed
         // каждую итерацию делает бенч детерминированным и честным для всех движков; нагрузка
         // (100 инверсий на сущность + запись позиции) сохранена. unwrap_or — страховка.
-        self.world.query::<(Read<Matrix4<f32>>, Write<Position>)>()
+        self.world.query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
             .par_for_each(|_, (mat, mut pos)| {
                 let mut m = *mat;
                 for _ in 0..100 {

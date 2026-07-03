@@ -6,6 +6,7 @@ use crate::{
     entity::Entity,
     sub_world::SubWorld,
     system_param::WorldQuerySystemAccess,
+    unsafe_world_cell::UnsafeWorldCell,
     world::World,
 };
 
@@ -348,6 +349,33 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
 
 /// Алиас `Read<T>` — для совместимости стиля (`Ref<T>` ≡ `Read<T>`).
 pub type Ref<T> = Read<T>;
+
+// ── ReadOnlyWorldQuery ─────────────────────────────────────────
+
+/// Marker for query shapes that can never hand out mutable component access.
+///
+/// This is the type-level knob of the borrow model: `Query::new(&World)` (and
+/// every other shared-`&World` constructor) is only available for shapes that
+/// are read-only end to end, so safe code cannot obtain two aliasing `&mut T`
+/// through shared world borrows. Write shapes construct from `&mut World`
+/// ([`Query::new_mut`]) or through the scheduler's validated unsafe escape.
+///
+/// # Safety
+/// Implement only for shapes whose `Item` (and the items of every nested
+/// element) provides no mutable access to component data. `Write<T>`,
+/// `&mut T` and `MaybeWrite<T>` must NOT implement this.
+pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
+
+// SAFETY: items are shared references / entity ids / filter unit types.
+unsafe impl<T: Component> ReadOnlyWorldQuery for Read<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
+unsafe impl ReadOnlyWorldQuery for Entity {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for With<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Without<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Maybe<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Added<T> {}
+unsafe impl ReadOnlyWorldQuery for () {}
 
 /// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
 /// выдаёт `&T`.
@@ -1054,6 +1082,11 @@ macro_rules! impl_or_query {
                     $( .merge(&$F::system_access()) )+
             }
         }
+
+        // SAFETY: `Or` yields `()`; it is read-only iff every branch is
+        // read-only (branch states are still fetched, so a write branch
+        // would create transient mutable state).
+        unsafe impl< $($F: ReadOnlyWorldQuery),+ > ReadOnlyWorldQuery for Or<( $($F,)+ )> {}
     };
 }
 
@@ -1163,6 +1196,9 @@ macro_rules! impl_world_query_tuple {
                     $( .merge(&$Q::system_access()) )+
             }
         }
+
+        // SAFETY: a tuple is read-only iff every element is read-only.
+        unsafe impl< $($Q: ReadOnlyWorldQuery),+ > ReadOnlyWorldQuery for ( $($Q,)+ ) {}
     };
 }
 
@@ -1262,6 +1298,44 @@ pub(crate) struct ArchState<S> {
 /// фильтрация разнесены, item фильтра не попадает в выдачу. По умолчанию
 /// `F = ()` — единый кортеж остаётся как вторая форма
 /// (`Query<(Read<A>, With<C>)>` эквивалентен).
+/// C2: reject a query shape that borrows the same component's data mutably
+/// more than once (`(&mut T, &mut T)`) or both mutably and immutably
+/// (`(&T, &mut T)`, `(Read<T>, Write<T>)`). Such a shape would hand out
+/// aliasing references to one row on every iteration — undefined behavior
+/// reachable from entirely safe code. Mirrors Bevy, which panics on the same
+/// shapes. Runs once at construction over the (typically ≤ 8) declared
+/// accesses, so the cost is negligible. Shared by every query construction
+/// path (`Query`, `CachedQuery`).
+pub(crate) fn assert_no_self_alias<S: WorldQuery>(world: &World) {
+    let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
+    S::fill_data_access(world, &mut access);
+    for i in 0..access.len() {
+        let (id_i, excl_i) = access[i];
+        // Unregistered components collapse to INVALID and match no archetype,
+        // so a duplicate INVALID can never actually alias — skip it.
+        if id_i == ComponentId::INVALID {
+            continue;
+        }
+        for &(id_j, excl_j) in &access[i + 1..] {
+            if id_j == id_i && (excl_i || excl_j) {
+                let name = world
+                    .registry
+                    .get_info(id_i)
+                    .map(|info| info.name)
+                    .unwrap_or("<component>");
+                panic!(
+                    "Query aliases component `{name}`: it is accessed mutably more than \
+                     once (or both mutably and immutably) within a single query \
+                     (e.g. `Query<(&mut {name}, &mut {name})>` or `(Read, Write)` of the \
+                     same component). This would create aliasing references to one row. \
+                     Access each component at most once per query, or split into separate \
+                     queries."
+                );
+            }
+        }
+    }
+}
+
 pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
     world: &'w World,
     /// Inline до 8 архетипов (D2-1): типичный системный запрос матчит 1-5
@@ -1279,52 +1353,78 @@ pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
 }
 
 impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
-    pub fn new(world: &'w World) -> Self {
-        Self::new_with_tick(world, Tick::ZERO)
+    /// Read-only query over a shared world borrow.
+    ///
+    /// Write shapes (`Write<T>`, `&mut T`, `MaybeWrite<T>`) do not satisfy
+    /// [`ReadOnlyWorldQuery`]: construct those with [`Query::new_mut`]
+    /// (exclusive borrow proves no aliasing), or receive the query from the
+    /// scheduler as a system parameter — cross-system exclusivity is
+    /// validated there from declared accesses.
+    pub fn new(world: &'w World) -> Self
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        Self::build(world, Tick::ZERO)
     }
 
-    /// C2: reject a query shape that borrows the same component's data mutably
-    /// more than once (`Query<(&mut T, &mut T)>`) or both mutably and immutably
-    /// (`Query<(&T, &mut T)>`, `Query<Read<T>, Write<T>>`). Such a shape would
-    /// hand out aliasing references to one row on every iteration — undefined
-    /// behavior reachable from entirely safe code. Mirrors Bevy, which panics on
-    /// the same shapes. Runs once at construction over the (typically ≤ 8)
-    /// declared accesses, so the cost is negligible.
+    /// Read-only query with an explicit change-detection base tick.
+    pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape query (including writes) over an exclusive world borrow.
+    /// The `&mut World` receiver proves no other world view is live, so the
+    /// yielded `Mut<T>` items cannot alias anything.
+    pub fn new_mut(world: &'w mut World) -> Self {
+        Self::build(world, Tick::ZERO)
+    }
+
+    /// [`Query::new_mut`] with an explicit change-detection base tick.
+    pub fn new_mut_with_tick(world: &'w mut World, last_run: Tick) -> Self {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape query through the unsafe world escape.
+    ///
+    /// # Safety
+    /// For the lifetime of the query the declared component access must not
+    /// alias any other live access to the same world: components this shape
+    /// writes are accessed by no other view, components it reads — by no
+    /// mutable view. The scheduler upholds this for systems by validating
+    /// the declared accesses of everything that runs concurrently.
+    pub unsafe fn new_unchecked(world: UnsafeWorldCell<'w>) -> Self {
+        Self::build(world.world(), Tick::ZERO)
+    }
+
+    /// [`Query::new_unchecked`] with an explicit change-detection base tick.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`].
+    pub unsafe fn new_unchecked_with_tick(world: UnsafeWorldCell<'w>, last_run: Tick) -> Self {
+        Self::build(world.world(), last_run)
+    }
+
+    /// C2: см. [`assert_no_self_alias`] — проверяется форма `(Q, F)` целиком.
     fn assert_no_self_alias(world: &World) {
-        let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
-        <(Q, F)>::fill_data_access(world, &mut access);
-        for i in 0..access.len() {
-            let (id_i, excl_i) = access[i];
-            // Unregistered components collapse to INVALID and match no archetype,
-            // so a duplicate INVALID can never actually alias — skip it.
-            if id_i == ComponentId::INVALID {
-                continue;
-            }
-            for &(id_j, excl_j) in &access[i + 1..] {
-                if id_j == id_i && (excl_i || excl_j) {
-                    let name = world
-                        .registry
-                        .get_info(id_i)
-                        .map(|info| info.name)
-                        .unwrap_or("<component>");
-                    panic!(
-                        "Query aliases component `{name}`: it is accessed mutably more than \
-                         once (or both mutably and immutably) within a single query \
-                         (e.g. `Query<(&mut {name}, &mut {name})>` or `(Read, Write)` of the \
-                         same component). This would create aliasing references to one row. \
-                         Access each component at most once per query, or split into separate \
-                         queries."
-                    );
-                }
-            }
-        }
+        assert_no_self_alias::<(Q, F)>(world);
     }
 
     /// Создать Query с ограничением на архетипы и строки из SubWorld.
     ///
     /// Использует `sub.archetype_indices` для фильтрации архетипов
     /// и `sub.row_ranges` для ограничения строк (row-level splits).
-    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+    ///
+    /// # Safety
+    /// The `SubWorld` must have been vended by the scheduler for a system
+    /// whose declared access covers this query's shape, and no access that
+    /// conflicts with it may run concurrently (the scheduler validates this
+    /// from declared accesses; row ranges keep same-system splits disjoint).
+    pub unsafe fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
         let mut q = Self::new_within_archetypes(sub.world(), sub.archetype_indices(), last_run);
         q.row_ranges = sub.row_ranges();
         q
@@ -1379,7 +1479,10 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         }
     }
 
-    pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
+    /// Shared construction path. Callers prove access exclusivity for write
+    /// shapes (see the public constructors above); the shared `&'w World`
+    /// here is a view for metadata and column pointers only.
+    fn build(world: &'w World, last_run: Tick) -> Self {
         Self::assert_no_self_alias(world);
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(world, &mut ids);
@@ -1905,48 +2008,98 @@ impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, Q,
 }
 
 
-// ── QueryBuilder ───────────────────────────────────────────────
+// ── Dynamic query (QueryBuilder / DynQuery / DynItem) ──────────
+//
+// Runtime-composed queries for consumers that don't know component types at
+// compile time: the editor inspector, scripting bindings and agent IPC.
+//
+// The READ path ([`QueryBuilder`] → [`DynQuery`]) is safe over a shared
+// `&World` — structural changes cannot happen while the borrow is live. The
+// WRITE path ([`QueryBuilderMut`] → [`DynQueryMut`]) mirrors the typed
+// borrow model (B1(v)): it is constructed from `&mut World`, so the exclusive
+// borrow proves the yielded `&mut T` cannot alias anything.
 
-pub struct QueryBuilder<'w> {
-    world: &'w World,
-    reads: Vec<ComponentId>,
-    writes: Vec<ComponentId>,
-    excludes: Vec<ComponentId>,
+/// Error produced by [`QueryBuilder::build`] / [`QueryBuilderMut::build`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynQueryError {
+    /// A component name passed to `*_name` is not registered in the world's
+    /// component registry. Names are matched against the full
+    /// `std::any::type_name` of the component (the same resolution as
+    /// [`World::component_id_by_name`]).
+    UnknownComponent(String),
+    /// The (read) builder contains `write`/`write_id`/`write_name` terms.
+    /// Dynamic write access needs exclusive world access to be sound — use
+    /// [`World::query_builder_mut`] instead of [`World::query_builder`].
+    WriteNotSupported,
+    /// A write builder requests mutable access to the same component id more
+    /// than once (`(&mut T, &mut T)`), which would alias one row's data.
+    /// Mirrors the typed query's self-alias rejection (C2).
+    AliasedWrite(ComponentId),
 }
 
-impl<'w> QueryBuilder<'w> {
-    pub fn new(world: &'w World) -> Self {
-        Self {
-            world,
-            reads: Vec::new(),
-            writes: Vec::new(),
-            excludes: Vec::new(),
+impl std::fmt::Display for DynQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownComponent(name) => {
+                write!(f, "dynamic query: unknown component name '{name}'")
+            }
+            Self::WriteNotSupported => write!(
+                f,
+                "dynamic query: write access requires exclusive world access; \
+                 use World::query_builder_mut (not query_builder)"
+            ),
+            Self::AliasedWrite(id) => write!(
+                f,
+                "dynamic query: component id {id:?} is written more than once — \
+                 that would alias one row's data (write each component at most once)"
+            ),
         }
     }
+}
 
-    pub fn read<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() {
-            self.reads.push(id);
-        }
-        self
+impl std::error::Error for DynQueryError {}
+
+/// Resolved terms of a dynamic query — shared by the read and write builders.
+#[derive(Default)]
+struct DynTerms {
+    reads: Vec<ComponentId>,
+    writes: Vec<ComponentId>,
+    withs: Vec<ComponentId>,
+    excludes: Vec<ComponentId>,
+    /// First unresolved component name — surfaced as an error at build time.
+    unknown: Option<String>,
+}
+
+impl DynTerms {
+    #[inline]
+    fn id_of<T: Component>(world: &World) -> ComponentId {
+        world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID)
     }
 
-    pub fn write<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() {
-            self.writes.push(id);
+    #[inline]
+    fn resolve_name(&mut self, world: &World, name: &str) -> Option<ComponentId> {
+        let id = world.component_id_by_name(name);
+        if id.is_none() && self.unknown.is_none() {
+            self.unknown = Some(name.to_string());
         }
-        self
+        id
     }
 
-    pub fn exclude<T: Component>(mut self) -> Self {
-        if let Some(id) = self.world.registry.get_id::<T>() {
-            self.excludes.push(id);
-        }
-        self
+    /// An archetype matches iff it has every read/write/with component and
+    /// none of the excludes.
+    #[inline]
+    fn matches_arch(&self, arch: &Archetype) -> bool {
+        self.reads.iter().all(|id| arch.has_component(*id))
+            && self.writes.iter().all(|id| arch.has_component(*id))
+            && self.withs.iter().all(|id| arch.has_component(*id))
+            && self.excludes.iter().all(|id| !arch.has_component(*id))
     }
 
-    pub fn matching_archetype_ids(&self) -> Vec<usize> {
-        self.world
+    fn matching_archetype_ids(&self, world: &World) -> Vec<usize> {
+        if self.unknown.is_some() {
+            return Vec::new();
+        }
+        world
             .archetypes
             .iter()
             .enumerate()
@@ -1955,11 +2108,640 @@ impl<'w> QueryBuilder<'w> {
             .collect()
     }
 
+    /// C2 for the dynamic write path: a write id must not repeat. Unregistered
+    /// ids collapse to `INVALID` and match nothing, so a duplicate `INVALID`
+    /// can never actually alias — skip it.
+    fn check_write_alias(&self) -> Result<(), DynQueryError> {
+        for i in 0..self.writes.len() {
+            let id = self.writes[i];
+            if id == ComponentId::INVALID {
+                continue;
+            }
+            if self.writes[i + 1..].contains(&id) {
+                return Err(DynQueryError::AliasedWrite(id));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builder for a runtime-composed (dynamic) READ query.
+///
+/// Components can be selected statically (`read::<T>()`), by
+/// [`ComponentId`] (`read_id`) or by full type name (`read_name`). Unknown
+/// names are reported loudly by [`build`](Self::build); a *typed* term whose
+/// component was never registered simply matches nothing (no entity can have
+/// it) — this is encoded with the [`ComponentId::INVALID`] sentinel, the same
+/// convention the typed query path uses.
+///
+/// For mutation use [`QueryBuilderMut`] ([`World::query_builder_mut`]).
+pub struct QueryBuilder<'w> {
+    world: &'w World,
+    terms: DynTerms,
+}
+
+impl<'w> QueryBuilder<'w> {
+    pub fn new(world: &'w World) -> Self {
+        Self {
+            world,
+            terms: DynTerms::default(),
+        }
+    }
+
+    /// Read access to `T`. An unregistered `T` makes the query match nothing
+    /// (nothing can have a never-registered component).
+    pub fn read<T: Component>(mut self) -> Self {
+        self.terms.reads.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Read access to the component with the given runtime id.
+    pub fn read_id(mut self, id: ComponentId) -> Self {
+        self.terms.reads.push(id);
+        self
+    }
+
+    /// Read access to the component with the given full type name.
+    /// An unknown name is a loud [`DynQueryError::UnknownComponent`] at build.
+    pub fn read_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.reads.push(id);
+        }
+        self
+    }
+
+    /// Write access to `T`. Recorded for archetype matching, but
+    /// [`build`](Self::build) rejects write terms — see
+    /// [`DynQueryError::WriteNotSupported`]. Use [`QueryBuilderMut`] to mutate.
+    pub fn write<T: Component>(mut self) -> Self {
+        self.terms.writes.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Write access by runtime id (matching only; `build` rejects writes).
+    pub fn write_id(mut self, id: ComponentId) -> Self {
+        self.terms.writes.push(id);
+        self
+    }
+
+    /// Presence filter: archetype must contain `T` (no data access).
+    pub fn with<T: Component>(mut self) -> Self {
+        self.terms.withs.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Presence filter by runtime id.
+    pub fn with_id(mut self, id: ComponentId) -> Self {
+        self.terms.withs.push(id);
+        self
+    }
+
+    /// Presence filter by full type name (unknown name is loud at build).
+    pub fn with_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.withs.push(id);
+        }
+        self
+    }
+
+    /// Absence filter: archetype must NOT contain `T`. An unregistered `T` is
+    /// vacuously absent, so the term is trivially satisfied.
+    pub fn exclude<T: Component>(mut self) -> Self {
+        self.terms.excludes.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Absence filter by runtime id.
+    pub fn exclude_id(mut self, id: ComponentId) -> Self {
+        self.terms.excludes.push(id);
+        self
+    }
+
+    /// Absence filter by full type name (unknown name is loud at build).
+    pub fn exclude_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.excludes.push(id);
+        }
+        self
+    }
+
+    /// Indices into `world.archetypes()` of the archetypes matching the
+    /// builder's terms. If a name failed to resolve the result is empty
+    /// (the loud error path is [`build`](Self::build)).
+    pub fn matching_archetype_ids(&self) -> Vec<usize> {
+        self.terms.matching_archetype_ids(self.world)
+    }
+
+    /// Build the read-only dynamic query.
+    ///
+    /// Errors loudly on unresolved component names and on write terms
+    /// (§0.2a — no silent narrowing of what the caller asked for).
+    pub fn build(self) -> Result<DynQuery<'w>, DynQueryError> {
+        if let Some(name) = self.terms.unknown {
+            return Err(DynQueryError::UnknownComponent(name));
+        }
+        if !self.terms.writes.is_empty() {
+            return Err(DynQueryError::WriteNotSupported);
+        }
+        let arch_ids = self.terms.matching_archetype_ids(self.world);
+        Ok(DynQuery {
+            world: self.world,
+            reads: self.terms.reads,
+            arch_ids,
+        })
+    }
+}
+
+/// Builder for a runtime-composed (dynamic) WRITE query.
+///
+/// Same term vocabulary as [`QueryBuilder`], but built from `&mut World` so
+/// the resulting [`DynQueryMut`] can hand out `&mut T` soundly (B1(v)). Terms
+/// use `&mut self` chaining. `write_*` terms request mutable access; the same
+/// component may not be written twice ([`DynQueryError::AliasedWrite`]).
+pub struct QueryBuilderMut<'w> {
+    world: &'w mut World,
+    terms: DynTerms,
+}
+
+impl<'w> QueryBuilderMut<'w> {
+    pub fn new(world: &'w mut World) -> Self {
+        Self {
+            world,
+            terms: DynTerms::default(),
+        }
+    }
+
+    /// Read access to `T`.
+    pub fn read<T: Component>(mut self) -> Self {
+        self.terms.reads.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Read access by runtime id.
+    pub fn read_id(mut self, id: ComponentId) -> Self {
+        self.terms.reads.push(id);
+        self
+    }
+
+    /// Read access by full type name (unknown name is loud at build).
+    pub fn read_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.reads.push(id);
+        }
+        self
+    }
+
+    /// Mutable access to `T`.
+    pub fn write<T: Component>(mut self) -> Self {
+        self.terms.writes.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Mutable access by runtime id.
+    pub fn write_id(mut self, id: ComponentId) -> Self {
+        self.terms.writes.push(id);
+        self
+    }
+
+    /// Mutable access by full type name (unknown name is loud at build).
+    pub fn write_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.writes.push(id);
+        }
+        self
+    }
+
+    /// Presence filter: archetype must contain `T`.
+    pub fn with<T: Component>(mut self) -> Self {
+        self.terms.withs.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Presence filter by runtime id.
+    pub fn with_id(mut self, id: ComponentId) -> Self {
+        self.terms.withs.push(id);
+        self
+    }
+
+    /// Presence filter by full type name.
+    pub fn with_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.withs.push(id);
+        }
+        self
+    }
+
+    /// Absence filter: archetype must NOT contain `T`.
+    pub fn exclude<T: Component>(mut self) -> Self {
+        self.terms.excludes.push(DynTerms::id_of::<T>(self.world));
+        self
+    }
+
+    /// Absence filter by runtime id.
+    pub fn exclude_id(mut self, id: ComponentId) -> Self {
+        self.terms.excludes.push(id);
+        self
+    }
+
+    /// Absence filter by full type name.
+    pub fn exclude_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.excludes.push(id);
+        }
+        self
+    }
+
+    /// Build the read/write dynamic query.
+    ///
+    /// Errors loudly on unresolved names and on a component written twice
+    /// (§0.2a / C2). Consumes the `&mut World` borrow into the query.
+    pub fn build(self) -> Result<DynQueryMut<'w>, DynQueryError> {
+        if let Some(name) = self.terms.unknown {
+            return Err(DynQueryError::UnknownComponent(name));
+        }
+        self.terms.check_write_alias()?;
+        let arch_ids = self.terms.matching_archetype_ids(self.world);
+        Ok(DynQueryMut {
+            world: self.world.as_unsafe_world_cell(),
+            reads: self.terms.reads,
+            writes: self.terms.writes,
+            arch_ids,
+        })
+    }
+}
+
+/// A built read-only dynamic query. Iterate with [`iter`](Self::iter) or do a
+/// point lookup with [`get`](Self::get); items are untyped [`DynItem`]s.
+pub struct DynQuery<'w> {
+    world: &'w World,
+    reads: Vec<ComponentId>,
+    /// Matched archetype indices, ascending (see `matching_archetype_ids`).
+    arch_ids: Vec<usize>,
+}
+
+impl<'w> DynQuery<'w> {
+    /// Component ids the builder requested read access to, in call order.
+    pub fn reads(&self) -> &[ComponentId] {
+        &self.reads
+    }
+
+    /// Indices into `world.archetypes()` matched by this query.
+    pub fn archetype_ids(&self) -> &[usize] {
+        &self.arch_ids
+    }
+
+    /// Number of matching entities (sum of matched archetype lengths).
+    pub fn count(&self) -> usize {
+        let archs = self.world.archetypes();
+        self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Iterate all matching entities.
+    pub fn iter(&self) -> DynIter<'_, 'w> {
+        DynIter {
+            world: self.world,
+            arch_ids: &self.arch_ids,
+            arch_cursor: 0,
+            row: 0,
+        }
+    }
+
+    /// Point lookup: the item for `entity`, or `None` if the entity is dead
+    /// or its archetype does not match this query.
+    pub fn get(&self, entity: Entity) -> Option<DynItem<'w>> {
+        let loc = self.world.entity_allocator().get_location(entity)?;
+        let arch_idx = loc.archetype_id.as_usize();
+        // arch_ids is ascending by construction.
+        self.arch_ids.binary_search(&arch_idx).ok()?;
+        Some(DynItem {
+            entity,
+            arch: &self.world.archetypes()[arch_idx],
+            row: loc.row as usize,
+            registry: self.world.registry(),
+        })
+    }
+}
+
+impl std::fmt::Debug for DynQuery<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynQuery")
+            .field("reads", &self.reads)
+            .field("arch_ids", &self.arch_ids)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'q, 'w> IntoIterator for &'q DynQuery<'w> {
+    type Item = DynItem<'w>;
+    type IntoIter = DynIter<'q, 'w>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over the entities matched by a [`DynQuery`].
+pub struct DynIter<'q, 'w> {
+    world: &'w World,
+    arch_ids: &'q [usize],
+    arch_cursor: usize,
+    row: usize,
+}
+
+impl<'q, 'w> Iterator for DynIter<'q, 'w> {
+    type Item = DynItem<'w>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let &arch_idx = self.arch_ids.get(self.arch_cursor)?;
+            let arch = &self.world.archetypes()[arch_idx];
+            if self.row < arch.len() {
+                let row = self.row;
+                self.row += 1;
+                return Some(DynItem {
+                    entity: arch.entities()[row],
+                    arch,
+                    row,
+                    registry: self.world.registry(),
+                });
+            }
+            self.arch_cursor += 1;
+            self.row = 0;
+        }
+    }
+}
+
+/// One entity yielded by a dynamic query: `{entity, archetype, row}` plus
+/// untyped/typed component access.
+pub struct DynItem<'w> {
+    entity: Entity,
+    arch: &'w Archetype,
+    row: usize,
+    registry: &'w crate::component::ComponentRegistry,
+}
+
+impl std::fmt::Debug for DynItem<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynItem")
+            .field("entity", &self.entity)
+            .field("row", &self.row)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'w> DynItem<'w> {
     #[inline]
-    fn matches_arch(&self, arch: &Archetype) -> bool {
-        self.reads.iter().all(|id| arch.has_component(*id))
-            && self.writes.iter().all(|id| arch.has_component(*id))
-            && self.excludes.iter().all(|id| !arch.has_component(*id))
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    #[inline]
+    pub fn archetype(&self) -> &'w Archetype {
+        self.arch
+    }
+
+    #[inline]
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Untyped pointer to this entity's component `id`, or `None` if the
+    /// archetype has no such component.
+    ///
+    /// The pointer is valid while the underlying `&World` borrow is live (no
+    /// structural change can occur) and must be interpreted as the component
+    /// type registered under `id`. For zero-sized components the pointer is a
+    /// dangling aligned sentinel and must not be read through.
+    #[inline]
+    pub fn get_ptr(&self, id: ComponentId) -> Option<*const u8> {
+        let col_idx = self.arch.column_index(id)?;
+        // SAFETY: `row < arch.len()` by construction (iterator bound /
+        // entity location), and all columns share the archetype's length.
+        Some(unsafe { self.arch.columns_raw()[col_idx].get_raw_ptr(self.row) })
+    }
+
+    /// Typed view of this entity's component `id`.
+    ///
+    /// Returns `None` if the archetype has no such component. A mismatch
+    /// between `T` and the type registered under `id` is a caller bug and is
+    /// reported loudly (throttled warn) before returning `None`.
+    pub fn get<T: Component>(&self, id: ComponentId) -> Option<&'w T> {
+        let col_idx = self.arch.column_index(id)?;
+        let info = self.registry.get_info(id)?;
+        if info.type_id != std::any::TypeId::of::<T>() {
+            crate::warn_once!(
+                "DynItem::get::<{}>: component id {:?} is registered as '{}' — type mismatch, returning None",
+                std::any::type_name::<T>(),
+                id,
+                info.name,
+            );
+            return None;
+        }
+        // SAFETY: `row < arch.len()` by construction; the registry confirms
+        // the column under `id` stores `T`; the shared `&World` borrow keeps
+        // the storage alive and structurally unchanged for 'w.
+        Some(unsafe { self.arch.columns_raw()[col_idx].get::<T>(self.row) })
+    }
+}
+
+/// A built read/write dynamic query (see [`QueryBuilderMut`]). Holds the
+/// world's exclusive access through an [`UnsafeWorldCell`]; iterate with
+/// [`for_each_mut`](Self::for_each_mut) or point-look up with
+/// [`get_mut`](Self::get_mut). Items are [`DynItemMut`]s and are vended one at
+/// a time (a lending pattern), so mutable component access never aliases.
+pub struct DynQueryMut<'w> {
+    world: UnsafeWorldCell<'w>,
+    reads: Vec<ComponentId>,
+    writes: Vec<ComponentId>,
+    /// Matched archetype indices, ascending.
+    arch_ids: Vec<usize>,
+}
+
+impl std::fmt::Debug for DynQueryMut<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynQueryMut")
+            .field("reads", &self.reads)
+            .field("writes", &self.writes)
+            .field("arch_ids", &self.arch_ids)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'w> DynQueryMut<'w> {
+    /// Component ids requested for read access, in call order.
+    pub fn reads(&self) -> &[ComponentId] {
+        &self.reads
+    }
+
+    /// Component ids requested for mutable access, in call order.
+    pub fn writes(&self) -> &[ComponentId] {
+        &self.writes
+    }
+
+    /// Indices into `world.archetypes()` matched by this query.
+    pub fn archetype_ids(&self) -> &[usize] {
+        &self.arch_ids
+    }
+
+    /// Number of matching entities.
+    pub fn count(&self) -> usize {
+        // SAFETY: read-only metadata view; no mutable view is live here.
+        let archs = unsafe { self.world.world() }.archetypes();
+        self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count() == 0
+    }
+
+    /// Visit every matching entity with a mutable item. The item is scoped to
+    /// the call, so `&mut T` obtained from it can never alias another row.
+    pub fn for_each_mut(&mut self, mut f: impl FnMut(DynItemMut<'_>)) {
+        // SAFETY: `self` is borrowed exclusively for the call, and the
+        // `UnsafeWorldCell` was created from `&mut World` — so this is the only
+        // live view of the world. Items borrow it for the closure call only.
+        let world = unsafe { self.world.world() };
+        let this_run = world.current_tick();
+        let registry = world.registry();
+        for &arch_idx in &self.arch_ids {
+            let arch = &world.archetypes()[arch_idx];
+            for row in 0..arch.len() {
+                f(DynItemMut {
+                    entity: arch.entities()[row],
+                    arch,
+                    row,
+                    registry,
+                    this_run,
+                });
+            }
+        }
+    }
+
+    /// Point lookup: a mutable item for `entity`, or `None` if the entity is
+    /// dead or its archetype does not match this query.
+    pub fn get_mut(&mut self, entity: Entity) -> Option<DynItemMut<'_>> {
+        // SAFETY: exclusive borrow of `self` + `&mut World`-derived cell ⇒ sole
+        // live view; the returned item borrows it for its own lifetime only.
+        let world = unsafe { self.world.world() };
+        let loc = world.entity_allocator().get_location(entity)?;
+        let arch_idx = loc.archetype_id.as_usize();
+        self.arch_ids.binary_search(&arch_idx).ok()?;
+        Some(DynItemMut {
+            entity,
+            arch: &world.archetypes()[arch_idx],
+            row: loc.row as usize,
+            registry: world.registry(),
+            this_run: world.current_tick(),
+        })
+    }
+}
+
+/// One entity yielded by a dynamic WRITE query. Provides the same read access
+/// as [`DynItem`] plus mutable access (`get_mut` / `get_mut_ptr`), which marks
+/// the component changed. Mutable accessors take `&mut self`, so only one
+/// `&mut T` is live at a time.
+pub struct DynItemMut<'a> {
+    entity: Entity,
+    arch: &'a Archetype,
+    row: usize,
+    registry: &'a crate::component::ComponentRegistry,
+    this_run: Tick,
+}
+
+impl std::fmt::Debug for DynItemMut<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynItemMut")
+            .field("entity", &self.entity)
+            .field("row", &self.row)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> DynItemMut<'a> {
+    #[inline]
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    #[inline]
+    pub fn archetype(&self) -> &'a Archetype {
+        self.arch
+    }
+
+    #[inline]
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Shared untyped pointer to component `id` (does not mark changed). See
+    /// [`DynItem::get_ptr`] for the pointer-validity contract.
+    #[inline]
+    pub fn get_ptr(&self, id: ComponentId) -> Option<*const u8> {
+        let col_idx = self.arch.column_index(id)?;
+        // SAFETY: `row < arch.len()`; columns share the archetype's length.
+        Some(unsafe { self.arch.columns_raw()[col_idx].get_raw_ptr(self.row) })
+    }
+
+    /// Shared typed view of component `id` (does not mark changed). Type
+    /// mismatch is a loud (throttled) warn + `None`.
+    pub fn get<T: Component>(&self, id: ComponentId) -> Option<&T> {
+        let col_idx = self.arch.column_index(id)?;
+        let info = self.registry.get_info(id)?;
+        if info.type_id != std::any::TypeId::of::<T>() {
+            crate::warn_once!(
+                "DynItemMut::get::<{}>: component id {:?} is registered as '{}' — type mismatch, returning None",
+                std::any::type_name::<T>(),
+                id,
+                info.name,
+            );
+            return None;
+        }
+        // SAFETY: registry confirms the column stores `T`; `row` in bounds.
+        Some(unsafe { self.arch.columns_raw()[col_idx].get::<T>(self.row) })
+    }
+
+    /// Mutable untyped pointer to component `id`, marking it changed. `None`
+    /// if the archetype lacks it. Borrows the item mutably, so at most one
+    /// mutable accessor is live at a time. For ZSTs the pointer is a dangling
+    /// aligned sentinel and must not be written through.
+    #[inline]
+    pub fn get_mut_ptr(&mut self, id: ComponentId) -> Option<*mut u8> {
+        let col_idx = self.arch.column_index(id)?;
+        let col = &self.arch.columns_raw()[col_idx];
+        // SAFETY: `row < arch.len()`; the query holds the world's exclusive
+        // access, and `&mut self` means no other view of this row is live, so
+        // both the change-tick write and the returned `*mut` are sound.
+        unsafe {
+            col.set_change_tick(self.row, self.this_run);
+            Some(col.get_ptr(self.row))
+        }
+    }
+
+    /// Mutable typed view of component `id`, marking it changed. Type mismatch
+    /// is a loud (throttled) warn + `None`.
+    pub fn get_mut<T: Component>(&mut self, id: ComponentId) -> Option<&mut T> {
+        let col_idx = self.arch.column_index(id)?;
+        let info = self.registry.get_info(id)?;
+        if info.type_id != std::any::TypeId::of::<T>() {
+            crate::warn_once!(
+                "DynItemMut::get_mut::<{}>: component id {:?} is registered as '{}' — type mismatch, returning None",
+                std::any::type_name::<T>(),
+                id,
+                info.name,
+            );
+            return None;
+        }
+        let col = &self.arch.columns_raw()[col_idx];
+        // SAFETY: registry confirms the column stores `T`; `row` in bounds;
+        // `&mut self` + the query's exclusive world access ⇒ no other live
+        // reference to this row.
+        unsafe {
+            col.set_change_tick(self.row, self.this_run);
+            Some(&mut *(col.get_ptr(self.row) as *mut T))
+        }
     }
 }
 
@@ -2029,7 +2811,7 @@ mod query_filter_tests {
         }
         assert_eq!(sum, 3);
 
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         for mut hp in &mut q {
             hp.0 *= 10;
         }
@@ -2071,7 +2853,7 @@ mod query_filter_tests {
         // Per-item Write path: `Mut::deref_mut` writes the tick through the
         // shared `&Column` via `ticks_ptr()`.
         {
-            let mut q = Query::<Write<Hp>>::new(&world);
+            let mut q = Query::<Write<Hp>>::new_mut(&mut world);
             for mut hp in &mut q {
                 hp.0 += 100;
             }
@@ -2089,7 +2871,7 @@ mod query_filter_tests {
         world.advance_change_tick();
         let lr2 = world.last_run_tick();
         {
-            let q = Query::<Write<Hp>>::new(&world);
+            let q = Query::<Write<Hp>>::new_mut(&mut world);
             q.for_each_chunk(|_entities, hps: &mut [Hp]| {
                 for hp in hps {
                     hp.0 += 1;
@@ -2119,31 +2901,31 @@ mod query_filter_tests {
 
         // Aliasing shapes must panic.
         let ww = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, Write<Hp>)>::new(&world);
+            let _ = Query::<(Write<Hp>, Write<Hp>)>::new_mut(&mut world);
         }));
         assert!(ww.is_err(), "write+write of same component must panic");
 
         let rw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Read<Hp>, Write<Hp>)>::new(&world);
+            let _ = Query::<(Read<Hp>, Write<Hp>)>::new_mut(&mut world);
         }));
         assert!(rw.is_err(), "read+write of same component must panic");
 
         let refmut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(&mut Hp, &mut Hp)>::new(&world);
+            let _ = Query::<(&mut Hp, &mut Hp)>::new_mut(&mut world);
         }));
         assert!(refmut.is_err(), "&mut + &mut of same component must panic");
 
         let maybe_alias = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new(&world);
+            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new_mut(&mut world);
         }));
         assert!(maybe_alias.is_err(), "write + optional write of same component must panic");
 
         // Legal shapes must NOT panic (construction runs the check).
         let _ = Query::<(Read<Hp>, Read<Hp>)>::new(&world); // shared + shared
-        let _ = Query::<(Write<Hp>, Write<Mana>)>::new(&world); // distinct components
-        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new(&world); // filter over written comp
-        let _ = Query::<Write<Hp>, Changed<Hp>>::new(&world); // Changed filter is not a data borrow
-        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new(&world); // write + optional distinct
+        let _ = Query::<(Write<Hp>, Write<Mana>)>::new_mut(&mut world); // distinct components
+        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new_mut(&mut world); // filter over written comp
+        let _ = Query::<Write<Hp>, Changed<Hp>>::new_mut(&mut world); // Changed filter is not a data borrow
+        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new_mut(&mut world); // write + optional distinct
     }
 
     /// A12: `len`/`is_empty` must honor per-row filters (and row ranges), not
@@ -2192,7 +2974,7 @@ mod query_filter_tests {
         drop(q);
 
         // single_mut: мутация через Mut<T>.
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         let mut hp = q.single_mut().unwrap();
         hp.0 = 7;
         drop(q);
@@ -2228,7 +3010,7 @@ mod query_filter_tests {
         drop(q);
 
         // get_mut: мутация через Mut<T>.
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         q.get_mut(boss).unwrap().0 = 1;
         drop(q);
         assert_eq!(world.get::<Hp>(boss), Some(&Hp(1)));
@@ -2343,7 +3125,7 @@ mod tests {
 
         // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
         {
-            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
             q.for_each(|e, mut p| {
                 if e == target {
                     p.x += 1.0;
@@ -2374,7 +3156,7 @@ mod tests {
         Query::<(&Pos,)>::new(&world).for_each(|_, (p,)| {
             assert_eq!(p.x, 1.0);
         });
-        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
             p.x += 10.0;
         });
         assert_eq!(world.get::<Pos>(e).unwrap().x, 11.0);
@@ -2383,7 +3165,7 @@ mod tests {
         world.tick();
         let lr = world.current_tick();
         world.tick();
-        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
             p.x += 1.0;
         });
         let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
@@ -2404,7 +3186,7 @@ mod tests {
         world.tick();
 
         {
-            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
             let mut sink = 0.0;
             q.for_each(|_, p| {
                 // Только Deref (чтение) — без DerefMut.
@@ -2474,7 +3256,7 @@ mod tests {
         world.spawn((A,));
 
         // Опциональная запись: у кого есть B — удваиваем
-        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new(&world);
+        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
             .iter()
             .map(|(_, b_opt)| b_opt.is_some())
@@ -2683,5 +3465,358 @@ mod tests {
         assert!(results[0].0 && results[0].1);
         // e2: A=None, C=None
         assert!(!results[1].0 && !results[1].1);
+    }
+}
+
+// ── Dynamic query tests ────────────────────────────────────────
+
+#[cfg(test)]
+mod dyn_query_tests {
+    use super::*;
+    use crate::component::Component;
+    use crate::world::World;
+
+    #[derive(Debug, PartialEq)]
+    struct Hp(u32);
+    impl Component for Hp {}
+    #[derive(Debug, PartialEq)]
+    struct Mana(u32);
+    impl Component for Mana {}
+    struct Boss;
+    impl Component for Boss {}
+    /// Never spawned/registered in these tests.
+    struct Ghost;
+    impl Component for Ghost {}
+
+    fn type_name<T>() -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    #[test]
+    fn dyn_read_by_name_iter_typed_and_untyped() {
+        let mut world = World::new();
+        let a = world.spawn((Hp(100), Mana(50)));
+        let b = world.spawn((Hp(10),));
+        let _c = world.spawn((Mana(5),));
+
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let q = world
+            .query_builder()
+            .read_name(type_name::<Hp>())
+            .build()
+            .unwrap();
+        assert_eq!(q.reads(), &[hp_id]);
+        assert_eq!(q.count(), 2);
+
+        let mut seen: Vec<(Entity, u32)> = q
+            .iter()
+            .map(|item| (item.entity(), item.get::<Hp>(hp_id).unwrap().0))
+            .collect();
+        seen.sort_by_key(|(_, hp)| *hp);
+        assert_eq!(seen, vec![(b, 10), (a, 100)]);
+
+        // Untyped pointer access sees the same bytes.
+        let item = q.get(a).unwrap();
+        let ptr = item.get_ptr(hp_id).unwrap();
+        // SAFETY: hp_id is registered as Hp; the shared &World borrow is live.
+        let via_ptr = unsafe { &*(ptr as *const Hp) };
+        assert_eq!(via_ptr, &Hp(100));
+    }
+
+    #[test]
+    fn dyn_unknown_name_is_loud() {
+        let world = World::new();
+        let err = world
+            .query_builder()
+            .read_name("does::not::Exist")
+            .build()
+            .unwrap_err();
+        assert_eq!(err, DynQueryError::UnknownComponent("does::not::Exist".into()));
+        // The non-Result matching path degrades to "matches nothing".
+        assert!(world
+            .query_builder()
+            .read_name("does::not::Exist")
+            .matching_archetype_ids()
+            .is_empty());
+    }
+
+    /// Regression: an unregistered *typed* term used to be silently DROPPED,
+    /// making the query match MORE than requested. It must match nothing.
+    #[test]
+    fn dyn_unregistered_typed_read_matches_nothing() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+
+        let q = world.query_builder().read::<Hp>().read::<Ghost>();
+        assert!(q.matching_archetype_ids().is_empty());
+        assert_eq!(q.build().unwrap().count(), 0);
+
+        // Excluding an unregistered component is vacuously satisfied.
+        let q = world.query_builder().read::<Hp>().exclude::<Ghost>();
+        assert_eq!(q.build().unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dyn_with_and_exclude_filters() {
+        let mut world = World::new();
+        let boss = world.spawn((Hp(100), Mana(50), Boss));
+        let mob = world.spawn((Hp(10), Mana(5)));
+
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        let q = world
+            .query_builder()
+            .read_id(hp_id)
+            .with::<Boss>()
+            .build()
+            .unwrap();
+        let seen: Vec<Entity> = q.iter().map(|i| i.entity()).collect();
+        assert_eq!(seen, vec![boss]);
+
+        let q = world
+            .query_builder()
+            .read_id(hp_id)
+            .exclude::<Boss>()
+            .build()
+            .unwrap();
+        let seen: Vec<Entity> = q.iter().map(|i| i.entity()).collect();
+        assert_eq!(seen, vec![mob]);
+    }
+
+    #[test]
+    fn dyn_point_get_respects_filter_and_liveness() {
+        let mut world = World::new();
+        let boss = world.spawn((Hp(100), Boss));
+        let mob = world.spawn((Hp(10),));
+        let dead = world.spawn((Hp(1), Boss));
+        world.despawn(dead);
+
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .with::<Boss>()
+            .build()
+            .unwrap();
+        assert!(q.get(boss).is_some());
+        assert!(q.get(mob).is_none()); // archetype not matched
+        assert!(q.get(dead).is_none()); // dead entity
+
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        assert_eq!(q.get(boss).unwrap().get::<Hp>(hp_id).unwrap().0, 100);
+    }
+
+    #[test]
+    fn dyn_write_build_is_rejected() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        let err = world.query_builder().write::<Hp>().build().unwrap_err();
+        assert_eq!(err, DynQueryError::WriteNotSupported);
+        // Matching-only usage keeps working for write terms.
+        assert_eq!(
+            world.query_builder().write::<Hp>().matching_archetype_ids().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn dyn_typed_get_type_mismatch_returns_none() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1), Mana(2)));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let mana_id = world.component_id_by_name(type_name::<Mana>()).unwrap();
+
+        let q = world.query_builder().read_id(hp_id).build().unwrap();
+        let item = q.get(e).unwrap();
+        // Wrong T for the id — loud warn + None, never a reinterpreted value.
+        assert!(item.get::<Mana>(hp_id).is_none());
+        // Component present on the archetype but not requested: still readable
+        // (read path over shared &World — access is per-archetype, like Bevy's
+        // FilteredEntityRef it is bounded by what the entity actually has).
+        assert_eq!(item.get::<Mana>(mana_id).unwrap().0, 2);
+        // Component id the archetype lacks → None.
+        let boss_arch_missing = world.query_builder().read_id(hp_id).build().unwrap();
+        let item = boss_arch_missing.get(e).unwrap();
+        assert!(item.get_ptr(ComponentId::INVALID).is_none());
+    }
+
+    #[test]
+    fn dyn_zst_component_typed_get() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1), Boss));
+        let boss_id = world.component_id_by_name(type_name::<Boss>()).unwrap();
+
+        let q = world.query_builder().with_id(boss_id).read::<Hp>().build().unwrap();
+        let item = q.get(e).unwrap();
+        // ZST: typed get works (dangling aligned pointer is fine for a ZST ref).
+        assert!(item.get::<Boss>(boss_id).is_some());
+        // Untyped pointer exists but is a sentinel — callers must not read it.
+        assert!(item.get_ptr(boss_id).is_some());
+    }
+
+    #[test]
+    fn dyn_iter_spans_multiple_archetypes() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        world.spawn((Hp(2), Mana(1)));
+        world.spawn((Hp(3), Boss));
+        world.spawn((Mana(9),));
+
+        let q = world.query_builder().read::<Hp>().build().unwrap();
+        assert!(q.archetype_ids().len() >= 3);
+        assert_eq!(q.count(), 3);
+        let sum: u32 = (&q)
+            .into_iter()
+            .map(|i| {
+                let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+                i.get::<Hp>(hp_id).unwrap().0
+            })
+            .sum();
+        assert_eq!(sum, 6);
+        assert!(!q.is_empty());
+    }
+
+    // ── Dynamic WRITE path ──────────────────────────────────────
+
+    #[test]
+    fn dyn_write_for_each_mut_typed_and_untyped() {
+        let mut world = World::new();
+        let a = world.spawn((Hp(100), Mana(50)));
+        let b = world.spawn((Hp(10),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        let mut q = world
+            .query_builder_mut()
+            .write_name(type_name::<Hp>())
+            .build()
+            .unwrap();
+        assert_eq!(q.writes(), &[hp_id]);
+        assert_eq!(q.count(), 2);
+
+        // Typed mutation.
+        q.for_each_mut(|mut item| {
+            item.get_mut::<Hp>(hp_id).unwrap().0 += 1;
+        });
+        assert_eq!(world.get::<Hp>(a), Some(&Hp(101)));
+        assert_eq!(world.get::<Hp>(b), Some(&Hp(11)));
+
+        // Untyped mutation through the raw pointer.
+        let mut q = world.query_builder_mut().write_id(hp_id).build().unwrap();
+        q.for_each_mut(|mut item| {
+            let ptr = item.get_mut_ptr(hp_id).unwrap();
+            // SAFETY: hp_id is registered as Hp; exclusive access via the query.
+            unsafe {
+                (*(ptr as *mut Hp)).0 += 1000;
+            }
+        });
+        assert_eq!(world.get::<Hp>(a), Some(&Hp(1101)));
+    }
+
+    #[test]
+    fn dyn_write_marks_changed() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        world.advance_change_tick();
+
+        // Nothing changed since `lr` yet.
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr).iter().count(),
+            0
+        );
+
+        world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .build()
+            .unwrap()
+            .for_each_mut(|mut item| {
+                item.get_mut::<Hp>(hp_id).unwrap().0 = 42;
+            });
+
+        // The dynamic write stamped the change tick.
+        let changed: Vec<Entity> = Query::<Entity, Changed<Hp>>::new_with_tick(&world, lr)
+            .iter()
+            .collect();
+        assert_eq!(changed, vec![e]);
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(42)));
+    }
+
+    #[test]
+    fn dyn_write_aliased_is_loud() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let err = world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .write_id(hp_id)
+            .build()
+            .unwrap_err();
+        assert_eq!(err, DynQueryError::AliasedWrite(hp_id));
+    }
+
+    #[test]
+    fn dyn_write_unknown_name_is_loud() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        let err = world
+            .query_builder_mut()
+            .write_name("nope::Nope")
+            .build()
+            .unwrap_err();
+        assert_eq!(err, DynQueryError::UnknownComponent("nope::Nope".into()));
+    }
+
+    #[test]
+    fn dyn_write_read_build_rejects_write_terms() {
+        let mut world = World::new();
+        world.spawn((Hp(1),));
+        // The READ builder still rejects write terms (points at query_builder_mut).
+        let err = world.query_builder().write::<Hp>().build().unwrap_err();
+        assert_eq!(err, DynQueryError::WriteNotSupported);
+    }
+
+    #[test]
+    fn dyn_write_get_mut_point_lookup_and_filter() {
+        let mut world = World::new();
+        let boss = world.spawn((Hp(100), Boss));
+        let mob = world.spawn((Hp(10),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        let mut q = world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .with::<Boss>()
+            .build()
+            .unwrap();
+        // Point-mutate the boss; the mob is filtered out.
+        q.get_mut(boss).unwrap().get_mut::<Hp>(hp_id).unwrap().0 = 7;
+        assert!(q.get_mut(mob).is_none());
+        assert_eq!(world.get::<Hp>(boss), Some(&Hp(7)));
+        assert_eq!(world.get::<Hp>(mob), Some(&Hp(10)));
+    }
+
+    #[test]
+    fn dyn_write_mixed_read_and_write_terms() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(3), Mana(10)));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let mana_id = world.component_id_by_name(type_name::<Mana>()).unwrap();
+
+        let mut q = world
+            .query_builder_mut()
+            .read_id(hp_id)
+            .write_id(mana_id)
+            .build()
+            .unwrap();
+        q.for_each_mut(|mut item| {
+            // Read Hp, scale Mana by it. Sequential accessors (one &mut at a time).
+            let hp = item.get::<Hp>(hp_id).unwrap().0;
+            item.get_mut::<Mana>(mana_id).unwrap().0 *= hp;
+        });
+        assert_eq!(world.get::<Mana>(e), Some(&Mana(30)));
     }
 }

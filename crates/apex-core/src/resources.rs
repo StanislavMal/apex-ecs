@@ -16,14 +16,79 @@ struct ResourceCell(UnsafeCell<Box<dyn Any + Send + Sync>>);
 // resource never share a stage), so exposing `Sync` is sound.
 unsafe impl Sync for ResourceCell {}
 
+/// E7: serialize/deserialize fns for a resource type registered for snapshots.
+#[derive(Clone)]
+pub struct ResourceSerdeFns {
+    pub type_name: &'static str,
+    /// Serialize the resource if it is currently present.
+    pub serialize: fn(&Resources) -> Option<Vec<u8>>,
+    /// Deserialize bytes and insert the resource.
+    pub deserialize: fn(&mut Resources, &[u8]) -> Result<(), String>,
+}
+
+fn ser_resource<R: serde::Serialize + Send + Sync + 'static>(res: &Resources) -> Option<Vec<u8>> {
+    res.try_get::<R>().and_then(|r| bincode::serialize(r).ok())
+}
+fn de_resource<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    res: &mut Resources,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let r: R = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+    res.insert(r);
+    Ok(())
+}
+
 pub struct Resources {
     data: FxHashMap<TypeId, ResourceCell>,
+    /// E7: resource types opted into snapshots (`register_serde`).
+    serde: FxHashMap<TypeId, ResourceSerdeFns>,
 }
 
 impl Resources {
     pub fn new() -> Self {
         Self {
             data: FxHashMap::default(),
+            serde: FxHashMap::default(),
+        }
+    }
+
+    /// E7: opt a resource type into snapshots (bincode). Present resources of
+    /// this type are then included by [`snapshot_serde`](Self::snapshot_serde)
+    /// and restored by [`restore_serde`](Self::restore_serde).
+    pub fn register_serde<R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static>(
+        &mut self,
+    ) {
+        self.serde.insert(
+            TypeId::of::<R>(),
+            ResourceSerdeFns {
+                type_name: std::any::type_name::<R>(),
+                serialize: ser_resource::<R>,
+                deserialize: de_resource::<R>,
+            },
+        );
+    }
+
+    /// E7: `(type_name, bytes)` for every registered resource that is present.
+    pub fn snapshot_serde(&self) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        for fns in self.serde.values() {
+            if let Some(bytes) = (fns.serialize)(self) {
+                out.push((fns.type_name.to_string(), bytes));
+            }
+        }
+        out
+    }
+
+    /// E7: deserialize+insert a resource by `type_name`. `Ok(false)` if that
+    /// type_name was never registered (unknown resource — caller may warn).
+    pub fn restore_serde(&mut self, type_name: &str, bytes: &[u8]) -> Result<bool, String> {
+        let fns = self.serde.values().find(|f| f.type_name == type_name).cloned();
+        match fns {
+            Some(f) => {
+                (f.deserialize)(self, bytes)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 

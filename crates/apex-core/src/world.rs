@@ -475,6 +475,57 @@ impl World {
         self.registry.register_serde_with::<T>(fns)
     }
 
+    /// Зарегистрировать ремап Entity-ссылок компонента `T` (E6): при `restore`
+    /// snapshot старые Entity-id ВНУТРИ `T` (напр. `Target(Entity)`) обновляются
+    /// на новые вторым проходом restore через [`MapEntities::map_entities`]. Без
+    /// этого Entity-ссылки после restore указывают в пустоту.
+    pub fn register_map_entities<T: Component + crate::component::MapEntities>(
+        &mut self,
+    ) -> ComponentId {
+        let id = self.registry.get_or_register::<T>();
+        let map_fn: crate::component::MapEntitiesFn = |ptr, f| {
+            // SAFETY: `ptr` is a valid `*mut T` of a live component (restore contract).
+            let val = unsafe { &mut *(ptr as *mut T) };
+            val.map_entities(f);
+        };
+        self.registry.set_map_entities(id, map_fn);
+        id
+    }
+
+    /// E6: ремапнуть Entity-ссылки внутри всех компонентов `entity`, которые
+    /// зарегистрировали [`MapEntitiesFn`](crate::component::MapEntitiesFn), через
+    /// `f`. Вызывается `restore` ПОСЛЕ построения полной карты old→new (в т.ч.
+    /// forward-ссылки). No-op для мёртвой entity / компонентов без ремапа.
+    pub fn map_entity_refs(&mut self, entity: Entity, f: &mut dyn FnMut(Entity) -> Entity) {
+        let Some(loc) = self.entities.get_location(entity) else {
+            return;
+        };
+        let arch_idx = loc.archetype_id.0 as usize;
+        let row = loc.row as usize;
+        // Snapshot (component_id, map_fn) first — avoids holding a shared borrow
+        // of the archetype while taking a mutable one below.
+        let mapped: SmallVec<[(ComponentId, crate::component::MapEntitiesFn); 8]> = self.archetypes
+            [arch_idx]
+            .component_ids
+            .iter()
+            .filter_map(|&cid| {
+                self.registry
+                    .get_info(cid)
+                    .and_then(|i| i.map_entities)
+                    .map(|mf| (cid, mf))
+            })
+            .collect();
+        for (cid, map_fn) in mapped {
+            let arch = &mut self.archetypes[arch_idx];
+            if let Some(col_idx) = arch.column_index(cid) {
+                // SAFETY: `row` is live in this archetype; `map_fn` was registered
+                // for the type stored in column `cid`.
+                let ptr = unsafe { arch.columns[col_idx].get_ptr(row) };
+                unsafe { map_fn(ptr, f) };
+            }
+        }
+    }
+
     // ── Хуки состава (W3-1) ────────────────────────────────────
 
     /// Зарегистрировать `on_add`-хук компонента `T`: вызывается после того,
@@ -772,6 +823,18 @@ impl World {
         self.resources.insert(value);
     }
 
+    /// E7: включить ресурс `R` в snapshot (opt-in, bincode). После этого
+    /// `WorldSerializer::snapshot` сохраняет присутствующий ресурс `R`, а
+    /// `restore` его восстанавливает. Без регистрации ресурсы в snapshot НЕ
+    /// попадают (мир может содержать не-сериализуемые ресурсы — GPU-хэндлы и пр.).
+    pub fn register_resource_serde<
+        R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    >(
+        &mut self,
+    ) {
+        self.resources.register_serde::<R>();
+    }
+
     #[track_caller]
     pub fn resource<T: Send + Sync + 'static>(&self) -> &T {
         self.resources.get::<T>()
@@ -979,15 +1042,15 @@ impl World {
             return Vec::new();
         }
 
-        let probe = make_bundle(0);
         // `decl_ids` — порядок ОБЪЯВЛЕНИЯ бандла (= порядок обхода `write_into_batch`); `ids` —
         // ОТСОРТИРОВАННЫЙ (для архетипа). Их РАЗДЕЛЕНИЕ критично: col_indices ОБЯЗАН быть в порядке
-        // обхода, иначе компонент пишется в чужую колонку (UB).
+        // обхода, иначе компонент пишется в чужую колонку (UB). §10.10: состав берётся СТАТИЧЕСКИ
+        // (по типу `B`), без `make_bundle(0)`-probe — замыкание больше не зовётся лишний раз ради
+        // состава и не обязано быть чистым.
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        probe.push_component_ids(&mut self.registry, &mut decl_ids);
+        B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
         ids.sort_unstable();
-        drop(probe);
 
         let archetype_id = self.get_or_create_archetype(&ids);
         let arch_idx = archetype_id.0 as usize;
@@ -1124,7 +1187,7 @@ impl World {
         // `decl_ids` (порядок объявления = обхода write_into_batch) ОТДЕЛЬНО от `ids` (сорт. для
         // архетипа) — col_indices строится из decl_ids, иначе компонент пишется в чужую колонку (UB).
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        bundles[0].push_component_ids(&mut self.registry, &mut decl_ids);
+        B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
         ids.sort_unstable();
         if ids.is_empty() {
@@ -1771,23 +1834,45 @@ impl World {
 
     // ── Query API ──────────────────────────────────────────────
 
-    /// Кешированный типизированный запрос (как Bevy `world.query::<Q>()`;
-    /// зеркало `ctx.query` в системах). Список архетипов берётся из
-    /// инкрементального глобального кэша.
-    pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+    /// Кешированный типизированный read-only запрос (как Bevy
+    /// `world.query::<Q>()`; зеркало `ctx.query` в системах). Список
+    /// архетипов берётся из инкрементального глобального кэша. Write-формы —
+    /// через [`query_mut`](Self::query_mut) (эксклюзивный заём).
+    pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(&self) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, Tick::ZERO)
     }
 
     /// То же с явной базой change-detection (`Changed<T>`/`Added<T>` в Q).
-    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
+    pub fn query_changed<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(
+        &self,
+        last_run: Tick,
+    ) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, last_run)
     }
 
-    /// Динамический запрос по runtime-`ComponentId` (редкий случай: типы не
-    /// известны статически — скриптинг/инспектор). Для обычного кода —
-    /// типизированный [`query`](Self::query).
+    /// Запрос любой формы (включая `Write<T>`) под эксклюзивным заёмом мира.
+    pub fn query_mut<Q: WorldQuery>(&mut self) -> CachedQuery<'_, Q> {
+        CachedQuery::new_mut(self, Tick::ZERO)
+    }
+
+    /// [`query_mut`](Self::query_mut) с явной базой change-detection.
+    pub fn query_mut_changed<Q: WorldQuery>(&mut self, last_run: Tick) -> CachedQuery<'_, Q> {
+        CachedQuery::new_mut(self, last_run)
+    }
+
+    /// Динамический READ-запрос по runtime-`ComponentId`/имени (редкий случай:
+    /// типы не известны статически — скриптинг/инспектор/agent-IPC). Для
+    /// обычного кода — типизированный [`query`](Self::query). Мутация —
+    /// [`query_builder_mut`](Self::query_builder_mut).
     pub fn query_builder(&self) -> QueryBuilder<'_> {
         QueryBuilder::new(self)
+    }
+
+    /// Динамический READ/WRITE-запрос (эксклюзивный заём мира ⇒ выдаваемые
+    /// `&mut T` заведомо не алиасят — B1(в)). См.
+    /// [`QueryBuilderMut`](crate::query::QueryBuilderMut).
+    pub fn query_builder_mut(&mut self) -> crate::query::QueryBuilderMut<'_> {
+        crate::query::QueryBuilderMut::new(self)
     }
 
     // ── Внутренние методы ──────────────────────────────────────
@@ -2176,7 +2261,12 @@ impl<'w> SystemContext<'w> {
     }
 
     /// Создать контекст с thread-local командами.
-    pub fn with_commands(
+    ///
+    /// # Safety
+    /// `deferred_cmds` must point to a `Vec<Commands>` with one slot per rayon
+    /// worker thread, alive for the context's lifetime; each worker accesses
+    /// only its own slot (see [`commands`](Self::commands)).
+    pub unsafe fn with_commands(
         sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
         deferred_cmds: *mut Vec<Commands>,
     ) -> Self {
@@ -2228,12 +2318,16 @@ impl<'w> SystemContext<'w> {
         // База change-detection — `last_run_tick` мира (граница прошлого кадра),
         // так `Changed<T>` внутри системы достоверен (TD-9), а не «всё подряд».
         let last_run = self.sub_worlds[0].world().last_run_tick();
-        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
+        // SAFETY: the context's SubWorlds are scheduler-vended; the system's
+        // declared access is expected to cover `Q` (see F3: this arbitrary-Q
+        // accessor leaves the public surface with the SystemParam migration).
+        unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
     #[inline]
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
-        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
+        // SAFETY: see `query` above.
+        unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
     #[inline]
@@ -2429,7 +2523,33 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
 }
 
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
-    pub fn new(world: &'w World, last_run: Tick) -> Self {
+    /// Read-only cached query over a shared world borrow (see
+    /// [`Query::new`](crate::query::Query::new) for the borrow model: write
+    /// shapes construct via [`new_mut`](Self::new_mut) or the scheduler).
+    pub fn new(world: &'w World, last_run: Tick) -> Self
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape cached query over an exclusive world borrow.
+    pub fn new_mut(world: &'w mut World, last_run: Tick) -> Self {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape cached query through the unsafe world escape.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`](crate::query::Query::new_unchecked).
+    pub unsafe fn new_unchecked(world: crate::unsafe_world_cell::UnsafeWorldCell<'w>, last_run: Tick) -> Self {
+        Self::build(world.world(), last_run)
+    }
+
+    fn build(world: &'w World, last_run: Tick) -> Self {
+        // C2: same self-alias rejection as `Query` — this is the second
+        // construction path and must not bypass the check.
+        crate::query::assert_no_self_alias::<Q>(world);
         // Один проход реестра: ключ кэша несёт и ids (нижние 32 бита каждой
         // НЕ-маркерной записи, в порядке fill_ids — инвариант fill_cache_key),
         // и роли формы. Структурные маркеры Or<> (KEY_MARKER_BIT) пропускаются.
@@ -2466,7 +2586,15 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// ids — inline-SmallVec. Не вызывает `get_or_compute` (thread-safe для
     /// параллельных систем). Фильтрация по `Q::matches_archetype` происходит
     /// в `for_each`/`par_for_each` — `fetch_state` только для совпадающих.
-    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+    ///
+    /// # Safety
+    /// The `SubWorld` must have been vended by the scheduler for a system
+    /// whose declared access covers this query's shape, and no conflicting
+    /// access may run concurrently (row ranges keep same-system splits
+    /// disjoint).
+    pub unsafe fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+        // C2: reject self-aliasing shapes on this path too.
+        crate::query::assert_no_self_alias::<Q>(sub.world());
         let mut ids = crate::query::IdBuf::new();
         Q::fill_ids(sub.world(), &mut ids);
 
@@ -2886,16 +3014,56 @@ impl<Q: WorldQuery> QueryState<Q> {
         }
     }
 
-    /// Запрос с базой change-detection `world.last_run_tick()` (как
-    /// `ctx.query` в системах).
+    /// Read-only запрос с базой change-detection `world.last_run_tick()`
+    /// (как `ctx.query` в системах). Write-формы — [`query_mut`](Self::query_mut).
     #[inline]
-    pub fn query<'a>(&'a mut self, world: &'a World) -> CachedQuery<'a, Q> {
-        self.query_with_tick(world, world.last_run_tick())
+    pub fn query<'a>(&'a mut self, world: &'a World) -> CachedQuery<'a, Q>
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        let last_run = world.last_run_tick();
+        self.query_with_tick(world, last_run)
     }
 
-    /// Запрос с явной базой `last_run` (для `Changed<T>`-форм с собственным
-    /// отсчётом, например extract-систем).
-    pub fn query_with_tick<'a>(&'a mut self, world: &'a World, last_run: Tick) -> CachedQuery<'a, Q> {
+    /// Read-only запрос с явной базой `last_run` (для `Changed<T>`-форм с
+    /// собственным отсчётом, например extract-систем).
+    pub fn query_with_tick<'a>(&'a mut self, world: &'a World, last_run: Tick) -> CachedQuery<'a, Q>
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        self.update(world);
+        CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
+    }
+
+    /// Запрос любой формы под эксклюзивным заёмом мира.
+    #[inline]
+    pub fn query_mut<'a>(&'a mut self, world: &'a mut World) -> CachedQuery<'a, Q> {
+        let last_run = world.last_run_tick();
+        self.query_mut_with_tick(world, last_run)
+    }
+
+    /// [`query_mut`](Self::query_mut) с явной базой `last_run`.
+    pub fn query_mut_with_tick<'a>(
+        &'a mut self,
+        world: &'a mut World,
+        last_run: Tick,
+    ) -> CachedQuery<'a, Q> {
+        crate::query::assert_no_self_alias::<Q>(world);
+        self.update(world);
+        CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
+    }
+
+    /// Запрос любой формы через unsafe-эскейп мира.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`](crate::query::Query::new_unchecked).
+    pub unsafe fn query_unchecked_with_tick<'a>(
+        &'a mut self,
+        world: crate::unsafe_world_cell::UnsafeWorldCell<'a>,
+        last_run: Tick,
+    ) -> CachedQuery<'a, Q> {
+        let world = world.world();
+        crate::query::assert_no_self_alias::<Q>(world);
         self.update(world);
         CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
     }
@@ -2942,15 +3110,36 @@ impl<Q: WorldQuery> QueryState<Q> {
 // ── Bundle ─────────────────────────────────────────────────────
 
 pub trait Bundle: Sized {
-    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]>;
+    /// Состав бандла в порядке ОБЪЯВЛЕНИЯ (declaration order) БЕЗ конструирования
+    /// значения (§10.10): derive/кортежи знают его статически по типам. Это
+    /// устраняет footgun `make_bundle(0)`-probe в `spawn_many` (замыкание больше
+    /// не обязано быть чистым и не зовётся лишний раз ради состава).
+    ///
+    /// Порядок — ОБЪЯВЛЕНИЯ, НЕ сортированный: `col_indices` для
+    /// `write_into_batch` обязан быть в порядке обхода (иначе запись в чужую
+    /// колонку — UB). Отсортированный ключ архетипа даёт [`component_ids`].
+    fn static_component_ids(
+        registry: &mut ComponentRegistry,
+        out: &mut SmallVec<[ComponentId; 8]>,
+    );
 
-    /// Записать ComponentId'ы напрямую в `out` — без создания промежуточных SmallVec.
+    /// Состав как ОТСОРТИРОВАННЫЙ владеемый `SmallVec` — ключ архетипа. Делегирует
+    /// к [`static_component_ids`](Bundle::static_component_ids) + `sort_unstable`.
+    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
+        let mut out = SmallVec::new();
+        Self::static_component_ids(registry, &mut out);
+        out.sort_unstable();
+        out
+    }
+
+    /// Записать ComponentId'ы в порядке ОБЪЯВЛЕНИЯ в `out` (без промежуточного
+    /// SmallVec) — для обхода `write_into_batch`.
     fn push_component_ids(
         &self,
         registry: &mut ComponentRegistry,
         out: &mut SmallVec<[ComponentId; 8]>,
     ) {
-        out.extend(self.component_ids(registry));
+        Self::static_component_ids(registry, out);
     }
 
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
@@ -3010,13 +3199,7 @@ impl<T: Component> Bundle for T {
     }
 
     #[inline(always)]
-    fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-        smallvec::smallvec![registry.get_or_register::<T>()]
-    }
-
-    #[inline(always)]
-    fn push_component_ids(
-        &self,
+    fn static_component_ids(
         registry: &mut ComponentRegistry,
         out: &mut SmallVec<[ComponentId; 8]>,
     ) {
@@ -3116,30 +3299,17 @@ macro_rules! impl_bundle {
                 0usize $( + $T::component_count() )+
             }
 
-            #[inline]
-            fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-                let mut ids = smallvec::SmallVec::<[ComponentId; 8]>::new();
-                #[allow(non_snake_case)]
-                let ($($T,)+) = self;
-                $( $T.push_component_ids(registry, &mut ids); )+
-                ids.sort_unstable();
-                ids
-            }
-
             /// ВАЖНО (корректность batch-спавна): пушит id в порядке ОБЪЯВЛЕНИЯ кортежа — том же,
-            /// в котором `write_into_batch` обходит компоненты. `component_ids` СОРТИРУЕТ (для
-            /// архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в порядке обхода, иначе
-            /// компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B колонку). См.
-            /// `spawn_many_inner`/`spawn_bundles_bulk` — они строят `col_indices` ИМЕННО отсюда.
+            /// в котором `write_into_batch` обходит компоненты. `component_ids` (дефолт trait'а)
+            /// СОРТИРУЕТ (ключ архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в
+            /// порядке обхода, иначе компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B
+            /// колонку). См. `spawn_many_inner`/`spawn_bundles_bulk` — строят `col_indices` отсюда.
             #[inline]
-            fn push_component_ids(
-                &self,
+            fn static_component_ids(
                 registry: &mut ComponentRegistry,
                 out: &mut SmallVec<[ComponentId; 8]>,
             ) {
-                #[allow(non_snake_case)]
-                let ($($T,)+) = self;
-                $( $T.push_component_ids(registry, out); )+
+                $( $T::static_component_ids(registry, out); )+
             }
 
             #[inline]
@@ -3220,8 +3390,10 @@ impl Bundle for () {
         0
     }
 
-    fn component_ids(&self, _registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
-        SmallVec::new()
+    fn static_component_ids(
+        _registry: &mut ComponentRegistry,
+        _out: &mut SmallVec<[ComponentId; 8]>,
+    ) {
     }
 
     fn write_into(self, _world: &mut World, _archetype_id: ArchetypeId, _row: usize, _tick: Tick) {
@@ -3566,7 +3738,8 @@ mod tests {
     fn system_context_try_resource_some() {
         let mut world = World::new();
         world.insert_resource(Score(42));
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         let res = ctx.try_resource::<Score>();
@@ -3577,7 +3750,8 @@ mod tests {
     #[test]
     fn system_context_try_resource_none() {
         let world = World::new();
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         assert!(ctx.try_resource::<Score>().is_none());
@@ -3587,7 +3761,8 @@ mod tests {
     fn system_context_try_resource_mut_some() {
         let mut world = World::new();
         world.insert_resource(Score(10));
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         let res_mut = ctx.try_resource_mut::<Score>();
@@ -3598,7 +3773,8 @@ mod tests {
     #[test]
     fn system_context_try_resource_mut_none() {
         let world = World::new();
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         assert!(ctx.try_resource_mut::<Score>().is_none());
@@ -3892,15 +4068,12 @@ mod tests {
             2
         }
 
-        fn component_ids(
-            &self,
+        fn static_component_ids(
             registry: &mut crate::ComponentRegistry,
-        ) -> SmallVec<[crate::ComponentId; 8]> {
-            let mut ids = SmallVec::new();
-            crate::Bundle::push_component_ids(&self.pos, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.hp, registry, &mut ids);
-            ids.sort_unstable();
-            ids
+            out: &mut SmallVec<[crate::ComponentId; 8]>,
+        ) {
+            <Pos as crate::Bundle>::static_component_ids(registry, out);
+            <Hp as crate::Bundle>::static_component_ids(registry, out);
         }
 
         fn write_into(
@@ -3930,16 +4103,13 @@ mod tests {
             4
         }
 
-        fn component_ids(
-            &self,
+        fn static_component_ids(
             registry: &mut crate::ComponentRegistry,
-        ) -> SmallVec<[crate::ComponentId; 8]> {
-            let mut ids = SmallVec::new();
-            crate::Bundle::push_component_ids(&self.base, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.weapon, registry, &mut ids);
-            crate::Bundle::push_component_ids(&self.armor, registry, &mut ids);
-            ids.sort_unstable();
-            ids
+            out: &mut SmallVec<[crate::ComponentId; 8]>,
+        ) {
+            <PlayerBase as crate::Bundle>::static_component_ids(registry, out);
+            <Vel as crate::Bundle>::static_component_ids(registry, out);
+            <Armor as crate::Bundle>::static_component_ids(registry, out);
         }
 
         fn write_into(
@@ -4759,8 +4929,8 @@ mod wave5_par_split {
     #[test]
     fn par_split_write_matches_sequential() {
         // Parallel (adaptive-split) mutation.
-        let (wp, _) = skewed_world();
-        wp.query::<crate::query::Write<N>>()
+        let (mut wp, _) = skewed_world();
+        wp.query_mut::<crate::query::Write<N>>()
             .par_for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut par: Vec<u32> = wp
             .query::<crate::query::Read<N>>()
@@ -4770,8 +4940,8 @@ mod wave5_par_split {
         par.sort_unstable();
 
         // Sequential reference on an identically-built world.
-        let (ws, _) = skewed_world();
-        ws.query::<crate::query::Write<N>>()
+        let (mut ws, _) = skewed_world();
+        ws.query_mut::<crate::query::Write<N>>()
             .for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut seq: Vec<u32> = ws
             .query::<crate::query::Read<N>>()
@@ -4784,5 +4954,62 @@ mod wave5_par_split {
             par, seq,
             "split par_for_each must mutate each entity exactly like sequential"
         );
+    }
+}
+
+#[cfg(test)]
+mod wave6_bundle {
+    //! §10.10: `spawn_many` takes the bundle composition STATICALLY
+    //! (`Bundle::static_component_ids`), so the `make_bundle` closure is called
+    //! exactly `count` times — no extra `make_bundle(0)` probe. This removes the
+    //! footgun that the closure had to be pure.
+    use super::*;
+
+    #[derive(Debug, PartialEq)]
+    struct C(u32);
+    impl Component for C {}
+
+    #[test]
+    fn spawn_many_calls_make_bundle_exactly_count_times() {
+        let mut world = World::new();
+        let mut calls = 0usize;
+        let entities = world.spawn_many(5, |i| {
+            calls += 1;
+            C(i as u32)
+        });
+        assert_eq!(entities.len(), 5);
+        assert_eq!(
+            calls, 5,
+            "make_bundle must run exactly `count` times (no make_bundle(0) probe)"
+        );
+        // Per-entity data is intact (probe removal did not disturb the loop).
+        for (i, &e) in entities.iter().enumerate() {
+            assert_eq!(world.get::<C>(e), Some(&C(i as u32)));
+        }
+    }
+
+    /// E6: `map_entity_refs` rewrites the registered component's Entity fields in
+    /// place through the raw `MapEntitiesFn` path (Miri-checked unsafe).
+    #[test]
+    fn e6_map_entity_refs_remaps_in_place() {
+        #[derive(Debug, PartialEq)]
+        struct Link(Entity);
+        impl Component for Link {}
+        impl crate::component::MapEntities for Link {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        world.register_map_entities::<Link>();
+        let a = world.spawn(());
+        let b = world.spawn(());
+        let e = world.spawn((Link(a),));
+        assert_eq!(world.get::<Link>(e).unwrap().0, a);
+
+        let mut remap = |old: Entity| if old == a { b } else { old };
+        world.map_entity_refs(e, &mut remap);
+        assert_eq!(world.get::<Link>(e).unwrap().0, b, "ref remapped a -> b");
     }
 }
