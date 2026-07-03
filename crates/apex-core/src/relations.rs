@@ -611,6 +611,17 @@ impl World {
     /// Мёртвые subject/target игнорируются (с warn в лог): связь с мёртвым
     /// target никогда не была бы вычищена и при переиспользовании индекса
     /// указала бы на чужую entity.
+    ///
+    /// # Re-parenting and transforms (C5)
+    ///
+    /// Changing an entity's `ChildOf` parent does NOT touch its `LocalTransform`,
+    /// so `propagate_transforms` (which keys on `Changed<LocalTransform>`) will not
+    /// recompute the child's `GlobalTransform` on its own. The caller decides the
+    /// intent: to keep the child's WORLD position, recompute and write its
+    /// `LocalTransform` relative to the new parent (this also dirties it); to keep
+    /// the child's LOCAL transform (it moves with the new parent), also stamp the
+    /// `LocalTransform` change tick so propagation picks it up. Nothing here is
+    /// done automatically because the two intents are mutually exclusive.
     pub fn add_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
         let kind_idx = self.relations.get_or_register::<R>();
         self.add_relation_by_kind_idx(subject, kind_idx, target);
