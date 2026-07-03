@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::{
-    archetype::{Archetype, ArchetypeId},
+    archetype::{Archetype, ArchetypeId, TickCell},
     commands::Commands,
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{Entity, EntityAllocator, EntityLocation},
@@ -970,8 +970,10 @@ impl World {
             let arch = &mut self.archetypes[arch_idx];
             for &col_idx in &col_indices {
                 let col = &mut arch.columns[col_idx];
-                col.change_ticks.resize(target_len, tick);
-                col.added_ticks.resize(target_len, tick);
+                col.change_ticks
+                    .resize_with(target_len, || TickCell::new(tick));
+                col.added_ticks
+                    .resize_with(target_len, || TickCell::new(tick));
                 col.len = target_len;
             }
         }
@@ -1091,8 +1093,10 @@ impl World {
         let target_len = start_row + count;
         for &col_idx in &col_indices {
             let col = &mut self.archetypes[arch_idx].columns[col_idx];
-            col.change_ticks.resize(target_len, tick);
-            col.added_ticks.resize(target_len, tick);
+            col.change_ticks
+                .resize_with(target_len, || TickCell::new(tick));
+            col.added_ticks
+                .resize_with(target_len, || TickCell::new(tick));
             col.len = target_len;
         }
         self.entities
@@ -1573,7 +1577,7 @@ impl World {
         let col_idx = arch.column_index(component_id)?;
         let col = &mut arch.columns[col_idx];
         if row < col.change_ticks.len() {
-            col.change_ticks[row] = tick;
+            col.change_ticks[row] = TickCell::new(tick);
         }
         unsafe { Some(col.get_mut::<T>(row)) }
     }
@@ -2847,8 +2851,8 @@ impl<T: Component> Bundle for T {
                         col.item_size,
                     );
                 }
-                col.change_ticks.push(tick);
-                col.added_ticks.push(tick);
+                col.change_ticks.push(TickCell::new(tick));
+                col.added_ticks.push(TickCell::new(tick));
                 col.len += 1;
             }
         }
@@ -2874,8 +2878,8 @@ impl<T: Component> Bundle for T {
                 let dst = col.get_ptr(row);
                 std::ptr::copy_nonoverlapping(&self as *const T as *const u8, dst, col.item_size);
             }
-            col.change_ticks.push(tick);
-            col.added_ticks.push(tick);
+            col.change_ticks.push(TickCell::new(tick));
+            col.added_ticks.push(TickCell::new(tick));
             col.len += 1;
         }
         std::mem::forget(self);

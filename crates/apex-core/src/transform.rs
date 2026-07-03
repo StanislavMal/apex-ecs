@@ -493,8 +493,8 @@ pub fn propagate_transforms(world: &mut World) {
                     continue;
                 };
                 let col = &arch.columns[col_idx];
-                for (&tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
-                    if tick.is_newer_than(last_run) {
+                for (tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
+                    if tick.get().is_newer_than(last_run) {
                         dirty_entities.push(entity);
                         dirty.mark(entity.index);
                     }

@@ -1925,6 +1925,69 @@ mod query_filter_tests {
         assert!(pairs.iter().all(|(e, _)| world.is_alive(*e)));
     }
 
+    /// A2 regression: mutating through `Query<Write<T>>` stamps the row's
+    /// change-tick via a `*mut Tick` whose provenance is the `TickCell`
+    /// interior — a write through a *shared* `&Column`. Under the pre-fix
+    /// `Vec<Tick>` layout that write was undefined behavior (Miri Tree Borrows
+    /// rejects a write to non-interior-mutable memory reached from `&self`).
+    /// Covers both the per-item hot path (`Mut::deref_mut` → `ticks_ptr`) and
+    /// the dense chunk path (`stamp_range`); the `Changed<T>` asserts confirm
+    /// the stamp actually lands. Run under
+    /// `cargo +nightly miri test -Zmiri-tree-borrows` to validate soundness.
+    #[test]
+    fn a2_write_stamps_change_tick_soundly() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1),));
+        let f = world.spawn((Hp(2),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        // Nothing changed since the advance.
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+                .iter()
+                .count(),
+            0
+        );
+
+        // Per-item Write path: `Mut::deref_mut` writes the tick through the
+        // shared `&Column` via `ticks_ptr()`.
+        {
+            let mut q = Query::<Write<Hp>>::new(&world);
+            for mut hp in &mut q {
+                hp.0 += 100;
+            }
+        }
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(101)));
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+                .iter()
+                .count(),
+            2
+        );
+
+        // Dense chunk path: `Write<T>::fetch_slices` calls `stamp_range` over
+        // the same cell buffer.
+        world.advance_change_tick();
+        let lr2 = world.last_run_tick();
+        {
+            let q = Query::<Write<Hp>>::new(&world);
+            q.for_each_chunk(|_entities, hps: &mut [Hp]| {
+                for hp in hps {
+                    hp.0 += 1;
+                }
+            });
+        }
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(102)));
+        assert_eq!(world.get::<Hp>(f), Some(&Hp(103)));
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr2)
+                .iter()
+                .count(),
+            2
+        );
+    }
+
     /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
     #[test]
     fn query_single() {
