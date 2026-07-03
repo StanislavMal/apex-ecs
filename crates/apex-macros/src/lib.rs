@@ -445,33 +445,39 @@ fn expand_tuple_struct(
             }
         })
     } else {
-        // Несколько полей → таблица с позиционными ключами
-        let to_lua_stmts = (0..field_count).map(|i| {
+        // Несколько полей → таблица с позиционными строковыми ключами "0","1",…
+        // ВАЖНО: генерировать локальные переменные через `f{i}` (f0, f1, …), а НЕ через
+        // `syn::Index` — иначе `let 0: T = …` даёт литеральный refutable-паттерн (E0005),
+        // а `Self(0, 1)` конструирует из ЛИТЕРАЛОВ вместо переменных.
+        let local_idents: Vec<syn::Ident> = (0..field_count)
+            .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
+            .collect();
+
+        // Строковые ключи полей — те же "0","1",… что и в field_names() (согласованность).
+        let field_keys: Vec<String> = (0..field_count).map(|i| i.to_string()).collect();
+
+        let to_lua_stmts = (0..field_count).zip(field_keys.iter()).map(|(i, key)| {
             let fi = syn::Index::from(i);
-            let key = i.to_string();
             quote! {
                 t.set(#key, self.#fi.clone())?;
             }
         });
 
-        let from_lua_stmts = (0..field_count).zip(field_types.iter()).map(|(i, ft)| {
-            let fi = syn::Index::from(i);
-            let key = i.to_string();
-            quote! {
-                let #fi: #ft = t.get(#key).ok()?;
-            }
-        });
+        let from_lua_stmts = local_idents.iter()
+            .zip(field_types.iter())
+            .zip(field_keys.iter())
+            .map(|((local, ft), key)| {
+                quote! {
+                    let #local: #ft = t.get(#key).ok()?;
+                }
+            });
 
-        let struct_fields = (0..field_count).map(|i| {
-            let fi = syn::Index::from(i);
-            quote! { #fi }
-        });
+        let struct_fields = local_idents.iter().map(|local| quote! { #local });
 
-        let reg_arg_names: Vec<syn::Ident> = (0..field_count)
-            .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
-            .collect();
-        let reg_inserts = reg_arg_names.iter().enumerate().map(|(i, a)| {
-            let key = i.to_string();
+        let field_names_arr = field_keys.iter().map(|n| quote! { #n });
+
+        let reg_arg_names = &local_idents;
+        let reg_inserts = reg_arg_names.iter().zip(field_keys.iter()).map(|(a, key)| {
             quote! {
                 t.set(#key, #a)?;
             }
@@ -480,7 +486,7 @@ fn expand_tuple_struct(
         Ok(quote! {
             impl ::apex_scripting::ScriptableRegistrar for #ident {
                 fn type_name_str() -> &'static str { #type_name }
-                fn field_names() -> &'static [&'static str] { &[#(::std::stringify!(#field_types)),*] }
+                fn field_names() -> &'static [&'static str] { &[#(#field_names_arr),*] }
 
                 fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
                     let t = lua.create_table()?;
@@ -578,15 +584,17 @@ fn expand_c_like_enum(
     let variant_idents: Vec<&syn::Ident> = variants.iter().map(|v| &v.ident).collect();
     let variant_names: Vec<String> = variant_idents.iter().map(|v| v.to_string()).collect();
 
-    let from_lua_arms: Vec<TokenStream2> = variant_idents.iter().enumerate().map(|(i, v)| {
-        let vi = i as i64;
-        quote! { #vi => ::std::option::Option::Some(Self::#v) }
+    // Match on the REAL discriminant (`Self::V as i64`), not the ordinal index —
+    // otherwise a C-enum with explicit discriminants (`enum E { A = 10 }`) breaks
+    // roundtrip: to_lua emits 10 but from_lua would only match ordinal 0.
+    let from_lua_arms: Vec<TokenStream2> = variant_idents.iter().map(|v| {
+        quote! { x if x == (#ident::#v as i64) => ::std::option::Option::Some(Self::#v) }
     }).collect();
 
-    let reg_entries: Vec<TokenStream2> = variant_names.iter().enumerate().map(|(i, n)| {
-        let vi = i as i32;
+    // Lua-namespace constants use the same real discriminants so `E.A == 10`.
+    let reg_entries: Vec<TokenStream2> = variant_idents.iter().zip(variant_names.iter()).map(|(v, n)| {
         quote! {
-            t.set(#n, #vi)?;
+            t.set(#n, #ident::#v as i64)?;
         }
     }).collect();
 
@@ -597,12 +605,13 @@ fn expand_c_like_enum(
             fn field_names() -> &'static [&'static str] { &[] }
 
             fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
-                Ok(mlua::Value::Integer(*self as i32 as mlua::Integer))
+                // Emit the real discriminant (matches from_lua and the Lua constants).
+                Ok(mlua::Value::Integer((*self as i64) as mlua::Integer))
             }
 
             fn from_lua(val: &mlua::Value) -> ::std::option::Option<Self> {
-                let v: i32 = val.as_i32()?;
-                match v as i64 {
+                let v: i64 = val.as_i64()?;
+                match v {
                     #(#from_lua_arms),*,
                     _ => ::std::option::Option::None,
                 }
