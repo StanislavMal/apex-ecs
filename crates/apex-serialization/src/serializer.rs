@@ -1111,6 +1111,37 @@ mod tests {
         assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
     }
 
+    /// F7: `#[derive(Component)]` and `#[derive(Bundle)]` work on GENERIC types
+    /// (impl uses split_for_impl; the linkme registrar is dropped for generics,
+    /// which register lazily on first use of a concrete substitution).
+    #[test]
+    fn f7_generic_derive_component_and_bundle() {
+        #[derive(Component, Clone, Copy, Debug, PartialEq)]
+        struct Wrapper<T: Send + Sync + 'static>(T);
+
+        #[derive(Component, Clone, Copy, Debug, PartialEq)]
+        struct Tag;
+
+        #[derive(Bundle)]
+        struct GenBundle<T: Send + Sync + 'static> {
+            w: Wrapper<T>,
+            t: Tag,
+        }
+
+        let mut world = World::new();
+        let e = world.spawn(GenBundle {
+            w: Wrapper(42u32),
+            t: Tag,
+        });
+        assert_eq!(world.get::<Wrapper<u32>>(e), Some(&Wrapper(42u32)));
+        assert!(world.get::<Tag>(e).is_some());
+
+        // A different substitution is a distinct component type.
+        let e2 = world.spawn((Wrapper(1.5f32),));
+        assert_eq!(world.get::<Wrapper<f32>>(e2), Some(&Wrapper(1.5f32)));
+        assert!(world.get::<Wrapper<u32>>(e2).is_none());
+    }
+
     /// E7: a resource opted into serde survives snapshot/restore into a fresh
     /// world; a non-registered resource is simply absent (no panic).
     #[test]
