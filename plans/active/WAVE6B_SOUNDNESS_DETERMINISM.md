@@ -236,7 +236,28 @@ Per-system командные буферы (в per-system state-слоте из 
 - **ПЕРЕД реализацией:** полный 3-way `cargo bench -p apex-bench --bench benchmarks --features "bevy legion" --
   --save-baseline wave6b_pre` (ОБЯЗАТЕЛЬНО `--bench benchmarks`: без него args уходят и в lib-harness,
   который не знает `--save-baseline`) (apex vs Bevy 0.18 vs Legion 0.4, 18 групп). Плюс `frag_world`-стража и
-  many_foxes движка A/B как контекст.
+  many_foxes движка A/B как контекст. Позже сравнивать: `... -- --baseline wave6b_pre`.
+
+  **Базлайн `wave6b_pre` снят 2026-07-03** (HEAD main после мержа волны 6; медиана µs, `>1.0x` = apex
+  быстрее; criterion-данные локальны в `target/` — числа продублированы здесь durably на случай
+  чистки). **Подтверждает: волна 6 (B1в+dynamic query) перф НЕ регрессировала** — совпадает со
+  стендингом кампании `[[apex-ecs-benchmark-standing]]`:
+
+  | группа | apex µs | vs Bevy | vs Legion | группа | apex µs | vs Bevy | vs Legion |
+  |---|--:|--:|--:|---|--:|--:|--:|
+  | add_remove_component | 505 | 1.61x | 5.13x | despawn_recursive | 22.9 | 2.50x | — |
+  | events | 12.7 | 1.74x | — | commands_spawn | 381 | **1.19x** | — |
+  | changed_iter | 7.0 | 1.04x | — | despawn | 277 | 1.03x | 1.71x |
+  | get_component | 33.4 | 1.05x | 1.47x | commands_insert | 485 | 0.97x | — |
+  | wide_iter | 3.63 | 0.97x | 0.59x | simple_iter | 9.22 | 0.96x | 0.64x |
+  | heavy_compute | 551 | 0.92x | 0.76x | schedule | 45.0 | 0.87x | 0.67x |
+  | simple_insert | 360 | 0.87x | 0.59x | relations | 845 | 0.74x | — |
+  | fragmented_iter | 0.17 | 0.77x | 1.03x | par_split | 1320 | (parallel) | — |
+
+  **Реперы волны 6б** (что защищаем/улучшаем): `commands_spawn` **1.19x** vs Bevy — D8b per-system-блочный
+  резерв должен УЛУЧШИТЬ (убирает contention общего атомика); `commands_insert`/`par_split` — D8b не
+  должен регрессировать; `simple_iter`/`schedule` — В3 трогает plain-fn dispatch, держать. Отставания от
+  Legion (simple/wide_iter, schedule) — известный packed-storage долг В2 (ROI-гейт, вне 6б).
 - **Каждый пункт:** `cargo test --workspace` зелёный · `cargo clippy --workspace` net-neutral (3
   pre-existing apex-bench) · движок `cargo build --workspace` · **`cargo bench -p apex-bench --bench benchmarks --features
   "bevy legion" --no-run`** (criterion-харнесс `benches/*.rs` компилируется ТОЛЬКО `cargo bench`, не
