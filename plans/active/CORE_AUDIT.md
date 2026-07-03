@@ -289,11 +289,22 @@ main):**
   v1 читается пустым); CURRENT_VERSION 1→2 + v1→v2 no-op migration; `SnapshotVersion::CURRENT`=2.
   Регресс `e7_resource_survives_snapshot_restore`. Гейт: workspace зелёный (41 serde), clippy чист,
   движок собирается, goldens 656/656.
-- **Очередь волны 6:** F7 generics в derive (низкий спрос, мелкий) · **В1(в)+В3** (UnsafeWorldCell +
-  `&mut World`-конструкторы write + единый Query поверх per-system QueryState — САМЫЙ тяжёлый, ломает
-  API движка масштабно, риск UB в soundness-фундаменте; план — ДЕТАЛЬНЫЙ план реализации + отдельная
-  фокус-сессия с ревью юзера, НЕ наспех автономно) · QueryBuilder dynamic query · SystemContext
-  ужатие (F3). D8b (Entity id детерминизм) — в В1(в)/F4.
+- **F7 generics в derive ✅** — `#[derive(Component)]`/`#[derive(Bundle)]` через `split_for_impl`
+  работают на обобщённых типах (`Wrapper<T>`, `GenBundle<T>`); linkme-registrar только для non-generic
+  (обобщённые регистрируются лениво). Scriptable-generics опущен (Lua-типы конкретные — нет спроса;
+  tuple/enum закрыты волной 2). Регресс `f7_generic_derive_component_and_bundle`. Гейт: workspace,
+  clippy, движок, goldens 656/656.
+- **ОЧЕРЕДЬ волны 6 (следующая сессия, ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):**
+  (1) **QueryBuilder → dynamic query (§10.4)** — СНАЧАЛА: runtime by ComponentId/имени + untyped
+  итерация (DynItem{entity,arch,row}+get_ptr(id)+typed get::<T>); READ самостоятелен (safe, shared
+  &World; консумер — inspector редактора/скриптинг/agent-IPC); WRITE — с В1(в). QueryBuilder сейчас
+  рудиментарен (query.rs:1908). API готов: `world.component_id_by_name`, `arch.column_index`,
+  `Column::get_raw_ptr`, `arch.entities()`, `arch.columns_raw()`.
+  (2) **В1(в)+В3 одним migration-проходом** — ЗАТЕМ, доделать волну 6 ПОЛНОСТЬЮ: UnsafeWorldCell +
+  `&mut World`-конструкторы write (query::<Write>/get_mut/iter_mut) + единый `Query<'w,'s>` поверх
+  per-system QueryState + SystemContext-ужатие(F3) + QueryBuilder-write + D8b. ~250 ядро + ~50 движок
+  call-sites, adoption-стиль, ОБА репо одним заходом, Miri ОБЯЗАТЕЛЕН, goldens байт-идентичны. §10.1
+  целевая модель (в) целиком. При закрытии — правило ротации + мерж --no-ff в main обоих репо.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
