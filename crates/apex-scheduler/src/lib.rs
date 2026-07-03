@@ -1752,7 +1752,14 @@ impl Scheduler {
                     }
                 }
             }
-            for (label, ids) in level_by_label {
+            // D8: determinism — several `Custom(_)` labels share priority 7, so
+            // their relative order would come from the FxHashMap iteration
+            // (unstable, and different on wasm32). Sort labels (StageLabel: Ord,
+            // Custom ordered by name) so stage order is reproducible run-to-run.
+            let mut labeled: Vec<(StageLabel, Vec<SystemId>)> =
+                level_by_label.into_iter().collect();
+            labeled.sort_by(|a, b| a.0.cmp(&b.0));
+            for (label, ids) in labeled {
                 let prio = label.priority();
                 // Разбиваем на под-Stage'и по маркерам apply_deferred_after
                 let sub_groups = split_at_apply_boundaries(&ids, &self.systems, &self.explicit_orderings);
@@ -1791,8 +1798,10 @@ impl Scheduler {
                     stages.append(&mut s_stages);
                 }
             }
-            // Стадии не указанные в порядке — добавляем в конец
+            // Стадии не указанные в порядке — добавляем в конец, детерминированно
+            // (D8: по label, иначе FxHashMap-порядок непредсказуем).
             let mut remaining: Vec<Stage> = stage_map.into_values().flatten().collect();
+            remaining.sort_by(|a, b| a.label.cmp(&b.label));
             stages.append(&mut remaining);
         } else {
             // Стандартный порядок по priority (Startup → First → ... → Last → Custom)
@@ -4365,6 +4374,35 @@ mod tests {
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
             "Update должен быть перед PreUpdate при configure_stages"
+        );
+    }
+
+    /// D8: multiple Custom stages (all priority 7) are ordered by NAME, not by
+    /// FxHashMap iteration — reproducible run-to-run and across platforms.
+    #[test]
+    fn custom_stages_ordered_by_name_deterministically() {
+        let mut sched = Scheduler::new();
+        sched.add_system_to_stage("z", |_| {}, StageLabel::Custom("zebra".to_string()));
+        sched.add_system_to_stage("a", |_| {}, StageLabel::Custom("alpha".to_string()));
+        sched.add_system_to_stage("m", |_| {}, StageLabel::Custom("mango".to_string()));
+        sched.compile().unwrap();
+
+        let stages = sched.stages().unwrap();
+        let custom: Vec<String> = stages
+            .iter()
+            .filter_map(|s| match &s.label {
+                StageLabel::Custom(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            custom,
+            vec![
+                "alpha".to_string(),
+                "mango".to_string(),
+                "zebra".to_string()
+            ],
+            "Custom stages must be ordered by name"
         );
     }
 
