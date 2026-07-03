@@ -2416,9 +2416,6 @@ impl Scheduler {
             }
         }
 
-        let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-        let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
-
         let mut thread_commands: Vec<Commands> = vec![Commands::new()];
         let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
 
@@ -2469,6 +2466,11 @@ impl Scheduler {
             if !any_active {
                 continue;
             }
+            // D4: rebuild the SubWorld per stage so a Parallel system sees new
+            // archetypes created by an earlier stage this frame (it was built once
+            // before the loop and went stale).
+            let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
+            let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
             {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
@@ -2883,6 +2885,21 @@ impl Scheduler {
         }
 
         for &stage_pos in &schedule {
+            // D4: an earlier stage may have spawned entities into NEW archetypes.
+            // Refresh the cached per-system archetype indices before this stage so
+            // a Filtered parallel system sees them. Previously only the parallel
+            // branch refreshed (in its tail), so new archetypes created by a
+            // non-parallel / fallback stage were missed until the next frame.
+            {
+                let w = unsafe { &*const_ptr };
+                let cur = w.archetypes().len();
+                if cur != prev_arch_count {
+                    prev_arch_count = cur;
+                    self.compute_archetype_indices(w);
+                    self.sub_worlds_dirty = true;
+                    self.prepare_sub_worlds(w);
+                }
+            }
             let (stage_idx, _label, stage_ids, all_parallel, emit_event_types) = &stages[stage_pos];
             // D6: skip the whole stage — including opening the change window — when
             // every system is disabled by its run_condition. Otherwise the window
@@ -4991,6 +5008,50 @@ mod tests {
             world.resource::<Ctl>().seen,
             1,
             "reader must see Changed<Mark> produced while its stage was paused"
+        );
+    }
+
+    /// D4: a Filtered system in a later stage must see archetypes an earlier stage
+    /// spawned THIS frame — the cached per-system archetype indices are refreshed
+    /// before each stage (a non-parallel stage's new archetypes used to be missed
+    /// by a later parallel stage until the next frame).
+    #[test]
+    fn later_stage_sees_archetype_spawned_earlier_this_frame() {
+        use apex_core::prelude::*;
+
+        #[derive(apex_macros::Component)]
+        struct Fresh;
+        #[derive(Default)]
+        struct Count(usize);
+        #[derive(Default)]
+        struct Done(bool);
+
+        fn spawner(w: &mut World) {
+            if !w.resource::<Done>().0 {
+                for _ in 0..5 {
+                    w.spawn((Fresh,));
+                }
+                w.resource_mut::<Done>().0 = true;
+            }
+        }
+        fn counter(q: Query<Read<Fresh>>, mut count: ResMut<Count>) {
+            let mut n = 0;
+            q.for_each(|_, _| n += 1);
+            count.0 = n;
+        }
+
+        let mut world = World::new();
+        world.insert_resource(Count::default());
+        world.insert_resource(Done::default());
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, spawner);
+        sched.add_systems(StageLabel::PostUpdate, counter);
+
+        sched.run(&mut world); // frame 1: Update spawns Fresh, PostUpdate must count them
+        assert_eq!(
+            world.resource::<Count>().0,
+            5,
+            "counter must see the archetype spawned by an earlier stage this frame"
         );
     }
 
