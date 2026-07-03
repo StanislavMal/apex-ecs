@@ -105,7 +105,13 @@ impl WorldBridge {
 
     /// Отправить действие в целевой мир.
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
-        let _ = self.inbound.send(BridgeEvent::Action(f));
+        // §0.2a (E12): a closed channel (peer world torn down) silently dropped
+        // the action. Surface it (throttled).
+        if self.inbound.send(BridgeEvent::Action(f)).is_err() {
+            apex_core::warn_once!(
+                "WorldBridge::send_action: peer world channel closed — action dropped"
+            );
+        }
     }
 
     /// Отправить типизированное событие в целевой мир.
@@ -116,9 +122,24 @@ impl WorldBridge {
         let type_name = std::any::type_name::<T>().to_string();
         let data = match bincode::serialize(event) {
             Ok(bytes) => bytes,
-            Err(_) => return,
+            // §0.2a (E12): a serialize failure silently discarded the event.
+            Err(e) => {
+                apex_core::warn_once!(
+                    "WorldBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
+                );
+                return;
+            }
         };
-        let _ = self.inbound.send(BridgeEvent::Event { type_name, data });
+        if self
+            .inbound
+            .send(BridgeEvent::Event { type_name, data })
+            .is_err()
+        {
+            apex_core::warn_once!(
+                "WorldBridge::send_event: peer world channel closed — `{}` event dropped",
+                std::any::type_name::<T>(),
+            );
+        }
     }
 
     /// Применить все накопленные сообщения к миру.
@@ -302,7 +323,12 @@ impl CloneableBridge {
 
     /// Отправить действие в IsolatedWorld.
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
-        let _ = self.to_sub.send(BridgeEvent::Action(f));
+        // §0.2a (E12): a closed channel silently dropped the action.
+        if self.to_sub.send(BridgeEvent::Action(f)).is_err() {
+            apex_core::warn_once!(
+                "CloneableBridge::send_action: peer world channel closed — action dropped"
+            );
+        }
     }
 
     /// Отправить типизированное событие в целевой мир (сериализуется через bincode).
@@ -312,9 +338,24 @@ impl CloneableBridge {
         let type_name = std::any::type_name::<T>().to_string();
         let data = match bincode::serialize(event) {
             Ok(bytes) => bytes,
-            Err(_) => return,
+            // §0.2a (E12): a serialize failure silently discarded the event.
+            Err(e) => {
+                apex_core::warn_once!(
+                    "CloneableBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
+                );
+                return;
+            }
         };
-        let _ = self.to_sub.send(BridgeEvent::Event { type_name, data });
+        if self
+            .to_sub
+            .send(BridgeEvent::Event { type_name, data })
+            .is_err()
+        {
+            apex_core::warn_once!(
+                "CloneableBridge::send_event: peer world channel closed — `{}` event dropped",
+                std::any::type_name::<T>(),
+            );
+        }
     }
 
     /// Отправить событие как `Action`.
@@ -396,6 +437,33 @@ mod tests {
     // -----------------------------------------------------------------------
     // IsolatedWorld
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // §0.2a (E12): bridge send paths surface dropped events/actions instead of
+    // swallowing them silently. Behaviour is a graceful no-op (no panic); the
+    // loudness itself (warn_once) is covered by the apex-core macro test.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn e12_closed_channel_drops_without_panic() {
+        let (main, sub) = WorldBridge::new();
+        drop(sub); // receiver for `main.inbound` is gone → send() errors
+        main.send_action(Box::new(|_w: &mut World| {}));
+        main.send_event(&7u32);
+    }
+
+    #[test]
+    fn e12_serialize_failure_drops_event_without_panic() {
+        struct FailSer;
+        impl serde::Serialize for FailSer {
+            fn serialize<S: serde::Serializer>(&self, _s: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("intentional serialize failure"))
+            }
+        }
+        let (main, _sub) = WorldBridge::new();
+        // bincode::serialize fails before the channel is touched — event dropped.
+        main.send_event(&FailSer);
+    }
 
     #[test]
     fn isolated_world_tick() {
