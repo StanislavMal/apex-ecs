@@ -69,6 +69,12 @@ impl Ord for RelationPair {
 /// хранилище переключается на HashSet для O(1) операций.
 const DENSE_THRESHOLD: usize = 8;
 
+/// Upper bound on the ancestor walk used for cycle detection in `add_relation`.
+/// A well-formed hierarchy is far shallower; exceeding it means a pre-existing
+/// cycle (defensive) and the edge is rejected. Bounds the cost against a
+/// pathological chain while never limiting any real scene graph.
+const MAX_ANCESTOR_WALK: usize = 1 << 20;
+
 /// Хранилище отношений для одной сущности.
 ///
 /// - `Sparse`: отсортированный SmallVec для малого числа отношений (≤8).
@@ -423,6 +429,13 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
     fn cascade_delete_on_target_despawn() -> bool {
         false
     }
+
+    /// Exclusive kinds hold at most ONE target per subject: adding a new relation
+    /// replaces the previous one (e.g. `ChildOf` — an entity has a single parent).
+    /// Non-exclusive kinds accumulate (an entity may `Owns` many things).
+    fn exclusive() -> bool {
+        false
+    }
 }
 
 // ── RelationRegistry ───────────────────────────────────────────
@@ -435,6 +448,7 @@ pub type RelationHookFn = fn(&mut crate::world::World, Entity, Entity);
 pub struct RelationRegistry {
     type_to_idx: FxHashMap<TypeId, u32>,
     cascade_flags: Vec<bool>,
+    exclusive_flags: Vec<bool>,
     /// kind_idx → type_name строка (для сериализации).
     /// Инвариант: `idx_to_name[kind_idx]` заполняется в `get_or_register`.
     idx_to_name: Vec<String>,
@@ -452,6 +466,7 @@ impl RelationRegistry {
         Self {
             type_to_idx: FxHashMap::default(),
             cascade_flags: Vec::new(),
+            exclusive_flags: Vec::new(),
             idx_to_name: Vec::new(),
             name_to_idx: FxHashMap::default(),
             next_idx: 0,
@@ -471,6 +486,7 @@ impl RelationRegistry {
         self.type_to_idx.insert(type_id, idx);
         self.cascade_flags
             .push(R::cascade_delete_on_target_despawn());
+        self.exclusive_flags.push(R::exclusive());
         self.on_add_hooks.push(None);
         self.on_remove_hooks.push(None);
 
@@ -543,6 +559,14 @@ impl RelationRegistry {
             .unwrap_or(false)
     }
 
+    #[inline]
+    pub fn is_exclusive(&self, kind_idx: u32) -> bool {
+        self.exclusive_flags
+            .get(kind_idx as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
     // ── Методы для сериализации ────────────────────────────────
 
     /// Получить type_name строку по kind_idx.
@@ -597,14 +621,67 @@ impl World {
     pub fn add_relation_by_kind_idx(&mut self, subject: Entity, kind_idx: u32, target: Entity) {
         debug_assert!(
             (kind_idx as usize) < self.relations.kind_count(),
-            "add_relation_by_kind_idx: незарегистрированный kind_idx {kind_idx}"
+            "add_relation_by_kind_idx: unregistered kind_idx {kind_idx}"
         );
         if !self.entities.is_alive(subject) || !self.entities.is_alive(target) {
             log::warn!(
-                "add_relation: subject {subject} или target {target} не живы — связь не добавлена"
+                "add_relation: subject {subject} or target {target} is not alive — relation not added"
             );
             return;
         }
+        // A relation to itself is never meaningful and forms a 1-cycle.
+        if subject.index == target.index {
+            log::warn!("add_relation: self-relation on {subject} rejected");
+            return;
+        }
+
+        let exclusive = self.relations.is_exclusive(kind_idx);
+        // For hierarchical kinds (exclusive or cascading), reject an edge that
+        // would close a cycle: walking parents up from `target` along this kind
+        // must not reach `subject`. A cycle would spin transform propagation and
+        // cascade-despawn forever (C4). Non-hierarchical kinds may cycle freely.
+        if exclusive || self.relations.is_cascade(kind_idx) {
+            let mut cur = target;
+            let mut depth = 0usize;
+            while let Some(parent) = self.subject_index.first_with_kind(cur.index, kind_idx) {
+                if parent.target.index == subject.index {
+                    log::warn!(
+                        "add_relation: edge {subject} -> {target} (kind {kind_idx}) would create a cycle — rejected"
+                    );
+                    return;
+                }
+                cur = parent.target;
+                depth += 1;
+                if depth > MAX_ANCESTOR_WALK {
+                    log::warn!(
+                        "add_relation: ancestor chain for kind {kind_idx} exceeds the depth limit — rejected (possible pre-existing cycle)"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Exclusive kinds hold at most one target per subject: drop the old pair
+        // (and queue its remove hook — this is what makes a re-parent fire
+        // remove-then-add on the child).
+        if exclusive {
+            if let Some(old) = self.subject_index.first_with_kind(subject.index, kind_idx) {
+                if old.target == target {
+                    return; // already related to this exact target — no-op
+                }
+                self.subject_index.remove(subject.index, old);
+                self.target_index.remove(kind_idx, old.target.index, subject);
+                if self.relations.on_remove_hook(kind_idx).is_some() {
+                    self.hook_queue
+                        .push(crate::world::HookEvent::RelationRemoved {
+                            kind_idx,
+                            subject,
+                            target: old.target,
+                        });
+                }
+            }
+        }
+
         let pair = RelationPair { kind_idx, target };
         if self.subject_index.insert(subject.index, pair) {
             self.target_index.add(kind_idx, target, subject);
@@ -614,9 +691,9 @@ impl World {
                     subject,
                     target,
                 });
-                self.flush_hooks();
             }
         }
+        self.flush_hooks();
     }
 
     pub fn remove_relation<R: RelationKind>(&mut self, subject: Entity, _kind: R, target: Entity) {
@@ -846,6 +923,10 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
 pub struct ChildOf;
 impl RelationKind for ChildOf {
     fn cascade_delete_on_target_despawn() -> bool {
+        true
+    }
+    /// An entity has exactly one parent — a second `set_parent` replaces the first.
+    fn exclusive() -> bool {
         true
     }
 }
@@ -1103,6 +1184,68 @@ mod tests {
         world.add_relation(child, ChildOf, parent);
         assert!(!world.has_relation(child, ChildOf, parent));
         assert_eq!(world.get_relation_target(child, ChildOf), None);
+    }
+
+    /// B9: ChildOf is exclusive — a second `add_relation` re-parents the child
+    /// instead of giving it two parents (the source of the propagate torn-write).
+    #[test]
+    fn exclusive_childof_replaces_previous_parent() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let child = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let p1 = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let p2 = world.spawn((Position { x: 2.0, y: 0.0 },));
+
+        world.add_relation(child, ChildOf, p1);
+        assert_eq!(world.get_relation_target(child, ChildOf), Some(p1));
+
+        world.add_relation(child, ChildOf, p2); // exclusive → replaces p1
+        assert_eq!(world.get_relation_target(child, ChildOf), Some(p2));
+        assert_eq!(world.children_of(ChildOf, p1).count(), 0, "old parent lost the child");
+        assert_eq!(world.children_of(ChildOf, p2).count(), 1, "new parent gained it");
+    }
+
+    /// B9: a non-exclusive kind still accumulates multiple targets.
+    #[test]
+    fn non_exclusive_relation_still_accumulates() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let hub = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let t1 = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let t2 = world.spawn((Position { x: 2.0, y: 0.0 },));
+        world.add_relation(hub, Likes, t1);
+        world.add_relation(hub, Likes, t2);
+        assert!(world.has_relation(hub, Likes, t1));
+        assert!(world.has_relation(hub, Likes, t2));
+    }
+
+    /// B9/C4: a self-relation is rejected (it would be a 1-cycle).
+    #[test]
+    fn self_relation_rejected() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let a = world.spawn((Position { x: 0.0, y: 0.0 },));
+        world.add_relation(a, ChildOf, a);
+        assert_eq!(world.get_relation_target(a, ChildOf), None);
+    }
+
+    /// C4: a cycle-forming ChildOf edge is rejected, so transform propagation and
+    /// cascade-despawn can never spin on it.
+    #[test]
+    fn childof_cycle_rejected() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let a = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let b = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let c = world.spawn((Position { x: 2.0, y: 0.0 },));
+
+        world.add_relation(a, ChildOf, b); // a -> b
+        world.add_relation(b, ChildOf, c); // b -> c
+        // c -> a would close the cycle a->b->c->a: rejected.
+        world.add_relation(c, ChildOf, a);
+        assert_eq!(world.get_relation_target(c, ChildOf), None, "cycle edge rejected");
+        assert_eq!(world.get_relation_target(a, ChildOf), Some(b), "existing edges intact");
+        assert_eq!(world.get_relation_target(b, ChildOf), Some(c));
     }
 
     #[test]
