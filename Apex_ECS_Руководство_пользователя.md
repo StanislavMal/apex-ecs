@@ -747,18 +747,41 @@ Query::<(Added<PhysicsBody>, Read<PhysicsBody>)>::new_with_tick(&world, last_run
 
 ### 4.4 `QueryBuilder` (динамический запрос)
 
-Когда типы компонентов не известны статически — используйте `QueryBuilder`.
+Когда типы компонентов не известны статически (инспектор редактора, скриптинг,
+agent-IPC) — используйте `QueryBuilder`. Компоненты выбираются на этапе
+выполнения: типом (`read::<T>()`), по `ComponentId` (`read_id`) или по полному
+имени типа (`read_name` — то же разрешение, что `world.component_id_by_name`).
 
 ```rust
-// QueryBuilder — runtime запрос (типы не известны статически):
-let arch_ids = world.query_builder()
-    .read::<Position>()
-    .write::<Velocity>()
-    .exclude::<Enemy>()
-    .matching_archetype_ids();
+// Собрать запрос и пройтись по результатам без знания типов на этапе компиляции:
+let hp_id = world.component_id_by_name("my_game::Hp").unwrap();
+let q = world.query_builder()
+    .read_id(hp_id)                     // доступ на чтение по runtime-id
+    .with_name("my_game::Boss")         // фильтр наличия по имени
+    .exclude::<Dead>()                  // фильтр отсутствия типом
+    .build()?;                          // Err: неизвестное имя / write-термы
 
-println!("Подходящих архетипов: {}", arch_ids.len());
+for item in &q {
+    // DynItem { entity, archetype, row } + untyped/typed доступ:
+    let entity = item.entity();
+    let hp: &Hp = item.get::<Hp>(hp_id).unwrap();      // typed (тип сверяется с реестром)
+    let ptr: *const u8 = item.get_ptr(hp_id).unwrap(); // untyped (для биндингов)
+}
+
+// Точечный lookup (инспектор): None если entity мертва или не матчится.
+if let Some(item) = q.get(entity) { /* ... */ }
 ```
+
+Правила громкости (§0.2a): неизвестное имя — `DynQueryError::UnknownComponent`
+при `build()`; НЕзарегистрированный *типовой* терм — запрос честно не матчит
+ничего (никто не может иметь незарегистрированный компонент); несоответствие
+`T` и `id` в `item.get::<T>(id)` — throttled-warn + `None`.
+
+Динамическая ЗАПИСЬ через `build()` недоступна (нужен эксклюзивный доступ к
+миру — `DynQueryError::WriteNotSupported`); для мутаций используйте
+типизированный `Query<Write<T>>`. Метод `matching_archetype_ids()` (индексы
+подходящих архетипов) работает и с write-термами — для низкоуровневых
+консумеров.
 
 ---
 

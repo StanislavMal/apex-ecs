@@ -73,8 +73,8 @@ pub use fn_system::{short_system_name, SystemParamFunction};
 pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
-    Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QuerySingleError, Read,
-    Ref, With, Without, WorldQuery, Write,
+    Added, ArchetypeFilter, Changed, DynItem, DynIter, DynQuery, DynQueryError, Maybe, MaybeWrite,
+    Mut, Or, Query, QueryBuilder, QuerySingleError, Read, Ref, With, Without, WorldQuery, Write,
 };
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
@@ -111,8 +111,9 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, Single,
-        QuerySingleError, Read, Ref, With, Without, WorldQuery, Write,
+        Added, ArchetypeFilter, Changed, DynItem, DynIter, DynQuery, DynQueryError, Maybe,
+        MaybeWrite, Mut, Or, Query, QueryBuilder, QuerySingleError, Read, Ref, Single, With,
+        Without, WorldQuery, Write,
     };
     pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
     pub use crate::resources::Resources;
