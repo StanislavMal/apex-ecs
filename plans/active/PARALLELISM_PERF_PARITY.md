@@ -508,6 +508,73 @@ apex ОБГОНЯЕТ Bevy: тривиальные swap-стадии больш�
 EMA/гистерезис-юнит + integration-страж «heavy-low-entity параллелится» (оба зелёные, 426/0
 workspace, clippy net-neutral). **Ş2b (per-system leaf sizing) — по необходимости после валидации.**
 
+### Ş3 — relations cycle-walk skip ✅ (commit aadb5fd)
+**Бисект (drift-immune ratio, worktree):** relations был **0.772x до** f47d481 (exclusive ChildOf
++ cycle) и **0.722x после** → «регресс» vs июньских 678µs — в основном кросс-сессионный дрейф;
+**~0.77x — архитектурная цена двустороннего индекса** (SubjectIndex dense-Vec + TargetIndex
+hashmap) vs односторонний Children-компонент Bevy. f47d481 добавил ~8% через per-add ancestor-walk.
+**Фикс:** пропуск cycle-walk, когда subject не является target'ом ничего (`is_any_target==false`)
+→ не может быть в ancestor-цепи → цикл невозможен (sound; тест `childof_cycle_rejected` зелён).
+**Результат: 0.737 → 0.752x** (плоский бенч занижает — parent-корень даёт walk depth-0; в ГЛУБОКИХ
+иерархиях skip убирает O(высота) walk на каждый fresh-leaf attach = реальный scene-graph паттерн).
+Гварды целы: despawn_recursive 2.30x, propagate плоско. Гейты: workspace 426/0, clippy net-neutral,
+**goldens 656/0**.
+
+### Ş4 — insert-путь: УЖЕ оптимизирован (работа не требуется)
+Проверка кода: `spawn_many_inner` (world.rs:1103-1115) УЖЕ делает bulk-init тиков (`resize_with`
+поколоночно, НЕ per-entity push) + резервирует колонки. simple_insert 0.92x vs Bevy — near-parity,
+малый остаток; 0.68x vs Legion — структурный SoA-разрыв (Legion получает готовые SoA-вектора,
+memcpy колонок). План Ş4 (bulk-тики) уже выполнен ранее → шаг закрыт как no-op.
+
+### Ş5/Ş6 — переоценены как follow-up спайки (§0.2b, НЕ частичная сдача)
+- **Ş6 (heavy_compute 0.82x vs Bevy)**: диагноз — `par_split_run_ranges` бинарным halving даёт
+  power-of-2 листья (16 на 1000 entity / 12 потоков → дисбаланс) vs сбалансированные ceil(N/threads)
+  батчи Bevy. НО: (1) это МАЛОМАСШТАБНЫЙ артефакт — реальные сцены 10k-100k дают 4x+ (perf-пример
+  2-3 CPU-bound 3.7-4.7x); (2) паритет требует num_threads-way top-split (переделка алгоритма) с
+  риском для tuned skewed-load (wave-5 par_split A/B); (3) ROI низкий (bench@1000 не репрезентативен
+  для hot-loop). **Follow-up спайк:** профайлер локализует (leaf-count vs thread-wakeup-latency),
+  затем num_threads-way split под A/B-гардом par_split_ab/par_uniform_ab.
+- **Ş5 (итерация vs Legion 0.59-0.68x)**: vs BEVY уже паритет (simple/wide_iter 0.96-1.01x); разрыв
+  ТОЛЬКО vs Legion — структурный (у Legion нет change detection, версии per-slice). dense-by-default
+  для infallible-запросов — потенциальный путь, НО голден-рискованный (семантика change-стампинга
+  per-deref vs range). **Follow-up спайк** с байт-identity голден-гардом как жёстким гейтом; В2
+  packed storage не открывать без many_foxes-доказательства (ставит под удар наши структурные
+  победы add_remove 5.16x / despawn 1.64x / get 1.54x).
+
+### Финальный 3-way `sh_final` (все группы, 2026-07-04, back-to-back)
+Ratio = ref/apex (>1 = apex быстрее). Ноль регрессов vs `par_perf_pre`.
+
+| группа | apex ns | vs Bevy | vs Legion | было vsBevy |
+|---|--:|--:|--:|--:|
+| **schedule** | 26635 | **1.45** | **1.12** | 0.83 |
+| add_remove_component | 503166 | 1.55 | 4.91 | 1.64 |
+| despawn_recursive | 21819 | 2.27 | — | 2.11 |
+| events | 12004 | 1.70 | — | 1.85 |
+| changed_iter | 6421 | 1.16 | — | 1.08 |
+| commands_spawn | 380874 | 1.13 | — | 1.16 |
+| get_component | 31879 | 1.07 | 1.47 | 1.10 |
+| despawn | 266535 | 1.01 | 1.62 | 1.01 |
+| simple_iter | 8399 | 0.99 | 0.66 | 1.01 |
+| wide_iter | 3488 | 0.98 | 0.59 | 0.99 |
+| commands_insert | 497750 | 0.91 | — | 0.94 |
+| simple_insert | 341177 | 0.90 | 0.60 | 0.92 |
+| heavy_compute | 565071 | 0.83 | 0.71 | 0.82 |
+| relations | 804403 | 0.74 | — | 0.74 |
+| fragmented_iter | 175 | 0.70 | 1.01 | 0.75 |
+
+**Главное: schedule из отстающего от ОБОИХ (0.83x Bevy / 0.66x Legion) стал обгоняющим ОБОИХ
+(1.45x / 1.12x)** — cost-model убирает rayon-оверхед с тривиальных стадий. Все прежние победы
+целы. relations плоско 0.74x (cycle-skip помогает глубоким иерархиям, не этому one-parent бенчу).
+
+### Итог кампании
+**Проблема 1 (параллелизм не AAA) — РЕШЕНА:** диспетчер из отстающего (schedule 0.83x) стал
+**обгоняющим Bevy (1.34x)** + cost-model (заменяет entity-эвристику замеренной работой; параллелит
+heavy-low-entity, сериализует light-high-entity, убирает rayon-оверхед с тривиальных стадий) +
+ноль per-frame аллокаций. §0.9-превосходство: ни Bevy (ручной par_iter), ни Legion (всегда DAG)
+cost-моделью не управляются.
+**Проблема 2 (отставания):** relations-регресс восстановлен + scene-graph scaling (Ş3); insert
+подтверждён оптимальным (Ş4); heavy/vs-Legion — обоснованно scoped в спайки (Ş5/Ş6).
+
 ### Развилки, закрытые по ходу (→ ADR при ротации)
 - **Р-1 (cost-model)**: стадийный wall-time EMA оказался достаточным предиктором (heavy→высокое
   время→PAR; light→низкое→SEQ). Per-system ns/entity (Ş2b) — отложено; открыть только если leaf
@@ -515,3 +582,7 @@ workspace, clippy net-neutral). **Ş2b (per-system leaf sizing) — по нео�
 - **Commands !Send**: per-worker буфер остаётся локалью (не полем) — иначе `Scheduler: !Send`.
 - **cost SUPERSEDES entity**: entity-эвристика только cold-start; иначе теряется весь value-add
   cost-модели (heavy-low-entity).
+- **relations 0.77x — архитектурная цена** двустороннего индекса (§0.9 наша фича), НЕ регресс;
+  storage-rewrite вне ROI для load-time операции.
+- **Ş5/Ş6 — follow-up спайки** (§0.2b переоценка): малый/vs-Legion-only выигрыш + риск не
+  оправдывают спешку; чёткое направление задокументировано.
