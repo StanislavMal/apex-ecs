@@ -7,7 +7,11 @@
 > (критерий — золотой путь, см. §10). **Волны 0-4 ✅ СМЕРЖЕНЫ и ЗАПУШЕНЫ**. **Волна 5 ✅ ГОТОВА**
 > (перф + ложные Changed): A13 (get_mut→Mut) + split par_for_each (§7, +7%) + O(R²)→O(R) diff;
 > пулинг/ленивая-entity/bulk обоснованно отклонены, string-table отложена. Ветка `core-audit-wave5`.
-> **Волна 6 🔜** (архитектура: В1(в) borrow-модель + В3 query-консолидация; самый тяжёлый заход).
+> **Волна 6 ✅** (архитектура): make_bundle/D8a/E6/E7/F7 + QueryBuilder dynamic query (read+write) +
+> **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery + `&mut World`/`new_mut` write-
+> конструкторы — soundness в типах). Ветка `core-audit-wave6`, готова к мержу.
+> **Волна 6б 🔜** (scheduler/SystemParam overhaul): В3 per-system QueryState (⚠ ROI-гейт) + F3-target
+> (ctx-ужатие) + D8b (per-system commands). Переоценка §0.2b — см. «Журнал волн».
 
 ## Журнал волн (ход исполнения)
 
@@ -337,11 +341,29 @@ main):**
   (+prelude); руководство §4.4 дополнено. Регресс: +7 тестов (typed/untyped for_each_mut, Changed-
   стамп, aliased/unknown громко, read-build-отказ, point-get+фильтр, mixed read+write). Гейт:
   workspace, clippy net-neutral, движок собирается, Miri TB dyn_query 16/16 0 UB, goldens 656/656.
-- **ОЧЕРЕДЬ волны 6 (ГОТОВЫЙ ПРОМПТ в памяти `apex-core-audit-2026-07`):** **В3** (единый
-  `Query<'w,'s>` поверх per-system QueryState — plain-fn системы пересобирают state каждый вызов) +
-  **F3** (SystemContext-ужатие: убрать resource_mut/event_writer/произвольный query из публичного
-  ctx — доступ только через декларированные SystemParam) + **D8b** (per-system command-буферы,
-  детерминизм Entity id). При закрытии — правило ротации + мерж --no-ff в main обоих репо.
+- **⚠ ПЕРЕОЦЕНКА (§0.2b): В3+F3+D8b выделены в «Волну 6б — scheduler/SystemParam overhaul»**
+  (2026-07-03). Обоснование: флагманский soundness-🔴 (мутабельный алиас из safe-кода) ЗАКРЫТ
+  B1(в) — безопасность выражена в типах. Оставшиеся три — качественно иная работа (переработка
+  ядра планировщика + трейта `SystemParam`), НЕ хвост borrow-migration, и полу-приземлять её
+  нельзя (§0.2b):
+  - **В3** (единый `Query<'w,'s>` поверх per-system QueryState) — требует `State`/`init_state`/
+    `get_param` на ВСЕХ 19 impl'ах `SystemParam` + threading состояния кортежей (макро) +
+    per-system хранилище (в замыкании `fn_sys` либо в слоте планировщика). ⚠ ROI СОМНИТЕЛЕН:
+    arch-индексы УЖЕ предвычислены планировщиком per-system и заимствуются zero-alloc через
+    SubWorld — «пересборка state каждый вызов» на деле = только `fill_ids` (~8 lookup'ов) +
+    `assert_no_self_alias` (~8). Это класс arch_cols (реализовано→замерено→отклонено,
+    [[apex-ecs-benchmark-standing]]): делать ТОЛЬКО с A/B-замером, доказывающим выигрыш, иначе
+    не трогать. Оценить по факту, не по «главный горячий выигрыш» на веру.
+  - **F3-target** (убрать resource_mut/event_writer/произвольный-Q query из публичного
+    SystemContext) — 23 движковых `ctx.*`-сайта + внутренние; «правильная» форма = миграция
+    AutoSystem'ов на декларированные SystemParam ИЛИ debug-валидация запрошенного access против
+    декларированного (более слабая, но громкая — §0.2a). F3-минимум (Ctx⇒NEEDS_WHOLE_WORLD)
+    уже сделан (волна 2).
+  - **D8b** (per-system command-буферы, детерминизм Entity id) — замена 16 связок
+    `thread_commands`/`current_thread_index` на per-system буферы + apply в порядке систем;
+    Commands сейчас per-thread, apply per-stage.
+  **Волна 6 (borrow-модель + dynamic query) готова к мержу; 6б — отдельным заходом (свой промпт
+  в памяти).** При закрытии 6б — правило ротации + мерж --no-ff в main обоих репо.
 > **Охват:** все крейты воркспейса apex-ecs на HEAD `4ff7a0a` (apex-core 18.2k строк,
 > apex-scheduler 7.2k, apex-serialization 2.2k, apex-scripting 1.9k, apex-graph, apex-isolated,
 > apex-hot-reload, apex-macros, apex-bench, apex-examples; ~36k строк).
@@ -885,17 +907,23 @@ allow(missing_safety_doc) → точечные SAFETY-доки.
 *Гейт: criterion 3-way — нет регресса ни в одной группе >5% (шум), целевые группы улучшены
 воспроизводимо; frag_world; many_foxes движка A/B; goldens.*
 
-**Волна 6 — АРХИТЕКТУРА/API (P3; все развилки решены — §10).**
-**В1(в)+В3 одним migration-проходом** (UnsafeWorldCell + `&mut World`-конструкторы write-путей
-+ единый `Query<'w,'s>` поверх per-system QueryState) · В4 дифференциаторы: snapshot
-(E6 MapEntities + E7 ресурсы/версии) И IsolatedWorld (ремаппинг, bounded-каналы,
-кросс-поточные тесты) · QueryBuilder → полноценный dynamic query (консумеры: инспектор
-редактора, скриптинг, agent-IPC) · D8 детерминизм (per-system command-буферы + сортировка
-Custom-стадий) · F7 generics в derive · make_bundle → честный `Bundle::static_component_ids` ·
-D6-полное (per-system last_run — оценить по факту после D6-минимума) · SystemContext ужатие
-(F3 целевое).
-*Гейт: migration-проход движка одним заходом, adoption-стиль; полный сьют оба репо; goldens;
-руководство ядра актуализировано.*
+**Волна 6 ✅ — АРХИТЕКТУРА/API (P3; все развилки решены — §10).** СДЕЛАНО:
+make_bundle→`Bundle::static_component_ids` · D8a детерминизм Custom-стадий · E6 MapEntities +
+E7 ресурсы/версии (snapshot-дифференциатор) · F7 generics в derive · **QueryBuilder → dynamic
+query (read+write)** · **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery +
+`&mut World`/`new_mut`/`unsafe new_unchecked` write-конструкторы — soundness в типах, §10.1
+целиком). Ветка `core-audit-wave6`. *Гейт каждого пункта пройден: workspace+clippy net-neutral+
+целевой Miri TB 0 UB+goldens 656/656.* ОСТАЛОСЬ (В4 IsolatedWorld-дифференциатор) — не входило в
+исходный wave-6 scope этой сессии.
+
+**Волна 6б 🔜 — SCHEDULER/SYSTEMPARAM OVERHAUL (P3; переоценка §0.2b — см. «Журнал волн»).**
+В3 единый `Query<'w,'s>` поверх per-system QueryState (⚠ ROI-гейт: A/B перед внедрением —
+класс arch_cols; arch-индексы уже кэшируются, выигрыш = только fill_ids) · F3-target SystemContext
+ужатие (убрать resource_mut/event_writer/произвольный-Q из публичного ctx — миграция AutoSystem'ов
+или debug-валидация access) · D8b per-system command-буферы (детерминизм Entity id) · D6-полное
+(per-system last_run).
+*Гейт: A/B-замер для В3 ОБЯЗАТЕЛЕН до внедрения; migration adoption-стиль; полный сьют оба репо;
+goldens; руководство актуализировано.*
 
 **Волна 7 — EN-МИГРАЦИЯ + ТЕСТ-КАМПАНИЯ + ДОКИ (P3/P4).**
 Кириллица ≈6.3k строк: (1) user-facing литералы (compile_error!/panic/expect/log) — сразу;
