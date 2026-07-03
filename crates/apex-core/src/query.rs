@@ -80,6 +80,18 @@ pub unsafe trait WorldQuery: Sized {
     /// Один проход, без heap-аллокаций до 8 компонентов.
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>);
 
+    /// Reports this form's DATA borrows for the runtime self-alias check (C2):
+    /// pushes `(component_id, exclusive)` for every component whose data this
+    /// form hands out as a reference. Pure filters (`With`/`Without`/`Changed`/
+    /// `Added`/`Or`), `Entity` and `()` borrow no component data, so the default
+    /// is a no-op; data-yielding forms (`Read`/`Write`/`&T`/`&mut T`/`Maybe`/
+    /// `MaybeWrite`) and tuples override / union. Used by
+    /// [`Query`](crate::query::Query) constructors to reject shapes that would
+    /// alias one row's data (e.g. `Query<(&mut T, &mut T)>`).
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        let _ = (world, out);
+    }
+
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
     /// Захватывает per-archetype состояние для итерации.
@@ -226,6 +238,13 @@ unsafe impl<T: Component> WorldQuery for Read<T> {
         key.push(id.0 as u64); // роль REQUIRED = 0
     }
 
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        out.push((
+            world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID),
+            false,
+        ));
+    }
+
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         !ids.is_empty() && arch.has_component(ids[0])
     }
@@ -267,6 +286,13 @@ unsafe impl<T: Component> WorldQuery for Write<T> {
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
         key.push(id.0 as u64); // роль REQUIRED = 0
+    }
+
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        out.push((
+            world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID),
+            true,
+        ));
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -325,6 +351,9 @@ unsafe impl<T: Component> WorldQuery for &T {
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         <Read<T> as WorldQuery>::fill_cache_key(world, key)
     }
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        <Read<T> as WorldQuery>::fill_data_access(world, out)
+    }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         <Read<T> as WorldQuery>::matches_archetype(arch, ids)
     }
@@ -359,6 +388,9 @@ unsafe impl<T: Component> WorldQuery for &mut T {
     }
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         <Write<T> as WorldQuery>::fill_cache_key(world, key)
+    }
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        <Write<T> as WorldQuery>::fill_data_access(world, out)
     }
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         <Write<T> as WorldQuery>::matches_archetype(arch, ids)
@@ -577,6 +609,14 @@ unsafe impl<T: Component> WorldQuery for Maybe<T> {
         key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
     }
 
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        // Optional shared read: still aliases if paired with a write of the same T.
+        out.push((
+            world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID),
+            false,
+        ));
+    }
+
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
         true
     }
@@ -673,6 +713,13 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
         key.push(id.0 as u64 | KEY_ROLE_OPTIONAL);
+    }
+
+    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+        out.push((
+            world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID),
+            true,
+        ));
     }
 
     fn matches_archetype(_: &Archetype, _: &[ComponentId]) -> bool {
@@ -1045,6 +1092,10 @@ macro_rules! impl_world_query_tuple {
                 $( $Q::fill_cache_key(world, key); )+
             }
 
+            fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
+                $( $Q::fill_data_access(world, out); )+
+            }
+
             fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
                 let mut offset = 0;
                 $(
@@ -1218,6 +1269,43 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         Self::new_with_tick(world, Tick::ZERO)
     }
 
+    /// C2: reject a query shape that borrows the same component's data mutably
+    /// more than once (`Query<(&mut T, &mut T)>`) or both mutably and immutably
+    /// (`Query<(&T, &mut T)>`, `Query<Read<T>, Write<T>>`). Such a shape would
+    /// hand out aliasing references to one row on every iteration — undefined
+    /// behavior reachable from entirely safe code. Mirrors Bevy, which panics on
+    /// the same shapes. Runs once at construction over the (typically ≤ 8)
+    /// declared accesses, so the cost is negligible.
+    fn assert_no_self_alias(world: &World) {
+        let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
+        <(Q, F)>::fill_data_access(world, &mut access);
+        for i in 0..access.len() {
+            let (id_i, excl_i) = access[i];
+            // Unregistered components collapse to INVALID and match no archetype,
+            // so a duplicate INVALID can never actually alias — skip it.
+            if id_i == ComponentId::INVALID {
+                continue;
+            }
+            for &(id_j, excl_j) in &access[i + 1..] {
+                if id_j == id_i && (excl_i || excl_j) {
+                    let name = world
+                        .registry
+                        .get_info(id_i)
+                        .map(|info| info.name)
+                        .unwrap_or("<component>");
+                    panic!(
+                        "Query aliases component `{name}`: it is accessed mutably more than \
+                         once (or both mutably and immutably) within a single query \
+                         (e.g. `Query<(&mut {name}, &mut {name})>` or `(Read, Write)` of the \
+                         same component). This would create aliasing references to one row. \
+                         Access each component at most once per query, or split into separate \
+                         queries."
+                    );
+                }
+            }
+        }
+    }
+
     /// Создать Query с ограничением на архетипы и строки из SubWorld.
     ///
     /// Использует `sub.archetype_indices` для фильтрации архетипов
@@ -1231,6 +1319,7 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// Создать Query, перебирающий только указанные архетипы.
     /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
     fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
+        Self::assert_no_self_alias(world);
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(world, &mut ids);
         debug_assert_eq!(
@@ -1277,6 +1366,7 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     }
 
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
+        Self::assert_no_self_alias(world);
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(world, &mut ids);
         debug_assert_eq!(
@@ -1923,6 +2013,109 @@ mod query_filter_tests {
         let pairs: Vec<(Entity, &Hp)> = q.iter().collect();
         assert_eq!(pairs.len(), 2);
         assert!(pairs.iter().all(|(e, _)| world.is_alive(*e)));
+    }
+
+    /// A2 regression: mutating through `Query<Write<T>>` stamps the row's
+    /// change-tick via a `*mut Tick` whose provenance is the `TickCell`
+    /// interior — a write through a *shared* `&Column`. Under the pre-fix
+    /// `Vec<Tick>` layout that write was undefined behavior (Miri Tree Borrows
+    /// rejects a write to non-interior-mutable memory reached from `&self`).
+    /// Covers both the per-item hot path (`Mut::deref_mut` → `ticks_ptr`) and
+    /// the dense chunk path (`stamp_range`); the `Changed<T>` asserts confirm
+    /// the stamp actually lands. Run under
+    /// `cargo +nightly miri test -Zmiri-tree-borrows` to validate soundness.
+    #[test]
+    fn a2_write_stamps_change_tick_soundly() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1),));
+        let f = world.spawn((Hp(2),));
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+
+        // Nothing changed since the advance.
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+                .iter()
+                .count(),
+            0
+        );
+
+        // Per-item Write path: `Mut::deref_mut` writes the tick through the
+        // shared `&Column` via `ticks_ptr()`.
+        {
+            let mut q = Query::<Write<Hp>>::new(&world);
+            for mut hp in &mut q {
+                hp.0 += 100;
+            }
+        }
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(101)));
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+                .iter()
+                .count(),
+            2
+        );
+
+        // Dense chunk path: `Write<T>::fetch_slices` calls `stamp_range` over
+        // the same cell buffer.
+        world.advance_change_tick();
+        let lr2 = world.last_run_tick();
+        {
+            let q = Query::<Write<Hp>>::new(&world);
+            q.for_each_chunk(|_entities, hps: &mut [Hp]| {
+                for hp in hps {
+                    hp.0 += 1;
+                }
+            });
+        }
+        assert_eq!(world.get::<Hp>(e), Some(&Hp(102)));
+        assert_eq!(world.get::<Hp>(f), Some(&Hp(103)));
+        assert_eq!(
+            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr2)
+                .iter()
+                .count(),
+            2
+        );
+    }
+
+    /// C2 regression: a query that borrows one component's data mutably more
+    /// than once — or both mutably and immutably — panics at construction. Such
+    /// a shape would hand out aliasing references to a single row on every
+    /// iteration (safe-code UB). Distinct components, repeated shared reads, and
+    /// filters (`With`/`Changed`) over a written component are all legal and must
+    /// NOT panic.
+    #[test]
+    fn c2_rejects_self_aliasing_query_shapes() {
+        let mut world = World::new();
+        world.spawn((Hp(1), Mana(2)));
+
+        // Aliasing shapes must panic.
+        let ww = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Query::<(Write<Hp>, Write<Hp>)>::new(&world);
+        }));
+        assert!(ww.is_err(), "write+write of same component must panic");
+
+        let rw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Query::<(Read<Hp>, Write<Hp>)>::new(&world);
+        }));
+        assert!(rw.is_err(), "read+write of same component must panic");
+
+        let refmut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Query::<(&mut Hp, &mut Hp)>::new(&world);
+        }));
+        assert!(refmut.is_err(), "&mut + &mut of same component must panic");
+
+        let maybe_alias = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new(&world);
+        }));
+        assert!(maybe_alias.is_err(), "write + optional write of same component must panic");
+
+        // Legal shapes must NOT panic (construction runs the check).
+        let _ = Query::<(Read<Hp>, Read<Hp>)>::new(&world); // shared + shared
+        let _ = Query::<(Write<Hp>, Write<Mana>)>::new(&world); // distinct components
+        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new(&world); // filter over written comp
+        let _ = Query::<Write<Hp>, Changed<Hp>>::new(&world); // Changed filter is not a data borrow
+        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new(&world); // write + optional distinct
     }
 
     /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.

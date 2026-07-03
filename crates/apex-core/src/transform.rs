@@ -493,8 +493,8 @@ pub fn propagate_transforms(world: &mut World) {
                     continue;
                 };
                 let col = &arch.columns[col_idx];
-                for (&tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
-                    if tick.is_newer_than(last_run) {
+                for (tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
+                    if tick.get().is_newer_than(last_run) {
                         dirty_entities.push(entity);
                         dirty.mark(entity.index);
                     }
@@ -883,6 +883,12 @@ mod tests {
 
     /// C6: `LocalTransform`/`GlobalTransform` авто-регистрируются при `World::new()`
     /// через `#[derive(Component)]` (linkme) — без ручного `register_component`.
+    ///
+    /// Под Miri (и wasm32) `linkme::distributed_slice` отключён — компоненты
+    /// регистрируются лениво на spawn/insert (см. `component.rs`, TD-25), поэтому
+    /// авто-регистрация при пустом `World::new()` не выполняется. Тест проверяет
+    /// именно linkme-путь → скипаем в этих конфигурациях.
+    #[cfg_attr(any(miri, target_arch = "wasm32"), ignore)]
     #[test]
     fn transform_components_auto_registered() {
         let world = World::new();

@@ -1,29 +1,23 @@
 use rustc_hash::FxHashMap;
 /// Resources — глобальные синглтоны мира.
 use std::any::{Any, TypeId};
+use std::cell::UnsafeCell;
 
-trait ResourceStorage: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync>;
-}
+/// A resource slot behind `UnsafeCell` so `get_raw_ptr` can hand out a `*mut T`
+/// whose provenance is the cell's interior — writing through it is legal —
+/// rather than laundering a `*mut` out of a shared `&T`, which is UB (A3). The
+/// scheduler serializes mutable access per resource via `AccessDescriptor`, so
+/// the interior mutation never actually aliases.
+#[repr(transparent)]
+struct ResourceCell(UnsafeCell<Box<dyn Any + Send + Sync>>);
 
-struct ResourceStorageImpl(Box<dyn Any + Send + Sync>);
-
-impl ResourceStorage for ResourceStorageImpl {
-    fn as_any(&self) -> &dyn Any {
-        &*self.0
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        &mut *self.0
-    }
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send + Sync> {
-        self.0
-    }
-}
+// SAFETY: the inner value is `Send + Sync`; concurrent access is serialized by
+// the scheduler's AccessDescriptor discipline (two systems mutating the same
+// resource never share a stage), so exposing `Sync` is sound.
+unsafe impl Sync for ResourceCell {}
 
 pub struct Resources {
-    data: FxHashMap<TypeId, Box<dyn ResourceStorage>>,
+    data: FxHashMap<TypeId, ResourceCell>,
 }
 
 impl Resources {
@@ -36,7 +30,7 @@ impl Resources {
     pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) {
         self.data.insert(
             TypeId::of::<T>(),
-            Box::new(ResourceStorageImpl(Box::new(value))),
+            ResourceCell(UnsafeCell::new(Box::new(value))),
         );
     }
 
@@ -61,39 +55,39 @@ impl Resources {
     }
 
     pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.data
-            .get(&TypeId::of::<T>())
-            .and_then(|b| b.as_any().downcast_ref::<T>())
+        let cell = self.data.get(&TypeId::of::<T>())?;
+        // SAFETY: shared read of the cell interior; the scheduler guarantees no
+        // concurrent mutable access to this resource.
+        unsafe { (*cell.0.get()).downcast_ref::<T>() }
     }
 
     pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
-        self.data
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|b| b.as_any_mut().downcast_mut::<T>())
+        // `&mut self` — exclusive; take the interior mutably without unsafe.
+        let cell = self.data.get_mut(&TypeId::of::<T>())?;
+        cell.0.get_mut().downcast_mut::<T>()
     }
 
     /// Получить raw mutable pointer на ресурс.
     ///
     /// Используется `SystemContext::resource_mut` для параллельного доступа.
-    /// Метод определён здесь (в своём крейте) — это законно.
     ///
     /// # Safety
     /// Вызывающий код должен гарантировать что только одна система
     /// в данный момент держит мутабельный доступ к T.
     /// Планировщик обеспечивает это через `AccessDescriptor`.
     pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut T> {
-        // SAFETY: мы берём shared ref и кастуем в *mut.
-        // Это тот же паттерн что UnsafeCell<T>::get().
-        // Безопасность обеспечивается планировщиком: два ParSystem
-        // с Write<T> к одному ресурсу никогда не в одном Stage.
-        let r = self.try_get::<T>()?;
-        Some(r as *const T as *mut T)
+        let cell = self.data.get(&TypeId::of::<T>())?;
+        // SAFETY: the `*mut` provenance is the UnsafeCell interior (via `get()`),
+        // so writing through it is legal (A3). The scheduler guarantees exclusive
+        // access to this resource while the pointer is live.
+        let boxed: &mut Box<dyn Any + Send + Sync> = unsafe { &mut *cell.0.get() };
+        boxed.downcast_mut::<T>().map(|r| r as *mut T)
     }
 
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         self.data
             .remove(&TypeId::of::<T>())
-            .and_then(|b| b.into_any().downcast::<T>().ok().map(|b| *b))
+            .and_then(|cell| cell.0.into_inner().downcast::<T>().ok().map(|b| *b))
     }
 
     #[inline]

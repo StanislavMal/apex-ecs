@@ -371,20 +371,20 @@ pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 // ── SendPtr ────────────────────────────────────────────────────
 
 #[allow(dead_code)]
-struct SendPtr<T>(*mut T);
+struct SendPtr<T: ?Sized>(*mut T);
 
 // SAFETY: использование строго ограничено run_hybrid_parallel где
 // уникальность ptr гарантирована — каждый ptr из уникального индекса.
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-impl<T> Clone for SendPtr<T> {
+unsafe impl<T: ?Sized> Send for SendPtr<T> {}
+unsafe impl<T: ?Sized> Sync for SendPtr<T> {}
+impl<T: ?Sized> Clone for SendPtr<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for SendPtr<T> {}
+impl<T: ?Sized> Copy for SendPtr<T> {}
 
-impl<T> SendPtr<T> {
+impl<T: ?Sized> SendPtr<T> {
     #[inline]
     #[allow(dead_code)]
     // Обёртка над сырым `*mut T`; уникальность гарантируется вызывающим
@@ -402,7 +402,7 @@ impl<T> SendPtr<T> {
 
 /// Задача для ASD (Adaptive Scope Distribution).
 ///
-/// Содержит указатель на SystemDescriptor, указатель на срез архетипов
+/// Содержит указатель на систему (`dyn ParSystem`), указатель на срез архетипов
 /// системы и диапазоны строк, которые эта задача должна обработать.
 /// Каждая задача обрабатывает subset entity системы.
 ///
@@ -410,8 +410,13 @@ impl<T> SendPtr<T> {
 /// (весь SubWorld без ограничений).
 #[allow(dead_code)]
 struct AsdTask {
-    /// Указатель на SystemDescriptor
-    ptr: SendPtr<SystemDescriptor>,
+    /// Pointer to the `dyn ParSystem` itself — NOT the enclosing
+    /// `SystemDescriptor`. Row-split tasks for one system run concurrently and
+    /// each forms `&mut *ptr`; targeting the trait object (a ZST for the only
+    /// systems that are ever split — stateless plain-fn adapters) keeps those
+    /// `&mut` non-aliasing over any real bytes, whereas `&mut SystemDescriptor`
+    /// (which owns a `String` name, etc.) aliased UB-ly (D3).
+    ptr: SendPtr<dyn ParSystem>,
     /// Индексы архетипов для этой задачи.
     /// Если `chunk_ranges` пусто — все архетипы системы.
     /// Иначе — только те, что есть в `chunk_ranges` (сужение для 4-arch cases).
@@ -2561,7 +2566,7 @@ impl Scheduler {
 
         // 1. Собираем per-system информацию
         struct SysInfo {
-            ptr: SendPtr<SystemDescriptor>,
+            ptr: SendPtr<dyn ParSystem>,
             arch_indices: Vec<usize>,
             entity_count: usize,
             has_events: bool,
@@ -2623,9 +2628,17 @@ impl Scheduler {
                     let non_query_side_effects = access
                         .map(|a| a.writes_resource || a.uses_commands)
                         .unwrap_or(true);
+                    // The `access` borrow ends here; take a raw pointer to the
+                    // `dyn ParSystem` itself (D3). A filtered system always
+                    // declares component access, i.e. is `Parallel`; a
+                    // `Sequential` system has nothing to run on this path.
+                    let par_ptr: *mut dyn ParSystem = match &mut self.systems[sys_idx].kind {
+                        SystemKind::Parallel { system, .. } => &mut **system,
+                        SystemKind::Sequential(_) => continue,
+                    };
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
-                        ptr: SendPtr(&mut self.systems[sys_idx] as *mut SystemDescriptor),
+                        ptr: SendPtr(par_ptr),
                         arch_indices,
                         entity_count,
                         has_events,
@@ -2768,35 +2781,32 @@ impl Scheduler {
                 let cmds = cmds_ptr;
                 s.spawn(move |_| {
                     let cmds_ptr = cmds as *mut Vec<Commands>;
-                    // SAFETY (W3-4): несколько задач одной системы существуют
+                    // SAFETY (W3-4 + D3): несколько задач одной системы существуют
                     // ТОЛЬКО для систем без состояния (`stateful`/`has_events`/
                     // `uses_par_for_each`/`needs_whole_world` получают единый
                     // per-system scope). Для них `run(&mut self)` не читает и
-                    // не пишет байтов self (ZST/без захватов) — конкурентные
-                    // вызовы не гоняются по данным. Диапазоны строк задач
-                    // дизъюнктны по построению (последовательная нарезка).
+                    // не пишет байтов self (ZST/без захватов). `task.ptr` целит
+                    // ПРЯМО в `dyn ParSystem` (ZST-цель), поэтому конкурентные
+                    // `&mut *task.ptr.0` не алиасят реальных байт — в отличие от
+                    // прежнего `&mut SystemDescriptor` (владеет `String` name и
+                    // т.п.). Диапазоны строк задач дизъюнктны по построению.
                     unsafe {
-                        let system = &mut *task.ptr.0;
-                        if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
-                            if task.chunk_ranges.is_empty() {
-                                // Полный SubWorld — все архетипы системы без ограничений
-                                let sub = apex_core::SubWorld::from_raw(world, &task.arch_indices);
-                                // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
-                                // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
-                                // Каждый поток обращается к своему индексу через current_thread_index().
-                                sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
-                            } else {
-                                // SubWorld с range-ограничениями и суженными arch_indices
-                                let sub = apex_core::SubWorld::from_raw_with_ranges(
-                                    world,
-                                    &task.arch_indices,
-                                    &task.chunk_ranges,
-                                );
-                                // SAFETY: cmds_ptr указывает на Vec<Commands> из Scheduler,
-                                // который живёт пока жив thread_commands (до конца run_hybrid_parallel).
-                                // Каждый поток обращается к своему индексу через current_thread_index().
-                                sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
-                            }
+                        let sys: &mut dyn ParSystem = &mut *task.ptr.0;
+                        // SAFETY (both arms): cmds_ptr указывает на Vec<Commands> из
+                        // Scheduler, живущий до конца run_hybrid_parallel; каждый поток
+                        // обращается к своему индексу через current_thread_index().
+                        if task.chunk_ranges.is_empty() {
+                            // Полный SubWorld — все архетипы системы без ограничений
+                            let sub = apex_core::SubWorld::from_raw(world, &task.arch_indices);
+                            sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
+                        } else {
+                            // SubWorld с range-ограничениями и суженными arch_indices
+                            let sub = apex_core::SubWorld::from_raw_with_ranges(
+                                world,
+                                &task.arch_indices,
+                                &task.chunk_ranges,
+                            );
+                            sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
                         }
                     }
                 });
@@ -4979,7 +4989,7 @@ mod tests {
                 (c.mutate, c.entity)
             };
             if mutate {
-                if let Some(mut m) = w.get_mut::<Mark>(e) {
+                if let Some(m) = w.get_mut::<Mark>(e) {
                     m.0 += 1;
                 }
             }
@@ -6350,6 +6360,65 @@ mod tests {
             }
         });
         assert_eq!(bad, 0, "каждая строка обработана ровно по разу за кадр");
+    }
+
+    /// D3 regression: concurrent row-split ASD tasks for one stateless system
+    /// each form `&mut *task.ptr`. The pointer must target the `dyn ParSystem`
+    /// (zero-sized for a plain-fn system) — NOT the enclosing `SystemDescriptor`,
+    /// which owns a `String` name and other real bytes. Pre-fix the task
+    /// materialized `&mut SystemDescriptor`, so several split tasks running at
+    /// once held aliasing `&mut` over the same non-ZST object (Stacked/Tree
+    /// Borrows UB). A dedicated 4-thread pool plus a chunk config that forces
+    /// small chunks makes the split deterministic (and Miri-tractable, unlike the
+    /// 100k test above). Validate with
+    /// `MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-tree-borrows" cargo +nightly
+    /// miri test -p apex-scheduler asd_row_split_no_descriptor_aliasing`.
+    #[test]
+    fn asd_row_split_no_descriptor_aliasing() {
+        #[derive(Component, Clone, Copy)]
+        struct Hits(u32);
+
+        system! {
+            fn bump(q: Write<Hits>) {
+                q.for_each(|_, mut h| h.0 += 1);
+            }
+        }
+
+        const N: usize = 256;
+        let mut world = World::new();
+        // Force splitting at a small N: never fall back to serial, allow small
+        // chunks. With 4 threads: target_chunk ~32, effective_chunk 32, so 256
+        // entities split into 8 concurrent tasks for one system.
+        world.set_chunk_config(apex_core::world::ChunkConfig {
+            min_entities_per_thread: 1,
+            dynamic_min_chunk: 8,
+            max_chunk_size: 65536,
+            auto_serial_fallback: false,
+            task_multiplier: 2.0,
+        });
+        world.spawn_many(N, |_| (Hits(0),));
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, bump);
+
+        // A dedicated 4-thread pool makes the concurrent split path run
+        // regardless of the host CPU count (`rayon::scope` inside `run` uses the
+        // installed pool).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            sched.run(&mut world);
+        });
+
+        let mut bad = 0usize;
+        Query::<Read<Hits>>::new(&world).for_each(|_, h| {
+            if h.0 != 1 {
+                bad += 1;
+            }
+        });
+        assert_eq!(bad, 0, "each row bumped exactly once across concurrent split tasks");
     }
 
     /// Система с СОСТОЯНИЕМ не делится row-split'ом (W3-4): один экземпляр,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::{
-    archetype::{Archetype, ArchetypeId},
+    archetype::{Archetype, ArchetypeId, TickCell},
     commands::Commands,
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{Entity, EntityAllocator, EntityLocation},
@@ -233,6 +233,37 @@ pub(crate) enum HookEvent {
         subject: Entity,
         target: Entity,
     },
+}
+
+/// Rolls back a partially-built bulk-spawn batch on unwind (A6).
+///
+/// Bulk spawn (`spawn_many_inner`, `spawn_bundles_bulk`) pushes entities into
+/// `arch.entities` one at a time inside the write loop, but bumps each column's
+/// `len` (and tick cells) only once, AFTER the loop. If a user closure
+/// (`make_bundle(i)`) or a bundle's `write_data_into_batch` panics mid-loop,
+/// `arch.entities.len()` ends up larger than `col.len` — a broken archetype
+/// invariant that makes later queries read uninitialized column rows.
+///
+/// The guard is armed around the loop and disarmed on success. On unwind its
+/// `Drop` truncates `arch.entities` back to `start_row` (which equals the
+/// untouched `col.len`), restoring the invariant. Column bytes written for
+/// completed rows are leaked rather than dropped, which is memory-safe under
+/// unwind (the entities' locations were never published).
+struct BulkSpawnRollback<'a> {
+    world: &'a mut World,
+    arch_idx: usize,
+    start_row: usize,
+    armed: bool,
+}
+
+impl Drop for BulkSpawnRollback<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.world.archetypes[self.arch_idx]
+                .entities
+                .truncate(self.start_row);
+        }
+    }
 }
 
 impl World {
@@ -957,12 +988,26 @@ impl World {
         // Перф: пишем ДАННЫЕ per-entity (`write_data_into_batch`, без тиков/len), а тики/`len`
         // проставляем ПОКОЛОНОЧНО один раз на пачку (resize вместо count×ncols push'ей).
         {
-            for (i, &entity) in entities.iter().enumerate() {
-                let row = start_row + i;
-                let bundle = make_bundle(i);
-                self.archetypes[arch_idx].entities.push(entity);
-                bundle.write_data_into_batch(self, archetype_id, row, tick, &col_indices);
+            // A6: if `make_bundle(i)` panics mid-loop, roll the archetype back to
+            // a consistent state (entities.len() == col.len) instead of leaving
+            // ghost entity rows over uninitialized column memory.
+            let mut guard = BulkSpawnRollback {
+                world: &mut *self,
+                arch_idx,
+                start_row,
+                armed: true,
+            };
+            {
+                let world = &mut *guard.world;
+                for (i, &entity) in entities.iter().enumerate() {
+                    let row = start_row + i;
+                    let bundle = make_bundle(i);
+                    world.archetypes[arch_idx].entities.push(entity);
+                    bundle.write_data_into_batch(world, archetype_id, row, tick, &col_indices);
+                }
             }
+            guard.armed = false;
+            drop(guard);
             // Тики + len — ПОКОЛОНОЧНО, к АБСОЛЮТНОМУ target (start_row+count). Это устойчиво к ОБОИМ
             // путям записи: для data-only override'ов (leaf/tuple/derive) — заполняет count новых
             // слотов; для дефолта (ручной impl → write_into_batch уже выставил тики/len) — no-op.
@@ -970,8 +1015,10 @@ impl World {
             let arch = &mut self.archetypes[arch_idx];
             for &col_idx in &col_indices {
                 let col = &mut arch.columns[col_idx];
-                col.change_ticks.resize(target_len, tick);
-                col.added_ticks.resize(target_len, tick);
+                col.change_ticks
+                    .resize_with(target_len, || TickCell::new(tick));
+                col.added_ticks
+                    .resize_with(target_len, || TickCell::new(tick));
                 col.len = target_len;
             }
         }
@@ -1082,17 +1129,34 @@ impl World {
         // Бандлы РАЗНЫЕ per-item ⇒ пишем ДАННЫЕ каждого через write_data_into_batch (с предвычисленными
         // col_indices в порядке обхода — без повторного get_or_register/архетип-поиска); тики/len —
         // поколоночно к абсолютному target (устойчиво к data-only override и дефолту).
-        for (i, bundle) in bundles.into_iter().enumerate() {
-            let entity = entities[i];
-            let row = start_row + i;
-            self.archetypes[arch_idx].entities.push(entity);
-            bundle.write_data_into_batch(self, archetype_id, row, tick, &col_indices);
+        {
+            // A6: a custom `Bundle::write_data_into_batch` that panics mid-loop
+            // must not leave ghost entity rows over uninitialized column memory.
+            let mut guard = BulkSpawnRollback {
+                world: &mut *self,
+                arch_idx,
+                start_row,
+                armed: true,
+            };
+            {
+                let world = &mut *guard.world;
+                for (i, bundle) in bundles.into_iter().enumerate() {
+                    let entity = entities[i];
+                    let row = start_row + i;
+                    world.archetypes[arch_idx].entities.push(entity);
+                    bundle.write_data_into_batch(world, archetype_id, row, tick, &col_indices);
+                }
+            }
+            guard.armed = false;
+            drop(guard);
         }
         let target_len = start_row + count;
         for &col_idx in &col_indices {
             let col = &mut self.archetypes[arch_idx].columns[col_idx];
-            col.change_ticks.resize(target_len, tick);
-            col.added_ticks.resize(target_len, tick);
+            col.change_ticks
+                .resize_with(target_len, || TickCell::new(tick));
+            col.added_ticks
+                .resize_with(target_len, || TickCell::new(tick));
             col.len = target_len;
         }
         self.entities
@@ -1209,7 +1273,7 @@ impl World {
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-        mut data: Vec<u8>,
+        data: Vec<u8>,
         tick: Tick,
     ) {
         // The raw bytes must match the component's storage layout exactly — a
@@ -1233,7 +1297,23 @@ impl World {
                 // is honored exactly once (A9); the column never received a copy.
                 if !data.is_empty() {
                     if let Some(info) = self.registry.get_info(component_id) {
-                        unsafe { (info.drop_fn)(data.as_mut_ptr()) };
+                        // `data` is a `Vec<u8>` (alignment 1), but `drop_fn` runs
+                        // `drop_in_place::<T>`, which requires a `T`-aligned
+                        // pointer — dropping straight off the `Vec` is unaligned
+                        // UB for any `T` with `align > 1`. Move the bytes into a
+                        // correctly-aligned scratch allocation and drop there.
+                        let layout =
+                            std::alloc::Layout::from_size_align(info.size, info.align).unwrap();
+                        unsafe {
+                            let aligned = std::alloc::alloc(layout);
+                            assert!(!aligned.is_null(), "insert_raw: allocation failed");
+                            std::ptr::copy_nonoverlapping(data.as_ptr(), aligned, info.size);
+                            // Ownership now lives in `aligned`; drop it exactly
+                            // once. The original `data` buffer is freed as raw
+                            // bytes when it drops at end of scope (no `T::drop`).
+                            (info.drop_fn)(aligned);
+                            std::alloc::dealloc(aligned, layout);
+                        }
                     }
                 }
                 return;
@@ -1573,7 +1653,7 @@ impl World {
         let col_idx = arch.column_index(component_id)?;
         let col = &mut arch.columns[col_idx];
         if row < col.change_ticks.len() {
-            col.change_ticks[row] = tick;
+            col.change_ticks[row] = TickCell::new(tick);
         }
         unsafe { Some(col.get_mut::<T>(row)) }
     }
@@ -2847,8 +2927,8 @@ impl<T: Component> Bundle for T {
                         col.item_size,
                     );
                 }
-                col.change_ticks.push(tick);
-                col.added_ticks.push(tick);
+                col.change_ticks.push(TickCell::new(tick));
+                col.added_ticks.push(TickCell::new(tick));
                 col.len += 1;
             }
         }
@@ -2874,8 +2954,8 @@ impl<T: Component> Bundle for T {
                 let dst = col.get_ptr(row);
                 std::ptr::copy_nonoverlapping(&self as *const T as *const u8, dst, col.item_size);
             }
-            col.change_ticks.push(tick);
-            col.added_ticks.push(tick);
+            col.change_ticks.push(TickCell::new(tick));
+            col.added_ticks.push(TickCell::new(tick));
             col.len += 1;
         }
         std::mem::forget(self);
@@ -3234,6 +3314,47 @@ mod tests {
                 .iter()
                 .count();
         assert_eq!(false_changed, 1, "санити: без клампа wrap даёт ложный Changed");
+    }
+
+    /// A6 regression: a panic in `make_bundle(i)` mid `spawn_many` must roll the
+    /// archetype back to a consistent state — `entities.len() == col.len` — not
+    /// leave ghost entity rows over uninitialized column memory. Pre-fix the loop
+    /// pushed one entity per iteration but bumped `col.len` only after the loop,
+    /// so a mid-loop panic left `entities.len() > col.len` and later queries read
+    /// uninitialized rows.
+    #[test]
+    fn spawn_many_panic_rolls_back_batch() {
+        use crate::query::Read;
+
+        #[derive(Debug)]
+        struct P(#[allow(dead_code)] u32);
+        impl crate::component::Component for P {}
+
+        let mut world = World::new();
+        world.spawn((P(1),));
+        world.spawn((P(2),));
+        let before = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        assert_eq!(before, 2);
+
+        // `make_bundle` panics on the 4th element, after rows 0..3 were pushed.
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.spawn_many(5, |i| {
+                if i == 3 {
+                    panic!("boom at {i}");
+                }
+                (P(100 + i as u32),)
+            });
+        }));
+        assert!(res.is_err(), "the make_bundle panic must propagate");
+
+        // The partial batch was rolled back — the archetype is consistent again.
+        let after = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        assert_eq!(after, before, "partial spawn_many batch rolled back on panic");
+
+        // The world remains fully usable after the rollback.
+        world.spawn((P(9),));
+        let n = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        assert_eq!(n, 3);
     }
 
     // ── W2-0: QueryState ───────────────────────────────────────

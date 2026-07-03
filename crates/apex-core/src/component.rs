@@ -1,4 +1,4 @@
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(miri)))]
 use linkme::distributed_slice;
 use rustc_hash::FxHashMap;
 use std::any::TypeId;
@@ -8,17 +8,20 @@ pub type ComponentRegistrarFn = fn(&mut ComponentRegistry);
 
 /// Глобальный список всех авторегистраторов компонентов.
 /// Заполняется линкером из всех крейтов, использующих #[derive(Component)].
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(miri)))]
 #[distributed_slice]
 pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn] = [..];
 
-/// На wasm32 `linkme::distributed_slice` не реализован — авторегистрация
-/// на `World::new()` не выполняется, компоненты регистрируются лениво
-/// (`get_or_register` на spawn/insert). ⚠ Следствие: `#[require(...)]`
-/// на wasm пока НЕ применяется (регистраторы derive не запускаются) —
-/// TD-25 в `apex-engine/plans/TECH_DEBT.md`, закрыть до первого
-/// wasm-рантайма (план: ленивый require через trait-метод Component).
-#[cfg(target_arch = "wasm32")]
+/// На wasm32 (и под Miri) `linkme::distributed_slice` недоступно —
+/// авторегистрация на `World::new()` не выполняется, компоненты регистрируются
+/// лениво (`get_or_register` на spawn/insert). Miri: linkme's distributed-slice
+/// address arithmetic overflows under Miri, so the same lazy path is used —
+/// components still register on first use (only `#[require]` pre-application is
+/// skipped, like wasm). ⚠ Следствие: `#[require(...)]` на wasm пока НЕ
+/// применяется (регистраторы derive не запускаются) — TD-25 в
+/// `apex-engine/plans/TECH_DEBT.md`, закрыть до первого wasm-рантайма (план:
+/// ленивый require через trait-метод Component).
+#[cfg(any(target_arch = "wasm32", miri))]
 pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn; 0] = [];
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
