@@ -5,7 +5,7 @@
 //! Каждый элемент итератора — Lua таблица со структурой:
 //! ```text
 //! {
-//!     entity = 42,
+//!     entity = "42:0",                   -- id "index:generation" (E10), не голый индекс
 //!     position = { x = 1.0, y = 2.0 },   -- Read/Write компоненты (lowercase ключи)
 //!     velocity = { x = 0.5, y = 0.0 },
 //!     _meta = { arch = 0, row = 3, writes = { position = 1, velocity = 2 } }
@@ -30,6 +30,45 @@ use apex_core::{
 };
 
 use crate::context::ScriptContext;
+
+// ── Entity id encoding (E10) ───────────────────────────────────
+//
+// An `Entity` is a generational index: 2×u32 = 64 bits. Lua numbers are f64,
+// exact only up to 2^53, so a packed 64-bit id could silently lose its high
+// bits. To keep the FULL generation across frames we hand entity ids to Lua as
+// `"index:generation"` strings and decode them back into a real `Entity`.
+//
+// This matters because slots are reused: an index saved from a past frame can,
+// after that entity died and a new one took its slot, refer to a DIFFERENT
+// generation. Carrying the generation lets `World::despawn`/commit reject the
+// stale id (generation mismatch → no-op) instead of hitting the new tenant.
+
+/// Encode an entity as the `"index:generation"` string handed to Lua.
+pub(crate) fn encode_entity_id(entity: Entity) -> String {
+    format!("{}:{}", entity.index(), entity.generation())
+}
+
+/// Decode an entity id previously produced by [`encode_entity_id`].
+///
+/// Accepts a Lua string `"index:generation"`. For backward tolerance a bare
+/// integer/string index (no `:generation`) is rejected as invalid rather than
+/// silently reconstructed with a guessed generation — a caller must round-trip
+/// the exact id it was given.
+pub(crate) fn parse_entity_id(value: &mlua::Value) -> Option<Entity> {
+    let s = match value {
+        mlua::Value::String(s) => s.to_str().ok()?.to_owned(),
+        _ => return None,
+    };
+    parse_entity_id_str(&s)
+}
+
+/// Decode an `"index:generation"` string into an [`Entity`].
+pub(crate) fn parse_entity_id_str(s: &str) -> Option<Entity> {
+    let (idx, gen) = s.split_once(':')?;
+    let index: u32 = idx.trim().parse().ok()?;
+    let generation: u32 = gen.trim().parse().ok()?;
+    Some(Entity::from_raw_parts(index, generation))
+}
 
 // ── QueryDesc ──────────────────────────────────────────────────
 
@@ -197,12 +236,18 @@ pub(crate) fn build_entity_table(
     let arch = &world.archetypes()[arch_idx];
     let entity: Entity = arch.entities()[row];
 
+    let entity_id = encode_entity_id(entity);
+
     let t = lua.create_table()?;
-    t.set("entity", entity.index() as i32)?;
+    // Full "index:generation" id (E10), not a bare index — see encode_entity_id.
+    t.set("entity", entity_id.as_str())?;
 
     let meta = lua.create_table()?;
     meta.set("arch", arch_idx as i32)?;
     meta.set("row", row as i32)?;
+    // Mirror the id into `_meta` so commit can validate that the row still holds
+    // THIS entity (full generation), rejecting stale/forged tables (E1 + E10).
+    meta.set("entity", entity_id.as_str())?;
 
     let writes = lua.create_table()?;
     for comp in components {
@@ -266,8 +311,18 @@ pub(crate) fn commit_entity_table(
 
     let arch_idx: i32 = meta.get("arch")?;
     let row: i32 = meta.get("row")?;
-    let meta_entity: i32 = meta.get("entity")?;
+    let meta_entity_raw: mlua::Value = meta.get("entity")?;
     let writes: mlua::Table = meta.get("writes")?;
+
+    // Decode the FULL entity id (index + generation) stored in `_meta` (E10).
+    // A missing/garbage id can't be trusted → reject cleanly.
+    let meta_entity = match parse_entity_id(&meta_entity_raw) {
+        Some(e) => e,
+        None => {
+            log::warn!("commit: _meta.entity is not a valid entity id, skipped");
+            return Ok(());
+        }
+    };
 
     // Никогда НЕ доверяем `_meta` из Lua: скрипт может подделать arch/row/col
     // или сохранить таблицу до следующего кадра, где строку уже swap-removed'нули.
@@ -291,8 +346,10 @@ pub(crate) fn commit_entity_table(
     }
     // Строка обязана всё ещё нести ту entity, для которой построена таблица —
     // иначе отложенное структурное изменение переселило её, и мы бы записали
-    // в ЧУЖУЮ entity (порча данных).
-    if arch.entities()[row].index() as i32 != meta_entity {
+    // в ЧУЖУЮ entity (порча данных). Сравниваем ПОЛНУЮ entity (index +
+    // generation): переиспользованный слот с новым поколением ловится как
+    // несовпадение и отвергается (E1 + E10).
+    if arch.entities()[row] != meta_entity {
         log::warn!(
             "commit: entity at archetype {arch_idx} row {row} no longer matches table entity, skipped"
         );
@@ -417,7 +474,9 @@ mod tests {
     struct Marker;
     impl Component for Marker {}
 
-    fn forged_meta(lua: &mlua::Lua, arch: i32, row: i32, entity: i32) -> mlua::Table {
+    /// Build a forged `_meta` table. `entity` is the `"index:generation"` string
+    /// exactly as the real query path stores it (E10).
+    fn forged_meta(lua: &mlua::Lua, arch: i32, row: i32, entity: &str) -> mlua::Table {
         let t = lua.create_table().unwrap();
         let meta = lua.create_table().unwrap();
         meta.set("arch", arch).unwrap();
@@ -436,19 +495,44 @@ mod tests {
         let lua = mlua::Lua::new();
         let ctx = ScriptContext::new();
         let mut world = World::new();
-        let _e = world.spawn((Marker,)); // archetype 0, one row
+        let e = world.spawn((Marker,)); // archetype 0, one row
+        let real_id = encode_entity_id(e);
 
         // Out-of-range archetype.
-        let t = forged_meta(&lua, 9999, 0, 0);
+        let t = forged_meta(&lua, 9999, 0, &real_id);
         commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
 
         // Valid archetype, out-of-range row.
-        let t = forged_meta(&lua, 0, 9999, 0);
+        let t = forged_meta(&lua, 0, 9999, &real_id);
         commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
 
         // Valid archetype/row, but the table claims a different entity than the
         // one currently occupying that row.
-        let t = forged_meta(&lua, 0, 0, 424242);
+        let t = forged_meta(&lua, 0, 0, "424242:0");
         commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+
+        // E10: valid archetype/row and the CORRECT index, but a STALE generation
+        // (as if the slot were reused). Full-entity comparison must reject it.
+        let stale_gen = format!("{}:{}", e.index(), e.generation().wrapping_add(1));
+        let t = forged_meta(&lua, 0, 0, &stale_gen);
+        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+    }
+
+    /// E10: entity ids round-trip through the `"index:generation"` string form,
+    /// preserving the full generation (not just the low index bits).
+    #[test]
+    fn entity_id_roundtrip_preserves_generation() {
+        let e = Entity::from_raw_parts(7, 42);
+        let s = encode_entity_id(e);
+        assert_eq!(s, "7:42");
+        assert_eq!(parse_entity_id_str(&s), Some(e));
+
+        // High generation bits survive (would be lost by a bare index).
+        let e2 = Entity::from_raw_parts(1, u32::MAX);
+        assert_eq!(parse_entity_id_str(&encode_entity_id(e2)), Some(e2));
+
+        // Garbage / bare index is rejected, not silently accepted.
+        assert_eq!(parse_entity_id_str("5"), None);
+        assert_eq!(parse_entity_id_str("abc:def"), None);
     }
 }

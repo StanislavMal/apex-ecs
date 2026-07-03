@@ -122,22 +122,27 @@ fn register_spawn(lua: &mlua::Lua) -> mlua::Result<()> {
     })?)
 }
 
-// ── despawn(entity_index) ──────────────────────────────────────
+// ── despawn(entity_id) ─────────────────────────────────────────
 
 fn register_despawn(lua: &mlua::Lua) -> mlua::Result<()> {
-    lua.globals().set("despawn", lua.create_function(|lua, entity_idx: i32| {
+    lua.globals().set("despawn", lua.create_function(|lua, entity_id: mlua::Value| {
         let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
-        let entity = {
-            let ctx_ref = ctx.borrow();
-            let world = ctx_ref.world_ref();
-            world.entity_allocator().get_by_index(entity_idx as u32)
+
+        // Entity ids are handed to Lua as `"index:generation"` strings so the full
+        // 64-bit generational id survives (a bare index would drop the generation,
+        // and packing both u32 into one f64 would lose precision above 2^53). We
+        // reconstruct the FULL entity — including generation — before despawning.
+        // A stale id (slot reused by a newer generation) yields a generation
+        // mismatch, so `World::despawn` no-ops instead of killing the new tenant (E10).
+        let entity = match iterators::parse_entity_id(&entity_id) {
+            Some(e) => e,
+            None => {
+                log::warn!("despawn: invalid entity id {:?}", entity_id);
+                return Ok(());
+            }
         };
-        if let Some(entity) = entity {
-            ctx.borrow_mut().queue_despawn(entity);
-        } else {
-            log::warn!("despawn: entity index {} не найден или уже мёртв", entity_idx);
-        }
+        ctx.borrow_mut().queue_despawn(entity);
         Ok(())
     })?)
 }
@@ -175,8 +180,8 @@ fn register_resource_api(lua: &mlua::Lua) -> mlua::Result<()> {
     lua.globals().set("write_resource", lua.create_function(|lua, (type_name, value): (String, mlua::Value)| {
         let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
-        let static_name: &'static str = Box::leak(type_name.into_boxed_str());
-        let result = ctx.borrow_mut().write_resource(lua, static_name, value);
+        // No `Box::leak`: the deferred buffer owns the name as a `String` (E3).
+        let result = ctx.borrow_mut().write_resource(lua, &type_name, value);
         result
     })?)
 }
@@ -187,8 +192,8 @@ fn register_event_api(lua: &mlua::Lua) -> mlua::Result<()> {
     lua.globals().set("emit_event", lua.create_function(|lua, (type_name, value): (String, mlua::Value)| {
         let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
-        let static_name: &'static str = Box::leak(type_name.into_boxed_str());
-        let result = ctx.borrow_mut().emit_event(lua, static_name, value);
+        // No `Box::leak`: the deferred buffer owns the name as a `String` (E3).
+        let result = ctx.borrow_mut().emit_event(lua, &type_name, value);
         result
     })?)
 }

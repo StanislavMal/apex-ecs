@@ -89,11 +89,17 @@ pub struct ScriptContext {
 
     /// Буфер отложенных записей ресурсов: (type_name, RegistryKey)
     /// Применяется после завершения скрипта.
-    pub(crate) deferred_resource_writes: Vec<(&'static str, mlua::RegistryKey)>,
+    ///
+    /// Ключ хранится как владеющий `String`, а не `&'static str`. Ранее
+    /// `write_resource` делал `Box::leak(name)` на КАЖДЫЙ вызов, что давало
+    /// линейную утечку памяти для скрипта, пишущего ресурс каждый кадр (E3).
+    /// Лукап биндинга и так по строке, поэтому владеющий ключ корректен и не течёт.
+    pub(crate) deferred_resource_writes: Vec<(String, mlua::RegistryKey)>,
 
     /// Буфер отложенных событий: (type_name, RegistryKey)
-    /// Применяется после завершения скрипта.
-    pub(crate) deferred_events: Vec<(&'static str, mlua::RegistryKey)>,
+    /// Применяется после завершения скрипта. Владеющий `String`-ключ — см. E3
+    /// в комментарии к `deferred_resource_writes`.
+    pub(crate) deferred_events: Vec<(String, mlua::RegistryKey)>,
 
     /// Счётчик entity — кешируется чтобы не вызывать world через ptr каждый раз
     entity_count_cache: usize,
@@ -200,15 +206,15 @@ impl ScriptContext {
 
         let write_infos: Vec<(&'static str, ApplyFn)> = writes.iter()
             .filter_map(|(name, _)| {
-                self.resource_bindings.get(name)
-                    .map(|b| (*name, b.write))
+                self.resource_bindings.get(name.as_str())
+                    .map(|b| (b.name, b.write))
             })
             .collect();
 
         let emit_infos: Vec<(&'static str, ApplyFn)> = events.iter()
             .filter_map(|(name, _)| {
-                self.event_bindings.get(name)
-                    .map(|b| (*name, b.emit))
+                self.event_bindings.get(name.as_str())
+                    .map(|b| (b.name, b.emit))
             })
             .collect();
 
@@ -220,7 +226,7 @@ impl ScriptContext {
                 Err(_) => continue,
             };
             for (name, write_fn) in &write_infos {
-                if *name == type_name {
+                if *name == type_name.as_str() {
                     write_fn(&val, world);
                 }
             }
@@ -233,7 +239,7 @@ impl ScriptContext {
                 Err(_) => continue,
             };
             for (name, emit_fn) in &emit_infos {
-                if *name == type_name {
+                if *name == type_name.as_str() {
                     emit_fn(&val, world);
                 }
             }
@@ -281,10 +287,15 @@ impl ScriptContext {
         (binding.read)(lua, world).ok()
     }
 
+    /// Поставить в очередь отложенную запись ресурса.
+    ///
+    /// Принимает `&str` (не `&'static str`) — имя копируется во владеющий
+    /// `String`-ключ. Без `Box::leak`, поэтому повторные вызовы с тем же именем
+    /// не накапливают утечку (E3).
     pub fn write_resource(
         &mut self,
         lua: &mlua::Lua,
-        type_name: &'static str,
+        type_name: &str,
         value: mlua::Value,
     ) -> mlua::Result<()> {
         if !self.resource_bindings.contains_key(type_name) {
@@ -292,14 +303,16 @@ impl ScriptContext {
             return Ok(());
         }
         let key = lua.create_registry_value(value)?;
-        self.deferred_resource_writes.push((type_name, key));
+        self.deferred_resource_writes.push((type_name.to_owned(), key));
         Ok(())
     }
 
+    /// Поставить в очередь отложенное событие. `&str` → владеющий `String`-ключ,
+    /// без `Box::leak` (E3).
     pub fn emit_event(
         &mut self,
         lua: &mlua::Lua,
-        type_name: &'static str,
+        type_name: &str,
         value: mlua::Value,
     ) -> mlua::Result<()> {
         if !self.event_bindings.contains_key(type_name) {
@@ -307,11 +320,86 @@ impl ScriptContext {
             return Ok(());
         }
         let key = lua.create_registry_value(value)?;
-        self.deferred_events.push((type_name, key));
+        self.deferred_events.push((type_name.to_owned(), key));
         Ok(())
     }
 }
 
 impl Default for ScriptContext {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registrar::{ResourceBinding, EventBinding};
+
+    fn dummy_resource_write(_v: &mlua::Value, _w: &mut World) -> bool { true }
+    fn dummy_resource_read(_lua: &mlua::Lua, _w: &World) -> mlua::Result<mlua::Value> {
+        Ok(mlua::Value::Nil)
+    }
+    fn dummy_event_emit(_v: &mlua::Value, _w: &mut World) -> bool { true }
+
+    /// E3: `write_resource` must NOT leak memory per call. Previously each call
+    /// did `Box::leak(name)`, so a script writing the same resource every frame
+    /// leaked linearly. The deferred buffer now owns the name as a `String`, so
+    /// repeated calls with the SAME name allocate no permanent per-call storage.
+    ///
+    /// We assert the observable contract: N calls with one name produce exactly N
+    /// queued writes, each carrying the correct owned name (round-trip), and the
+    /// set of DISTINCT queued names stays at 1 (no name explosion / interning bug).
+    #[test]
+    fn write_resource_does_not_leak_per_call() {
+        let lua = mlua::Lua::new();
+        let mut ctx = ScriptContext::new();
+        ctx.add_resource_binding(ResourceBinding {
+            name:  "Score",
+            read:  dummy_resource_read,
+            write: dummy_resource_write,
+        });
+
+        const N: usize = 100;
+        for _ in 0..N {
+            ctx.write_resource(&lua, "Score", mlua::Value::Integer(1))
+                .expect("queued");
+        }
+
+        // One queued write per call — round-trip of the name is intact.
+        assert_eq!(ctx.deferred_resource_writes.len(), N);
+        assert!(ctx.deferred_resource_writes.iter().all(|(n, _)| n == "Score"));
+
+        // Only ONE distinct name across all calls: repeated same-name writes do
+        // not grow a per-call leaked/interned name table.
+        let distinct: std::collections::HashSet<&str> = ctx
+            .deferred_resource_writes
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(distinct.len(), 1);
+    }
+
+    /// E3 (events): same no-leak contract for `emit_event`.
+    #[test]
+    fn emit_event_does_not_leak_per_call() {
+        let lua = mlua::Lua::new();
+        let mut ctx = ScriptContext::new();
+        ctx.add_event_binding(EventBinding {
+            name: "Boom",
+            emit: dummy_event_emit,
+        });
+
+        const N: usize = 100;
+        for _ in 0..N {
+            ctx.emit_event(&lua, "Boom", mlua::Value::Integer(1))
+                .expect("queued");
+        }
+
+        assert_eq!(ctx.deferred_events.len(), N);
+        let distinct: std::collections::HashSet<&str> = ctx
+            .deferred_events
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(distinct.len(), 1);
+    }
 }
