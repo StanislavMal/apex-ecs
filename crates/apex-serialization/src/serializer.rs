@@ -258,7 +258,18 @@ impl WorldSerializer {
                     let info = world.registry().get_info(component_id).unwrap();
                     let serde_fns = match &info.serde {
                         Some(s) => s,
-                        None    => continue,
+                        // §0.2a (E8): the type is registered but has no serde
+                        // functions, so its snapshot bytes are silently dropped
+                        // on restore — the entity comes back missing this
+                        // component. Surface it (throttled) so the data loss is
+                        // visible; register serde for the type to fix.
+                        None => {
+                            apex_core::warn_once!(
+                                "restore: component '{}' is registered without serde functions — snapshot data dropped, entity restored without it",
+                                comp_snap.type_name,
+                            );
+                            continue;
+                        }
                     };
 
                     // Данные уже в нужном формате — используем как есть
@@ -723,6 +734,42 @@ mod tests {
             "a zero-sized marker component must survive snapshot/restore by presence"
         );
         assert_eq!(w2.get::<Position>(restored).map(|p| p.x), Some(1.0));
+    }
+
+    /// §0.2a (E8): if a component's type is registered on the restore side but
+    /// WITHOUT serde functions (e.g. version skew), its snapshot bytes are
+    /// dropped and the entity comes back missing it. The drop must be loud
+    /// (`warn_once!`, verified by the apex-core macro test) rather than silent;
+    /// here we pin the data-loss contract — restore still succeeds, serde-backed
+    /// components come back, the serde-less one is absent.
+    #[test]
+    fn restore_drops_component_registered_without_serde() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Position>();
+        world.register_component_serde_json::<Health>();
+        let e = world.spawn((
+            Position { x: 5.0, y: 6.0 },
+            Health { current: 50.0, max: 100.0 },
+        ));
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        // Restore side: Position has serde, Health is registered as a plain
+        // component (no serde) — the E8 branch.
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<Position>();
+        w2.register_component::<Health>();
+        let map = WorldSerializer::restore(&mut w2, &snap).unwrap();
+
+        let restored = map[&e.index()];
+        assert_eq!(
+            w2.get::<Position>(restored),
+            Some(&Position { x: 5.0, y: 6.0 }),
+            "serde-backed component must restore",
+        );
+        assert!(
+            w2.get::<Health>(restored).is_none(),
+            "component registered without serde must be dropped on restore (E8)",
+        );
     }
 
     fn setup_world() -> World {
