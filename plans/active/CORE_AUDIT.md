@@ -275,9 +275,13 @@ dirty-корни + widen-then-descend + параллельная прямая з
 - **C1 (S):** `pub fn new(world: &'w World, indices: &'w [usize]) -> Self` — привязать
   лайфтаймы (raw-указатели внутри остаются для Send/Sync); with_ranges — аналогично либо
   `unsafe fn`.
-- **C2 (S-M):** в конструкторах Query/CachedQuery/QueryState::update — проверка самоконфликта
-  ids по ролям (есть `WorldQuerySystemAccess::system_access`) → `panic!` при write-write/
-  write-read внутри формы (Bevy-семантика «conflicting access»).
+- **C2 → перенесена в волну 3, co-located с В1(б)** (решение при реализации 2026-07-03):
+  полная детекция требует различать роли по позициям формы, но `AccessDescriptor::merge`
+  дедуплицирует writes ⇒ write-write (`Query<(&mut T, &mut T)>`) в слитом дескрипторе невидим.
+  Компайл-тайм-проверка только write-read — полумера (§0.2b) и потребовала бы проброса
+  `Q: WorldQuerySystemAccess` через все конструкторы Query (широкий риск). Runtime
+  borrow-флаги per-ComponentId (В1(б), волна 3) ловят И write-read, И write-write из ЛЮБОГО
+  safe-пути (queries/get_mut) единообразно — это и есть полное решение.
 - **C7 (S):** `pub unsafe trait WorldQuery` — согласованность has_row_filter/fetch_item
   становится частью unsafe-контракта. + макро-тест-переборщик «для каждой in-crate формы:
   has_row_filter()==false ⇒ fetch_item везде Some».
@@ -494,10 +498,11 @@ results.txt/perf.txt/apex-benc.txt (+.gitignore); зафиксировать cri
 
 **Волна 1 — SOUNDNESS: достижимый UB из safe-кода (P0; S/M-фиксы).**
 A1 dup-bundle → panic+dedup · B1 арена-align · B3 zeroed-ZST assert · B2 stale-lease
-(+`cmds.clear()` в планировщике) · B4 template Arc · C1 SubWorld лайфтаймы · C2 самоконфликт
-форм · B8 insert_raw size-assert · E1(Lua _meta валидация) · E2 (Clone-bridge) · D10
-SystemBuilder лайфтайм · C7 unsafe trait WorldQuery.
-Зависимости: B2 вместе с B-Н15; C2 до В3 (потом переедет в конструкторы нового Query).
+(+`cmds.clear()` в планировщике) · B4 template Arc · C1 SubWorld лайфтаймы · B8 insert_raw
+size-assert · E1(Lua _meta валидация) · E2 (Clone-bridge) · D10 SystemBuilder лайфтайм ·
+C7 unsafe trait WorldQuery.
+Зависимости: B2 вместе с B-Н15. **C2 перенесена в волну 3** (co-located с В1(б) runtime
+borrow-чекером — там полная детекция write-write+write-read, см. §4).
 *Гейт: новые регресс-тесты на каждый пункт (вкл. Miri на арену/dup-bundle), полный сьют,
 clippy net-neutral, criterion+frag_world без регресса, goldens движка байт-идентичны.*
 

@@ -27,7 +27,20 @@ pub const KEY_OR_CLOSE: u64 = 5 << 32;
 /// Бит «запись ключа — структурный маркер, а не компонент».
 pub const KEY_MARKER_BIT: u64 = 4 << 32;
 
-pub trait WorldQuery: Sized {
+/// # Safety
+///
+/// Реализация — часть unsafe-контракта итерации (safe-код в `for_each`/`iter`
+/// полагается на него без проверок):
+/// - `fetch_state`/`fetch_item` вызываются только для архетипа, прошедшего
+///   `matches_archetype`, и `row < arch.len()`; возвращаемые `Item` не должны
+///   алиасить чужие строки.
+/// - Если `has_row_filter()` возвращает `false`, то `fetch_item` ОБЯЗАН вернуть
+///   `Some` для КАЖДОЙ строки совпавшего непустого архетипа — иначе
+///   `fetch_item_unchecked` (её `unwrap_unchecked`) — UB. Форма, которая может
+///   отфильтровать строку, обязана вернуть `has_row_filter() == true`.
+/// - `component_count()` = число записей, которые `fill_ids`/`fill_cache_key`
+///   кладут, и совпадает с числом сегментов, которые ждёт `fetch_state`.
+pub unsafe trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
 
@@ -195,7 +208,7 @@ impl<T> Copy for WriteState<T> {}
 
 pub struct Read<T: Component>(std::marker::PhantomData<T>);
 
-impl<T: Component> WorldQuery for Read<T> {
+unsafe impl<T: Component> WorldQuery for Read<T> {
     type Item<'w> = &'w T;
     type State = *const T;
 
@@ -238,7 +251,7 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Read<T> {
 
 pub struct Write<T: Component>(std::marker::PhantomData<T>);
 
-impl<T: Component> WorldQuery for Write<T> {
+unsafe impl<T: Component> WorldQuery for Write<T> {
     type Item<'w> = Mut<'w, T>;
     type State = WriteState<T>;
 
@@ -298,7 +311,7 @@ pub type Ref<T> = Read<T>;
 
 /// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
 /// выдаёт `&T`.
-impl<T: Component> WorldQuery for &T {
+unsafe impl<T: Component> WorldQuery for &T {
     type Item<'w> = &'w T;
     type State = <Read<T> as WorldQuery>::State;
 
@@ -333,7 +346,7 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &T {
 
 /// `&mut T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в
 /// [`Write<T>`], выдаёт [`Mut<T>`] (со стампом change-tick на `DerefMut`).
-impl<T: Component> WorldQuery for &mut T {
+unsafe impl<T: Component> WorldQuery for &mut T {
     type Item<'w> = Mut<'w, T>;
     type State = <Write<T> as WorldQuery>::State;
 
@@ -371,7 +384,7 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &mut T {
 /// `Entity` — обычная форма запроса: `Query<(Entity, &Pos)>` выдаёт id
 /// сущности в составе item. После П1 `iter()`/for-цикл выдают ТОЛЬКО item —
 /// entity больше не навязана; нужна — запросите явно (как в Bevy).
-impl WorldQuery for Entity {
+unsafe impl WorldQuery for Entity {
     type Item<'w> = Entity;
     /// Указатель на массив `Archetype::entities` (живёт, пока жив мир и нет
     /// структурных изменений — стандартный инвариант итерации).
@@ -410,7 +423,7 @@ impl WorldQuerySystemAccess for Entity {
 
 pub struct With<T: Component>(std::marker::PhantomData<T>);
 
-impl<T: Component> WorldQuery for With<T> {
+unsafe impl<T: Component> WorldQuery for With<T> {
     type Item<'w> = ();
     type State = ();
 
@@ -455,7 +468,7 @@ impl<T: Component + 'static> WorldQuerySystemAccess for With<T> {
 
 pub struct Without<T: Component>(std::marker::PhantomData<T>);
 
-impl<T: Component> WorldQuery for Without<T> {
+unsafe impl<T: Component> WorldQuery for Without<T> {
     type Item<'w> = ();
     type State = ();
 
@@ -540,7 +553,7 @@ impl MaybeState {
     }
 }
 
-impl<T: Component> WorldQuery for Maybe<T> {
+unsafe impl<T: Component> WorldQuery for Maybe<T> {
     type Item<'w> = Option<&'w T>;
     type State = MaybeState;
 
@@ -639,7 +652,7 @@ impl MaybeMutState {
     }
 }
 
-impl<T: Component> WorldQuery for MaybeWrite<T> {
+unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
     type Item<'w> = Option<Mut<'w, T>>;
     type State = MaybeMutState;
 
@@ -725,7 +738,7 @@ pub struct ChangedState {
 unsafe impl Send for ChangedState {}
 unsafe impl Sync for ChangedState {}
 
-impl<T: Component> WorldQuery for Changed<T> {
+unsafe impl<T: Component> WorldQuery for Changed<T> {
     type Item<'w> = ();
     type State = ChangedState;
 
@@ -808,7 +821,7 @@ pub struct AddedState {
 unsafe impl Send for AddedState {}
 unsafe impl Sync for AddedState {}
 
-impl<T: Component> WorldQuery for Added<T> {
+unsafe impl<T: Component> WorldQuery for Added<T> {
     type Item<'w> = ();
     type State = AddedState;
 
@@ -893,7 +906,7 @@ pub struct Or<T>(std::marker::PhantomData<T>);
 
 macro_rules! impl_or_query {
     ( $( ($F:ident, $idx:tt) ),+ ) => {
-        impl< $($F: WorldQuery),+ > WorldQuery for Or<( $($F,)+ )> {
+        unsafe impl< $($F: WorldQuery),+ > WorldQuery for Or<( $($F,)+ )> {
             type Item<'w> = ();
             /// Per-arch состояние ветки: `Some(state)` — ветка матчит этот
             /// архетип, `None` — ветка мертва (state НЕ фетчится, иначе UB
@@ -1005,7 +1018,7 @@ impl_or_query!(
 
 macro_rules! impl_world_query_tuple {
     ( $( ($Q:ident, $idx:tt) ),+ ) => {
-        impl< $($Q: WorldQuery),+ > WorldQuery for ( $($Q,)+ ) {
+        unsafe impl< $($Q: WorldQuery),+ > WorldQuery for ( $($Q,)+ ) {
             type Item<'w> = ( $($Q::Item<'w>,)+ );
             type State    = ( $($Q::State,)+ );
 
@@ -1090,7 +1103,7 @@ macro_rules! impl_world_query_tuple {
 
 // ── () — пустой запрос (для AutoSystem без компонентного доступа) ─
 
-impl WorldQuery for () {
+unsafe impl WorldQuery for () {
     type Item<'w> = ();
     type State = ();
 
