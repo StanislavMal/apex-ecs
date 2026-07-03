@@ -243,37 +243,32 @@ impl<T> Events<T> {
             self.assert_lagging_invariant();
             return;
         }
-        let all_read = self.all_readers_caught_up();
-
-        if all_read {
-            // Все читатели прочитали старые события — очищаем буфер и сбрасываем курсоры
+        if self.all_readers_caught_up() {
+            // Everyone read the current buffer: drop it, reset cursors to 0, and
+            // make the pending events the whole new buffer (reusing the old
+            // events allocation for `pending`).
             self.events.clear();
             for pos in self.cursors.iter_mut().flatten() {
                 *pos = 0;
             }
-        }
-
-        // Меняем местами буферы: events ← pending (новые события текущего тика)
-        std::mem::swap(&mut self.events, &mut self.pending);
-
-        if all_read {
-            // Все читатели догнали — просто очищаем pending, курсоры уже в 0
+            std::mem::swap(&mut self.events, &mut self.pending);
             self.pending.clear();
         } else {
-            // Не все читатели догнали: старые события (теперь в pending) нужно
-            // дописать в конец events, чтобы отстающие читатели могли их догнать
-            let new_count = self.events.len() as u32;
-
-            // Сдвигаем курсоры на количество новых событий, которые встали перед старыми
-            for pos in self.cursors.iter_mut().flatten() {
-                *pos += new_count;
-            }
-
-            // Переносим старые события в конец буфера чтения
+            // Some readers are still behind. Append the NEW events AFTER the old
+            // ones, so a lagging cursor at position `p` reads `old[p..]` and then
+            // flows straight into the new events, and a caught-up cursor sitting
+            // at `events.len()` lands exactly on the first new event — no cursor
+            // shifting, nothing lost.
+            //
+            // The old code swapped `[new, old]` into place and shifted every
+            // cursor forward by `new_count`, which left the new events *behind*
+            // every cursor: no one ever read them and the next all-caught-up
+            // `update` cleared them. That silently dropped every event produced
+            // while any reader lagged (F1).
             let pending_cap = self.pending.capacity();
             self.events.append(&mut self.pending);
-            // Vec::append обнулил capacity у pending — восстанавливаем,
-            // чтобы следующий tick не аллоцировал с нуля
+            // Vec::append zeroed pending's capacity — restore some so the next
+            // tick does not allocate from scratch.
             self.pending.reserve(pending_cap.min(256));
         }
 
@@ -1306,6 +1301,51 @@ mod tests {
         let events = queue.iter(&reader_a);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], 3);
+    }
+
+    /// F1: when a reader lags across an `update`, neither the old (unread) events
+    /// nor the new ones may be lost — for that reader or any other.
+    #[test]
+    fn lagging_reader_receives_old_and_new_events_none_lost() {
+        let mut queue = Events::new();
+        let reader_a = queue.add_reader(); // will lag
+        let reader_b = queue.add_reader(); // stays caught up
+
+        // Frame 1: 1, 2.
+        queue.send(1);
+        queue.send(2);
+        queue.update();
+
+        // B reads (catches up); A intentionally does not read.
+        assert_eq!(queue.iter(&reader_b), &[1, 2]);
+        queue.advance_reader_mut(&reader_b);
+
+        // Frame 2: 3, 4, while A still lags.
+        queue.send(3);
+        queue.send(4);
+        queue.update();
+
+        // A must see everything it never read plus the new events.
+        assert_eq!(
+            queue.iter(&reader_a),
+            &[1, 2, 3, 4],
+            "lagging reader lost events across update"
+        );
+        queue.advance_reader_mut(&reader_a);
+
+        // B was caught up; it must still receive the new events (the old code
+        // buried them behind every cursor and dropped them).
+        assert_eq!(
+            queue.iter(&reader_b),
+            &[3, 4],
+            "caught-up reader missed events produced while another reader lagged"
+        );
+        queue.advance_reader_mut(&reader_b);
+
+        // Both are now caught up — the next update drains cleanly.
+        queue.update();
+        assert_eq!(queue.iter(&reader_a), &[] as &[i32]);
+        assert_eq!(queue.iter(&reader_b), &[] as &[i32]);
     }
 
     #[test]
