@@ -545,7 +545,7 @@ fn bench_scheduler_throughput(n: usize) {
     {
         let mut sched = Scheduler::new();
         sched.add_systems(StageLabel::Update, seq("move", |world: &mut World| {
-            Query::<(Read<Velocity>, Write<Position>)>::new(world)
+            Query::<(Read<Velocity>, Write<Position>)>::new_mut(world)
                 .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
         }));
         sched.compile().unwrap();
@@ -901,8 +901,8 @@ fn bench_query(n: usize) {
     bench_with_setup(
         &format!("Query<(Read<Vel>, Write<Pos>)>    ({n}k)"),
         || make_world_3comp(n * 1000),
-        |world: World| {
-            Query::<(Read<Velocity>, Write<Position>)>::new(&world)
+        |mut world: World| {
+            Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
                 .for_each(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64

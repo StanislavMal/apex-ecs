@@ -6,6 +6,7 @@ use crate::{
     entity::Entity,
     sub_world::SubWorld,
     system_param::WorldQuerySystemAccess,
+    unsafe_world_cell::UnsafeWorldCell,
     world::World,
 };
 
@@ -348,6 +349,33 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
 
 /// Алиас `Read<T>` — для совместимости стиля (`Ref<T>` ≡ `Read<T>`).
 pub type Ref<T> = Read<T>;
+
+// ── ReadOnlyWorldQuery ─────────────────────────────────────────
+
+/// Marker for query shapes that can never hand out mutable component access.
+///
+/// This is the type-level knob of the borrow model: `Query::new(&World)` (and
+/// every other shared-`&World` constructor) is only available for shapes that
+/// are read-only end to end, so safe code cannot obtain two aliasing `&mut T`
+/// through shared world borrows. Write shapes construct from `&mut World`
+/// ([`Query::new_mut`]) or through the scheduler's validated unsafe escape.
+///
+/// # Safety
+/// Implement only for shapes whose `Item` (and the items of every nested
+/// element) provides no mutable access to component data. `Write<T>`,
+/// `&mut T` and `MaybeWrite<T>` must NOT implement this.
+pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
+
+// SAFETY: items are shared references / entity ids / filter unit types.
+unsafe impl<T: Component> ReadOnlyWorldQuery for Read<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
+unsafe impl ReadOnlyWorldQuery for Entity {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for With<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Without<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Maybe<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Added<T> {}
+unsafe impl ReadOnlyWorldQuery for () {}
 
 /// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
 /// выдаёт `&T`.
@@ -1054,6 +1082,11 @@ macro_rules! impl_or_query {
                     $( .merge(&$F::system_access()) )+
             }
         }
+
+        // SAFETY: `Or` yields `()`; it is read-only iff every branch is
+        // read-only (branch states are still fetched, so a write branch
+        // would create transient mutable state).
+        unsafe impl< $($F: ReadOnlyWorldQuery),+ > ReadOnlyWorldQuery for Or<( $($F,)+ )> {}
     };
 }
 
@@ -1163,6 +1196,9 @@ macro_rules! impl_world_query_tuple {
                     $( .merge(&$Q::system_access()) )+
             }
         }
+
+        // SAFETY: a tuple is read-only iff every element is read-only.
+        unsafe impl< $($Q: ReadOnlyWorldQuery),+ > ReadOnlyWorldQuery for ( $($Q,)+ ) {}
     };
 }
 
@@ -1262,6 +1298,44 @@ pub(crate) struct ArchState<S> {
 /// фильтрация разнесены, item фильтра не попадает в выдачу. По умолчанию
 /// `F = ()` — единый кортеж остаётся как вторая форма
 /// (`Query<(Read<A>, With<C>)>` эквивалентен).
+/// C2: reject a query shape that borrows the same component's data mutably
+/// more than once (`(&mut T, &mut T)`) or both mutably and immutably
+/// (`(&T, &mut T)`, `(Read<T>, Write<T>)`). Such a shape would hand out
+/// aliasing references to one row on every iteration — undefined behavior
+/// reachable from entirely safe code. Mirrors Bevy, which panics on the same
+/// shapes. Runs once at construction over the (typically ≤ 8) declared
+/// accesses, so the cost is negligible. Shared by every query construction
+/// path (`Query`, `CachedQuery`).
+pub(crate) fn assert_no_self_alias<S: WorldQuery>(world: &World) {
+    let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
+    S::fill_data_access(world, &mut access);
+    for i in 0..access.len() {
+        let (id_i, excl_i) = access[i];
+        // Unregistered components collapse to INVALID and match no archetype,
+        // so a duplicate INVALID can never actually alias — skip it.
+        if id_i == ComponentId::INVALID {
+            continue;
+        }
+        for &(id_j, excl_j) in &access[i + 1..] {
+            if id_j == id_i && (excl_i || excl_j) {
+                let name = world
+                    .registry
+                    .get_info(id_i)
+                    .map(|info| info.name)
+                    .unwrap_or("<component>");
+                panic!(
+                    "Query aliases component `{name}`: it is accessed mutably more than \
+                     once (or both mutably and immutably) within a single query \
+                     (e.g. `Query<(&mut {name}, &mut {name})>` or `(Read, Write)` of the \
+                     same component). This would create aliasing references to one row. \
+                     Access each component at most once per query, or split into separate \
+                     queries."
+                );
+            }
+        }
+    }
+}
+
 pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
     world: &'w World,
     /// Inline до 8 архетипов (D2-1): типичный системный запрос матчит 1-5
@@ -1279,52 +1353,78 @@ pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
 }
 
 impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
-    pub fn new(world: &'w World) -> Self {
-        Self::new_with_tick(world, Tick::ZERO)
+    /// Read-only query over a shared world borrow.
+    ///
+    /// Write shapes (`Write<T>`, `&mut T`, `MaybeWrite<T>`) do not satisfy
+    /// [`ReadOnlyWorldQuery`]: construct those with [`Query::new_mut`]
+    /// (exclusive borrow proves no aliasing), or receive the query from the
+    /// scheduler as a system parameter — cross-system exclusivity is
+    /// validated there from declared accesses.
+    pub fn new(world: &'w World) -> Self
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        Self::build(world, Tick::ZERO)
     }
 
-    /// C2: reject a query shape that borrows the same component's data mutably
-    /// more than once (`Query<(&mut T, &mut T)>`) or both mutably and immutably
-    /// (`Query<(&T, &mut T)>`, `Query<Read<T>, Write<T>>`). Such a shape would
-    /// hand out aliasing references to one row on every iteration — undefined
-    /// behavior reachable from entirely safe code. Mirrors Bevy, which panics on
-    /// the same shapes. Runs once at construction over the (typically ≤ 8)
-    /// declared accesses, so the cost is negligible.
+    /// Read-only query with an explicit change-detection base tick.
+    pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape query (including writes) over an exclusive world borrow.
+    /// The `&mut World` receiver proves no other world view is live, so the
+    /// yielded `Mut<T>` items cannot alias anything.
+    pub fn new_mut(world: &'w mut World) -> Self {
+        Self::build(world, Tick::ZERO)
+    }
+
+    /// [`Query::new_mut`] with an explicit change-detection base tick.
+    pub fn new_mut_with_tick(world: &'w mut World, last_run: Tick) -> Self {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape query through the unsafe world escape.
+    ///
+    /// # Safety
+    /// For the lifetime of the query the declared component access must not
+    /// alias any other live access to the same world: components this shape
+    /// writes are accessed by no other view, components it reads — by no
+    /// mutable view. The scheduler upholds this for systems by validating
+    /// the declared accesses of everything that runs concurrently.
+    pub unsafe fn new_unchecked(world: UnsafeWorldCell<'w>) -> Self {
+        Self::build(world.world(), Tick::ZERO)
+    }
+
+    /// [`Query::new_unchecked`] with an explicit change-detection base tick.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`].
+    pub unsafe fn new_unchecked_with_tick(world: UnsafeWorldCell<'w>, last_run: Tick) -> Self {
+        Self::build(world.world(), last_run)
+    }
+
+    /// C2: см. [`assert_no_self_alias`] — проверяется форма `(Q, F)` целиком.
     fn assert_no_self_alias(world: &World) {
-        let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
-        <(Q, F)>::fill_data_access(world, &mut access);
-        for i in 0..access.len() {
-            let (id_i, excl_i) = access[i];
-            // Unregistered components collapse to INVALID and match no archetype,
-            // so a duplicate INVALID can never actually alias — skip it.
-            if id_i == ComponentId::INVALID {
-                continue;
-            }
-            for &(id_j, excl_j) in &access[i + 1..] {
-                if id_j == id_i && (excl_i || excl_j) {
-                    let name = world
-                        .registry
-                        .get_info(id_i)
-                        .map(|info| info.name)
-                        .unwrap_or("<component>");
-                    panic!(
-                        "Query aliases component `{name}`: it is accessed mutably more than \
-                         once (or both mutably and immutably) within a single query \
-                         (e.g. `Query<(&mut {name}, &mut {name})>` or `(Read, Write)` of the \
-                         same component). This would create aliasing references to one row. \
-                         Access each component at most once per query, or split into separate \
-                         queries."
-                    );
-                }
-            }
-        }
+        assert_no_self_alias::<(Q, F)>(world);
     }
 
     /// Создать Query с ограничением на архетипы и строки из SubWorld.
     ///
     /// Использует `sub.archetype_indices` для фильтрации архетипов
     /// и `sub.row_ranges` для ограничения строк (row-level splits).
-    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+    ///
+    /// # Safety
+    /// The `SubWorld` must have been vended by the scheduler for a system
+    /// whose declared access covers this query's shape, and no access that
+    /// conflicts with it may run concurrently (the scheduler validates this
+    /// from declared accesses; row ranges keep same-system splits disjoint).
+    pub unsafe fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
         let mut q = Self::new_within_archetypes(sub.world(), sub.archetype_indices(), last_run);
         q.row_ranges = sub.row_ranges();
         q
@@ -1379,7 +1479,10 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         }
     }
 
-    pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self {
+    /// Shared construction path. Callers prove access exclusivity for write
+    /// shapes (see the public constructors above); the shared `&'w World`
+    /// here is a view for metadata and column pointers only.
+    fn build(world: &'w World, last_run: Tick) -> Self {
         Self::assert_no_self_alias(world);
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(world, &mut ids);
@@ -2362,7 +2465,7 @@ mod query_filter_tests {
         }
         assert_eq!(sum, 3);
 
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         for mut hp in &mut q {
             hp.0 *= 10;
         }
@@ -2404,7 +2507,7 @@ mod query_filter_tests {
         // Per-item Write path: `Mut::deref_mut` writes the tick through the
         // shared `&Column` via `ticks_ptr()`.
         {
-            let mut q = Query::<Write<Hp>>::new(&world);
+            let mut q = Query::<Write<Hp>>::new_mut(&mut world);
             for mut hp in &mut q {
                 hp.0 += 100;
             }
@@ -2422,7 +2525,7 @@ mod query_filter_tests {
         world.advance_change_tick();
         let lr2 = world.last_run_tick();
         {
-            let q = Query::<Write<Hp>>::new(&world);
+            let q = Query::<Write<Hp>>::new_mut(&mut world);
             q.for_each_chunk(|_entities, hps: &mut [Hp]| {
                 for hp in hps {
                     hp.0 += 1;
@@ -2452,31 +2555,31 @@ mod query_filter_tests {
 
         // Aliasing shapes must panic.
         let ww = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, Write<Hp>)>::new(&world);
+            let _ = Query::<(Write<Hp>, Write<Hp>)>::new_mut(&mut world);
         }));
         assert!(ww.is_err(), "write+write of same component must panic");
 
         let rw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Read<Hp>, Write<Hp>)>::new(&world);
+            let _ = Query::<(Read<Hp>, Write<Hp>)>::new_mut(&mut world);
         }));
         assert!(rw.is_err(), "read+write of same component must panic");
 
         let refmut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(&mut Hp, &mut Hp)>::new(&world);
+            let _ = Query::<(&mut Hp, &mut Hp)>::new_mut(&mut world);
         }));
         assert!(refmut.is_err(), "&mut + &mut of same component must panic");
 
         let maybe_alias = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new(&world);
+            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new_mut(&mut world);
         }));
         assert!(maybe_alias.is_err(), "write + optional write of same component must panic");
 
         // Legal shapes must NOT panic (construction runs the check).
         let _ = Query::<(Read<Hp>, Read<Hp>)>::new(&world); // shared + shared
-        let _ = Query::<(Write<Hp>, Write<Mana>)>::new(&world); // distinct components
-        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new(&world); // filter over written comp
-        let _ = Query::<Write<Hp>, Changed<Hp>>::new(&world); // Changed filter is not a data borrow
-        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new(&world); // write + optional distinct
+        let _ = Query::<(Write<Hp>, Write<Mana>)>::new_mut(&mut world); // distinct components
+        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new_mut(&mut world); // filter over written comp
+        let _ = Query::<Write<Hp>, Changed<Hp>>::new_mut(&mut world); // Changed filter is not a data borrow
+        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new_mut(&mut world); // write + optional distinct
     }
 
     /// A12: `len`/`is_empty` must honor per-row filters (and row ranges), not
@@ -2525,7 +2628,7 @@ mod query_filter_tests {
         drop(q);
 
         // single_mut: мутация через Mut<T>.
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         let mut hp = q.single_mut().unwrap();
         hp.0 = 7;
         drop(q);
@@ -2561,7 +2664,7 @@ mod query_filter_tests {
         drop(q);
 
         // get_mut: мутация через Mut<T>.
-        let mut q = Query::<Write<Hp>>::new(&world);
+        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         q.get_mut(boss).unwrap().0 = 1;
         drop(q);
         assert_eq!(world.get::<Hp>(boss), Some(&Hp(1)));
@@ -2676,7 +2779,7 @@ mod tests {
 
         // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
         {
-            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
             q.for_each(|e, mut p| {
                 if e == target {
                     p.x += 1.0;
@@ -2707,7 +2810,7 @@ mod tests {
         Query::<(&Pos,)>::new(&world).for_each(|_, (p,)| {
             assert_eq!(p.x, 1.0);
         });
-        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
             p.x += 10.0;
         });
         assert_eq!(world.get::<Pos>(e).unwrap().x, 11.0);
@@ -2716,7 +2819,7 @@ mod tests {
         world.tick();
         let lr = world.current_tick();
         world.tick();
-        Query::<&mut Pos>::new(&world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
             p.x += 1.0;
         });
         let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
@@ -2737,7 +2840,7 @@ mod tests {
         world.tick();
 
         {
-            let q: Query<'_, Write<Pos>> = Query::new(&world);
+            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
             let mut sink = 0.0;
             q.for_each(|_, p| {
                 // Только Deref (чтение) — без DerefMut.
@@ -2807,7 +2910,7 @@ mod tests {
         world.spawn((A,));
 
         // Опциональная запись: у кого есть B — удваиваем
-        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new(&world);
+        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
             .iter()
             .map(|(_, b_opt)| b_opt.is_some())

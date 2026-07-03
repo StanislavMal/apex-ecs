@@ -65,12 +65,12 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     let sink = AtomicU64::new(0);
 
     let t = Instant::now();
-    world.query::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
+    world.query_mut::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
         .for_each(|_, (m, _p)| { sink.fetch_add(heavy(*m).to_bits() as u64, Ordering::Relaxed); });
     let seq = t.elapsed();
 
     let t = Instant::now();
-    world.query::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
+    world.query_mut::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
         .par_for_each(|_, (m, _p)| { sink.fetch_add(heavy(*m).to_bits() as u64, Ordering::Relaxed); });
     let par = t.elapsed();
 

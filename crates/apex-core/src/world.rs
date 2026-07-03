@@ -1834,16 +1834,30 @@ impl World {
 
     // ── Query API ──────────────────────────────────────────────
 
-    /// Кешированный типизированный запрос (как Bevy `world.query::<Q>()`;
-    /// зеркало `ctx.query` в системах). Список архетипов берётся из
-    /// инкрементального глобального кэша.
-    pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+    /// Кешированный типизированный read-only запрос (как Bevy
+    /// `world.query::<Q>()`; зеркало `ctx.query` в системах). Список
+    /// архетипов берётся из инкрементального глобального кэша. Write-формы —
+    /// через [`query_mut`](Self::query_mut) (эксклюзивный заём).
+    pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(&self) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, Tick::ZERO)
     }
 
     /// То же с явной базой change-detection (`Changed<T>`/`Added<T>` в Q).
-    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
+    pub fn query_changed<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(
+        &self,
+        last_run: Tick,
+    ) -> CachedQuery<'_, Q> {
         CachedQuery::new(self, last_run)
+    }
+
+    /// Запрос любой формы (включая `Write<T>`) под эксклюзивным заёмом мира.
+    pub fn query_mut<Q: WorldQuery>(&mut self) -> CachedQuery<'_, Q> {
+        CachedQuery::new_mut(self, Tick::ZERO)
+    }
+
+    /// [`query_mut`](Self::query_mut) с явной базой change-detection.
+    pub fn query_mut_changed<Q: WorldQuery>(&mut self, last_run: Tick) -> CachedQuery<'_, Q> {
+        CachedQuery::new_mut(self, last_run)
     }
 
     /// Динамический запрос по runtime-`ComponentId` (редкий случай: типы не
@@ -2239,7 +2253,12 @@ impl<'w> SystemContext<'w> {
     }
 
     /// Создать контекст с thread-local командами.
-    pub fn with_commands(
+    ///
+    /// # Safety
+    /// `deferred_cmds` must point to a `Vec<Commands>` with one slot per rayon
+    /// worker thread, alive for the context's lifetime; each worker accesses
+    /// only its own slot (see [`commands`](Self::commands)).
+    pub unsafe fn with_commands(
         sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
         deferred_cmds: *mut Vec<Commands>,
     ) -> Self {
@@ -2291,12 +2310,16 @@ impl<'w> SystemContext<'w> {
         // База change-detection — `last_run_tick` мира (граница прошлого кадра),
         // так `Changed<T>` внутри системы достоверен (TD-9), а не «всё подряд».
         let last_run = self.sub_worlds[0].world().last_run_tick();
-        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
+        // SAFETY: the context's SubWorlds are scheduler-vended; the system's
+        // declared access is expected to cover `Q` (see F3: this arbitrary-Q
+        // accessor leaves the public surface with the SystemParam migration).
+        unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
     #[inline]
     pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
-        CachedQuery::from_sub_world(&self.sub_worlds[0], last_run)
+        // SAFETY: see `query` above.
+        unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
     #[inline]
@@ -2492,7 +2515,33 @@ pub struct CachedQuery<'w, Q: WorldQuery> {
 }
 
 impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
-    pub fn new(world: &'w World, last_run: Tick) -> Self {
+    /// Read-only cached query over a shared world borrow (see
+    /// [`Query::new`](crate::query::Query::new) for the borrow model: write
+    /// shapes construct via [`new_mut`](Self::new_mut) or the scheduler).
+    pub fn new(world: &'w World, last_run: Tick) -> Self
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape cached query over an exclusive world borrow.
+    pub fn new_mut(world: &'w mut World, last_run: Tick) -> Self {
+        Self::build(world, last_run)
+    }
+
+    /// Any-shape cached query through the unsafe world escape.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`](crate::query::Query::new_unchecked).
+    pub unsafe fn new_unchecked(world: crate::unsafe_world_cell::UnsafeWorldCell<'w>, last_run: Tick) -> Self {
+        Self::build(world.world(), last_run)
+    }
+
+    fn build(world: &'w World, last_run: Tick) -> Self {
+        // C2: same self-alias rejection as `Query` — this is the second
+        // construction path and must not bypass the check.
+        crate::query::assert_no_self_alias::<Q>(world);
         // Один проход реестра: ключ кэша несёт и ids (нижние 32 бита каждой
         // НЕ-маркерной записи, в порядке fill_ids — инвариант fill_cache_key),
         // и роли формы. Структурные маркеры Or<> (KEY_MARKER_BIT) пропускаются.
@@ -2529,7 +2578,15 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// ids — inline-SmallVec. Не вызывает `get_or_compute` (thread-safe для
     /// параллельных систем). Фильтрация по `Q::matches_archetype` происходит
     /// в `for_each`/`par_for_each` — `fetch_state` только для совпадающих.
-    pub fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+    ///
+    /// # Safety
+    /// The `SubWorld` must have been vended by the scheduler for a system
+    /// whose declared access covers this query's shape, and no conflicting
+    /// access may run concurrently (row ranges keep same-system splits
+    /// disjoint).
+    pub unsafe fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
+        // C2: reject self-aliasing shapes on this path too.
+        crate::query::assert_no_self_alias::<Q>(sub.world());
         let mut ids = crate::query::IdBuf::new();
         Q::fill_ids(sub.world(), &mut ids);
 
@@ -2949,16 +3006,56 @@ impl<Q: WorldQuery> QueryState<Q> {
         }
     }
 
-    /// Запрос с базой change-detection `world.last_run_tick()` (как
-    /// `ctx.query` в системах).
+    /// Read-only запрос с базой change-detection `world.last_run_tick()`
+    /// (как `ctx.query` в системах). Write-формы — [`query_mut`](Self::query_mut).
     #[inline]
-    pub fn query<'a>(&'a mut self, world: &'a World) -> CachedQuery<'a, Q> {
-        self.query_with_tick(world, world.last_run_tick())
+    pub fn query<'a>(&'a mut self, world: &'a World) -> CachedQuery<'a, Q>
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        let last_run = world.last_run_tick();
+        self.query_with_tick(world, last_run)
     }
 
-    /// Запрос с явной базой `last_run` (для `Changed<T>`-форм с собственным
-    /// отсчётом, например extract-систем).
-    pub fn query_with_tick<'a>(&'a mut self, world: &'a World, last_run: Tick) -> CachedQuery<'a, Q> {
+    /// Read-only запрос с явной базой `last_run` (для `Changed<T>`-форм с
+    /// собственным отсчётом, например extract-систем).
+    pub fn query_with_tick<'a>(&'a mut self, world: &'a World, last_run: Tick) -> CachedQuery<'a, Q>
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        self.update(world);
+        CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
+    }
+
+    /// Запрос любой формы под эксклюзивным заёмом мира.
+    #[inline]
+    pub fn query_mut<'a>(&'a mut self, world: &'a mut World) -> CachedQuery<'a, Q> {
+        let last_run = world.last_run_tick();
+        self.query_mut_with_tick(world, last_run)
+    }
+
+    /// [`query_mut`](Self::query_mut) с явной базой `last_run`.
+    pub fn query_mut_with_tick<'a>(
+        &'a mut self,
+        world: &'a mut World,
+        last_run: Tick,
+    ) -> CachedQuery<'a, Q> {
+        crate::query::assert_no_self_alias::<Q>(world);
+        self.update(world);
+        CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
+    }
+
+    /// Запрос любой формы через unsafe-эскейп мира.
+    ///
+    /// # Safety
+    /// Same contract as [`Query::new_unchecked`](crate::query::Query::new_unchecked).
+    pub unsafe fn query_unchecked_with_tick<'a>(
+        &'a mut self,
+        world: crate::unsafe_world_cell::UnsafeWorldCell<'a>,
+        last_run: Tick,
+    ) -> CachedQuery<'a, Q> {
+        let world = world.world();
+        crate::query::assert_no_self_alias::<Q>(world);
         self.update(world);
         CachedQuery::from_state_parts(world, &self.arch_indices, &self.ids, last_run)
     }
@@ -3633,7 +3730,8 @@ mod tests {
     fn system_context_try_resource_some() {
         let mut world = World::new();
         world.insert_resource(Score(42));
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         let res = ctx.try_resource::<Score>();
@@ -3644,7 +3742,8 @@ mod tests {
     #[test]
     fn system_context_try_resource_none() {
         let world = World::new();
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         assert!(ctx.try_resource::<Score>().is_none());
@@ -3654,7 +3753,8 @@ mod tests {
     fn system_context_try_resource_mut_some() {
         let mut world = World::new();
         world.insert_resource(Score(10));
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         let res_mut = ctx.try_resource_mut::<Score>();
@@ -3665,7 +3765,8 @@ mod tests {
     #[test]
     fn system_context_try_resource_mut_none() {
         let world = World::new();
-        let sw = crate::sub_world::SubWorld::new(&world, &[]);
+        // SAFETY: the test holds the only reference to `world`; nothing conflicts.
+        let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
         assert!(ctx.try_resource_mut::<Score>().is_none());
@@ -4820,8 +4921,8 @@ mod wave5_par_split {
     #[test]
     fn par_split_write_matches_sequential() {
         // Parallel (adaptive-split) mutation.
-        let (wp, _) = skewed_world();
-        wp.query::<crate::query::Write<N>>()
+        let (mut wp, _) = skewed_world();
+        wp.query_mut::<crate::query::Write<N>>()
             .par_for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut par: Vec<u32> = wp
             .query::<crate::query::Read<N>>()
@@ -4831,8 +4932,8 @@ mod wave5_par_split {
         par.sort_unstable();
 
         // Sequential reference on an identically-built world.
-        let (ws, _) = skewed_world();
-        ws.query::<crate::query::Write<N>>()
+        let (mut ws, _) = skewed_world();
+        ws.query_mut::<crate::query::Write<N>>()
             .for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut seq: Vec<u32> = ws
             .query::<crate::query::Read<N>>()

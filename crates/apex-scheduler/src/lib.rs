@@ -2421,10 +2421,16 @@ impl Scheduler {
                         match &mut system.kind {
                             SystemKind::Sequential(f) => f(w),
                             SystemKind::Parallel { system, .. } => {
-                                system.run(SystemContext::with_commands(
-                                    std::slice::from_ref(&sub_world),
-                                    cmds_ptr,
-                                ));
+                                // SAFETY: `cmds_ptr` points at `thread_commands`
+                                // (one slot per rayon worker), alive until the
+                                // end of the run.
+                                let ctx = unsafe {
+                                    SystemContext::with_commands(
+                                        std::slice::from_ref(&sub_world),
+                                        cmds_ptr,
+                                    )
+                                };
+                                system.run(ctx);
                             }
                         }
                         if let Some(t) = prof_t {
@@ -2585,11 +2591,13 @@ impl Scheduler {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
                         let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
                         // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
-                        // указывает на thread_commands, который жив до конца run_hybrid_parallel.
-                        sys.run(SystemContext::with_commands(
-                            &[sw],
-                            cmds_ptr as *mut Vec<Commands>,
-                        ));
+                        // указывает на thread_commands (по слоту на rayon-поток),
+                        // который жив до конца run_hybrid_parallel.
+                        let sws = [sw];
+                        let ctx = unsafe {
+                            SystemContext::with_commands(&sws, cmds_ptr as *mut Vec<Commands>)
+                        };
+                        sys.run(ctx);
                     }
                 }
             }
@@ -2869,10 +2877,16 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::with_commands(
-                                        std::slice::from_ref(&sub_world),
-                                        cmds_ptr as *mut Vec<Commands>,
-                                    ));
+                                    // SAFETY: `cmds_ptr` points at `thread_commands`
+                                    // (one slot per rayon worker), alive until the
+                                    // end of the run.
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_ptr as *mut Vec<Commands>,
+                                        )
+                                    };
+                                    system.run(ctx);
                                 }
                             }
                             if let Some(t) = prof_t {
@@ -2940,10 +2954,16 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    system.run(SystemContext::with_commands(
-                                        std::slice::from_ref(&sub_world),
-                                        cmds_ptr as *mut Vec<Commands>,
-                                    ));
+                                    // SAFETY: `cmds_ptr` points at `thread_commands`
+                                    // (one slot per rayon worker), alive until the
+                                    // end of the run.
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_ptr as *mut Vec<Commands>,
+                                        )
+                                    };
+                                    system.run(ctx);
                                 }
                             }
                             if let Some(t) = prof_t {

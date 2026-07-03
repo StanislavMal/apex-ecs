@@ -1002,7 +1002,7 @@ mod tests {
         // какого-либо ручного маркера.
         world.tick();
         {
-            let q = Query::<Write<LocalTransform>>::new(&world);
+            let q = Query::<Write<LocalTransform>>::new_mut(&mut world);
             q.for_each(|_, mut lt| {
                 lt.translation = Vec3::new(42.0, 0.0, 0.0);
             });
@@ -1125,7 +1125,7 @@ mod tests {
         // Все родители dirty одновременно → n независимых поддеревьев → parallel-ветка.
         world.tick();
         {
-            let q = Query::<Write<LocalTransform>>::new(&world);
+            let q = Query::<Write<LocalTransform>>::new_mut(&mut world);
             q.for_each(|_, mut lt| {
                 if lt.translation.y == 0.0 {
                     lt.translation.x += 1000.0;
@@ -1173,7 +1173,7 @@ mod tests {
         // Сдвигаем ТОЛЬКО корень → пересчёт каскадирует на 600 потомков через широкие уровни.
         world.tick();
         {
-            let q = Query::<Write<LocalTransform>>::new(&world);
+            let q = Query::<Write<LocalTransform>>::new_mut(&mut world);
             q.for_each(|e, mut lt| {
                 if e == root {
                     lt.translation.x = 1000.0;
@@ -1213,7 +1213,7 @@ mod tests {
         // Двигаем ТОЛЬКО родителя.
         world.tick();
         {
-            let q = Query::<Write<LocalTransform>>::new(&world);
+            let q = Query::<Write<LocalTransform>>::new_mut(&mut world);
             q.for_each(|e, mut lt| {
                 if e == parent {
                     lt.translation = Vec3::new(100.0, 0.0, 0.0);

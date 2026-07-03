@@ -51,7 +51,7 @@ impl FragIter {
     }
 
     pub fn run(&mut self) {
-        self.state.query(&self.world).for_each(|_, mut data| {
+        self.state.query_mut(&mut self.world).for_each(|_, mut data| {
             data.0 *= 2.0;
         });
     }

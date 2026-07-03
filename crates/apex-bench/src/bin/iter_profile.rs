@@ -38,7 +38,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                let q = world.query::<(Read<Velocity>, Write<Position>)>();
+                let q = world.query_mut::<(Read<Velocity>, Write<Position>)>();
                 black_box(&q);
             }
             t.elapsed().as_secs_f64() * 1e6 / N as f64
@@ -51,7 +51,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                let q = Query::<(Read<Velocity>, Write<Position>)>::new(&world);
+                let q = Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world);
                 black_box(&q);
             }
             t.elapsed().as_secs_f64() * 1e6 / N as f64
@@ -65,7 +65,7 @@ fn main() {
             let t = Instant::now();
             for _ in 0..N {
                 world
-                    .query::<(Read<Velocity>, Write<Position>)>()
+                    .query_mut::<(Read<Velocity>, Write<Position>)>()
                     .for_each(|_, (vel, mut pos)| {
                         pos.0 += vel.0;
                     });
@@ -80,7 +80,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                Query::<(Read<Velocity>, Write<Position>)>::new(&world).for_each(
+                Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world).for_each(
                     |_, (vel, mut pos)| {
                         pos.0 += vel.0;
                     },
@@ -98,7 +98,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                let q = state.query(&world);
+                let q = state.query_mut(&mut world);
                 black_box(&q);
             }
             t.elapsed().as_secs_f64() * 1e6 / N as f64
@@ -111,7 +111,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                state.query(&world).for_each(|_, (vel, mut pos)| {
+                state.query_mut(&mut world).for_each(|_, (vel, mut pos)| {
                     pos.0 += vel.0;
                 });
             }
@@ -126,7 +126,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                state.query(&world).for_each_chunk(|_, (vel, pos)| {
+                state.query_mut(&mut world).for_each_chunk(|_, (vel, pos)| {
                     for i in 0..pos.len() {
                         pos[i].0 += vel[i].0;
                     }
@@ -143,7 +143,7 @@ fn main() {
             let t = Instant::now();
             for _ in 0..N {
                 world
-                    .query::<(Read<Velocity>, Write<Position>)>()
+                    .query_mut::<(Read<Velocity>, Write<Position>)>()
                     .for_each_chunk(|_, (vel, pos)| {
                         for i in 0..pos.len() {
                             pos[i].0 += vel[i].0;
