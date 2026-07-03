@@ -1596,21 +1596,18 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     }
 
     /// Параллельная итерация.
+    /// Параллельная итерация через adaptive-split (wave 5, §7) — единый механизм
+    /// с [`CachedQuery::par_for_each`](crate::world::CachedQuery::par_for_each):
+    /// рекурсивный `rayon::join` поперёк архетипов. Порядок недетерминирован.
     pub fn par_for_each<Func>(&self, f: Func)
     where
         Q: Send,
         F: Send,
         Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
     {
-        use rayon::prelude::*;
-
         let num_threads = rayon::current_num_threads();
-
-        // Предварительно вычисляем ID компонентов (как в new_with_tick)
         let mut ids = IdBuf::new();
         <(Q, F)>::fill_ids(self.world, &mut ids);
-
-        // Учитываем row_ranges при вычислении длины архетипов для chunk'ирования
         let row_ranges = self.row_ranges;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges
@@ -1618,47 +1615,47 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                 .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
                 .unwrap_or((0, usize::MAX))
         };
-        let chunks = compute_par_chunks(
-            self.archetypes.iter().map(|a| {
-                let s = rr(a.arch_idx);
-                let effective_len = s.1.min(a.len).saturating_sub(s.0);
-                (a.arch_idx, effective_len)
-            }),
-            num_threads,
-            self.world.chunk_config(),
-        );
-
         let last_run = self.last_run;
         let world = self.world;
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let (r_start, r_end) = rr(arch_idx);
-            let clamped_start = r_start + start;
-            let clamped_end = (r_start + end).min(r_end);
-            if clamped_start >= clamped_end {
-                return;
-            }
-            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
-            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
+        let this_run = world.current_tick();
+        // Absolute disjoint (arch, start, end) row ranges honoring row_ranges.
+        let items: smallvec::SmallVec<[(usize, usize, usize); 32]> = self
+            .archetypes
+            .iter()
+            .filter_map(|a| {
+                let (s, e) = rr(a.arch_idx);
+                let start = s;
+                let end = e.min(a.len);
+                if start >= end {
+                    None
+                } else {
+                    Some((a.arch_idx, start, end))
+                }
+            })
+            .collect();
+        let total: usize = items.iter().map(|&(_, s, e)| e - s).sum();
+        let threshold = crate::world::adaptive_chunk_size(total, num_threads, world.chunk_config());
+        // SAFETY: each leaf gets a disjoint row range of a matched archetype, so
+        // `&mut` access never aliases across the parallel `join`.
+        let process = |arch_idx: usize, start: usize, end: usize| {
             let arch = &world.archetypes[arch_idx];
-            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
-            let entities = &arch.entities[clamped_start..clamped_end];
+            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, this_run) };
+            let entities = &arch.entities[start..end];
             if <(Q, F)>::has_row_filter() {
                 for (offset, &entity) in entities.iter().enumerate() {
-                    let row = clamped_start + offset;
-                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, row) } {
+                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, start + offset) } {
                         f(entity, item);
                     }
                 }
             } else {
-                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
                 for (offset, &entity) in entities.iter().enumerate() {
                     let (item, _) =
-                        unsafe { <(Q, F)>::fetch_item_unchecked(state, clamped_start + offset) };
+                        unsafe { <(Q, F)>::fetch_item_unchecked(state, start + offset) };
                     f(entity, item);
                 }
             }
-        });
+        };
+        crate::par_utils::par_split_run_ranges(&items, threshold, &process);
     }
 
     /// Число матчей запроса.

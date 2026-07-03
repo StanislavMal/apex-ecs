@@ -14,6 +14,7 @@ pub mod propagate;
 pub mod despawn_recursive;
 pub mod wide_iter;
 pub mod commands_insert;
+pub mod par_skew;
 
 pub use simple_insert::SimpleInsert;
 pub use simple_iter::SimpleIter;
