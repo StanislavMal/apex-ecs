@@ -319,16 +319,25 @@ Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ
     `access.uses_commands` (последнее — только `Commands` SystemParam) → `non_query_side_effects` пропускал
     макро-command-системы (могли row-split'иться, дублируя/роняя команды — латентный TD-37-разрыв).
     `non_query_side_effects` + предикат сидинга теперь = `has_deferred || uses_commands`.
-  - ⏭ **D8b остаток (фронтир, задокументирован §4.2):** детерминированный free-list **reuse под churn**
-    (блоки карвят из high-water, игнорируя free-list → под тяжёлым despawn+respawn high-water растёт;
-    reuse недетерминирован) + **rank-ordered deterministic overflow** (сейчас overflow → shared path,
-    недетерминирован тот кадр, self-correcting адаптивным ростом). Обе — делатная хирургия аллокатора
-    (не-непрерывные id-списки из lease/free, взаимодействие с B2-переарендой) → отдельный аккуратный
-    заход. Граница гарантии: fresh-world reproducibility в steady-state (no-frame-1-overflow) — доказана
-    капстоном; это ровно record/replay use-case §4.2. Opt-in трейдит per-frame id-space за детерминизм.
+  - ✅ **D8b reuse-aware блоки** (ветка wave6b-d8b-reuse): **детерминированный free-list reuse под churn
+    + ограниченное id-пространство**. `BlockCursor` contiguous `{next,end}` → **id-list** `{ids: Box<[Entity]>,
+    next}`. `reserve_block` теперь **reuse-aware**: сперва тянет освобождённые слоты из аренды (descending,
+    как `reserve_from`, один bulk `fetch_sub` курсора — координируется с общим путём), затем свежие из
+    high-water; главный поток в порядке ранга → детерминированный срез. `reclaim_block_tail(unused)`
+    возвращает незаспавненный хвост блока в `free_list` БЕЗ gen-инкремента (слоты никогда не были живы) →
+    id-пространство ограничено под despawn+respawn. Планировщик: `commit_spawn_history` + `reclaim` после
+    apply (records выращены flush'ем), в порядке ранга. **Де-риск: аллокаторный churn/aliasing тест
+    ПЕРВЫМ** (в изоляции: reuse до fresh + bounded + детерминизм + ноль double-issue) → затем проводка.
+    Капстоны: `reserve_block_draws_freed_slots_before_fresh`, `reuse_aware_blocks_bound_id_space_..._churn`
+    (аллокатор), `deterministic_reuse_under_churn_is_reproducible_and_bounded` (планировщик, spawn+despawn,
+    30 кадров, fresh-run детерминизм + bounded). **Ноль нового unsafe** (block-путь весь safe). Default OFF
+    → путь `reserve()` неизменен (goldens 656/0). Gate: workspace, entity 19/0, capstones, clippy, goldens,
+    Miri TB. **Граница гарантии теперь БЕЗУСЛОВНА** для record/replay (steady-state, no-overflow): держит и
+    под churn. Остаток: rank-ordered deterministic **overflow** (frame-1/spike, редкий после адаптивного
+    прогрева) — узкий фронтир.
 
-**Приоритет остатка:** F3 (soundness) — главная ценность; В3 Phase B/C — API-качество; D8b free-list-reuse
-фронтир — по спросу. Порядок — по выбору (F3 независим от В3 Phase B).
+**Приоритет остатка:** F3 + D8b (soundness/детерминизм) — СДЕЛАНЫ; В3 Phase B/C — API-качество (крупный
+рефактор всего query-usage кросс-репо); overflow-детерминизм — узкий фронтир по спросу.
 
 ---
 
