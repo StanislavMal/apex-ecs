@@ -938,18 +938,23 @@ impl Scheduler {
         }
     }
 
-    /// D8b: after a stage applies, fold each seeded system's observed spawn count
-    /// (block size − remaining) into the adaptive-sizing history. `reserver` shares
-    /// the block cursor with the one handed to the system, so `block_remaining`
-    /// reflects consumption. On overflow (remaining 0) `used == size`, so the next
-    /// block doubles — converging to demand. Drains `seeded`.
+    /// D8b: after a stage applies (`flush` grew records), for each seeded system:
+    /// (1) fold its observed spawn count (block size − remaining) into the adaptive-
+    /// sizing history — `reserver` shares the block cursor with the one handed to the
+    /// system, so `block_remaining` reflects consumption; on overflow (remaining 0)
+    /// `used == size`, so the next block doubles toward demand; (2) reclaim the block's
+    /// UNUSED tail to the reuse pool — reserved-but-not-spawned indices go back to the
+    /// free-list (in rank order → deterministic), keeping the id-space bounded under
+    /// despawn+respawn churn. Drains `seeded`.
     fn commit_spawn_history(
         &mut self,
         seeded: &mut Vec<(SystemId, u32, apex_core::entity::EntityReserver)>,
+        world: &mut World,
     ) {
         for (sys_id, size, reserver) in seeded.drain(..) {
             let used = size - reserver.block_remaining().unwrap_or(0);
             self.system_spawn_history.insert(sys_id, used);
+            world.reclaim_entity_block_tail(&reserver.unused_block_ids());
         }
     }
 
@@ -3182,7 +3187,9 @@ impl Scheduler {
                     }
                 }
                 // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
-                self.commit_spawn_history(&mut seeded); // D8b: adaptive block sizing
+                // D8b: adaptive block sizing + reclaim unused block tails (bounds
+                // id-space under churn). After apply (records grown by flush).
+                self.commit_spawn_history(&mut seeded, unsafe { &mut *world_ptr });
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
@@ -3303,9 +3310,9 @@ impl Scheduler {
                     }
                 }
             }
-            // D8b: fold each seeded system's observed spawn count into adaptive
-            // block-sizing history (covers both the SEQ-fallback and PAR branches).
-            self.commit_spawn_history(&mut seeded);
+            // D8b: adaptive block sizing + reclaim unused block tails (covers both the
+            // SEQ-fallback and PAR branches). After apply (records grown by flush).
+            self.commit_spawn_history(&mut seeded, unsafe { &mut *world_ptr });
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }

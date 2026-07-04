@@ -143,9 +143,17 @@ fn reserve_from(lease: &ReserveLease, high_water: &AtomicU32) -> Entity {
 /// order). `next` is atomic only so the reserver stays `Send + Sync`; spawning
 /// systems are never row-split (`Commands` ⇒ `non_query_side_effects` ⇒ single ASD
 /// task), so in practice one thread drives one block.
+/// D8b: a private, pre-computed deterministic id-block. The scheduler reserves it on
+/// the main thread in system-rank order ([`EntityAllocator::reserve_block`]), which
+/// draws REUSED freed slots (deterministic order, carrying their generations) plus
+/// fresh indices into `ids`. A per-system reserver hands out `ids[0], ids[1], …` via
+/// `next` with NO cross-system contention and a deterministic order. Because the block
+/// draws freed slots (reuse-aware), the id-space stays BOUNDED under despawn+respawn
+/// churn and reuse is deterministic; the unconsumed tail (`ids[next..]`) is reclaimed
+/// to the free-list after the stage ([`EntityAllocator::reclaim_block_tail`]).
 struct BlockCursor {
+    ids: Box<[Entity]>,
     next: AtomicU32,
-    end: u32,
 }
 
 #[derive(Clone)]
@@ -163,34 +171,34 @@ impl EntityReserver {
     /// параллельных систем: read-lock ячейки аренды (параллелен между резерваторами) → атомарный
     /// курсор текущей аренды + high-water. Всегда видит АКТУАЛЬНУЮ аренду (B2).
     ///
-    /// D8b: если резерватор засеян блоком (`with_block`), сперва выдаёт id из приватного
+    /// D8b: если резерватор засеян блоком (`with_ids`), сперва выдаёт id из приватного
     /// блока (детерминированно, без contention); при исчерпании блока — общий путь.
     #[inline]
     pub fn reserve(&self) -> Entity {
         if let Some(block) = &self.block {
-            let id = block.next.fetch_add(1, Ordering::Relaxed);
-            if id < block.end {
-                return Entity { index: id, generation: 0 };
+            let i = block.next.fetch_add(1, Ordering::Relaxed);
+            if (i as usize) < block.ids.len() {
+                return block.ids[i as usize];
             }
-            // Block exhausted — fall through to the shared reserver. The rank-ordered
-            // overflow claim (fully deterministic overflow) is a follow-up (§4.1).
+            // Block exhausted — fall through to the shared reserver (non-deterministic
+            // that frame). Adaptive sizing makes overflow a warmup/spike-only event; the
+            // rank-ordered deterministic overflow claim is a follow-up (§4.1).
         }
         let lease = read_lease(&self.lease);
         reserve_from(&lease, &self.high_water)
     }
 
-    /// D8b: клон резерватора, привязанный к детерминированному блоку `[base, base+size)`.
-    /// `reserve()` выдаёт `base, base+1, …` приватным счётчиком (без contention,
-    /// детерминированно), после исчерпания — общий путь. Вызывающий (планировщик)
-    /// гарантирует, что `[base, base+size)` уже зарезервирован из high-water
-    /// ([`EntityAllocator::reserve_block`]).
-    pub fn with_block(&self, base: u32, size: u32) -> EntityReserver {
+    /// D8b: клон резерватора, привязанный к детерминированному блоку `ids`. `reserve()`
+    /// выдаёт `ids[0], ids[1], …` приватным счётчиком (без contention, детерминированно),
+    /// после исчерпания — общий путь. Вызывающий ([`EntityAllocator::reserve_block`])
+    /// формирует `ids`, вытянув reused-слоты из аренды + свежие из high-water.
+    pub(crate) fn with_ids(&self, ids: Box<[Entity]>) -> EntityReserver {
         EntityReserver {
             high_water: Arc::clone(&self.high_water),
             lease: Arc::clone(&self.lease),
             block: Some(Arc::new(BlockCursor {
-                next: AtomicU32::new(base),
-                end: base.saturating_add(size),
+                ids,
+                next: AtomicU32::new(0),
             })),
         }
     }
@@ -200,7 +208,22 @@ impl EntityReserver {
     pub fn block_remaining(&self) -> Option<u32> {
         self.block
             .as_ref()
-            .map(|b| b.end.saturating_sub(b.next.load(Ordering::Relaxed)))
+            .map(|b| (b.ids.len() as u32).saturating_sub(b.next.load(Ordering::Relaxed)))
+    }
+
+    /// D8b: неиспользованный хвост блока (`ids[next..]`) — зарезервированные, но НЕ
+    /// материализованные id (система заспавнила меньше размера блока). Их поколения не
+    /// тронуты (никогда не были живы), поэтому планировщик возвращает их в reuse-пул
+    /// после стадии ([`EntityAllocator::reclaim_block_tail`]) → id-пространство ограничено
+    /// под churn. Пусто, если блока нет или он исчерпан (overflow).
+    pub fn unused_block_ids(&self) -> Vec<Entity> {
+        self.block
+            .as_ref()
+            .map(|b| {
+                let next = b.next.load(Ordering::Relaxed) as usize;
+                b.ids.get(next..).map(|s| s.to_vec()).unwrap_or_default()
+            })
+            .unwrap_or_default()
     }
 
     /// Зарезервировать `n` `Entity` минимумом атомарных операций (один `fetch_sub` аренды + один
@@ -215,12 +238,10 @@ impl EntityReserver {
         // On block overflow, fall through to the shared path (rare; rank-ordered overflow
         // determinism is a follow-up, §4.1).
         if let Some(block) = &self.block {
-            let cur = block.next.load(Ordering::Relaxed);
-            if cur.saturating_add(n as u32) <= block.end {
-                block.next.store(cur + n as u32, Ordering::Relaxed);
-                return (0..n as u32)
-                    .map(|j| Entity { index: cur + j, generation: 0 })
-                    .collect();
+            let cur = block.next.load(Ordering::Relaxed) as usize;
+            if cur + n <= block.ids.len() {
+                block.next.store((cur + n) as u32, Ordering::Relaxed);
+                return block.ids[cur..cur + n].to_vec();
             }
         }
         let lease = read_lease(&self.lease);
@@ -287,15 +308,53 @@ impl EntityAllocator {
         }
     }
 
-    /// D8b: зарезервировать непрерывный блок `[base, base+size)` из high-water и вернуть
-    /// резерватор, привязанный к нему. `base` детерминирован (текущий high-water,
-    /// главный поток), поэтому раздача блоков системам стадии в порядке ранга даёт
-    /// детерминированные id. Неиспользованный хвост блока материализуется `flush`'ем
-    /// как location-less записи (как обычная зарезервированная-но-не-живая) —
-    /// возвращать их в free-list в порядке ранга — задача планировщика (§4.1).
+    /// D8b: зарезервировать детерминированный блок из `size` id и вернуть привязанный к
+    /// нему резерватор. **Reuse-aware:** сперва тянет освобождённые слоты из текущей
+    /// аренды (в детерминированном descending-порядке, как `reserve_from` — один bulk
+    /// `fetch_sub` курсора), затем добирает свежие из high-water. Вызывается планировщиком
+    /// на главном потоке в порядке ранга систем стадии → срез аренды и свежие индексы
+    /// каждого блока детерминированы, а переиспользование освобождённых слотов держит
+    /// id-пространство ограниченным под churn (см. [`reclaim_block_tail`](Self::reclaim_block_tail)).
+    /// `&self`: и курсор аренды, и high-water — атомарные (главный поток, систем не бежит).
     pub fn reserve_block(&self, size: u32) -> EntityReserver {
-        let base = self.high_water.fetch_add(size, Ordering::Relaxed);
-        self.reserver().with_block(base, size)
+        let lease = read_lease(&self.lease);
+        let mut ids: Vec<Entity> = Vec::with_capacity(size as usize);
+        // Reused freed slots from the lease (descending, matching `reserve_from`).
+        let old = lease.cursor.fetch_sub(size as i64, Ordering::Relaxed);
+        let reuse = old.max(0).min(size as i64);
+        for k in 0..reuse {
+            let (index, generation) = lease.free[(old - 1 - k) as usize];
+            ids.push(Entity { index, generation });
+        }
+        // Remainder: fresh indices from high-water (generation 0).
+        let fresh = size - reuse as u32;
+        if fresh > 0 {
+            let start = self.high_water.fetch_add(fresh, Ordering::Relaxed);
+            for j in 0..fresh {
+                ids.push(Entity { index: start + j, generation: 0 });
+            }
+        }
+        self.reserver().with_ids(ids.into_boxed_slice())
+    }
+
+    /// D8b: вернуть неиспользованный хвост блока в reuse-пул. Эти `unused` id были
+    /// зарезервированы (из аренды или high-water), но НЕ материализованы (система
+    /// заспавнила меньше размера блока), поэтому их поколения не тронуты (никогда не были
+    /// живы) — толкаем индексы в `free_list` БЕЗ generation-bump'а `free()`. Так
+    /// id-пространство остаётся ограниченным под churn; слоты пере-арендуются на
+    /// следующем `flush`. Планировщик зовёт это в порядке ранга → детерминированный reuse.
+    ///
+    /// Вызывать ПОСЛЕ `flush` стадии (records выращены до high-water, поэтому все
+    /// `unused`-индексы покрыты записями и `refresh_lease` прочитает их поколение).
+    pub fn reclaim_block_tail(&mut self, unused: &[Entity]) {
+        for e in unused {
+            debug_assert!(
+                (e.index as usize) < self.records.len(),
+                "reclaim_block_tail: index {} beyond records (call after flush)",
+                e.index
+            );
+            self.free_list.push(e.index);
+        }
     }
 
     /// Пере-арендовать: текущий `free_list` (новые освобождения + возвращённые) → новая аренда; курсор
@@ -939,5 +998,94 @@ mod tests {
         // System 0 (rank 0, block base 0) → 0,1,2; system 1 (base 4) → 4,5;
         // system 2 (base 8) → 8,9,10,11.
         assert_eq!(a, vec![vec![0, 1, 2], vec![4, 5], vec![8, 9, 10, 11]]);
+    }
+
+    // ── D8b reuse-aware blocks: deterministic reuse + bounded id-space under churn ──
+
+    /// `reserve_block` draws FREED slots (reuse) before fresh high-water indices, in a
+    /// deterministic descending order — the same slots a plain `reserve()` would reuse.
+    #[test]
+    fn reserve_block_draws_freed_slots_before_fresh() {
+        let mut alloc = EntityAllocator::new();
+        // Materialize + free three slots so the lease holds them.
+        let es: Vec<Entity> = (0..3).map(|_| alloc.allocate()).collect();
+        for e in &es {
+            alloc.set_location(*e, make_loc());
+        }
+        for e in &es {
+            assert!(alloc.free(*e)); // gen -> 1; pushed to free_list
+        }
+        alloc.flush(); // free_list -> lease (3 reusable slots, gen 1)
+        // A block of 5 draws the 3 reused slots (gen 1) + 2 fresh (gen 0).
+        let r = alloc.reserve_block(5);
+        let ids: Vec<Entity> = (0..5).map(|_| r.reserve()).collect();
+        let reused: Vec<u32> = ids.iter().filter(|e| e.generation == 1).map(|e| e.index).collect();
+        let fresh: Vec<u32> = ids.iter().filter(|e| e.generation == 0).map(|e| e.index).collect();
+        assert_eq!(reused.len(), 3, "block reused the 3 freed slots (gen 1): {ids:?}");
+        assert_eq!(fresh.len(), 2, "block drew 2 fresh slots (gen 0): {ids:?}");
+        // The reused indices are exactly the freed ones (0,1,2), no double-issue.
+        let mut ru = reused.clone();
+        ru.sort_unstable();
+        assert_eq!(ru, vec![0, 1, 2]);
+    }
+
+    /// Capstone (churn): a spawn+despawn steady-state loop driven by reuse-aware blocks
+    /// keeps the id-space BOUNDED (no unbounded high-water growth) AND assigns identical
+    /// ids run-to-run, while never double-issuing an index to a live entity.
+    #[test]
+    fn reuse_aware_blocks_bound_id_space_and_are_deterministic_under_churn() {
+        const FRAMES: usize = 200;
+        const K: u32 = 8; // spawns/despawns per frame
+        const BLOCK: u32 = K + 4; // slack ⇒ an unused tail to reclaim each frame
+
+        fn run() -> (u32, Vec<u32>) {
+            let mut alloc = EntityAllocator::new();
+            let mut prev: Vec<Entity> = Vec::new();
+            let mut max_index = 0u32;
+            let mut trace: Vec<u32> = Vec::new(); // first spawned index per frame
+            for _ in 0..FRAMES {
+                // 1. Reserve a deterministic block (reuse-aware) — stage start.
+                let r = alloc.reserve_block(BLOCK);
+                // 2. Spawn K ids from the block (the "parallel" phase).
+                let spawned: Vec<Entity> = (0..K).map(|_| r.reserve()).collect();
+                trace.push(spawned[0].index);
+                for e in &spawned {
+                    max_index = max_index.max(e.index);
+                }
+                // 3. Despawn the previous frame's entities (steady churn).
+                for e in &prev {
+                    assert!(alloc.free(*e), "despawn of a live entity must succeed");
+                }
+                // 4. Apply/flush — materialize records, refresh the lease.
+                alloc.flush();
+                // 5. Materialize the spawns (make them live). No id may already be live.
+                for e in &spawned {
+                    assert!(
+                        !alloc.is_alive(*e),
+                        "reused id {e:?} must not already be live (no double-issue)"
+                    );
+                    alloc.set_location(*e, make_loc());
+                    assert!(alloc.is_alive(*e));
+                }
+                // 6. Reclaim the block's unused tail (after flush ⇒ records grown).
+                alloc.reclaim_block_tail(&r.unused_block_ids());
+                prev = spawned;
+            }
+            (max_index, trace)
+        }
+
+        let (max_a, trace_a) = run();
+        let (max_b, trace_b) = run();
+
+        // Determinism: identical id assignment across two independent runs — the
+        // record/replay guarantee, now holding UNDER despawn+respawn churn.
+        assert_eq!(trace_a, trace_b, "churn id assignment is deterministic run-to-run");
+        assert_eq!(max_a, max_b);
+        // Bounded id-space: reuse keeps the max index near the concurrent peak (~2·K),
+        // NOT growing with FRAMES. Without reuse it would be ~FRAMES·K = 1600.
+        assert!(
+            max_a < 100,
+            "id-space must stay bounded under churn (max_index={max_a}, peak≈2K=16)"
+        );
     }
 }

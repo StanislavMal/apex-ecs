@@ -143,3 +143,77 @@ fn non_deterministic_mode_still_spawns_correctly() {
     expected.sort_unstable();
     assert_eq!(content, expected, "all spawns land regardless of determinism mode");
 }
+
+// ── Churn capstone: deterministic reuse of freed slots under despawn+respawn ──
+
+#[derive(Component, Clone, Copy)]
+struct Child {
+    tag: u32,
+}
+
+// Each frame: spawn one Child per seed (Update). The seed set is stable, so the spawn
+// COUNT and content are identical every frame.
+system! {
+    fn churn_spawn(seeds: Read<Seed>, cmds: Cmd) {
+        seeds.for_each(|_, s| { cmds.spawn((Child { tag: s.0 },)); });
+    }
+}
+
+// Each frame BEFORE spawning (PreUpdate): despawn every Child from the previous frame,
+// freeing their slots back to the reuse pool.
+system! {
+    fn churn_despawn(q: Read<Child>, cmds: Cmd) {
+        q.for_each(|e, _| { cmds.despawn(e); });
+    }
+}
+
+/// With `deterministic_spawn` ON, a spawn+despawn steady-state loop reuses freed entity
+/// slots DETERMINISTICALLY (identical id→content mapping across independent runs) AND
+/// keeps the id-space BOUNDED (reuse, not unbounded high-water growth). This is the
+/// record/replay guarantee holding under realistic churn — the D8b reuse-aware frontier.
+#[test]
+fn deterministic_reuse_under_churn_is_reproducible_and_bounded() {
+    const FRAMES: usize = 30;
+
+    fn run() -> (Vec<(u32, u32)>, u32) {
+        let mut world = World::new();
+        for i in 0..SEEDS {
+            world.spawn((Seed(i),));
+        }
+        let mut sched = Scheduler::new();
+        sched.set_deterministic_spawn(true);
+        sched.set_parallel_auto_disable(false);
+        sched.set_parallel_min_entities(0);
+        // PreUpdate despawns last frame's children; Update spawns this frame's.
+        sched.add_systems(StageLabel::PreUpdate, churn_despawn);
+        sched.add_systems(StageLabel::Update, churn_spawn);
+        sched.compile_with_world(&world).unwrap();
+        for _ in 0..FRAMES {
+            sched.run(&mut world);
+        }
+        // Snapshot the surviving children: (entity index, tag), plus the max index.
+        let mut snap: Vec<(u32, u32)> = Vec::new();
+        let mut max_index = 0u32;
+        Query::<Read<Child>>::new(&world).for_each(|e, c| {
+            snap.push((e.index(), c.tag));
+            max_index = max_index.max(e.index());
+        });
+        snap.sort_unstable();
+        (snap, max_index)
+    }
+
+    let (snap_a, max_a) = run();
+    let (snap_b, max_b) = run();
+
+    // The surviving set is one child per seed (last frame's spawn).
+    assert_eq!(snap_a.len() as u32, SEEDS, "one live child per seed after churn");
+    // Determinism UNDER CHURN: identical id→content mapping across independent runs.
+    assert_eq!(snap_a, snap_b, "reuse of freed slots is deterministic run-to-run");
+    assert_eq!(max_a, max_b);
+    // Bounded id-space: reuse keeps indices near the concurrent peak, NOT growing with
+    // FRAMES. Without reuse it would be ~SEEDS·FRAMES = 480.
+    assert!(
+        max_a < SEEDS * 6,
+        "id-space must stay bounded under churn (max_index={max_a}, SEEDS={SEEDS})"
+    );
+}
