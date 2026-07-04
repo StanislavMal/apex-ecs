@@ -412,6 +412,12 @@ struct AsdTask {
     /// `(arch_idx, start, end)` — только эти строки указанных архетипов.
     /// Если пусто — SubWorld без ограничений (все entity системы).
     chunk_ranges: SmallVec<[(usize, usize, usize); 4]>,
+    /// D8b: pointer to this system's private per-system `Commands` slot, set ONLY
+    /// for single-task (per-system scope, `chunk_ranges` empty) tasks — a command-
+    /// emitting system is never row-split, so the slot has a unique writer. Row-split
+    /// (query-only) tasks carry `None` and use an inline buffer (they emit no
+    /// commands). Applying slots in rank order gives deterministic command ordering.
+    cmds: Option<SendPtr<Commands>>,
 }
 
 unsafe impl Send for AsdTask {}
@@ -843,6 +849,21 @@ pub struct Scheduler {
     scratch_tasks: Vec<AsdTask>,
     /// Reused per-parallel-stage skipped-system set.
     scratch_skipped: FxHashSet<SystemId>,
+
+    // ── D8b: deterministic parallel spawn (opt-in) ──────────────────────────────
+    /// When true, every command-emitting system in a stage is seeded with a private
+    /// entity-id block at a rank-deterministic base, so parallel `Commands` spawns
+    /// assign IDENTICAL ids run-to-run given the same start snapshot + inputs — a
+    /// record/replay / rollback-netcode primitive Bevy does not provide. Because the
+    /// blocks are seeded regardless of the SEQ/PAR path the cost-model picks, id
+    /// assignment is path-independent (timing does not perturb ids). Default false;
+    /// see the guarantee boundary (steady-state / no-frame-1-overflow) in the guide.
+    deterministic_spawn: bool,
+    /// D8b: per-system observed spawn count (ids drawn from its block last stage),
+    /// for adaptive block sizing (next = observed*2, clamped). Persists across
+    /// frames. `SystemId`/`u32` are `Send`, so this is safe as a field (unlike a
+    /// `Vec<Commands>`, which would make `Scheduler: !Send`).
+    system_spawn_history: FxHashMap<SystemId, u32>,
 }
 
 impl Scheduler {
@@ -879,6 +900,56 @@ impl Scheduler {
             scratch_sys_infos: Vec::new(),
             scratch_tasks: Vec::new(),
             scratch_skipped: FxHashSet::default(),
+            deterministic_spawn: false,
+            system_spawn_history: FxHashMap::default(),
+        }
+    }
+
+    /// D8b: enable/disable deterministic parallel-spawn entity-id assignment.
+    ///
+    /// When on, parallel `Commands::spawn` from stage systems assign identical
+    /// entity ids run-to-run given the same start snapshot + inputs (see the
+    /// per-system block scheme). This is the record/replay / rollback foundation;
+    /// Bevy does not guarantee it. Off by default: each command-emitting system
+    /// reserves a per-frame id block, so opting in trades a modest id-space /
+    /// memory cost (and, under heavy despawn+respawn churn, id-space growth — a
+    /// documented frontier) for determinism.
+    pub fn set_deterministic_spawn(&mut self, on: bool) -> &mut Self {
+        self.deterministic_spawn = on;
+        self
+    }
+
+    /// D8b: is deterministic parallel-spawn id assignment enabled?
+    #[inline]
+    pub fn deterministic_spawn(&self) -> bool {
+        self.deterministic_spawn
+    }
+
+    /// D8b: adaptive per-system block size — `None` (never dispatched) → a generous
+    /// initial guess; `Some(0)` (observed non-spawning) → no block; else observed
+    /// peak ×2 (slack so steady-state never overflows), clamped to a small floor.
+    fn block_size_for(&self, sys_id: SystemId) -> u32 {
+        const INITIAL: u32 = 256;
+        const FLOOR: u32 = 8;
+        match self.system_spawn_history.get(&sys_id) {
+            None => INITIAL,
+            Some(&0) => 0,
+            Some(&v) => v.saturating_mul(2).max(FLOOR),
+        }
+    }
+
+    /// D8b: after a stage applies, fold each seeded system's observed spawn count
+    /// (block size − remaining) into the adaptive-sizing history. `reserver` shares
+    /// the block cursor with the one handed to the system, so `block_remaining`
+    /// reflects consumption. On overflow (remaining 0) `used == size`, so the next
+    /// block doubles — converging to demand. Drains `seeded`.
+    fn commit_spawn_history(
+        &mut self,
+        seeded: &mut Vec<(SystemId, u32, apex_core::entity::EntityReserver)>,
+    ) {
+        for (sys_id, size, reserver) in seeded.drain(..) {
+            let used = size - reserver.block_remaining().unwrap_or(0);
+            self.system_spawn_history.insert(sys_id, used);
         }
     }
 
@@ -2464,8 +2535,13 @@ impl Scheduler {
             }
         }
 
-        let mut thread_commands: Vec<Commands> = vec![Commands::new()];
-        let cmds_ptr = &mut thread_commands as *mut Vec<Commands>;
+        // Sequential path: one shared command buffer per run, applied after each
+        // stage. Systems run one-at-a-time in rank order, so both command order and
+        // entity-id assignment are already deterministic (the shared reserver hands
+        // ids out in rank order) — no per-system blocks needed here (D8b applies to
+        // the parallel path). Single `Commands` matches the new per-system slot API.
+        let mut stage_cmds = Commands::new();
+        let cmds_ptr = &mut stage_cmds as *mut Commands;
 
         // (клонируем метаданные стадий — plan заимствует self, а stage_steps
         // и системы ниже требуют &mut)
@@ -2533,9 +2609,9 @@ impl Scheduler {
                         match &mut system.kind {
                             SystemKind::Sequential(f) => f(w),
                             SystemKind::Parallel { system, .. } => {
-                                // SAFETY: `cmds_ptr` points at `thread_commands`
-                                // (one slot per rayon worker), alive until the
-                                // end of the run.
+                                // SAFETY: `cmds_ptr` points at `stage_cmds`, a single
+                                // buffer alive until the end of the run; systems run
+                                // sequentially on this thread, so no aliasing.
                                 let ctx = unsafe {
                                     SystemContext::with_commands(
                                         std::slice::from_ref(&sub_world),
@@ -2551,11 +2627,9 @@ impl Scheduler {
                     }
                 }
 
-                // Применяем отложенные команды после каждой стадии/шага
-                for cmds in &mut thread_commands {
-                    cmds.apply(w);
-                }
-                thread_commands[0] = Commands::new();
+                // Применяем отложенные команды после каждой стадии/шага (rank order —
+                // systems appended to `stage_cmds` in execution order).
+                stage_cmds.apply(w);
 
                 // Per-stage flush — делает события доступными для следующего этапа
                 if !emit_event_types.is_empty() {
@@ -2599,7 +2673,18 @@ impl Scheduler {
     /// к разным системам безопасен. SubWorld создаётся локально внутри spawn
     /// с ограничением `(arch_idx, start, end)`, что гарантирует что
     /// разные задачи НЕ пересекаются по данным одного архетипа.
-    fn run_stage_parallel(&mut self, stage_ids: &[SystemId], world: &World, cmds_ptr: usize) {
+    /// `cmds_base` — raw pointer (as `usize`, Copy+Send) to the base of the
+    /// stage's per-system `Commands` slots (`stage_cmds` in `run_hybrid_parallel`),
+    /// one per system in rank order. `slot_of` maps a `SystemId` to its slot index.
+    /// Command-emitting systems are single-task (per-system scope), so each writes a
+    /// unique slot; row-split (query-only) tasks use an inline buffer (D8b).
+    fn run_stage_parallel(
+        &mut self,
+        stage_ids: &[SystemId],
+        world: &World,
+        cmds_base: usize,
+        slot_of: &FxHashMap<SystemId, usize>,
+    ) {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
 
@@ -2661,9 +2746,15 @@ impl Scheduler {
                     let stateful = access.map(|a| a.stateful).unwrap_or(true);
                     // Мутация ресурса / Commands (TD-37): сайд-эффект, не локальный для партиции
                     // запроса ⇒ row-split дублировал бы его. Нет access ⇒ консервативно true.
-                    let non_query_side_effects = access
-                        .map(|a| a.writes_resource || a.uses_commands)
-                        .unwrap_or(true);
+                    // `has_deferred` covers `system!`-macro command systems (`Cmd` sets
+                    // `HAS_DEFERRED` but NOT `access.uses_commands` — only the `Commands`
+                    // SystemParam sets the latter); both must forbid row-split, else the
+                    // body (and its spawns) run once per chunk AND, post-D8b-layer-1, a
+                    // row-split task's commands are dropped (it carries no per-system slot).
+                    let non_query_side_effects = self.systems[sys_idx].has_deferred
+                        || access
+                            .map(|a| a.writes_resource || a.uses_commands)
+                            .unwrap_or(true);
                     // The `access` borrow ends here; take a raw pointer to the
                     // `dyn ParSystem` itself (D3). A filtered system always
                     // declares component access, i.e. is `Parallel`; a
@@ -2684,17 +2775,20 @@ impl Scheduler {
                         non_query_side_effects,
                     });
                 } else {
-                    // Система без entity (только ресурсы/события) — запускаем сразу
+                    // Система без entity (только ресурсы/события) — запускаем сразу.
+                    let slot = slot_of[&sys_id];
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
                         let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
-                        // SAFETY: cmds_ptr — usize, преобразованный из &mut Vec<Commands>,
-                        // указывает на thread_commands (по слоту на rayon-поток),
-                        // который жив до конца run_hybrid_parallel.
                         let sws = [sw];
+                        // SAFETY: this system's private per-system slot (D8b), run
+                        // single-task on the main thread here → unique `&mut`.
                         let ctx = unsafe {
-                            SystemContext::with_commands(&sws, cmds_ptr as *mut Vec<Commands>)
+                            SystemContext::with_commands(
+                                &sws,
+                                (cmds_base as *mut Commands).add(slot),
+                            )
                         };
                         sys.run(ctx);
                     }
@@ -2752,11 +2846,14 @@ impl Scheduler {
                 || info.non_query_side_effects
                 || info.entity_count <= effective_chunk
             {
-                // Per-system scope: одна задача, все entity целиком
+                // Per-system scope: одна задача, все entity целиком. D8b: single-task
+                // → private per-system command slot (unique writer).
+                let slot = slot_of[&info.sys_id];
                 tasks.push(AsdTask {
                     ptr: info.ptr,
                     arch_indices: SmallVec::from_slice(arch_slice),
                     chunk_ranges: SmallVec::new(), // пусто = весь SubWorld
+                    cmds: Some(SendPtr((cmds_base as *mut Commands).wrapping_add(slot))),
                 });
             } else {
                 // Multi-архетипная крупная система — ASD разбивка
@@ -2806,10 +2903,13 @@ impl Scheduler {
                     }
 
                     if !chunk_ranges.is_empty() {
+                        // Row-split (query-only) task: no command slot (D8b) — such a
+                        // system declares no side effects, so it emits no commands.
                         tasks.push(AsdTask {
                             ptr: info.ptr,
                             arch_indices: chunk_arch_set,
                             chunk_ranges,
+                            cmds: None,
                         });
                     }
                 }
@@ -2819,14 +2919,12 @@ impl Scheduler {
         // 4. Сортируем чанки по archetype_id для cache locality
         tasks.sort_unstable_by_key(|t| t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0));
 
-        // 5. Запускаем через rayon::scope
-        // cmds_ptr — это usize (из &mut Vec<Commands>), который является Copy + Send + Sync.
-        // Внутри замыкания преобразуем обратно в *mut Vec<Commands>.
+        // 5. Запускаем через rayon::scope. `task.cmds` (Option<SendPtr<Commands>>)
+        //    is Copy+Send — each single-task system carries the pointer to its own
+        //    per-system slot; row-split tasks carry `None`.
         rayon::scope(|s| {
             for task in &tasks {
-                let cmds = cmds_ptr;
                 s.spawn(move |_| {
-                    let cmds_ptr = cmds as *mut Vec<Commands>;
                     // SAFETY (W3-4 + D3): несколько задач одной системы существуют
                     // ТОЛЬКО для систем без состояния (`stateful`/`has_events`/
                     // `uses_par_for_each`/`needs_whole_world` получают единый
@@ -2838,22 +2936,29 @@ impl Scheduler {
                     // т.п.). Диапазоны строк задач дизъюнктны по построению.
                     unsafe {
                         let sys: &mut dyn ParSystem = &mut *task.ptr.0;
-                        // SAFETY (both arms): cmds_ptr указывает на Vec<Commands> из
-                        // Scheduler, живущий до конца run_hybrid_parallel; каждый поток
-                        // обращается к своему индексу через current_thread_index().
-                        if task.chunk_ranges.is_empty() {
+                        let sub = if task.chunk_ranges.is_empty() {
                             // Полный SubWorld — все архетипы системы без ограничений
-                            let sub = apex_core::SubWorld::from_raw(world, &task.arch_indices);
-                            sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
+                            apex_core::SubWorld::from_raw(world, &task.arch_indices)
                         } else {
                             // SubWorld с range-ограничениями и суженными arch_indices
-                            let sub = apex_core::SubWorld::from_raw_with_ranges(
+                            apex_core::SubWorld::from_raw_with_ranges(
                                 world,
                                 &task.arch_indices,
                                 &task.chunk_ranges,
-                            );
-                            sys.run(SystemContext::with_commands(&[sub], cmds_ptr));
-                        }
+                            )
+                        };
+                        let sws = std::slice::from_ref(&sub);
+                        // D8b: single-task systems carry a private per-system command
+                        // slot (`Some`), applied in rank order for deterministic
+                        // command ordering; row-split (query-only) tasks carry `None`
+                        // and use an inline buffer (they emit no commands).
+                        // SAFETY: a command-emitting system is single-task (per-system
+                        // scope), so exactly one task ever forms `&mut *slot.0`.
+                        let ctx = match task.cmds {
+                            Some(slot) => SystemContext::with_commands(sws, slot.0),
+                            None => SystemContext::new(sws),
+                        };
+                        sys.run(ctx);
                     }
                 });
             }
@@ -2902,11 +3007,19 @@ impl Scheduler {
         let const_ptr = world_ptr as *const World;
         let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
-        let num_threads = rayon::current_num_threads();
-        // Per-worker command buffers — a local (Commands is !Send; see the field note).
-        let mut thread_commands: Vec<Commands> =
-            (0..num_threads).map(|_| Commands::new()).collect();
-        let cmds_ptr: usize = &mut thread_commands as *mut Vec<Commands> as usize;
+        // D8b: per-system command buffers — one slot per system in rank (stage_ids)
+        // order, rebuilt per stage below and applied in rank order. This makes both
+        // command ordering AND (via per-system block reservers) entity-id assignment
+        // deterministic under parallel spawning — a guarantee Bevy does not give.
+        // A local, not a Scheduler field: `Commands` is `!Send`, so a field would
+        // make `Scheduler: !Send` (breaks `ThreadPool::install`; see the scratch
+        // note). Reused across stages via `clear` + `resize_with`.
+        let mut stage_cmds: Vec<Commands> = Vec::new();
+        let mut slot_of: FxHashMap<SystemId, usize> = FxHashMap::default();
+        // D8b: systems seeded with an id block this stage (sys_id, block size, a
+        // clone of the reserver sharing the block cursor) — drained after apply to
+        // update adaptive-sizing history. Empty unless `deterministic_spawn`.
+        let mut seeded: Vec<(SystemId, u32, apex_core::entity::EntityReserver)> = Vec::new();
 
         // Ш1: pooled arch-length snapshot (cleared + refilled, capacity retained).
         let mut arch_lengths = std::mem::take(&mut self.scratch_arch_lengths);
@@ -2981,6 +3094,50 @@ impl Scheduler {
             }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
             self.open_stage_change_window(stage_idx, unsafe { &mut *world_ptr });
+
+            // D8b: (re)build per-system command slots for this stage in rank order
+            // (position in `stage_ids`). One slot per system; command-emitting
+            // single-task systems write their slot, applied in rank order below.
+            stage_cmds.clear();
+            stage_cmds.resize_with(stage_ids.len(), Commands::new);
+            slot_of.clear();
+            seeded.clear();
+            for (slot, &sys_id) in stage_ids.iter().enumerate() {
+                slot_of.insert(sys_id, slot);
+                // D8b: seed a private, rank-deterministic id block for each command-
+                // emitting system so parallel spawns assign identical ids run-to-run.
+                // Seeded for ALL command systems regardless of the SEQ/PAR path taken
+                // below → id assignment is independent of the cost-model's timing.
+                // `reserve_entity_block` runs here on the main thread in rank
+                // (stage_ids) order, so the block bases are deterministic.
+                if self.deterministic_spawn {
+                    // "Uses Commands" = `has_deferred` (system!-macro path) OR
+                    // `access.uses_commands` (Commands SystemParam path) — see the
+                    // non_query_side_effects note; only these systems spawn/defer.
+                    let uses_cmds = self
+                        .system_indices
+                        .get(&sys_id)
+                        .map(|&idx| {
+                            self.systems[idx].has_deferred
+                                || self.systems[idx]
+                                    .kind
+                                    .access()
+                                    .map(|a| a.uses_commands)
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if uses_cmds {
+                        let size = self.block_size_for(sys_id);
+                        if size > 0 {
+                            let reserver = unsafe { &*const_ptr }.reserve_entity_block(size);
+                            stage_cmds[slot].set_reserver(reserver.clone());
+                            seeded.push((sys_id, size, reserver));
+                        }
+                    }
+                }
+            }
+            let cmds_base: *mut Commands = stage_cmds.as_mut_ptr();
+
             if !all_parallel {
                 {
                     let w = unsafe { &*const_ptr };
@@ -2997,13 +3154,14 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    // SAFETY: `cmds_ptr` points at `thread_commands`
-                                    // (one slot per rayon worker), alive until the
-                                    // end of the run.
+                                    // SAFETY: this system's private per-system slot
+                                    // (D8b); it runs single-task on the main thread
+                                    // here, so the `&mut` is unique.
+                                    let slot = slot_of[&sys_id];
                                     let ctx = unsafe {
                                         SystemContext::with_commands(
                                             std::slice::from_ref(&sub_world),
-                                            cmds_ptr as *mut Vec<Commands>,
+                                            cmds_base.add(slot),
                                         )
                                     };
                                     system.run(ctx);
@@ -3017,13 +3175,14 @@ impl Scheduler {
                 }
                 {
                     let w = unsafe { &mut *world_ptr };
-                    for cmds in &mut thread_commands {
+                    // D8b: apply per-system command buffers in rank order (slot =
+                    // position in stage_ids) — deterministic command application.
+                    for cmds in &mut stage_cmds {
                         cmds.apply(w);
                     }
                 }
-                for cmds in &mut thread_commands {
-                    *cmds = Commands::new();
-                }
+                // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
+                self.commit_spawn_history(&mut seeded); // D8b: adaptive block sizing
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
@@ -3091,13 +3250,14 @@ impl Scheduler {
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
-                                    // SAFETY: `cmds_ptr` points at `thread_commands`
-                                    // (one slot per rayon worker), alive until the
-                                    // end of the run.
+                                    // SAFETY: this system's private per-system slot
+                                    // (D8b); it runs single-task on the main thread
+                                    // here, so the `&mut` is unique.
+                                    let slot = slot_of[&sys_id];
                                     let ctx = unsafe {
                                         SystemContext::with_commands(
                                             std::slice::from_ref(&sub_world),
-                                            cmds_ptr as *mut Vec<Commands>,
+                                            cmds_base.add(slot),
                                         )
                                     };
                                     system.run(ctx);
@@ -3111,19 +3271,26 @@ impl Scheduler {
                 }
                 {
                     let w = unsafe { &mut *world_ptr };
-                    for cmds in &mut thread_commands {
+                    // D8b: apply per-system command buffers in rank order (slot =
+                    // position in stage_ids) — deterministic command application.
+                    for cmds in &mut stage_cmds {
                         cmds.apply(w);
                     }
                 }
-                for cmds in &mut thread_commands {
-                    *cmds = Commands::new();
-                }
+                // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
             } else {
-                self.run_stage_parallel(stage_ids, unsafe { &*const_ptr }, cmds_ptr);
+                self.run_stage_parallel(
+                    stage_ids,
+                    unsafe { &*const_ptr },
+                    cmds_base as usize,
+                    &slot_of,
+                );
 
                 {
                     let w = unsafe { &mut *world_ptr };
-                    for cmds in &mut thread_commands {
+                    // D8b: apply per-system command buffers in rank order (slot =
+                    // position in stage_ids) — deterministic command application.
+                    for cmds in &mut stage_cmds {
                         cmds.apply(w);
                     }
                 }
@@ -3136,6 +3303,9 @@ impl Scheduler {
                     }
                 }
             }
+            // D8b: fold each seeded system's observed spawn count into adaptive
+            // block-sizing history (covers both the SEQ-fallback and PAR branches).
+            self.commit_spawn_history(&mut seeded);
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }

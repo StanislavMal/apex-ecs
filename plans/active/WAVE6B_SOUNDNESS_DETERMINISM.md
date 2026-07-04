@@ -267,17 +267,39 @@ Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ
     приватного блока (без contention, детерминированно), overflow → общий путь. **Упрощение:
     spawning-системы single-task** (`Commands` ⇒ `non_query_side_effects` ⇒ не row-split) → приватный
     счётчик детерминирован без гонки — снимает главную боль §4.1. Тесты 244/0 (вкл. capstone-shape).
-  - ⏭ **Increment B** (scheduler, риск: трогает cost-model/`thread_commands` из parallelism-perf):
-    per-system Commands-буферы (сейчас `thread_commands[worker]` шарится всеми системами воркера с ОДНИМ
-    reserver — `ctx.commands()` per-worker; нужен per-system буфер + block-reserver). Планировщик:
-    блоки в порядке ранга (адаптивный размер = spawn-count прошлого кадра + slack) → `reserve_block` per
-    система → apply в порядке ранга → reclaim неиспользованного хвоста блока (free-list, порядок ранга) +
-    rank-ordered overflow. Капстон: N прогонов → идентичный snapshot. **Крупная правка только что
-    стабилизированного command-model → отдельный аккуратный заход, не спешить (§0.2b).**
+  - ✅ **Increment B — layer 1** (commit 37775be): per-system Commands-буферы + **rank-ordered apply**
+    (детерминизм P2 = порядок применения). `thread_commands[worker]` (per-worker) → per-system слоты
+    (по слоту на систему в rank-порядке `stage.system_ids`), apply в rank-порядке во ВСЕХ трёх ветках
+    диспетча (all_parallel-false / cost-model fallback / ASD parallel). Ключ soundness: command-emitting
+    ⟺ `non_query_side_effects` ⟺ single-task ⟺ `chunk_ranges.is_empty()` → у слота ровно один писатель,
+    `!Send` не мешает; row-split (query-only) задачи → `None` (inline). `SystemContext::deferred_cmds`
+    `*mut Vec<Commands>` → `*mut Commands`. Ripple содержан (world.rs + scheduler). Gate: workspace,
+    goldens 656/0 (apply-order смена НЕ меняет рендер), clippy.
+  - ✅ **Increment B — layer 2** (commit a1dd1b6): **opt-in `set_deterministic_spawn(true)`** — блочные
+    резерваторы для детерминизма id (P1). Каждая command-система засевается приватным блоком с
+    rank-детерминированной базой (`World::reserve_entity_block` на main-потоке в rank-порядке); блоки
+    сеются для ВСЕХ command-систем независимо от SEQ/PAR-пути → id **path-independent** (timing не
+    влияет). Адаптивный размер (peak×2, `system_spawn_history`). **Капстон** (`tests/d8b_determinism.rs`):
+    3 системы спавнят конкурентно, 40 fresh-прогонов → идентичный (id→content) snapshot, id уникальны,
+    per-system блоки непрерывны. Gate: workspace, капстон, goldens 656/0 (default OFF), clippy,
+    **Miri TB ✅** (только benign int-to-ptr note), bench компилится. **Перф A/B** (back-to-back,
+    §6-метод): `commands_spawn` apex 385µs vs bevy 439µs = **1.14x**, `schedule` 28.4µs vs bevy 38.0µs =
+    **1.34x** — регресса нет (первый прогон показал +3-6% у ВСЕХ движков вкл. bevy/legion = тепловой дрейф,
+    осел на re-run; default OFF → D8b-машинерия дормантна). Граница гарантии — в руководстве §6.6a.
+  - ⚙ **Root-cause фикс (в layer 2):** `system!`-макрос ставит `HAS_DEFERRED` для `Cmd`, но НЕ
+    `access.uses_commands` (последнее — только `Commands` SystemParam) → `non_query_side_effects` пропускал
+    макро-command-системы (могли row-split'иться, дублируя/роняя команды — латентный TD-37-разрыв).
+    `non_query_side_effects` + предикат сидинга теперь = `has_deferred || uses_commands`.
+  - ⏭ **D8b остаток (фронтир, задокументирован §4.2):** детерминированный free-list **reuse под churn**
+    (блоки карвят из high-water, игнорируя free-list → под тяжёлым despawn+respawn high-water растёт;
+    reuse недетерминирован) + **rank-ordered deterministic overflow** (сейчас overflow → shared path,
+    недетерминирован тот кадр, self-correcting адаптивным ростом). Обе — делатная хирургия аллокатора
+    (не-непрерывные id-списки из lease/free, взаимодействие с B2-переарендой) → отдельный аккуратный
+    заход. Граница гарантии: fresh-world reproducibility в steady-state (no-frame-1-overflow) — доказана
+    капстоном; это ровно record/replay use-case §4.2. Opt-in трейдит per-frame id-space за детерминизм.
 
-**Приоритет остатка:** F3 (soundness) и D8b (детерминизм §0.9) — главная ценность; В3 Phase B/C —
-API-качество. Порядок реализации — по выбору (F3 независим от В3 Phase B; D8b command-буфер отдельно
-от В3 Send+Sync-State).
+**Приоритет остатка:** F3 (soundness) — главная ценность; В3 Phase B/C — API-качество; D8b free-list-reuse
+фронтир — по спросу. Порядок — по выбору (F3 независим от В3 Phase B).
 
 ---
 
