@@ -374,6 +374,37 @@ main):**
 > (file:line), прогон полного тест-сьюта / clippy / criterion 3-way (apex+bevy 0.18+legion 0.4
 > в одном процессе) / frag_world-стража / примеров. Код НЕ менялся (сессия анализа).
 
+**Волна 6б ✅ — SOUNDNESS + ДЕТЕРМИНИЗМ (закрыта 2026-07-04; ветка `core-audit-wave6b` от
+`parallelism-perf`, смержена --no-ff в main обоих репо, НЕ запушено). План-источник (архив):
+`plans/archive/WAVE6B_SOUNDNESS_DETERMINISM.md`. Автономные решения → `decisions/ADR-001` (D8b),
+`decisions/ADR-002` (F3).** Флагманский soundness-🔴 закрыла волна 6 (B1(в), `Query::new`); 6б
+закрыла ВТОРУю половину дыры (F3) + детерминизм спавна (D8b, §0.9). Сделано:
+- **F3 (soundness) ✅** — недекларированный мутабельный доступ через `SystemContext` = гонка из
+  safe-кода (тот же класс, что B1(в)). `F3.1`: `ReadOnlyWorldQuery`-бинд на `ctx.query`/`query_changed`;
+  `F3.2`: `#[doc(hidden)]`+`_unchecked`-скрытие `ctx.resource_mut`/`try_resource_mut`/`event_writer`.
+  Декларированный путь — только SystemParam/`system!`. `commands()` осознанно не тронут (deferred, не
+  live-write). **Ноль нового unsafe, поведенчески идентично** (bind + rename). Дизайн — ADR-002.
+- **D8b (детерминизм, §0.9) ✅** — детерминированное присвоение entity-id при параллельном спавне.
+  Спайк (block 20.5× vs shared-atomic, детерминизм 40/40); increment A (block-reserver в entity.rs);
+  increment B layer 1 (per-system command-буферы + rank-ordered apply) + layer 2 (opt-in
+  `set_deterministic_spawn`, адаптивные блоки, капстон 40 fresh-прогонов); reuse-aware блоки
+  (детерминированный free-list reuse + ограниченное id-пространство под despawn+respawn churn).
+  Дефолт OFF → goldens 656/0. Граница гарантии (single-binary, вкл. churn; FP/кросс-платформа вне
+  scope) — руководство §6.6a. Дизайн — ADR-001. **Гейты пройдены** (workspace, clippy net-neutral,
+  Miri TB 0 UB, goldens byte-identical, bench компилится, перф A/B: `schedule` 1.34× / `commands_spawn`
+  1.14× vs Bevy — регресса нет).
+- **⚠ ПЕРЕОЦЕНКА В3 (§0.2b, 2026-07-04): ОТЛОЖЕН как долг C6.** Phase A (per-system state-инфра:
+  `SystemParam::State`/`get_param`, дефолт = fetch) СДЕЛАНА (нейтрально, дом для F3/D8b). Phase B/C
+  (реальный кэш-State + консолидация 3 query-типов `Query`/`CachedQuery`/`QueryState` → один
+  `Query<'w,'s>`) — **не делаем сейчас**: атомарный кросс-репо рефактор ВСЕГО query-usage (движок не
+  собирается до конца миграции), риск лайфтаймов 'w/'s, перф маргинален/плоский (arch-индексы уже
+  zero-copy из SubWorld — план §2), ценность = только API-качество, а ядро уже top-tier. ROI не
+  оправдывает цену/риск. **Отслеживается как C6 query-zoo consolidation** (spike-first, если возьмём:
+  сперва изолированный lifetime-спайк `Query<'w,'s>`, потом атомарная миграция). Overflow-детерминизм
+  D8b — узкий фронтир по спросу (после прогрева не наступает).
+> **Итог 6б:** soundness ядра выражен В ТИПАХ целиком (B1(в) + F3); детерминизм спавна — §0.9
+> превосходство над Bevy. Остаток (В3/C6, D8b-overflow) — API-качество/фронтир, не soundness.
+
 ## 0. TL;DR
 
 - **Тесты/clippy/бенчи/примеры здоровы:** весь воркспейс зелёный (0 падений), clippy
@@ -918,7 +949,9 @@ query (read+write)** · **B1(в) borrow-модель** (UnsafeWorldCell + ReadOn
 целевой Miri TB 0 UB+goldens 656/656.* ОСТАЛОСЬ (В4 IsolatedWorld-дифференциатор) — не входило в
 исходный wave-6 scope этой сессии.
 
-**Волна 6б 🔜 — SCHEDULER/SYSTEMPARAM OVERHAUL (P3; переоценка §0.2b — см. «Журнал волн»).**
+**Волна 6б ✅ — SOUNDNESS + ДЕТЕРМИНИЗМ (закрыта 2026-07-04 — см. «Журнал волн» + архив плана
+`plans/archive/WAVE6B_SOUNDNESS_DETERMINISM.md`). Сделано: F3 (ctx-ужатие) + D8b (детерминизм id).
+В3 — ОТЛОЖЕН как долг C6 (переоценка §0.2b).** Исходный scope (для истории):
 В3 единый `Query<'w,'s>` поверх per-system QueryState (⚠ ROI-гейт: A/B перед внедрением —
 класс arch_cols; arch-индексы уже кэшируются, выигрыш = только fill_ids) · F3-target SystemContext
 ужатие (убрать resource_mut/event_writer/произвольный-Q из публичного ctx — миграция AutoSystem'ов
