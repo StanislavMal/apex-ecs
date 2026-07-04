@@ -849,6 +849,21 @@ pub struct Scheduler {
     scratch_tasks: Vec<AsdTask>,
     /// Reused per-parallel-stage skipped-system set.
     scratch_skipped: FxHashSet<SystemId>,
+
+    // ── D8b: deterministic parallel spawn (opt-in) ──────────────────────────────
+    /// When true, every command-emitting system in a stage is seeded with a private
+    /// entity-id block at a rank-deterministic base, so parallel `Commands` spawns
+    /// assign IDENTICAL ids run-to-run given the same start snapshot + inputs — a
+    /// record/replay / rollback-netcode primitive Bevy does not provide. Because the
+    /// blocks are seeded regardless of the SEQ/PAR path the cost-model picks, id
+    /// assignment is path-independent (timing does not perturb ids). Default false;
+    /// see the guarantee boundary (steady-state / no-frame-1-overflow) in the guide.
+    deterministic_spawn: bool,
+    /// D8b: per-system observed spawn count (ids drawn from its block last stage),
+    /// for adaptive block sizing (next = observed*2, clamped). Persists across
+    /// frames. `SystemId`/`u32` are `Send`, so this is safe as a field (unlike a
+    /// `Vec<Commands>`, which would make `Scheduler: !Send`).
+    system_spawn_history: FxHashMap<SystemId, u32>,
 }
 
 impl Scheduler {
@@ -885,6 +900,56 @@ impl Scheduler {
             scratch_sys_infos: Vec::new(),
             scratch_tasks: Vec::new(),
             scratch_skipped: FxHashSet::default(),
+            deterministic_spawn: false,
+            system_spawn_history: FxHashMap::default(),
+        }
+    }
+
+    /// D8b: enable/disable deterministic parallel-spawn entity-id assignment.
+    ///
+    /// When on, parallel `Commands::spawn` from stage systems assign identical
+    /// entity ids run-to-run given the same start snapshot + inputs (see the
+    /// per-system block scheme). This is the record/replay / rollback foundation;
+    /// Bevy does not guarantee it. Off by default: each command-emitting system
+    /// reserves a per-frame id block, so opting in trades a modest id-space /
+    /// memory cost (and, under heavy despawn+respawn churn, id-space growth — a
+    /// documented frontier) for determinism.
+    pub fn set_deterministic_spawn(&mut self, on: bool) -> &mut Self {
+        self.deterministic_spawn = on;
+        self
+    }
+
+    /// D8b: is deterministic parallel-spawn id assignment enabled?
+    #[inline]
+    pub fn deterministic_spawn(&self) -> bool {
+        self.deterministic_spawn
+    }
+
+    /// D8b: adaptive per-system block size — `None` (never dispatched) → a generous
+    /// initial guess; `Some(0)` (observed non-spawning) → no block; else observed
+    /// peak ×2 (slack so steady-state never overflows), clamped to a small floor.
+    fn block_size_for(&self, sys_id: SystemId) -> u32 {
+        const INITIAL: u32 = 256;
+        const FLOOR: u32 = 8;
+        match self.system_spawn_history.get(&sys_id) {
+            None => INITIAL,
+            Some(&0) => 0,
+            Some(&v) => v.saturating_mul(2).max(FLOOR),
+        }
+    }
+
+    /// D8b: after a stage applies, fold each seeded system's observed spawn count
+    /// (block size − remaining) into the adaptive-sizing history. `reserver` shares
+    /// the block cursor with the one handed to the system, so `block_remaining`
+    /// reflects consumption. On overflow (remaining 0) `used == size`, so the next
+    /// block doubles — converging to demand. Drains `seeded`.
+    fn commit_spawn_history(
+        &mut self,
+        seeded: &mut Vec<(SystemId, u32, apex_core::entity::EntityReserver)>,
+    ) {
+        for (sys_id, size, reserver) in seeded.drain(..) {
+            let used = size - reserver.block_remaining().unwrap_or(0);
+            self.system_spawn_history.insert(sys_id, used);
         }
     }
 
@@ -2681,9 +2746,15 @@ impl Scheduler {
                     let stateful = access.map(|a| a.stateful).unwrap_or(true);
                     // Мутация ресурса / Commands (TD-37): сайд-эффект, не локальный для партиции
                     // запроса ⇒ row-split дублировал бы его. Нет access ⇒ консервативно true.
-                    let non_query_side_effects = access
-                        .map(|a| a.writes_resource || a.uses_commands)
-                        .unwrap_or(true);
+                    // `has_deferred` covers `system!`-macro command systems (`Cmd` sets
+                    // `HAS_DEFERRED` but NOT `access.uses_commands` — only the `Commands`
+                    // SystemParam sets the latter); both must forbid row-split, else the
+                    // body (and its spawns) run once per chunk AND, post-D8b-layer-1, a
+                    // row-split task's commands are dropped (it carries no per-system slot).
+                    let non_query_side_effects = self.systems[sys_idx].has_deferred
+                        || access
+                            .map(|a| a.writes_resource || a.uses_commands)
+                            .unwrap_or(true);
                     // The `access` borrow ends here; take a raw pointer to the
                     // `dyn ParSystem` itself (D3). A filtered system always
                     // declares component access, i.e. is `Parallel`; a
@@ -2945,6 +3016,10 @@ impl Scheduler {
         // note). Reused across stages via `clear` + `resize_with`.
         let mut stage_cmds: Vec<Commands> = Vec::new();
         let mut slot_of: FxHashMap<SystemId, usize> = FxHashMap::default();
+        // D8b: systems seeded with an id block this stage (sys_id, block size, a
+        // clone of the reserver sharing the block cursor) — drained after apply to
+        // update adaptive-sizing history. Empty unless `deterministic_spawn`.
+        let mut seeded: Vec<(SystemId, u32, apex_core::entity::EntityReserver)> = Vec::new();
 
         // Ш1: pooled arch-length snapshot (cleared + refilled, capacity retained).
         let mut arch_lengths = std::mem::take(&mut self.scratch_arch_lengths);
@@ -3026,8 +3101,40 @@ impl Scheduler {
             stage_cmds.clear();
             stage_cmds.resize_with(stage_ids.len(), Commands::new);
             slot_of.clear();
+            seeded.clear();
             for (slot, &sys_id) in stage_ids.iter().enumerate() {
                 slot_of.insert(sys_id, slot);
+                // D8b: seed a private, rank-deterministic id block for each command-
+                // emitting system so parallel spawns assign identical ids run-to-run.
+                // Seeded for ALL command systems regardless of the SEQ/PAR path taken
+                // below → id assignment is independent of the cost-model's timing.
+                // `reserve_entity_block` runs here on the main thread in rank
+                // (stage_ids) order, so the block bases are deterministic.
+                if self.deterministic_spawn {
+                    // "Uses Commands" = `has_deferred` (system!-macro path) OR
+                    // `access.uses_commands` (Commands SystemParam path) — see the
+                    // non_query_side_effects note; only these systems spawn/defer.
+                    let uses_cmds = self
+                        .system_indices
+                        .get(&sys_id)
+                        .map(|&idx| {
+                            self.systems[idx].has_deferred
+                                || self.systems[idx]
+                                    .kind
+                                    .access()
+                                    .map(|a| a.uses_commands)
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if uses_cmds {
+                        let size = self.block_size_for(sys_id);
+                        if size > 0 {
+                            let reserver = unsafe { &*const_ptr }.reserve_entity_block(size);
+                            stage_cmds[slot].set_reserver(reserver.clone());
+                            seeded.push((sys_id, size, reserver));
+                        }
+                    }
+                }
             }
             let cmds_base: *mut Commands = stage_cmds.as_mut_ptr();
 
@@ -3075,6 +3182,7 @@ impl Scheduler {
                     }
                 }
                 // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
+                self.commit_spawn_history(&mut seeded); // D8b: adaptive block sizing
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
@@ -3195,6 +3303,9 @@ impl Scheduler {
                     }
                 }
             }
+            // D8b: fold each seeded system's observed spawn count into adaptive
+            // block-sizing history (covers both the SEQ-fallback and PAR branches).
+            self.commit_spawn_history(&mut seeded);
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
