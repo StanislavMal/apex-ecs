@@ -178,6 +178,10 @@ impl SystemConfig {
         }
         let has_deferred = <F::Param as apex_core::SystemParam>::has_deferred();
         let mut f = f;
+        // В3: the closure OWNS the per-system state (Query arch-index caches etc.),
+        // alive across frames. `State: Send + Sync + Default + 'static`, so the box
+        // keeps its existing Send + Sync bounds (no ripple).
+        let mut state = <<F::Param as apex_core::SystemParam>::State>::default();
         let func: Box<dyn FnMut(SystemContext<'_>) + Send + Sync> =
             Box::new(move |ctx: SystemContext<'_>| {
                 // Э5: skip-семантика параметров (Single<Q> и т.п.) — Bevy
@@ -185,7 +189,8 @@ impl SystemConfig {
                 if !<F::Param as apex_core::SystemParam>::validate(&ctx) {
                     return;
                 }
-                let item = <F::Param as apex_core::SystemParam>::fetch(&ctx);
+                let item =
+                    <F::Param as apex_core::SystemParam>::get_param(&ctx, &mut state);
                 f.run(item);
             });
         Self {

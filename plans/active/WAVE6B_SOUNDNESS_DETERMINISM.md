@@ -331,8 +331,15 @@ Per-system командные буферы (в per-system state-слоте из 
 
 ## 9. Открытые вопросы (решить на спайке/реализации)
 
-- Форма единого `Query<'w,'s>`: лайфтайм 'state в `SystemParam::Item<'w>` — как в Bevy (`Item<'world,'state>`)
-  или через отдельный трейт? Влияет на сигнатуру `get_param`.
+- ✅ **РЕШЕНО (В3 lifetime-спайк 2026-07-04, standalone rustc).** Форма
+  `get_param<'w>(ctx: &'w SystemContext<'w>, state: &'w mut State) -> Item<'w>` (Item заимствует
+  ОБА, 'state схлопнут в 'w) — компилируется и интегрируется с HRTB-double-bound
+  (`SystemParamFunction`), stateful Query кэширует между кадрами, кортежи тредят `State=(S1,S2)`.
+  **Находки для реальной интеграции:** (1) `type State: Send + Default + 'static` (НЕ Sync);
+  (2) **boxed system-замыкание должно быть `Send`, НЕ `Send + Sync`** — Sync снять (обосновано:
+  FnMut зовётся через эксклюзивный `&mut`, а stateful-системы не row-split'ятся). Это главный
+  ripple интеграции — проверить, что `Scheduler`/`SystemKind` компилируются без Sync на замыкании.
+- ~~Форма единого `Query<'w,'s>`~~ — см. выше (решено).
 - `Commands: !Send` — подтвердить; если да, как per-system буфер пересекает rayon-границу (сделать Send
   vs thread-safe сбор vs буфер в per-system slot, наполняемый только своим потоком в ASD).
 - ASD row-split × per-system state: state одной системы шарится между row-тасками — read-only на

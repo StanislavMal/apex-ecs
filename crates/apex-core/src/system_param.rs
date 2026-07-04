@@ -410,11 +410,29 @@ pub trait SystemParam {
     /// Что возвращается при [`fetch`](SystemParam::fetch) (с лайфтаймом `'w`).
     type Item<'w>;
 
+    /// Per-system persistent state (В3, wave 6b). Lives in the `fn_sys` closure
+    /// across frames — the home for `Query`/`CachedQuery`/`Single` arch-index caches
+    /// (and, later, event cursors). Stateless params use the default `()`.
+    /// `Send + Sync` so the boxed system fn keeps its existing bounds (no ripple);
+    /// `'static` because it outlives every call and owns no borrows.
+    type State: Send + Sync + Default + 'static;
+
     /// Статическая декларация доступа для планировщика.
     fn access() -> AccessDescriptor;
 
     /// Извлечь значение из контекста системы.
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w>;
+
+    /// Stateful fetch (В3): извлечь значение, используя per-system `state`. Дефолт —
+    /// игнорирует `state` и зовёт [`fetch`](Self::fetch) (для stateless-параметров:
+    /// `Res`/`ResMut`/`EventReader`/`EventWriter`/`Commands`). Кэширующие параметры
+    /// (`Query`-семейство) переопределяют, чтобы переиспользовать резолв между кадрами.
+    fn get_param<'w>(
+        ctx: &'w crate::world::SystemContext<'w>,
+        _state: &'w mut Self::State,
+    ) -> Self::Item<'w> {
+        Self::fetch(ctx)
+    }
 
     /// Параметр использует отложенные команды (`Commands`) — планировщик
     /// вставляет auto-apply sync-точку после системы (D2-1).
@@ -434,6 +452,7 @@ pub trait SystemParam {
 
 impl<T: Send + Sync + 'static> SystemParam for ResRead<T> {
     type Item<'w> = Res<'w, T>;
+    type State = ();
     fn access() -> AccessDescriptor {
         <Self as ResourceAccessList>::resource_accesses()
     }
@@ -444,6 +463,7 @@ impl<T: Send + Sync + 'static> SystemParam for ResRead<T> {
 
 impl<T: Send + Sync + 'static> SystemParam for ResWrite<T> {
     type Item<'w> = ResMut<'w, T>;
+    type State = ();
     fn access() -> AccessDescriptor {
         <Self as ResourceAccessList>::resource_accesses()
     }
@@ -456,6 +476,7 @@ impl<T: Send + Sync + 'static> SystemParam for ResWrite<T> {
 
 impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
     type Item<'w> = EventReader<'w, E>;
+    type State = ();
     fn access() -> AccessDescriptor {
         <Self as EventAccessList>::event_accesses()
     }
@@ -466,6 +487,7 @@ impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
 
 impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
     type Item<'w> = EventWriter<'w, E>;
+    type State = ();
     fn access() -> AccessDescriptor {
         <Self as EventAccessList>::event_accesses()
     }
@@ -487,6 +509,7 @@ pub struct QueryParam<Q: WorldQuery>(PhantomData<Q>);
 
 impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
     type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access()
     }
@@ -508,6 +531,7 @@ pub struct CommandsParam;
 
 impl SystemParam for CommandsParam {
     type Item<'w> = &'w mut crate::commands::Commands;
+    type State = ();
     fn access() -> AccessDescriptor {
         // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
         AccessDescriptor::new().commands_used()
@@ -531,6 +555,7 @@ impl SystemParam for CommandsParam {
 
 impl<'a, T: Send + Sync + 'static> SystemParam for Res<'a, T> {
     type Item<'w> = Res<'w, T>;
+    type State = ();
     fn access() -> AccessDescriptor {
         AccessDescriptor::new().read::<T>()
     }
@@ -541,6 +566,7 @@ impl<'a, T: Send + Sync + 'static> SystemParam for Res<'a, T> {
 
 impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
     type Item<'w> = ResMut<'w, T>;
+    type State = ();
     fn access() -> AccessDescriptor {
         // `write::<T>()` — для конфликт-анализа (две `ResMut<T>` не параллелятся);
         // `resource_write()` — гейт ASD: систему с мутацией ресурса нельзя дробить на чанки
@@ -558,6 +584,7 @@ where
     F: WorldQuery + WorldQuerySystemAccess,
 {
     type Item<'w> = crate::query::Query<'w, Q, F>;
+    type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access().merge(&F::system_access())
     }
@@ -580,6 +607,7 @@ where
     F: WorldQuery + WorldQuerySystemAccess,
 {
     type Item<'w> = crate::query::Single<'w, Q, F>;
+    type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access().merge(&F::system_access())
     }
@@ -612,6 +640,7 @@ where
     F: WorldQuery + WorldQuerySystemAccess,
 {
     type Item<'w> = Option<crate::query::Single<'w, Q, F>>;
+    type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access().merge(&F::system_access())
     }
@@ -637,6 +666,7 @@ where
 
 impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::CachedQuery<'a, Q> {
     type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access()
     }
@@ -649,6 +679,7 @@ impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::C
 
 impl<'a, E: Send + Sync + 'static> SystemParam for EventReader<'a, E> {
     type Item<'w> = EventReader<'w, E>;
+    type State = ();
     fn access() -> AccessDescriptor {
         AccessDescriptor::new().read_event::<E>()
     }
@@ -659,6 +690,7 @@ impl<'a, E: Send + Sync + 'static> SystemParam for EventReader<'a, E> {
 
 impl<'a, E: Send + Sync + 'static> SystemParam for EventWriter<'a, E> {
     type Item<'w> = EventWriter<'w, E>;
+    type State = ();
     fn access() -> AccessDescriptor {
         AccessDescriptor::new().write_event::<E>()
     }
@@ -669,6 +701,7 @@ impl<'a, E: Send + Sync + 'static> SystemParam for EventWriter<'a, E> {
 
 impl SystemParam for &mut crate::commands::Commands {
     type Item<'w> = &'w mut crate::commands::Commands;
+    type State = ();
     fn access() -> AccessDescriptor {
         // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
         AccessDescriptor::new().commands_used()
@@ -685,6 +718,7 @@ impl SystemParam for &mut crate::commands::Commands {
 
 impl SystemParam for () {
     type Item<'w> = ();
+    type State = ();
     fn access() -> AccessDescriptor {
         AccessDescriptor::new()
     }
@@ -697,12 +731,22 @@ macro_rules! impl_system_param_tuple {
     ( $($P:ident),+ ) => {
         impl< $($P: SystemParam),+ > SystemParam for ( $($P,)+ ) {
             type Item<'w> = ( $($P::Item<'w>,)+ );
+            type State = ( $($P::State,)+ );
             fn access() -> AccessDescriptor {
                 AccessDescriptor::new()
                     $( .merge(&$P::access()) )+
             }
             fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
                 ( $($P::fetch(ctx),)+ )
+            }
+            #[allow(non_snake_case)]
+            fn get_param<'w>(
+                ctx: &'w crate::world::SystemContext<'w>,
+                state: &'w mut Self::State,
+            ) -> Self::Item<'w> {
+                // Thread each param's own state slot (В3). Names reuse $P as the slot binding.
+                let ( $($P,)+ ) = state;
+                ( $($P::get_param(ctx, $P),)+ )
             }
             fn has_deferred() -> bool {
                 false $( || $P::has_deferred() )+
@@ -894,6 +938,7 @@ impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> 
     for Extract<QueryParam<Q>>
 {
     type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    type State = ();
 
     fn access() -> AccessDescriptor {
         Q::system_access()
@@ -909,6 +954,7 @@ impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> 
 // Extract<ResRead<T>> — читает ресурс из MainWorld
 impl<T: Send + Sync + 'static> SystemParam for Extract<ResRead<T>> {
     type Item<'w> = Res<'w, T>;
+    type State = ();
 
     fn access() -> AccessDescriptor {
         <ResRead<T> as ResourceAccessList>::resource_accesses()
@@ -924,6 +970,7 @@ impl<T: Send + Sync + 'static> SystemParam for Extract<ResRead<T>> {
 // Extract<Listen<E>> — читает события из MainWorld
 impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
     type Item<'w> = EventReader<'w, E>;
+    type State = ();
 
     fn access() -> AccessDescriptor {
         <Listen<E> as EventAccessList>::event_accesses()
