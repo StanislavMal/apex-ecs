@@ -137,20 +137,70 @@ fn reserve_from(lease: &ReserveLease, high_water: &AtomicU32) -> Entity {
 /// `cmd.spawn` (раньше резервация была монотонной ⇒ неограниченная утечка под командным churn'ом).
 /// До flush entity «зарезервирована, но не жива» (`is_alive`=false) — как `commands.spawn().id()` в
 /// Bevy до sync-точки.
+/// D8b: private deterministic id-block cursor. A per-system reserver hands out
+/// `base, base+1, …` from `next` until `end`, with NO cross-system contention and a
+/// deterministic order (the block base is assigned by the scheduler in system-rank
+/// order). `next` is atomic only so the reserver stays `Send + Sync`; spawning
+/// systems are never row-split (`Commands` ⇒ `non_query_side_effects` ⇒ single ASD
+/// task), so in practice one thread drives one block.
+struct BlockCursor {
+    next: AtomicU32,
+    end: u32,
+}
+
 #[derive(Clone)]
 pub struct EntityReserver {
     high_water: Arc<AtomicU32>,
     lease: LeaseCell,
+    /// D8b: optional deterministic block. When present, `reserve()` draws from the
+    /// private block (deterministic, contention-free) until exhausted, then falls
+    /// back to the shared high-water/lease.
+    block: Option<Arc<BlockCursor>>,
 }
 
 impl EntityReserver {
     /// Зарезервировать `Entity` (переиспользует свободный слот или свежий). Безопасно из
     /// параллельных систем: read-lock ячейки аренды (параллелен между резерваторами) → атомарный
     /// курсор текущей аренды + high-water. Всегда видит АКТУАЛЬНУЮ аренду (B2).
+    ///
+    /// D8b: если резерватор засеян блоком (`with_block`), сперва выдаёт id из приватного
+    /// блока (детерминированно, без contention); при исчерпании блока — общий путь.
     #[inline]
     pub fn reserve(&self) -> Entity {
+        if let Some(block) = &self.block {
+            let id = block.next.fetch_add(1, Ordering::Relaxed);
+            if id < block.end {
+                return Entity { index: id, generation: 0 };
+            }
+            // Block exhausted — fall through to the shared reserver. The rank-ordered
+            // overflow claim (fully deterministic overflow) is a follow-up (§4.1).
+        }
         let lease = read_lease(&self.lease);
         reserve_from(&lease, &self.high_water)
+    }
+
+    /// D8b: клон резерватора, привязанный к детерминированному блоку `[base, base+size)`.
+    /// `reserve()` выдаёт `base, base+1, …` приватным счётчиком (без contention,
+    /// детерминированно), после исчерпания — общий путь. Вызывающий (планировщик)
+    /// гарантирует, что `[base, base+size)` уже зарезервирован из high-water
+    /// ([`EntityAllocator::reserve_block`]).
+    pub fn with_block(&self, base: u32, size: u32) -> EntityReserver {
+        EntityReserver {
+            high_water: Arc::clone(&self.high_water),
+            lease: Arc::clone(&self.lease),
+            block: Some(Arc::new(BlockCursor {
+                next: AtomicU32::new(base),
+                end: base.saturating_add(size),
+            })),
+        }
+    }
+
+    /// D8b: сколько id ещё осталось в блоке (для адаптивного размера/переклейма).
+    /// `None` — резерватор без блока.
+    pub fn block_remaining(&self) -> Option<u32> {
+        self.block
+            .as_ref()
+            .map(|b| b.end.saturating_sub(b.next.load(Ordering::Relaxed)))
     }
 
     /// Зарезервировать `n` `Entity` минимумом атомарных операций (один `fetch_sub` аренды + один
@@ -159,6 +209,19 @@ impl EntityReserver {
     pub fn reserve_n(&self, n: usize) -> Vec<Entity> {
         if n == 0 {
             return Vec::new();
+        }
+        // D8b: block mode — draw `n` contiguously from the private block (deterministic,
+        // no contention). Single-task per spawning system, so plain load+store is sound.
+        // On block overflow, fall through to the shared path (rare; rank-ordered overflow
+        // determinism is a follow-up, §4.1).
+        if let Some(block) = &self.block {
+            let cur = block.next.load(Ordering::Relaxed);
+            if cur.saturating_add(n as u32) <= block.end {
+                block.next.store(cur + n as u32, Ordering::Relaxed);
+                return (0..n as u32)
+                    .map(|j| Entity { index: cur + j, generation: 0 })
+                    .collect();
+            }
         }
         let lease = read_lease(&self.lease);
         let old = lease.cursor.fetch_sub(n as i64, Ordering::Relaxed);
@@ -220,7 +283,19 @@ impl EntityAllocator {
             high_water: Arc::clone(&self.high_water),
             // Клон Arc на ТУ ЖЕ ячейку — резерватор видит все будущие переаренды.
             lease: Arc::clone(&self.lease),
+            block: None,
         }
+    }
+
+    /// D8b: зарезервировать непрерывный блок `[base, base+size)` из high-water и вернуть
+    /// резерватор, привязанный к нему. `base` детерминирован (текущий high-water,
+    /// главный поток), поэтому раздача блоков системам стадии в порядке ранга даёт
+    /// детерминированные id. Неиспользованный хвост блока материализуется `flush`'ем
+    /// как location-less записи (как обычная зарезервированная-но-не-живая) —
+    /// возвращать их в free-list в порядке ранга — задача планировщика (§4.1).
+    pub fn reserve_block(&self, size: u32) -> EntityReserver {
+        let base = self.high_water.fetch_add(size, Ordering::Relaxed);
+        self.reserver().with_block(base, size)
     }
 
     /// Пере-арендовать: текущий `free_list` (новые освобождения + возвращённые) → новая аренда; курсор
@@ -805,5 +880,64 @@ mod tests {
             assert_eq!(loc.archetype_id.0, 42);
             assert_eq!(loc.row as usize, i);
         }
+    }
+
+    // ── D8b: deterministic id-block reserver ────────────────────────────────
+    #[test]
+    fn block_reserver_hands_out_contiguous_deterministic_ids() {
+        let alloc = EntityAllocator::new();
+        let r = alloc.reserve_block(5);
+        let ids: Vec<u32> = (0..5).map(|_| r.reserve().index).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4], "block yields base+0..size in order");
+        assert_eq!(r.block_remaining(), Some(0));
+    }
+
+    #[test]
+    fn block_reserver_overflow_falls_back_to_shared() {
+        let alloc = EntityAllocator::new();
+        let r = alloc.reserve_block(2); // reserves [0,2) from high_water; hw now 2
+        assert_eq!(r.reserve().index, 0);
+        assert_eq!(r.reserve().index, 1);
+        // block exhausted → shared path draws the next fresh index (2).
+        assert_eq!(r.reserve().index, 2);
+    }
+
+    #[test]
+    fn block_reserver_n_is_contiguous() {
+        let alloc = EntityAllocator::new();
+        let r = alloc.reserve_block(10);
+        let batch = r.reserve_n(4);
+        assert_eq!(
+            batch.iter().map(|e| e.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(r.reserve().index, 4);
+    }
+
+    #[test]
+    fn per_system_blocks_are_deterministic_across_runs() {
+        // Model a stage: systems in rank order get blocks; each spawns some ids.
+        // Two independent runs must produce IDENTICAL id assignment (D8b capstone
+        // shape at the reserver level — the scheduler seeds blocks in rank order).
+        fn run(sizes: &[u32], spawns: &[u32]) -> Vec<Vec<u32>> {
+            let alloc = EntityAllocator::new();
+            let reservers: Vec<EntityReserver> =
+                sizes.iter().map(|&s| alloc.reserve_block(s)).collect();
+            // Spawns happen "in parallel" but each system drives its own block, so
+            // the id set per system is a pure function of (rank, spawn index).
+            reservers
+                .iter()
+                .zip(spawns)
+                .map(|(r, &n)| (0..n).map(|_| r.reserve().index).collect())
+                .collect()
+        }
+        let sizes = [4u32, 4, 4];
+        let spawns = [3u32, 2, 4];
+        let a = run(&sizes, &spawns);
+        let b = run(&sizes, &spawns);
+        assert_eq!(a, b, "per-system block id assignment is deterministic");
+        // System 0 (rank 0, block base 0) → 0,1,2; system 1 (base 4) → 4,5;
+        // system 2 (base 8) → 8,9,10,11.
+        assert_eq!(a, vec![vec![0, 1, 2], vec![4, 5], vec![8, 9, 10, 11]]);
     }
 }

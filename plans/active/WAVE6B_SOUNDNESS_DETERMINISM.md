@@ -211,6 +211,74 @@ Per-system командные буферы (в per-system state-слоте из 
 записанные команды по захваченному `(arch_idx,row)` перед flush; eager-ссылки внутри буфера ремапятся
 (E6), с явной оговоркой про escape id в ресурс. Выбор — по результату спайка, громко в плане.
 
+### 4.4a ✅ РЕЗУЛЬТАТ СПАЙКА (2026-07-04, `apex-bench/src/bin/d8b_spike.rs`)
+
+**Схема (B) ВАЛИДИРОВАНА — фолбэк НЕ нужен.** Прототип block-reserver (private `Cell`-счётчик над
+детерминированно пред-назначенной sub-base в порядке (rank, task)) + rayon-параллельная spawn-стадия
+(6 систем × 8 tasks × 500 = 24000 entity):
+1. **Детерминизм: IDENTICAL across 40 прогонов**, id-множество плотное [0,24000) без дыр/дублей.
+   Контроль: shared-atomic (текущий `reserve()`) — позиционное присвоение id РАЗЛИЧАЕТСЯ run-to-run
+   (та самая недетерминированность, которую D8b чинит).
+2. **Перф: block 20.5x быстрее** shared-atomic `EntityReserver::reserve()` (134µs vs 2751µs) и 4.83x
+   vs даже сырой один `AtomicU32.fetch_add`. Текущий `reserve()` тяжёл: RwLock-read + `Arc::clone`
+   аренды НА КАЖДЫЙ reserve. Block (private Cell) убирает всё это → детерминизм И перф в одну сторону.
+3. **eager `.id()`**: base+counter, без remap — известен в момент reserve.
+
+**Остатки для полной имплементации (D8b step 4), НЕ блокеры feasibility:** (а) адаптивный размер
+блока/sub-block (per-task high-water прошлого кадра + slack); (б) overflow rank-ordered claim (редкий
+после прогрева); (в) детерминизм free-list reuse (аренда free-слотов блокам в порядке ранга — B2). 
+Спайк моделировал known-counts steady-state; ядро схемы (block-детерминизм+перф+eager) доказано.
+
+---
+
+## Журнал выполнения (2026-07-04, ветка `core-audit-wave6b` от `parallelism-perf`)
+
+> ⚠ Ветка заведена от `parallelism-perf` (НЕ от main): та кампания тяжело правит тот же диспетчер
+> (`run_hybrid_parallel`/`run_stage_parallel`/`thread_commands`), которого касается D8b/F3; стек
+> избегает конфликтов (координация — PARALLELISM_PERF_PARITY §8). При мерже: parallelism-perf → main,
+> затем wave6b (или wave6b, включающий parallelism-perf).
+
+### ✅ Step 1 — D8b спайк (commit 525d7fb)
+Схема (B) валидирована: детерминизм IDENTICAL/40, **block 20.5x** vs shared-atomic, eager сохранён
+(§4.4a). Фолбэк не нужен. Артефакт: `apex-bench/src/bin/d8b_spike.rs`.
+
+### ✅ В3 lifetime-спайк (standalone rustc, §9)
+`get_param<'w>(ctx, &'w mut state) -> Item<'w>` компилируется с HRTB-double-bound; **`State: Send +
+Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ ripple** (Sync-drop нужен только для
+!Send Commands-буфера D8b, отложен).
+
+### ✅ Step 2 — В3 Phase A (commit 094631f): per-system state infrastructure
+`SystemParam::State` + `get_param` (дефолт = fetch); 19 impl'ов `State = ()`; кортеж тредит
+`State=(S1,..)`; `fn_sys`-замыкание владеет state между кадрами. **Поведенчески нейтрально**
+(gate: core+scheduler 344/0). Дом для F3/D8b готов.
+
+### ⏭ Осталось (каждый — крупная, частью кросс-репо, работа; кампания многосессионна)
+- **В3 Phase B/C** (apex-core): дать `Query`/`CachedQuery`/`Single` реальный кэш-`State` (get_param
+  переиспользует резолв) + консолидация 3 query-типов в один. Перф маргинален (bonus, A/B), главная
+  ценность — API. Крупный рефактор (трогает все query-usage).
+- **F3** (apex-core + движок): `ReadOnlyWorldQuery`-бинд на `ctx.query`, `pub(crate)` на mutable-
+  аксессоры; **адоптион: 23 движковых `ctx.*`-сайта (15 resource_mut / 5 query / 3 event_writer) +
+  15 AutoSystem-impl'ов** (миграция на plain-fn ЛИБО type-constrained ctx). Закрывает safe-достижимую
+  гонку. Кросс-репо.
+- **D8b** (apex-core + scheduler):
+  - ✅ **Increment A** (commit d76ade3): block-reserver — real, tested. `EntityReserver.with_block`/
+    `block_remaining` + `EntityAllocator::reserve_block(size)` (carve contiguous block from high-water;
+    детерминированная база = текущий high-water на main-потоке). `reserve()`/`reserve_n()` тянут из
+    приватного блока (без contention, детерминированно), overflow → общий путь. **Упрощение:
+    spawning-системы single-task** (`Commands` ⇒ `non_query_side_effects` ⇒ не row-split) → приватный
+    счётчик детерминирован без гонки — снимает главную боль §4.1. Тесты 244/0 (вкл. capstone-shape).
+  - ⏭ **Increment B** (scheduler, риск: трогает cost-model/`thread_commands` из parallelism-perf):
+    per-system Commands-буферы (сейчас `thread_commands[worker]` шарится всеми системами воркера с ОДНИМ
+    reserver — `ctx.commands()` per-worker; нужен per-system буфер + block-reserver). Планировщик:
+    блоки в порядке ранга (адаптивный размер = spawn-count прошлого кадра + slack) → `reserve_block` per
+    система → apply в порядке ранга → reclaim неиспользованного хвоста блока (free-list, порядок ранга) +
+    rank-ordered overflow. Капстон: N прогонов → идентичный snapshot. **Крупная правка только что
+    стабилизированного command-model → отдельный аккуратный заход, не спешить (§0.2b).**
+
+**Приоритет остатка:** F3 (soundness) и D8b (детерминизм §0.9) — главная ценность; В3 Phase B/C —
+API-качество. Порядок реализации — по выбору (F3 независим от В3 Phase B; D8b command-буфер отдельно
+от В3 Send+Sync-State).
+
 ---
 
 ## 5. Порядок реализации (sequencing)
@@ -313,8 +381,15 @@ Per-system командные буферы (в per-system state-слоте из 
 
 ## 9. Открытые вопросы (решить на спайке/реализации)
 
-- Форма единого `Query<'w,'s>`: лайфтайм 'state в `SystemParam::Item<'w>` — как в Bevy (`Item<'world,'state>`)
-  или через отдельный трейт? Влияет на сигнатуру `get_param`.
+- ✅ **РЕШЕНО (В3 lifetime-спайк 2026-07-04, standalone rustc).** Форма
+  `get_param<'w>(ctx: &'w SystemContext<'w>, state: &'w mut State) -> Item<'w>` (Item заимствует
+  ОБА, 'state схлопнут в 'w) — компилируется и интегрируется с HRTB-double-bound
+  (`SystemParamFunction`), stateful Query кэширует между кадрами, кортежи тредят `State=(S1,S2)`.
+  **Находки для реальной интеграции:** (1) `type State: Send + Default + 'static` (НЕ Sync);
+  (2) **boxed system-замыкание должно быть `Send`, НЕ `Send + Sync`** — Sync снять (обосновано:
+  FnMut зовётся через эксклюзивный `&mut`, а stateful-системы не row-split'ятся). Это главный
+  ripple интеграции — проверить, что `Scheduler`/`SystemKind` компилируются без Sync на замыкании.
+- ~~Форма единого `Query<'w,'s>`~~ — см. выше (решено).
 - `Commands: !Send` — подтвердить; если да, как per-system буфер пересекает rayon-границу (сделать Send
   vs thread-safe сбор vs буфер в per-system slot, наполняемый только своим потоком в ASD).
 - ASD row-split × per-system state: state одной системы шарится между row-тасками — read-only на
