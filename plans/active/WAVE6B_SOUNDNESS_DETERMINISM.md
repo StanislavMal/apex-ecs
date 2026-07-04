@@ -231,6 +231,46 @@ Per-system командные буферы (в per-system state-слоте из 
 
 ---
 
+## Журнал выполнения (2026-07-04, ветка `core-audit-wave6b` от `parallelism-perf`)
+
+> ⚠ Ветка заведена от `parallelism-perf` (НЕ от main): та кампания тяжело правит тот же диспетчер
+> (`run_hybrid_parallel`/`run_stage_parallel`/`thread_commands`), которого касается D8b/F3; стек
+> избегает конфликтов (координация — PARALLELISM_PERF_PARITY §8). При мерже: parallelism-perf → main,
+> затем wave6b (или wave6b, включающий parallelism-perf).
+
+### ✅ Step 1 — D8b спайк (commit 525d7fb)
+Схема (B) валидирована: детерминизм IDENTICAL/40, **block 20.5x** vs shared-atomic, eager сохранён
+(§4.4a). Фолбэк не нужен. Артефакт: `apex-bench/src/bin/d8b_spike.rs`.
+
+### ✅ В3 lifetime-спайк (standalone rustc, §9)
+`get_param<'w>(ctx, &'w mut state) -> Item<'w>` компилируется с HRTB-double-bound; **`State: Send +
+Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ ripple** (Sync-drop нужен только для
+!Send Commands-буфера D8b, отложен).
+
+### ✅ Step 2 — В3 Phase A (commit 094631f): per-system state infrastructure
+`SystemParam::State` + `get_param` (дефолт = fetch); 19 impl'ов `State = ()`; кортеж тредит
+`State=(S1,..)`; `fn_sys`-замыкание владеет state между кадрами. **Поведенчески нейтрально**
+(gate: core+scheduler 344/0). Дом для F3/D8b готов.
+
+### ⏭ Осталось (каждый — крупная, частью кросс-репо, работа; кампания многосессионна)
+- **В3 Phase B/C** (apex-core): дать `Query`/`CachedQuery`/`Single` реальный кэш-`State` (get_param
+  переиспользует резолв) + консолидация 3 query-типов в один. Перф маргинален (bonus, A/B), главная
+  ценность — API. Крупный рефактор (трогает все query-usage).
+- **F3** (apex-core + движок): `ReadOnlyWorldQuery`-бинд на `ctx.query`, `pub(crate)` на mutable-
+  аксессоры; **адоптион: 23 движковых `ctx.*`-сайта (15 resource_mut / 5 query / 3 event_writer) +
+  15 AutoSystem-impl'ов** (миграция на plain-fn ЛИБО type-constrained ctx). Закрывает safe-достижимую
+  гонку. Кросс-репо.
+- **D8b full** (apex-core + scheduler): per-system командные буферы (⚠ `Commands: !Send` → буфер НЕ в
+  Send+Sync-`State`; отдельный per-task сбор в ASD с детерминированной конкатенацией) + block-reserver
+  (адаптивный размер, overflow rank-claim, free-list детерминизм) + apply в порядке ранга + капстон
+  determinism-тест. Взаимодействует с cost-model/thread_commands из parallelism-perf.
+
+**Приоритет остатка:** F3 (soundness) и D8b (детерминизм §0.9) — главная ценность; В3 Phase B/C —
+API-качество. Порядок реализации — по выбору (F3 независим от В3 Phase B; D8b command-буфер отдельно
+от В3 Send+Sync-State).
+
+---
+
 ## 5. Порядок реализации (sequencing)
 
 Зависимости: F3 и D8b едут на per-system state-слоте из В3; D8b-дизайн влияет на форму `Commands`-параметра.
