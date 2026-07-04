@@ -514,7 +514,10 @@ impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
         Q::system_access()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::world::CachedQuery<'w, Q> {
-        ctx.query::<Q>()
+        // `query_unchecked`: `Q` may be mutable (`Write<T>`), which is sound here —
+        // this IS the declared parameter, so the scheduler validated the access and
+        // serializes conflicts (F3). The public `ctx.query` is read-only-bound.
+        ctx.query_unchecked::<Q>()
     }
 }
 
@@ -673,7 +676,8 @@ impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::C
     fn fetch<'w>(
         ctx: &'w crate::world::SystemContext<'w>,
     ) -> crate::world::CachedQuery<'w, Q> {
-        ctx.query::<Q>()
+        // Declared query parameter ⇒ `query_unchecked` (F3): access is validated.
+        ctx.query_unchecked::<Q>()
     }
 }
 

@@ -1179,7 +1179,7 @@ impl Scheduler {
     ///     "physics",
     ///     access_desc!(read<Vel>, write<Pos>),
     ///     |ctx| {
-    ///         ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, mut p)| {
+    ///         ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, mut p)| {
     ///             p.x += v.x;
     ///         });
     ///     },
@@ -3858,7 +3858,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>().for_each(|_, (vel, mut pos)| {
+            ctx.query_unchecked::<Self::Query>().for_each(|_, (vel, mut pos)| {
                 pos.x += vel.x;
                 pos.y += vel.y;
             });
@@ -3871,7 +3871,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Self::Query>().for_each(|_, mut hp| {
+            ctx.query_unchecked::<Self::Query>().for_each(|_, mut hp| {
                 hp.0 = hp.0.max(0.0);
             });
         }
@@ -4242,7 +4242,7 @@ mod tests {
                 AccessDescriptor::new().read::<Vel>().write::<Pos>()
             }
             fn run(&mut self, ctx: SystemContext<'_>) {
-                ctx.query::<(Read<Vel>, Write<Pos>)>()
+                ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
                     .for_each(|_, (vel, mut pos)| {
                         pos.x += vel.x;
                         pos.y += vel.y;
@@ -4352,7 +4352,7 @@ mod tests {
             access_desc!(read<DeltaTime>, read<Vel>, write<Pos>),
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
-                ctx.query::<(Read<Vel>, Write<Pos>)>()
+                ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
                     .for_each(|_, (vel, mut pos)| {
                         pos.x += vel.x * (*dt).0;
                         pos.y += vel.y * (*dt).0;

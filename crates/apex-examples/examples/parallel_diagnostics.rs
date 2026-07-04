@@ -201,7 +201,7 @@ fn register_par_for_each_demo(sched: &mut Scheduler) {
             "demo_intra_par",
             access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
             |ctx| {
-                ctx.query::<(Read<Velocity>, Write<Position>)>()
+                ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>()
                     .par_for_each(|_, (vel, mut pos)| {
                         pos.x += vel.x * 0.016;
                         pos.y += vel.y * 0.016;
