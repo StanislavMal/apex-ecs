@@ -260,10 +260,20 @@ Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ
   аксессоры; **адоптион: 23 движковых `ctx.*`-сайта (15 resource_mut / 5 query / 3 event_writer) +
   15 AutoSystem-impl'ов** (миграция на plain-fn ЛИБО type-constrained ctx). Закрывает safe-достижимую
   гонку. Кросс-репо.
-- **D8b full** (apex-core + scheduler): per-system командные буферы (⚠ `Commands: !Send` → буфер НЕ в
-  Send+Sync-`State`; отдельный per-task сбор в ASD с детерминированной конкатенацией) + block-reserver
-  (адаптивный размер, overflow rank-claim, free-list детерминизм) + apply в порядке ранга + капстон
-  determinism-тест. Взаимодействует с cost-model/thread_commands из parallelism-perf.
+- **D8b** (apex-core + scheduler):
+  - ✅ **Increment A** (commit d76ade3): block-reserver — real, tested. `EntityReserver.with_block`/
+    `block_remaining` + `EntityAllocator::reserve_block(size)` (carve contiguous block from high-water;
+    детерминированная база = текущий high-water на main-потоке). `reserve()`/`reserve_n()` тянут из
+    приватного блока (без contention, детерминированно), overflow → общий путь. **Упрощение:
+    spawning-системы single-task** (`Commands` ⇒ `non_query_side_effects` ⇒ не row-split) → приватный
+    счётчик детерминирован без гонки — снимает главную боль §4.1. Тесты 244/0 (вкл. capstone-shape).
+  - ⏭ **Increment B** (scheduler, риск: трогает cost-model/`thread_commands` из parallelism-perf):
+    per-system Commands-буферы (сейчас `thread_commands[worker]` шарится всеми системами воркера с ОДНИМ
+    reserver — `ctx.commands()` per-worker; нужен per-system буфер + block-reserver). Планировщик:
+    блоки в порядке ранга (адаптивный размер = spawn-count прошлого кадра + slack) → `reserve_block` per
+    система → apply в порядке ранга → reclaim неиспользованного хвоста блока (free-list, порядок ранга) +
+    rank-ordered overflow. Капстон: N прогонов → идентичный snapshot. **Крупная правка только что
+    стабилизированного command-model → отдельный аккуратный заход, не спешить (§0.2b).**
 
 **Приоритет остатка:** F3 (soundness) и D8b (детерминизм §0.9) — главная ценность; В3 Phase B/C —
 API-качество. Порядок реализации — по выбору (F3 независим от В3 Phase B; D8b command-буфер отдельно
