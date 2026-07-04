@@ -388,7 +388,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -405,7 +405,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut::<$ty>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut_unchecked::<$ty>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -447,7 +447,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -576,7 +576,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -590,7 +590,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut::<$ty>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut_unchecked::<$ty>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -632,7 +632,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_writer::<$ev>(); ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};

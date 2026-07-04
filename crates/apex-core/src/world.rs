@@ -2376,14 +2376,22 @@ impl<'w> SystemContext<'w> {
         Res(self.world().resource::<T>())
     }
 
+    /// Mutable resource access WITHOUT a declared-access check (F3.2). The scheduler
+    /// parallelizes systems by their DECLARED access, so a `ResMut` obtained from
+    /// `ctx` that the system did NOT declare is a safe-reachable data race (the same
+    /// class F3.1 closed for `ctx.query`). Declare it as a `ResMut<T>` PARAMETER — the
+    /// scheduler validates it and serializes conflicts. The ONLY intended callers are
+    /// `SystemParam` (`ResMut`/`ResWrite`) and the `system!` macro, where access is
+    /// validated. `#[doc(hidden)]`: an internal escape, not blessed API.
+    #[doc(hidden)]
     #[inline]
-    pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
+    pub fn resource_mut_unchecked<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
             let ptr = self
                 .world()
                 .resources
                 .get_raw_ptr::<T>()
-                .expect("resource_mut: resource not found");
+                .expect("resource_mut_unchecked: resource not found");
             ResMut::from_ptr(ptr)
         }
     }
@@ -2393,8 +2401,11 @@ impl<'w> SystemContext<'w> {
         self.world().try_resource::<T>().map(Res)
     }
 
+    /// Fallible [`resource_mut_unchecked`](Self::resource_mut_unchecked) — same F3.2
+    /// caveat: declared access required, internal escape.
+    #[doc(hidden)]
     #[inline]
-    pub fn try_resource_mut<T: Send + Sync + 'static>(&self) -> Option<ResMut<'_, T>> {
+    pub fn try_resource_mut_unchecked<T: Send + Sync + 'static>(&self) -> Option<ResMut<'_, T>> {
         unsafe {
             self.world()
                 .resources
@@ -2414,13 +2425,19 @@ impl<'w> SystemContext<'w> {
         }
     }
 
+    /// Event-writer access WITHOUT a declared-access check (F3.2). An `EventWriter`
+    /// obtained from `ctx` that the system did NOT declare (`Emit<E>`) races with
+    /// other undeclared writers/readers of the same event. Declare it as an
+    /// `EventWriter<E>` PARAMETER. The ONLY intended callers are `SystemParam` and the
+    /// `system!` macro. `#[doc(hidden)]`: an internal escape, not blessed API.
+    #[doc(hidden)]
     #[inline]
-    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+    pub fn event_writer_unchecked<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
             let ptr = self
                 .world()
                 .event_queue_ptr::<T>()
-                .expect("event_writer: event type not registered");
+                .expect("event_writer_unchecked: event type not registered");
             EventWriter::from_ptr(ptr)
         }
     }
@@ -3806,7 +3823,7 @@ mod tests {
         let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
-        let res_mut = ctx.try_resource_mut::<Score>();
+        let res_mut = ctx.try_resource_mut_unchecked::<Score>();
         assert!(res_mut.is_some());
         assert_eq!(*res_mut.unwrap(), Score(10));
     }
@@ -3818,7 +3835,7 @@ mod tests {
         let sw = unsafe { crate::sub_world::SubWorld::new(&world, &[]) };
         let ctx = SystemContext::from_sub_world(&sw);
 
-        assert!(ctx.try_resource_mut::<Score>().is_none());
+        assert!(ctx.try_resource_mut_unchecked::<Score>().is_none());
     }
 
     #[test]

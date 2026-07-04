@@ -40,7 +40,9 @@ fn plugin_a(sched: &mut Scheduler) {
     sched.add_systems(
         StageLabel::tag("input"),
         par_access("read_keyboard", access_desc!(write<FrameInput>), |ctx| {
-            ctx.resource_mut::<FrameInput>().keys = 42;
+            // Raw par path: access is declared above via `access_desc!`, so the
+            // `_unchecked` mutable accessor is the correct (validated) escape (F3.2).
+            ctx.resource_mut_unchecked::<FrameInput>().keys = 42;
             println!("  [Input] read_keyboard");
         }),
     );
