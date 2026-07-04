@@ -342,6 +342,19 @@ impl TargetIndex {
         &mut self.by_kind[k]
     }
 
+    /// Whether `entity_index` is currently the target of ANY relation (any kind).
+    /// Cheap O(1) read used to short-circuit cycle detection: an entity that is not
+    /// a target of anything cannot appear in any ancestor chain, so no edge into it
+    /// can close a cycle.
+    #[inline]
+    pub fn is_any_target(&self, entity_index: u32) -> bool {
+        self.target_counts
+            .get(entity_index as usize)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
     #[inline]
     pub fn add(&mut self, kind_idx: u32, target: Entity, subject: Entity) {
         self.ensure_kind(kind_idx)
@@ -651,7 +664,15 @@ impl World {
         // would close a cycle: walking parents up from `target` along this kind
         // must not reach `subject`. A cycle would spin transform propagation and
         // cascade-despawn forever (C4). Non-hierarchical kinds may cycle freely.
-        if exclusive || self.relations.is_cascade(kind_idx) {
+        //
+        // Fast skip: a cycle requires `subject` to already sit in `target`'s ancestor
+        // chain, i.e. `subject` must be the target of some existing pair. If `subject`
+        // is not a target of ANYTHING, the walk can never reach it — so skip it
+        // entirely. This is the common case (attaching a fresh leaf to a parent) and
+        // recovers the per-add cost the exclusive/cascade cycle check introduced.
+        if (exclusive || self.relations.is_cascade(kind_idx))
+            && self.target_index.is_any_target(subject.index)
+        {
             let mut cur = target;
             let mut depth = 0usize;
             while let Some(parent) = self.subject_index.first_with_kind(cur.index, kind_idx) {
