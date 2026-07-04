@@ -953,6 +953,16 @@ impl World {
         self.entities.reserver()
     }
 
+    /// D8b: зарезервировать непрерывный блок из `size` entity-индексов и вернуть
+    /// резерватор, привязанный к нему (детерминированная база = текущий high-water).
+    /// Планировщик вызывает это на главном потоке в порядке ранга систем стадии,
+    /// поэтому базы блоков детерминированы; внутри блока система резервирует id
+    /// приватным счётчиком — без contention и детерминированно (см. [`EntityReserver`]).
+    #[inline]
+    pub fn reserve_entity_block(&self, size: u32) -> crate::entity::EntityReserver {
+        self.entities.reserve_block(size)
+    }
+
     /// Материализовать записи под все зарезервированные через [`World::entity_reserver`] индексы.
     /// Вызывается [`Commands::apply`](crate::commands::Commands::apply) перед обработкой очереди, до
     /// того как spawn-команды проставят компоненты зарезервированным entity. Идемпотентно/дёшево.
@@ -2230,10 +2240,15 @@ pub struct SystemContext<'w> {
     /// Обычно один SubWorld, но может быть несколько если система
     /// работает с несколькими группами архетипов.
     pub(crate) sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
-    /// Thread-local команды. Указатель на `Vec<Commands>` из Scheduler.
-    /// Каждый поток rayon имеет свой `Commands` по индексу `current_thread_index()`.
-    /// Если не предоставлен — используется `inline_cmds`.
-    pub(crate) deferred_cmds: Option<*mut Vec<Commands>>,
+    /// D8b: per-system command slot. Points at THIS system's private `Commands`
+    /// buffer, owned by the scheduler for the duration of the stage. The scheduler
+    /// hands a slot only to SINGLE-TASK systems (a command-emitting system declares
+    /// `uses_commands` ⇒ `non_query_side_effects` ⇒ it is never row-split), so
+    /// exactly one task ever forms `&mut *ptr` — no cross-task aliasing. Row-split
+    /// (query-only) tasks get `None` and fall back to `inline_cmds`. Applying these
+    /// per-system buffers in rank order gives deterministic command ordering (D8b).
+    /// If `None` — `inline_cmds` is used (sequential / undeclared paths).
+    pub(crate) deferred_cmds: Option<*mut Commands>,
     /// Локальный Commands для sequential систем или когда deferred_cmds не задан.
     /// Используется вместо глобального статического `DUMMY_COMMANDS`.
     pub(crate) inline_cmds: UnsafeCell<Commands>,
@@ -2260,15 +2275,16 @@ impl<'w> SystemContext<'w> {
         }
     }
 
-    /// Создать контекст с thread-local командами.
+    /// Создать контекст с per-system командным буфером (D8b).
     ///
     /// # Safety
-    /// `deferred_cmds` must point to a `Vec<Commands>` with one slot per rayon
-    /// worker thread, alive for the context's lifetime; each worker accesses
-    /// only its own slot (see [`commands`](Self::commands)).
+    /// `deferred_cmds` must point to a `Commands` owned by the caller (scheduler)
+    /// and alive for the context's lifetime, handed only to a SINGLE-TASK system
+    /// (no row-split), so no other task forms a concurrent `&mut` to the same slot
+    /// (see [`commands`](Self::commands)).
     pub unsafe fn with_commands(
         sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
-        deferred_cmds: *mut Vec<Commands>,
+        deferred_cmds: *mut Commands,
     ) -> Self {
         Self {
             sub_worlds,
@@ -2280,22 +2296,23 @@ impl<'w> SystemContext<'w> {
     /// Получить `Commands` для текущего потока.
     /// Команды применяются планировщиком после завершения Stage.
     ///
-    /// `&self → &mut Commands` намеренно: буфер команд — thread-local (по индексу
-    /// rayon-потока) либо `UnsafeCell` в sequential-режиме, поэтому уникальность
-    /// `&mut` гарантирована без `&mut self`. Это позволяет нескольким системам
-    /// в одном батче складывать команды параллельно через общий `&SystemContext`.
+    /// `&self → &mut Commands` намеренно: буфер команд — либо приватный per-system
+    /// слот (D8b: система-владелец single-task, т.е. не row-split, → уникальный
+    /// доступ одним потоком), либо `UnsafeCell` в sequential/undeclared-режиме,
+    /// поэтому уникальность `&mut` гарантирована без `&mut self`.
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub fn commands(&self) -> &mut Commands {
-        let cmds = if let Some(deferred_cmds) = self.deferred_cmds {
-            unsafe {
-                let thread_idx = rayon::current_thread_index().unwrap_or(0);
-                let vec = &mut *deferred_cmds;
-                &mut vec[thread_idx]
-            }
+        let cmds = if let Some(ptr) = self.deferred_cmds {
+            // SAFETY: `ptr` — приватный командный слот этой системы (D8b). Планировщик
+            // выдаёт слот ТОЛЬКО single-task системам (command-emitting система несёт
+            // `uses_commands` ⇒ `non_query_side_effects` ⇒ никогда не row-split), поэтому
+            // ровно одна задача формирует этот `&mut`. Row-split (query-only) задачи
+            // получают `None` и не алиасят слот.
+            unsafe { &mut *ptr }
         } else {
-            // SAFETY: inline_cmds используется только когда deferred_cmds не задан
-            // (sequential режим). В этом случае доступ exclusive — один поток.
+            // SAFETY: inline_cmds используется только когда per-system слот не задан
+            // (sequential / row-split-inline). Доступ exclusive — один поток, свой ctx.
             unsafe { &mut *self.inline_cmds.get() }
         };
         // Единая точка внедрения резерватора: любой `cmd.spawn().id()` из системы получает
