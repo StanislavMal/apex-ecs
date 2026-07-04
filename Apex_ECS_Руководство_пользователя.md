@@ -1064,7 +1064,8 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `clear()` | Очистить оба буфера и сбросить все курсоры |
 | `update()` | Переключить буферы: pending → events. Вызывается Scheduler'ом после каждого Stage (sequential и parallel), либо вручную через `world.flush_all_events()` |
 
-**`EventWriter<T>`** (доступен через `ctx.event_writer::<T>()`):
+**`EventWriter<T>`** (декларируется как параметр системы `name: EventWriter<T>` — планировщик
+валидирует доступ; F3.2):
 
 | Метод | Описание |
 |-------|----------|

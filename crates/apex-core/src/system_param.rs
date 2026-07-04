@@ -271,7 +271,7 @@ pub struct Listen<E: Send + Sync + 'static>(PhantomData<E>);
 
 /// Маркер: публикация событий типа E в `AutoSystem::Events`.
 ///
-/// Соответствует `ctx.event_writer::<E>()` внутри `run()`.
+/// Соответствует `ctx.event_writer_unchecked::<E>()` внутри `run()`.
 pub struct Emit<E: Send + Sync + 'static>(PhantomData<E>);
 
 // ── ResourceAccessList ─────────────────────────────────────────
@@ -468,7 +468,7 @@ impl<T: Send + Sync + 'static> SystemParam for ResWrite<T> {
         <Self as ResourceAccessList>::resource_accesses()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
-        ctx.resource_mut::<T>()
+        ctx.resource_mut_unchecked::<T>()
     }
 }
 
@@ -492,7 +492,7 @@ impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
         <Self as EventAccessList>::event_accesses()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventWriter<'w, E> {
-        ctx.event_writer::<E>()
+        ctx.event_writer_unchecked::<E>()
     }
 }
 
@@ -577,7 +577,7 @@ impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
         AccessDescriptor::new().write::<T>().resource_write()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
-        ctx.resource_mut::<T>()
+        ctx.resource_mut_unchecked::<T>()
     }
 }
 
@@ -699,7 +699,7 @@ impl<'a, E: Send + Sync + 'static> SystemParam for EventWriter<'a, E> {
         AccessDescriptor::new().write_event::<E>()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventWriter<'w, E> {
-        ctx.event_writer::<E>()
+        ctx.event_writer_unchecked::<E>()
     }
 }
 

@@ -264,13 +264,31 @@ Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ
     Адоптион: макрос (4 генерации) + `QueryParam`/`CachedQuery` SystemParam + 4 тест-сайта scheduler +
     5 тест-сайтов app.rs + 9 сайтов perf/diag-примеров → `query_unchecked`. Gate: apex-ecs workspace,
     clippy, goldens. **Ноль нового unsafe** (тот же `from_sub_world`, лишь bind + переименование).
-  - ⏭ **F3.2 — resource/event-измерение + AutoSystem** (БОЛЬШОЙ атомарный кросс-репо): `pub(crate)`/
-    `#[doc(hidden)]` на `resource_mut`/`event_writer` (⚠ `commands()` зовёт `system!`-макрос из
-    user-крейта → не `pub(crate)`, только `#[doc(hidden)]`-shim). Адоптион — **СОТНИ** движковых сайтов
-    (apex-render: gpu_tests 166, live_harness 50, extract 11, render_isolated 16×2, prepass 16 …) +
-    миграция AutoSystem-impl'ов на plain-fn. Движок не соберётся до полной миграции → отдельная
-    многосессионная кампания, не сессионный юнит. Оценка «23 сайта» в исходном плане — драстически
-    занижена (считала подмножество). Golden-путь = миграция AutoSystem на plain-fn (access=параметр).
+  - ✅ **F3.2 — resource/event-измерение** (ветка wave6b-f3-2): `#[doc(hidden)]` +
+    `_unchecked`-переименование на `SystemContext::resource_mut`→`resource_mut_unchecked`,
+    `try_resource_mut`→`try_resource_mut_unchecked`, `event_writer`→`event_writer_unchecked`
+    (undeclared мутабельный ресурс/событие из safe-кода = гонка; убраны с blessed-поверхности, как query
+    в F3.1). Read-аксессоры (`resource`/`try_resource`/`event_reader`) — blessed. Роут: макрос (6
+    генераций) + `ResMut`/`ResWrite`/`EventWriter` SystemParam (4) + apex-ecs тест/пример (3). Движок:
+    apex-input (7 AutoSystem-impl'ов, 14 сайтов) + app.rs (2 тест-сайта) → `_unchecked`. **Ноль нового
+    unsafe, поведенчески идентично** (чистый rename). Gate: apex-ecs workspace, apex-input тесты 14/0,
+    clippy, goldens.
+    - **⚠ МЕТОД-КОРРЕКЦИЯ:** «СОТНИ сайтов» — БЫЛА ОШИБКА замера (grep `.resource_mut::<` считал
+      `world.resource_mut` — эксклюзивный `&mut World`, 140 шт., **sound, не дыра**). Реальная дыра =
+      только `ctx.resource_mut`/`ctx.event_writer` (receiver `SystemContext`): **14 ecs + 18 движок ≈ 32
+      сайта**. F3.2 оказался чистой единой сессией, не многосессионным.
+    - **Решение по подходу (senior):** `#[doc(hidden)]`+`_unchecked` (как F3.1), НЕ `pub(crate)` (роутинг
+      макроса на `SystemParam::fetch` — лайфтайм-риск) и НЕ plain-fn миграция apex-input (input не покрыт
+      goldens → regression-риск; системы уже sound; макро-миграция упирается в cross-module видимость →
+      inner-module хак = не чисто). `_unchecked` на ручных AutoSystem — честный/греппабельный сигнал
+      «доступ декларирован в `type Resources`, валидирован планировщиком».
+    - **`commands()` НЕ трогали** (осознанно): deferred-аксессор (не live-`&mut` в мир), blessed-путь =
+      `Commands` param, ASD-корректность undeclared-commands ловит D8b `has_deferred`. Иной класс, чем
+      live-write resource_mut/event_writer.
+    - **⏭ Остаток F3 (опциональный polish):** миграция ручных AutoSystem-impl'ов (apex-input и др.) на
+      plain-fn/`system!`-макрос (access=параметр, mismatch-невозможен) — golden-путь, но требует
+      vis-поддержки в `system!`-макросе (сейчас генерит приватные структуры) ИЛИ inner-module. Системы
+      уже sound (декларируют доступ), поэтому это качество-кода, не soundness-блокер.
 - **D8b** (apex-core + scheduler):
   - ✅ **Increment A** (commit d76ade3): block-reserver — real, tested. `EntityReserver.with_block`/
     `block_remaining` + `EntityAllocator::reserve_block(size)` (carve contiguous block from high-water;
