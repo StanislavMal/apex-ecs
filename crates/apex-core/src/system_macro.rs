@@ -360,7 +360,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
+        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -504,7 +504,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
+        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -548,7 +548,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
+        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -688,7 +688,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query::<Self::Query>(); ],
+        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};

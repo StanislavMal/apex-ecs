@@ -523,7 +523,7 @@ fn bench_scheduler_throughput(n: usize) {
             access_desc!(read<PhysicsConfig>, write<Position>),
             |ctx| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
-                ctx.query::<Write<Position>>().for_each(|_, mut pos| { pos.x += dt; });
+                ctx.query_unchecked::<Write<Position>>().for_each(|_, mut pos| { pos.x += dt; });
             },
         ));
         sched.compile().unwrap();
@@ -1198,7 +1198,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (mut v, mut p)| {
+            ctx.query_unchecked::<(Write<Velocity>, Write<Position>)>().par_for_each(|_, (mut v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1220,7 +1220,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Temperature>>().par_for_each(|_, mut t| {
+            ctx.query_unchecked::<Write<Temperature>>().par_for_each(|_, mut t| {
                 let ambient = 20.0f32;
                 let diff    = t.0 - ambient;
                 let rate    = (diff * 0.1).tanh() * 0.05;
@@ -1239,7 +1239,7 @@ fn bench_parallel_scheduler(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<Write<Mana>>().par_for_each(|_, mut m| {
+            ctx.query_unchecked::<Write<Mana>>().par_for_each(|_, mut m| {
                 let ratio = m.current / m.max;
                 let regen = (1.0 - ratio).sqrt() * 0.5;
                 m.current = (m.current + regen).min(m.max);
@@ -1549,7 +1549,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
+            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1564,7 +1564,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
+            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1579,7 +1579,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
+            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().for_each(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1597,7 +1597,7 @@ fn bench_intra_system_parallel(n: usize) {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
+            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().par_for_each(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);

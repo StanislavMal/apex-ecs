@@ -256,10 +256,21 @@ Sync + Default + 'static` → закрытие Send+Sync на боксе, БЕЗ
 - **В3 Phase B/C** (apex-core): дать `Query`/`CachedQuery`/`Single` реальный кэш-`State` (get_param
   переиспользует резолв) + консолидация 3 query-типов в один. Перф маргинален (bonus, A/B), главная
   ценность — API. Крупный рефактор (трогает все query-usage).
-- **F3** (apex-core + движок): `ReadOnlyWorldQuery`-бинд на `ctx.query`, `pub(crate)` на mutable-
-  аксессоры; **адоптион: 23 движковых `ctx.*`-сайта (15 resource_mut / 5 query / 3 event_writer) +
-  15 AutoSystem-impl'ов** (миграция на plain-fn ЛИБО type-constrained ctx). Закрывает safe-достижимую
-  гонку. Кросс-репо.
+- **F3** (apex-core + движок):
+  - ✅ **F3.1 — query-измерение** (ветка wave6b-f3): `ReadOnlyWorldQuery`-бинд на публичный
+    `SystemContext::query`/`query_changed` (undeclared мутабельный query из safe-кода = гонка, тот же
+    класс B1(в) для `Query::new`). Декларированный (возможно мутабельный) путь — `#[doc(hidden)]
+    query_unchecked`, зовут только `SystemParam`/`system!`-макрос (access валидирован планировщиком).
+    Адоптион: макрос (4 генерации) + `QueryParam`/`CachedQuery` SystemParam + 4 тест-сайта scheduler +
+    5 тест-сайтов app.rs + 9 сайтов perf/diag-примеров → `query_unchecked`. Gate: apex-ecs workspace,
+    clippy, goldens. **Ноль нового unsafe** (тот же `from_sub_world`, лишь bind + переименование).
+  - ⏭ **F3.2 — resource/event-измерение + AutoSystem** (БОЛЬШОЙ атомарный кросс-репо): `pub(crate)`/
+    `#[doc(hidden)]` на `resource_mut`/`event_writer` (⚠ `commands()` зовёт `system!`-макрос из
+    user-крейта → не `pub(crate)`, только `#[doc(hidden)]`-shim). Адоптион — **СОТНИ** движковых сайтов
+    (apex-render: gpu_tests 166, live_harness 50, extract 11, render_isolated 16×2, prepass 16 …) +
+    миграция AutoSystem-impl'ов на plain-fn. Движок не соберётся до полной миграции → отдельная
+    многосессионная кампания, не сессионный юнит. Оценка «23 сайта» в исходном плане — драстически
+    занижена (считала подмножество). Golden-путь = миграция AutoSystem на plain-fn (access=параметр).
 - **D8b** (apex-core + scheduler):
   - ✅ **Increment A** (commit d76ade3): block-reserver — real, tested. `EntityReserver.with_block`/
     `block_remaining` + `EntityAllocator::reserve_block(size)` (carve contiguous block from high-water;

@@ -2330,20 +2330,44 @@ impl<'w> SystemContext<'w> {
         self.sub_worlds[0].world()
     }
 
+    /// Read-only query over the system's SubWorld. Requires `Q: ReadOnlyWorldQuery`
+    /// (F3): a mutable query obtained from `ctx` is UNDECLARED write access, and the
+    /// scheduler parallelizes systems by their DECLARED access — an undeclared `&mut`
+    /// is a safe-reachable data race (the exact class B1(в) closed for `Query::new`).
+    /// Declare mutable access as a system PARAMETER (`q: Query<Write<T>>` in the
+    /// signature) — the scheduler validates it and serializes conflicts — rather than
+    /// reaching for a mutable `ctx.query`.
     #[inline]
-    pub fn query<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+    pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(&self) -> CachedQuery<'_, Q> {
         // База change-detection — `last_run_tick` мира (граница прошлого кадра),
         // так `Changed<T>` внутри системы достоверен (TD-9), а не «всё подряд».
         let last_run = self.sub_worlds[0].world().last_run_tick();
-        // SAFETY: the context's SubWorlds are scheduler-vended; the system's
-        // declared access is expected to cover `Q` (see F3: this arbitrary-Q
-        // accessor leaves the public surface with the SystemParam migration).
+        // SAFETY: read-only `Q` cannot alias `&mut`; the SubWorld is scheduler-vended.
+        unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
+    }
+
+    /// Query with an ARBITRARY (possibly mutable) `Q`, WITHOUT the read-only bind.
+    ///
+    /// The caller must guarantee the system DECLARED this access, so the scheduler
+    /// serializes conflicting systems (otherwise an undeclared `&mut` races). This
+    /// holds for the declared query built by `SystemParam` / the `system!` macro —
+    /// which is the ONLY intended caller. Prefer a mutable query PARAMETER. Hidden
+    /// from docs: an internal escape, not blessed API (mirrors `Query::new_unchecked`).
+    #[doc(hidden)]
+    #[inline]
+    pub fn query_unchecked<Q: WorldQuery>(&self) -> CachedQuery<'_, Q> {
+        let last_run = self.sub_worlds[0].world().last_run_tick();
+        // SAFETY: the caller guarantees the access was declared (see doc); the
+        // context's SubWorlds are scheduler-vended under that validated access.
         unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
     #[inline]
-    pub fn query_changed<Q: WorldQuery>(&self, last_run: Tick) -> CachedQuery<'_, Q> {
-        // SAFETY: see `query` above.
+    pub fn query_changed<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(
+        &self,
+        last_run: Tick,
+    ) -> CachedQuery<'_, Q> {
+        // SAFETY: see `query` above (read-only Q).
         unsafe { CachedQuery::from_sub_world(&self.sub_worlds[0], last_run) }
     }
 
