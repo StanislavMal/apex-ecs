@@ -211,6 +211,24 @@ Per-system командные буферы (в per-system state-слоте из 
 записанные команды по захваченному `(arch_idx,row)` перед flush; eager-ссылки внутри буфера ремапятся
 (E6), с явной оговоркой про escape id в ресурс. Выбор — по результату спайка, громко в плане.
 
+### 4.4a ✅ РЕЗУЛЬТАТ СПАЙКА (2026-07-04, `apex-bench/src/bin/d8b_spike.rs`)
+
+**Схема (B) ВАЛИДИРОВАНА — фолбэк НЕ нужен.** Прототип block-reserver (private `Cell`-счётчик над
+детерминированно пред-назначенной sub-base в порядке (rank, task)) + rayon-параллельная spawn-стадия
+(6 систем × 8 tasks × 500 = 24000 entity):
+1. **Детерминизм: IDENTICAL across 40 прогонов**, id-множество плотное [0,24000) без дыр/дублей.
+   Контроль: shared-atomic (текущий `reserve()`) — позиционное присвоение id РАЗЛИЧАЕТСЯ run-to-run
+   (та самая недетерминированность, которую D8b чинит).
+2. **Перф: block 20.5x быстрее** shared-atomic `EntityReserver::reserve()` (134µs vs 2751µs) и 4.83x
+   vs даже сырой один `AtomicU32.fetch_add`. Текущий `reserve()` тяжёл: RwLock-read + `Arc::clone`
+   аренды НА КАЖДЫЙ reserve. Block (private Cell) убирает всё это → детерминизм И перф в одну сторону.
+3. **eager `.id()`**: base+counter, без remap — известен в момент reserve.
+
+**Остатки для полной имплементации (D8b step 4), НЕ блокеры feasibility:** (а) адаптивный размер
+блока/sub-block (per-task high-water прошлого кадра + slack); (б) overflow rank-ordered claim (редкий
+после прогрева); (в) детерминизм free-list reuse (аренда free-слотов блокам в порядке ранга — B2). 
+Спайк моделировал known-counts steady-state; ядро схемы (block-детерминизм+перф+eager) доказано.
+
 ---
 
 ## 5. Порядок реализации (sequencing)
