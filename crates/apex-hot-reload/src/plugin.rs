@@ -294,7 +294,7 @@ mod tests {
         let result = plugin.watch_config::<DummyConfig>(&path, &mut world);
         assert!(result.is_err(), "broken initial file should error");
         // ...but the resource was never inserted.
-        assert!(world.resources.try_get::<DummyConfig>().is_none());
+        assert!(world.try_resource::<DummyConfig>().is_none());
 
         // The path is still registered as an asset (E9a: not orphaned).
         assert_eq!(plugin.asset_count(), 1);
@@ -312,7 +312,7 @@ mod tests {
         // force_reload must succeed — the loader is present and the file valid.
         plugin.force_reload(id, &mut world).expect("reload after fix");
         assert_eq!(
-            world.resources.try_get::<DummyConfig>(),
+            world.try_resource::<DummyConfig>(),
             Some(&DummyConfig { value: 42 }),
             "fixed config was not applied"
         );

@@ -195,7 +195,7 @@ pub struct World {
     pub(crate) world_id: u64,
     pub(crate) entities: EntityAllocator,
     pub(crate) registry: ComponentRegistry,
-    pub archetypes: Vec<Archetype>,
+    pub(crate) archetypes: Vec<Archetype>,
     pub(crate) archetype_index: FxHashMap<ArchetypeKey, ArchetypeId>,
     /// Индекс компонент → список архетипов, содержащих этот компонент.
     /// Используется в Query::new_with_tick для O(1) поиска архетипов-кандидатов
@@ -210,7 +210,7 @@ pub struct World {
     pub(crate) relations: RelationRegistry,
     pub(crate) subject_index: SubjectIndex,
     pub(crate) target_index: TargetIndex,
-    pub resources: Resources,
+    pub(crate) resources: Resources,
     pub(crate) events: EventRegistry,
     /// Реестр именованных шаблонов (EntityTemplate).
     pub(crate) templates: TemplateRegistry,
@@ -833,6 +833,20 @@ impl World {
         &mut self,
     ) {
         self.resources.register_serde::<R>();
+    }
+
+    /// Snapshot every resource registered via
+    /// [`register_resource_serde`](Self::register_resource_serde) as
+    /// `(type_name, bytes)` pairs. Consumed by `WorldSerializer`.
+    pub fn snapshot_resources_serde(&self) -> Vec<(String, Vec<u8>)> {
+        self.resources.snapshot_serde()
+    }
+
+    /// Restore one resource from its serde bytes. `Ok(true)` = applied,
+    /// `Ok(false)` = type not registered for serde on this world (caller warns,
+    /// §0.2a). Consumed by `WorldSerializer`.
+    pub fn restore_resource_serde(&mut self, type_name: &str, bytes: &[u8]) -> Result<bool, String> {
+        self.resources.restore_serde(type_name, bytes)
     }
 
     #[track_caller]

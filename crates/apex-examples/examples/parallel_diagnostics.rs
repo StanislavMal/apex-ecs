@@ -263,9 +263,9 @@ fn measure_scheduler(
 }
 
 fn register_resources_and_events(world: &mut World) {
-    world.resources.insert(DeltaTime(0.016));
-    world.resources.insert(Gravity(-9.81));
-    world.resources.insert(GlobalCounter(0));
+    world.insert_resource(DeltaTime(0.016));
+    world.insert_resource(Gravity(-9.81));
+    world.insert_resource(GlobalCounter(0));
     world.add_event::<DamageEvent>();
 }
 

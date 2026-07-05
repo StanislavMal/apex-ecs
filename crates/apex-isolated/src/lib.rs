@@ -250,7 +250,7 @@ impl IsolatedWorld {
 
     /// Прочитать ресурс по типу.
     pub fn read_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
-        self.world.resources.try_get::<T>()
+        self.world.try_resource::<T>()
     }
 
     /// Отправить событие в IsolatedWorld.
@@ -416,7 +416,7 @@ pub fn sync_bridge_cloneable(world: &mut World) {
     // очереди) и отпускаем заём ресурса ДО дренажа. Входящий Action может
     // удалить/заменить ресурс CloneableBridge — заём, удержанный через
     // apply_incoming, тогда бы повис (UAF, E2). Клон делает это безопасно.
-    let bridge = match world.resources.try_get::<CloneableBridge>() {
+    let bridge = match world.try_resource::<CloneableBridge>() {
         Some(b) => b.clone(),
         None => return,
     };
@@ -501,8 +501,7 @@ mod tests {
         let mut iso = IsolatedWorld::new();
 
         iso.world_mut()
-            .resources
-            .insert::<String>("hello".to_string());
+            .insert_resource::<String>("hello".to_string());
 
         let val: Option<&String> = iso.read_resource();
         assert_eq!(val, Some(&"hello".to_string()));
@@ -677,7 +676,7 @@ mod tests {
 
         sync_bridge_cloneable(&mut world); // must not crash / UAF
         assert!(
-            world.resources.try_get::<CloneableBridge>().is_none(),
+            world.try_resource::<CloneableBridge>().is_none(),
             "the incoming Action removed the bridge resource"
         );
     }

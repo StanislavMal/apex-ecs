@@ -239,13 +239,13 @@ impl ScriptEngine {
         let binding = ResourceBinding {
             name: T::type_name_str(),
             read: |lua: &mlua::Lua, world: &World| -> mlua::Result<mlua::Value> {
-                let res = world.resources.try_get::<T>()
+                let res = world.try_resource::<T>()
                     .ok_or_else(|| mlua::Error::runtime(format!("resource '{}' not found", T::type_name_str())))?;
                 res.to_lua(lua)
             },
             write: |value: &mlua::Value, world: &mut World| -> bool {
                 if let Some(new_val) = T::from_lua(value) {
-                    world.resources.insert(new_val);
+                    world.insert_resource(new_val);
                     true
                 } else {
                     log::warn!("write_resource: не удалось конвертировать Lua value в {}", T::type_name_str());

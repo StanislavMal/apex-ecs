@@ -123,7 +123,7 @@ end
     engine.register_component::<Enemy>(&world);
     engine.register_resource::<Gravity>();
     engine.register_event::<PlayerDied>();
-    world.resources.insert(Gravity(9.8));
+    world.insert_resource(Gravity(9.8));
     world.add_event::<PlayerDied>();
     engine.load_scripts().expect("load_scripts");
 
@@ -343,12 +343,12 @@ function run()
 end
 "#);
 
-    let before_g = world.resources.try_get::<Gravity>().copied();
+    let before_g = world.try_resource::<Gravity>().copied();
     std::thread::sleep(Duration::from_millis(200));
     engine.poll_hot_reload();
     engine.run(0.016, &mut world);
     world.tick();
-    let after_g = world.resources.try_get::<Gravity>().copied();
+    let after_g = world.try_resource::<Gravity>().copied();
 
     match (before_g, after_g) {
         (Some(before), Some(after)) => {

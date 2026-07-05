@@ -210,7 +210,7 @@ fn main() {
     //   - from_sub  = main_recv    ← принимает из IsolatedWorld
     //   (исправлено: раньше каналы были перепутаны)
     let main_bridge = CloneableBridge::new(main_to_sub, main_recv);
-    world.resources.insert(main_bridge);
+    world.insert_resource(main_bridge);
 
     // Создаём изолированный мир
     let mut iso = IsolatedWorld::new();
@@ -246,7 +246,7 @@ fn main() {
     {
         println!("\n  --- send_event: сериализованное событие main → sub ---");
         // Достаём мост из ресурсов
-        let bridge = world.resources.try_get::<CloneableBridge>().unwrap();
+        let bridge = world.try_resource::<CloneableBridge>().unwrap();
         // Регистрируем тип String в IsolatedWorld
         bridge.register_event::<String>(iso.world_mut());
         // Отправляем сериализованное событие
@@ -259,7 +259,7 @@ fn main() {
     // Это просто замыкание, которое вызовет world.send_event() на той стороне.
     {
         println!("\n  --- send_action_event: действие main → sub ---");
-        let bridge = world.resources.try_get::<CloneableBridge>().unwrap();
+        let bridge = world.try_resource::<CloneableBridge>().unwrap();
         bridge.send_action_event("Action event from main!".to_string());
         println!("  ✓ send_action_event отправлено в IsolatedWorld");
     }

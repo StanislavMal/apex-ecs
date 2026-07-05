@@ -189,7 +189,7 @@ impl WorldSerializer {
         // ── Resources (E7) ─────────────────────────────────────
         // Only resources opted in via `register_resource_serde` (a world may
         // hold non-serializable resources — GPU handles etc.).
-        for (type_name, data) in world.resources.snapshot_serde() {
+        for (type_name, data) in world.snapshot_resources_serde() {
             snap.resources
                 .push(crate::snapshot::ResourceSnapshot { type_name, data });
         }
@@ -344,7 +344,7 @@ impl WorldSerializer {
 
         // ── Шаг 3: Resources (E7) ──────────────────────────────
         for res in &snapshot.resources {
-            match world.resources.restore_serde(&res.type_name, &res.data) {
+            match world.restore_resource_serde(&res.type_name, &res.data) {
                 Ok(true) => {}
                 // §0.2a: a resource in the snapshot whose type is not registered
                 // for serde on this world is silently lost otherwise.
