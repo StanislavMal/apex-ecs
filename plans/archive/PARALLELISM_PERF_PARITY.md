@@ -1,12 +1,28 @@
 # Кампания: Параллелизм AAA + перф-паритет (Bevy 0.18 / Legion 0.4)
 
-> **Статус: 🔜 план (2026-07-03).** Источник истины кампании. Статусы пунктов — ЗДЕСЬ.
-> Родитель: `plans/active/CORE_AUDIT.md` (перф-ветка; В2 packed storage — развилка §8 аудита).
-> Сосед: `plans/active/WAVE6B_SOUNDNESS_DETERMINISM.md` (В3/F3/D8b) — координация обязательна, §8.
-> Ветка (завести): `parallelism-perf` от main. Планка: `docs/CONVENTIONS.md` §0.2a (громко),
-> §0.2b (без полумер / переоценка), §0.9 (анти-mimicry — наши козыри, 1:1 только идиоматически
-> верный Rust). Эталоны: Bevy `C:\My\Projects\Rust_projects\bevy`, Legion 0.4
-> `%USERPROFILE%\.cargo\registry\src\index.crates.io-*\legion-0.4.0`.
+> **🗄 АРХИВ — кампания ЗАКРЫТА 2026-07-04.** Ветка `parallelism-perf`, смержена в main (`66ecba0`,
+> локально, не запушено). Заморожен; правки не вносить. Статусы-указатели теперь в реестрах.
+>
+> **Что сделано (Проблема 1 — параллелизм не AAA — РЕШЕНА):**
+> - **Ş1** (`080102e`) — ноль per-frame аллокаций диспетчера (scratch-пулы + `mem::take` плана):
+>   `schedule` 0.83×→0.99× vs Bevy.
+> - **Ş2** — cost-model (per-stage EMA α=0.2 + гистерезис ±20% вокруг 40µs; замеренная работа
+>   СУПЕРСЕДИТ entity-count): `schedule` →**1.37–1.45× vs Bevy, 1.12× vs Legion** (из отстающего от
+>   обоих — в обгоняющего обоих). §0.9-превосходство: cost-моделью не управляется ни Bevy, ни Legion.
+> - **Ş3** (`aadb5fd`) — relations cycle-walk skip (`is_any_target==false`): scene-graph scaling.
+> - **Ş4** — insert-путь подтверждён уже оптимальным (bulk-тики через `resize_with`) — no-op.
+>
+> **Что отложено (с обоснованием §0.2b, дом = `plans/TECH_DEBT.md`):** Ş5 dense-by-default,
+> Ş6 heavy_compute leaf-sizing, В2 packed/SoA storage, Ş2b per-system leaf sizing, `ParallelPolicy`
+> (обещанная политика/Fixed-фолбэк — НЕ реализована). Числа до/после — §11 (`sh_final`).
+>
+> **Дизайн-развилки → `decisions/ADR-003`** (Р-1 EMA / Р-2 стадии сохраняются / Р-3 rayon /
+> Р-4 change-ticks не демонтируем). Пользовательская документация авто-параллелизма →
+> `Apex_ECS_Руководство_пользователя.md` §13/§14. Родитель кампании: `plans/active/CORE_AUDIT.md`
+> «Журнал волн». Планка: `docs/CONVENTIONS.md` §0.2a/§0.2b/§0.9.
+>
+> ---
+> *(ниже — исходный план кампании, сохранён как есть для археологии)*
 
 ## 0. TL;DR
 
@@ -481,8 +497,33 @@ serial-фолбэк, гистерезис, `ParallelPolicy` (+Fixed-фолбэк
 Медианы (ns): relations 834260 vs bevy 620066 = **0.74x** (топ-сигнал, стабилен). schedule 46203
 vs 38428 = 0.83x. heavy_compute 552795 vs 455006 = 0.82x. simple_insert 331380 vs 305111 = 0.92x
 (vs legion 224084 = 0.68x). Победы целы: add_remove 1.64x, despawn_recursive 2.11x, events 1.85x,
-commands_spawn 1.16x. Полная таблица — в scratchpad `baseline_par_perf_pre.md` (продублировать сюда
-при закрытии). Релейшн-бисект (87b6e2a↔a90c752) отложен на Ш3 (старый регресс).
+commands_spawn 1.16x. Релейшн-бисект (87b6e2a↔a90c752) отложен на Ш3 (старый регресс).
+
+**Полная таблица `par_perf_pre`** (3-way, 2026-07-03, `parallelism-perf @236ffe1`; медианы ns,
+ratio = apex/reference, >1 = apex быстрее):
+
+| группа | apex ns | bevy ns | legion ns | vsBevy | vsLegion |
+|---|--:|--:|--:|--:|--:|
+| simple_insert | 331380 | 305111 | 224084 | 0.92 | 0.68 |
+| simple_iter | 8692 | 8790 | 5934 | 1.01 | 0.68 |
+| wide_iter | 3505 | 3461 | 2055 | 0.99 | 0.59 |
+| fragmented_iter | 172.5 | 128.7 | 184.2 | 0.75 | 1.07 |
+| heavy_compute | 552795 | 455006 | 391257 | 0.82 | 0.71 |
+| schedule | 46203 | 38428 | 30591 | 0.83 | 0.66 |
+| add_remove_component | 477081 | 781004 | 2463983 | 1.64 | 5.16 |
+| commands_spawn | 369036 | 426957 | — | 1.16 | — |
+| commands_insert | 468407 | 440353 | — | 0.94 | — |
+| despawn | 268240 | 270862 | 439972 | 1.01 | 1.64 |
+| despawn_recursive | 22706 | 47989 | — | 2.11 | — |
+| get_component | 31069 | 34031 | 47897 | 1.10 | 1.54 |
+| changed_iter | 6226 | 6738 | — | 1.08 | — |
+| events | 11809 | 21847 | — | 1.85 | — |
+| relations | 834260 | 620066 | — | 0.74 | — |
+| propagate | 281437 | — | — | — | — |
+
+Топ-сигналы к закрытию: relations 0.74, fragmented 0.75, heavy_compute 0.82, schedule 0.83.
+vs Legion (iter/insert 0.59–0.68) — структурная цена change detection (Ш5 dense-путь, НЕ В2 без
+доказательства). Финальный `sh_final` (после Ш1–Ш4) — ниже в этом §11.
 
 ### Ш1 — устранение per-frame аллокаций диспетчера ✅ (commit 080102e)
 `run_hybrid_parallel`/`run_stage_parallel` пересобирали буферы каждый кадр (Д3). Устранено:

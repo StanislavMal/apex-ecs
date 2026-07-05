@@ -3,15 +3,31 @@
 > **Назначение.** Полный аудит ядра ECS на соответствие «золотому пути» проекта
 > (apex-engine: CLAUDE.md, docs/CONVENTIONS.md §0.2a/§0.2b/§0.9): корректность/soundness,
 > сырые места, производительность, профессионализм. Итог — план работ волнами.
-> **Дата:** 2026-07-03. **Статус:** 🔄 в работе. Все 10 развилок §10 РЕШЕНЫ 2026-07-03
-> (критерий — золотой путь, см. §10). **Волны 0-4 ✅ СМЕРЖЕНЫ и ЗАПУШЕНЫ**. **Волна 5 ✅ ГОТОВА**
-> (перф + ложные Changed): A13 (get_mut→Mut) + split par_for_each (§7, +7%) + O(R²)→O(R) diff;
-> пулинг/ленивая-entity/bulk обоснованно отклонены, string-table отложена. Ветка `core-audit-wave5`.
-> **Волна 6 ✅** (архитектура): make_bundle/D8a/E6/E7/F7 + QueryBuilder dynamic query (read+write) +
-> **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery + `&mut World`/`new_mut` write-
-> конструкторы — soundness в типах). Ветка `core-audit-wave6`, готова к мержу.
-> **Волна 6б 🔜** (scheduler/SystemParam overhaul): В3 per-system QueryState (⚠ ROI-гейт) + F3-target
-> (ctx-ужатие) + D8b (per-system commands). Переоценка §0.2b — см. «Журнал волн».
+> **Дата аудита:** 2026-07-03. **Верификация:** 2026-07-04. **Статус: волны 0–6б ✅ ЗАКРЫТЫ.**
+> Все 10 развилок §10 РЕШЕНЫ. Волны 0–4 смержены и ЗАПУШЕНЫ; волны 5/6/6б смержены в main обоих
+> репо (НЕ запушено — пуш за пользователем). Кратко по волнам:
+> - **0–4** ✅ инфра/soundness(13🔴)/корректность(20)/panic-safety+формальный UB/громкость+мёртвый код.
+> - **5 ✅** перф + ложные Changed: A13 (get_mut→Mut), split par_for_each (§7), O(R²)→O(R) diff.
+> - **6 ✅** архитектура: make_bundle/D8a/E6/E7/F7 + QueryBuilder dynamic query (read+write) +
+>   **B1(в) borrow-модель** (UnsafeWorldCell + ReadOnlyWorldQuery + `&mut World`/`new_mut` write-
+>   конструкторы — soundness в типах на КОНСТРУКТОРАХ).
+> - **6б ✅** F3 (ctx-ужатие, ADR-002) + D8b (детерминизм спавна, ADR-001); В3 → долг C6.
+> - **Кампания PARALLELISM ✅ ЗАКРЫТА и АРХИВИРОВАНА** (2026-07-04, `plans/archive/PARALLELISM_PERF_PARITY.md`;
+>   cost-model диспетчера → `decisions/ADR-003`): schedule 0.83×→**1.45×** vs Bevy.
+>
+> **Дочерняя кампания:** `plans/active/API_GOLDEN_PATH.md` (унификация публичного API + переписывание
+> руководства, развилки Р-1..Р-5 решены 2026-07-05) — координация порядка обязательна, см. волну 7 §9
+> ниже и API §8 (правила A/B: EN-миграция + декомпозиция scheduler ПОСЛЕ API-волн; руководство — в API).
+>
+> **Остаток (не в этом плане — вынесен в реестр):** **волна 7** (EN-миграция ~95 файлов + тест-кампании
+> + декомпозиция scheduler) + весь ОТКРЫТЫЙ долг ядра → **`plans/TECH_DEBT.md`** (заведён 2026-07-04):
+> soundness-хвосты B1(в) (S1 write-аксессоры `&self`, S2 `ctx.fetch`-обход F3 — верификация 2026-07-04),
+> бездомные F4/D6-full/B5/B6/В4/§10.8, C6 query-zoo, Ş5/Ş6/В2, ParallelPolicy, F3-guide-примеры.
+>
+> **⚠ Счётчик goldens.** Записи ниже фиксируют «656/656» — это движковый golden-count НА МОМЕНТ волн
+> ядра. Он дрейфует с состоянием ДВИЖКА (кампания B9-материалов добавила/переигнорила тесты): на
+> 2026-07-04 фактически **649 passed / 0 failed / 9 ignored** байт-идентично. Дрейф — от движка, НЕ
+> регресс ядра; «656» в исторических записях не переписывается (снимок своего времени).
 
 ## Журнал волн (ход исполнения)
 
@@ -402,8 +418,22 @@ main):**
   оправдывает цену/риск. **Отслеживается как C6 query-zoo consolidation** (spike-first, если возьмём:
   сперва изолированный lifetime-спайк `Query<'w,'s>`, потом атомарная миграция). Overflow-детерминизм
   D8b — узкий фронтир по спросу (после прогрева не наступает).
-> **Итог 6б:** soundness ядра выражен В ТИПАХ целиком (B1(в) + F3); детерминизм спавна — §0.9
-> превосходство над Bevy. Остаток (В3/C6, D8b-overflow) — API-качество/фронтир, не soundness.
+> **Итог 6б:** soundness ядра выражен В ТИПАХ (B1(в)-конструкторы + F3); детерминизм спавна — §0.9
+> превосходство над Bevy. Остаток (В3/C6, D8b-overflow) — API-качество/фронтир.
+
+**Кампания PARALLELISM ✅ ЗАКРЫТА (2026-07-04; ветка `parallelism-perf`, merge `66ecba0`; ротирована в
+`plans/archive/PARALLELISM_PERF_PARITY.md`).** Проблема «параллелизм не AAA» решена: Ş1 (ноль per-frame
+аллокаций) + Ş2 (cost-model per-stage EMA — замеренная работа суперсидит entity-count) + Ş3 (relations
+cycle-skip); `schedule` из 0.83× (отставал от обоих) → **1.45× vs Bevy / 1.12× vs Legion**. Дизайн-
+развилки Р-1..Р-4 → `decisions/ADR-003`. Ş5/Ş6/В2/ParallelPolicy отложены → `plans/TECH_DEBT.md`.
+
+**Верификация волн (2026-07-04, объективный аудит кода + гейты).** Гейты чисты: workspace-тесты
+зелёные, clippy net-neutral, движок собирается, goldens 649/0 (+9 ignored) байт-идентично. Все 13🔴
+и системные §1.2 подтверждены закрытыми в типах/коде. **НО:** (1) B1(в) закрыла soundness на
+КОНСТРУКТОРАХ, аксессоры остались лазейкой (S1: `Query/CachedQuery::get/get_mut/iter` берут `&self` →
+алиасящий `&mut` из safe-кода, PoC); (2) F3 обходится `ctx.fetch` (S2); (3) ряд пунктов реестра
+(F4/D6-full/B5/B6/В4/§10.8/D9/§1.4-хвосты) числились, но не сделаны и не имели «дома». **Всё вынесено
+в `plans/TECH_DEBT.md`** (заведён тем же заходом; S1/S2 — приоритет «первым заходом»).
 
 ## 0. TL;DR
 
@@ -892,7 +922,7 @@ version-путь; IsolatedWorld: Entity-ремаппинг, bounded-каналы
 отложен до волны 3 из-за блокера linkme↔Miri, см. Журнал волн). Мусор удалён, план в репо,
 Miri установлен.
 
-**Волна 1 — SOUNDNESS: достижимый UB из safe-кода (P0; S/M-фиксы).**
+**Волна 1 ✅ — SOUNDNESS: достижимый UB из safe-кода (P0; S/M-фиксы).**
 A1 dup-bundle → panic+dedup · B1 арена-align · B3 zeroed-ZST assert · B2 stale-lease
 (+`cmds.clear()` в планировщике) · B4 template Arc · C1 SubWorld лайфтаймы · B8 insert_raw
 size-assert · E1(Lua _meta валидация) · E2 (Clone-bridge) · D10 SystemBuilder лайфтайм ·
@@ -902,7 +932,7 @@ borrow-чекером — там полная детекция write-write+write
 *Гейт: новые регресс-тесты на каждый пункт (вкл. Miri на арену/dup-bundle), полный сьют,
 clippy net-neutral, criterion+frag_world без регресса, goldens движка байт-идентичны.*
 
-**Волна 2 — КОРРЕКТНОСТЬ поведения (P0/P1).**
+**Волна 2 ✅ — КОРРЕКТНОСТЬ поведения (P0/P1).**
 D1 FixedUpdate-старвация · D2+F3 пустой access/Ctx → single-task+full-access · F1 lag-ветка
 Events · F2+F4 курсор-per-system · B9+C4+C5 ChildOf EXCLUSIVE + анти-цикл + reparent-dirty ·
 D9+D4 единый исполнитель стадии + recompute индексов · D5 explicit-порядок для симметричных ·
@@ -912,7 +942,7 @@ F7 Scriptable tuple/enum · E10 Lua id c generation.
 *Гейт: тесты на каждый пункт (вкл. «сегодня упадут»: две FixedUpdate-системы, цикл ChildOf,
 lag-reader); примеры ядра 14/14 до конца; goldens движка.*
 
-**Волна 3 — PANIC-SAFETY + формальный UB (P1).**
+**Волна 3 ✅ — PANIC-SAFETY + формальный UB (P1).**
 A6 drop-guard spawn-путей · A8 swap_remove порядок · A2 TickCell(UnsafeCell) · A3 Resources
 UnsafeCell · D3 ASD без алиасящихся &mut · F5 EventIterator (по вердикту Miri) · B-Н17 арена
 panic-guard · **В1(б) runtime borrow-флаги per-ComponentId (debug-режим)** — инструмент,
@@ -922,7 +952,7 @@ panic-guard · **В1(б) runtime borrow-флаги per-ComponentId (debug-реж
 `World`. Гейт: Miri-smoke становится ОБЯЗАТЕЛЬНЫМ гейтом коммита ядра (расширенный сьют:
 query/dense/transform/events/commands); goldens движка.*
 
-**Волна 4 — §0.2a ГРОМКОСТЬ + мёртвый код (P2).**
+**Волна 4 ✅ — §0.2a ГРОМКОСТЬ + мёртвый код (P2).**
 Warn-волна: B7/B10/A9/A10/E8/E12(bincode-drop)/S15/S23/D-«молчаливые» — единый стиль
 (throttled `log::warn` с entity/типом и причиной). Мёртвое (решения §10.3/§10.5): удалить
 SparseSet, row-split 5.7 (prepare_sub_worlds/make_sub_world/storage), assign_masks+
@@ -933,7 +963,7 @@ prefab expect→Result, атомарная запись сейвов, верси
 allow(missing_safety_doc) → точечные SAFETY-доки.
 *Гейт: clippy строже (снятые allow), сьют, grep-чек «молчаливых no-op» по чек-листу аудита.*
 
-**Волна 5 — ПЕРФ (P2; каждый пункт с A/B в одном прогоне).**
+**Волна 5 ✅ — ПЕРФ (P2; каждый пункт с A/B в одном прогоне).**
 Восстановление split-par_for_each (§7) · пулинг буферов планировщика + кэш метаданных стадий ·
 ленивая entity в par · B-Н16 bulk без двойного копирования · A13 get_mut→Mut (ложные Changed
 — тоже перф) · string-table снапшота (E-S21) · O(R²) диффы.
@@ -961,14 +991,19 @@ query (read+write)** · **B1(в) borrow-модель** (UnsafeWorldCell + ReadOn
 goldens; руководство актуализировано.*
 
 **Волна 7 — EN-МИГРАЦИЯ + ТЕСТ-КАМПАНИЯ + ДОКИ (P3/P4).**
-Кириллица ≈6.3k строк: (1) user-facing литералы (compile_error!/panic/expect/log) — сразу;
-(2) rustdoc/комментарии по-крейтово (core→scheduler→остальные), механические коммиты в
-.git-blame-ignore-revs. Тест-дыры по реестрам агентов (scripting с нуля; isolated
-кросс-поточные + живые ассерты; serialization round-trip relations/error-path/fuzz;
-hot-reload watcher; events lag/threads; макро trybuild; par-пути core). Декомпозиция
-scheduler/lib.rs. Rustdoc-полировка + CHANGELOG. Руководство пользователя ядра — сверка
-после всех волн.
-*Гейт: grep-ноль кириллицы в *.rs (решено: да, §10.2); tests count↑; руководство компилируется.*
+⚠ **ПОРЯДОК (координация с `plans/active/API_GOLDEN_PATH.md` §8, правила A/B):** EN-миграция rustdoc/
+комментариев и декомпозиция `scheduler/lib.rs` идут **ПОСЛЕ API-волн 1–4** — перевод/сплит должны
+касаться ФИНАЛЬНЫХ имён и структуры (после naming-sweep и C6), иначе делается дважды. Переписывание
+руководства пользователя — **НЕ здесь**, а в API-волне 5 (один раз, супер­седит прежний пункт «сверка
+руководства после всех волн»).
+Кириллица ≈6.3k строк: (1) user-facing литералы (compile_error!/panic/expect/log) — можно сразу
+(не блокируются API-порядком); (2) rustdoc/комментарии по-крейтово (core→scheduler→остальные),
+механические коммиты в .git-blame-ignore-revs — ПОСЛЕ API-волн. Тест-дыры по реестрам агентов
+(scripting с нуля; isolated кросс-поточные + живые ассерты; serialization round-trip relations/
+error-path/fuzz; hot-reload watcher; events lag/threads; макро trybuild; par-пути core) — от
+API-порядка НЕ зависят, можно вести параллельно. Декомпозиция scheduler/lib.rs (после API-волны 3).
+Rustdoc-полировка + CHANGELOG.
+*Гейт: grep-ноль кириллицы в *.rs (решено: да, §10.2); tests count↑.*
 
 ---
 
