@@ -107,7 +107,7 @@ impl SystemConfig {
 
 impl SystemConfig {
     /// AutoSystem (включает `system!` struct).
-    pub fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
+    pub(crate) fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
         let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses());
@@ -134,7 +134,7 @@ impl SystemConfig {
     }
 
     /// Sequential система.
-    pub fn seq<F>(name: impl Into<String>, f: F) -> Self
+    pub(crate) fn seq<F>(name: impl Into<String>, f: F) -> Self
     where
         F: FnMut(&mut apex_core::world::World) + Send + 'static,
     {
@@ -203,7 +203,7 @@ impl SystemConfig {
     }
 
     /// Параллельное замыкание (без доступа к компонентам).
-    pub fn par<F>(name: impl Into<String>, f: F) -> Self
+    pub(crate) fn par<F>(name: impl Into<String>, f: F) -> Self
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
@@ -225,7 +225,7 @@ impl SystemConfig {
     }
 
     /// Параллельное замыкание с явным AccessDescriptor.
-    pub fn par_access<F>(name: impl Into<String>, access: AccessDescriptor, f: F) -> Self
+    pub(crate) fn par_access<F>(name: impl Into<String>, access: AccessDescriptor, f: F) -> Self
     where
         F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
     {
