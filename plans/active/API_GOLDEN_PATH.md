@@ -378,6 +378,26 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
 EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс с Severity/контекстом (§0.2a
 системно — вместо разрозненных warn_once там, где уместна политика уровня приложения).
 
+> **⚠ Разведка F4 (2026-07-05, для следующего захода):** `Events<T>` глубоко завязан на
+> **registry-cursor** модель (`cursors: Vec<Option<u32>>` + `lagging_count`-инвариант + adaptive
+> `update()` (сохраняет события отстающих читателей) + `free_list` + RAII read-guards, мутирующие
+> курсор на drop). Планировщик СЕРИАЛИЗУЕТ двух читателей одного события
+> (`ConflictKind::SharedEventReaders`, F2) — именно потому, что чтение мутирует общий реестр.
+> **Две версии F4:**
+> - **(A) «дёшево», plan-scope:** персистентный registry-курсор в State-слоте (`Listen<E>::State =
+>   EventReaderState<E>`, get_param переиспользует курсор, EventReader НЕ remove на Drop). Чинит
+>   баг дублей (FixedUpdate катчап + ложь rustdoc `Removed<T>`). НО: только golden-path (plain-fn);
+>   AutoSystem/`system!` зовут `ctx.event_reader` (свежий курсор) — останутся; и НЕ снимает
+>   SharedEventReaders-сериализацию. = §0.2b-полумера.
+> - **(B) Bevy-паритет (ПРАВИЛЬНО, превосходство):** локальный курсор (`last_event_count` в State),
+>   **immutable-read** → параллельные читатели одного события (снять SharedEventReaders = обгон),
+>   закрытие S3/S4. Требует **переписывания буферизации `Events`** (монотонный счётчик + двойной
+>   буфер с start-count по-Bevy) + редизайн read-guards + миграция ВСЕХ EventReader-консумеров +
+>   standalone `world.event_reader()` + сериализатор. Широкий blast-radius, soundness-критично (Miri
+>   TB + goldens). = отдельная фокус-сессия, НЕ хвост. Юзер хочет «на совесть» → делать (B), но своим
+>   заходом. Файлы: `events.rs` (Events/update/read-guards), `system_param.rs:477` (Listen State),
+>   `world.rs:941/2465` (event_reader), scheduler `lib.rs:3747` (SharedEventReaders — удалить).
+
 **Волна 5 — Руководство** (после стабилизации API): переписывание под целевую структуру §3 —
 quick start, перенумерация, справочник в конец (+полнота: query_mut-семейство, DynQuery, set_
 deterministic_spawn, register_resource_serde/map_entities, v2/migrate), вычистка 52 шифров и
@@ -397,9 +417,27 @@ App API → в док движка, брендинг **ApexForge_ECS** (Р-2), �
   компилируются (deprecation-варнинг в сниппете = провал). Делается ПОСЛЕ волны P (руководство
   документирует финальный канон без алиасов), иначе — переписывать дважды.
 
-**Волна 6 — Relations-полировка** (козырь до образца): targets_of/target_of (ренейм ✅ волна 3),
-EntityRef-сахар, `children![]`-аналог, типизированный iter_relations, индексы pub(crate). Витринная
-глава руководства.
+**Волна 6 — Relations-полировка (козырь до образца). 🔶 БОЛЬШАЯ ЧАСТЬ СДЕЛАНА (2026-07-05).**
+- targets_of/target_of (ренейм ✅ волна 3); индексы SubjectIndex/TargetIndex → pub(crate) ✅ (было).
+- **✅ Р-4 честная лестница аксессоров (ecs `0e5e707`):** тип назывался `EntityRef`, но держал
+  `&mut World` (= full accessor). Переименован в `EntityWorldMut`; заведён read-only `EntityRef`
+  (`&World`: get/has_relation/**target_of/targets_of любого kind** — навигации по произвольным
+  relations у entity-аксессора Bevy НЕТ); `World::entity`(read)/`entity_mut`(full)/`get_entity`/
+  `get_entity_mut`. Прямой ренейм без deprecation-шима (ноль внешних вызовов `World::entity` в обоих
+  репо). `EntityMut` (component-mut без структурных, как QueryData с disjoint) — отдельная будущая фича.
+- **✅ EntityWorldMut immediate hierarchy sugar (в `0e5e707`):** set_parent/add_child/add_children/
+  remove_parent/clear_children/with_children (immediate-зеркало EntityCommands; §1.9 gap — сахар был
+  только на Commands).
+- **✅ S8 relation-термы в QueryBuilder (ecs `881c625`):** динамические запросы фильтруют по
+  RELATIONS (`with_relation`/`with_any_relation`/`without_relation`, read+write) — per-entity пост-фильтр
+  по subject-индексу; резолв kind read-only (unregistered → REQUIRED пусто / ABSENCE trivially-true, §0.2a).
+  Превосходство: типизированный запрос так не умеет в runtime, у Bevy dynamic builder этого нет. Для
+  редактора/скриптов/IPC.
+- **⏳ Остаток — маргинальный/mimicry:** `children![]`-аналог (у нас уже есть `with_children` — closure-
+  форма чище макроса; §0.9 анти-mimicry: не копировать макрос ради паритета) и типизированный
+  `iter_relations` (raw `(u32,u32,Entity)` легитимно нужен сериализации — 2 консумера; per-entity
+  типизир. навигация уже покрыта `EntityRef::targets_of`). Оба — низкий приоритет, кандидаты на
+  «закрыть с §0.9-обоснованием». Витринная глава руководства — волна 5.
 
 **Волна P — пре-публикационная чистка deprecated-поверхности (ПОСЛЕ волн 3–6, ДО первого релиза
 crates.io).** ОДНИМ проходом снести ВСЕ `#[deprecated]`-алиасы, накопленные ренеймами кампании.
