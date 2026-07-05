@@ -462,8 +462,19 @@ App API → в док движка, брендинг **ApexForge_ECS** (Р-2), �
 аксессоре + S8 dynamic relation-запросы) сделана; маргиналии закрыты §0.9-обоснованием. Витринная
 глава руководства — в волне 5.
 
-**Волна P — пре-публикационная чистка deprecated-поверхности (ПОСЛЕ волн 3–6, ДО первого релиза
-crates.io).** ОДНИМ проходом снести ВСЕ `#[deprecated]`-алиасы, накопленные ренеймами кампании.
+**Волна P — ✅ ЗАКРЫТА (2026-07-05, ecs `75c9b68`).** ОДНИМ проходом снесены ВСЕ 9 `#[deprecated]`-
+алиасов кампании + парные `#[doc(alias)]`: `insert_raw_pub`→`insert_dyn`; `children_of`→`targets_of` и
+`get_relation_target`→`target_of` (World+SystemContext+RelationRegistry); `spawn_from_template`→
+`spawn_template_with` (World+Commands); `Ref<T>` (semantic-trap); `Scheduler::par_for_each_used_by_name`→
+`SystemConfig::par_for_each_used()`. Заодно снесён осиротевший приватный `Scheduler::par_for_each_used(id)`
+(§0.2a). Верифицирован ноль реальных вызовов в ОБОИХ репо перед сносом (только гайд .md=волна 5 и archive-
+планы). CHANGELOG обновлён (финальный канон + migration-заметка). Гейт: `grep #[deprecated] crates`=пусто;
+workspace tests + clippy net-neutral + движок check --all-targets + goldens 649/0/9 byte-identical. **Резерв
+crates.io имён вынесен в отдельный план `plans/active/CRATES_IO_RESERVATION.md`** (делаем после полировки
+всех волн; момент — за пользователем). Историческая формулировка задачи ниже.
+
+**[архив формулировки] Волна P — пре-публикационная чистка deprecated-поверхности (ПОСЛЕ волн 3–6, ДО
+первого релиза crates.io).** ОДНИМ проходом снести ВСЕ `#[deprecated]`-алиасы, накопленные ренеймами кампании.
 Ключевой нюанс: ядро **не опубликовано**, а все внутренние вызовы уже мигрированы на новые имена ⇒
 алиасы никого не защищают, удаляются **напрямую, без major-bump** (deprecation-цикл §CONVENTIONS-3 — это
 пост-публикационная дисциплина; до релиза алиас = transitional-мусор). Делать ОДНИМ финальным коммитом,
