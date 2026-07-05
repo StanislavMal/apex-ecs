@@ -508,12 +508,12 @@ impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
 pub struct QueryParam<Q: WorldQuery>(PhantomData<Q>);
 
 impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
-    type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    type Item<'w> = crate::query::Query<'w, 'w, Q>;
     type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access()
     }
-    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::world::CachedQuery<'w, Q> {
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q> {
         // `query_unchecked`: `Q` may be mutable (`Write<T>`), which is sound here —
         // this IS the declared parameter, so the scheduler validated the access and
         // serializes conflicts (F3). The public `ctx.query` is read-only-bound.
@@ -581,17 +581,17 @@ impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
     }
 }
 
-impl<'a, Q, F> SystemParam for crate::query::Query<'a, Q, F>
+impl<'a, 's, Q, F> SystemParam for crate::query::Query<'a, 's, Q, F>
 where
     Q: WorldQuery + WorldQuerySystemAccess,
     F: WorldQuery + WorldQuerySystemAccess,
 {
-    type Item<'w> = crate::query::Query<'w, Q, F>;
+    type Item<'w> = crate::query::Query<'w, 'w, Q, F>;
     type State = ();
     fn access() -> AccessDescriptor {
         Q::system_access().merge(&F::system_access())
     }
-    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, Q, F> {
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q, F> {
         // База Changed/Added — last_run_tick мира (граница прошлого кадра),
         // как у ctx.query() (TD-9).
         let sub = &ctx.sub_worlds[0];
@@ -618,11 +618,11 @@ where
         // `iter_mut` (not `iter`): the shape may be a write query, which no longer
         // satisfies the `&self` read-only iterator bound (S1 part 2). The local
         // owns `q`, so the exclusive borrow is trivially available.
-        let mut q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        let mut q = <crate::query::Query<'_, '_, Q, F> as SystemParam>::fetch(ctx);
         q.iter_mut().take(2).count() == 1
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
-        let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);
+        let q = <crate::query::Query<'w, 'w, Q, F> as SystemParam>::fetch(ctx);
         match q.single_inner() {
             Ok((entity, item)) => crate::query::Single {
                 entity,
@@ -652,11 +652,11 @@ where
     }
     fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
         // `iter_mut`: see the `Single` impl above — the shape may be a write query.
-        let mut q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        let mut q = <crate::query::Query<'_, '_, Q, F> as SystemParam>::fetch(ctx);
         q.iter_mut().take(2).count() <= 1
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
-        let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);
+        let q = <crate::query::Query<'w, 'w, Q, F> as SystemParam>::fetch(ctx);
         match q.single_inner() {
             Ok((entity, item)) => Some(crate::query::Single {
                 entity,
@@ -668,20 +668,6 @@ where
                 "Option<Single<…>>: больше одного матча ({e:?});                  системы пропускаются планировщиком"
             ),
         }
-    }
-}
-
-impl<'a, Q: WorldQuery + WorldQuerySystemAccess> SystemParam for crate::world::CachedQuery<'a, Q> {
-    type Item<'w> = crate::world::CachedQuery<'w, Q>;
-    type State = ();
-    fn access() -> AccessDescriptor {
-        Q::system_access()
-    }
-    fn fetch<'w>(
-        ctx: &'w crate::world::SystemContext<'w>,
-    ) -> crate::world::CachedQuery<'w, Q> {
-        // Declared query parameter ⇒ `query_unchecked` (F3): access is validated.
-        ctx.query_unchecked::<Q>()
     }
 }
 
@@ -945,17 +931,17 @@ pub struct Extract<P>(PhantomData<P>);
 impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> SystemParam
     for Extract<QueryParam<Q>>
 {
-    type Item<'w> = crate::world::CachedQuery<'w, Q>;
+    type Item<'w> = crate::query::Query<'w, 'w, Q>;
     type State = ();
 
     fn access() -> AccessDescriptor {
         Q::system_access()
     }
 
-    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::world::CachedQuery<'w, Q> {
+    fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q> {
         let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
         // Res.0 is &'w MainWorld; MainWorld.world() borrows and returns &'w World
-        crate::world::CachedQuery::new(mw.0.world(), crate::component::Tick(0))
+        crate::query::Query::from_world_cached(mw.0.world(), crate::component::Tick(0))
     }
 }
 

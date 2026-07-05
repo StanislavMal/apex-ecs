@@ -1,5 +1,4 @@
 use crate::{
-    entity::Entity,
     system_param::{EventReader, EventWriter, Res, ResMut},
     World,
 };
@@ -149,9 +148,13 @@ impl<'w> SubWorld<'w> {
 
     // ── Public API ──────────────────────────────
 
+    /// The underlying world, at the full `'w` lifetime (the raw pointer is valid
+    /// for the SubWorld's whole lifetime). Returning `&'w World` — rather than the
+    /// shorter `&self` borrow — lets [`Query::from_sub_world`](crate::query::Query::from_sub_world)
+    /// keep the world borrow (`'w`) independent of the state borrow (`'s`).
     #[inline]
-    pub fn world(&self) -> &World {
-        self.world_ref()
+    pub fn world(&self) -> &'w World {
+        unsafe { &*self.world }
     }
 
     #[inline]
@@ -222,130 +225,6 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    // ── Row-level parallel API ──────────────────
-
-    #[inline]
-    fn arch_row_range(&self, arch_idx: usize) -> Option<(usize, usize)> {
-        self.row_ranges_slice().iter().find_map(
-            |&(a, s, e)| {
-                if a == arch_idx {
-                    Some((s, e))
-                } else {
-                    None
-                }
-            },
-        )
-    }
-
-    /// Последовательная итерация по всем entity в этом SubWorld.
-    #[inline]
-    pub fn for_each_entity<F: FnMut(Entity)>(&self, mut f: F) {
-        let w = self.world_ref();
-        for &arch_idx in self.archetype_indices_slice() {
-            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-            let entities = arch.entities();
-            if let Some((start, end)) = self.arch_row_range(arch_idx) {
-                for row in start..end.min(entities.len()) {
-                    f(entities[row]);
-                }
-            } else {
-                for &entity in entities {
-                    f(entity);
-                }
-            }
-        }
-    }
-
-    /// Параллельная итерация по всем entity в этом SubWorld.
-    pub fn par_for_each_entity<F: Fn(Entity) + Send + Sync>(&self, f: F) {
-        use crate::par_utils::compute_par_chunks;
-        use rayon::prelude::*;
-
-        let num_threads = rayon::current_num_threads();
-        let w = self.world_ref();
-        let chunks = compute_par_chunks(
-            self.archetype_indices_slice().iter().map(|&arch_idx| {
-                let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-                if let Some((start, end)) = self.arch_row_range(arch_idx) {
-                    let len = end.min(arch.len()).saturating_sub(start);
-                    (arch_idx, len)
-                } else {
-                    (arch_idx, arch.len())
-                }
-            }),
-            num_threads,
-            w.chunk_config(),
-        );
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let w = self.world_ref();
-            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-            let entities = arch.entities();
-            // Чанки считаются в координатах ДИАПАЗОНА (0..len) — переводим в
-            // глобальные строки архетипа смещением r_start (W3-4: раньше
-            // смещение терялось и сплит-задача ходила по чужим строкам).
-            let (r_start, r_end) = self.arch_row_range(arch_idx).unwrap_or((0, usize::MAX));
-            let row_start = r_start + start;
-            let row_end = (r_start + end).min(r_end).min(entities.len());
-            for row in row_start..row_end {
-                f(entities[row]);
-            }
-        });
-    }
-
-    /// Последовательная итерация по строкам архетипов SubWorld.
-    #[inline]
-    pub fn for_each_row<F: FnMut(Entity, usize)>(&self, mut f: F) {
-        let w = self.world_ref();
-        for &arch_idx in self.archetype_indices_slice() {
-            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-            let entities = arch.entities();
-            if let Some((start, end)) = self.arch_row_range(arch_idx) {
-                for row in start..end.min(arch.len()) {
-                    f(entities[row], row);
-                }
-            } else {
-                for row in 0..arch.len() {
-                    f(entities[row], row);
-                }
-            }
-        }
-    }
-
-    /// Параллельная итерация по строкам архетипов SubWorld.
-    pub fn par_for_each_row<F: Fn(Entity, usize) + Send + Sync>(&self, f: F) {
-        use crate::par_utils::compute_par_chunks;
-        use rayon::prelude::*;
-
-        let num_threads = rayon::current_num_threads();
-        let w = self.world_ref();
-        let chunks = compute_par_chunks(
-            self.archetype_indices_slice().iter().map(|&arch_idx| {
-                let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-                if let Some((start, end)) = self.arch_row_range(arch_idx) {
-                    let len = end.min(arch.len()).saturating_sub(start);
-                    (arch_idx, len)
-                } else {
-                    (arch_idx, arch.len())
-                }
-            }),
-            num_threads,
-            w.chunk_config(),
-        );
-
-        chunks.par_iter().for_each(|&(arch_idx, start, end)| {
-            let w = self.world_ref();
-            let arch = unsafe { &*w.archetype_ptr(arch_idx) };
-            let entities = arch.entities();
-            // См. par_for_each_entity: чанк → глобальные строки через r_start.
-            let (r_start, r_end) = self.arch_row_range(arch_idx).unwrap_or((0, usize::MAX));
-            let row_start = r_start + start;
-            let row_end = (r_start + end).min(r_end).min(entities.len());
-            for row in row_start..row_end {
-                f(entities[row], row);
-            }
-        });
-    }
 }
 
 unsafe impl Send for SubWorld<'_> {}

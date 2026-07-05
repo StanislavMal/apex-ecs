@@ -6163,7 +6163,7 @@ mod tests {
     /// Имя системы выводится из имени функции (D2-1/U.4).
     #[test]
     fn plain_fn_name_derived_from_fn() {
-        fn my_special_system(_q: apex_core::query::Query<'_, Read<Pos>>) {}
+        fn my_special_system(_q: apex_core::query::Query<'_, '_, Read<Pos>>) {}
         let cfg = SystemConfig::fn_sys(my_special_system);
         assert_eq!(cfg.name, "my_special_system");
     }
@@ -6172,13 +6172,13 @@ mod tests {
     /// (параллельный батч), с пересекающимся — конфликтуют.
     #[test]
     fn plain_fn_access_inferred_for_conflicts() {
-        fn writes_pos(mut q: apex_core::query::Query<'_, Write<Pos>>) {
+        fn writes_pos(mut q: apex_core::query::Query<'_, '_, Write<Pos>>) {
             q.for_each_mut(|_, mut p| p.x += 1.0);
         }
-        fn writes_vel(mut q: apex_core::query::Query<'_, Write<Vel>>) {
+        fn writes_vel(mut q: apex_core::query::Query<'_, '_, Write<Vel>>) {
             q.for_each_mut(|_, mut v| v.x += 1.0);
         }
-        fn reads_pos(q: apex_core::query::Query<'_, Read<Pos>>) {
+        fn reads_pos(q: apex_core::query::Query<'_, '_, Read<Pos>>) {
             q.for_each(|_, _| {});
         }
 

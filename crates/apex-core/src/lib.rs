@@ -75,8 +75,8 @@ pub use linkme; // re-exported for #[derive(Component)] macro
 pub use dense::DenseQuery;
 pub use query::{
     Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
-    DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QuerySingleError,
-    Read, ReadOnlyWorldQuery, Ref, With, Without, WorldQuery, Write,
+    DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QueryIter,
+    QuerySingleError, Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
 };
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
@@ -89,9 +89,7 @@ pub use system_param::{
 };
 pub use transform::IndexStamp;
 pub use unsafe_world_cell::UnsafeWorldCell;
-pub use world::{
-    ArchetypeStats, Bundle, CachedQuery, ParallelWorld, QueryState, SystemContext, World,
-};
+pub use world::{ArchetypeStats, Bundle, ParallelWorld, QueryState, SystemContext, World};
 
 /// Шорткат `Default::default()` для struct-update-литералов (Bevy-идиома):
 /// `PbrMaterial { roughness: 0.5, ..default() }` вместо `..Default::default()`.
@@ -116,7 +114,7 @@ pub mod prelude {
     pub use crate::query::{
         Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
         DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut,
-        QuerySingleError, Read, ReadOnlyWorldQuery, Ref, Single, With, Without, WorldQuery, Write,
+        QuerySingleError, Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
     };
     pub use crate::unsafe_world_cell::UnsafeWorldCell;
     pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
@@ -128,7 +126,7 @@ pub mod prelude {
         WorldQuerySystemAccess,
     };
     pub use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
-    pub use crate::world::{Bundle, CachedQuery, QueryState, SystemContext, World};
+    pub use crate::world::{Bundle, QueryState, SystemContext, World};
     pub use crate::BundleDerive as Bundle;
     pub use crate::Component;
 }

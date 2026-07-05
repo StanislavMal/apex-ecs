@@ -357,7 +357,15 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
 
 // ── Bevy-подобные алиасы и `&T`/`&mut T` синтаксис (C3) ─────────
 
-/// Алиас `Read<T>` — для совместимости стиля (`Ref<T>` ≡ `Read<T>`).
+/// Deprecated alias of [`Read<T>`]. This is a semantic trap: in Bevy `Ref<T>`
+/// means a *read reference with change detection* (a distinct type), whereas here
+/// it is merely a synonym for `Read<T>` and carries no change-detection semantics.
+/// Use `&T` / [`Read<T>`] for plain reads; the `Ref<T>` name is reserved for a
+/// future real change-detection read type (Bevy parity).
+#[deprecated(
+    since = "0.1.0",
+    note = "use `&T` or `Read<T>`; `Ref<T>` is reserved for a future change-detection read type"
+)]
 pub type Ref<T> = Read<T>;
 
 // ── ReadOnlyWorldQuery ─────────────────────────────────────────
@@ -1305,29 +1313,55 @@ impl_archetype_filter_tuple!(A, B, C, D, E, F);
 impl_archetype_filter_tuple!(A, B, C, D, E, F, G);
 impl_archetype_filter_tuple!(A, B, C, D, E, F, G, H);
 
-// ── ArchState ──────────────────────────────────────────────────
+// ── Query<'w, 's, D, F = ()> — the single view (C6) ────────────
+//
+// One query type over a lazy per-archetype fetch machine: collapses the former
+// `Query` (inline-owned), `CachedQuery` (Arc-cache) and the view half of
+// `QueryState` (borrowed) into ONE type. The matched-archetype list comes from
+// [`StateSrc`] ({Owned | Shared | Borrowed}); component data always lives in the
+// archetype columns (their own allocations), so a single method set serves all
+// three sources. The public signature carries TWO lifetime parameters (`'w` —
+// the world borrow, `'s` — the state borrow), like Bevy `Query<'w, 's>`: today
+// they coincide on every construction path, but they are split up front so the
+// signature is stable before crates.io publication and forward-compatible with a
+// future borrowed-`QueryState` fast path (`'s` outliving `'w`) without a major
+// version bump.
+//
+// Read/write split (S1): the `&self` accessors (`iter`/`for_each`/`par_*`/
+// `*_chunk`/`get`/`single`) require a read-only projection of the shape
+// ([`ReadOnlyWorldQuery`]) — otherwise two scoped threads sharing `&q` (the type
+// is `Sync`) could each obtain `&mut` to the same row (a data race from safe
+// code). Write shapes go through the `&mut self` `*_mut` variants: the exclusive
+// borrow proves the query is not shared.
 
-pub(crate) struct ArchState<S> {
-    pub arch_idx: usize,
-    pub state: S,
-    pub len: usize,
+/// Source of the matched-archetype list for [`Query`]:
+/// - `Owned` — computed in place (ad-hoc `Query::new`), inline up to 8, no heap;
+/// - `Shared` — from the global `QueryCache` (`World::query`), a shared `Arc`;
+/// - `Borrowed` — borrowed from [`QueryState`]/`SubWorld` (per-system, zero-copy).
+enum StateSrc<'s> {
+    Owned(smallvec::SmallVec<[usize; 8]>),
+    Shared(std::sync::Arc<[usize]>),
+    Borrowed(&'s [usize]),
 }
 
-// ── Query<Q, F = ()> ───────────────────────────────────────────
+impl<'s> StateSrc<'s> {
+    #[inline]
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            StateSrc::Owned(v) => v,
+            StateSrc::Shared(a) => a,
+            StateSrc::Borrowed(s) => s,
+        }
+    }
+}
 
-/// Запрос по компонентам. Вторым параметром принимает ФИЛЬТР (D2-2,
-/// Bevy-форма): `Query<(&A, &mut B), (With<C>, Changed<A>)>` — данные и
-/// фильтрация разнесены, item фильтра не попадает в выдачу. По умолчанию
-/// `F = ()` — единый кортеж остаётся как вторая форма
-/// (`Query<(Read<A>, With<C>)>` эквивалентен).
 /// C2: reject a query shape that borrows the same component's data mutably
 /// more than once (`(&mut T, &mut T)`) or both mutably and immutably
 /// (`(&T, &mut T)`, `(Read<T>, Write<T>)`). Such a shape would hand out
 /// aliasing references to one row on every iteration — undefined behavior
 /// reachable from entirely safe code. Mirrors Bevy, which panics on the same
 /// shapes. Runs once at construction over the (typically ≤ 8) declared
-/// accesses, so the cost is negligible. Shared by every query construction
-/// path (`Query`, `CachedQuery`).
+/// accesses, so the cost is negligible. Shared by every query construction path.
 pub(crate) fn assert_no_self_alias<S: WorldQuery>(world: &World) {
     let mut access: smallvec::SmallVec<[(ComponentId, bool); 8]> = smallvec::SmallVec::new();
     S::fill_data_access(world, &mut access);
@@ -1358,69 +1392,79 @@ pub(crate) fn assert_no_self_alias<S: WorldQuery>(world: &World) {
     }
 }
 
-pub struct Query<'w, Q: WorldQuery, F: WorldQuery = ()> {
+/// A component query. The second parameter is the FILTER (Bevy form):
+/// `Query<(&A, &mut B), (With<C>, Changed<A>)>` — data and filtering are split,
+/// the filter's item is not yielded. `F` defaults to `()`; the single-tuple form
+/// stays valid too (`Query<(Read<A>, With<C>)>` is equivalent).
+///
+/// The shape `(D, F)` runs in a single pass: `matches_archetype` is the AND of
+/// both, and the filter's `fetch_item` is dropped on output (leaving `D::Item`).
+pub struct Query<'w, 's, D: WorldQuery, F: WorldQuery = ()> {
     world: &'w World,
-    /// Inline до 8 архетипов (D2-1): типичный системный запрос матчит 1-5
-    /// архетипов — конструктор без heap-аллокации (plain-fn `Query`-параметр
-    /// строится на КАЖДЫЙ вызов системы).
-    ///
-    /// Состояние — ПАРЫ `(Q, F)`: data и filter исполняются одним проходом
-    /// (matches = AND, fetch_item фильтра отбрасывается на выдаче).
-    archetypes: smallvec::SmallVec<[ArchState<<(Q, F) as WorldQuery>::State>; 8]>,
-    #[allow(dead_code)]
+    arch: StateSrc<'s>,
+    /// Component ids of the shape `(D, F)` in `fill_ids` order — inline up to 8,
+    /// no heap.
+    ids: smallvec::SmallVec<[ComponentId; 8]>,
     last_run: Tick,
-    /// Ограничения строк для row-level splits.
-    /// Если не пусто — итерация ограничена `(arch_idx, start, end)`.
-    row_ranges: &'w [(usize, usize, usize)],
+    /// Row restrictions (SubWorld row-level splits): `(arch_idx, start, end)`.
+    row_ranges: &'s [(usize, usize, usize)],
+    /// `true` if every index in `arch` has ALREADY passed `matches_archetype`
+    /// (`Owned`/`Shared`/`QueryState`: the list is an exact match). `from_sub_world`
+    /// sets `false`: the scheduler's indices are a superset, so filter while
+    /// iterating.
+    match_verified: bool,
+    _phantom: std::marker::PhantomData<fn() -> (D, F)>,
 }
 
-impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
-    /// Read-only query over a shared world borrow.
+impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
+    // ── Constructors (ad-hoc owned; see also World::query / QueryState) ──
+
+    /// Read-only ad-hoc query over a shared world borrow.
     ///
     /// Write shapes (`Write<T>`, `&mut T`, `MaybeWrite<T>`) do not satisfy
-    /// [`ReadOnlyWorldQuery`]: construct those with [`Query::new_mut`]
-    /// (exclusive borrow proves no aliasing), or receive the query from the
-    /// scheduler as a system parameter — cross-system exclusivity is
-    /// validated there from declared accesses.
+    /// [`ReadOnlyWorldQuery`]: construct those with [`Query::new_mut`] (the
+    /// exclusive borrow proves no aliasing), or receive the query from the
+    /// scheduler as a system parameter — cross-system exclusivity is validated
+    /// there from the declared access.
     pub fn new(world: &'w World) -> Self
     where
-        Q: ReadOnlyWorldQuery,
+        D: ReadOnlyWorldQuery,
         F: ReadOnlyWorldQuery,
     {
-        Self::build(world, Tick::ZERO)
+        Self::build_owned(world, Tick::ZERO)
     }
 
-    /// Read-only query with an explicit change-detection base tick.
+    /// [`Query::new`] with an explicit change-detection base tick.
     pub fn new_with_tick(world: &'w World, last_run: Tick) -> Self
     where
-        Q: ReadOnlyWorldQuery,
+        D: ReadOnlyWorldQuery,
         F: ReadOnlyWorldQuery,
     {
-        Self::build(world, last_run)
+        Self::build_owned(world, last_run)
     }
 
     /// Any-shape query (including writes) over an exclusive world borrow.
     /// The `&mut World` receiver proves no other world view is live, so the
     /// yielded `Mut<T>` items cannot alias anything.
     pub fn new_mut(world: &'w mut World) -> Self {
-        Self::build(world, Tick::ZERO)
+        Self::build_owned(world, Tick::ZERO)
     }
 
     /// [`Query::new_mut`] with an explicit change-detection base tick.
     pub fn new_mut_with_tick(world: &'w mut World, last_run: Tick) -> Self {
-        Self::build(world, last_run)
+        Self::build_owned(world, last_run)
     }
 
     /// Any-shape query through the unsafe world escape.
     ///
     /// # Safety
-    /// For the lifetime of the query the declared component access must not
-    /// alias any other live access to the same world: components this shape
-    /// writes are accessed by no other view, components it reads — by no
-    /// mutable view. The scheduler upholds this for systems by validating
-    /// the declared accesses of everything that runs concurrently.
+    /// For the lifetime of the query the declared component access must not alias
+    /// any other live access to the same world: components this shape writes are
+    /// accessed by no other view, components it reads — by no mutable view. The
+    /// scheduler upholds this for systems by validating the declared accesses of
+    /// everything that runs concurrently.
     pub unsafe fn new_unchecked(world: UnsafeWorldCell<'w>) -> Self {
-        Self::build(world.world(), Tick::ZERO)
+        Self::build_owned(world.world(), Tick::ZERO)
     }
 
     /// [`Query::new_unchecked`] with an explicit change-detection base tick.
@@ -1428,136 +1472,54 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// # Safety
     /// Same contract as [`Query::new_unchecked`].
     pub unsafe fn new_unchecked_with_tick(world: UnsafeWorldCell<'w>, last_run: Tick) -> Self {
-        Self::build(world.world(), last_run)
+        Self::build_owned(world.world(), last_run)
     }
 
-    /// C2: см. [`assert_no_self_alias`] — проверяется форма `(Q, F)` целиком.
+    /// C2: see [`assert_no_self_alias`] — checks the whole `(D, F)` shape.
+    #[inline]
     fn assert_no_self_alias(world: &World) {
-        assert_no_self_alias::<(Q, F)>(world);
+        assert_no_self_alias::<(D, F)>(world);
     }
 
-    /// Создать Query с ограничением на архетипы и строки из SubWorld.
-    ///
-    /// Использует `sub.archetype_indices` для фильтрации архетипов
-    /// и `sub.row_ranges` для ограничения строк (row-level splits).
-    ///
-    /// # Safety
-    /// The `SubWorld` must have been vended by the scheduler for a system
-    /// whose declared access covers this query's shape, and no access that
-    /// conflicts with it may run concurrently (the scheduler validates this
-    /// from declared accesses; row ranges keep same-system splits disjoint).
-    pub unsafe fn from_sub_world(sub: &'w SubWorld<'w>, last_run: Tick) -> Self {
-        let mut q = Self::new_within_archetypes(sub.world(), sub.archetype_indices(), last_run);
-        q.row_ranges = sub.row_ranges();
-        q
-    }
-
-    /// Создать Query, перебирающий только указанные архетипы.
-    /// Используется из from_sub_world для сканирования archetype_indices SubWorld.
-    fn new_within_archetypes(world: &'w World, arch_indices: &[usize], last_run: Tick) -> Self {
+    /// Shared inline path (ad-hoc `Query::new*`): computes matching archetypes in
+    /// place, without the global cache (no lock, no shared state — suitable for a
+    /// read-only `&World`). Candidates are narrowed through `component_arch_index`
+    /// only on a large world (a linear scan is cheaper on a small one).
+    fn build_owned(world: &'w World, last_run: Tick) -> Self {
         Self::assert_no_self_alias(world);
         let mut ids = IdBuf::new();
-        <(Q, F)>::fill_ids(world, &mut ids);
+        <(D, F)>::fill_ids(world, &mut ids);
         debug_assert_eq!(
             ids.len(),
-            <(Q, F)>::component_count(),
-            "инвариант fill_ids нарушен"
+            <(D, F)>::component_count(),
+            "fill_ids invariant violated"
         );
 
-        // Without-семантика целиком в matches_archetype (Without::matches_archetype
-        // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
+        // Without semantics live entirely in matches_archetype (Without checks the
+        // absence itself), so no separate exclude mask is needed (CR-M4).
         let arch_filter = |arch_idx: usize| -> bool {
             let arch = &world.archetypes[arch_idx];
-            !arch.is_empty() && <(Q, F)>::matches_archetype(arch, &ids)
+            !arch.is_empty() && <(D, F)>::matches_archetype(arch, &ids)
         };
 
-        let archetypes: smallvec::SmallVec<[ArchState<<(Q, F) as WorldQuery>::State>; 8]> =
-            arch_indices
-                .iter()
-                .copied()
-                .filter(|&arch_idx| arch_filter(arch_idx))
-                .map(|arch_idx| {
-                    let state = unsafe {
-                        <(Q, F)>::fetch_state(
-                            &world.archetypes[arch_idx],
-                            &ids,
-                            last_run,
-                            world.current_tick(),
-                        )
-                    };
-                    ArchState {
-                        arch_idx,
-                        state,
-                        len: world.archetypes[arch_idx].len(),
-                    }
-                })
-                .collect();
-
-        Self {
-            world,
-            archetypes,
-            last_run,
-            row_ranges: &[],
-        }
-    }
-
-    /// Shared construction path. Callers prove access exclusivity for write
-    /// shapes (see the public constructors above); the shared `&'w World`
-    /// here is a view for metadata and column pointers only.
-    fn build(world: &'w World, last_run: Tick) -> Self {
-        Self::assert_no_self_alias(world);
-        let mut ids = IdBuf::new();
-        <(Q, F)>::fill_ids(world, &mut ids);
-        debug_assert_eq!(
-            ids.len(),
-            <(Q, F)>::component_count(),
-            "инвариант fill_ids нарушен"
-        );
-
-        // Without-семантика целиком в matches_archetype (Without::matches_archetype
-        // проверяет отсутствие сам) — отдельная exclude-маска не нужна (CR-M4).
-        let arch_filter = |arch_idx: usize| -> bool {
-            let arch = &world.archetypes[arch_idx];
-            !arch.is_empty() && <(Q, F)>::matches_archetype(arch, &ids)
-        };
-
-        // Порог линейного обхода: на малых мирах сканировать все архетипы
-        // дешевле, чем ходить в component_arch_index (hash-lookup на компонент).
+        // Linear-scan threshold: on a small world scanning every archetype is
+        // cheaper than a component_arch_index hash-lookup per component.
         const LINEAR_SCAN_MAX_ARCHETYPES: usize = 128;
 
-        let archetypes = {
-            // Обязательные компоненты (без Maybe/Without) — источник кандидатов.
-            // Считаются ТОЛЬКО на большом мире: на малом (типичный случай)
-            // линейный обход не требует ни прохода реестра, ни аллокации.
+        let indices: smallvec::SmallVec<[usize; 8]> = {
             let mut required_ids = IdBuf::new();
             if world.archetypes.len() > LINEAR_SCAN_MAX_ARCHETYPES {
-                <(Q, F)>::fill_required_ids(world, &mut required_ids);
+                <(D, F)>::fill_required_ids(world, &mut required_ids);
             }
 
             if required_ids.is_empty() {
-                // Линейный обход: мир мал ЛИБО запрос без обязательных
-                // компонентов (Without-only / Maybe-only / пустой) — такие
-                // матчат почти всё, кандидат-индекс не сузит.
-                world
-                    .archetypes
-                    .iter()
-                    .enumerate()
-                    .filter(|&(arch_idx, _arch)| arch_filter(arch_idx))
-                    .map(|(arch_idx, arch)| {
-                        let state =
-                            unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
-                        ArchState {
-                            arch_idx,
-                            state,
-                            len: arch.len(),
-                        }
-                    })
+                // Linear scan: the world is small OR the query has no required
+                // components (Without-only / Maybe-only / empty).
+                (0..world.archetypes.len())
+                    .filter(|&arch_idx| arch_filter(arch_idx))
                     .collect()
             } else {
-                // Кандидаты = архетипы САМОГО РЕДКОГО обязательного компонента
-                // из component_arch_index: O(кандидатов), не O(всех архетипов).
-                // Отсутствие записи в индексе = компонент не встречается ни в
-                // одном архетипе → запрос заведомо пуст (кандидатов нет).
+                // Candidates = archetypes of the rarest required component.
                 let mut candidates: &[crate::archetype::ArchetypeId] = &[];
                 let mut best = usize::MAX;
                 for id in &required_ids {
@@ -1571,34 +1533,106 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                         candidates = list;
                     }
                 }
-
                 candidates
                     .iter()
                     .map(|id| id.0 as usize)
                     .filter(|&arch_idx| arch_filter(arch_idx))
-                    .map(|arch_idx| {
-                        let arch = &world.archetypes[arch_idx];
-                        let state =
-                            unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, world.current_tick()) };
-                        ArchState {
-                            arch_idx,
-                            state,
-                            len: arch.len(),
-                        }
-                    })
                     .collect()
             }
         };
 
         Self {
             world,
-            archetypes,
+            arch: StateSrc::Owned(indices),
+            ids,
             last_run,
             row_ranges: &[],
+            match_verified: true,
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Получить диапазон строк для архетипа, если есть row_ranges.
+    /// Cached path (`World::query`/`query_mut`): the archetype list comes from the
+    /// incremental global [`QueryCache`] (a shared `Arc`). Single registry pass —
+    /// the cache key carries both the ids and the shape roles.
+    pub(crate) fn from_world_cached(world: &'w World, last_run: Tick) -> Self {
+        Self::assert_no_self_alias(world);
+        let mut key: smallvec::SmallVec<[u64; 8]> = smallvec::SmallVec::new();
+        <(D, F)>::fill_cache_key(world, &mut key);
+        let ids: smallvec::SmallVec<[ComponentId; 8]> = key
+            .iter()
+            .filter(|&&e| e & KEY_MARKER_BIT == 0)
+            .map(|&e| ComponentId(e as u32))
+            .collect();
+        debug_assert_eq!(
+            ids.len(),
+            <(D, F)>::component_count(),
+            "fill_cache_key invariant violated"
+        );
+
+        let arch_indices = world
+            .query_cache
+            .get_or_compute(&key, &world.archetypes, |arch| {
+                <(D, F)>::matches_archetype(arch, &ids)
+            });
+
+        Self {
+            world,
+            arch: StateSrc::Shared(arch_indices),
+            ids,
+            last_run,
+            row_ranges: &[],
+            match_verified: true, // get_or_compute filtered by matches_archetype
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Query over the archetypes/rows of a SubWorld (the scheduler's transport).
+    ///
+    /// Zero-alloc: the archetype indices are BORROWED from the SubWorld
+    /// (precomputed per system by the scheduler). The indices are a superset;
+    /// filtering by `matches_archetype` happens while iterating
+    /// (`match_verified == false`).
+    ///
+    /// # Safety
+    /// The `SubWorld` must have been vended by the scheduler for a system whose
+    /// declared access covers this query's shape, and no conflicting access may
+    /// run concurrently (row ranges keep same-system splits disjoint).
+    pub unsafe fn from_sub_world(sub: &'s SubWorld<'w>, last_run: Tick) -> Self {
+        Self::assert_no_self_alias(sub.world());
+        let mut ids = IdBuf::new();
+        <(D, F)>::fill_ids(sub.world(), &mut ids);
+        Self {
+            world: sub.world(),
+            arch: StateSrc::Borrowed(sub.archetype_indices()),
+            ids,
+            last_run,
+            row_ranges: sub.row_ranges(),
+            match_verified: false, // scheduler indices are a superset
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Internal constructor for [`QueryState`]: borrows the state's ready-made
+    /// indices and ids — zero allocations, zero locks.
+    pub(crate) fn from_state_parts(
+        world: &'w World,
+        arch_indices: &'s [usize],
+        ids: &[ComponentId],
+        last_run: Tick,
+    ) -> Self {
+        Self {
+            world,
+            arch: StateSrc::Borrowed(arch_indices),
+            ids: ids.iter().copied().collect(),
+            last_run,
+            row_ranges: &[],
+            match_verified: true, // QueryState.update filtered by matches_archetype
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
     fn row_range(&self, arch_idx: usize) -> (usize, usize) {
         self.row_ranges
             .iter()
@@ -1606,33 +1640,41 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             .unwrap_or((0, usize::MAX))
     }
 
-    /// Shared iteration core (no read-only bound): builds the lazy iterator over
-    /// the matched archetypes. Private — the public `&self` entry
-    /// [`iter`](Self::iter) adds the [`ReadOnlyWorldQuery`] bound, the `&mut self`
-    /// entry [`iter_mut`](Self::iter_mut) proves exclusivity. Internal callers
-    /// that only count rows (`len`/`is_empty`/`single_impl`) go through this
-    /// directly (single-threaded, transient `Mut` never escapes).
+    // ── Iteration ─────────────────────────────────────────────────
+
+    /// Lazy iterator (no read-only bound) over the matched archetypes, tied to the
+    /// `&self` borrow. Private: the public [`iter`](Self::iter) (`&self`, read-only
+    /// bound) / [`iter_mut`](Self::iter_mut) (`&mut self`, exclusive) add the
+    /// aliasing discipline. Internal counters (`len`/`is_empty`) go through here.
     #[inline]
-    fn iter_raw(&self) -> QueryIter<'_, Q, F> {
+    fn iter_raw(&self) -> QueryIter<'_, D, F> {
         QueryIter {
-            archetypes: &self.archetypes,
-            arch_cursor: 0,
-            row_cursor: 0,
+            world: self.world,
+            arch_indices: self.arch.as_slice(),
+            ids: &self.ids,
+            last_run: self.last_run,
             row_ranges: self.row_ranges,
+            match_verified: self.match_verified,
+            arch_pos: 0,
+            row: 0,
+            row_end: 0,
+            state: None,
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Read-only iterator over the query items (П1: entity — через форму
-    /// `Query<(Entity, …)>`, как в Bevy).
+    /// Read-only iterator over the query items (entity — via the shape
+    /// `Query<(Entity, …)>`, as in Bevy).
     ///
     /// Requires a read-only shape: a shared `&self` iterator over a write shape
     /// would hand out `Mut<T>`, and because a query is `Sync` two scoped threads
     /// sharing `&q` could each obtain `&mut` to the same row — a data race from
-    /// safe code (S1 part 2). Write shapes iterate via [`iter_mut`](Self::iter_mut)
+    /// safe code (S1). Write shapes iterate via [`iter_mut`](Self::iter_mut)
     /// (`&mut self` proves the query is not shared).
-    pub fn iter(&self) -> QueryIter<'_, Q, F>
+    #[inline]
+    pub fn iter(&self) -> QueryIter<'_, D, F>
     where
-        Q: ReadOnlyWorldQuery,
+        D: ReadOnlyWorldQuery,
         F: ReadOnlyWorldQuery,
     {
         self.iter_raw()
@@ -1641,69 +1683,52 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// Iterator yielding `Mut<T>` for write shapes. `&mut self` proves the query
     /// is not shared, so the yielded mutable items cannot alias across threads.
     #[inline]
-    pub fn iter_mut(&mut self) -> QueryIter<'_, Q, F> {
+    pub fn iter_mut(&mut self) -> QueryIter<'_, D, F> {
         self.iter_raw()
     }
 
-    /// Item конкретной entity, если она матчит запрос (П3, Bevy-паритет
-    /// `Query::get`). O(1) по location + поиск архетипа среди матчащих
-    /// (их единицы); построчные фильтры (`Changed`/`Added` в Q или F)
-    /// применяются — не прошедшая фильтр entity даёт `None`.
-    /// Read-only формы: item на `&self`. Write-формы — [`get_mut`](Self::get_mut):
-    /// `q.get(e)` дважды на write-форме дало бы ДВА `Mut<T>` на одну строку
-    /// (aliasing из safe-кода, S1) — `ReadOnlyWorldQuery`-бинд это запрещает,
-    /// мутабельный доступ идёт только через `&mut self`.
-    pub fn get(&self, entity: Entity) -> Option<Q::Item<'_>>
-    where
-        Q: ReadOnlyWorldQuery,
-    {
-        self.get_impl(entity)
-    }
-
-    /// Item конкретной entity для мутабельных форм. `&mut self` доказывает
-    /// эксклюзивность — второго живого item на ту же строку быть не может.
     #[inline]
-    pub fn get_mut(&mut self, entity: Entity) -> Option<Q::Item<'_>> {
-        self.get_impl(entity)
-    }
-
-    #[inline]
-    fn get_impl(&self, entity: Entity) -> Option<Q::Item<'_>> {
+    fn get_impl(&self, entity: Entity) -> Option<D::Item<'_>> {
         let loc = self.world.entities.get_location(entity)?;
         let arch_idx = loc.archetype_id.as_usize();
-        let a = self.archetypes.iter().find(|a| a.arch_idx == arch_idx)?;
-        let row = loc.row as usize;
-        let (r_start, r_end) = self.row_range(arch_idx);
-        if row < r_start || row >= r_end.min(a.len) {
+        if !self.arch.as_slice().contains(&arch_idx) {
             return None;
         }
-        unsafe { <(Q, F)>::fetch_item(a.state, row) }.map(|(item, _)| item)
+        let arch = &self.world.archetypes[arch_idx];
+        if !self.match_verified && !<(D, F)>::matches_archetype(arch, &self.ids) {
+            return None;
+        }
+        let row = loc.row as usize;
+        let (r_start, r_end) = self.row_range(arch_idx);
+        if row < r_start || row >= r_end.min(arch.len()) {
+            return None;
+        }
+        let state =
+            unsafe { <(D, F)>::fetch_state(arch, &self.ids, self.last_run, self.world.current_tick()) };
+        unsafe { <(D, F)>::fetch_item(state, row) }.map(|(item, _)| item)
     }
 
-    /// Ровно одна матчащаяся entity (Bevy-паритет, D2-2).
-    ///
-    /// `Err(QuerySingleError)` при нуле или нескольких. Выдаёт `Q::Item`
-    /// (как Bevy); нужна entity — включите её в запрос:
-    /// `Query<(Entity, &Hp)>` (П1). Работает и для мутабельных форм (item
-    /// `Write<T>` — это `Mut<T>`), поэтому отдельного `&mut self`-варианта
-    /// не требуется; [`single_mut`](Self::single_mut) — алиас для привычки
-    /// мигранта.
-    pub fn single(&self) -> Result<Q::Item<'_>, QuerySingleError>
+    /// Item of a specific entity, if it matches the query (Bevy parity
+    /// `Query::get`). Read-only shapes: item on `&self`. Write shapes —
+    /// [`get_mut`](Self::get_mut): calling `q.get(e)` twice on a write shape would
+    /// yield TWO `Mut<T>` to the same row (aliasing from safe code, S1).
+    #[inline]
+    pub fn get(&self, entity: Entity) -> Option<D::Item<'_>>
     where
-        Q: ReadOnlyWorldQuery,
+        D: ReadOnlyWorldQuery,
     {
-        self.single_impl()
+        self.get_impl(entity)
     }
 
-    /// [`single`](Self::single) для мутабельных форм (`&mut self` эксклюзивен —
-    /// повторный вызов невозможен, второго `Mut` на ту же строку не будет).
+    /// Item of a specific entity for mutable shapes. `&mut self` proves
+    /// exclusivity — there cannot be a second live item on the same row.
     #[inline]
-    pub fn single_mut(&mut self) -> Result<Q::Item<'_>, QuerySingleError> {
-        self.single_impl()
+    pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
+        self.get_impl(entity)
     }
 
     #[inline]
-    fn single_impl(&self) -> Result<Q::Item<'_>, QuerySingleError> {
+    fn single_impl(&self) -> Result<D::Item<'_>, QuerySingleError> {
         let mut it = self.iter_raw();
         let first = it.next().ok_or(QuerySingleError::NoEntities)?;
         if it.next().is_some() {
@@ -1712,24 +1737,51 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         Ok(first)
     }
 
-    /// Потребляющая форма [`single`](Self::single): item живёт `'w` (мировой
-    /// заём), а не заём `&self` — нужна `Single<Q>`-параметру систем (Э5),
-    /// который кладёт извлечённый item в поле и переживает локальный Query.
-    pub fn single_inner(self) -> Result<(Entity, Q::Item<'w>), QuerySingleError> {
-        let mut found: Option<(Entity, Q::Item<'w>)> = None;
-        for a in &self.archetypes {
-            let (row_start, row_end) = self.row_range(a.arch_idx);
-            let end = row_end.min(a.len);
+    /// Exactly one matching entity (Bevy parity). `Err(QuerySingleError)` on zero
+    /// or several. Yields `D::Item`; if you need the entity, include it in the
+    /// query: `Query<(Entity, &Hp)>`. Read-only shape (`&self`); write —
+    /// [`single_mut`](Self::single_mut).
+    #[inline]
+    pub fn single(&self) -> Result<D::Item<'_>, QuerySingleError>
+    where
+        D: ReadOnlyWorldQuery,
+    {
+        self.single_impl()
+    }
+
+    /// [`single`](Self::single) for mutable shapes (`&mut self` is exclusive — no
+    /// second `Mut` to the same row).
+    #[inline]
+    pub fn single_mut(&mut self) -> Result<D::Item<'_>, QuerySingleError> {
+        self.single_impl()
+    }
+
+    /// Consuming form of [`single`](Self::single): the item lives for `'w` (the
+    /// world borrow), not the `&self` borrow — needed by the `Single<D>` system
+    /// parameter, which stores the extracted item in a field that outlives the
+    /// local query.
+    pub fn single_inner(self) -> Result<(Entity, D::Item<'w>), QuerySingleError> {
+        let ids = &self.ids;
+        let this_run = self.world.current_tick();
+        let mut found: Option<(Entity, D::Item<'w>)> = None;
+        for &arch_idx in self.arch.as_slice() {
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() || (!self.match_verified && !<(D, F)>::matches_archetype(arch, ids)) {
+                continue;
+            }
+            let (row_start, row_end) = self.row_range(arch_idx);
+            let end = row_end.min(arch.len());
             if end <= row_start {
                 continue;
             }
-            let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
+            // SAFETY: the state holds column pointers valid for the whole world
+            // borrow 'w; `self` is consumed, so no further access through this
+            // Query is possible (the same aliasing discipline as iter()).
+            let state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
+            let entities = &arch.entities[row_start..end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = row_start + offset;
-                // SAFETY: state хранит указатели колонок, действительные весь
-                // мировой заём 'w; self потребляется — повторного доступа через
-                // этот Query не будет (та же дисциплина алиасинга, что у iter()).
-                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
                     if found.is_some() {
                         return Err(QuerySingleError::MultipleEntities);
                     }
@@ -1740,133 +1792,121 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         found.ok_or(QuerySingleError::NoEntities)
     }
 
-    /// Read-only `for_each` — see [`iter`](Self::iter) for why the shared-borrow
-    /// entry requires a read-only shape. Write shapes use
-    /// [`for_each_mut`](Self::for_each_mut).
     #[inline]
-    pub fn for_each<Func: FnMut(Entity, Q::Item<'_>)>(&self, f: Func)
-    where
-        Q: ReadOnlyWorldQuery,
-        F: ReadOnlyWorldQuery,
-    {
-        self.for_each_raw(f);
-    }
-
-    /// `for_each` yielding `Mut<T>` for write shapes; `&mut self` proves the
-    /// query is not shared across threads.
-    #[inline]
-    pub fn for_each_mut<Func: FnMut(Entity, Q::Item<'_>)>(&mut self, f: Func) {
-        self.for_each_raw(f);
-    }
-
-    #[inline]
-    fn for_each_raw<Func: FnMut(Entity, Q::Item<'_>)>(&self, mut f: Func) {
-        for a in &self.archetypes {
-            let (row_start, row_end) = self.row_range(a.arch_idx);
-            let end = row_end.min(a.len);
+    fn for_each_raw<Func: FnMut(Entity, D::Item<'_>)>(&self, mut f: Func) {
+        let ids = &self.ids;
+        debug_assert_eq!(ids.len(), <(D, F)>::component_count(), "fill_ids invariant violated");
+        let this_run = self.world.current_tick();
+        for &arch_idx in self.arch.as_slice() {
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() {
+                continue;
+            }
+            if !self.match_verified && !<(D, F)>::matches_archetype(arch, ids) {
+                continue;
+            }
+            let state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
+            let (row_start, row_end) = self.row_range(arch_idx);
+            let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
             if len == 0 {
                 continue;
             }
-            let entities = &self.world.archetypes[a.arch_idx].entities[row_start..end];
-            if <(Q, F)>::has_row_filter() {
-                // Построчный фильтр: entity грузим ЛЕНИВО — только для прошедших строк
-                // (см. CachedQuery::for_each в world.rs).
+            let entities = &arch.entities[row_start..end];
+            if <(D, F)>::has_row_filter() {
+                // Row-level filter: load the entity LAZILY — only for passing rows.
                 for offset in 0..len {
                     let row = row_start + offset;
-                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+                    if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
                         f(entities[offset], item);
                     }
                 }
             } else {
-                // Архетип-уровневая форма: плотный цикл без Option-ветки (§3.1A).
+                // Archetype-level shape: dense loop without the Option branch (§3.1A).
                 for offset in 0..len {
-                    let (item, _) = unsafe { <(Q, F)>::fetch_item_unchecked(a.state, row_start + offset) };
+                    let (item, _) =
+                        unsafe { <(D, F)>::fetch_item_unchecked(state, row_start + offset) };
                     f(entities[offset], item);
                 }
             }
         }
     }
 
-    /// Параллельная итерация через adaptive-split (wave 5, §7) — единый механизм
-    /// с [`CachedQuery::par_for_each`](crate::world::CachedQuery::par_for_each):
-    /// рекурсивный `rayon::join` поперёк архетипов. Порядок недетерминирован.
-    ///
-    /// Read-only shape only (see [`iter`](Self::iter)); write shapes use
-    /// [`par_for_each_mut`](Self::par_for_each_mut).
-    pub fn par_for_each<Func>(&self, f: Func)
+    /// Read-only `for_each` — see [`iter`](Self::iter) for the read-only bound.
+    /// Write shapes: [`for_each_mut`](Self::for_each_mut).
+    #[inline]
+    pub fn for_each<Func: FnMut(Entity, D::Item<'_>)>(&self, f: Func)
     where
-        Q: ReadOnlyWorldQuery + Send,
-        F: ReadOnlyWorldQuery + Send,
-        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
+        D: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
     {
-        self.par_for_each_raw(f);
+        self.for_each_raw(f);
     }
 
-    /// Параллельная итерация с `Mut<T>` для write-форм; `&mut self` доказывает
-    /// эксклюзивность (запрос не расшарен между потоками, каждый leaf получает
-    /// непересекающийся диапазон строк).
-    pub fn par_for_each_mut<Func>(&mut self, f: Func)
-    where
-        Q: Send,
-        F: Send,
-        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
-    {
-        self.par_for_each_raw(f);
+    /// `for_each` yielding `Mut<T>` for write shapes; `&mut self` proves
+    /// exclusivity.
+    #[inline]
+    pub fn for_each_mut<Func: FnMut(Entity, D::Item<'_>)>(&mut self, f: Func) {
+        self.for_each_raw(f);
     }
 
     fn par_for_each_raw<Func>(&self, f: Func)
     where
-        Q: Send,
+        D: Send,
         F: Send,
-        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
+        Func: Fn(Entity, D::Item<'_>) + Send + Sync,
     {
+        let ids = self.ids.clone();
+        let world = self.world;
+        let last_run = self.last_run;
+        let this_run = world.current_tick();
         let num_threads = rayon::current_num_threads();
-        let mut ids = IdBuf::new();
-        <(Q, F)>::fill_ids(self.world, &mut ids);
         let row_ranges = self.row_ranges;
+        let match_verified = self.match_verified;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges
                 .iter()
                 .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
                 .unwrap_or((0, usize::MAX))
         };
-        let last_run = self.last_run;
-        let world = self.world;
-        let this_run = world.current_tick();
-        // Absolute disjoint (arch, start, end) row ranges honoring row_ranges.
+        // Flat disjoint (arch, start, end) row ranges — one per matched archetype.
         let items: smallvec::SmallVec<[(usize, usize, usize); 32]> = self
-            .archetypes
+            .arch
+            .as_slice()
             .iter()
+            .copied()
+            .filter(|&a| !world.archetypes[a].is_empty())
+            .filter(|&a| match_verified || <(D, F)>::matches_archetype(&world.archetypes[a], &ids))
             .filter_map(|a| {
-                let (s, e) = rr(a.arch_idx);
+                let (s, e) = rr(a);
                 let start = s;
-                let end = e.min(a.len);
+                let end = e.min(world.archetypes[a].len());
                 if start >= end {
                     None
                 } else {
-                    Some((a.arch_idx, start, end))
+                    Some((a, start, end))
                 }
             })
             .collect();
         let total: usize = items.iter().map(|&(_, s, e)| e - s).sum();
         let threshold = crate::world::adaptive_chunk_size(total, num_threads, world.chunk_config());
         // SAFETY: each leaf gets a disjoint row range of a matched archetype, so
-        // `&mut` access never aliases across the parallel `join`.
+        // `&mut` access never aliases across the parallel `join`; `ids` is the
+        // query id list.
         let process = |arch_idx: usize, start: usize, end: usize| {
             let arch = &world.archetypes[arch_idx];
-            let state = unsafe { <(Q, F)>::fetch_state(arch, &ids, last_run, this_run) };
+            let state = unsafe { <(D, F)>::fetch_state(arch, &ids, last_run, this_run) };
             let entities = &arch.entities[start..end];
-            if <(Q, F)>::has_row_filter() {
+            if <(D, F)>::has_row_filter() {
                 for (offset, &entity) in entities.iter().enumerate() {
-                    if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(state, start + offset) } {
+                    if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, start + offset) } {
                         f(entity, item);
                     }
                 }
             } else {
                 for (offset, &entity) in entities.iter().enumerate() {
                     let (item, _) =
-                        unsafe { <(Q, F)>::fetch_item_unchecked(state, start + offset) };
+                        unsafe { <(D, F)>::fetch_item_unchecked(state, start + offset) };
                     f(entity, item);
                 }
             }
@@ -1874,119 +1914,126 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         crate::par_utils::par_split_run_ranges(&items, threshold, &process);
     }
 
-    /// Число матчей запроса.
+    /// Parallel iteration via an adaptive split (recursive `rayon::join` across
+    /// archetypes). Order is nondeterministic. Read-only shape (see
+    /// [`iter`](Self::iter)); write shapes — [`par_for_each_mut`](Self::par_for_each_mut).
+    pub fn par_for_each<Func>(&self, f: Func)
+    where
+        D: ReadOnlyWorldQuery + Send,
+        F: ReadOnlyWorldQuery + Send,
+        Func: Fn(Entity, D::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    /// Parallel iteration with `Mut<T>` for write shapes; `&mut self` proves
+    /// exclusivity (each leaf gets a disjoint row range).
+    pub fn par_for_each_mut<Func>(&mut self, f: Func)
+    where
+        D: Send,
+        F: Send,
+        Func: Fn(Entity, D::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    /// Number of query matches.
     ///
-    /// A12: раньше суммировались ПОЛНЫЕ длины архетипов, что завышало счёт для
-    /// SubWorld-запросов (row_ranges ограничивают строки) и построчных фильтров
-    /// (`Changed`/`Added`/`Or` пропускают часть строк). Fast-path (нет
-    /// row_ranges И нет построчного фильтра) точен по сумме длин; иначе считаем
-    /// фактические матчи (`iter().count()`, как Bevy).
+    /// Fast path (match_verified, no row_ranges, no row-level filter) is exact by
+    /// summing lengths; otherwise count the actual matches (`iter().count()`).
     pub fn len(&self) -> usize {
-        if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
-            return self.archetypes.iter().map(|a| a.len).sum();
+        if self.match_verified && self.row_ranges.is_empty() && !<(D, F)>::has_row_filter() {
+            return self
+                .arch
+                .as_slice()
+                .iter()
+                .map(|&i| self.world.archetypes[i].len())
+                .sum();
         }
         self.iter_raw().count()
     }
 
     pub fn is_empty(&self) -> bool {
-        if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
-            return self.archetypes.iter().all(|a| a.len == 0);
+        if self.match_verified && self.row_ranges.is_empty() && !<(D, F)>::has_row_filter() {
+            return self
+                .arch
+                .as_slice()
+                .iter()
+                .all(|&i| self.world.archetypes[i].is_empty());
         }
         self.iter_raw().next().is_none()
     }
 
-    /// Плотная (chunk) итерация (W2-0.5): колбэк получает entities-слайс и
-    /// СЛАЙСЫ колонок архетипа целиком — без per-row `fetch_item`. Доступна
-    /// только не-фильтрующим формам ([`DenseQuery`]); `Changed<T>` не
-    /// компилируется (построчный фильтр несовместим со слайсами).
-    ///
-    /// Write-колонки стампятся ДИАПАЗОНОМ при выдаче слайса: контракт
-    /// «слайс на запись = весь диапазон changed».
-    ///
-    /// ```ignore
-    /// Query::<(Read<Vel>, Write<Pos>)>::new(&world)
-    ///     .for_each_chunk(|_entities, (vel, pos)| {
-    ///         for i in 0..pos.len() { pos[i].0 += vel[i].0; } // SIMD-friendly
-    ///     });
-    /// ```
-    pub fn for_each_chunk<Func>(&self, f: Func)
-    where
-        Q: crate::dense::DenseQuery + ReadOnlyWorldQuery,
-        F: ArchetypeFilter,
-        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
-    {
-        self.for_each_chunk_raw(f);
-    }
-
-    /// Плотная итерация с изменяемыми слайсами (`&mut [T]`) для write-форм;
-    /// `&mut self` доказывает эксклюзивность.
-    pub fn for_each_chunk_mut<Func>(&mut self, f: Func)
-    where
-        Q: crate::dense::DenseQuery,
-        F: ArchetypeFilter,
-        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
-    {
-        self.for_each_chunk_raw(f);
-    }
-
     fn for_each_chunk_raw<Func>(&self, mut f: Func)
     where
-        Q: crate::dense::DenseQuery,
+        D: crate::dense::DenseQuery,
         F: ArchetypeFilter,
-        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+        Func: FnMut(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>),
     {
+        // The dense path relies on the ids of the DATA shape `D` (filters are
+        // `ArchetypeFilter` and carry no data); `matches_archetype` needs the full
+        // `(D, F)` ids, so compute both.
         let mut ids = IdBuf::new();
-        Q::fill_ids(self.world, &mut ids);
+        D::fill_ids(self.world, &mut ids);
+        let mut match_ids = IdBuf::new();
+        <(D, F)>::fill_ids(self.world, &mut match_ids);
         let this_run = self.world.current_tick();
-
-        for a in &self.archetypes {
-            let (row_start, row_end) = self.row_range(a.arch_idx);
-            let end = row_end.min(a.len);
+        for &arch_idx in self.arch.as_slice() {
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() || (!self.match_verified && !<(D, F)>::matches_archetype(arch, &match_ids)) {
+                continue;
+            }
+            let (row_start, row_end) = self.row_range(arch_idx);
+            let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
             if len == 0 {
                 continue;
             }
-            let arch = &self.world.archetypes[a.arch_idx];
-            let slices = unsafe { Q::fetch_slices(arch, &ids, row_start, len, this_run) };
+            let slices = unsafe { D::fetch_slices(arch, &ids, row_start, len, this_run) };
             f(&arch.entities[row_start..end], slices);
         }
     }
 
-    /// Параллельная плотная итерация: те же chunk-диапазоны, что у
-    /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
-    pub fn par_for_each_chunk<Func>(&self, f: Func)
+    /// Dense (chunk) iteration: the callback receives the entities slice and whole
+    /// archetype column SLICES — no per-row `fetch_item`. Available only to
+    /// non-filtering shapes ([`DenseQuery`]); `Changed<T>` does not compile.
+    /// Read-only shape; write — [`for_each_chunk_mut`](Self::for_each_chunk_mut).
+    pub fn for_each_chunk<Func>(&self, f: Func)
     where
-        Q: crate::dense::DenseQuery + ReadOnlyWorldQuery + Send,
+        D: crate::dense::DenseQuery + ReadOnlyWorldQuery,
         F: ArchetypeFilter,
-        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+        Func: FnMut(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>),
     {
-        self.par_for_each_chunk_raw(f);
+        self.for_each_chunk_raw(f);
     }
 
-    /// Параллельная плотная итерация с изменяемыми слайсами для write-форм;
-    /// `&mut self` доказывает эксклюзивность.
-    pub fn par_for_each_chunk_mut<Func>(&mut self, f: Func)
+    /// Dense iteration with mutable slices (`&mut [T]`) for write shapes;
+    /// `&mut self` proves exclusivity.
+    pub fn for_each_chunk_mut<Func>(&mut self, f: Func)
     where
-        Q: crate::dense::DenseQuery + Send,
+        D: crate::dense::DenseQuery,
         F: ArchetypeFilter,
-        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+        Func: FnMut(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>),
     {
-        self.par_for_each_chunk_raw(f);
+        self.for_each_chunk_raw(f);
     }
 
     fn par_for_each_chunk_raw<Func>(&self, f: Func)
     where
-        Q: crate::dense::DenseQuery + Send,
+        D: crate::dense::DenseQuery + Send,
         F: ArchetypeFilter,
-        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+        Func: Fn(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
     {
         use rayon::prelude::*;
-
         let num_threads = rayon::current_num_threads();
         let mut ids = IdBuf::new();
-        Q::fill_ids(self.world, &mut ids);
+        D::fill_ids(self.world, &mut ids);
+        let mut match_ids = IdBuf::new();
+        <(D, F)>::fill_ids(self.world, &mut match_ids);
 
+        let world = self.world;
         let row_ranges = self.row_ranges;
+        let match_verified = self.match_verified;
         let rr = |arch_idx: usize| -> (usize, usize) {
             row_ranges
                 .iter()
@@ -1994,18 +2041,25 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
                 .unwrap_or((0, usize::MAX))
         };
         let chunks = compute_par_chunks(
-            self.archetypes.iter().map(|a| {
-                let s = rr(a.arch_idx);
-                let effective_len = s.1.min(a.len).saturating_sub(s.0);
-                (a.arch_idx, effective_len)
-            }),
+            self.arch
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|&arch_idx| !world.archetypes[arch_idx].is_empty())
+                .filter(|&arch_idx| {
+                    match_verified || <(D, F)>::matches_archetype(&world.archetypes[arch_idx], &match_ids)
+                })
+                .map(|arch_idx| {
+                    let s = rr(arch_idx);
+                    let effective_len =
+                        s.1.min(world.archetypes[arch_idx].len()).saturating_sub(s.0);
+                    (arch_idx, effective_len)
+                }),
             num_threads,
-            self.world.chunk_config(),
+            world.chunk_config(),
         );
 
-        let world = self.world;
         let this_run = world.current_tick();
-
         chunks.par_iter().for_each(|&(arch_idx, start, end)| {
             let (r_start, r_end) = rr(arch_idx);
             let clamped_start = r_start + start;
@@ -2013,115 +2067,163 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             if clamped_start >= clamped_end {
                 return;
             }
-            // Shared `&World` in a `par_iter` closure — plain indexing is a safe
-            // shared borrow; the raw-pointer deref here was gratuitous `unsafe`.
             let arch = &world.archetypes[arch_idx];
             let len = clamped_end - clamped_start;
-            let slices = unsafe { Q::fetch_slices(arch, &ids, clamped_start, len, this_run) };
+            let slices = unsafe { D::fetch_slices(arch, &ids, clamped_start, len, this_run) };
             f(&arch.entities[clamped_start..clamped_end], slices);
         });
     }
+
+    /// Parallel dense iteration: the same chunk ranges as
+    /// [`par_for_each`](Self::par_for_each), but the callback receives slices.
+    pub fn par_for_each_chunk<Func>(&self, f: Func)
+    where
+        D: crate::dense::DenseQuery + ReadOnlyWorldQuery + Send,
+        F: ArchetypeFilter,
+        Func: Fn(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
+
+    /// Parallel dense iteration with mutable slices for write shapes; `&mut self`
+    /// proves exclusivity.
+    pub fn par_for_each_chunk_mut<Func>(&mut self, f: Func)
+    where
+        D: crate::dense::DenseQuery + Send,
+        F: ArchetypeFilter,
+        Func: Fn(&[Entity], <D as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
 }
 
-// ── Итераторы ──────────────────────────────────────────────────
+// ── Iterators ──────────────────────────────────────────────────
 
-pub struct QueryIter<'q, Q: WorldQuery, F: WorldQuery = ()>
-where
-    Q::State: 'q,
-    F::State: 'q,
-{
-    archetypes: &'q [ArchState<<(Q, F) as WorldQuery>::State>],
-    arch_cursor: usize,
-    row_cursor: usize,
+/// Lazy iterator for [`Query`]. `fetch_state` runs lazily — only when moving to a
+/// new archetype. Tied to the `&self`/`&mut self` borrow (lifetime `'q`):
+/// read-only on `&self`, write on `&mut self`.
+pub struct QueryIter<'q, D: WorldQuery, F: WorldQuery = ()> {
+    world: &'q World,
+    arch_indices: &'q [usize],
+    ids: &'q [ComponentId],
+    last_run: Tick,
     row_ranges: &'q [(usize, usize, usize)],
+    match_verified: bool,
+
+    arch_pos: usize,
+    row: usize,
+    row_end: usize,
+    state: Option<<(D, F) as WorldQuery>::State>,
+    _phantom: std::marker::PhantomData<fn() -> (D, F)>,
 }
 
-impl<'q, Q: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, Q, F> {
-    /// П1 (TD-8): итерация выдаёт ТОЛЬКО `Q::Item` (Bevy 1:1). Entity больше
-    /// не навязана — включайте её в запрос явно: `Query<(Entity, &Pos)>`.
-    type Item = Q::Item<'q>;
+impl<'q, D: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, D, F> {
+    /// Iteration yields ONLY `D::Item` (Bevy 1:1); entity — via the query
+    /// shape (`Query<(Entity, &A)>`).
+    type Item = D::Item<'q>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let a = self.archetypes.get(self.arch_cursor)?;
-            let (r_start, r_end) = self.row_range(a.arch_idx);
-            let effective_end = r_end.min(a.len);
-            if self.row_cursor < r_start {
-                self.row_cursor = r_start;
+            while self.row >= self.row_end {
+                if !self.advance_archetype() {
+                    return None;
+                }
             }
-            if self.row_cursor >= effective_end {
-                self.arch_cursor += 1;
-                self.row_cursor = 0;
-                continue;
-            }
-            let row = self.row_cursor;
-            self.row_cursor += 1;
-            if <(Q, F)>::has_row_filter() {
-                if let Some((item, _)) = unsafe { <(Q, F)>::fetch_item(a.state, row) } {
+            let row = self.row;
+            self.row += 1;
+
+            let state = *self.state.as_ref().unwrap();
+            if <(D, F)>::has_row_filter() {
+                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
                     return Some(item);
                 }
             } else {
-                // Инфаллибельная форма: строка всегда выдаётся (§3.1A).
-                let (item, _) = unsafe { <(Q, F)>::fetch_item_unchecked(a.state, row) };
+                let (item, _) = unsafe { <(D, F)>::fetch_item_unchecked(state, row) };
                 return Some(item);
             }
         }
     }
 }
 
-impl<'q, Q: WorldQuery, F: WorldQuery> QueryIter<'q, Q, F> {
-    fn row_range(&self, arch_idx: usize) -> (usize, usize) {
-        self.row_ranges
-            .iter()
-            .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
-            .unwrap_or((0, usize::MAX))
+impl<'q, D: WorldQuery, F: WorldQuery> QueryIter<'q, D, F> {
+    /// Set up the next non-empty matching archetype (from `arch_pos`).
+    fn advance_archetype(&mut self) -> bool {
+        while self.arch_pos < self.arch_indices.len() {
+            let arch_idx = self.arch_indices[self.arch_pos];
+            self.arch_pos += 1;
+
+            let arch = &self.world.archetypes[arch_idx];
+            if arch.is_empty() {
+                continue;
+            }
+            if !self.match_verified && !<(D, F)>::matches_archetype(arch, self.ids) {
+                continue;
+            }
+
+            let (r_start, r_end) = self
+                .row_ranges
+                .iter()
+                .find_map(|&(a, s, e)| if a == arch_idx { Some((s, e)) } else { None })
+                .unwrap_or((0, usize::MAX));
+            let end = r_end.min(arch.len());
+            if end <= r_start {
+                continue;
+            }
+
+            self.state = Some(unsafe {
+                <(D, F)>::fetch_state(arch, self.ids, self.last_run, self.world.current_tick())
+            });
+            self.row = r_start;
+            self.row_end = end;
+            return true;
+        }
+        false
     }
 }
 
-/// Ровно один матч запроса (Э5, 1:1 Bevy `Single`): параметр plain-fn системы;
-/// система ПРОПУСКАЕТСЯ планировщиком в кадрах, где матчей 0 или >1
-/// (skip-семантика, не паника). `Option<Single<Q, F>>` — `None` при нуле
-/// матчей, пропуск только при >1.
+/// Exactly one query match (1:1 Bevy `Single`): a plain-fn system parameter;
+/// the scheduler SKIPS the system in frames with 0 or >1 matches (skip semantics,
+/// not a panic). `Option<Single<D, F>>` is `None` on zero matches, skipped only on
+/// >1.
 ///
 /// ```ignore
 /// fn update(camera: Single<(&mut DistanceFog, &mut LocalTransform), With<Camera>>) {
 ///     let (mut fog, mut tf) = camera.into_inner();
 /// }
 /// ```
-pub struct Single<'w, Q: WorldQuery, F: WorldQuery = ()> {
+pub struct Single<'w, D: WorldQuery, F: WorldQuery = ()> {
     pub(crate) entity: Entity,
-    pub(crate) item: Q::Item<'w>,
+    pub(crate) item: D::Item<'w>,
     pub(crate) _filter: std::marker::PhantomData<F>,
 }
 
-impl<'w, Q: WorldQuery, F: WorldQuery> Single<'w, Q, F> {
-    /// Entity единственного матча.
+impl<'w, D: WorldQuery, F: WorldQuery> Single<'w, D, F> {
+    /// Entity of the single match.
     pub fn entity(&self) -> Entity {
         self.entity
     }
 
-    /// Забрать item (для деструктуризации кортежа: `let (a, b) = s.into_inner()`).
-    pub fn into_inner(self) -> Q::Item<'w> {
+    /// Take the item (for tuple destructuring: `let (a, b) = s.into_inner()`).
+    pub fn into_inner(self) -> D::Item<'w> {
         self.item
     }
 }
 
-impl<'w, Q: WorldQuery, F: WorldQuery> std::ops::Deref for Single<'w, Q, F> {
-    type Target = Q::Item<'w>;
+impl<'w, D: WorldQuery, F: WorldQuery> std::ops::Deref for Single<'w, D, F> {
+    type Target = D::Item<'w>;
     fn deref(&self) -> &Self::Target {
         &self.item
     }
 }
 
-impl<'w, Q: WorldQuery, F: WorldQuery> std::ops::DerefMut for Single<'w, Q, F> {
+impl<'w, D: WorldQuery, F: WorldQuery> std::ops::DerefMut for Single<'w, D, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.item
     }
 }
 
-
-/// Ошибка [`Query::single`] (D2-2, Bevy-паритет).
+/// Error from [`Query::single`] (Bevy parity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuerySingleError {
     NoEntities,
@@ -2131,35 +2233,33 @@ pub enum QuerySingleError {
 impl std::fmt::Display for QuerySingleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoEntities => write!(f, "Query::single: ни одной матчащейся entity"),
-            Self::MultipleEntities => write!(f, "Query::single: больше одной матчащейся entity"),
+            Self::NoEntities => write!(f, "Query::single: no matching entity"),
+            Self::MultipleEntities => write!(f, "Query::single: more than one matching entity"),
         }
     }
 }
 
 impl std::error::Error for QuerySingleError {}
 
-/// `for item in &query` (D2-2/П1) — Bevy 1:1: выдаёт `Q::Item`; entity —
-/// через форму запроса (`for (e, hp) in &Query::<(Entity, &Hp)>::new(&w)`).
-/// `for item in &query` — read-only shapes only (matches [`Query::iter`]);
-/// write shapes iterate via `&mut query` ([`Query::iter_mut`]).
-impl<'q, 'w, Q, F> IntoIterator for &'q Query<'w, Q, F>
+/// `for item in &query` — Bevy 1:1: yields `D::Item`; entity — via the query
+/// shape. Read-only shapes (like [`Query::iter`]); write — `&mut query`.
+impl<'q, 'w, 's, D, F> IntoIterator for &'q Query<'w, 's, D, F>
 where
-    Q: ReadOnlyWorldQuery,
+    D: ReadOnlyWorldQuery,
     F: ReadOnlyWorldQuery,
 {
-    type Item = Q::Item<'q>;
-    type IntoIter = QueryIter<'q, Q, F>;
+    type Item = D::Item<'q>;
+    type IntoIter = QueryIter<'q, D, F>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
 /// `for mut item in &mut query` — write shapes yield `Mut<T>`; the exclusive
-/// `&mut` borrow proves the query is not shared (S1 part 2).
-impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, Q, F> {
-    type Item = Q::Item<'q>;
-    type IntoIter = QueryIter<'q, Q, F>;
+/// `&mut` borrow proves the query is not shared (S1).
+impl<'q, 'w, 's, D: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, 's, D, F> {
+    type Item = D::Item<'q>;
+    type IntoIter = QueryIter<'q, D, F>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
@@ -3214,7 +3314,7 @@ mod tests {
         let e3 = world.spawn((B,));
 
         // Query<Read<A>, Without<B>> должен вернуть только e1
-        let query: Query<'_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
@@ -3223,7 +3323,7 @@ mod tests {
         );
 
         // Query<Read<B>, Without<A>> должен вернуть только e3
-        let query: Query<'_, (Entity, Read<B>, Without<A>)> = Query::new(&world);
+        let query: Query<'_, '_, (Entity, Read<B>, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
@@ -3232,7 +3332,7 @@ mod tests {
         );
 
         // Query<Without<A>, Without<B>> — пустой результат (все имеют хотя бы один компонент)
-        let query: Query<'_, (Without<A>, Without<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (Without<A>, Without<B>)> = Query::new(&world);
         assert!(query.is_empty(), "Без A и B ничего не должно остаться");
     }
 
@@ -3252,7 +3352,7 @@ mod tests {
         }
 
         // Query<Read<A>, Without<B>> — должны получить только entities с A без B
-        let query: Query<'_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
 
         assert_eq!(results.len(), 50, "Должно быть 50 сущностей с A без B");
@@ -3283,7 +3383,7 @@ mod tests {
 
         // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
         {
-            let mut q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
+            let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
             q.for_each_mut(|e, mut p| {
                 if e == target {
                     p.x += 1.0;
@@ -3344,7 +3444,7 @@ mod tests {
         world.tick();
 
         {
-            let mut q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
+            let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
             let mut sink = 0.0;
             q.for_each_mut(|_, p| {
                 // Только Deref (чтение) — без DerefMut.
@@ -3368,7 +3468,7 @@ mod tests {
         let _e3 = world.spawn((A, B));
 
         // Чистый Without<A> — все сущности без A
-        let query: Query<'_, (Entity, Without<A>)> = Query::new(&world);
+        let query: Query<'_, '_, (Entity, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
         assert_eq!(
             results,
@@ -3384,7 +3484,7 @@ mod tests {
         world.spawn((A, B));
         world.spawn((A, B));
 
-        let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
         let count = query.iter().count();
         assert_eq!(count, 2, "Должно быть 2 entity с A");
     }
@@ -3397,7 +3497,7 @@ mod tests {
         world.spawn((A,));
         world.spawn((B,));
 
-        let query: Query<'_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(_, b)| b.is_some()).collect();
 
         assert_eq!(results.len(), 2, "Должно быть 2 сущности с A");
@@ -3414,7 +3514,7 @@ mod tests {
         world.spawn((A,));
 
         // Опциональная запись: у кого есть B — удваиваем
-        let mut query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
+        let mut query: Query<'_, '_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
             .iter_mut()
             .map(|(_, b_opt)| b_opt.is_some())
@@ -3432,7 +3532,7 @@ mod tests {
         world.spawn((A,));
 
         // Query<Maybe<B>> — B никогда не регистрировался
-        let query: Query<'_, Maybe<B>> = Query::new(&world);
+        let query: Query<'_, '_, Maybe<B>> = Query::new(&world);
         // Должен вернуть entity, но B будет None
         let results: Vec<_> = query.iter().collect();
         assert_eq!(results.len(), 1, "Должна вернуться entity без B");
@@ -3451,7 +3551,7 @@ mod tests {
         world.spawn((A,));
         world.spawn((A, B));
 
-        let query: Query<'_, (Maybe<NeverRegistered>, Read<A>)> = Query::new(&world);
+        let query: Query<'_, '_, (Maybe<NeverRegistered>, Read<A>)> = Query::new(&world);
         assert_eq!(
             query.iter().count(),
             2,
@@ -3611,7 +3711,7 @@ mod tests {
         let _e2 = world.spawn((B, D(2)));
 
         // (Maybe<A>, Maybe<C>) — все entity
-        let query: Query<'_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
+        let query: Query<'_, '_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
         let results: Vec<_> = query
             .iter()
             .map(|(a, c)| (a.is_some(), c.is_some()))
