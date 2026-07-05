@@ -25,3 +25,35 @@ impl Benchmark {
         sum
     }
 }
+
+// Steady-state кадровый цикл — bevy-аналог apex `FrameLoopBench`: каждый кадр write пачки +
+// read персистентным курсором + update (ротация). Standalone `Messages<T>` (тот же уровень,
+// что apex standalone `Events<T>`), одинаковая работа: N send + N read + 1 rotate на кадр.
+pub struct FrameLoopBenchmark {
+    frames: u64,
+    per_frame: u64,
+}
+
+impl FrameLoopBenchmark {
+    pub fn new() -> Self {
+        Self { frames: 10_000, per_frame: 8 }
+    }
+
+    pub fn run(&mut self) -> u64 {
+        let mut messages = Messages::<E>::default();
+        let mut cursor = messages.get_cursor();
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for _ in 0..self.frames {
+            for _ in 0..self.per_frame {
+                messages.write(E(n));
+                n += 1;
+            }
+            for e in cursor.read(&messages) {
+                sum += e.0;
+            }
+            messages.update(); // ротация буфера (per-кадр)
+        }
+        sum
+    }
+}

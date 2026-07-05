@@ -34,3 +34,42 @@ impl EventsBench {
         sum
     }
 }
+
+// Steady-state кадровый цикл: КАЖДЫЙ кадр — послать пачку, прочитать персистентным читателем,
+// ротировать буфер. В отличие от разового батча (EventsBench) амортизирует per-кадр стоимость
+// send+read+rotate (ротация вызывается КАЖДЫЙ кадр) — ближе к реальному кадру движка.
+// Персистентный курсор — как у системного читателя. Обе реализации читают все события.
+pub struct FrameLoopBench {
+    frames: u64,
+    per_frame: u64,
+}
+
+impl Default for FrameLoopBench {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameLoopBench {
+    pub fn new() -> Self {
+        Self { frames: 10_000, per_frame: 8 }
+    }
+
+    pub fn run(&mut self) -> u64 {
+        let mut events = Events::<E>::new();
+        let cursor = events.add_reader();
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for _ in 0..self.frames {
+            for _ in 0..self.per_frame {
+                events.send(E(n));
+                n += 1;
+            }
+            events.update(); // pending → читаемо (ротация)
+            for e in events.read(&cursor).iter() {
+                sum += e.0;
+            }
+        }
+        sum
+    }
+}

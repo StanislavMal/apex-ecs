@@ -224,6 +224,21 @@ fn bench_events(c: &mut Criterion) {
     });
 }
 
+// Steady-state кадровый профиль: 10k кадров × (8 send + read персист. курсором + rotate).
+// Другой профиль, чем разовый батч (bench_events): амортизирует per-кадр rotate.
+fn bench_events_frame_loop(c: &mut Criterion) {
+    let mut group = c.benchmark_group("events_frame_loop");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::events::FrameLoopBench::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::events::FrameLoopBenchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
 fn bench_relations(c: &mut Criterion) {
     let mut group = c.benchmark_group("relations");
     group.bench_function("apex", |b| {
@@ -330,6 +345,7 @@ criterion_group!(
     bench_get_component,
     bench_changed_iter,
     bench_events,
+    bench_events_frame_loop,
     bench_relations,
     bench_propagate,
     bench_despawn_recursive,

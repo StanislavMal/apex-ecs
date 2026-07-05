@@ -15,6 +15,18 @@ fn events_apex_and_bevy_read_all_10k() {
 
 #[cfg(feature = "bevy")]
 #[test]
+fn events_frame_loop_apex_and_bevy_read_all() {
+    use apex_bench::apex::events::FrameLoopBench;
+    use apex_bench::bevy::events::FrameLoopBenchmark as BevyFrameLoop;
+
+    // 10_000 кадров × 8 = 80_000 событий; sum(0..80000) = 80000*79999/2 = 3_199_960_000.
+    const EXPECTED: u64 = 3_199_960_000;
+    assert_eq!(FrameLoopBench::new().run(), EXPECTED, "apex frame-loop прочитал не все события");
+    assert_eq!(BevyFrameLoop::new().run(), EXPECTED, "bevy frame-loop прочитал не все события");
+}
+
+#[cfg(feature = "bevy")]
+#[test]
 fn relations_apex_and_bevy_see_all_10k_children() {
     use apex_bench::apex::relations::Relations;
     use apex_bench::bevy::relations::Benchmark as BevyRelations;
