@@ -45,6 +45,14 @@ pub unsafe trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
 
+    /// Read-only projection of this shape: every `&mut T` / `Mut<T>` becomes
+    /// `&T`. `Read<T>::ReadOnly = Read<T>`, `Write<T>::ReadOnly = Read<T>`,
+    /// filters map to themselves, tuples element-wise. Lets a shared-borrow
+    /// (`&self`) iterator hand out read-only items even for a write-shaped query
+    /// (Bevy `QueryData::ReadOnly`): the bound guarantees the projection yields
+    /// no mutable component access.
+    type ReadOnly: ReadOnlyWorldQuery;
+
     fn component_count() -> usize;
 
     /// Заполняет ComponentId формы. ИНВАРИАНТ (W2): каждая форма кладёт РОВНО
@@ -238,6 +246,7 @@ pub struct Read<T: Component>(std::marker::PhantomData<T>);
 unsafe impl<T: Component> WorldQuery for Read<T> {
     type Item<'w> = &'w T;
     type State = *const T;
+    type ReadOnly = Read<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -288,6 +297,7 @@ pub struct Write<T: Component>(std::marker::PhantomData<T>);
 unsafe impl<T: Component> WorldQuery for Write<T> {
     type Item<'w> = Mut<'w, T>;
     type State = WriteState<T>;
+    type ReadOnly = Read<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -379,9 +389,10 @@ unsafe impl ReadOnlyWorldQuery for () {}
 
 /// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
 /// выдаёт `&T`.
-unsafe impl<T: Component> WorldQuery for &T {
+unsafe impl<'a, T: Component> WorldQuery for &'a T {
     type Item<'w> = &'w T;
     type State = <Read<T> as WorldQuery>::State;
+    type ReadOnly = &'a T;
 
     #[inline]
     fn component_count() -> usize {
@@ -417,9 +428,10 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &T {
 
 /// `&mut T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в
 /// [`Write<T>`], выдаёт [`Mut<T>`] (со стампом change-tick на `DerefMut`).
-unsafe impl<T: Component> WorldQuery for &mut T {
+unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
     type Item<'w> = Mut<'w, T>;
     type State = <Write<T> as WorldQuery>::State;
+    type ReadOnly = &'a T;
 
     #[inline]
     fn component_count() -> usize {
@@ -463,6 +475,7 @@ unsafe impl WorldQuery for Entity {
     /// Указатель на массив `Archetype::entities` (живёт, пока жив мир и нет
     /// структурных изменений — стандартный инвариант итерации).
     type State = *const Entity;
+    type ReadOnly = Entity;
 
     #[inline]
     fn component_count() -> usize {
@@ -500,6 +513,7 @@ pub struct With<T: Component>(std::marker::PhantomData<T>);
 unsafe impl<T: Component> WorldQuery for With<T> {
     type Item<'w> = ();
     type State = ();
+    type ReadOnly = With<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -545,6 +559,7 @@ pub struct Without<T: Component>(std::marker::PhantomData<T>);
 unsafe impl<T: Component> WorldQuery for Without<T> {
     type Item<'w> = ();
     type State = ();
+    type ReadOnly = Without<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -630,6 +645,7 @@ impl MaybeState {
 unsafe impl<T: Component> WorldQuery for Maybe<T> {
     type Item<'w> = Option<&'w T>;
     type State = MaybeState;
+    type ReadOnly = Maybe<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -737,6 +753,7 @@ impl MaybeMutState {
 unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
     type Item<'w> = Option<Mut<'w, T>>;
     type State = MaybeMutState;
+    type ReadOnly = Maybe<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -830,6 +847,7 @@ unsafe impl Sync for ChangedState {}
 unsafe impl<T: Component> WorldQuery for Changed<T> {
     type Item<'w> = ();
     type State = ChangedState;
+    type ReadOnly = Changed<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -913,6 +931,7 @@ unsafe impl Sync for AddedState {}
 unsafe impl<T: Component> WorldQuery for Added<T> {
     type Item<'w> = ();
     type State = AddedState;
+    type ReadOnly = Added<T>;
 
     #[inline]
     fn component_count() -> usize {
@@ -1001,6 +1020,7 @@ macro_rules! impl_or_query {
             /// архетип, `None` — ветка мертва (state НЕ фетчится, иначе UB
             /// на отсутствующей колонке).
             type State = ( $(Option<$F::State>,)+ );
+            type ReadOnly = Or<( $(<$F as WorldQuery>::ReadOnly,)+ )>;
 
             #[inline]
             fn component_count() -> usize { 0 $( + $F::component_count() )+ }
@@ -1115,6 +1135,7 @@ macro_rules! impl_world_query_tuple {
         unsafe impl< $($Q: WorldQuery),+ > WorldQuery for ( $($Q,)+ ) {
             type Item<'w> = ( $($Q::Item<'w>,)+ );
             type State    = ( $($Q::State,)+ );
+            type ReadOnly = ( $(<$Q as WorldQuery>::ReadOnly,)+ );
 
             #[inline]
             fn component_count() -> usize { 0 $( + $Q::component_count() )+ }
@@ -1207,6 +1228,7 @@ macro_rules! impl_world_query_tuple {
 unsafe impl WorldQuery for () {
     type Item<'w> = ();
     type State = ();
+    type ReadOnly = ();
 
     fn component_count() -> usize {
         0
