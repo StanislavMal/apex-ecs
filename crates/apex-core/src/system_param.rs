@@ -141,11 +141,16 @@ pub struct EventReader<'w, T: Send + Sync + 'static> {
     /// Сырой указатель для возможности мутабельного доступа через `read()`.
     ptr: *const Events<T>,
     cursor: EventCursor,
+    /// `false` (default) — this reader OWNS its cursor and frees it on drop
+    /// (standalone / one-shot use). `true` — the cursor is PERSISTENT, owned by
+    /// a system's `SystemParam` state across frames (F4), so drop must NOT free
+    /// it — the next frame reuses the same cursor and resumes where it left off.
+    persistent: bool,
     _marker: PhantomData<&'w Events<T>>,
 }
 
 impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
-    /// Создать читателя с новым курсором.
+    /// Создать читателя с новым курсором (владеет им — освобождает на drop).
     /// # Panics
     /// Паникует если события типа T не зарегистрированы.
     pub fn new(events: &'w mut Events<T>) -> Self {
@@ -153,6 +158,20 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
         Self {
             ptr: events as *const Events<T>,
             cursor,
+            persistent: false,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Create a reader over an EXISTING persistent cursor (F4). The cursor is
+    /// owned by the caller (a system's per-frame `SystemParam` state) and is NOT
+    /// freed on drop, so its read position survives across frames/runs — a
+    /// FixedUpdate catch-up reads each event exactly once (no reset-to-zero).
+    pub(crate) fn from_persistent(events: &'w mut Events<T>, cursor: EventCursor) -> Self {
+        Self {
+            ptr: events as *const Events<T>,
+            cursor,
+            persistent: true,
             _marker: PhantomData,
         }
     }
@@ -188,6 +207,11 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
 
 impl<T: Send + Sync + 'static> Drop for EventReader<'_, T> {
     fn drop(&mut self) {
+        // A persistent cursor is owned by the system's state and reused next
+        // frame — freeing it here would reset the read position (the F4 bug).
+        if self.persistent {
+            return;
+        }
         unsafe {
             let events = self.ptr as *mut Events<T>;
             (*events).remove_reader(self.cursor);
@@ -671,14 +695,38 @@ where
     }
 }
 
+/// Per-system persistent state for an [`EventReader`] param (F4). Holds the
+/// system's own event cursor, created on first run and reused every frame so
+/// the read position survives across frames and FixedUpdate catch-up runs
+/// (`Send + Sync + Default + 'static` — [`EventCursor`] is a `Copy` `u32`).
+pub struct EventReaderState<E> {
+    cursor: Option<EventCursor>,
+    _marker: PhantomData<fn() -> E>,
+}
+
+impl<E> Default for EventReaderState<E> {
+    fn default() -> Self {
+        Self { cursor: None, _marker: PhantomData }
+    }
+}
+
 impl<'a, E: Send + Sync + 'static> SystemParam for EventReader<'a, E> {
     type Item<'w> = EventReader<'w, E>;
-    type State = ();
+    type State = EventReaderState<E>;
     fn access() -> AccessDescriptor {
         AccessDescriptor::new().read_event::<E>()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
+        // Stateless fallback (no persistent cursor): a fresh one-shot reader.
         ctx.event_reader::<E>()
+    }
+    fn get_param<'w>(
+        ctx: &'w crate::world::SystemContext<'w>,
+        state: &'w mut Self::State,
+    ) -> EventReader<'w, E> {
+        // F4: reuse a persistent per-system cursor (in `state`) so reads resume
+        // across frames / FixedUpdate runs instead of restarting from zero.
+        ctx.event_reader_persistent::<E>(&mut state.cursor)
     }
 }
 
@@ -974,5 +1022,60 @@ impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
         let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
         let world: &crate::world::World = mw.0.world();
         world.event_reader::<E>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{EventCursor, Events};
+
+    /// F4: a persistent per-system cursor resumes across runs — reading the same
+    /// readable buffer twice (a FixedUpdate catch-up) does NOT duplicate, unlike
+    /// a fresh cursor that restarts at zero every run.
+    #[test]
+    fn persistent_event_reader_no_duplicate_reads() {
+        let mut events = Events::<u32>::new();
+        events.send(10);
+        events.send(20);
+        events.update(); // 10, 20 now in the readable buffer
+
+        // The system's SystemParam state — its persistent cursor across runs.
+        let mut cursor: Option<EventCursor> = None;
+
+        // Run 1: create/resume, read all, advance (the read() guard advances on drop).
+        {
+            let c = match cursor {
+                Some(c) => c,
+                None => {
+                    let c = events.add_reader();
+                    cursor = Some(c);
+                    c
+                }
+            };
+            let mut r = EventReader::from_persistent(&mut events, c);
+            assert_eq!(r.read().as_slice().to_vec(), vec![10, 20]);
+            // r dropped: persistent => cursor NOT freed; position advanced to end.
+        }
+
+        // Run 2 in the SAME frame (no update): resume from the persistent cursor.
+        {
+            let c = cursor.expect("cursor persisted across runs");
+            let mut r = EventReader::from_persistent(&mut events, c);
+            assert!(
+                r.read().as_slice().is_empty(),
+                "persistent cursor resumed — the second run reads nothing (no dup)"
+            );
+        }
+
+        // Contrast: a FRESH cursor (the pre-F4 behavior) re-reads the whole buffer.
+        {
+            let mut fresh = EventReader::new(&mut events);
+            assert_eq!(
+                fresh.read().as_slice().to_vec(),
+                vec![10, 20],
+                "a fresh reader restarts at 0 — exactly the duplicate F4 removes"
+            );
+        }
     }
 }

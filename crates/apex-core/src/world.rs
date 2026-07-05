@@ -2472,6 +2472,39 @@ impl<'w> SystemContext<'w> {
         }
     }
 
+    /// F4: build an [`EventReader`] over a PERSISTENT per-system cursor stored in
+    /// `cursor` (the system's `SystemParam` state). Created on first call and
+    /// reused every frame, so the read position survives across frames /
+    /// FixedUpdate catch-up runs (no reset-to-zero ⇒ no duplicate reads). The
+    /// only intended caller is `SystemParam for EventReader`.
+    ///
+    /// # Safety
+    /// Same contract as [`event_reader`](Self::event_reader): the scheduler
+    /// serializes conflicting event access, so this system has exclusive access
+    /// to `T`'s queue for the call.
+    #[inline]
+    pub(crate) fn event_reader_persistent<T: Send + Sync + 'static>(
+        &self,
+        cursor: &mut Option<crate::events::EventCursor>,
+    ) -> EventReader<'_, T> {
+        unsafe {
+            let ptr = self
+                .world()
+                .event_queue_ptr::<T>()
+                .expect("event_reader: event type not registered");
+            let events = &mut *ptr;
+            let c = match *cursor {
+                Some(c) => c,
+                None => {
+                    let c = events.add_reader();
+                    *cursor = Some(c);
+                    c
+                }
+            };
+            EventReader::from_persistent(events, c)
+        }
+    }
+
     /// Event-writer access WITHOUT a declared-access check (F3.2). An `EventWriter`
     /// obtained from `ctx` that the system did NOT declare (`Emit<E>`) races with
     /// other undeclared writers/readers of the same event. Declare it as an
