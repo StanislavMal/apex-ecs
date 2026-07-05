@@ -10,6 +10,7 @@ use crate::{
     commands::Commands,
     component::{Component, ComponentId, ComponentInfo, ComponentRegistry, Tick},
     entity::{Entity, EntityAllocator, EntityLocation},
+    error::{ErrorHandler, ErrorMode},
     events::EventRegistry,
     query::{QueryBuilder, WorldQuery},
     relations::{RelationRegistry, SubjectIndex, TargetIndex},
@@ -216,6 +217,9 @@ pub struct World {
     pub(crate) templates: TemplateRegistry,
     /// Конфигурация чанкования для параллельной итерации.
     pub(crate) chunk_config: ChunkConfig,
+    /// §0.2a policy: what to do with conscious drops/refusals (log/panic/
+    /// silent/custom) + anomaly counters. Per-world (see [`crate::error`]).
+    pub(crate) error_handler: ErrorHandler,
     /// Очередь хуков состава (W3-1): структурные операции СНАЧАЛА завершаются,
     /// потом диспетчер вызывает хуки на консистентном мире. Вложенные
     /// структурные операции из хуков дописывают в ту же очередь — обрабатывает
@@ -294,6 +298,7 @@ impl World {
             events: EventRegistry::new(),
             templates: TemplateRegistry::new(),
             chunk_config: ChunkConfig::default(),
+            error_handler: ErrorHandler::default(),
             hook_queue: Vec::new(),
             hook_dispatch_active: false,
         };
@@ -431,6 +436,33 @@ impl World {
     #[inline]
     pub fn set_chunk_config(&mut self, config: ChunkConfig) {
         self.chunk_config = config;
+    }
+
+    /// The §0.2a error policy for this world (log/panic/silent/custom + anomaly
+    /// counters). See [`crate::error`]. Default: [`ErrorMode::Warn`].
+    #[inline]
+    pub fn error_handler(&self) -> &ErrorHandler {
+        &self.error_handler
+    }
+
+    /// Mutable access to the error policy — e.g. `world.error_handler_mut().
+    /// reset_counts()` before an end-of-frame "zero drops" assertion.
+    #[inline]
+    pub fn error_handler_mut(&mut self) -> &mut ErrorHandler {
+        &mut self.error_handler
+    }
+
+    /// Replace the whole error policy (e.g. [`ErrorHandler::from_env`]).
+    #[inline]
+    pub fn set_error_handler(&mut self, handler: ErrorHandler) {
+        self.error_handler = handler;
+    }
+
+    /// Shorthand for `world.error_handler_mut().set_mode(mode)` — the common
+    /// case of flipping strict/quiet without rebuilding the handler.
+    #[inline]
+    pub fn set_error_mode(&mut self, mode: ErrorMode) {
+        self.error_handler.set_mode(mode);
     }
 
     /// Удалить все сущности, сохранив ресурсы, зарегистрированные компоненты и события.
@@ -1034,10 +1066,10 @@ impl World {
             );
             #[cfg(not(debug_assertions))]
             {
-                crate::warn_once!(
-                    "World::spawn_at on already-live entity {}:{} — refused (bundle dropped) to avoid orphaning its row",
-                    entity.index,
-                    entity.generation,
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::spawn_at",
+                    Some(entity), None,
+                    "already-live entity refused (bundle dropped) to avoid orphaning its row"
                 );
                 return;
             }
@@ -1359,11 +1391,10 @@ impl World {
                 // §0.2a: inserting into a dead entity is a no-op — `component` is
                 // dropped here (no leak), but the write is silently lost. Surface
                 // it so the caller learns the entity was already despawned.
-                crate::warn_once!(
-                    "World::insert::<{}> on dead entity {}:{} — component dropped, not inserted",
-                    std::any::type_name::<T>(),
-                    entity.index,
-                    entity.generation,
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::insert",
+                    Some(entity), Some(std::any::type_name::<T>()),
+                    "component dropped, not inserted (entity already despawned)"
                 );
                 return;
             }
@@ -1446,10 +1477,10 @@ impl World {
                 // leaking owned fields (String/Arc/Vec). Run drop_fn so ownership
                 // is honored exactly once (A9); the column never received a copy.
                 // §0.2a: the insert is silently lost — surface the dead-entity hit.
-                crate::warn_once!(
-                    "World::insert_raw for {component_id:?} on dead entity {}:{} — data dropped, not inserted",
-                    entity.index,
-                    entity.generation,
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::insert_raw",
+                    Some(entity), None,
+                    "data for {component_id:?} dropped, not inserted (entity already despawned)"
                 );
                 if !data.is_empty() {
                     if let Some(info) = self.registry.get_info(component_id) {
@@ -1538,11 +1569,11 @@ impl World {
                 // §0.2a: batch insert onto a dead entity — the caller owns the
                 // payloads and frees them (see `apply_insert_group`), but the
                 // write is lost. Surface the dead-entity hit.
-                crate::warn_once!(
-                    "World::insert_parts on dead entity {}:{} — {} component(s) dropped, not inserted",
-                    entity.index,
-                    entity.generation,
-                    parts.len(),
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::insert_parts",
+                    Some(entity), None,
+                    "{} component(s) dropped, not inserted (entity already despawned)",
+                    parts.len()
                 );
                 return false;
             }
@@ -1597,10 +1628,10 @@ impl World {
             Some(loc) => loc,
             None => {
                 // §0.2a: remove targeting a dead entity is a no-op — surface it.
-                crate::warn_once!(
-                    "World::remove_raw for {component_id:?} on dead entity {}:{} — no-op",
-                    entity.index,
-                    entity.generation,
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::remove_raw",
+                    Some(entity), None,
+                    "no-op: {component_id:?} not removed (entity already despawned)"
                 );
                 return;
             }
@@ -1635,11 +1666,10 @@ impl World {
                 // §0.2a: remove targeting a dead entity is a no-op. `false` is
                 // returned (as for "component absent"), but most callers ignore
                 // it — surface the dead-entity case explicitly.
-                crate::warn_once!(
-                    "World::remove::<{}> on dead entity {}:{} — no-op",
-                    std::any::type_name::<T>(),
-                    entity.index,
-                    entity.generation,
+                crate::anomaly!(
+                    self, crate::Severity::Warn, "World::remove",
+                    Some(entity), Some(std::any::type_name::<T>()),
+                    "no-op: component not removed (entity already despawned)"
                 );
                 return false;
             }

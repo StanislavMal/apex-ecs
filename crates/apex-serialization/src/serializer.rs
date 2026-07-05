@@ -269,12 +269,14 @@ impl WorldSerializer {
                         // §0.2a (E8): the type is registered but has no serde
                         // functions, so its snapshot bytes are silently dropped
                         // on restore — the entity comes back missing this
-                        // component. Surface it (throttled) so the data loss is
-                        // visible; register serde for the type to fix.
+                        // component. Surface it through the world's ErrorHandler
+                        // (throttled by default) so the data loss is visible;
+                        // register serde for the type to fix.
                         None => {
-                            apex_core::warn_once!(
-                                "restore: component '{}' is registered without serde functions — snapshot data dropped, entity restored without it",
-                                comp_snap.type_name,
+                            apex_core::anomaly!(
+                                world, apex_core::Severity::Warn, "WorldSerializer::restore",
+                                None, Some(comp_snap.type_name.as_str()),
+                                "component registered without serde functions — snapshot data dropped, entity restored without it"
                             );
                             continue;
                         }
@@ -806,9 +808,9 @@ mod tests {
 
     /// §0.2a (E8): if a component's type is registered on the restore side but
     /// WITHOUT serde functions (e.g. version skew), its snapshot bytes are
-    /// dropped and the entity comes back missing it. The drop must be loud
-    /// (`warn_once!`, verified by the apex-core macro test) rather than silent;
-    /// here we pin the data-loss contract — restore still succeeds, serde-backed
+    /// dropped and the entity comes back missing it. The drop is loud — routed
+    /// through the world's `ErrorHandler` (§0.2a) rather than silent; here we
+    /// pin the data-loss contract — restore still succeeds, serde-backed
     /// components come back, the serde-less one is absent.
     #[test]
     fn restore_drops_component_registered_without_serde() {

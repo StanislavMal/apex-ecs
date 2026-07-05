@@ -35,12 +35,49 @@ macro_rules! warn_once {
     }};
 }
 
+/// Report a §0.2a [`Anomaly`](crate::error::Anomaly) through a world's
+/// [`ErrorHandler`](crate::error::ErrorHandler) — the policy-driven successor to
+/// [`warn_once!`]. The first `$world` argument is anything exposing
+/// `error_handler()` (a `&World` or `&mut World`); the rest describe the
+/// anomaly: severity, operation, optional entity, optional component name, then
+/// a `format!`-style message.
+///
+/// The per-call-site `AtomicBool` throttle lives in the expansion (same latch
+/// `warn_once!` uses), so a hot misuse path logs once — but the handler still
+/// counts every hit, and `Panic`/`Custom` modes fire every time.
+///
+/// ```ignore
+/// crate::anomaly!(
+///     self, $crate::Severity::Warn, "World::insert",
+///     Some(entity), Some(::std::any::type_name::<T>()),
+///     "component dropped, not inserted (entity already despawned)"
+/// );
+/// ```
+#[macro_export]
+macro_rules! anomaly {
+    ($world:expr, $severity:expr, $op:expr, $entity:expr, $component:expr, $($detail:tt)+) => {{
+        static __ANOMALY_THROTTLE: ::std::sync::atomic::AtomicBool =
+            ::std::sync::atomic::AtomicBool::new(false);
+        $world.error_handler().report(
+            &$crate::error::Anomaly {
+                severity: $severity,
+                op: $op,
+                entity: $entity,
+                component: $component,
+                detail: ::std::format_args!($($detail)+),
+            },
+            &__ANOMALY_THROTTLE,
+        );
+    }};
+}
+
 pub mod access;
 pub mod archetype;
 pub mod commands;
 pub mod component;
 pub mod dense;
 pub mod entity;
+pub mod error;
 pub mod events;
 pub mod fn_system;
 pub mod par_utils;
@@ -66,6 +103,7 @@ pub use component::{
     SerdeContext, Tick,
 };
 pub use entity::Entity;
+pub use error::{Anomaly, AnomalyCounts, ErrorHandler, ErrorMode, Severity};
 pub use events::{
     DelayedQueue, EventCursor, EventIterator, EventReadGuard, Events, PartialReadGuard, PeekGuard,
     Removed,

@@ -717,10 +717,10 @@ impl Commands {
                     // silently no-ops. Surface it — the caller queued a despawn
                     // that did nothing.
                     if !world.despawn(entity) {
-                        crate::warn_once!(
-                            "Commands::despawn on dead entity {}:{} — no-op (already despawned?)",
-                            entity.index,
-                            entity.generation,
+                        crate::anomaly!(
+                            world, crate::Severity::Warn, "Commands::despawn",
+                            Some(entity), None,
+                            "no-op (already despawned?)"
                         );
                     }
                 }
@@ -729,8 +729,10 @@ impl Commands {
                     // (typo, or the template was never registered) silently spawns
                     // nothing. Surface it.
                     if world.spawn_template_with(&name, &params).is_none() {
-                        crate::warn_once!(
-                            "Commands::spawn_template(\"{name}\") — no template registered under that name; nothing spawned",
+                        crate::anomaly!(
+                            world, crate::Severity::Warn, "Commands::spawn_template",
+                            None, None,
+                            "no template registered under name \"{name}\"; nothing spawned"
                         );
                     }
                 }
