@@ -348,13 +348,31 @@ after/chain` остаётся для ДИНАМИЧЕСКОГО порядка (
 6 новых config-ordering), clippy net-neutral (0 warns core/scheduler/isolated), движок check --all-
 targets чист, goldens 649/0/9 byte-identical, scheduler doctests. Коммит ecs `d2949dd`.
 
-**⏳ ОСТАЛОСЬ в волне 3 (focused-проходы, НЕ полумеры — каждый сам по себе):**
-- **SystemBuilder → pub(crate) + чистка legacy add_system-пути.** Демоушен `SystemBuilder` вскрыл, что
-  весь builder-chaining путь (`add_system().run_if()` + `run_if_cond`/`or_else`/`condition`) — МЁРТВ
-  (вытеснен `add_systems`+`SystemConfig`). Убрать связку (приватные `add_system*` + `SystemBuilder` +
-  его методы) — сцеплено, отдельный заход.
-- **`par_for_each_used_by_name` → декларативно.** Нужен флаг на `SystemConfig` (не ренейм); benchmark-
-  only, низкий приоритет.
+**✅ SystemBuilder + legacy add_system-путь — СДЕЛАНО (2026-07-05).** Классификация по факту: весь
+builder-chaining кластер — не «мёртвый прод-код», а ТЕСТ-инфраструктура. Все `add_*`-конструкторы,
+возвращавшие `SystemBuilder`, уже были `#[cfg(test)]`, кроме `add_system_to_stage` (pub(crate), 1 прод-
+вызов в `states.rs`). Прод-вызов мигрирован на golden-path `add_systems(First, seq(...))`; затем весь
+кластер (`SystemBuilder` struct+impl + `add_system_to_stage`) помечен `#[cfg(test)]` — в shipped-библио
+ноль следа (сильнее, чем pub(crate); CONVENTIONS §2). Clippy-форсинг вскрыл мёртвое даже в тесте:
+удалены неиспользуемые методы `SystemBuilder::{run_if_cond,or_else,or_else_cond,condition,
+add_condition_or}` (оставлены `id`/`run_if`/`add_condition_leaf`) и **вестигиальное поле
+`SystemDescriptor::condition_access`** (его читал только incremental builder-путь; прод
+`register_system_config` уже вливает `cfg.condition_access` в `access` при регистрации — поле было
+дублем). `SystemConfig::condition_access` остаётся (прод-путь run_if-на-конфиге). Гейты: workspace
+tests (99 lib + все), clippy net-neutral (0 warns core/scheduler/isolated + all-targets), движок check
+чист, goldens byte-identical. Коммит ecs `9bad914`.
+
+**✅ `par_for_each_used` → декларативно — СДЕЛАНО (2026-07-05).** Новый метод
+`SystemConfig::par_for_each_used()` ставит `access.uses_par_for_each` на Auto/ParClosure-конфиге при
+сборке (golden path, как `.run_if()`); Sequential — no-op. Императивный `Scheduler
+::par_for_each_used_by_name` депрекейтнут (`#[deprecated]`+`#[doc(alias)]`), консумеры (perf.rs, 5
+сайтов) мигрированы на `sys(name, s).par_for_each_used()`. Приватный `par_for_each_used(id)` жив (зовёт
+депрекейтнутый by-name). Коммит ecs `9bad914`.
+
+**✅ ВОЛНА 3 ЗАКРЫТА (2026-07-05).** Все пункты (CONVENTIONS-гейт, A5-harden, ChunkConfig, naming-sweep,
+sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBuilder→cfg(test)**,
+**par_for_each-декларатив**) выполнены. NEXT = волна 4 (события+ErrorHandler) ИЛИ 6 (relations) —
+переставимы; затем волна P (снос deprecated-алиасов), волна 5 (руководство).
 
 **Волна 4 — События+ошибки.** F4 (персистентные курсоры на State-слоте — TECH_DEBT); reader-API/
 EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс с Severity/контекстом (§0.2a
