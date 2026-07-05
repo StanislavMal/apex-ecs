@@ -374,29 +374,23 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
 **par_for_each-декларатив**) выполнены. NEXT = волна 4 (события+ErrorHandler) ИЛИ 6 (relations) —
 переставимы; затем волна P (снос deprecated-алиасов), волна 5 (руководство).
 
-**Волна 4 — События+ошибки.** F4 (персистентные курсоры на State-слоте — TECH_DEBT); reader-API/
-EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс с Severity/контекстом (§0.2a
-системно — вместо разрозненных warn_once там, где уместна политика уровня приложения).
+**Волна 4 — События+ошибки. 🔶 ЧАСТИЧНО (F4 ✅ golden-path, 2026-07-05).**
+- **✅ F4 персистентные курсоры (ecs `f6c0c2d`):** `EventReader`-параметр → `State =
+  EventReaderState<E>`; персистентный курсор через `SystemContext::event_reader_persistent`; Drop не
+  освобождает персист-курсор. Чинит FixedUpdate-дубли + ложь rustdoc `Removed<T>`. Детали и §0.9-решение
+  (НЕ Bevy-lossy-rewrite — сохранён наш no-loss registry; бонус: no-loss активирован для system-читателей)
+  — в `plans/TECH_DEBT.md` F4. Регресс-тест + Miri TB. **F4b (edge, TECH_DEBT):** AutoSystem/`system!`-путь
+  (`ctx.event_reader` прямой) — не персистентен (macro-хирургия); golden-path закрыт.
+- **⏳ Остаток волны 4:** reader-API/EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс
+  с Severity/контекстом (§0.2a системно). — переставимо с волной P.
 
-> **⚠ Разведка F4 (2026-07-05, для следующего захода):** `Events<T>` глубоко завязан на
-> **registry-cursor** модель (`cursors: Vec<Option<u32>>` + `lagging_count`-инвариант + adaptive
-> `update()` (сохраняет события отстающих читателей) + `free_list` + RAII read-guards, мутирующие
-> курсор на drop). Планировщик СЕРИАЛИЗУЕТ двух читателей одного события
-> (`ConflictKind::SharedEventReaders`, F2) — именно потому, что чтение мутирует общий реестр.
-> **Две версии F4:**
-> - **(A) «дёшево», plan-scope:** персистентный registry-курсор в State-слоте (`Listen<E>::State =
->   EventReaderState<E>`, get_param переиспользует курсор, EventReader НЕ remove на Drop). Чинит
->   баг дублей (FixedUpdate катчап + ложь rustdoc `Removed<T>`). НО: только golden-path (plain-fn);
->   AutoSystem/`system!` зовут `ctx.event_reader` (свежий курсор) — останутся; и НЕ снимает
->   SharedEventReaders-сериализацию. = §0.2b-полумера.
-> - **(B) Bevy-паритет (ПРАВИЛЬНО, превосходство):** локальный курсор (`last_event_count` в State),
->   **immutable-read** → параллельные читатели одного события (снять SharedEventReaders = обгон),
->   закрытие S3/S4. Требует **переписывания буферизации `Events`** (монотонный счётчик + двойной
->   буфер с start-count по-Bevy) + редизайн read-guards + миграция ВСЕХ EventReader-консумеров +
->   standalone `world.event_reader()` + сериализатор. Широкий blast-radius, soundness-критично (Miri
->   TB + goldens). = отдельная фокус-сессия, НЕ хвост. Юзер хочет «на совесть» → делать (B), но своим
->   заходом. Файлы: `events.rs` (Events/update/read-guards), `system_param.rs:477` (Listen State),
->   `world.rs:941/2465` (event_reader), scheduler `lib.rs:3747` (SharedEventReaders — удалить).
+> **§0.9-РЕШЕНИЕ ПО F4 (важно, не переоткрывать):** рассматривались (A) персист. registry-курсор [СДЕЛАНО]
+> vs (B) Bevy-паритетный local-cursor (параллельные читатели). **Выбран (A)**, потому что (B) требует
+> перехода на Bevy-lossy модель (события истекают за 2 кадра → `run_if`-gated читатель ТЕРЯЕТ события) —
+> это РЕГРЕССИЯ нашего no-loss преимущества. Параллельные читатели (обгон по перфу) НЕ стоят потери
+> no-loss (обгон по корректности). Сериализация читателей (`SharedEventReaders`) = осознанная цена
+> no-loss, оставлена. Т.е. «правильно/на совесть» здесь = НЕ копировать Bevy, а починить корректность на
+> нашей превосходящей модели. Параллельные-читатели-через-local-cursor — НЕ делать (потеряем no-loss).
 
 **Волна 5 — Руководство** (после стабилизации API): переписывание под целевую структуру §3 —
 quick start, перенумерация, справочник в конец (+полнота: query_mut-семейство, DynQuery, set_
@@ -433,11 +427,19 @@ App API → в док движка, брендинг **ApexForge_ECS** (Р-2), �
   по subject-индексу; резолв kind read-only (unregistered → REQUIRED пусто / ABSENCE trivially-true, §0.2a).
   Превосходство: типизированный запрос так не умеет в runtime, у Bevy dynamic builder этого нет. Для
   редактора/скриптов/IPC.
-- **⏳ Остаток — маргинальный/mimicry:** `children![]`-аналог (у нас уже есть `with_children` — closure-
-  форма чище макроса; §0.9 анти-mimicry: не копировать макрос ради паритета) и типизированный
-  `iter_relations` (raw `(u32,u32,Entity)` легитимно нужен сериализации — 2 консумера; per-entity
-  типизир. навигация уже покрыта `EntityRef::targets_of`). Оба — низкий приоритет, кандидаты на
-  «закрыть с §0.9-обоснованием». Витринная глава руководства — волна 5.
+- **✅ ЗАКРЫТО с §0.9-обоснованием (2026-07-05) — НЕ строим (осознанный анти-mimicry, не полумера):**
+  - `children![]`-макрос: у нас `with_children(|c| …)` есть на Commands И EntityWorldMut (immediate) —
+    closure-форма чище инлайн-макроса и уже покрывает декларативный спавн поддерева. Копировать
+    Bevy-макрос ради паритета = mimicry; обобщённый `related![]` над произвольными kind'ами —
+    спекулятивная поверхность без консумера (§0.2a: не плодить). Идиома золотого пути = `with_children`.
+  - типизированный `iter_relations`: raw `(subject_idx, kind_idx, target)` ЛЕГИТИМНО нужен
+    сериализации (компактные индексы — serializer.rs + editor capture.rs). Per-entity типизированная
+    навигация уже first-class через `EntityRef::{target_of,targets_of}` (любой kind). Глобальный
+    типизированный обход — нишевый, консумера нет.
+
+**⇒ ВОЛНА 6 ЗАКРЫТА (2026-07-05):** превосходство-часть (Р-4 лестница + generic relation-nav на
+аксессоре + S8 dynamic relation-запросы) сделана; маргиналии закрыты §0.9-обоснованием. Витринная
+глава руководства — в волне 5.
 
 **Волна P — пре-публикационная чистка deprecated-поверхности (ПОСЛЕ волн 3–6, ДО первого релиза
 crates.io).** ОДНИМ проходом снести ВСЕ `#[deprecated]`-алиасы, накопленные ренеймами кампании.

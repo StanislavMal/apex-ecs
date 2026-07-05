@@ -75,14 +75,24 @@
 
 ## 🟡 Бездомные пункты реестра аудита (числились, но не сделаны/не отложены явно)
 
-- **F4 🟡 — per-system event-курсоры не персистентны.** `EventReader` как SystemParam:
-  `type State = ()` (`system_param.rs:479`), каждый `fetch` зовёт `Events::add_reader()` →
-  курсор `Some(0)` (`events.rs:167`) → свежий курсор с нуля каждый запуск. Следствие: FixedUpdate-
-  катчап читает дубли; rustdoc `Removed<T>` «без дублей и пропусков» (`events.rs:~1002-1004`) — ложь.
-  **Инфраструктура готова:** В3 Phase A (`SystemParam::State`/`get_param`, `system_param.rs:418`) —
-  ровно тот per-system слот, для которого F4 проектировался (сейчас `State` не использует НИКТО).
-  F4 теперь дёшев. Дважды переадресован (волна 2→6→6б) и оба раза выпал. Детали: CORE_AUDIT §1.3/§6.
-  **Дом исполнения: `plans/active/API_GOLDEN_PATH.md` волна 4** (события+ошибки — курсоры на State-слоте).
+- **F4 ✅ ЗАКРЫТ для golden-path (2026-07-05, ветка api-golden-path).** `EventReader`-параметр (plain-fn,
+  Р-1) держал `type State = ()` → каждый `get_param` звал `add_reader()` → свежий курсор с нуля →
+  FixedUpdate-катчап читал дубли (rustdoc `Removed<T>` «без дублей/пропусков» — была ложь). **Фикс:**
+  `State = EventReaderState<E>` (хранит `Option<EventCursor>`); `get_param` создаёт/переиспользует
+  персистентный курсор через `SystemContext::event_reader_persistent`; `EventReader` получил
+  `persistent`-флаг (Drop НЕ освобождает курсор — им владеет state). **§0.9-решение (не мимикрия):** НЕ
+  переписывать `Events` на Bevy-лоссовую local-cursor модель (у Bevy события истекают за 2 кадра;
+  `run_if`-gated читатель теряет их) — курсор в НАШЕЙ no-loss registry. Бонус: no-loss ТЕПЕРЬ активен
+  для system-читателей (раньше transient-курсор терялся к `update()` → пропущенный читатель молча терял
+  события). Цена no-loss — сериализация читателей одного события (`SharedEventReaders`) — оставлена
+  осознанно. Гейты: workspace + clippy net-neutral + движок check + Miri TB (F4-тест + 23 event) +
+  goldens byte-identical. Регресс-тест `persistent_event_reader_no_duplicate_reads`.
+- **F4b 🟢 (edge, низкий приоритет) — AutoSystem/`system!`-путь чтения событий НЕ персистентен.**
+  `ctx.event_reader::<E>()` внутри `AutoSystem::run` / `system!`-тела даёт свежий курсор (не через
+  `SystemParam::State`) → тот же FixedUpdate-дубль для AutoSystem-читателей. AutoSystem — второй уровень
+  (Р-1: plain-fn = golden path). Фикс потребовал бы хранить курсоры в AutoSystem-инстансе (macro-хирургия
+  `system!`). Golden-path (plain-fn) закрыт F4; это — хвост. **Смежно: S3/S4** (footgun-гонки `&self`
+  event-мутации) F4 НЕ закрывает (по-прежнему registry + `ctx.event_reader` для standalone).
 - **D6-полное 🟡 — per-system `last_run` (Bevy-паритет change-окон).** Окно по-прежнему
   per-execution-stage (`stage_last_run: Vec<Tick>`, `apex-scheduler/src/lib.rs:~740-747, 2449-2454`);
   волна 2 закрыла только run_if-кейс. Значился в исходном scope волны 6б, исчез при формировании плана.
