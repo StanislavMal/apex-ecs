@@ -3,7 +3,7 @@
 //! Демонстрирует все способы применения трейта SystemParam:
 //! - Одиночные параметры (ResRead, ResWrite, Listen, Emit, QueryParam, CommandsParam)
 //! - Кортежи 2–4 элемента
-//! - Удобный метод ctx.fetch::<P>()
+//! - Механизм ctx.fetch_unchecked::<Self::Params>() (raw; сверки декларации нет — §0.2a)
 //! - Использование в эксклюзивной системе (`with_ctx`) через SystemContext
 //! - Доступ через access() без рантайма (проверка деклараций)
 //! - Корректность логики (фактическое применение параметров)
@@ -68,7 +68,7 @@ fn test_resources() {
 
     with_ctx(&mut world, |ctx| {
         type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>);
-        let (cfg, mut stats) = ctx.fetch::<P>();
+        let (cfg, mut stats) = ctx.fetch_unchecked::<P>();
 
         assert!((cfg.gravity - 9.8).abs() < 1e-6, "gravity should be 9.8");
         assert_eq!(stats.frame, 0);
@@ -151,7 +151,7 @@ fn test_query_param() {
         // Read<T> один
         {
             type P = QueryParam<Read<Position>>;
-            let q = ctx.fetch::<P>();
+            let q = ctx.fetch_unchecked::<P>();
             assert_eq!(q.iter().count(), 3);
             println!("  Read<Position>: 3 entities");
         }
@@ -159,7 +159,7 @@ fn test_query_param() {
         // (Read, Read, Read) — три компонента
         {
             type P = QueryParam<(Read<Position>, Read<Velocity>, Read<Mass>)>;
-            let q = ctx.fetch::<P>();
+            let q = ctx.fetch_unchecked::<P>();
             let mut count = 0;
             let mut vel_sum = (0.0f32, 0.0f32);
             q.for_each(|_, (_, vel, _)| {
@@ -176,7 +176,7 @@ fn test_query_param() {
         // Read с With-фильтром
         {
             type P = QueryParam<(Read<Position>, With<Mass>)>;
-            let q = ctx.fetch::<P>();
+            let q = ctx.fetch_unchecked::<P>();
             let count = q.iter().count();
             assert_eq!(count, 2, "With<Mass> должен отфильтровать до 2 entity");
             println!("  (Read<Pos>, With<Mass>): {} entities", count);
@@ -189,7 +189,7 @@ fn test_query_param() {
         // Write<T> — мутабельный доступ
         {
             type P = QueryParam<Write<Position>>;
-            let q = ctx.fetch::<P>();
+            let q = ctx.fetch_unchecked::<P>();
             let count = q.iter().count();
             assert_eq!(count, 3);
             q.for_each(|_, mut pos| { pos.x += 100.0; });
@@ -243,7 +243,7 @@ fn test_commands_and_empty() {
         let mut world = World::new();
         with_ctx(&mut world, |ctx| {
             type P = ();
-            ctx.fetch::<P>(); // () — фетч ничего не возвращает
+            ctx.fetch_unchecked::<P>(); // () — фетч ничего не возвращает
 
             let access = P::access();
             assert!(access.reads.is_empty());
@@ -272,7 +272,7 @@ fn test_tuples() {
         // Кортеж 2: ResRead + ResWrite
         {
             type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>);
-            let (cfg, mut stats) = ctx.fetch::<P>();
+            let (cfg, mut stats) = ctx.fetch_unchecked::<P>();
             assert!((cfg.dt - 0.016).abs() < 1e-6);
             assert_eq!(stats.frame, 1);
             stats.frame += 1;
@@ -286,7 +286,7 @@ fn test_tuples() {
                 QueryParam<(Read<Position>, Read<Velocity>)>,
                 Emit<CollisionEvent>,
             );
-            let (cfg, q, mut writer) = ctx.fetch::<P>();
+            let (cfg, q, mut writer) = ctx.fetch_unchecked::<P>();
             assert!((cfg.gravity - 9.8).abs() < 1e-6);
             let mut e_entity = None;
             q.for_each(|e, (pos, vel)| {
@@ -308,7 +308,7 @@ fn test_tuples() {
                 QueryParam<Read<Position>>,
                 CommandsParam,
             );
-            let (cfg, stats, q, _cmds) = ctx.fetch::<P>();
+            let (cfg, stats, q, _cmds) = ctx.fetch_unchecked::<P>();
             assert!((cfg.dt - 0.016).abs() < 1e-6);
             assert_eq!(stats.frame, 2); // инкрементирован в tuple2
             let count = q.iter().count();
@@ -341,7 +341,7 @@ fn test_inside_exclusive_system() {
                 ResRead<PhysicsConfig>,
                 QueryParam<(Read<Position>, Read<Velocity>)>,
             );
-            let (cfg, q) = ctx.fetch::<Params>();
+            let (cfg, q) = ctx.fetch_unchecked::<Params>();
 
             assert!((cfg.gravity - 9.8).abs() < 1e-6);
             let mut found = 0;

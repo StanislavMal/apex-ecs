@@ -265,10 +265,18 @@ ids`; `event_reserve_by_type`; APEX_MAIN_PROF (движковая диагнос
 unified `Query<'w,'s>`+ReadOnly+sound-аксессоры как «1b/2» одним кросс-репо проходом (~53 ecs + 3 engine
 сайта). Аксессоры НЕ трогаются дважды.
 
-**Волна 1a — Soundness БЕЗ Query-типа (🔴, TECH_DEBT S2+S3/S4+A5).** `ctx.fetch` гейт/увод;
-`World.archetypes`/`World.resources`/`run_sequential(*mut)`/`get_raw_ptr`/`event_queue_ptr` → pub(crate);
-`SubWorld::resource_mut` → `&mut self`/`_unchecked`. Не трогает Query-тип → чистый быстрый заход, ноль
-поломок движка (recon §4.1). *Гейт: workspace+движок+goldens byte-identical; Miri TB targeted.*
+**Волна 1a — Soundness БЕЗ Query-типа (🔴).** ✅ ВЫПОЛНЕНА (2026-07-05, ветка `api-golden-path`).
+Закрыты два реально достижимых из safe-кода прохода: **A5 pub-поля** `World.archetypes`/`resources` →
+pub(crate) (commit b2a1ff5; потребители на `try_resource`/`insert_resource`, +2 serde-делегата) и
+**S2** `ctx.fetch` → `fetch_unchecked` + `#[doc(hidden)]` (ADR-002-консистентно; пример мигрирован).
+**Реклассификация по факту анализа** (§0.2b — не полумерить): (а) raw-МЕТОДЫ (`run_sequential(*mut)`→
+`&mut World`, `get_raw_ptr`, `event_queue_ptr`, `compute_archetype_indices`, `populate_type_names`) —
+футганы, НЕ UB-из-safe (нужен явный unsound-каст) → **харденинг поверхности волны 3**; (б) **S3/S4**
+(`World::event_writer/event_reader(&self)` + `World: Sync`) — реализуемый race лишь при явном шеринге
+`&World` меж-поток; чистый фикс = per-system курсоры (F4) → **волна 4** (rename-only был бы полумерой);
+(в) `SubWorld::resource_mut/event_*(&self)` — ноль вызовов, `&SubWorld` наружу не отдаётся (недостижимо
+из safe) → dead-code/харденинг **волны 3/4**. *Гейт волны 1a: workspace tests ✅, clippy net-neutral ✅,
+движок all-targets, goldens byte-identical.*
 
 **Волна 1b/2 — Unified Query + sound-аксессоры (🔴 S1 + C6, ОДНА работа — спайк GO).** Единый
 `Query<'w, 's, D, F>` держит `UnsafeWorldCell<'w>` + `StateSrc<'s>{Owned|Borrowed}`; `type ReadOnly`-

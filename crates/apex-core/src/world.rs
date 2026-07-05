@@ -2470,14 +2470,18 @@ impl<'w> SystemContext<'w> {
         self.world().entity_count()
     }
 
-    /// Извлечь параметры через трейт [`SystemParam`](crate::system_param::SystemParam).
+    /// Fetch declared parameters via [`SystemParam`](crate::system_param::SystemParam).
     ///
-    /// ```ignore
-    /// type Params = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>);
-    /// let (dt, q) = ctx.fetch::<Params>();
-    /// ```
+    /// `#[doc(hidden)]` + `_unchecked`: this bypasses the scheduler's access
+    /// validation — `P` is fetched whether or not the running system *declared*
+    /// it, so `fetch_unchecked::<ResWrite<B>>()` from a system that didn't declare
+    /// `B` is an undeclared mutable access (data race, F3/ADR-002 class). Sound
+    /// only when `P` equals the system's declared params (`Self::Params`), which
+    /// the scheduler validated. The blessed path is params-as-access (declared
+    /// `SystemParam` arguments); direct `fetch` is the raw mechanism, not API.
+    #[doc(hidden)]
     #[inline]
-    pub fn fetch<P: crate::system_param::SystemParam>(&self) -> P::Item<'_> {
+    pub fn fetch_unchecked<P: crate::system_param::SystemParam>(&self) -> P::Item<'_> {
         P::fetch(self)
     }
 

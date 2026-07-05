@@ -32,28 +32,32 @@
   комментарий у `get_mut` «`&self` достаточно» неверен); то же у `CachedQuery`
   (`world.rs:~2706,2934`), который вдобавок `#[derive(Clone)]` (`world.rs:2559`) + Send/Sync →
   клонируемый write-запрос гоняется из двух потоков. PoC (три строки safe-кода): `new_mut::<Write<T>>`
-  → двойной `q.get(e)` → два алиасящих `&mut T` на одну строку. Тот же класс:
-  `SubWorld::resource_mut(&self)` (`sub_world.rs:190`) — вообще без `_unchecked`-суффикса. *Золотой
-  путь:* `&mut self` на write-аксессорах (модель Bevy `get_mut`/`iter_mut`), снять `Clone` с
+  → двойной `q.get(e)` → два алиасящих `&mut T` на одну строку. (Смежное:
+  `SubWorld::resource_mut/event_*(&self)` `sub_world.rs:190+` — тот же &self-write паттерн, НО ноль
+  вызовов и `&SubWorld` наружу не отдаётся → недостижимо из safe → волна 3/4 dead-code, не S1.)
+  *Золотой путь S1:* `&mut self` на write-аксессорах (модель Bevy `get_mut`/`iter_mut`), снять `Clone` с
   write-варианта CachedQuery; read-аксессоры остаются `&self` (Bevy-трюк: read-методы подставляют
   `Q::ReadOnly`). Гейт: PoC перестаёт компилироваться; Miri TB; goldens byte-identical.
-- **A5 🔴 — сырая pub-поверхность хранилища (аудит-A5, «делаем безусловно волны 1/4» — ВЫПАЛ;
-  найден повторно API-инвентаризацией 2026-07-05).** `World.archetypes: Vec<Archetype>` и
-  `World.resources: Resources` — **pub-ПОЛЯ** (`world.rs:198/213`): `world.archetypes.clear()` из
-  safe-кода ломает все инварианты хранилища. Туда же: `Scheduler::run_sequential(*mut World)` — pub с
-  сырым указателем; `Resources::get_raw_ptr` (`resources.rs:~159`); `World::event_queue_ptr`;
-  `compute_archetype_indices`/`populate_type_names` (фазы compile — pub). *Фикс:* pub(crate) + фасады
-  для легальных консумеров (движок через существующие аксессоры). Одна волна с S1/S2
-  (`plans/active/API_GOLDEN_PATH.md` волна 1).
-- **S2 🔴 — `SystemContext::fetch::<P>()` — safe-обход F3/ADR-002.** `ctx.fetch::<ResWrite<B>>()`
-  (`world.rs:2466`) — публичный документированный safe-метод к `_unchecked`-семейству без декларации
-  доступа → недекларированный live-write, обесценивает `#[doc(hidden)]`-стратегию ADR-002 (в ADR не
-  учтён). *Путь:* гейтить `fetch` по декларации либо перевести в `_unchecked`/`#[doc(hidden)]`.
-- **S3 🟡 — `World::event_writer/event_reader(&self)` = гонка из safe-кода.** `world.rs:~913-933`
-  мутируют event-очереди через `&World`; `World: Sync` (unsafe impl для `ResourceCell`
-  `resources.rs:17` / `EventQueueCell` `events.rs:1053`) → два потока с `&World` в safe-коде. Тот же
-  класс, что ADR-002 закрыл на `SystemContext`, но на самом `World` оставлен.
-- **S4 🟡 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне conflict-детекции.**
+- **A5 ✅ ЧАСТИЧНО (pub-ПОЛЯ закрыты 2026-07-05, commit b2a1ff5) — сырая pub-поверхность хранилища.**
+  `World.archetypes`/`World.resources` были **pub-ПОЛЯ** (`world.rs:198/213`): `world.archetypes.clear()`
+  из safe-кода ломал инварианты. **→ pub(crate)**; потребители (scripting/isolated/hot-reload/
+  serialization/examples) переведены на `World::try_resource`/`insert_resource`; +`World::
+  snapshot_resources_serde`/`restore_resource_serde` для сериализатора. **ОСТАТОК → волна 3 (харденинг
+  поверхности, НЕ UB-из-safe):** raw-МЕТОДЫ `run_sequential(*mut World)`→`&mut World` (тривиально,
+  исходно-совместимо — все вызовы уже `&mut world`, движком не используется), `Resources::get_raw_ptr`,
+  `World::event_queue_ptr`, `compute_archetype_indices`/`populate_type_names` (фазы compile). Для плохого
+  `*mut` нужен явный unsound-каст → футган, не прямой UB-из-safe.
+- **S2 ✅ ЗАКРЫТ (2026-07-05) — `SystemContext::fetch::<P>()` safe-обход F3/ADR-002.** `ctx.fetch::<P>()`
+  фетчил ЛЮБОЙ SystemParam без сверки декларации → недекларированный live-write. **→ `fetch_unchecked`
+  + `#[doc(hidden)]`** (ADR-002-консистентно с `query_unchecked`/`resource_mut_unchecked`); единственный
+  потребитель — пример `system_param.rs` — мигрирован. Полное устранение (params-as-args, `fetch` не
+  нужен) — Р-1/волна 3.
+- **S3 🟡 → ВОЛНА 4 — `World::event_writer/event_reader(&self)` = гонка из safe-кода.** `world.rs:~913-933`
+  мутируют event-очереди через `&World`; `World: Sync` → два потока с `&World` в safe. **Реализуемо лишь
+  при явном меж-поточном шеринге `&World`** (планировщик использует UnsafeWorldCell, не `&World`) →
+  футган-класс. Чистый фикс = per-system курсоры (F4) → **волна 4** (rename-only был бы полумерой §0.2b;
+  используется примером basic.rs И EventReader-SystemParam).
+- **S4 🟡 → ВОЛНА 4 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне conflict-детекции.**
   `ctx.event_reader` (`world.rs:2427`) благословлён как «read», но `EventReader::new`→`add_reader`
   пишет в реестр курсоров (push/realloc, `events.rs:163-178`). Для ДЕКЛАРИРОВАННЫХ читателей гонку
   закрывает F2 (`SharedEventReaders`), но недекларированный ctx-путь планировщик не видит. Связан с F4.
