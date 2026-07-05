@@ -822,7 +822,6 @@ impl World {
     /// the component type is not known statically — used on snapshot/prefab
     /// restore). See the `_dyn` naming canon in `docs/CONVENTIONS.md`.
     #[inline]
-    #[doc(alias = "insert_raw_pub")]
     pub fn insert_dyn(
         &mut self,
         entity: Entity,
@@ -831,20 +830,6 @@ impl World {
         tick: Tick,
     ) {
         self.insert_raw(entity, component_id, data, tick);
-    }
-
-    /// Deprecated alias of [`insert_dyn`](Self::insert_dyn) (`_raw` was ambiguous
-    /// between raw pointers and by-`ComponentId` access; canon is `_dyn`).
-    #[inline]
-    #[deprecated(since = "0.1.0", note = "renamed to `insert_dyn`")]
-    pub fn insert_raw_pub(
-        &mut self,
-        entity: Entity,
-        component_id: ComponentId,
-        data: Vec<u8>,
-        tick: Tick,
-    ) {
-        self.insert_dyn(entity, component_id, data, tick);
     }
 
     // ── Параллельный доступ ────────────────────────────────────
@@ -2603,24 +2588,12 @@ impl<'w> SystemContext<'w> {
     /// Subjects pointing at `parent` via relation `R` (see
     /// [`World::targets_of`](crate::world::World::targets_of)).
     #[inline]
-    #[doc(alias = "children_of")]
     pub fn targets_of<R: crate::relations::RelationKind>(
         &self,
         kind: R,
         parent: Entity,
     ) -> impl Iterator<Item = Entity> + '_ {
         self.world().targets_of(kind, parent)
-    }
-
-    /// Deprecated alias of [`targets_of`](Self::targets_of).
-    #[inline]
-    #[deprecated(since = "0.1.0", note = "renamed to `targets_of`")]
-    pub fn children_of<R: crate::relations::RelationKind>(
-        &self,
-        kind: R,
-        parent: Entity,
-    ) -> impl Iterator<Item = Entity> + '_ {
-        self.targets_of(kind, parent)
     }
 
     /// Проверить наличие relation `R` между `subject` и `target`.
@@ -2637,24 +2610,12 @@ impl<'w> SystemContext<'w> {
     /// Target of the first relation `R` from `subject` (see
     /// [`World::target_of`](crate::world::World::target_of)).
     #[inline]
-    #[doc(alias = "get_relation_target")]
     pub fn target_of<R: crate::relations::RelationKind>(
         &self,
         subject: Entity,
         kind: R,
     ) -> Option<Entity> {
         self.world().target_of(subject, kind)
-    }
-
-    /// Deprecated alias of [`target_of`](Self::target_of).
-    #[inline]
-    #[deprecated(since = "0.1.0", note = "renamed to `target_of`")]
-    pub fn get_relation_target<R: crate::relations::RelationKind>(
-        &self,
-        subject: Entity,
-        kind: R,
-    ) -> Option<Entity> {
-        self.target_of(subject, kind)
     }
 }
 
@@ -3435,7 +3396,6 @@ impl World {
     /// то после спавна автоматически устанавливается `ChildOf(parent)`.
     /// Пара к [`spawn_template`](Self::spawn_template) (параметры по умолчанию),
     /// `_with`-канон (см. `docs/CONVENTIONS.md`).
-    #[doc(alias = "spawn_from_template")]
     pub fn spawn_template_with(
         &mut self,
         name: &str,
@@ -3449,16 +3409,6 @@ impl World {
             self.add_relation(entity, crate::relations::ChildOf, parent);
         }
         Some(entity)
-    }
-
-    /// Deprecated alias of [`spawn_template_with`](Self::spawn_template_with).
-    #[deprecated(since = "0.1.0", note = "renamed to `spawn_template_with`")]
-    pub fn spawn_from_template(
-        &mut self,
-        name: &str,
-        params: &crate::template::TemplateParams,
-    ) -> Option<crate::entity::Entity> {
-        self.spawn_template_with(name, params)
     }
 
     /// Создать entity из шаблона с параметрами по умолчанию.

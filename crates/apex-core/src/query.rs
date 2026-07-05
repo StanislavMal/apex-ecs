@@ -355,19 +355,6 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
     }
 }
 
-// ── Bevy-подобные алиасы и `&T`/`&mut T` синтаксис (C3) ─────────
-
-/// Deprecated alias of [`Read<T>`]. This is a semantic trap: in Bevy `Ref<T>`
-/// means a *read reference with change detection* (a distinct type), whereas here
-/// it is merely a synonym for `Read<T>` and carries no change-detection semantics.
-/// Use `&T` / [`Read<T>`] for plain reads; the `Ref<T>` name is reserved for a
-/// future real change-detection read type (Bevy parity).
-#[deprecated(
-    since = "0.1.0",
-    note = "use `&T` or `Read<T>`; `Ref<T>` is reserved for a future change-detection read type"
-)]
-pub type Ref<T> = Read<T>;
-
 // ── ReadOnlyWorldQuery ─────────────────────────────────────────
 
 /// Marker for query shapes that can never hand out mutable component access.

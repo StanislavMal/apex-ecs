@@ -528,18 +528,11 @@ impl Commands {
     /// cmds.spawn_template_with("Monster", TemplateParams::new()
     ///     .set::<MonsterSpeed>(10.0f32));
     /// ```
-    #[doc(alias = "spawn_from_template")]
     pub fn spawn_template_with(&mut self, name: &str, params: TemplateParams) {
         self.queue.push(Command::SpawnFromTemplate {
             name: name.to_string(),
             params: Box::new(params),
         });
-    }
-
-    /// Deprecated alias of [`spawn_template_with`](Self::spawn_template_with).
-    #[deprecated(since = "0.1.0", note = "renamed to `spawn_template_with`")]
-    pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
-        self.spawn_template_with(name, params);
     }
 
     /// Создать entity из шаблона с параметрами по умолчанию.

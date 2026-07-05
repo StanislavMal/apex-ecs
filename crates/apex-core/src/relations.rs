@@ -882,7 +882,6 @@ impl World {
     /// Subjects pointing at `parent` via relation `R` — O(number of subjects).
     /// The plural pairs with [`target_of`](Self::target_of) (single target of a
     /// subject); `_of` naming reads uniformly for both directions.
-    #[doc(alias = "children_of")]
     pub fn targets_of<'w, R: RelationKind>(
         &'w self,
         _kind: R,
@@ -897,18 +896,7 @@ impl World {
         subjects.iter().copied()
     }
 
-    /// Deprecated alias of [`targets_of`](Self::targets_of).
-    #[deprecated(since = "0.1.0", note = "renamed to `targets_of`")]
-    pub fn children_of<'w, R: RelationKind>(
-        &'w self,
-        kind: R,
-        parent: Entity,
-    ) -> impl Iterator<Item = Entity> + 'w {
-        self.targets_of(kind, parent)
-    }
-
     /// Target of the first relation of kind `R` from `subject` (generation-correct).
-    #[doc(alias = "get_relation_target")]
     pub fn target_of<R: RelationKind>(&self, subject: Entity, _kind: R) -> Option<Entity> {
         if !self.entities.is_alive(subject) {
             return None;
@@ -917,16 +905,6 @@ impl World {
         self.subject_index
             .first_with_kind(subject.index, kind_idx)
             .map(|p| p.target)
-    }
-
-    /// Deprecated alias of [`target_of`](Self::target_of).
-    #[deprecated(since = "0.1.0", note = "renamed to `target_of`")]
-    pub fn get_relation_target<R: RelationKind>(
-        &self,
-        subject: Entity,
-        kind: R,
-    ) -> Option<Entity> {
-        self.target_of(subject, kind)
     }
 
     /// Рекурсивный despawn поддерева по виду связи.

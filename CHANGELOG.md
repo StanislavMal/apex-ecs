@@ -11,7 +11,8 @@
   `par_for_each_used(id)`, `add_dependency(id,id)`, `system_access(id)`,
   `set_run_if[_cond]`) — всё выражается `add_systems` + конструкторами
   `sys`/`seq`/`par`/`par_access`/`SystemConfig::exclusive` + bare-идентификаторами;
-  порядок — `chain`/`before`/`after` по именам, `par_for_each_used_by_name`.
+  порядок — `.chain()`/`.before()`/`.after()` на конфигах (по именам — для
+  динамики); `par_for_each` — декларативно через `SystemConfig::par_for_each_used()`.
 - **`staged(label, f)` → `scoped(f)`**: скоуп-условия отделены от стадий (стадия
   теперь всегда явная в `add_systems`). Попутно закрыты ДВА латентных бага:
   (1) путь `add_systems` молча терял scope-условия (документированный паттерн
@@ -26,6 +27,27 @@
 - **Удалён `World::try_send_event`** — дубль `send_event` (всегда возвращал true).
 - `add_systems(Startup, …)` после завершения Startup-этапа теперь предупреждает
   в лог (раньше предупреждали только удалённые `add_startup_*`).
+
+### Changed — API golden path (2026-07-05, ядро не публиковалось — без deprecation-цикла)
+
+- **Ренеймы под naming-канон** (`docs/CONVENTIONS.md`): `World::insert_raw_pub` →
+  `insert_dyn`; `children_of` → `targets_of`, `get_relation_target` → `target_of`
+  (World, SystemContext, RelationRegistry); `World/Commands::spawn_from_template` →
+  `spawn_template_with` (пара к `spawn_template`); императивный
+  `Scheduler::par_for_each_used_by_name` → декларативный
+  `SystemConfig::par_for_each_used()`. `Ref<T>`-алиас удалён (был semantic-trap
+  синоним `Read<T>`; имя зарезервировано под будущий change-detection-тип).
+  Переходные `#[deprecated]`-алиасы удалены пред-релизно (все внутренние вызовы
+  мигрированы; ядро не публиковалось — снос без major-bump).
+- **`Query`-зоопарк схлопнут в единый `Query<'w, 's, D, F>`** (`CachedQuery` и
+  view-часть `QueryState` убраны); read/write разделены по типам (`&self`-read
+  требует `ReadOnlyWorldQuery`, `*_mut`-write эксклюзивны).
+- **Событийная поверхность сужена**: `EventRegistry` → `pub(crate)`;
+  `Events::{send_sync,send_batch_sync,flush_sync}` → `#[doc(hidden)]` (golden-path —
+  `EventWriter<T>`-параметр).
+- **`ErrorHandler` (§0.2a)**: per-World политика осознанных дропов
+  (`Warn`/`Panic`/`Silent`/`Custom` + счётчики аномалий), `world.set_error_mode(..)`,
+  `APEX_ERROR_MODE`.
 
 ### Added
 

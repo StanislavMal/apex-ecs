@@ -1234,21 +1234,6 @@ impl Scheduler {
     // config object for all parallelism tuning. (Former setters
     // `set_parallel_min_entities` / `set_parallel_auto_disable` removed.)
 
-    /// Пометить AutoSystem (по SystemId) как использующую `par_for_each` внутри.
-    /// Планировщик не будет дополнительно чанковать эту систему через ASD.
-    fn par_for_each_used(&mut self, id: SystemId) -> &mut Self {
-        if let Some(sys) = self
-            .system_indices
-            .get(&id)
-            .and_then(|&idx| self.systems.get_mut(idx))
-        {
-            if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
-                access.uses_par_for_each = true;
-            }
-        }
-        self
-    }
-
     /// Эвристика: минимальное количество entity на одну систему для окупаемости
     /// параллелизма (rayon overhead < выигрыш).
     ///
@@ -1767,18 +1752,6 @@ impl Scheduler {
         self.merge_scope_condition(id);
         self.invalidate_plan();
         id
-    }
-
-    /// `par_for_each_used` по имени системы (удобно с `add_systems`).
-    #[deprecated(
-        since = "0.1.0",
-        note = "declare it on the config: `sys(name, s).par_for_each_used()`"
-    )]
-    #[doc(alias = "par_for_each_used")]
-    pub fn par_for_each_used_by_name(&mut self, name: &str) -> Result<&mut Self, SchedulerError> {
-        let id = self.find_id_by_name(name)?;
-        self.par_for_each_used(id);
-        Ok(self)
     }
 
     /// Получить `&mut SystemDescriptor` по `SystemId` (O(1)).
