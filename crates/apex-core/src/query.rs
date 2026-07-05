@@ -1621,7 +1621,26 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// `Query::get`). O(1) по location + поиск архетипа среди матчащих
     /// (их единицы); построчные фильтры (`Changed`/`Added` в Q или F)
     /// применяются — не прошедшая фильтр entity даёт `None`.
-    pub fn get(&self, entity: Entity) -> Option<Q::Item<'_>> {
+    /// Read-only формы: item на `&self`. Write-формы — [`get_mut`](Self::get_mut):
+    /// `q.get(e)` дважды на write-форме дало бы ДВА `Mut<T>` на одну строку
+    /// (aliasing из safe-кода, S1) — `ReadOnlyWorldQuery`-бинд это запрещает,
+    /// мутабельный доступ идёт только через `&mut self`.
+    pub fn get(&self, entity: Entity) -> Option<Q::Item<'_>>
+    where
+        Q: ReadOnlyWorldQuery,
+    {
+        self.get_impl(entity)
+    }
+
+    /// Item конкретной entity для мутабельных форм. `&mut self` доказывает
+    /// эксклюзивность — второго живого item на ту же строку быть не может.
+    #[inline]
+    pub fn get_mut(&mut self, entity: Entity) -> Option<Q::Item<'_>> {
+        self.get_impl(entity)
+    }
+
+    #[inline]
+    fn get_impl(&self, entity: Entity) -> Option<Q::Item<'_>> {
         let loc = self.world.entities.get_location(entity)?;
         let arch_idx = loc.archetype_id.as_usize();
         let a = self.archetypes.iter().find(|a| a.arch_idx == arch_idx)?;
@@ -1633,13 +1652,6 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         unsafe { <(Q, F)>::fetch_item(a.state, row) }.map(|(item, _)| item)
     }
 
-    /// Алиас [`get`](Self::get) для мутабельных форм (Bevy-паритет;
-    /// item `Write<T>` — это `Mut<T>`, `&self` достаточно).
-    #[inline]
-    pub fn get_mut(&mut self, entity: Entity) -> Option<Q::Item<'_>> {
-        self.get(entity)
-    }
-
     /// Ровно одна матчащаяся entity (Bevy-паритет, D2-2).
     ///
     /// `Err(QuerySingleError)` при нуле или нескольких. Выдаёт `Q::Item`
@@ -1648,19 +1660,28 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// `Write<T>` — это `Mut<T>`), поэтому отдельного `&mut self`-варианта
     /// не требуется; [`single_mut`](Self::single_mut) — алиас для привычки
     /// мигранта.
-    pub fn single(&self) -> Result<Q::Item<'_>, QuerySingleError> {
+    pub fn single(&self) -> Result<Q::Item<'_>, QuerySingleError>
+    where
+        Q: ReadOnlyWorldQuery,
+    {
+        self.single_impl()
+    }
+
+    /// [`single`](Self::single) для мутабельных форм (`&mut self` эксклюзивен —
+    /// повторный вызов невозможен, второго `Mut` на ту же строку не будет).
+    #[inline]
+    pub fn single_mut(&mut self) -> Result<Q::Item<'_>, QuerySingleError> {
+        self.single_impl()
+    }
+
+    #[inline]
+    fn single_impl(&self) -> Result<Q::Item<'_>, QuerySingleError> {
         let mut it = self.iter();
         let first = it.next().ok_or(QuerySingleError::NoEntities)?;
         if it.next().is_some() {
             return Err(QuerySingleError::MultipleEntities);
         }
         Ok(first)
-    }
-
-    /// Алиас [`single`](Self::single) (Bevy-паритет).
-    #[inline]
-    pub fn single_mut(&mut self) -> Result<Q::Item<'_>, QuerySingleError> {
-        self.single()
     }
 
     /// Потребляющая форма [`single`](Self::single): item живёт `'w` (мировой
