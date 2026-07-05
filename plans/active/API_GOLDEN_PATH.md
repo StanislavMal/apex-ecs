@@ -381,8 +381,16 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
   (НЕ Bevy-lossy-rewrite — сохранён наш no-loss registry; бонус: no-loss активирован для system-читателей)
   — в `plans/TECH_DEBT.md` F4. Регресс-тест + Miri TB. **F4b (edge, TECH_DEBT):** AutoSystem/`system!`-путь
   (`ctx.event_reader` прямой) — не персистентен (macro-хирургия); golden-path закрыт.
-- **⏳ Остаток волны 4:** reader-API/EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс
-  с Severity/контекстом (§0.2a системно). — переставимо с волной P.
+- **✅ Surface-diet (ecs `c9e3336`, 2026-07-05):** `EventRegistry` → pub(crate) + снят из root-реэкспорта
+  (ноль внешних потребителей; заодно контейнит `EventRegistry::get_raw_ptr`-footgun внутри крейта);
+  +удалены 6 обнажившихся мёртвых методов реестра (try_get/try_get_mut/get_mut_by_typeid/is_registered/
+  queue_count/total_event_count — §0.2a: снести, не глушить). `Events::{send_sync,send_batch_sync,
+  flush_sync}` → `#[doc(hidden)]` advanced (это `&self`-escape; golden-path = декларированный
+  `EventWriter<T>`, шлёт `&mut send`, планировщик сериализует писателей). Гейты все зелёные (649/0/9).
+- **⏳ reader-API (EventCursor/PeekGuard/PartialReadGuard/EventIterator) → pub(crate) — ЗАБЛОКИРОВАНО:**
+  движок реально использует (EventCursor×8, add_reader×3) → нужна миграция движка ИЛИ решение
+  «легитимный low-level API». Не форсить.
+- **⏳ Остаток волны 4:** ErrorHandler-ресурс с Severity/контекстом (§0.2a системно). — переставимо с волной P.
 
 > **§0.9-РЕШЕНИЕ ПО F4 (важно, не переоткрывать):** рассматривались (A) персист. registry-курсор [СДЕЛАНО]
 > vs (B) Bevy-паритетный local-cursor (параллельные читатели). **Выбран (A)**, потому что (B) требует
