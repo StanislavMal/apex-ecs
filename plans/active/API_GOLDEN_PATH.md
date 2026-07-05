@@ -374,7 +374,7 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
 **par_for_each-декларатив**) выполнены. NEXT = волна 4 (события+ErrorHandler) ИЛИ 6 (relations) —
 переставимы; затем волна P (снос deprecated-алиасов), волна 5 (руководство).
 
-**Волна 4 — События+ошибки. 🔶 ЧАСТИЧНО (F4 ✅ golden-path, 2026-07-05).**
+**Волна 4 — События+ошибки. ✅ ЗАКРЫТА golden-path (2026-07-05; reader-API заблокирован — хвост).**
 - **✅ F4 персистентные курсоры (ecs `f6c0c2d`):** `EventReader`-параметр → `State =
   EventReaderState<E>`; персистентный курсор через `SystemContext::event_reader_persistent`; Drop не
   освобождает персист-курсор. Чинит FixedUpdate-дубли + ложь rustdoc `Removed<T>`. Детали и §0.9-решение
@@ -387,10 +387,23 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
   queue_count/total_event_count — §0.2a: снести, не глушить). `Events::{send_sync,send_batch_sync,
   flush_sync}` → `#[doc(hidden)]` advanced (это `&self`-escape; golden-path = декларированный
   `EventWriter<T>`, шлёт `&mut send`, планировщик сериализует писателей). Гейты все зелёные (649/0/9).
+- **✅ ErrorHandler — системный §0.2a (ecs `754ed44`, 2026-07-05):** per-World `ErrorHandler` (ПОЛЕ на
+  World, зеркалит ChunkConfig-прецедент — НЕ ресурс: всегда присутствует с дефолтом, дёшево, per-world) с
+  режимами `Warn`(throttled-лог, дефолт=поведение сегодня)/`Panic`(strict: дропы→panic, тесты/CI)/`Silent`
+  (только счёт)/`Custom(Fn)`; `from_env()`=`APEX_ERROR_MODE`. `Anomaly{severity,op,entity,component,detail}` —
+  структурный контекст (не format-строка) → Custom-хендлер инспектирует ЧТО дропнуто. Счётчики независимы
+  от throttle → CI ассертит `counts().total()==0` («ноль дропов»). Макрос `anomaly!` — преемник `warn_once!`
+  (держит per-call-site latch). **Анти-mimicry (§0.9):** per-World, НЕ Bevy-глобал `GLOBAL_ERROR_HANDLER` —
+  IsolatedWorld/snapshot/editor-scratch каждый со своей политикой (strict-тест-мир паникует, live логирует),
+  глобал `OnceLock` так не умеет. **Охват фокусный:** мигрированы 9 §0.2a-сайтов с World в scope
+  (world.rs ×6, commands.rs ×2, serializer restore ×1). Регресс-тесты на все режимы через реальный
+  insert-on-dead путь. Гейты 649/0/9 byte-identical, новый unsafe=0.
+- **⏳ World-less §0.2a-хвост (TECH_DEBT, низкий приоритет):** TemplateParams, WorldBridge кросс-world
+  каналы (§В4), script iterators, DynItem-view — остаются на `warn_once!` (нет World в scope для политики).
+  Апгрейд потребует прокидывать политику ИЛИ процесс-глобальный фолбэк (частичная мимикрия) — не форсить.
 - **⏳ reader-API (EventCursor/PeekGuard/PartialReadGuard/EventIterator) → pub(crate) — ЗАБЛОКИРОВАНО:**
   движок реально использует (EventCursor×8, add_reader×3) → нужна миграция движка ИЛИ решение
   «легитимный low-level API». Не форсить.
-- **⏳ Остаток волны 4:** ErrorHandler-ресурс с Severity/контекстом (§0.2a системно). — переставимо с волной P.
 
 > **§0.9-РЕШЕНИЕ ПО F4 (важно, не переоткрывать):** рассматривались (A) персист. registry-курсор [СДЕЛАНО]
 > vs (B) Bevy-паритетный local-cursor (параллельные читатели). **Выбран (A)**, потому что (B) требует

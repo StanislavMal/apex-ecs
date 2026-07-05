@@ -117,6 +117,16 @@
 
 ## 🟢 Бездомные — чистота/эргономика/док-честность
 
+- **ErrorHandler world-less хвост 🟢 (API_GOLDEN_PATH волна 4, 2026-07-05).** Системный §0.2a
+  `ErrorHandler` (per-World поле, `anomaly!`-макрос, режимы Warn/Panic/Silent/Custom + счётчики; ecs
+  `754ed44`) охватил 9 сайтов с World в scope (world.rs ×6, commands.rs ×2, serializer restore ×1).
+  **Остаются на `warn_once!`** (нет World в scope → политику не достать): `TemplateParams::set`
+  (`template.rs`), `WorldBridge`/`CloneableBridge` кросс-world send-дропы (`apex-isolated`, смежно §В4),
+  script-query незарег. компоненты (`apex-scripting/iterators.rs` ×4), `DynItem`/`DynItemMut`
+  type-mismatch (`query.rs` ×3). Апгрейд потребует прокидывать `&ErrorHandler` в эти пути ИЛИ ввести
+  процесс-глобальный фолбэк (частичная мимикрия Bevy-глобала — против нашей per-world модели §0.9).
+  Осознанный фокусный охват, не полумера: golden-path мутаций покрыт; хвост — по спросу.
+
 - **ParallelPolicy 🟡 — обещан планом, не реализован; комментарий в коде лжёт.** План PARALLELISM §3.1
   обещал тип-политику (`ParallelPolicy`) с `Fixed`-фолбэком для отключения cost-model при патологии
   EMA. Не реализовано: пороги — захардкоженные `const`, ручки нет (только `parallel_min_entities` как
