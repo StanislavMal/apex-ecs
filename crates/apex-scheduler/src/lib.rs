@@ -759,16 +759,10 @@ pub struct Scheduler {
     stage_ran_seq: Vec<bool>,
 
     // ── Конфигурация параллелизма ───────────────────────────────
-    /// Минимальное количество entity в Stage для параллельного выполнения.
-    /// Если суммарное entity_count систем Stage меньше этого порога —
-    /// Stage выполняется последовательно (rayon overhead > выигрыша).
-    /// 0 = без ограничений (текущее поведение).
-    parallel_min_entities: usize,
-
-    /// Автоматически отключать параллелизм, если per-system entity count
-    /// ниже порога окупаемости (rayon overhead > выигрыш).
-    /// Использует эвристику на основе числа систем в Stage.
-    auto_disable_parallel: bool,
+    // Stage-parallelism gating moved to `ChunkConfig` on the World (wave 3,
+    // §1.7 single-config model): the scheduler reads
+    // `world.chunk_config().stage_parallel_min_entities` /
+    // `.auto_disable_stage_parallel` at stage-decision time.
 
     // ── Инкрементальный граф ────────────────────────────────────
     /// Граф зависимостей: узлы = SystemId, рёбра = ConflictKind.
@@ -876,8 +870,6 @@ impl Scheduler {
             stage_last_run: Vec::new(),
             stage_cost_ema_ns: Vec::new(),
             stage_ran_seq: Vec::new(),
-            parallel_min_entities: 0, // 0 = без ограничений
-            auto_disable_parallel: true, // true = автоотключение по умолчанию
             dependency_graph: Graph::new(),
             graph_nodes: FxHashMap::default(),
             edge_set: FxHashSet::default(),
@@ -1254,35 +1246,12 @@ impl Scheduler {
         }
     }
 
-    /// Установить минимальное количество entity для параллельного выполнения Stage.
-    ///
-    /// Если суммарное количество entity всех систем в Stage меньше этого порога,
-    /// Stage выполняется последовательно (избегаем rayon overhead для мелких миров).
-    ///
-    /// По умолчанию: `0` (без ограничений).
-    pub fn set_parallel_min_entities(&mut self, min: usize) -> &mut Self {
-        self.parallel_min_entities = min;
-        self
-    }
-
-    /// Включить/выключить автоматическое отключение параллелизма на основе
-    /// эвристики per-system entity count.
-    ///
-    /// Когда включено, движок вычисляет среднее количество entity на одну
-    /// систему в Stage и отключает параллелизм, если порог не достигнут:
-    ///   - 3+ систем:   min 15 000 entity/system
-    ///   - 2 системы:   min 25 000 entity/system
-    ///   - 1 система:   min 80 000 entity/system
-    ///
-    /// Пороги подобраны эмпирически (parallel_diagnostics benchmark, 12 ядер).
-    /// «Valley of death» (PAR в 2-3x медленнее SEQ) — 5 000–50 000 entity
-    /// в зависимости от числа систем.
-    ///
-    /// По умолчанию: `true` (автоотключение включено).
-    pub fn set_parallel_auto_disable(&mut self, enabled: bool) -> &mut Self {
-        self.auto_disable_parallel = enabled;
-        self
-    }
+    // Stage-parallelism gating is configured on the World, not the scheduler
+    // (wave 3, §1.7): `world.set_chunk_config(ChunkConfig {
+    // stage_parallel_min_entities, auto_disable_stage_parallel, ..default() })`.
+    // The scheduler reads these from `world.chunk_config()` at run time — one
+    // config object for all parallelism tuning. (Former setters
+    // `set_parallel_min_entities` / `set_parallel_auto_disable` removed.)
 
     /// Пометить AutoSystem (по SystemId) как использующую `par_for_each` внутри.
     /// Планировщик не будет дополнительно чанковать эту систему через ASD.
@@ -3014,6 +2983,13 @@ impl Scheduler {
         let const_ptr = world_ptr as *const World;
         let mut prev_arch_count = unsafe { &*const_ptr }.archetypes().len();
 
+        // Stage-parallelism gating knobs live on the World's `ChunkConfig` (wave 3
+        // §1.7). Config is stable during a run, so read once here.
+        let (stage_par_min, auto_disable_stage) = {
+            let cc = unsafe { &*const_ptr }.chunk_config();
+            (cc.stage_parallel_min_entities, cc.auto_disable_stage_parallel)
+        };
+
         // D8b: per-system command buffers — one slot per system in rank (stage_ids)
         // order, rebuilt per stage below and applied in rank order. This makes both
         // command ordering AND (via per-system block reservers) entity-id assignment
@@ -3206,8 +3182,8 @@ impl Scheduler {
             //      entity heuristic would serialize, and serializes light-high-entity
             //      stages it would parallelize (Д1/Д2);
             //   3. else (cold start, no history yet) fall back to the entity heuristic.
-            let stage_entity_count: usize = if self.parallel_min_entities > 0
-                || self.auto_disable_parallel
+            let stage_entity_count: usize = if stage_par_min > 0
+                || auto_disable_stage
             {
                 let total_entities: usize = arch_lengths.iter().sum();
                 stage_ids
@@ -3226,15 +3202,15 @@ impl Scheduler {
             } else {
                 0
             };
-            let below_hard_limit = self.parallel_min_entities > 0
-                && stage_entity_count < self.parallel_min_entities;
+            let below_hard_limit = stage_par_min > 0
+                && stage_entity_count < stage_par_min;
             let has_cost_history =
                 self.stage_cost_ema_ns.get(stage_idx).copied().unwrap_or(0.0) > 0.0;
             let should_fallback = if below_hard_limit {
                 true
             } else if has_cost_history {
                 self.cost_model_prefers_seq(stage_idx)
-            } else if self.auto_disable_parallel {
+            } else if auto_disable_stage {
                 let sys_count = stage_ids.len();
                 let per_system = stage_entity_count / sys_count.max(1);
                 per_system < Self::min_entities_for_parallelism(sys_count)
@@ -6598,6 +6574,7 @@ mod tests {
             max_chunk_size: 65536,
             auto_serial_fallback: false,
             task_multiplier: 2.0,
+            ..Default::default()
         });
         world.spawn_many(N, |_| (Hits(0),));
 

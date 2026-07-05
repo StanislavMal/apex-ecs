@@ -61,8 +61,11 @@ fn run_once() -> Vec<(u32, u32, u32)> {
     // Force the true parallel path on this (fresh, no cost-history) run so the three
     // spawners actually race — otherwise a small stage would fall back to sequential
     // (which is trivially deterministic and would not exercise the block scheme).
-    sched.set_parallel_auto_disable(false);
-    sched.set_parallel_min_entities(0);
+    world.set_chunk_config(apex_core::world::ChunkConfig {
+        auto_disable_stage_parallel: false,
+        stage_parallel_min_entities: 0,
+        ..Default::default()
+    });
     sched.add_systems(StageLabel::Update, (spawn_a, spawn_b, spawn_c));
     sched.compile_with_world(&world).unwrap();
     sched.run(&mut world);
@@ -124,8 +127,11 @@ fn non_deterministic_mode_still_spawns_correctly() {
     }
     let mut sched = Scheduler::new();
     // deterministic_spawn left OFF (default).
-    sched.set_parallel_auto_disable(false);
-    sched.set_parallel_min_entities(0);
+    world.set_chunk_config(apex_core::world::ChunkConfig {
+        auto_disable_stage_parallel: false,
+        stage_parallel_min_entities: 0,
+        ..Default::default()
+    });
     sched.add_systems(StageLabel::Update, (spawn_a, spawn_b, spawn_c));
     sched.compile_with_world(&world).unwrap();
     sched.run(&mut world);
@@ -182,8 +188,11 @@ fn deterministic_reuse_under_churn_is_reproducible_and_bounded() {
         }
         let mut sched = Scheduler::new();
         sched.set_deterministic_spawn(true);
-        sched.set_parallel_auto_disable(false);
-        sched.set_parallel_min_entities(0);
+        world.set_chunk_config(apex_core::world::ChunkConfig {
+            auto_disable_stage_parallel: false,
+            stage_parallel_min_entities: 0,
+            ..Default::default()
+        });
         // PreUpdate despawns last frame's children; Update spawns this frame's.
         sched.add_systems(StageLabel::PreUpdate, churn_despawn);
         sched.add_systems(StageLabel::Update, churn_spawn);

@@ -1645,14 +1645,15 @@ fn bench_intra_system_parallel(n: usize) {
         },
     );
 
-    println!("  Note: speedup при CPU-bound и кол-во entity >> PAR_CHUNK_SIZE(4096)");
+    println!("  Note: speedup при CPU-bound и кол-во entity >> max_chunk_size");
 }
 
 // ── main ───────────────────────────────────────────────────────
 
 fn main() {
-    // Инициализируем PAR_CHUNK_SIZE из переменной окружения (если задана)
-    apex_core::world::init_par_chunk_size_from_env();
+    // Chunk sizing is now per-world config (wave 3 §1.7): the former global
+    // `PAR_CHUNK_SIZE` atomic is gone. To honor `APEX_PAR_CHUNK_SIZE` in a bench,
+    // apply `world.set_chunk_config(ChunkConfig::from_env())` at world setup.
 
     println!("=== Apex ECS — Performance Benchmark v2 ===");
     println!("Build: {}",
@@ -1660,12 +1661,11 @@ fn main() {
         else                      { "RELEASE ✓" }
     );
     println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
-    let par_chunk_val = apex_core::world::PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-    if par_chunk_val == 0 {
-        println!("PAR_CHUNK_SIZE: auto (DEFAULT_MAX_CHUNK_SIZE={}) (задай APEX_PAR_CHUNK_SIZE для переопределения)",
-            apex_core::world::DEFAULT_MAX_CHUNK_SIZE);
+    let max_chunk = apex_core::world::ChunkConfig::from_env().max_chunk_size;
+    if max_chunk == apex_core::world::DEFAULT_MAX_CHUNK_SIZE {
+        println!("max_chunk_size: auto (DEFAULT_MAX_CHUNK_SIZE={max_chunk}) (set APEX_PAR_CHUNK_SIZE to override)");
     } else {
-        println!("PAR_CHUNK_SIZE: {} (явно задан через APEX_PAR_CHUNK_SIZE)", par_chunk_val);
+        println!("max_chunk_size: {max_chunk} (from APEX_PAR_CHUNK_SIZE)");
     }
     println!();
 

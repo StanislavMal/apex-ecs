@@ -2133,19 +2133,6 @@ unsafe impl Sync for MainWorld {}
 
 // ── SystemContext ──────────────────────────────────────────────
 
-/// Размер чанка для par_for_each.
-///
-/// Разбивает архетип на блоки по N entity для параллельной обработки.
-/// Слишком маленький → overhead rayon съедает выигрыш.
-/// Слишком большой → мало задач, плохой load balancing.
-///
-/// Пользовательский максимальный размер чанка для `adaptive_chunk_size`.
-///
-/// Если равен 0 (по умолчанию) — используется `DEFAULT_MAX_CHUNK_SIZE` (16384).
-/// Можно переопределить через переменную окружения `APEX_PAR_CHUNK_SIZE`
-/// или через `set_par_chunk_size()`.
-pub static PAR_CHUNK_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 // Константы заменены адаптивной логикой в adaptive_chunk_size.
 // MIN_CHUNK_SIZE и MAX_CHUNK_SIZE больше не используются.
 // Оставляем только для обратной совместимости, если нужно.
@@ -2157,8 +2144,12 @@ pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
 /// Определяет, как [`adaptive_chunk_size`] разбивает entity на чанки
 /// для параллельной итерации (`par_for_each`).
 ///
-/// Передаётся через `World::set_chunk_config()`. Если не задана явно,
-/// используется [`ChunkConfig::default()`].
+/// Единственный носитель тюнинга параллелизма: и chunk-sizing
+/// ([`adaptive_chunk_size`]), и stage-level gating планировщика (нужно ли вообще
+/// параллелить стадию). Передаётся через `World::set_chunk_config()`; планировщик
+/// читает stage-gating-поля из `world.chunk_config()`. Если не задана явно —
+/// [`ChunkConfig::default()`]; [`ChunkConfig::from_env()`] читает переопределения
+/// из окружения.
 ///
 /// # Пример
 ///
@@ -2166,7 +2157,7 @@ pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
 /// let config = ChunkConfig {
 ///     min_entities_per_thread: 32,
 ///     max_chunk_size: 8192,
-///     auto_serial_fallback: true,
+///     ..Default::default()
 /// };
 /// world.set_chunk_config(config);
 /// ```
@@ -2201,25 +2192,55 @@ pub struct ChunkConfig {
     ///
     /// Default: `2.0`.
     pub task_multiplier: f32,
+
+    // ── Stage-level parallelism gating (read by the scheduler) ──
+    /// Explicit floor: a stage runs SEQUENTIALLY when the total entity count of
+    /// its systems is below this. `0` = no floor (the cost-model / heuristic
+    /// decides). When `> 0` it always wins over the auto-heuristic.
+    ///
+    /// Default: `0`.
+    pub stage_parallel_min_entities: usize,
+
+    /// When `true`, the scheduler auto-disables stage parallelism on the cold
+    /// start (no cost history yet) via a per-system entity-count heuristic
+    /// (≈15k/25k/80k entity per system for 3+/2/1 systems). Once the cost-model
+    /// has measured a stage it supersedes this. `false` = always attempt
+    /// parallel (subject to the cost-model once warm).
+    ///
+    /// Default: `true`.
+    pub auto_disable_stage_parallel: bool,
 }
 
 impl Default for ChunkConfig {
     fn default() -> Self {
-        let max_from_env = {
-            let user = PAR_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed);
-            if user > 0 {
-                user
-            } else {
-                DEFAULT_MAX_CHUNK_SIZE
-            }
-        };
         Self {
             min_entities_per_thread: 16,
             dynamic_min_chunk: 64,
-            max_chunk_size: max_from_env,
+            max_chunk_size: DEFAULT_MAX_CHUNK_SIZE,
             auto_serial_fallback: true,
             task_multiplier: 2.0,
+            stage_parallel_min_entities: 0,
+            auto_disable_stage_parallel: true,
         }
+    }
+}
+
+impl ChunkConfig {
+    /// Config from [`Default`] with environment overrides applied. Single env
+    /// entry point (replaces the former `set_par_chunk_size` global atomic that
+    /// silently fed `Default`). Reads `APEX_PAR_CHUNK_SIZE` → `max_chunk_size`.
+    ///
+    /// Apply with `world.set_chunk_config(ChunkConfig::from_env())`.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(val) = std::env::var("APEX_PAR_CHUNK_SIZE") {
+            if let Ok(n) = val.trim().parse::<usize>() {
+                if n > 0 {
+                    cfg.max_chunk_size = n;
+                }
+            }
+        }
+        cfg
     }
 }
 
@@ -2245,22 +2266,6 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
     let raw = entity_count.div_ceil(targets);
     raw.clamp(config.dynamic_min_chunk, config.max_chunk_size)
         .min(entity_count)
-}
-
-/// Установить размер чанка для par_for_each.
-/// Используется для экспериментов — позволяет менять CHUNK_SIZE без перекомпиляции.
-pub fn set_par_chunk_size(chunk_size: usize) {
-    PAR_CHUNK_SIZE.store(chunk_size, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Инициализировать PAR_CHUNK_SIZE из переменной окружения (если задана).
-pub fn init_par_chunk_size_from_env() {
-    if let Ok(val) = std::env::var("APEX_PAR_CHUNK_SIZE") {
-        let trimmed = val.trim();
-        if let Ok(chunk_size) = trimmed.parse::<usize>() {
-            PAR_CHUNK_SIZE.store(chunk_size, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
 }
 
 pub struct SystemContext<'w> {
@@ -3469,6 +3474,7 @@ mod tests {
             max_chunk_size: 4096,
             auto_serial_fallback: false,
             task_multiplier: 1.0,
+            ..Default::default()
         };
         // auto_serial_fallback = false → always split into threads chunks
         // multiplier=1.0 → targets=8 → ceil(50/8)=7
@@ -3485,6 +3491,7 @@ mod tests {
             max_chunk_size: 8192,
             auto_serial_fallback: true,
             task_multiplier: 1.0,
+            ..Default::default()
         };
         // 8 * 8 = 64 threshold
         assert_eq!(adaptive_chunk_size(50, 8, &cfg), 50); // 50 < 64 → serial
