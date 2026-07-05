@@ -317,11 +317,34 @@ goldens 649/0/9 byte-identical; Miri TB чист (get/single/write-Mut/maybe/Que
 спайка:** `type ReadOnly`-проекция (f9f191c) уже была — новые impls не потребовались; `UnsafeWorldCell`
 не использован (см. выше).*
 
-**Волна 3 — Регистрация+конфиг+нейминг.** Ordering на конфигах (Р-3); merge sys/seq/par-дублей;
-SystemBuilder → pub(crate); ChunkConfig-единая модель (§1.7), глобалки deprecate; naming-sweep по
-словарю (§1.12: insert_raw_pub→insert_dyn, spawn_from_template→spawn_template_with, children_of/
-get_relation_target→targets_of/target_of, par_for_each_used_by_name→deprecate); prelude-диета +
-scheduler-prelude; `deprecated(since,note)`+`doc(alias)` на всех переименованиях (урок Bevy §8).
+**Волна 3 — Регистрация+конфиг+нейминг. 🔶 ЧАСТИЧНО (2026-07-05).** Гейт Rule D пройден:
+`apex-ecs/docs/CONVENTIONS.md` (naming-словарь Р-5 + prelude-политика). **✅ Сделано+закоммичено:**
+- **A5 surface-hardening** (ecs `18159d9`): `run_sequential(*mut→&mut World)`; `get_raw_ptr`/
+  `event_queue_ptr`/`compute_archetype_indices`/`populate_type_names` → pub(crate).
+- **ChunkConfig-единая модель** (ecs `0f53940`, §1.7): убраны глобальный atomic `PAR_CHUNK_SIZE` +
+  `set_par_chunk_size`/`init_par_chunk_size_from_env`; `ChunkConfig::from_env()`; stage-gating-ручки
+  (`stage_parallel_min_entities`/`auto_disable_stage_parallel`) перенесены на `ChunkConfig`, планировщик
+  читает из `world.chunk_config()`; сняты `Scheduler::set_parallel_min_entities/auto_disable`.
+- **naming-sweep** (ecs `dcf5582` + движок `06584fb`, §1.12): `insert_raw_pub→insert_dyn`,
+  `spawn_from_template→spawn_template_with`, `children_of→targets_of`, `get_relation_target→target_of`
+  — `#[deprecated]`+`#[doc(alias)]`, ВСЕ консумеры мигрированы (0 варнингов), 79+ сайтов оба репо.
+- **merge sys/seq/par-дублей** (ecs `3ae540e`): `SystemConfig::{sys,seq,par,par_access}` → pub(crate)
+  (свободные `sys`/`seq`/`par`/`par_access` — золотой путь).
+- **prelude-диета + scheduler-prelude** (ecs `e2ae42c`, CONVENTIONS §2): apex-core prelude обрезан до
+  golden-path (внутренние/advanced вон, 0 breakage); заведён `apex_scheduler::prelude`. **Уточнение
+  §2:** маркеры AutoSystem/`system!` (`ResRead`/`ResWrite`/`Listen`/`Emit`/`QueryParam`) ОСТАЮТСЯ в
+  prelude (первоклассный путь авторинга, не внутрянка); `DelayedQueue` — вон (advanced).
+
+**⏳ ОСТАЛОСЬ в волне 3 (focused-проходы, НЕ полумеры — каждый сам по себе):**
+- **Ordering на конфигах (Р-3)** — `.before()/.after()/.chain()` на `SystemConfig`/кортежах через
+  `IntoScheduleConfigs` (строковый `Scheduler::before/after/chain` — advanced для динамики). Это ФИЧА
+  (интеграция с графом зависимостей планировщика), не косметика — отдельный заход.
+- **SystemBuilder → pub(crate) + чистка legacy add_system-пути.** Демоушен `SystemBuilder` вскрыл, что
+  весь builder-chaining путь (`add_system().run_if()` + `run_if_cond`/`or_else`/`condition`) — МЁРТВ
+  (вытеснен `add_systems`+`SystemConfig`). Убрать связку (приватные `add_system*` + `SystemBuilder` +
+  его методы) — сцеплено, отдельный заход.
+- **`par_for_each_used_by_name` → декларативно.** Нужен флаг на `SystemConfig` (не ренейм); benchmark-
+  only, низкий приоритет.
 
 **Волна 4 — События+ошибки.** F4 (персистентные курсоры на State-слоте — TECH_DEBT); reader-API/
 EventRegistry → pub(crate); send_sync → advanced; ErrorHandler-ресурс с Severity/контекстом (§0.2a
