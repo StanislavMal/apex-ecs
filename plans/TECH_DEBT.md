@@ -27,17 +27,22 @@
 > `World`/`SystemContext`-поверхности остались лазейками. Заявка «soundness в типах» до конца НЕ
 > выполнена. Приоритет — первым заходом.
 
-- **S1 🔴 — write-аксессоры принимают `&self` → алиасящий `&mut` из safe-кода (доказано PoC).**
-  `Query::get/get_mut/iter/for_each/single` берут `&self` (`crates/apex-core/src/query.rs:~1589-1673`;
-  комментарий у `get_mut` «`&self` достаточно» неверен); то же у `CachedQuery`
-  (`world.rs:~2706,2934`), который вдобавок `#[derive(Clone)]` (`world.rs:2559`) + Send/Sync →
-  клонируемый write-запрос гоняется из двух потоков. PoC (три строки safe-кода): `new_mut::<Write<T>>`
-  → двойной `q.get(e)` → два алиасящих `&mut T` на одну строку. (Смежное:
-  `SubWorld::resource_mut/event_*(&self)` `sub_world.rs:190+` — тот же &self-write паттерн, НО ноль
-  вызовов и `&SubWorld` наружу не отдаётся → недостижимо из safe → волна 3/4 dead-code, не S1.)
-  *Золотой путь S1:* `&mut self` на write-аксессорах (модель Bevy `get_mut`/`iter_mut`), снять `Clone` с
-  write-варианта CachedQuery; read-аксессоры остаются `&self` (Bevy-трюк: read-методы подставляют
-  `Q::ReadOnly`). Гейт: PoC перестаёт компилироваться; Miri TB; goldens byte-identical.
+- **S1 🔴 ✅ ЧАСТЬ 1 (2026-07-05, commit e79ad1e) / 🔴 ЧАСТЬ 2 открыта — write-аксессоры `&self`.**
+  **Часть 1 ✅ (документированный PoC закрыт):** `Query::get`/`single` возвращали ОДИН дублируемый item;
+  `new_mut::<Write<T>>().get(e)` дважды → два `Mut<T>` на одну строку (aliasing из safe). → `get`/`single`
+  требуют `Q: ReadOnlyWorldQuery` (`&self`), write — через `get_mut`/`single_mut` (`&mut self`, эксклюзив).
+  Ноль миграции. `CachedQuery` НЕ Clone (верификатор ошибся — `derive(Clone)` на `ArchIndices`, не на
+  CachedQuery) → того вектора нет.
+  **Часть 2 🔴 (концурентный вектор, отдельный заход):** `for_each`/`iter`/`par_for_each`(`&self`) выдают
+  `Mut` **транзиентно** → single-thread sound, НО `CachedQuery`/`Query: Sync` ⇒ два scoped-потока с `&q`
+  пишут одни строки (data race, footgun; тот же корень, что S3 `World: Sync`). *Золотой путь (Bevy):*
+  read/mut split — `&self` read-аксессоры требуют `Q: ReadOnlyWorldQuery`, добавить `for_each_mut`/
+  `iter_mut`/`par_for_each_mut`(`&mut self`, эксклюзив→нельзя шарить). **⚠ Каскад (замерено попыткой,
+  откат):** split ломает ВНУТРЕННИЕ `iter()`-вызовы — `Query::len`/`is_empty`/`IntoIterator for &Query`(bound
+  ReadOnly)/`&mut Query`(iter_impl)/`single_impl`/chunk-методы + `system_param.rs:619`; то же на CachedQuery;
+  внешняя миграция write-query `for_each`→`for_each_mut` (~4 инлайн-Query сайта + N CachedQuery/ctx-сайтов).
+  Не тривиально — делать выделенным заходом с Miri TB + goldens byte-identical. (Смежное:
+  `SubWorld::resource_mut/event_*(&self)` недостижимо из safe → волна 3/4 dead-code, не S1.)
 - **A5 ✅ ЧАСТИЧНО (pub-ПОЛЯ закрыты 2026-07-05, commit b2a1ff5) — сырая pub-поверхность хранилища.**
   `World.archetypes`/`World.resources` были **pub-ПОЛЯ** (`world.rs:198/213`): `world.archetypes.clear()`
   из safe-кода ломал инварианты. **→ pub(crate)**; потребители (scripting/isolated/hot-reload/
