@@ -124,6 +124,10 @@ impl<T> Events<T> {
     ///
     /// Каждый вызов берёт `Mutex::lock`. При массовой отправке предпочтите
     /// собирать события в локальный `Vec`, а затем вызывать `send_batch_sync`.
+    ///
+    /// Advanced escape hatch: golden path is the declared `EventWriter<T>`
+    /// system parameter (the scheduler serializes writers), not `&Events<T>`.
+    #[doc(hidden)]
     pub fn send_sync(&self, event: T) {
         let sync = self.get_or_init_sync();
         sync.lock().unwrap().push(event);
@@ -132,6 +136,7 @@ impl<T> Events<T> {
     /// Отправить пачку событий из параллельного контекста (thread-safe).
     ///
     /// Берёт lock один раз для всего пакета — эффективнее многократных `send_sync`.
+    #[doc(hidden)] // advanced escape hatch — see `send_sync`
     pub fn send_batch_sync(&self, events: impl IntoIterator<Item = T>) {
         let sync = self.get_or_init_sync();
         sync.lock().unwrap().extend(events);
@@ -141,6 +146,7 @@ impl<T> Events<T> {
     ///
     /// Вызывается автоматически из [`update()`]. Можно вызвать вручную
     /// если нужно сделать события доступными до следующего тика.
+    #[doc(hidden)] // advanced — pairs with `send_sync`; no-op without it
     pub fn flush_sync(&mut self) {
         if let Some(sync) = self.sync_pending.get() {
             let mut guard = sync.lock().unwrap();
@@ -1052,8 +1058,9 @@ struct EventQueueCell(UnsafeCell<Box<dyn AnyEventQueue>>);
 // the scheduler's AccessDescriptor discipline, so exposing `Sync` is sound.
 unsafe impl Sync for EventQueueCell {}
 
-/// Реестр очередей событий — карта `TypeId → Events<T>`.
-pub struct EventRegistry {
+/// Event-queue registry — a `TypeId → Events<T>` map. Internal: the golden path
+/// reaches queues through `World::send_event` / `EventWriter` / `EventReader`.
+pub(crate) struct EventRegistry {
     queues: FxHashMap<TypeId, EventQueueCell>,
 }
 
@@ -1100,21 +1107,6 @@ impl EventRegistry {
                     std::any::type_name::<T>()
                 )
             })
-    }
-
-    /// Попробовать получить очередь событий по типу.
-    pub fn try_get<T: Send + Sync + 'static>(&self) -> Option<&Events<T>> {
-        self.queues
-            .get(&TypeId::of::<T>())
-            // SAFETY: shared read of the cell interior (see `get`).
-            .and_then(|c| unsafe { (*c.0.get()).as_any().downcast_ref::<Events<T>>() })
-    }
-
-    /// Попробовать получить мутабельный доступ к очереди.
-    pub fn try_get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut Events<T>> {
-        self.queues
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|c| c.0.get_mut().as_any_mut().downcast_mut::<Events<T>>())
     }
 
     /// Получить мутабельный доступ к очереди, автоматически регистрируя тип.
@@ -1174,31 +1166,6 @@ impl EventRegistry {
         self.update_all();
     }
 
-    /// Получить мутабельный доступ к очереди по TypeId.
-    pub fn get_mut_by_typeid(&mut self, type_id: TypeId) -> Option<&mut dyn AnyEventQueue> {
-        self.queues
-            .get_mut(&type_id)
-            .map(|c| &mut **c.0.get_mut())
-    }
-
-    /// Проверить, зарегистрирован ли тип события.
-    pub fn is_registered<T: Send + Sync + 'static>(&self) -> bool {
-        self.queues.contains_key(&TypeId::of::<T>())
-    }
-
-    /// Количество зарегистрированных типов событий.
-    pub fn queue_count(&self) -> usize {
-        self.queues.len()
-    }
-
-    /// Общее количество событий во всех очередях.
-    pub fn total_event_count(&self) -> usize {
-        // SAFETY: shared read of each cell interior (see `get`).
-        self.queues
-            .values()
-            .map(|c| unsafe { (*c.0.get()).len() })
-            .sum()
-    }
 }
 
 impl Default for EventRegistry {
