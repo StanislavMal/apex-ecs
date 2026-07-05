@@ -2317,6 +2317,18 @@ impl std::fmt::Display for DynQueryError {
 
 impl std::error::Error for DynQueryError {}
 
+/// One relation term of a dynamic query (S8). Relations are not
+/// archetype-structural, so these are applied as a per-entity post-filter over
+/// the archetype-matched set (see [`DynTerms::relations`]).
+#[derive(Clone, Copy)]
+struct RelationFilter {
+    kind_idx: u32,
+    /// `Some(target)` = relation to that exact target; `None` = any target.
+    target: Option<Entity>,
+    /// `true` = the entity must NOT have the relation (absence filter).
+    negate: bool,
+}
+
 /// Resolved terms of a dynamic query — shared by the read and write builders.
 #[derive(Default)]
 struct DynTerms {
@@ -2326,6 +2338,13 @@ struct DynTerms {
     excludes: Vec<ComponentId>,
     /// First unresolved component name — surfaced as an error at build time.
     unknown: Option<String>,
+    /// Relation terms (S8) — a per-entity post-filter (relations live in the
+    /// subject index, not the archetype).
+    relations: Vec<RelationFilter>,
+    /// A REQUIRED relation term whose kind was never registered can never match
+    /// any entity ⇒ the whole query is empty. Set at builder time; makes
+    /// [`matching_archetype_ids`](DynTerms::matching_archetype_ids) return none.
+    relation_impossible: bool,
 }
 
 impl DynTerms {
@@ -2354,7 +2373,7 @@ impl DynTerms {
     }
 
     fn matching_archetype_ids(&self, world: &World) -> Vec<usize> {
-        if self.unknown.is_some() {
+        if self.unknown.is_some() || self.relation_impossible {
             return Vec::new();
         }
         world
@@ -2364,6 +2383,31 @@ impl DynTerms {
             .filter(|(_, arch)| self.matches_arch(arch))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Whether `entity` satisfies every relation term (per-entity post-filter,
+    /// S8). Empty term list ⇒ trivially true (no per-entity cost).
+    #[inline]
+    fn entity_passes_relations(relations: &[RelationFilter], world: &World, entity: Entity) -> bool {
+        relations.iter().all(|t| {
+            world.subject_has_relation_idx(entity, t.kind_idx, t.target) != t.negate
+        })
+    }
+
+    /// Record a relation term, resolving the kind read-only. An unregistered
+    /// kind on a REQUIRED term makes the query empty; on an ABSENCE term it is
+    /// trivially satisfied (dropped).
+    fn push_relation<R: crate::relations::RelationKind>(
+        &mut self,
+        world: &World,
+        target: Option<Entity>,
+        negate: bool,
+    ) {
+        match world.relation_kind_idx::<R>() {
+            Some(kind_idx) => self.relations.push(RelationFilter { kind_idx, target, negate }),
+            None if !negate => self.relation_impossible = true,
+            None => {}
+        }
     }
 
     /// C2 for the dynamic write path: a write id must not repeat. Unregistered
@@ -2483,9 +2527,36 @@ impl<'w> QueryBuilder<'w> {
         self
     }
 
+    /// Relation term (S8): the entity must have relation `R` to `target`.
+    ///
+    /// Relations are matched per entity (they live in the subject index, not
+    /// the archetype), so this is a post-filter over the archetype-matched set.
+    /// A relation kind never used in this world matches nothing — the query is
+    /// empty. This is a dynamic-query superpower our relations enable and a
+    /// typed query cannot express at runtime (editor / scripting / IPC).
+    pub fn with_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
+        self.terms.push_relation::<R>(self.world, Some(target), false);
+        self
+    }
+
+    /// Relation term: the entity must have relation `R` to ANY target
+    /// (wildcard presence, e.g. "has a parent").
+    pub fn with_any_relation<R: crate::relations::RelationKind>(mut self, _kind: R) -> Self {
+        self.terms.push_relation::<R>(self.world, None, false);
+        self
+    }
+
+    /// Absence relation term: the entity must NOT have relation `R` to `target`.
+    pub fn without_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
+        self.terms.push_relation::<R>(self.world, Some(target), true);
+        self
+    }
+
     /// Indices into `world.archetypes()` of the archetypes matching the
-    /// builder's terms. If a name failed to resolve the result is empty
-    /// (the loud error path is [`build`](Self::build)).
+    /// builder's COMPONENT terms. Relation terms (a per-entity post-filter) are
+    /// NOT applied here — iterate the built query for the full result. If a name
+    /// failed to resolve the result is empty (loud error path is
+    /// [`build`](Self::build)).
     pub fn matching_archetype_ids(&self) -> Vec<usize> {
         self.terms.matching_archetype_ids(self.world)
     }
@@ -2506,6 +2577,7 @@ impl<'w> QueryBuilder<'w> {
             world: self.world,
             reads: self.terms.reads,
             arch_ids,
+            relations: self.terms.relations,
         })
     }
 }
@@ -2609,6 +2681,26 @@ impl<'w> QueryBuilderMut<'w> {
         self
     }
 
+    /// Relation term (S8): the entity must have relation `R` to `target`. See
+    /// [`QueryBuilder::with_relation`] — same per-entity semantics on the write
+    /// path.
+    pub fn with_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
+        self.terms.push_relation::<R>(self.world, Some(target), false);
+        self
+    }
+
+    /// Relation term: the entity must have relation `R` to ANY target.
+    pub fn with_any_relation<R: crate::relations::RelationKind>(mut self, _kind: R) -> Self {
+        self.terms.push_relation::<R>(self.world, None, false);
+        self
+    }
+
+    /// Absence relation term: the entity must NOT have relation `R` to `target`.
+    pub fn without_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
+        self.terms.push_relation::<R>(self.world, Some(target), true);
+        self
+    }
+
     /// Build the read/write dynamic query.
     ///
     /// Errors loudly on unresolved names and on a component written twice
@@ -2624,6 +2716,7 @@ impl<'w> QueryBuilderMut<'w> {
             reads: self.terms.reads,
             writes: self.terms.writes,
             arch_ids,
+            relations: self.terms.relations,
         })
     }
 }
@@ -2635,6 +2728,8 @@ pub struct DynQuery<'w> {
     reads: Vec<ComponentId>,
     /// Matched archetype indices, ascending (see `matching_archetype_ids`).
     arch_ids: Vec<usize>,
+    /// Relation terms (S8) — per-entity post-filter over the archetype set.
+    relations: Vec<RelationFilter>,
 }
 
 impl<'w> DynQuery<'w> {
@@ -2643,38 +2738,53 @@ impl<'w> DynQuery<'w> {
         &self.reads
     }
 
-    /// Indices into `world.archetypes()` matched by this query.
+    /// Indices into `world.archetypes()` matched by this query (COMPONENT terms
+    /// only; relation terms are a per-entity filter applied during iteration).
     pub fn archetype_ids(&self) -> &[usize] {
         &self.arch_ids
     }
 
-    /// Number of matching entities (sum of matched archetype lengths).
+    /// Number of matching entities. Without relation terms this is the sum of
+    /// matched archetype lengths (O(archetypes)); with relation terms it counts
+    /// the post-filtered entities (O(candidates)).
     pub fn count(&self) -> usize {
-        let archs = self.world.archetypes();
-        self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+        if self.relations.is_empty() {
+            let archs = self.world.archetypes();
+            self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+        } else {
+            self.iter().count()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count() == 0
+        if self.relations.is_empty() {
+            self.arch_ids.iter().all(|&i| self.world.archetypes()[i].is_empty())
+        } else {
+            self.iter().next().is_none()
+        }
     }
 
-    /// Iterate all matching entities.
+    /// Iterate all matching entities (archetype terms + relation post-filter).
     pub fn iter(&self) -> DynIter<'_, 'w> {
         DynIter {
             world: self.world,
             arch_ids: &self.arch_ids,
+            relations: &self.relations,
             arch_cursor: 0,
             row: 0,
         }
     }
 
-    /// Point lookup: the item for `entity`, or `None` if the entity is dead
-    /// or its archetype does not match this query.
+    /// Point lookup: the item for `entity`, or `None` if the entity is dead,
+    /// its archetype does not match, or it fails a relation term.
     pub fn get(&self, entity: Entity) -> Option<DynItem<'w>> {
         let loc = self.world.entity_allocator().get_location(entity)?;
         let arch_idx = loc.archetype_id.as_usize();
         // arch_ids is ascending by construction.
         self.arch_ids.binary_search(&arch_idx).ok()?;
+        if !DynTerms::entity_passes_relations(&self.relations, self.world, entity) {
+            return None;
+        }
         Some(DynItem {
             entity,
             arch: &self.world.archetypes()[arch_idx],
@@ -2705,6 +2815,8 @@ impl<'q, 'w> IntoIterator for &'q DynQuery<'w> {
 pub struct DynIter<'q, 'w> {
     world: &'w World,
     arch_ids: &'q [usize],
+    /// Relation terms (S8) — entities failing them are skipped.
+    relations: &'q [RelationFilter],
     arch_cursor: usize,
     row: usize,
 }
@@ -2719,8 +2831,13 @@ impl<'q, 'w> Iterator for DynIter<'q, 'w> {
             if self.row < arch.len() {
                 let row = self.row;
                 self.row += 1;
+                let entity = arch.entities()[row];
+                // Relation post-filter (S8): skip entities that fail a term.
+                if !DynTerms::entity_passes_relations(self.relations, self.world, entity) {
+                    continue;
+                }
                 return Some(DynItem {
-                    entity: arch.entities()[row],
+                    entity,
                     arch,
                     row,
                     registry: self.world.registry(),
@@ -2816,6 +2933,8 @@ pub struct DynQueryMut<'w> {
     writes: Vec<ComponentId>,
     /// Matched archetype indices, ascending.
     arch_ids: Vec<usize>,
+    /// Relation terms (S8) — per-entity post-filter over the archetype set.
+    relations: Vec<RelationFilter>,
 }
 
 impl std::fmt::Debug for DynQueryMut<'_> {
@@ -2844,11 +2963,22 @@ impl<'w> DynQueryMut<'w> {
         &self.arch_ids
     }
 
-    /// Number of matching entities.
+    /// Number of matching entities. With relation terms this counts the
+    /// post-filtered set (O(candidates)); without, it sums archetype lengths.
     pub fn count(&self) -> usize {
         // SAFETY: read-only metadata view; no mutable view is live here.
-        let archs = unsafe { self.world.world() }.archetypes();
-        self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+        let world = unsafe { self.world.world() };
+        if self.relations.is_empty() {
+            let archs = world.archetypes();
+            self.arch_ids.iter().map(|&i| archs[i].len()).sum()
+        } else {
+            let archs = world.archetypes();
+            self.arch_ids
+                .iter()
+                .flat_map(|&i| archs[i].entities().iter().copied())
+                .filter(|&e| DynTerms::entity_passes_relations(&self.relations, world, e))
+                .count()
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2867,8 +2997,13 @@ impl<'w> DynQueryMut<'w> {
         for &arch_idx in &self.arch_ids {
             let arch = &world.archetypes()[arch_idx];
             for row in 0..arch.len() {
+                let entity = arch.entities()[row];
+                // Relation post-filter (S8): skip entities that fail a term.
+                if !DynTerms::entity_passes_relations(&self.relations, world, entity) {
+                    continue;
+                }
                 f(DynItemMut {
-                    entity: arch.entities()[row],
+                    entity,
                     arch,
                     row,
                     registry,
@@ -2879,7 +3014,7 @@ impl<'w> DynQueryMut<'w> {
     }
 
     /// Point lookup: a mutable item for `entity`, or `None` if the entity is
-    /// dead or its archetype does not match this query.
+    /// dead, its archetype does not match, or it fails a relation term.
     pub fn get_mut(&mut self, entity: Entity) -> Option<DynItemMut<'_>> {
         // SAFETY: exclusive borrow of `self` + `&mut World`-derived cell ⇒ sole
         // live view; the returned item borrows it for its own lifetime only.
@@ -2887,6 +3022,9 @@ impl<'w> DynQueryMut<'w> {
         let loc = world.entity_allocator().get_location(entity)?;
         let arch_idx = loc.archetype_id.as_usize();
         self.arch_ids.binary_search(&arch_idx).ok()?;
+        if !DynTerms::entity_passes_relations(&self.relations, world, entity) {
+            return None;
+        }
         Some(DynItemMut {
             entity,
             arch: &world.archetypes()[arch_idx],
@@ -3931,6 +4069,102 @@ mod dyn_query_tests {
             .sum();
         assert_eq!(sum, 6);
         assert!(!q.is_empty());
+    }
+
+    /// S8: relation terms on the dynamic query — a per-entity post-filter that a
+    /// typed query cannot express at runtime.
+    #[test]
+    fn dyn_query_relation_terms() {
+        use crate::relations::{ChildOf, RelationKind};
+
+        let mut world = World::new();
+        let p1 = world.spawn((Hp(1),));
+        let p2 = world.spawn((Hp(2),));
+        let a = world.spawn((Hp(10),));
+        let b = world.spawn((Hp(11),));
+        let c = world.spawn((Hp(12),));
+        let d = world.spawn((Hp(13),)); // no parent
+        world.add_relation(a, ChildOf, p1);
+        world.add_relation(b, ChildOf, p1);
+        world.add_relation(c, ChildOf, p2);
+
+        // with_relation: Hp entities that are ChildOf p1 → {a, b}.
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .with_relation(ChildOf, p1)
+            .build()
+            .unwrap();
+        let ids: std::collections::HashSet<_> = q.iter().map(|i| i.entity()).collect();
+        assert_eq!(ids, std::collections::HashSet::from([a, b]));
+        assert_eq!(q.count(), 2);
+        assert!(!q.is_empty());
+
+        // with_any_relation: Hp entities with ANY ChildOf → {a, b, c}.
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .with_any_relation(ChildOf)
+            .build()
+            .unwrap();
+        assert_eq!(q.count(), 3);
+
+        // without_relation: Hp entities NOT ChildOf p1 → p1, p2, c, d.
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .without_relation(ChildOf, p1)
+            .build()
+            .unwrap();
+        let got: std::collections::HashSet<_> = q.iter().map(|i| i.entity()).collect();
+        assert!(!got.contains(&a) && !got.contains(&b));
+        assert!(got.contains(&c) && got.contains(&d) && got.contains(&p1) && got.contains(&p2));
+
+        // get(): point lookup honors the relation term.
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .with_relation(ChildOf, p1)
+            .build()
+            .unwrap();
+        assert!(q.get(a).is_some());
+        assert!(q.get(c).is_none(), "c is ChildOf p2, not p1");
+
+        // A never-used relation kind: a REQUIRED term matches nothing…
+        #[derive(Clone, Copy)]
+        struct Likes;
+        impl RelationKind for Likes {}
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .with_any_relation(Likes)
+            .build()
+            .unwrap();
+        assert_eq!(q.count(), 0, "never-used kind matches nothing");
+        // …while an ABSENCE term is trivially satisfied (all 6 Hp entities).
+        let q = world
+            .query_builder()
+            .read::<Hp>()
+            .without_relation(Likes, p1)
+            .build()
+            .unwrap();
+        assert_eq!(q.count(), 6);
+
+        // Write path: with_relation filters `for_each_mut`.
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let mut q = world
+            .query_builder_mut()
+            .write::<Hp>()
+            .with_relation(ChildOf, p1)
+            .build()
+            .unwrap();
+        assert_eq!(q.count(), 2);
+        q.for_each_mut(|mut item| {
+            item.get_mut::<Hp>(hp_id).unwrap().0 += 100;
+        });
+        assert_eq!(world.get::<Hp>(a), Some(&Hp(110)));
+        assert_eq!(world.get::<Hp>(b), Some(&Hp(111)));
+        assert_eq!(world.get::<Hp>(c), Some(&Hp(12)), "c untouched (ChildOf p2)");
     }
 
     // ── Dynamic WRITE path ──────────────────────────────────────

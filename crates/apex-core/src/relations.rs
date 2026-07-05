@@ -762,6 +762,38 @@ impl World {
         self.subject_index.has(subject.index, pair)
     }
 
+    /// Read-only resolve of a relation kind `R` to its registry index (does NOT
+    /// register). `None` if `R` was never used in this world. Used by the
+    /// dynamic query relation-filter (S8) to resolve terms at build time.
+    pub(crate) fn relation_kind_idx<R: RelationKind>(&self) -> Option<u32> {
+        self.relations.get_idx::<R>()
+    }
+
+    /// Whether `subject` has a relation of `kind_idx` to `target` (or to ANY
+    /// target when `target` is `None`). Backs [`QueryBuilder`]'s relation terms
+    /// (a per-entity post-filter — relations are not archetype-structural).
+    ///
+    /// [`QueryBuilder`]: crate::query::QueryBuilder
+    pub(crate) fn subject_has_relation_idx(
+        &self,
+        subject: Entity,
+        kind_idx: u32,
+        target: Option<Entity>,
+    ) -> bool {
+        if !self.entities.is_alive(subject) {
+            return false;
+        }
+        match target {
+            Some(t) => self
+                .subject_index
+                .has(subject.index, RelationPair { kind_idx, target: t }),
+            None => self
+                .subject_index
+                .first_with_kind(subject.index, kind_idx)
+                .is_some(),
+        }
+    }
+
     /// Subjects связи `(kind, target)` с данными компонентов `Q`.
     ///
     /// План исполнения: subjects из TargetIndex → группировка по архетипам →
