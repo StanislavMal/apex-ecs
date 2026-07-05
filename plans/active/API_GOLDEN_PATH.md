@@ -40,8 +40,15 @@ snapshot/MapEntities в ядре (у bevy_ecs нет вовсе); детерми
 `DynQuery`/`DynQueryMut`, `QueryBuilder`/`QueryBuilderMut`, `Single`, `QueryParam`-маркер. Входы:
 `World::query/query_mut/query_changed/query_mut_changed/query_builder(_mut)` + ctx-зеркала +
 QueryState-пятёрка. Единый `Query<'w,'s>` (C6) схлопывает ~35 pub fn в ~12. `Single` есть в prelude,
-но не в корневом реэкспорте (асимметрия). `Ref<T>` = алиас `Read<T>` — **семантическая ловушка**
-(в Bevy `Ref` = read+change-detection); deprecate или дать настоящую семантику.
+но не в корневом реэкспорте (асимметрия).
+**⚠ Словарь query-данных — ДВОЙНОЙ (решение волны 3, обсуждено 2026-07-05):** `Read<T>`/`Write<T>`
+(маркер-структуры) И `&T`/`&mut T` (ссылки) — обе пары дают идентичный Item; плюс `Ref<T>` = алиас
+`Read<T>` — **семантическая ловушка** (в Bevy `Ref` = read+change-detection, отдельная семантика). Это
+зоопарк. **Золотой путь (Bevy):** ОДИН словарь — `&T`/`&mut T` для данных + НАСТОЯЩИЕ `Ref<T>`/`Mut<T>`
+для change-detection; `Read`/`Write` → `#[deprecated]`-алиасы `&T`/`&mut T`, постепенная миграция сайтов
+(сотни, но не больно через deprecate). **Не блокирует C6:** `WorldQuery::ReadOnly` (шаг 1, commit f9f191c)
+проецирует КАЖДУЮ форму независимо от словаря; reference-формы уже спроецированы `&mut T→&'a T`
+(refs→refs, без кросс-словарной путаницы).
 
 ### 1.2 Итерация — 11 способов
 Целевая четвёрка на едином Query: `iter` / `for_each` / `par_for_each` / `for_each_chunk(+par)`.
