@@ -47,7 +47,7 @@ impl WideIter {
     pub fn run(&mut self) {
         self.state
             .query_mut(&mut self.world)
-            .for_each(|_, (b, c, d, e, mut a)| {
+            .for_each_mut(|_, (b, c, d, e, mut a)| {
                 a.0 += b.0 + c.0 + d.0 + e.0;
             });
     }

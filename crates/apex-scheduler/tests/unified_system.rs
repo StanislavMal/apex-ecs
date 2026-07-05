@@ -12,7 +12,7 @@ struct Counter(u32);
 // Параллельная система — доступ выведен из параметров (Write<Counter>).
 system! {
     fn parallel_inc(q: Write<Counter>) {
-        q.for_each(|_, mut c| {
+        q.for_each_mut(|_, mut c| {
             c.0 += 1;
         });
     }
@@ -55,7 +55,7 @@ fn unified_add_systems_bare_identifiers() {
 system! {
     struct Accumulator { step: u32 }
     fn run(s: &mut Self, q: Write<Counter>) {
-        q.for_each(|_, mut c| {
+        q.for_each_mut(|_, mut c| {
             c.0 += s.step;
         });
     }

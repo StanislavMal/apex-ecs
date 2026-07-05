@@ -2720,8 +2720,26 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
             .unwrap_or((0, usize::MAX))
     }
 
+    /// Read-only `for_each` — a shared-borrow write iteration would let two
+    /// scoped threads sharing `&q` each obtain `&mut` to the same row (S1 part 2;
+    /// `CachedQuery` is `Sync`). Write shapes use [`for_each_mut`](Self::for_each_mut).
     #[inline]
-    pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
+    pub fn for_each<F: FnMut(Entity, Q::Item<'_>)>(&self, f: F)
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        self.for_each_raw(f);
+    }
+
+    /// `for_each` yielding `Mut<T>` for write shapes; `&mut self` proves the
+    /// query is not shared across threads.
+    #[inline]
+    pub fn for_each_mut<F: FnMut(Entity, Q::Item<'_>)>(&mut self, f: F) {
+        self.for_each_raw(f);
+    }
+
+    #[inline]
+    fn for_each_raw<F: FnMut(Entity, Q::Item<'_>)>(&self, mut f: F) {
         let ids = &self.cached_ids;
         debug_assert_eq!(ids.len(), Q::component_count(), "инвариант fill_ids нарушен");
         let this_run = self.world.current_tick();
@@ -2769,7 +2787,27 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// per-archetype. Замер (A/B `par_split_ab`/`par_uniform_ab`): ~7% быстрее
     /// на равномерной тяжёлой нагрузке, ~2-3% на скошенной, никогда не хуже.
     /// Семантика прежняя; порядок обхода недетерминирован (как и был у rayon).
+    /// Read-only shape only (see [`for_each`](Self::for_each)); write shapes use
+    /// [`par_for_each_mut`](Self::par_for_each_mut).
     pub fn par_for_each<F>(&self, f: F)
+    where
+        Q: crate::query::ReadOnlyWorldQuery + Send,
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    /// Параллельная итерация с `Mut<T>` для write-форм; `&mut self` доказывает
+    /// эксклюзивность (каждый leaf — непересекающийся диапазон строк).
+    pub fn par_for_each_mut<F>(&mut self, f: F)
+    where
+        Q: Send,
+        F: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    fn par_for_each_raw<F>(&self, f: F)
     where
         Q: Send,
         F: Fn(Entity, Q::Item<'_>) + Send + Sync,
@@ -2848,7 +2886,7 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 .map(|&i| self.world.archetypes[i].len())
                 .sum();
         }
-        self.iter().count()
+        self.iter_raw().count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2859,14 +2897,32 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
                 .iter()
                 .all(|&i| self.world.archetypes[i].is_empty());
         }
-        self.iter().next().is_none()
+        self.iter_raw().next().is_none()
     }
 
     /// Плотная (chunk) итерация (W2-0.5) — см. [`Query::for_each_chunk`]
     /// (crate::query::Query::for_each_chunk): слайсы колонок вместо per-row
     /// `fetch_item`; write-слайсы стампятся диапазоном. `Changed<T>` не
     /// компилируется.
-    pub fn for_each_chunk<F>(&self, mut f: F)
+    pub fn for_each_chunk<F>(&self, f: F)
+    where
+        Q: crate::dense::DenseQuery + crate::query::ReadOnlyWorldQuery,
+        F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        self.for_each_chunk_raw(f);
+    }
+
+    /// Плотная итерация с изменяемыми слайсами для write-форм; `&mut self`
+    /// доказывает эксклюзивность.
+    pub fn for_each_chunk_mut<F>(&mut self, f: F)
+    where
+        Q: crate::dense::DenseQuery,
+        F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        self.for_each_chunk_raw(f);
+    }
+
+    fn for_each_chunk_raw<F>(&self, mut f: F)
     where
         Q: crate::dense::DenseQuery,
         F: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
@@ -2892,6 +2948,24 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// Параллельная плотная итерация — те же chunk-диапазоны, что у
     /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
     pub fn par_for_each_chunk<F>(&self, f: F)
+    where
+        Q: crate::dense::DenseQuery + crate::query::ReadOnlyWorldQuery + Send,
+        F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
+
+    /// Параллельная плотная итерация с изменяемыми слайсами для write-форм;
+    /// `&mut self` доказывает эксклюзивность.
+    pub fn par_for_each_chunk_mut<F>(&mut self, f: F)
+    where
+        Q: crate::dense::DenseQuery + Send,
+        F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
+
+    fn par_for_each_chunk_raw<F>(&self, f: F)
     where
         Q: crate::dense::DenseQuery + Send,
         F: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
@@ -2949,7 +3023,24 @@ impl<'w, Q: WorldQuery> CachedQuery<'w, Q> {
     /// В отличие от `for_each`, возвращает стандартный Rust-итератор.
     /// `fetch_state` вызывается лениво — только при переходе на новый архетип.
     #[inline]
-    pub fn iter(&self) -> CachedQueryIter<'w, Q> {
+    pub fn iter(&self) -> CachedQueryIter<'w, Q>
+    where
+        Q: crate::query::ReadOnlyWorldQuery,
+    {
+        self.iter_raw()
+    }
+
+    /// Итератор с `Mut<T>` для write-форм. Возврат привязан к заёму `&mut self`
+    /// (`'_`, не `'w`): иначе `CachedQueryIter` живёт `'w` независимо от `&mut`,
+    /// и повторный `iter_mut` дал бы два write-итератора на те же строки
+    /// (aliasing). Ковариантность по `'w` сужает `'w`→`'_`.
+    #[inline]
+    pub fn iter_mut(&mut self) -> CachedQueryIter<'_, Q> {
+        self.iter_raw()
+    }
+
+    #[inline]
+    fn iter_raw(&self) -> CachedQueryIter<'w, Q> {
         CachedQueryIter {
             world: self.world,
             arch_indices: self.arch_indices.clone(),
@@ -5016,7 +5107,7 @@ mod wave5_par_split {
         // Parallel (adaptive-split) mutation.
         let (mut wp, _) = skewed_world();
         wp.query_mut::<crate::query::Write<N>>()
-            .par_for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
+            .par_for_each_mut(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut par: Vec<u32> = wp
             .query::<crate::query::Read<N>>()
             .iter()
@@ -5027,7 +5118,7 @@ mod wave5_par_split {
         // Sequential reference on an identically-built world.
         let (mut ws, _) = skewed_world();
         ws.query_mut::<crate::query::Write<N>>()
-            .for_each(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
+            .for_each_mut(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut seq: Vec<u32> = ws
             .query::<crate::query::Read<N>>()
             .iter()

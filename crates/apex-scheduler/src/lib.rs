@@ -3865,7 +3865,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<Self::Query>().for_each(|_, (vel, mut pos)| {
+            ctx.query_unchecked::<Self::Query>().for_each_mut(|_, (vel, mut pos)| {
                 pos.x += vel.x;
                 pos.y += vel.y;
             });
@@ -3878,7 +3878,7 @@ mod tests {
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<Self::Query>().for_each(|_, mut hp| {
+            ctx.query_unchecked::<Self::Query>().for_each_mut(|_, mut hp| {
                 hp.0 = hp.0.max(0.0);
             });
         }
@@ -4250,7 +4250,7 @@ mod tests {
             }
             fn run(&mut self, ctx: SystemContext<'_>) {
                 ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
-                    .for_each(|_, (vel, mut pos)| {
+                    .for_each_mut(|_, (vel, mut pos)| {
                         pos.x += vel.x;
                         pos.y += vel.y;
                     });
@@ -4360,7 +4360,7 @@ mod tests {
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
                 ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
-                    .for_each(|_, (vel, mut pos)| {
+                    .for_each_mut(|_, (vel, mut pos)| {
                         pos.x += vel.x * (*dt).0;
                         pos.y += vel.y * (*dt).0;
                     });
@@ -6088,8 +6088,8 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Ping(u32);
 
-        fn movement(dt: Res<Dt>, q: Q<(&Vel, &mut Pos)>) {
-            q.for_each(|_, (v, mut p)| {
+        fn movement(dt: Res<Dt>, mut q: Q<(&Vel, &mut Pos)>) {
+            q.for_each_mut(|_, (v, mut p)| {
                 p.x += v.x * dt.step;
                 p.y += v.y * dt.step;
             });
@@ -6172,11 +6172,11 @@ mod tests {
     /// (параллельный батч), с пересекающимся — конфликтуют.
     #[test]
     fn plain_fn_access_inferred_for_conflicts() {
-        fn writes_pos(q: apex_core::query::Query<'_, Write<Pos>>) {
-            q.for_each(|_, mut p| p.x += 1.0);
+        fn writes_pos(mut q: apex_core::query::Query<'_, Write<Pos>>) {
+            q.for_each_mut(|_, mut p| p.x += 1.0);
         }
-        fn writes_vel(q: apex_core::query::Query<'_, Write<Vel>>) {
-            q.for_each(|_, mut v| v.x += 1.0);
+        fn writes_vel(mut q: apex_core::query::Query<'_, Write<Vel>>) {
+            q.for_each_mut(|_, mut v| v.x += 1.0);
         }
         fn reads_pos(q: apex_core::query::Query<'_, Read<Pos>>) {
             q.for_each(|_, _| {});
@@ -6540,7 +6540,7 @@ mod tests {
 
         system! {
             fn bump(q: Write<Hits>) {
-                q.for_each(|_, mut h| h.0 += 1);
+                q.for_each_mut(|_, mut h| h.0 += 1);
             }
         }
 
@@ -6581,7 +6581,7 @@ mod tests {
 
         system! {
             fn bump(q: Write<Hits>) {
-                q.for_each(|_, mut h| h.0 += 1);
+                q.for_each_mut(|_, mut h| h.0 += 1);
             }
         }
 

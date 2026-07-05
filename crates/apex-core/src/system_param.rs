@@ -615,8 +615,11 @@ where
         Q::system_access().merge(&F::system_access())
     }
     fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
-        let q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
-        q.iter().take(2).count() == 1
+        // `iter_mut` (not `iter`): the shape may be a write query, which no longer
+        // satisfies the `&self` read-only iterator bound (S1 part 2). The local
+        // owns `q`, so the exclusive borrow is trivially available.
+        let mut q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        q.iter_mut().take(2).count() == 1
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
         let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);
@@ -648,8 +651,9 @@ where
         Q::system_access().merge(&F::system_access())
     }
     fn validate(ctx: &crate::world::SystemContext<'_>) -> bool {
-        let q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
-        q.iter().take(2).count() <= 1
+        // `iter_mut`: see the `Single` impl above — the shape may be a write query.
+        let mut q = <crate::query::Query<'_, Q, F> as SystemParam>::fetch(ctx);
+        q.iter_mut().take(2).count() <= 1
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w> {
         let q = <crate::query::Query<'w, Q, F> as SystemParam>::fetch(ctx);

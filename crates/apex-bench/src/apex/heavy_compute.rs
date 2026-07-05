@@ -35,7 +35,7 @@ impl HeavyCompute {
         // каждую итерацию делает бенч детерминированным и честным для всех движков; нагрузка
         // (100 инверсий на сущность + запись позиции) сохранена. unwrap_or — страховка.
         self.world.query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
-            .par_for_each(|_, (mat, mut pos)| {
+            .par_for_each_mut(|_, (mat, mut pos)| {
                 let mut m = *mat;
                 for _ in 0..100 {
                     m = m.invert().unwrap_or(m);

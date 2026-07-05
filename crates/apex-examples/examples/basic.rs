@@ -56,7 +56,7 @@ system! {
         let dt = cfg.dt;
         let g = cfg.gravity;
         let count = q.len();
-        q.for_each(|_, (mass, mut vel, mut pos)| {
+        q.for_each_mut(|_, (mass, mut vel, mut pos)| {
             vel.y -= g * mass.0 * dt;
             pos.x += vel.x * dt;
             pos.y += vel.y * dt;
@@ -73,7 +73,7 @@ system! {
         cmd: Cmd,
     ) {
         let mut dead_entities: Vec<Entity> = Vec::new();
-        q.for_each(|entity, mut hp| {
+        q.for_each_mut(|entity, mut hp| {
             hp.current = hp.current.clamp(0.0, hp.max);
             if hp.current <= 0.0 {
                 dead_entities.push(entity);
@@ -93,7 +93,7 @@ system! {
         q: (Read<Velocity>, Write<Position>),
     ) {
         let count = q.len();
-        q.for_each(|_, (vel, mut pos)| {
+        q.for_each_mut(|_, (vel, mut pos)| {
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -232,7 +232,7 @@ system! {
         q: (Read<Enemy>, Write<Velocity>),
     ) {
         let count = q.len();
-        q.for_each(|_, (_, mut vel)| {
+        q.for_each_mut(|_, (_, mut vel)| {
             vel.x *= 0.99;
             vel.y *= 0.99;
         });

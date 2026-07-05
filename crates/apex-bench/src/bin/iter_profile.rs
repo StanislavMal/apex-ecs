@@ -66,7 +66,7 @@ fn main() {
             for _ in 0..N {
                 world
                     .query_mut::<(Read<Velocity>, Write<Position>)>()
-                    .for_each(|_, (vel, mut pos)| {
+                    .for_each_mut(|_, (vel, mut pos)| {
                         pos.0 += vel.0;
                     });
             }
@@ -80,7 +80,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world).for_each(
+                Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world).for_each_mut(
                     |_, (vel, mut pos)| {
                         pos.0 += vel.0;
                     },
@@ -111,7 +111,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                state.query_mut(&mut world).for_each(|_, (vel, mut pos)| {
+                state.query_mut(&mut world).for_each_mut(|_, (vel, mut pos)| {
                     pos.0 += vel.0;
                 });
             }
@@ -126,7 +126,7 @@ fn main() {
         || {
             let t = Instant::now();
             for _ in 0..N {
-                state.query_mut(&mut world).for_each_chunk(|_, (vel, pos)| {
+                state.query_mut(&mut world).for_each_chunk_mut(|_, (vel, pos)| {
                     for i in 0..pos.len() {
                         pos[i].0 += vel[i].0;
                     }
@@ -144,7 +144,7 @@ fn main() {
             for _ in 0..N {
                 world
                     .query_mut::<(Read<Velocity>, Write<Position>)>()
-                    .for_each_chunk(|_, (vel, pos)| {
+                    .for_each_chunk_mut(|_, (vel, pos)| {
                         for i in 0..pos.len() {
                             pos[i].0 += vel[i].0;
                         }

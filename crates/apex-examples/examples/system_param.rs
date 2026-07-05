@@ -189,10 +189,10 @@ fn test_query_param() {
         // Write<T> — мутабельный доступ
         {
             type P = QueryParam<Write<Position>>;
-            let q = ctx.fetch_unchecked::<P>();
-            let count = q.iter().count();
+            let mut q = ctx.fetch_unchecked::<P>();
+            let count = q.iter_mut().count();
             assert_eq!(count, 3);
-            q.for_each(|_, mut pos| { pos.x += 100.0; });
+            q.for_each_mut(|_, mut pos| { pos.x += 100.0; });
             println!("  Write<Position>: {} entities mutated", count);
         }
     });

@@ -30,12 +30,12 @@ fn heavy(x: f32) -> f32 {
 
 system! {
     fn heavy_a(q: Write<A>) {
-        q.for_each(|_, mut a| { a.0 = heavy(a.0); });
+        q.for_each_mut(|_, mut a| { a.0 = heavy(a.0); });
     }
 }
 system! {
     fn heavy_b(q: Write<B>) {
-        q.for_each(|_, mut b| { b.0 = heavy(b.0); });
+        q.for_each_mut(|_, mut b| { b.0 = heavy(b.0); });
     }
 }
 

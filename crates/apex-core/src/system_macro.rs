@@ -8,7 +8,10 @@
 ///         q: (Read<Velocity>, Write<Position>),
 ///         keys: Res<Input<KeyCode>>,
 ///     ) {
-///         for (vel, mut pos) in q.iter() {
+///         // Write query ⇒ mutable iteration: `iter_mut` / `for_each_mut`
+///         // (`iter`/`for_each` are read-only; see `Query::iter`). `q` is
+///         // already `mut`-bound by this macro.
+///         for (vel, mut pos) in q.iter_mut() {
 ///             if keys.pressed(KeyCode::A) { pos.x -= vel.x; }
 ///         }
 ///     }
@@ -360,7 +363,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
+        @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -504,7 +507,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
+        @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -548,7 +551,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
+        @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -688,7 +691,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname = $ctx.query_unchecked::<Self::Query>(); ],
+        @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};

@@ -89,6 +89,6 @@ impl ParSkew {
     pub fn run(&mut self) {
         self.world
             .query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
-            .par_for_each(|_, (mat, mut pos)| Self::heavy(mat, &mut pos));
+            .par_for_each_mut(|_, (mat, mut pos)| Self::heavy(mat, &mut pos));
     }
 }

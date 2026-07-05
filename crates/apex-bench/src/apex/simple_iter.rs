@@ -36,14 +36,14 @@ impl SimpleIter {
     /// `world.query()` каждую итерацию (пересборка матча архетипов) — это был
     /// нечестный гандикап apex против кэширующего bevy.
     pub fn run(&mut self) {
-        self.state.query_mut(&mut self.world).for_each(|_, (vel, mut pos)| {
+        self.state.query_mut(&mut self.world).for_each_mut(|_, (vel, mut pos)| {
             pos.0 += vel.0;
         });
     }
 
     /// W2-0.5: плотная chunk-итерация (слайсы колонок + stamp_range).
     pub fn run_chunked(&mut self) {
-        self.state.query_mut(&mut self.world).for_each_chunk(|_, (vel, pos)| {
+        self.state.query_mut(&mut self.world).for_each_chunk_mut(|_, (vel, pos)| {
             for (p, v) in pos.iter_mut().zip(vel) {
                 p.0 += v.0;
             }

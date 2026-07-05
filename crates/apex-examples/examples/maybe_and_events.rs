@@ -101,8 +101,8 @@ fn main() {
     println!("\n--- 2. MaybeWrite<Speed>: ускоряем только entity со Speed ---");
 
     // Замедляем все движущиеся entity, у кого есть Speed
-    let query = Query::<(MaybeWrite<Speed>, With<Enemy>)>::new_mut(&mut world);
-    query.for_each(|entity, (speed_opt, _)| {
+    let mut query = Query::<(MaybeWrite<Speed>, With<Enemy>)>::new_mut(&mut world);
+    query.for_each_mut(|entity, (speed_opt, _)| {
         if let Some(mut speed) = speed_opt {
             speed.0 *= 0.8;
             println!("  entity {:?}: замедлен до speed={}", entity, speed.0);

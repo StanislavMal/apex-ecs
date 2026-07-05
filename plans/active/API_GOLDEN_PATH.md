@@ -285,6 +285,14 @@ pub(crate) (commit b2a1ff5; потребители на `try_resource`/`insert_r
 из safe) → dead-code/харденинг **волны 3/4**. *Гейт волны 1a: workspace tests ✅, clippy net-neutral ✅,
 движок all-targets, goldens byte-identical.*
 
+**S1 ЧАСТЬ 2 ✅ (2026-07-05) — read/write accessor split (standalone, ДО C6).** Прагматично разведено с
+C6-merge: soundness 🔴 не ждёт структурной схлопки. `&self`-аксессоры (`iter`/`for_each`/`par_for_each`/
+`*_chunk`) → бинд `ReadOnlyWorldQuery`; добавлены `&mut self`-варианты `*_mut` (эксклюзив). `iter_raw` для
+внутренних счётчиков; `CachedQuery::iter_mut` привязан к заёму (`'_`); `system!` биндит query `mut`. Полная
+кросс-репо миграция write-итерации на `_mut`. Гейты все зелёные (детали — TECH_DEBT S1). Форвард-совместимо
+с C6: сигнатуры `_mut`-аксессоров переживают merge в unified `Query<'w,'s>`. **NEXT = C6** (структурная
+схлопка Query+CachedQuery+QueryState).
+
 **Волна 1b/2 — Unified Query + sound-аксессоры (🔴 S1 + C6, ОДНА работа — спайк GO).** Единый
 `Query<'w, 's, D, F>` держит `UnsafeWorldCell<'w>` + `StateSrc<'s>{Owned|Borrowed}`; `type ReadOnly`-
 проекция на `WorldQuery` (+impls на все формы) → `iter(&self)` read даже на write-форме; `iter_mut/

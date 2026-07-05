@@ -113,7 +113,7 @@ fn check_s1(sched: &mut Scheduler, world: &mut World) {
 
 system! {
     fn s2_system(q: (Read<Player>, Write<Pos>)) {
-        q.for_each(|_, (_, mut pos)| { pos.x += 1.0; });
+        q.for_each_mut(|_, (_, mut pos)| { pos.x += 1.0; });
         S2_CALLED.store(true, Ordering::SeqCst);
     }
 }

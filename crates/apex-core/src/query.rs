@@ -1606,15 +1606,43 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
             .unwrap_or((0, usize::MAX))
     }
 
-    /// Итератор по item'ам запроса (П1: entity — через форму
-    /// `Query<(Entity, …)>`, как в Bevy).
-    pub fn iter(&self) -> QueryIter<'_, Q, F> {
+    /// Shared iteration core (no read-only bound): builds the lazy iterator over
+    /// the matched archetypes. Private — the public `&self` entry
+    /// [`iter`](Self::iter) adds the [`ReadOnlyWorldQuery`] bound, the `&mut self`
+    /// entry [`iter_mut`](Self::iter_mut) proves exclusivity. Internal callers
+    /// that only count rows (`len`/`is_empty`/`single_impl`) go through this
+    /// directly (single-threaded, transient `Mut` never escapes).
+    #[inline]
+    fn iter_raw(&self) -> QueryIter<'_, Q, F> {
         QueryIter {
             archetypes: &self.archetypes,
             arch_cursor: 0,
             row_cursor: 0,
             row_ranges: self.row_ranges,
         }
+    }
+
+    /// Read-only iterator over the query items (П1: entity — через форму
+    /// `Query<(Entity, …)>`, как в Bevy).
+    ///
+    /// Requires a read-only shape: a shared `&self` iterator over a write shape
+    /// would hand out `Mut<T>`, and because a query is `Sync` two scoped threads
+    /// sharing `&q` could each obtain `&mut` to the same row — a data race from
+    /// safe code (S1 part 2). Write shapes iterate via [`iter_mut`](Self::iter_mut)
+    /// (`&mut self` proves the query is not shared).
+    pub fn iter(&self) -> QueryIter<'_, Q, F>
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        self.iter_raw()
+    }
+
+    /// Iterator yielding `Mut<T>` for write shapes. `&mut self` proves the query
+    /// is not shared, so the yielded mutable items cannot alias across threads.
+    #[inline]
+    pub fn iter_mut(&mut self) -> QueryIter<'_, Q, F> {
+        self.iter_raw()
     }
 
     /// Item конкретной entity, если она матчит запрос (П3, Bevy-паритет
@@ -1676,7 +1704,7 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
 
     #[inline]
     fn single_impl(&self) -> Result<Q::Item<'_>, QuerySingleError> {
-        let mut it = self.iter();
+        let mut it = self.iter_raw();
         let first = it.next().ok_or(QuerySingleError::NoEntities)?;
         if it.next().is_some() {
             return Err(QuerySingleError::MultipleEntities);
@@ -1712,8 +1740,27 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         found.ok_or(QuerySingleError::NoEntities)
     }
 
+    /// Read-only `for_each` — see [`iter`](Self::iter) for why the shared-borrow
+    /// entry requires a read-only shape. Write shapes use
+    /// [`for_each_mut`](Self::for_each_mut).
     #[inline]
-    pub fn for_each<Func: FnMut(Entity, Q::Item<'_>)>(&self, mut f: Func) {
+    pub fn for_each<Func: FnMut(Entity, Q::Item<'_>)>(&self, f: Func)
+    where
+        Q: ReadOnlyWorldQuery,
+        F: ReadOnlyWorldQuery,
+    {
+        self.for_each_raw(f);
+    }
+
+    /// `for_each` yielding `Mut<T>` for write shapes; `&mut self` proves the
+    /// query is not shared across threads.
+    #[inline]
+    pub fn for_each_mut<Func: FnMut(Entity, Q::Item<'_>)>(&mut self, f: Func) {
+        self.for_each_raw(f);
+    }
+
+    #[inline]
+    fn for_each_raw<Func: FnMut(Entity, Q::Item<'_>)>(&self, mut f: Func) {
         for a in &self.archetypes {
             let (row_start, row_end) = self.row_range(a.arch_idx);
             let end = row_end.min(a.len);
@@ -1741,11 +1788,34 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         }
     }
 
-    /// Параллельная итерация.
     /// Параллельная итерация через adaptive-split (wave 5, §7) — единый механизм
     /// с [`CachedQuery::par_for_each`](crate::world::CachedQuery::par_for_each):
     /// рекурсивный `rayon::join` поперёк архетипов. Порядок недетерминирован.
+    ///
+    /// Read-only shape only (see [`iter`](Self::iter)); write shapes use
+    /// [`par_for_each_mut`](Self::par_for_each_mut).
     pub fn par_for_each<Func>(&self, f: Func)
+    where
+        Q: ReadOnlyWorldQuery + Send,
+        F: ReadOnlyWorldQuery + Send,
+        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    /// Параллельная итерация с `Mut<T>` для write-форм; `&mut self` доказывает
+    /// эксклюзивность (запрос не расшарен между потоками, каждый leaf получает
+    /// непересекающийся диапазон строк).
+    pub fn par_for_each_mut<Func>(&mut self, f: Func)
+    where
+        Q: Send,
+        F: Send,
+        Func: Fn(Entity, Q::Item<'_>) + Send + Sync,
+    {
+        self.par_for_each_raw(f);
+    }
+
+    fn par_for_each_raw<Func>(&self, f: Func)
     where
         Q: Send,
         F: Send,
@@ -1815,14 +1885,14 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
         if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
             return self.archetypes.iter().map(|a| a.len).sum();
         }
-        self.iter().count()
+        self.iter_raw().count()
     }
 
     pub fn is_empty(&self) -> bool {
         if self.row_ranges.is_empty() && !<(Q, F)>::has_row_filter() {
             return self.archetypes.iter().all(|a| a.len == 0);
         }
-        self.iter().next().is_none()
+        self.iter_raw().next().is_none()
     }
 
     /// Плотная (chunk) итерация (W2-0.5): колбэк получает entities-слайс и
@@ -1839,7 +1909,27 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     ///         for i in 0..pos.len() { pos[i].0 += vel[i].0; } // SIMD-friendly
     ///     });
     /// ```
-    pub fn for_each_chunk<Func>(&self, mut f: Func)
+    pub fn for_each_chunk<Func>(&self, f: Func)
+    where
+        Q: crate::dense::DenseQuery + ReadOnlyWorldQuery,
+        F: ArchetypeFilter,
+        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        self.for_each_chunk_raw(f);
+    }
+
+    /// Плотная итерация с изменяемыми слайсами (`&mut [T]`) для write-форм;
+    /// `&mut self` доказывает эксклюзивность.
+    pub fn for_each_chunk_mut<Func>(&mut self, f: Func)
+    where
+        Q: crate::dense::DenseQuery,
+        F: ArchetypeFilter,
+        Func: FnMut(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>),
+    {
+        self.for_each_chunk_raw(f);
+    }
+
+    fn for_each_chunk_raw<Func>(&self, mut f: Func)
     where
         Q: crate::dense::DenseQuery,
         F: ArchetypeFilter,
@@ -1865,6 +1955,26 @@ impl<'w, Q: WorldQuery, F: WorldQuery> Query<'w, Q, F> {
     /// Параллельная плотная итерация: те же chunk-диапазоны, что у
     /// [`par_for_each`](Self::par_for_each), но колбэк получает слайсы.
     pub fn par_for_each_chunk<Func>(&self, f: Func)
+    where
+        Q: crate::dense::DenseQuery + ReadOnlyWorldQuery + Send,
+        F: ArchetypeFilter,
+        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
+
+    /// Параллельная плотная итерация с изменяемыми слайсами для write-форм;
+    /// `&mut self` доказывает эксклюзивность.
+    pub fn par_for_each_chunk_mut<Func>(&mut self, f: Func)
+    where
+        Q: crate::dense::DenseQuery + Send,
+        F: ArchetypeFilter,
+        Func: Fn(&[Entity], <Q as crate::dense::DenseQuery>::Slices<'_>) + Send + Sync,
+    {
+        self.par_for_each_chunk_raw(f);
+    }
+
+    fn par_for_each_chunk_raw<Func>(&self, f: Func)
     where
         Q: crate::dense::DenseQuery + Send,
         F: ArchetypeFilter,
@@ -2031,7 +2141,13 @@ impl std::error::Error for QuerySingleError {}
 
 /// `for item in &query` (D2-2/П1) — Bevy 1:1: выдаёт `Q::Item`; entity —
 /// через форму запроса (`for (e, hp) in &Query::<(Entity, &Hp)>::new(&w)`).
-impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q Query<'w, Q, F> {
+/// `for item in &query` — read-only shapes only (matches [`Query::iter`]);
+/// write shapes iterate via `&mut query` ([`Query::iter_mut`]).
+impl<'q, 'w, Q, F> IntoIterator for &'q Query<'w, Q, F>
+where
+    Q: ReadOnlyWorldQuery,
+    F: ReadOnlyWorldQuery,
+{
     type Item = Q::Item<'q>;
     type IntoIter = QueryIter<'q, Q, F>;
     fn into_iter(self) -> Self::IntoIter {
@@ -2039,14 +2155,13 @@ impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q Query<'w, Q, F> 
     }
 }
 
-/// `for mut item in &mut query` — привычная Bevy-форма для мутабельных
-/// запросов (наш `iter()` и так выдаёт `Mut<T>` через `&self`, но
-/// `&mut`-форма оставлена для построчного переноса кода).
+/// `for mut item in &mut query` — write shapes yield `Mut<T>`; the exclusive
+/// `&mut` borrow proves the query is not shared (S1 part 2).
 impl<'q, 'w, Q: WorldQuery, F: WorldQuery> IntoIterator for &'q mut Query<'w, Q, F> {
     type Item = Q::Item<'q>;
     type IntoIter = QueryIter<'q, Q, F>;
     fn into_iter(self) -> Self::IntoIter {
-        self.iter()
+        self.iter_mut()
     }
 }
 
@@ -2914,8 +3029,8 @@ mod query_filter_tests {
         world.advance_change_tick();
         let lr2 = world.last_run_tick();
         {
-            let q = Query::<Write<Hp>>::new_mut(&mut world);
-            q.for_each_chunk(|_entities, hps: &mut [Hp]| {
+            let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+            q.for_each_chunk_mut(|_entities, hps: &mut [Hp]| {
                 for hp in hps {
                     hp.0 += 1;
                 }
@@ -3168,8 +3283,8 @@ mod tests {
 
         // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
         {
-            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
-            q.for_each(|e, mut p| {
+            let mut q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
+            q.for_each_mut(|e, mut p| {
                 if e == target {
                     p.x += 1.0;
                 }
@@ -3199,7 +3314,7 @@ mod tests {
         Query::<(&Pos,)>::new(&world).for_each(|_, (p,)| {
             assert_eq!(p.x, 1.0);
         });
-        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each_mut(|_, mut p| {
             p.x += 10.0;
         });
         assert_eq!(world.get::<Pos>(e).unwrap().x, 11.0);
@@ -3208,7 +3323,7 @@ mod tests {
         world.tick();
         let lr = world.current_tick();
         world.tick();
-        Query::<&mut Pos>::new_mut(&mut world).for_each(|_, mut p| {
+        Query::<&mut Pos>::new_mut(&mut world).for_each_mut(|_, mut p| {
             p.x += 1.0;
         });
         let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
@@ -3229,9 +3344,9 @@ mod tests {
         world.tick();
 
         {
-            let q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
+            let mut q: Query<'_, Write<Pos>> = Query::new_mut(&mut world);
             let mut sink = 0.0;
-            q.for_each(|_, p| {
+            q.for_each_mut(|_, p| {
                 // Только Deref (чтение) — без DerefMut.
                 sink += p.x;
             });
@@ -3299,9 +3414,9 @@ mod tests {
         world.spawn((A,));
 
         // Опциональная запись: у кого есть B — удваиваем
-        let query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
+        let mut query: Query<'_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
-            .iter()
+            .iter_mut()
             .map(|(_, b_opt)| b_opt.is_some())
             .collect();
 
@@ -3861,5 +3976,36 @@ mod dyn_query_tests {
             item.get_mut::<Mana>(mana_id).unwrap().0 *= hp;
         });
         assert_eq!(world.get::<Mana>(e), Some(&Mana(30)));
+    }
+
+    /// S1 part 2 (concurrency vector): write iteration is confined to the
+    /// `&mut self` accessors (`iter_mut`/`for_each_mut`/`par_for_each_mut`),
+    /// while `&self` iteration (`iter`/`for_each`) is bound to
+    /// `ReadOnlyWorldQuery`. This keeps a shared `&Query`/`&CachedQuery` (both
+    /// `Sync`) from handing out `Mut<T>` to two scoped threads at once. The
+    /// read/write split must stay behavior-preserving: same rows visited, same
+    /// mutations applied.
+    #[test]
+    fn s1_read_write_accessor_split() {
+        let mut world = World::new();
+        for i in 0u32..8 {
+            world.spawn((Hp(i),));
+        }
+
+        // Exclusive `&mut self` write iteration mutates every row.
+        Query::<Write<Hp>>::new_mut(&mut world).for_each_mut(|_, mut hp| hp.0 += 100);
+        // `iter_mut` yields `Mut<T>` too (bump a second time via the iterator).
+        for mut hp in Query::<Write<Hp>>::new_mut(&mut world).iter_mut() {
+            hp.0 += 1000;
+        }
+
+        // Read-only `&self` iteration observes the writes; sum is stable.
+        let sum: u32 = Query::<Read<Hp>>::new(&world).iter().map(|hp| hp.0).sum();
+        // Σ i + 8*(100+1000) = 28 + 8800.
+        assert_eq!(sum, 28 + 8800);
+
+        let mut via_for_each = 0u32;
+        Query::<Read<Hp>>::new(&world).for_each(|_, hp| via_for_each += hp.0);
+        assert_eq!(via_for_each, sum);
     }
 }
