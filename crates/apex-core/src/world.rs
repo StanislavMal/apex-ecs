@@ -3066,17 +3066,73 @@ impl Bundle for () {
     }
 }
 
-// ── EntityRef ──────────────────────────────────────────────────
+// ── Entity accessor ladder (Р-4) ───────────────────────────────
+//
+// Honest names for the three access levels (Bevy-parity ladder):
+//   • `EntityRef`      — read-only view over `&World`  (get / relation reads);
+//   • `EntityWorldMut` — full mutable access over `&mut World`, INCLUDING
+//     structural ops (insert / remove / despawn) + relations + hierarchy sugar.
+// (`EntityMut` — component-mutation-only, usable as `QueryData` with disjoint
+//  access — is a separate feature, not yet built.)
+//
+// Obtain them via `World::entity` (read), `World::entity_mut` (full), or the
+// checked `get_entity` / `get_entity_mut`.
 
-/// Facade для операций над одной entity: вставка, удаление, деспавн, чтение.
-///
-/// Создаётся через [`World::entity`].
+/// Read-only view over a single entity's components and relations. Obtained via
+/// [`World::entity`] / [`World::get_entity`]. For mutation use
+/// [`EntityWorldMut`] (via [`World::entity_mut`]).
 pub struct EntityRef<'w> {
-    world: &'w mut World,
+    world: &'w World,
     entity: Entity,
 }
 
 impl<'w> EntityRef<'w> {
+    /// Return the entity id.
+    pub fn id(&self) -> Entity {
+        self.entity
+    }
+
+    /// Whether the entity is still alive.
+    pub fn is_alive(&self) -> bool {
+        self.world.entities.is_alive(self.entity)
+    }
+
+    /// Read component `T` (immutable), or `None` if absent.
+    pub fn get<T: Component>(&self) -> Option<&T> {
+        self.world.get::<T>(self.entity)
+    }
+
+    /// Whether this entity has a relation `R` to `target`.
+    pub fn has_relation<R: crate::relations::RelationKind>(&self, kind: R, target: Entity) -> bool {
+        self.world.has_relation(self.entity, kind, target)
+    }
+
+    /// Target of the first relation `R` from this entity (e.g. its parent for
+    /// [`ChildOf`](crate::relations::ChildOf)).
+    pub fn target_of<R: crate::relations::RelationKind>(&self, kind: R) -> Option<Entity> {
+        self.world.target_of(self.entity, kind)
+    }
+
+    /// Entities that relate to this one by `R` (e.g. its children for
+    /// [`ChildOf`](crate::relations::ChildOf)).
+    pub fn targets_of<R: crate::relations::RelationKind>(
+        &self,
+        kind: R,
+    ) -> impl Iterator<Item = Entity> + '_ {
+        self.world.targets_of(kind, self.entity)
+    }
+}
+
+/// Full mutable access to a single entity — structural ops (insert / remove /
+/// despawn), component mutation, relations, and hierarchy sugar. Obtained via
+/// [`World::entity_mut`] / [`World::get_entity_mut`]. For read-only access use
+/// [`EntityRef`] (via [`World::entity`]).
+pub struct EntityWorldMut<'w> {
+    world: &'w mut World,
+    entity: Entity,
+}
+
+impl<'w> EntityWorldMut<'w> {
     /// Вернуть идентификатор entity.
     pub fn id(&self) -> Entity {
         self.entity
@@ -3138,15 +3194,137 @@ impl<'w> EntityRef<'w> {
     pub fn has_relation<R: crate::relations::RelationKind>(&self, kind: R, target: Entity) -> bool {
         self.world.has_relation(self.entity, kind, target)
     }
+
+    // ── Hierarchy sugar (immediate mirror of EntityCommands) ──────
+    //
+    // `EntityWorldMut` holds `&mut World`, so these apply the `ChildOf` relation
+    // immediately (no deferral). Same semantics as the deferred
+    // `EntityCommands::{set_parent,add_child,…}` — first-class relations UX in
+    // both the immediate and command paths (§1.9 gap: sugar was Commands-only).
+
+    /// Make this entity a child of `parent` (immediate [`ChildOf`](crate::relations::ChildOf)
+    /// relation). Immediate mirror of
+    /// [`EntityCommands::set_parent`](crate::commands::EntityCommands::set_parent).
+    pub fn set_parent(&mut self, parent: Entity) -> &mut Self {
+        self.world
+            .add_relation(self.entity, crate::relations::ChildOf, parent);
+        self
+    }
+
+    /// Adopt an EXISTING `child` (immediate `ChildOf` child → self). Mirror of
+    /// [`EntityCommands::add_child`](crate::commands::EntityCommands::add_child).
+    pub fn add_child(&mut self, child: Entity) -> &mut Self {
+        self.world
+            .add_relation(child, crate::relations::ChildOf, self.entity);
+        self
+    }
+
+    /// Adopt a set of existing entities as children (see [`add_child`](Self::add_child)).
+    pub fn add_children(&mut self, children: &[Entity]) -> &mut Self {
+        for &child in children {
+            self.world
+                .add_relation(child, crate::relations::ChildOf, self.entity);
+        }
+        self
+    }
+
+    /// Detach this entity from its parent (drop its `ChildOf` relation), if any.
+    /// Mirror of [`EntityCommands::remove_parent`](crate::commands::EntityCommands::remove_parent).
+    pub fn remove_parent(&mut self) -> &mut Self {
+        let entity = self.entity;
+        if let Some(parent) = self.world.target_of(entity, crate::relations::ChildOf) {
+            self.world
+                .remove_relation(entity, crate::relations::ChildOf, parent);
+        }
+        self
+    }
+
+    /// Detach ALL children of this entity (drop their `ChildOf` → self) without
+    /// despawning them. Mirror of
+    /// [`EntityCommands::clear_children`](crate::commands::EntityCommands::clear_children).
+    pub fn clear_children(&mut self) -> &mut Self {
+        let parent = self.entity;
+        let kids: Vec<Entity> = self
+            .world
+            .targets_of(crate::relations::ChildOf, parent)
+            .collect();
+        for child in kids {
+            self.world
+                .remove_relation(child, crate::relations::ChildOf, parent);
+        }
+        self
+    }
+
+    /// Spawn children of this entity declaratively (immediate mirror of
+    /// [`EntityCommands::with_children`](crate::commands::EntityCommands::with_children)).
+    /// Each `c.spawn(...)` immediately gets a
+    /// [`ChildOf`](crate::relations::ChildOf) → this entity relation; nesting is
+    /// arbitrary (a child's [`EntityWorldMut`] also has `with_children`).
+    pub fn with_children(&mut self, f: impl FnOnce(&mut WorldChildSpawner)) -> &mut Self {
+        let parent = self.entity;
+        let mut spawner = WorldChildSpawner {
+            world: &mut *self.world,
+            parent,
+        };
+        f(&mut spawner);
+        self
+    }
+}
+
+/// Immediate child-spawner for [`EntityWorldMut::with_children`]. Each
+/// [`spawn`](WorldChildSpawner::spawn) attaches a `ChildOf` → parent relation.
+pub struct WorldChildSpawner<'w> {
+    world: &'w mut World,
+    parent: Entity,
+}
+
+impl WorldChildSpawner<'_> {
+    /// Spawn a child (a `ChildOf` → parent relation is attached automatically).
+    /// Returns the child's [`EntityWorldMut`] — nest another `with_children` on it.
+    pub fn spawn<B: Bundle>(&mut self, bundle: B) -> EntityWorldMut<'_> {
+        let child = self.world.spawn(bundle);
+        self.world
+            .add_relation(child, crate::relations::ChildOf, self.parent);
+        EntityWorldMut {
+            world: self.world,
+            entity: child,
+        }
+    }
 }
 
 impl World {
-    /// Получить [`EntityRef`] для entity.
-    pub fn entity(&mut self, entity: Entity) -> EntityRef<'_> {
+    /// Read-only accessor for `entity` (see [`EntityRef`]). Does not check that
+    /// the entity is alive — reads on a stale id return `None`. For a checked
+    /// lookup use [`get_entity`](World::get_entity); for mutation use
+    /// [`entity_mut`](World::entity_mut).
+    pub fn entity(&self, entity: Entity) -> EntityRef<'_> {
         EntityRef {
             world: self,
             entity,
         }
+    }
+
+    /// Full mutable accessor for `entity` (see [`EntityWorldMut`]). For a checked
+    /// lookup use [`get_entity_mut`](World::get_entity_mut).
+    pub fn entity_mut(&mut self, entity: Entity) -> EntityWorldMut<'_> {
+        EntityWorldMut {
+            world: self,
+            entity,
+        }
+    }
+
+    /// Read-only accessor, or `None` if the entity is not alive.
+    pub fn get_entity(&self, entity: Entity) -> Option<EntityRef<'_>> {
+        self.entities
+            .is_alive(entity)
+            .then_some(EntityRef { world: self, entity })
+    }
+
+    /// Full mutable accessor, or `None` if the entity is not alive.
+    pub fn get_entity_mut(&mut self, entity: Entity) -> Option<EntityWorldMut<'_>> {
+        self.entities
+            .is_alive(entity)
+            .then_some(EntityWorldMut { world: self, entity })
     }
 }
 
@@ -3274,6 +3452,69 @@ mod tests {
                 .iter()
                 .count();
         assert_eq!(false_changed, 1, "санити: без клампа wrap даёт ложный Changed");
+    }
+
+    // ── Р-4: entity accessor ladder + immediate hierarchy sugar ──────
+
+    #[test]
+    fn entity_accessor_ladder_and_hierarchy_sugar() {
+        use crate::relations::ChildOf;
+
+        struct Tag(u32);
+        impl crate::component::Component for Tag {}
+
+        let mut world = World::new();
+        let parent = world.spawn((Tag(0),));
+        let c1 = world.spawn((Tag(1),));
+        let c2 = world.spawn((Tag(2),));
+
+        // entity_mut(): full mutable — immediate hierarchy sugar.
+        world.entity_mut(parent).add_child(c1);
+        world.entity_mut(parent).add_children(&[c2]);
+
+        // entity(): read-only — relation navigation + component read.
+        assert_eq!(world.entity(parent).targets_of(ChildOf).count(), 2);
+        assert_eq!(world.entity(c1).target_of(ChildOf), Some(parent));
+        assert!(world.entity(c1).has_relation(ChildOf, parent));
+        assert_eq!(world.entity(c1).get::<Tag>().unwrap().0, 1);
+
+        // set_parent re-links c1 to a fresh parent p2.
+        let p2 = world.spawn((Tag(9),));
+        world.entity_mut(c1).set_parent(p2);
+        assert_eq!(world.entity(c1).target_of(ChildOf), Some(p2));
+
+        // remove_parent detaches.
+        world.entity_mut(c1).remove_parent();
+        assert_eq!(world.entity(c1).target_of(ChildOf), None);
+
+        // clear_children drops all of parent's remaining children (c2).
+        world.entity_mut(parent).clear_children();
+        assert_eq!(world.entity(parent).targets_of(ChildOf).count(), 0);
+
+        // with_children: immediate declarative spawn with nesting.
+        let root = world.spawn((Tag(100),));
+        world.entity_mut(root).with_children(|c| {
+            c.spawn((Tag(101),));
+            c.spawn((Tag(102),)).with_children(|gc| {
+                gc.spawn((Tag(103),));
+            });
+        });
+        let root_kids: Vec<Entity> = world.entity(root).targets_of(ChildOf).collect();
+        assert_eq!(root_kids.len(), 2, "with_children spawned 2 direct children");
+        // The nested grandchild exists under the second child.
+        let mid = root_kids
+            .iter()
+            .copied()
+            .find(|&e| world.entity(e).get::<Tag>().unwrap().0 == 102)
+            .unwrap();
+        assert_eq!(world.entity(mid).targets_of(ChildOf).count(), 1, "grandchild nested");
+
+        // Checked accessors: None on a despawned id.
+        let dead = world.spawn((Tag(7),));
+        world.despawn(dead);
+        assert!(world.get_entity(dead).is_none());
+        assert!(world.get_entity_mut(dead).is_none());
+        assert!(world.get_entity(root).is_some());
     }
 
     /// A6 regression: a panic in `make_bundle(i)` mid `spawn_many` must roll the
