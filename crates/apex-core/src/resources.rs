@@ -140,7 +140,7 @@ impl Resources {
     /// Вызывающий код должен гарантировать что только одна система
     /// в данный момент держит мутабельный доступ к T.
     /// Планировщик обеспечивает это через `AccessDescriptor`.
-    pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut T> {
+    pub(crate) fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut T> {
         let cell = self.data.get(&TypeId::of::<T>())?;
         // SAFETY: the `*mut` provenance is the UnsafeCell interior (via `get()`),
         // so writing through it is legal (A3). The scheduler guarantees exclusive

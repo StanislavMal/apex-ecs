@@ -914,7 +914,7 @@ impl World {
         self.events.reserve_by_type(type_id, capacity);
     }
 
-    pub fn event_queue_ptr<T: Send + Sync + 'static>(
+    pub(crate) fn event_queue_ptr<T: Send + Sync + 'static>(
         &self,
     ) -> Option<*mut crate::events::Events<T>> {
         self.events.get_raw_ptr::<T>()

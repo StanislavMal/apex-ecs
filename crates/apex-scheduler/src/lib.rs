@@ -1824,7 +1824,7 @@ impl Scheduler {
     /// Вызывается автоматически в `run()` / `run_sequential()`.
     /// Можно вызвать вручную перед `compile()`, если нужны реальные имена
     /// в `debug_plan_verbose()`.
-    pub fn populate_type_names(&mut self, registry: &ComponentRegistry) {
+    pub(crate) fn populate_type_names(&mut self, registry: &ComponentRegistry) {
         if !self.type_names.is_empty() {
             return; // Уже заполнены — все миры имеют одинаковые компоненты
         }
@@ -2009,7 +2009,7 @@ impl Scheduler {
     ///
     /// Вызывается после compile() перед run(), когда World уже создан.
     /// Использует AccessDescriptor.reads/writes (TypeId) для фильтрации.
-    pub fn compute_archetype_indices(&mut self, world: &apex_core::World) {
+    pub(crate) fn compute_archetype_indices(&mut self, world: &apex_core::World) {
         let archetypes = world.archetypes();
         let arch_count = archetypes.len();
 
@@ -2516,14 +2516,16 @@ impl Scheduler {
         self.startup_completed = true;
     }
 
-    /// Последовательное выполнение — для тестов и non-parallel builds.
+    /// Sequential execution — for tests and non-parallel builds.
     ///
-    /// Принимает `*mut World` намеренно: внутри одновременно создаются `SubWorld`
-    /// (read-only вид) и применяются `Commands` (`&mut World`), что невозможно
-    /// выразить через единый `&mut World` без reborrow-конфликтов. Вызывающий
-    /// гарантирует валидность указателя (обычно `&mut world`).
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub fn run_sequential(&mut self, world_ptr: *mut World) {
+    /// Takes a safe `&mut World` (A5: no raw pointer on the public surface).
+    /// Internally a raw pointer is re-derived because a `SubWorld` (read-only
+    /// view) and `Commands` application (`&mut World`) are juggled at once, which
+    /// cannot be expressed through a single `&mut World` without reborrow
+    /// conflicts — the exclusive `&mut World` receiver makes that re-derivation
+    /// sound (no other view is live).
+    pub fn run_sequential(&mut self, world: &mut World) {
+        let world_ptr = world as *mut World;
         let w = unsafe { &mut *world_ptr };
         self.populate_type_names(w.registry());
         if self.execution_plan.is_none() {

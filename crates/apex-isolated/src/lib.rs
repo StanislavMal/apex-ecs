@@ -237,10 +237,10 @@ impl IsolatedWorld {
 
     /// Выполнить один тик: tick() → scheduler.run().
     ///
-    /// Автоматически вызывает `compute_archetype_indices` и `compile` при первом запуске.
+    /// `compile` вызывается явно для мягкого логирования ошибки (иначе `run`
+    /// паникует); маппинг систем→архетипы `run` пересчитывает сам каждый вызов.
     pub fn tick(&mut self) {
         self.world.tick();
-        self.scheduler.compute_archetype_indices(&self.world);
         if let Err(e) = self.scheduler.compile() {
             log::error!("IsolatedWorld::tick — scheduler compile error: {e}");
             return;
