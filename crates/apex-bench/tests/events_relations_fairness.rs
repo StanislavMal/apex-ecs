@@ -13,6 +13,33 @@ fn events_apex_and_bevy_read_all_10k() {
     assert_eq!(BevyEvents::new().run(), EXPECTED, "bevy прочитал не все события");
 }
 
+/// The property that actually matters about events (correctness, not µs): a
+/// reader gated to run only every 3rd frame while events are written and the
+/// buffer rotated every frame. Apex preserves a lagging reader's events
+/// (no-loss) — it reads ALL of them; Bevy's messages expire after 2 frames — a
+/// gated reader silently DROPS the events written while it slept (a known Bevy
+/// footgun). Prints the actual counts (run with `--nocapture`).
+#[cfg(feature = "bevy")]
+#[test]
+fn gated_reader_apex_no_loss_bevy_drops() {
+    use apex_bench::apex::events::gated_reader_readout as apex_gated;
+    use apex_bench::bevy::events::gated_reader_readout as bevy_gated;
+
+    let (aw, ar) = apex_gated(30, 3);
+    let (bw, br) = bevy_gated(30, 3);
+
+    assert_eq!(aw, bw, "обе реализации ПИШУТ одинаково");
+    assert_eq!(ar, aw, "apex no-loss: gated-читатель обязан получить все {aw}, получил {ar}");
+    assert!(
+        br < bw,
+        "bevy expiry: gated-читатель ДОЛЖЕН терять события — written {bw}, read {br}"
+    );
+    println!(
+        "apex: written={aw} read={ar} (no-loss); bevy: written={bw} read={br} (потеряно {})",
+        bw - br
+    );
+}
+
 #[cfg(feature = "bevy")]
 #[test]
 fn events_frame_loop_apex_and_bevy_read_all() {

@@ -57,3 +57,23 @@ impl FrameLoopBenchmark {
         sum
     }
 }
+
+/// Bevy counterpart of apex `gated_reader_readout`: same protocol (write every
+/// frame, rotate every frame, read only every `read_every` frames). Bevy's
+/// `Messages` expire after 2 rotations, so a gated reader drops the events
+/// written while it was not running ⇒ `read < written`.
+pub fn gated_reader_readout(frames: u64, read_every: u64) -> (u64, u64) {
+    let mut messages = Messages::<E>::default();
+    let mut cursor = messages.get_cursor();
+    let (mut written, mut read) = (0u64, 0u64);
+    for frame in 0..frames {
+        messages.write(E(frame));
+        written += 1;
+        if frame % read_every == read_every - 1 {
+            read += cursor.read(&messages).count() as u64;
+        }
+        messages.update(); // rotate every frame (drops 2-frame-old messages)
+    }
+    read += cursor.read(&messages).count() as u64;
+    (written, read)
+}

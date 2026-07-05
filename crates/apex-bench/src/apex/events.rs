@@ -73,3 +73,25 @@ impl FrameLoopBench {
         sum
     }
 }
+
+/// Correctness, NOT throughput: a reader that runs only every `read_every` frames
+/// (a run-condition / state-gated system) while events are written every frame and
+/// the buffer is rotated every frame. Returns `(written, read)`. Apex preserves a
+/// lagging reader's events (no-loss) ⇒ `read == written`. Bevy's messages expire
+/// after 2 frames ⇒ a gated reader drops the events written while it slept.
+pub fn gated_reader_readout(frames: u64, read_every: u64) -> (u64, u64) {
+    let mut events = Events::<E>::new();
+    let cursor = events.add_reader();
+    let (mut written, mut read) = (0u64, 0u64);
+    for frame in 0..frames {
+        events.send(E(frame));
+        written += 1;
+        events.update(); // engine rotates the buffer every frame
+        if frame % read_every == read_every - 1 {
+            read += events.read(&cursor).as_slice().len() as u64;
+        }
+    }
+    // final drain so the tail (written after the last read-frame) is counted
+    read += events.read(&cursor).as_slice().len() as u64;
+    (written, read)
+}
