@@ -346,7 +346,7 @@ OrderEndpoint)>`, drain в начале dirty-блока `compile()`) — forwar
 `SystemDescriptor::after` тракт (граф-интеграция без изменений compile). Строковый `Scheduler::before/
 after/chain` остаётся для ДИНАМИЧЕСКОГО порядка (редактор/скрипты). Гейты: workspace tests (245 core +
 6 новых config-ordering), clippy net-neutral (0 warns core/scheduler/isolated), движок check --all-
-targets чист, goldens 649/0/9 byte-identical, scheduler doctests. Коммит ecs `70aed45`.
+targets чист, goldens 649/0/9 byte-identical, scheduler doctests. Коммит ecs `d2949dd`.
 
 **⏳ ОСТАЛОСЬ в волне 3 (focused-проходы, НЕ полумеры — каждый сам по себе):**
 - **SystemBuilder → pub(crate) + чистка legacy add_system-пути.** Демоушен `SystemBuilder` вскрыл, что
