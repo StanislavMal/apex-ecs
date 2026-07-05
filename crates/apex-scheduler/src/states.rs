@@ -28,7 +28,7 @@
 
 use apex_core::world::World;
 
-use crate::{Scheduler, StageLabel};
+use crate::{seq, Scheduler, StageLabel};
 
 /// Маркер-границы типа состояния (enum'ы со `derive(Clone, Copy, PartialEq)`).
 pub trait States: Clone + Copy + PartialEq + Send + Sync + 'static {}
@@ -89,10 +89,12 @@ pub fn init_state<S: States>(world: &mut World, sched: &mut Scheduler, initial: 
         first_apply: true,
     });
 
-    sched.add_system_to_stage(
-        format!("apply_state_transition<{}>", std::any::type_name::<S>()),
-        apply_state_transition::<S>,
+    sched.add_systems(
         StageLabel::First,
+        seq(
+            format!("apply_state_transition<{}>", std::any::type_name::<S>()),
+            apply_state_transition::<S>,
+        ),
     );
 }
 

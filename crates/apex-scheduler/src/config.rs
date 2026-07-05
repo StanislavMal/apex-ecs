@@ -106,6 +106,23 @@ impl SystemConfig {
         self.condition = tree;
         self
     }
+
+    /// Declare that this system calls `par_for_each` internally (it already
+    /// parallelizes its own body over entities). The scheduler then will NOT
+    /// also ASD-row-split it across worker tasks — nested parallelism would
+    /// oversubscribe the pool. Declarative golden-path replacement for the
+    /// imperative `Scheduler::par_for_each_used_by_name` (set at config-build
+    /// time, like `.run_if()`/`.before()`).
+    ///
+    /// No-op on `seq()` systems (Sequential has no component access to split).
+    pub fn par_for_each_used(mut self) -> Self {
+        match &mut self.kind {
+            SystemConfigKind::Auto(_, access) => access.uses_par_for_each = true,
+            SystemConfigKind::ParClosure { access, .. } => access.uses_par_for_each = true,
+            SystemConfigKind::Sequential(_) => {}
+        }
+        self
+    }
 }
 
 // ── Конструкторы ───────────────────────────────────────────

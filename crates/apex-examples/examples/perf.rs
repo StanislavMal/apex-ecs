@@ -1257,8 +1257,8 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys)); s.par_for_each_used_by_name("phys").unwrap(); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys)); s.par_for_each_used_by_name("temp").unwrap(); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys).par_for_each_used()); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys).par_for_each_used()); },
         );
         bench_seq_par(
             &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
@@ -1282,9 +1282,9 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         let (seq_par_sched, par_par_sched) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys)); s.par_for_each_used_by_name("phys").unwrap(); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys)); s.par_for_each_used_by_name("temp").unwrap(); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", HeavyManaParSys)); s.par_for_each_used_by_name("mana").unwrap(); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", HeavyPhysParSys).par_for_each_used()); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys).par_for_each_used()); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", HeavyManaParSys).par_for_each_used()); },
         );
         bench_seq_par(
             &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),

@@ -589,23 +589,28 @@ struct SystemDescriptor {
     /// True = система использует отложенные операции (Commands).
     /// Автоматически определяется при регистрации.
     has_deferred: bool,
-    /// Накопленный доступ из всех run_if/or_else условий.
-    /// При compile() мержится в system access для конфликтного анализа.
-    condition_access: AccessDescriptor,
 }
 
 // ── SystemBuilder ──────────────────────────────────────────────
 
-/// Билдер держит `&'a mut Scheduler` (а не сырой `*mut`): лайфтайм гарантирует,
-/// что билдер не переживёт планировщик — сохранённый билдер + уничтоженный
-/// `Scheduler` = UB был бы возможен с сырым указателем (D10).
-pub struct SystemBuilder<'a> {
+/// Test-only builder returned by the `add_*_to_stage` registration helpers.
+/// The golden-path public API is `add_systems` + [`SystemConfig`] (with
+/// `.run_if()`/`.before()`/`.after()`/`.chain()`), which fully superseded
+/// builder-chaining; the builder now exists only as test-authoring sugar and is
+/// `#[cfg(test)]` (zero footprint in the shipped library — CONVENTIONS §2).
+///
+/// Holds `&'a mut Scheduler` (not a raw `*mut`): the lifetime guarantees the
+/// builder cannot outlive the scheduler — a stored builder + a dropped
+/// `Scheduler` would be potential UB with a raw pointer (D10).
+#[cfg(test)]
+pub(crate) struct SystemBuilder<'a> {
     scheduler: &'a mut Scheduler,
     id: SystemId,
 }
 
+#[cfg(test)]
 impl<'a> SystemBuilder<'a> {
-    pub fn id(self) -> SystemId {
+    pub(crate) fn id(self) -> SystemId {
         self.id
     }
 
@@ -613,7 +618,6 @@ impl<'a> SystemBuilder<'a> {
         {
             let sched = &mut *self.scheduler;
             if let Some(sys) = sched.system_by_id_mut(self.id) {
-                sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
                 if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
                     *access = std::mem::take(access).merge(&condition_access);
                 }
@@ -632,70 +636,13 @@ impl<'a> SystemBuilder<'a> {
         self
     }
 
-    fn add_condition_or(self, leaf: ConditionTree, condition_access: AccessDescriptor) -> Self {
-        {
-            let sched = &mut *self.scheduler;
-            if let Some(sys) = sched.system_by_id_mut(self.id) {
-                sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&condition_access);
-                if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
-                    *access = std::mem::take(access).merge(&condition_access);
-                }
-                match &mut sys.run_condition {
-                    ConditionTree::Or(ref mut conds) => conds.push(leaf),
-                    _ => {
-                        let old = std::mem::replace(&mut sys.run_condition, ConditionTree::Or(Vec::new()));
-                        if let ConditionTree::Or(ref mut conds) = sys.run_condition {
-                            conds.push(old);
-                            conds.push(leaf);
-                        }
-                    }
-                }
-            }
-        }
-        self
-    }
-
     /// Прикрепить run condition — closure.
-    pub fn run_if<F>(self, condition: F) -> Self
+    pub(crate) fn run_if<F>(self, condition: F) -> Self
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
     {
         let leaf = ConditionTree::leaf(condition);
         self.add_condition_leaf(leaf, AccessDescriptor::new())
-    }
-
-    /// Прикрепить typed condition (с явным access для планировщика).
-    pub fn run_if_cond<C: Condition>(self, condition: C) -> Self {
-        let acc = condition.access();
-        let leaf = ConditionTree::Leaf(condition.into_check_fn());
-        self.add_condition_leaf(leaf, acc)
-    }
-
-    /// Прикрепить OR-условие — closure.
-    pub fn or_else<F>(self, condition: F) -> Self
-    where
-        F: Fn(&World) -> bool + Send + Sync + 'static,
-    {
-        let leaf = ConditionTree::leaf(condition);
-        self.add_condition_or(leaf, AccessDescriptor::new())
-    }
-
-    /// Прикрепить OR-условие — typed.
-    pub fn or_else_cond<C: Condition>(self, condition: C) -> Self {
-        let acc = condition.access();
-        let leaf = ConditionTree::Leaf(condition.into_check_fn());
-        self.add_condition_or(leaf, acc)
-    }
-
-    /// Установить всё дерево условий целиком (заменяет существующие).
-    pub fn condition(self, tree: ConditionTree) -> Self {
-        {
-            let sched = &mut *self.scheduler;
-            if let Some(sys) = sched.system_by_id_mut(self.id) {
-                sys.run_condition = tree;
-            }
-        }
-        self
     }
 }
 
@@ -1004,7 +951,9 @@ impl Scheduler {
     }
 
     /// Регистрировать Sequential систему в указанном этапе.
-    pub(crate) fn add_system_to_stage<F>(
+    /// Test-only builder helper — production code uses `add_systems` + `seq()`.
+    #[cfg(test)]
+    fn add_system_to_stage<F>(
         &mut self,
         name: impl Into<String>,
         func: F,
@@ -1027,7 +976,6 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
-            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.seq_system_indices.push(index);
@@ -1105,7 +1053,6 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: S::HAS_DEFERRED,
-            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -1174,7 +1121,6 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
-            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -1270,7 +1216,6 @@ impl Scheduler {
             run_condition: ConditionTree::default(),
             apply_deferred_after: false,
             has_deferred: false,
-            condition_access: AccessDescriptor::new(),
         });
         self.system_indices.insert(id, index);
         self.par_system_indices.push(index);
@@ -1630,7 +1575,6 @@ impl Scheduler {
         let acc = condition.access();
         let leaf = ConditionTree::Leaf(condition.into_check_fn());
         if let Some(sys) = self.system_by_id_mut(id) {
-            sys.condition_access = std::mem::take(&mut sys.condition_access).merge(&acc);
             if let SystemKind::Parallel { ref mut access, .. } = &mut sys.kind {
                 *access = std::mem::take(access).merge(&acc);
             }
@@ -1775,7 +1719,6 @@ impl Scheduler {
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
                     has_deferred: cfg.has_deferred,
-                    condition_access: cfg.condition_access,
                 });
                 self.par_system_indices.push(index);
             }
@@ -1790,7 +1733,6 @@ impl Scheduler {
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
                     has_deferred: cfg.has_deferred,
-                    condition_access: cfg.condition_access,
                 });
                 self.seq_system_indices.push(index);
             }
@@ -1812,7 +1754,6 @@ impl Scheduler {
                     run_condition: cfg.condition,
                     apply_deferred_after: false,
                     has_deferred: cfg.has_deferred,
-                    condition_access: cfg.condition_access,
                 });
                 self.par_system_indices.push(index);
             }
@@ -1829,6 +1770,11 @@ impl Scheduler {
     }
 
     /// `par_for_each_used` по имени системы (удобно с `add_systems`).
+    #[deprecated(
+        since = "0.1.0",
+        note = "declare it on the config: `sys(name, s).par_for_each_used()`"
+    )]
+    #[doc(alias = "par_for_each_used")]
     pub fn par_for_each_used_by_name(&mut self, name: &str) -> Result<&mut Self, SchedulerError> {
         let id = self.find_id_by_name(name)?;
         self.par_for_each_used(id);
