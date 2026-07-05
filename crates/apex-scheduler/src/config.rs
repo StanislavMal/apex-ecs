@@ -29,7 +29,7 @@ pub(crate) enum SystemConfigKind {
     },
 }
 
-/// Конфигурация одной системы (имя + тело + условия).
+/// Конфигурация одной системы (имя + тело + условия + порядок).
 /// Value type — не ссылается на Scheduler, можно делать tuple.
 pub struct SystemConfig {
     pub(crate) name: String,
@@ -37,6 +37,11 @@ pub struct SystemConfig {
     pub(crate) condition: ConditionTree,
     pub(crate) condition_access: AccessDescriptor,
     pub(crate) has_deferred: bool,
+    /// Names of systems this one must run BEFORE (declared via `.before()`).
+    /// Resolved to `SystemId` at compile time (forward references allowed).
+    pub(crate) before_names: Vec<String>,
+    /// Names of systems this one must run AFTER (declared via `.after()`).
+    pub(crate) after_names: Vec<String>,
 }
 
 impl SystemConfig {
@@ -130,6 +135,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: S::HAS_DEFERRED,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 
@@ -144,6 +151,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: false,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 
@@ -159,6 +168,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: false,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 
@@ -199,6 +210,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 
@@ -221,6 +234,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: false,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 
@@ -240,6 +255,8 @@ impl SystemConfig {
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: false,
+            before_names: Vec::new(),
+            after_names: Vec::new(),
         }
     }
 }
@@ -295,27 +312,99 @@ pub struct ExclusiveMarker;
 #[doc(hidden)]
 pub struct FnSystemMarker<M>(std::marker::PhantomData<M>);
 
-/// Трейт конвертации в `Vec<SystemConfig>`. Реализован для `SystemConfig`,
-/// bare `AutoSystem`/`ExclusiveSystem`-маркеров и кортежей до 12 элементов.
-pub trait IntoScheduleConfigs<M> {
-    fn into_vec(self) -> Vec<SystemConfig>;
+/// Маркер: элемент — уже собранный [`ScheduleConfigs`] (напр. результат
+/// `.chain()`/`.before()`/`.after()`).
+#[doc(hidden)]
+pub struct ScheduleConfigsMarker;
+
+/// Группа сконфигурированных систем + их порядковые рёбра — то, во что
+/// [`IntoScheduleConfigs`] превращает системы/кортежи перед регистрацией.
+///
+/// Порядковые методы (`.before()`/`.after()`/`.chain()`) золотого пути
+/// возвращают этот тип. `edges` — позиционные рёбра «раньше→позже» между
+/// элементами `configs` (индексы в `configs`); заполняются `.chain()` и
+/// сохраняются при склейке кортежей (вложенные `.chain()` не теряются).
+/// Именованные рёбра (`.before("x")`) хранятся на самих
+/// [`SystemConfig::before_names`]/[`SystemConfig::after_names`] и резолвятся
+/// планировщиком при `compile()` (forward-ссылки разрешены).
+pub struct ScheduleConfigs {
+    pub(crate) configs: Vec<SystemConfig>,
+    /// Позиционные рёбра порядка `(before_idx, after_idx)` внутри `configs`.
+    pub(crate) edges: Vec<(usize, usize)>,
+}
+
+impl ScheduleConfigs {
+    fn single(cfg: SystemConfig) -> Self {
+        Self { configs: vec![cfg], edges: Vec::new() }
+    }
+}
+
+/// Конвертация систем/кортежей в [`ScheduleConfigs`] — единый вход `add_systems`.
+///
+/// Реализован для `SystemConfig`, bare `AutoSystem`/`ExclusiveSystem`/plain-fn
+/// систем, [`ScheduleConfigs`] и кортежей до 12 элементов. Порядковые методы
+/// (`before`/`after`/`chain`) — золотой путь декларации зависимостей прямо на
+/// конфигах (Bevy-идиома); строковый `Scheduler::before/after/chain` остаётся
+/// для ДИНАМИЧЕСКОГО порядка по имени (редактор/скрипты).
+pub trait IntoScheduleConfigs<M>: Sized {
+    /// Превратить в группу конфигов (для `add_systems`).
+    fn into_configs(self) -> ScheduleConfigs;
+
+    /// Объявить, что ЭТА система (или все системы группы) выполняются ДО системы
+    /// с именем `name`. Имя резолвится при `compile()` (forward-ссылки допустимы).
+    fn before(self, name: impl Into<String>) -> ScheduleConfigs {
+        let mut c = self.into_configs();
+        let name = name.into();
+        for cfg in &mut c.configs {
+            cfg.before_names.push(name.clone());
+        }
+        c
+    }
+
+    /// Объявить, что ЭТА система (или все системы группы) выполняются ПОСЛЕ
+    /// системы с именем `name`. Имя резолвится при `compile()`.
+    fn after(self, name: impl Into<String>) -> ScheduleConfigs {
+        let mut c = self.into_configs();
+        let name = name.into();
+        for cfg in &mut c.configs {
+            cfg.after_names.push(name.clone());
+        }
+        c
+    }
+
+    /// Сцепить системы группы в цепочку: `a → b → c` (каждая после предыдущей).
+    /// Для одиночного элемента — no-op. Позиционно (по порядку в кортеже), имена
+    /// не нужны.
+    fn chain(self) -> ScheduleConfigs {
+        let mut c = self.into_configs();
+        for i in 0..c.configs.len().saturating_sub(1) {
+            c.edges.push((i, i + 1));
+        }
+        c
+    }
+}
+
+impl IntoScheduleConfigs<ScheduleConfigsMarker> for ScheduleConfigs {
+    fn into_configs(self) -> ScheduleConfigs {
+        self
+    }
 }
 
 impl IntoScheduleConfigs<ConfigMarker> for SystemConfig {
-    fn into_vec(self) -> Vec<SystemConfig> {
-        vec![self]
+    fn into_configs(self) -> ScheduleConfigs {
+        ScheduleConfigs::single(self)
     }
 }
 
 impl<S: AutoSystem + 'static> IntoScheduleConfigs<AutoMarker> for S {
-    fn into_vec(self) -> Vec<SystemConfig> {
-        vec![SystemConfig::sys(S::name(), self)]
+    fn into_configs(self) -> ScheduleConfigs {
+        ScheduleConfigs::single(SystemConfig::sys(S::name(), self))
     }
 }
 
 impl<S: ExclusiveSystem> IntoScheduleConfigs<ExclusiveMarker> for S {
-    fn into_vec(self) -> Vec<SystemConfig> {
-        vec![SystemConfig::exclusive(self)]
+    fn into_configs(self) -> ScheduleConfigs {
+        ScheduleConfigs::single(SystemConfig::exclusive(self))
     }
 }
 
@@ -326,14 +415,15 @@ impl<F, M> IntoScheduleConfigs<FnSystemMarker<M>> for F
 where
     F: apex_core::SystemParamFunction<M>,
 {
-    fn into_vec(self) -> Vec<SystemConfig> {
-        vec![SystemConfig::fn_sys(self)]
+    fn into_configs(self) -> ScheduleConfigs {
+        ScheduleConfigs::single(SystemConfig::fn_sys(self))
     }
 }
 
 /// Builder-методы прямо на plain-fn системе (П4, как Bevy `IntoSystemConfigs`):
 /// `movement.run_if(in_state(Game::Playing))` — без обёртки в
-/// `SystemConfig::fn_sys`.
+/// `SystemConfig::fn_sys`. (Порядковые `.before()/.after()/.chain()` доступны
+/// через [`IntoScheduleConfigs`].)
 pub trait FnSystemExt<M>: apex_core::SystemParamFunction<M> + Sized {
     /// Превратить fn в [`SystemConfig`] (имя — из имени функции).
     fn into_config(self) -> SystemConfig {
@@ -358,11 +448,22 @@ macro_rules! impl_into_schedule_configs_tuple {
             $( $T: IntoScheduleConfigs<$M>, )+
         {
             #[allow(non_snake_case)]
-            fn into_vec(self) -> Vec<SystemConfig> {
+            fn into_configs(self) -> ScheduleConfigs {
                 let ($($T,)+) = self;
-                let mut v = Vec::new();
-                $( v.extend($T.into_vec()); )+
-                v
+                let mut configs: Vec<SystemConfig> = Vec::new();
+                let mut edges: Vec<(usize, usize)> = Vec::new();
+                $(
+                    // Склейка: смещаем позиционные рёбра дочерней группы на текущее
+                    // число уже накопленных конфигов, чтобы вложенные `.chain()`
+                    // сохранялись после flatten.
+                    let mut sub = $T.into_configs();
+                    let offset = configs.len();
+                    for (a, b) in sub.edges.drain(..) {
+                        edges.push((a + offset, b + offset));
+                    }
+                    configs.append(&mut sub.configs);
+                )+
+                ScheduleConfigs { configs, edges }
             }
         }
     };

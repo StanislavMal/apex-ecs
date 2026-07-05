@@ -335,10 +335,20 @@ goldens 649/0/9 byte-identical; Miri TB чист (get/single/write-Mut/maybe/Que
   §2:** маркеры AutoSystem/`system!` (`ResRead`/`ResWrite`/`Listen`/`Emit`/`QueryParam`) ОСТАЮТСЯ в
   prelude (первоклассный путь авторинга, не внутрянка); `DelayedQueue` — вон (advanced).
 
+**✅ Ordering на конфигах (Р-3) — СДЕЛАНО (2026-07-05).** `.before(name)`/`.after(name)`/`.chain()` —
+provided-методы трейта `IntoScheduleConfigs`, доступны на `SystemConfig`, bare fn/AutoSystem/
+ExclusiveSystem, `ScheduleConfigs` и кортежах. `into_vec()→into_configs() -> ScheduleConfigs {configs,
+edges}`: `edges` — позиционные рёбра `.chain()` (со смещением при склейке кортежей — вложенные chain
+сохраняются); именованные `.before/.after` — на `SystemConfig::{before_names,after_names}`. Резолв
+имён отложен до `compile()` (новое поле `Scheduler::pending_orderings: Vec<(OrderEndpoint,
+OrderEndpoint)>`, drain в начале dirty-блока `compile()`) — forward-ссылки работают; ненайденное имя =
+громкий `SystemNotFound` (§0.2a). Рёбра вливаются в существующий `add_dependency`→`explicit_orderings`/
+`SystemDescriptor::after` тракт (граф-интеграция без изменений compile). Строковый `Scheduler::before/
+after/chain` остаётся для ДИНАМИЧЕСКОГО порядка (редактор/скрипты). Гейты: workspace tests (245 core +
+6 новых config-ordering), clippy net-neutral (0 warns core/scheduler/isolated), движок check --all-
+targets чист, goldens 649/0/9 byte-identical, scheduler doctests. Коммит ecs `70aed45`.
+
 **⏳ ОСТАЛОСЬ в волне 3 (focused-проходы, НЕ полумеры — каждый сам по себе):**
-- **Ordering на конфигах (Р-3)** — `.before()/.after()/.chain()` на `SystemConfig`/кортежах через
-  `IntoScheduleConfigs` (строковый `Scheduler::before/after/chain` — advanced для динамики). Это ФИЧА
-  (интеграция с графом зависимостей планировщика), не косметика — отдельный заход.
 - **SystemBuilder → pub(crate) + чистка legacy add_system-пути.** Демоушен `SystemBuilder` вскрыл, что
   весь builder-chaining путь (`add_system().run_if()` + `run_if_cond`/`or_else`/`condition`) — МЁРТВ
   (вытеснен `add_systems`+`SystemConfig`). Убрать связку (приватные `add_system*` + `SystemBuilder` +

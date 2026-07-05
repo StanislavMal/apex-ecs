@@ -67,7 +67,7 @@ pub mod stage;
 
 pub use config::{
     par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemExt,
-    FnSystemMarker, IntoScheduleConfigs, SystemConfig,
+    FnSystemMarker, IntoScheduleConfigs, ScheduleConfigs, ScheduleConfigsMarker, SystemConfig,
 };
 pub mod fixed;
 pub use fixed::FixedTime;
@@ -80,7 +80,9 @@ pub use states::{in_state, init_state, on_enter, on_exit, NextState, State, Stat
 /// `Scheduler`, stages, `add_systems` config (`sys`/`seq`/`par`/`par_access` +
 /// `SystemConfig`), run conditions/states, and the fixed-timestep clock.
 pub mod prelude {
-    pub use crate::config::{par, par_access, seq, sys, IntoScheduleConfigs, SystemConfig};
+    pub use crate::config::{
+        par, par_access, seq, sys, IntoScheduleConfigs, ScheduleConfigs, SystemConfig,
+    };
     pub use crate::fixed::FixedTime;
     pub use crate::stage::{Stage, StageLabel};
     pub use crate::states::{
@@ -714,6 +716,18 @@ struct GraphEdgeInfo {
     kind: ConflictKind,
 }
 
+// ── OrderEndpoint ──────────────────────────────────────────────
+
+/// One endpoint of a config-declared ordering edge (`.before()`/`.after()`/
+/// `.chain()`). Positional endpoints (chain) resolve to `Id` at registration;
+/// named endpoints (`.after("x")`) stay `Name` until `compile()` so that
+/// forward references (a system named later in another `add_systems` call)
+/// resolve correctly.
+enum OrderEndpoint {
+    Id(SystemId),
+    Name(String),
+}
+
 // ── Scheduler ─────────────────────────────────────────────────
 
 /// Гибридный планировщик с граф-ориентированным компилятором.
@@ -794,6 +808,12 @@ pub struct Scheduler {
     /// Пары систем с явным порядком (от add_dependency / .before / .after).
     /// Edge направлен от «раньше» к «позже»: (a, b) означает a до b.
     explicit_orderings: FxHashSet<(SystemId, SystemId)>,
+    /// Config-declared ordering edges awaiting name resolution, drained at the
+    /// start of `compile()`. Each pair is `(before, after)`: `before` runs
+    /// before `after`. Populated by `add_systems` from `.before()`/`.after()`/
+    /// `.chain()` on configs; `Name` endpoints are resolved via `find_id_by_name`
+    /// at compile so forward references work. Deterministic (insertion order).
+    pending_orderings: Vec<(OrderEndpoint, OrderEndpoint)>,
 
     // ── Seq/Par индексы для O(P) sequential-барьеров ────────────
     /// Индексы sequential систем в self.systems.
@@ -891,6 +911,7 @@ impl Scheduler {
             edge_info: Vec::new(),
             graph_dirty: false,
             explicit_orderings: FxHashSet::default(),
+            pending_orderings: Vec::new(),
             seq_system_indices: Vec::new(),
             par_system_indices: Vec::new(),
             system_archetype_indices: FxHashMap::default(),
@@ -1428,6 +1449,31 @@ impl Scheduler {
         }
     }
 
+    /// Drain config-declared orderings (`.before()`/`.after()`/`.chain()`),
+    /// resolving name endpoints to ids and recording each as a dependency edge.
+    /// Called once at the start of `compile()` while the graph is dirty; a name
+    /// that resolves to no system surfaces as `SystemNotFound` (loud, §0.2a).
+    fn resolve_pending_orderings(&mut self) -> Result<(), SchedulerError> {
+        if self.pending_orderings.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_orderings);
+        for (before, after) in pending {
+            let before_id = self.resolve_order_endpoint(&before)?;
+            let after_id = self.resolve_order_endpoint(&after)?;
+            // `after` runs after `before` ⇒ dependency edge before → after.
+            self.add_dependency(after_id, before_id);
+        }
+        Ok(())
+    }
+
+    fn resolve_order_endpoint(&self, ep: &OrderEndpoint) -> Result<SystemId, SchedulerError> {
+        match ep {
+            OrderEndpoint::Id(id) => Ok(*id),
+            OrderEndpoint::Name(name) => self.find_id_by_name(name),
+        }
+    }
+
     /// `a` выполняется до `b`. Эквивалентно `add_dependency(b, a)`.
     ///
     /// Явный порядок имеет приоритет над автоматически обнаруженными конфликтами
@@ -1636,7 +1682,7 @@ impl Scheduler {
     ///
     /// # Пример
     /// ```
-    /// # use apex_scheduler::{Scheduler, StageLabel, sys, seq};
+    /// # use apex_scheduler::{Scheduler, StageLabel, sys, seq, IntoScheduleConfigs};
     /// # let mut sched = Scheduler::new();
     /// sched.add_systems(StageLabel::Update, (
     ///     sys("a", MoveSys).run_if(|_: &apex_core::world::World| true),
@@ -1648,13 +1694,57 @@ impl Scheduler {
     /// #     fn run(&mut self, _: apex_core::world::SystemContext<'_>) {}
     /// # }
     /// ```
+    ///
+    /// # Порядок (золотой путь)
+    ///
+    /// Зависимости объявляются прямо на конфигах через `.before()`/`.after()`
+    /// (по имени системы) и `.chain()` (позиционно, по порядку в кортеже). Имена
+    /// резолвятся при `compile()`, поэтому forward-ссылки допустимы:
+    /// ```
+    /// # use apex_scheduler::{Scheduler, StageLabel, seq, IntoScheduleConfigs};
+    /// # let mut sched = Scheduler::new();
+    /// # let s = |_: &mut apex_core::world::World| {};
+    /// sched.add_systems(StageLabel::Update, (
+    ///     seq("input", s).before("physics"),      // input → physics
+    ///     (seq("gravity", s), seq("physics", s)).chain(), // gravity → physics
+    ///     seq("render", s).after("physics"),       // physics → render
+    /// ));
+    /// sched.compile().unwrap();
+    /// ```
+    /// Для ДИНАМИЧЕСКОГО порядка (по строке-имени, из редактора/скриптов)
+    /// остаётся `Scheduler::before`/`after`/`chain`.
     pub fn add_systems<M>(
         &mut self,
         stage_label: StageLabel,
         systems: impl IntoScheduleConfigs<M>,
     ) -> &mut Self {
-        for cfg in systems.into_vec() {
-            self.register_system_config(cfg, stage_label.clone());
+        let ScheduleConfigs { configs, edges } = systems.into_configs();
+        let mut ids = Vec::with_capacity(configs.len());
+        for mut cfg in configs {
+            // Config-declared name orderings (`.before("x")`/`.after("x")`) are
+            // deferred: the referenced system may be registered later. Positional
+            // ids for chain edges are captured below.
+            let before_names = std::mem::take(&mut cfg.before_names);
+            let after_names = std::mem::take(&mut cfg.after_names);
+            let id = self.register_system_config(cfg, stage_label.clone());
+            for b in before_names {
+                // self runs BEFORE b.
+                self.pending_orderings
+                    .push((OrderEndpoint::Id(id), OrderEndpoint::Name(b)));
+            }
+            for a in after_names {
+                // a runs BEFORE self.
+                self.pending_orderings
+                    .push((OrderEndpoint::Name(a), OrderEndpoint::Id(id)));
+            }
+            ids.push(id);
+        }
+        // Positional chain edges: configs[bi] runs before configs[ai].
+        for (bi, ai) in edges {
+            self.pending_orderings.push((
+                OrderEndpoint::Id(ids[bi]),
+                OrderEndpoint::Id(ids[ai]),
+            ));
         }
         self
     }
@@ -1851,6 +1941,10 @@ impl Scheduler {
         }
 
         if self.graph_dirty {
+            // Резолвим config-объявленный порядок (`.before/.after/.chain`) в
+            // id-рёбра ДО построения графа — теперь все имена известны
+            // (forward-ссылки разрешены). Ошибка «имя не найдено» — громко (§0.2a).
+            self.resolve_pending_orderings()?;
             // Инкрементальное обновление: добавляем только новые узлы и рёбра
             self.add_new_nodes_and_edges()?;
             self.graph_dirty = false;
@@ -5116,6 +5210,146 @@ mod tests {
         let a_stage = stages.iter().position(|s| s.system_ids.contains(&a)).unwrap();
         let b_stage = stages.iter().position(|s| s.system_ids.contains(&b)).unwrap();
         assert!(b_stage < a_stage, "explicit before(\"b\",\"a\") must run b before a");
+    }
+
+    // ── Р-3: ordering declared on configs (`.before/.after/.chain`) ────────
+
+    /// Helper: index of the execution stage containing `name` after compile.
+    #[cfg(test)]
+    fn stage_of(sched: &Scheduler, name: &str) -> usize {
+        let id = sched.find_id_by_name(name).unwrap();
+        sched
+            .stages()
+            .unwrap()
+            .iter()
+            .position(|s| s.system_ids.contains(&id))
+            .unwrap()
+    }
+
+    /// `.after("x")` on a config orders it after the named system.
+    #[test]
+    fn config_after_orders_by_name() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                par("a", |_: SystemContext<'_>| {}),
+                par("b", |_: SystemContext<'_>| {}).after("a"),
+            ),
+        );
+        sched.compile().unwrap();
+        assert!(
+            stage_of(&sched, "a") < stage_of(&sched, "b"),
+            ".after(\"a\") must run b after a"
+        );
+    }
+
+    /// `.before("x")` accepts a FORWARD reference (target registered later in the
+    /// same tuple) — name resolution is deferred to compile().
+    #[test]
+    fn config_before_forward_reference() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                par("a", |_: SystemContext<'_>| {}).before("b"),
+                par("b", |_: SystemContext<'_>| {}),
+            ),
+        );
+        sched.compile().unwrap();
+        assert!(
+            stage_of(&sched, "a") < stage_of(&sched, "b"),
+            ".before(\"b\") forward-ref must run a before b"
+        );
+    }
+
+    /// `.chain()` on a tuple sequences elements positionally: a → b → c.
+    #[test]
+    fn config_chain_orders_tuple() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                par("a", |_: SystemContext<'_>| {}),
+                par("b", |_: SystemContext<'_>| {}),
+                par("c", |_: SystemContext<'_>| {}),
+            )
+                .chain(),
+        );
+        sched.compile().unwrap();
+        let (a, b, c) = (
+            stage_of(&sched, "a"),
+            stage_of(&sched, "b"),
+            stage_of(&sched, "c"),
+        );
+        assert!(a < b && b < c, ".chain() must order a < b < c (got {a},{b},{c})");
+    }
+
+    /// A nested `.chain()` inside an unchained tuple keeps its edges after the
+    /// tuple flattens (positional-edge offsetting).
+    #[test]
+    fn config_nested_chain_preserved() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                (
+                    par("a", |_: SystemContext<'_>| {}),
+                    par("b", |_: SystemContext<'_>| {}),
+                )
+                    .chain(),
+                par("c", |_: SystemContext<'_>| {}),
+            ),
+        );
+        sched.compile().unwrap();
+        assert!(
+            stage_of(&sched, "a") < stage_of(&sched, "b"),
+            "nested .chain() a → b must survive tuple flatten"
+        );
+    }
+
+    /// `.after("<unknown>")` on a config surfaces as a loud `SystemNotFound` at
+    /// compile — never a silent drop (§0.2a).
+    #[test]
+    fn config_after_unknown_name_errors() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            par("a", |_: SystemContext<'_>| {}).after("ghost"),
+        );
+        assert!(
+            matches!(sched.compile(), Err(SchedulerError::SystemNotFound(_))),
+            ".after(\"ghost\") must fail loudly with SystemNotFound"
+        );
+    }
+
+    /// `.chain()` combined with `.after("x")` on the whole group: both the
+    /// internal chain and the external dependency hold.
+    #[test]
+    fn config_chain_then_after_group() {
+        use crate::config::IntoScheduleConfigs;
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                par("root", |_: SystemContext<'_>| {}),
+                (
+                    par("a", |_: SystemContext<'_>| {}),
+                    par("b", |_: SystemContext<'_>| {}),
+                )
+                    .chain()
+                    .after("root"),
+            ),
+        );
+        sched.compile().unwrap();
+        assert!(stage_of(&sched, "root") < stage_of(&sched, "a"), "a after root");
+        assert!(stage_of(&sched, "root") < stage_of(&sched, "b"), "b after root");
+        assert!(stage_of(&sched, "a") < stage_of(&sched, "b"), "a → b chained");
     }
 
     /// D2: a system with no component access (only side effects / whole-world)
