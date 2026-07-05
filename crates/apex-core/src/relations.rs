@@ -7,9 +7,9 @@
 //!
 //! - [`SubjectIndex`]: `entity.index` → набор [`RelationPair`] (kind + target
 //!   **целиком**, с generation) — отвечает за `has_relation`,
-//!   `get_relation_target`, сериализацию;
+//!   `target_of`, сериализацию;
 //! - [`TargetIndex`]: `(kind, target.index)` → subjects — отвечает за
-//!   `children_of` (O(детей)), `query_relation`/`query_wildcard` и
+//!   `targets_of` (O(детей)), `query_relation`/`query_wildcard` и
 //!   **cascade delete при `despawn(target)`**.
 //!
 //! Следствия:
@@ -847,8 +847,11 @@ impl World {
         }
     }
 
-    /// Дети (subjects) связи `(kind, parent)` — O(числа детей).
-    pub fn children_of<'w, R: RelationKind>(
+    /// Subjects pointing at `parent` via relation `R` — O(number of subjects).
+    /// The plural pairs with [`target_of`](Self::target_of) (single target of a
+    /// subject); `_of` naming reads uniformly for both directions.
+    #[doc(alias = "children_of")]
+    pub fn targets_of<'w, R: RelationKind>(
         &'w self,
         _kind: R,
         parent: Entity,
@@ -862,12 +865,19 @@ impl World {
         subjects.iter().copied()
     }
 
-    /// Target первой связи вида `R` у субъекта (с корректным generation).
-    pub fn get_relation_target<R: RelationKind>(
-        &self,
-        subject: Entity,
-        _kind: R,
-    ) -> Option<Entity> {
+    /// Deprecated alias of [`targets_of`](Self::targets_of).
+    #[deprecated(since = "0.1.0", note = "renamed to `targets_of`")]
+    pub fn children_of<'w, R: RelationKind>(
+        &'w self,
+        kind: R,
+        parent: Entity,
+    ) -> impl Iterator<Item = Entity> + 'w {
+        self.targets_of(kind, parent)
+    }
+
+    /// Target of the first relation of kind `R` from `subject` (generation-correct).
+    #[doc(alias = "get_relation_target")]
+    pub fn target_of<R: RelationKind>(&self, subject: Entity, _kind: R) -> Option<Entity> {
         if !self.entities.is_alive(subject) {
             return None;
         }
@@ -875,6 +885,16 @@ impl World {
         self.subject_index
             .first_with_kind(subject.index, kind_idx)
             .map(|p| p.target)
+    }
+
+    /// Deprecated alias of [`target_of`](Self::target_of).
+    #[deprecated(since = "0.1.0", note = "renamed to `target_of`")]
+    pub fn get_relation_target<R: RelationKind>(
+        &self,
+        subject: Entity,
+        kind: R,
+    ) -> Option<Entity> {
+        self.target_of(subject, kind)
     }
 
     /// Рекурсивный despawn поддерева по виду связи.
@@ -891,7 +911,7 @@ impl World {
             return;
         }
         // Не-каскадный kind: связь не сносит subjects автоматически — обходим вручную.
-        let children: Vec<Entity> = self.children_of(_kind, entity).collect();
+        let children: Vec<Entity> = self.targets_of(_kind, entity).collect();
         for child in children {
             self.despawn_recursive(_kind, child);
         }
@@ -1086,7 +1106,7 @@ mod tests {
         let child = world.spawn((Position { x: 1.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, parent);
-        assert_eq!(world.get_relation_target(child, ChildOf), Some(parent));
+        assert_eq!(world.target_of(child, ChildOf), Some(parent));
     }
 
     // ── Новые гарантии CR-M1 ───────────────────────────────────
@@ -1121,7 +1141,7 @@ mod tests {
         world.despawn(owner);
         assert!(world.is_alive(item));
         assert_eq!(
-            world.get_relation_target(item, Owns),
+            world.target_of(item, Owns),
             None,
             "связь не должна переживать свой target"
         );
@@ -1146,9 +1166,9 @@ mod tests {
             .find(|e| e.index() == parent.index())
             .expect("тест требует переиспользования index родителя");
 
-        assert_eq!(world.children_of(ChildOf, newcomer).count(), 0);
+        assert_eq!(world.targets_of(ChildOf, newcomer).count(), 0);
         // Стейл-хэндл старого родителя тоже ничего не возвращает
-        assert_eq!(world.children_of(ChildOf, parent).count(), 0);
+        assert_eq!(world.targets_of(ChildOf, parent).count(), 0);
     }
 
     #[test]
@@ -1162,7 +1182,7 @@ mod tests {
             world.add_relation(c, ChildOf, parent);
             spawned.push(c);
         }
-        let mut children: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        let mut children: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
         children.sort_by_key(|e| e.index());
         spawned.sort_by_key(|e| e.index());
         assert_eq!(children, spawned);
@@ -1215,7 +1235,7 @@ mod tests {
 
         world.add_relation(child, ChildOf, parent);
         assert!(!world.has_relation(child, ChildOf, parent));
-        assert_eq!(world.get_relation_target(child, ChildOf), None);
+        assert_eq!(world.target_of(child, ChildOf), None);
     }
 
     /// B9: ChildOf is exclusive — a second `add_relation` re-parents the child
@@ -1229,12 +1249,12 @@ mod tests {
         let p2 = world.spawn((Position { x: 2.0, y: 0.0 },));
 
         world.add_relation(child, ChildOf, p1);
-        assert_eq!(world.get_relation_target(child, ChildOf), Some(p1));
+        assert_eq!(world.target_of(child, ChildOf), Some(p1));
 
         world.add_relation(child, ChildOf, p2); // exclusive → replaces p1
-        assert_eq!(world.get_relation_target(child, ChildOf), Some(p2));
-        assert_eq!(world.children_of(ChildOf, p1).count(), 0, "old parent lost the child");
-        assert_eq!(world.children_of(ChildOf, p2).count(), 1, "new parent gained it");
+        assert_eq!(world.target_of(child, ChildOf), Some(p2));
+        assert_eq!(world.targets_of(ChildOf, p1).count(), 0, "old parent lost the child");
+        assert_eq!(world.targets_of(ChildOf, p2).count(), 1, "new parent gained it");
     }
 
     /// B9: a non-exclusive kind still accumulates multiple targets.
@@ -1258,7 +1278,7 @@ mod tests {
         world.register_component::<Position>();
         let a = world.spawn((Position { x: 0.0, y: 0.0 },));
         world.add_relation(a, ChildOf, a);
-        assert_eq!(world.get_relation_target(a, ChildOf), None);
+        assert_eq!(world.target_of(a, ChildOf), None);
     }
 
     /// C4: a cycle-forming ChildOf edge is rejected, so transform propagation and
@@ -1275,9 +1295,9 @@ mod tests {
         world.add_relation(b, ChildOf, c); // b -> c
         // c -> a would close the cycle a->b->c->a: rejected.
         world.add_relation(c, ChildOf, a);
-        assert_eq!(world.get_relation_target(c, ChildOf), None, "cycle edge rejected");
-        assert_eq!(world.get_relation_target(a, ChildOf), Some(b), "existing edges intact");
-        assert_eq!(world.get_relation_target(b, ChildOf), Some(c));
+        assert_eq!(world.target_of(c, ChildOf), None, "cycle edge rejected");
+        assert_eq!(world.target_of(a, ChildOf), Some(b), "existing edges intact");
+        assert_eq!(world.target_of(b, ChildOf), Some(c));
     }
 
     #[test]

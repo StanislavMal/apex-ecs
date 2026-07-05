@@ -29,7 +29,7 @@ impl Relations {
             world.add_relation(c, ChildOf, parent);
         }
         let mut count = 0u64;
-        for _c in world.children_of(ChildOf, parent) {
+        for _c in world.targets_of(ChildOf, parent) {
             count += 1;
         }
         count

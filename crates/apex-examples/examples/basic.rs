@@ -337,13 +337,13 @@ fn main() {
     println!("has_relation(leaf,   ChildOf, child1): {}", world.has_relation(leaf, ChildOf, child1));
     println!("has_relation(child2, ChildOf, child1): {}", world.has_relation(child2, ChildOf, child1));
 
-    if let Some(target) = world.get_relation_target(leaf, ChildOf) {
+    if let Some(target) = world.target_of(leaf, ChildOf) {
         if let Some(name) = world.get::<Name>(target) {
             println!("leaf's parent: {} ({})", target, name.0);
         }
     }
 
-    let children: Vec<Entity> = world.children_of(ChildOf, root).collect();
+    let children: Vec<Entity> = world.targets_of(ChildOf, root).collect();
     println!("Direct children of root: {}", children.len());
 
     let before = world.entity_count();
@@ -380,7 +380,7 @@ fn main() {
     println!("Verified: {}/{} children have ChildOf relation to parent", found, children.len());
 
     // Проверяем children_of
-    let direct: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+    let direct: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
     println!("children_of(parent) count: {} (expected 100)", direct.len());
 
     // Очищаем

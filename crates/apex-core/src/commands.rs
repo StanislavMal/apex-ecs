@@ -525,14 +525,21 @@ impl Commands {
     /// struct MonsterSpeed;
     /// impl apex_core::template::TemplateParam for MonsterSpeed { type Value = f32; }
     ///
-    /// cmds.spawn_from_template("Monster", TemplateParams::new()
+    /// cmds.spawn_template_with("Monster", TemplateParams::new()
     ///     .set::<MonsterSpeed>(10.0f32));
     /// ```
-    pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
+    #[doc(alias = "spawn_from_template")]
+    pub fn spawn_template_with(&mut self, name: &str, params: TemplateParams) {
         self.queue.push(Command::SpawnFromTemplate {
             name: name.to_string(),
             params: Box::new(params),
         });
+    }
+
+    /// Deprecated alias of [`spawn_template_with`](Self::spawn_template_with).
+    #[deprecated(since = "0.1.0", note = "renamed to `spawn_template_with`")]
+    pub fn spawn_from_template(&mut self, name: &str, params: TemplateParams) {
+        self.spawn_template_with(name, params);
     }
 
     /// Создать entity из шаблона с параметрами по умолчанию.
@@ -721,7 +728,7 @@ impl Commands {
                     // §0.2a (B10): a queued spawn of an unregistered template name
                     // (typo, or the template was never registered) silently spawns
                     // nothing. Surface it.
-                    if world.spawn_from_template(&name, &params).is_none() {
+                    if world.spawn_template_with(&name, &params).is_none() {
                         crate::warn_once!(
                             "Commands::spawn_template(\"{name}\") — no template registered under that name; nothing spawned",
                         );
@@ -858,7 +865,7 @@ impl EntityCommands<'_> {
     pub fn remove_parent(self) -> Self {
         let entity = self.entity;
         self.commands.add(move |world: &mut World| {
-            if let Some(parent) = world.get_relation_target(entity, crate::relations::ChildOf) {
+            if let Some(parent) = world.target_of(entity, crate::relations::ChildOf) {
                 world.remove_relation(entity, crate::relations::ChildOf, parent);
             }
         });
@@ -870,7 +877,7 @@ impl EntityCommands<'_> {
     pub fn clear_children(self) -> Self {
         let parent = self.entity;
         self.commands.add(move |world: &mut World| {
-            let kids: Vec<Entity> = world.children_of(crate::relations::ChildOf, parent).collect();
+            let kids: Vec<Entity> = world.targets_of(crate::relations::ChildOf, parent).collect();
             for child in kids {
                 world.remove_relation(child, crate::relations::ChildOf, parent);
             }
@@ -1023,12 +1030,12 @@ mod tests {
             .id();
         cmds.apply(&mut world);
 
-        let kids: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        let kids: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
         assert_eq!(kids.len(), 2, "оба ребёнка связаны ChildOf → parent");
         for k in kids {
             assert!(world.get::<Vel>(k).is_some(), "ребёнок несёт свой компонент");
             assert_eq!(
-                world.get_relation_target(k, ChildOf),
+                world.target_of(k, ChildOf),
                 Some(parent),
                 "target связи ChildOf = родитель"
             );
@@ -1068,18 +1075,18 @@ mod tests {
         // Усыновить существующие a, b.
         cmds.entity(parent).add_children(&[a, b]);
         cmds.apply(&mut world);
-        assert_eq!(world.get_relation_target(a, ChildOf), Some(parent));
-        assert_eq!(world.get_relation_target(b, ChildOf), Some(parent));
+        assert_eq!(world.target_of(a, ChildOf), Some(parent));
+        assert_eq!(world.target_of(b, ChildOf), Some(parent));
 
         // Отвязать a от родителя.
         cmds.entity(a).remove_parent();
         cmds.apply(&mut world);
-        assert_eq!(world.get_relation_target(a, ChildOf), None);
+        assert_eq!(world.target_of(a, ChildOf), None);
 
         // Отвязать всех детей parent (снимет b), не удаляя их.
         cmds.entity(parent).clear_children();
         cmds.apply(&mut world);
-        assert_eq!(world.get_relation_target(b, ChildOf), None);
+        assert_eq!(world.target_of(b, ChildOf), None);
         assert!(world.is_alive(b), "clear_children НЕ удаляет детей");
     }
 
@@ -1223,7 +1230,7 @@ mod tests {
         world.register_template("param_test", ParamTemplate { default: 5.0 });
 
         let mut cmds = Commands::new();
-        cmds.spawn_from_template("param_test", TemplateParams::new().set::<ParamVal>(42.0f32));
+        cmds.spawn_template_with("param_test", TemplateParams::new().set::<ParamVal>(42.0f32));
         cmds.apply(&mut world);
 
         let query = crate::query::Query::<Read<Pos>>::new(&world);

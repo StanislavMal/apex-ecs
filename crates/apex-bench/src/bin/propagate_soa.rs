@@ -114,7 +114,7 @@ fn main() {
             let mut next = Vec::new();
             let mut next_parents = Vec::new();
             for &e in &frontier {
-                for c in world.children_of(ChildOf, e) {
+                for c in world.targets_of(ChildOf, e) {
                     next.push(c);
                     next_parents.push(Some(e));
                 }

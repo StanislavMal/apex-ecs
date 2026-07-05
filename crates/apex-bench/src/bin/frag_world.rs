@@ -265,7 +265,7 @@ fn bench_relations_read(fw: &FragWorld, rep: &mut Report) {
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
         for &p in &fw.parents {
-            acc += w.children_of(ChildOf, p).count() as u64;
+            acc += w.targets_of(ChildOf, p).count() as u64;
         }
         acc
     });
@@ -280,7 +280,7 @@ fn bench_relations_read(fw: &FragWorld, rep: &mut Report) {
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
         for &s in &fw.subjects {
-            if let Some(target) = w.get_relation_target(s, ChildOf) {
+            if let Some(target) = w.target_of(s, ChildOf) {
                 acc = acc.wrapping_add(target.index() as u64);
             }
         }

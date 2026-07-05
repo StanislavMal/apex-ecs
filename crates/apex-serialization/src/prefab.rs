@@ -340,7 +340,7 @@ impl PrefabLoader {
                     }
                 ))?;
 
-            world.insert_raw_pub(entity, component_id, component_bytes, tick);
+            world.insert_dyn(entity, component_id, component_bytes, tick);
         }
 
         Ok(entity)
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(parent_name.0, "Parent");
 
         // Ищем ребёнка через ChildOf
-        let children: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        let children: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
         assert_eq!(children.len(), 1);
 
         let child_name = world.get::<Name>(children[0]).unwrap();
@@ -544,7 +544,7 @@ mod tests {
         let new_parent = loader.instantiate(&mut world2, &restored, &[], None, None).unwrap();
 
         assert_eq!(world2.get::<Name>(new_parent).unwrap().0, "Parent");
-        let kids: Vec<Entity> = world2.children_of(ChildOf, new_parent).collect();
+        let kids: Vec<Entity> = world2.targets_of(ChildOf, new_parent).collect();
         assert_eq!(kids.len(), 1);
         assert_eq!(world2.get::<Name>(kids[0]).unwrap().0, "Child");
         assert_eq!(world2.get::<Health>(kids[0]).unwrap().current, 30.0);
@@ -699,7 +699,7 @@ mod tests {
 
         // Ищем ребёнка
         use apex_core::relations::ChildOf;
-        let children: Vec<Entity> = world.children_of(ChildOf, parent).collect();
+        let children: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
         assert_eq!(children.len(), 1, "parent должен иметь ровно одного ребёнка");
 
         let child = children[0];

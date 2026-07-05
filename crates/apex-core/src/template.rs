@@ -42,7 +42,7 @@
 //! let mut world = World::new();
 //! world.register_template("Monster", MonsterTemplate { health: 100.0, speed: 5.0 });
 //!
-//! let entity = world.spawn_from_template("Monster", &TemplateParams::new()
+//! let entity = world.spawn_template_with("Monster", &TemplateParams::new()
 //!     .set::<MonsterSpeed>(10.0f32)
 //! ).unwrap();
 //! ```
@@ -417,7 +417,7 @@ mod tests {
         );
 
         let entity = world
-            .spawn_from_template("test", &TemplateParams::new())
+            .spawn_template_with("test", &TemplateParams::new())
             .unwrap();
         let pos = world.get::<Position>(entity).unwrap();
         assert_eq!(pos.x, 10.0);
@@ -441,7 +441,7 @@ mod tests {
         );
 
         let entity = world
-            .spawn_from_template(
+            .spawn_template_with(
                 "test",
                 &TemplateParams::new()
                     .set::<ParamX>(99.0f32)
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn template_not_found() {
         let mut world = World::new();
-        let result = world.spawn_from_template("nonexistent", &TemplateParams::new());
+        let result = world.spawn_template_with("nonexistent", &TemplateParams::new());
         assert!(result.is_none());
     }
 
@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(v.value, 42);
 
         let entity2 = world
-            .spawn_from_template("my", &TemplateParams::new().set::<ParamVal>(100i32))
+            .spawn_template_with("my", &TemplateParams::new().set::<ParamVal>(100i32))
             .unwrap();
         let v2 = world.get::<MyTemplate>(entity2).unwrap();
         assert_eq!(v2.value, 100);

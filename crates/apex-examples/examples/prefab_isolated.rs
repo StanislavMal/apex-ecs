@@ -161,13 +161,13 @@ fn main() {
 
     // spawn_from_template(&mut self, name, &TemplateParams)
     let enemy1 = world
-        .spawn_from_template("enemy", &TemplateParams::new())
+        .spawn_template_with("enemy", &TemplateParams::new())
         .expect("failed to spawn enemy from template");
     println!("  Враг создан из шаблона: entity={}", enemy1);
 
     // Второй враг
     let enemy2 = world
-        .spawn_from_template("enemy", &TemplateParams::new())
+        .spawn_template_with("enemy", &TemplateParams::new())
         .expect("failed to spawn enemy2 from template");
     println!("  Враг 2 создан из шаблона: entity={}", enemy2);
 
@@ -367,7 +367,7 @@ fn main() {
             let loader2 = PrefabLoader::new();
             match loader2.instantiate(&mut world, &hier, &[], None, None) {
                 Ok(new_root) => {
-                    let kids = world.children_of(ChildOf, new_root).count();
+                    let kids = world.targets_of(ChildOf, new_root).count();
                     println!(
                         "  ✓ Round-trip: префаб инстанцирован (entity={}, детей={})",
                         new_root, kids

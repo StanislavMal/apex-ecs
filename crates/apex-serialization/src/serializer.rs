@@ -257,7 +257,7 @@ impl WorldSerializer {
                 // ZST-маркер: байтов нет, восстанавливаем по присутствию (пустой инсерт), не вызывая
                 // deserialize_fn (данные пусты — парсить нечего). Парный к ZST-ветке в snapshot.
                 if world.registry().get_info(component_id).map(|i| i.size).unwrap_or(0) == 0 {
-                    world.insert_raw_pub(new_entity, component_id, Vec::new(), tick);
+                    world.insert_dyn(new_entity, component_id, Vec::new(), tick);
                     continue;
                 }
 
@@ -290,7 +290,7 @@ impl WorldSerializer {
                         })?
                 };
 
-                world.insert_raw_pub(new_entity, component_id, component_bytes, tick);
+                world.insert_dyn(new_entity, component_id, component_bytes, tick);
             }
         }
 
@@ -750,7 +750,7 @@ impl WorldSerializer {
         // Рекурсивно собираем детей как ВСТРОЕННЫЕ (inline) поддеревья — так префаб самодостаточен:
         // один файл инстанцируется без предзагрузки под-префабов (раньше клалось только имя ребёнка, и
         // сам суб-манифест терялся ⇒ `instantiate` падал с `SubPrefabNotFound`).
-        let children: Vec<Entity> = world.children_of(ChildOf, root).collect();
+        let children: Vec<Entity> = world.targets_of(ChildOf, root).collect();
         for child in children {
             let child_manifest = Self::hierarchy_to_prefab_with(world, child, ctx)?;
             manifest.children.push(PrefabChild::Inline(child_manifest));

@@ -524,14 +524,14 @@ pub fn propagate_transforms(world: &mut World) {
         } = &mut scratch;
         let dirty: &IndexStamp = dirty;
         let seed = |world: &World, entity: Entity| -> Option<(Entity, Mat4)> {
-            let parent = world.get_relation_target(entity, ChildOf);
+            let parent = world.target_of(entity, ChildOf);
             let mut ancestor = parent;
             let mut depth = 0usize;
             while let Some(p) = ancestor {
                 if dirty.contains(p.index) {
                     return None; // покрыта dirty-предком — пересчитается его спуском
                 }
-                ancestor = world.get_relation_target(p, ChildOf);
+                ancestor = world.target_of(p, ChildOf);
                 depth += 1;
                 if depth > MAX_PROPAGATE_DEPTH {
                     // Defensive: a ChildOf cycle would loop here forever.
@@ -620,7 +620,7 @@ pub fn propagate_transforms(world: &mut World) {
             } else {
                 missing.push((entity, global));
             }
-            for child in world.children_of(ChildOf, entity) {
+            for child in world.targets_of(ChildOf, entity) {
                 next.push((child, global));
             }
         }
@@ -662,7 +662,7 @@ pub fn propagate_transforms(world: &mut World) {
                 if !write_global_parallel(world_ref, gt_id, entity, global, this_run) {
                     local_missing.push((entity, global));
                 }
-                for child in world_ref.children_of(ChildOf, entity) {
+                for child in world_ref.targets_of(ChildOf, entity) {
                     stack.push((child, global));
                 }
             }
@@ -693,7 +693,7 @@ pub fn propagate_transforms(world: &mut World) {
             } else {
                 missing.push((entity, global));
             }
-            for child in world.children_of(ChildOf, entity) {
+            for child in world.targets_of(ChildOf, entity) {
                 stack.push((child, global));
             }
         }

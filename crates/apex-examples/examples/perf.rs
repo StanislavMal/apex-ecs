@@ -424,7 +424,7 @@ fn bench_has_relation(n: usize) {
             // setup: строим мир и пары — не входит в измерение
             let (world, parents) = build();
             let pairs: Vec<(Entity, Entity)> = parents.iter()
-                .filter_map(|&p| world.children_of(ChildOf, p).next().map(|c| (c, p)))
+                .filter_map(|&p| world.targets_of(ChildOf, p).next().map(|c| (c, p)))
                 .take(checks)
                 .collect();
             (world, pairs)
@@ -446,7 +446,7 @@ fn bench_has_relation(n: usize) {
         || {
             let (world, parents) = build();
             let true_pairs: Vec<(Entity, Entity)> = parents.iter()
-                .filter_map(|&p| world.children_of(ChildOf, p).next().map(|c| (c, p)))
+                .filter_map(|&p| world.targets_of(ChildOf, p).next().map(|c| (c, p)))
                 .take(checks)
                 .collect();
             // Подменяем parent на соседний — всегда false

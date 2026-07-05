@@ -476,7 +476,7 @@ mod tests {
             .iter()
             .zip(parents.iter().zip(override_vals.iter()))
         {
-            assert_eq!(world.get_relation_target(inst.entity, ChildOf), Some(parent));
+            assert_eq!(world.target_of(inst.entity, ChildOf), Some(parent));
             assert_eq!(world.get::<Tag>(inst.entity), Some(&Tag { value: ov }));
         }
 
@@ -495,7 +495,7 @@ mod tests {
         let mut seen_vals = Vec::new();
         for inst in instances {
             let parent = world
-                .get_relation_target(inst.entity, ChildOf)
+                .target_of(inst.entity, ChildOf)
                 .expect("recreated instance lost its parent");
             assert!(parents.contains(&parent), "recreated under an unknown parent");
             let tag = world.get::<Tag>(inst.entity).expect("recreated instance lost Tag");
