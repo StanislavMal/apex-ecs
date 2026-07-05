@@ -99,31 +99,24 @@ pub fn default<T: Default>() -> T {
 }
 
 pub mod prelude {
+    // Golden-path contract only. Advanced / internal / macro-level markers are
+    // reached by explicit path (see docs/CONVENTIONS.md §2).
     pub use crate::default;
-    pub use crate::access::AccessDescriptor;
     pub use crate::commands::Commands;
     pub use crate::component::{Component as ComponentTrait, Serializable, Tick};
     pub use crate::entity::Entity;
-    pub use crate::events::{
-        DelayedQueue, EventCursor, EventIterator, EventReadGuard, Events, PartialReadGuard,
-        PeekGuard, Removed,
-    };
+    pub use crate::events::{EventReadGuard, Events, Removed};
     pub use crate::fn_system::SystemParamFunction;
     pub use crate::impl_entity_template;
-    pub use crate::dense::DenseQuery;
     pub use crate::query::{
-        Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
-        DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut,
-        QuerySingleError, Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
+        Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QuerySingleError,
+        Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
     };
-    pub use crate::unsafe_world_cell::UnsafeWorldCell;
-    pub use crate::relations::{ChildOf, Owns, RelationHookFn, RelationKind};
-    pub use crate::resources::Resources;
+    pub use crate::relations::{ChildOf, Owns, RelationKind};
     pub use crate::system;
     pub use crate::system_param::{
         AutoSystem, CommandsParam, Emit, EventReader, EventWriter, ExclusiveSystem, Listen,
         QueryParam, RemovedComponents, Res, ResMut, ResRead, ResWrite, SystemParam,
-        WorldQuerySystemAccess,
     };
     pub use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
     pub use crate::world::{Bundle, QueryState, SystemContext, World};

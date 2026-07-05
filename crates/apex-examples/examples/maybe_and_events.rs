@@ -12,6 +12,8 @@
 //! ```
 
 use apex_core::prelude::*;
+// DelayedQueue is an advanced utility, not in the prelude (see docs/CONVENTIONS.md §2).
+use apex_core::events::DelayedQueue;
 use apex_macros::Component;
 
 // ── Компоненты ─────────────────────────────────────────────────

@@ -74,6 +74,21 @@ pub use fixed::FixedTime;
 pub mod states;
 pub use states::{in_state, init_state, on_enter, on_exit, NextState, State, StateTransitions, States};
 
+/// Prelude — golden-path scheduler API (`use apex_scheduler::prelude::*`).
+///
+/// The core ECS golden path is in `apex_core::prelude`; this adds scheduling:
+/// `Scheduler`, stages, `add_systems` config (`sys`/`seq`/`par`/`par_access` +
+/// `SystemConfig`), run conditions/states, and the fixed-timestep clock.
+pub mod prelude {
+    pub use crate::config::{par, par_access, seq, sys, IntoScheduleConfigs, SystemConfig};
+    pub use crate::fixed::FixedTime;
+    pub use crate::stage::{Stage, StageLabel};
+    pub use crate::states::{
+        in_state, init_state, on_enter, on_exit, NextState, State, StateTransitions, States,
+    };
+    pub use crate::Scheduler;
+}
+
 mod config;
 use crate::config::SystemConfigKind;
 

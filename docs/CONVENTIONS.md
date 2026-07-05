@@ -53,14 +53,18 @@ Prelude = минимальный набор для золотого пути. Ad
 **Входит:** `Component`/`Bundle`/derive; `Entity`; `Commands`; `Query`/`Single`; словарь форм
 (`Read`/`Write`/`&T`/`&mut T`/`With`/`Without`/`Maybe`/`MaybeWrite`/`Changed`/`Added`/`Or`) +
 `WorldQuery`/`ReadOnlyWorldQuery`/`ArchetypeFilter`; `Res`/`ResMut`; `EventReader`/`EventWriter`;
-`World`/`SystemContext`; `add_systems`+конфиг-ordering; relations-сахар; `default()`.
+`World`/`SystemContext`; `add_systems`+конфиг-ordering; relations-сахар (`ChildOf`/`Owns`/
+`RelationKind`); `default()`. **Плюс маркеры AutoSystem/`system!`** — это первоклассный путь
+авторинга систем, не внутренняя кухня: `AutoSystem`/`SystemParam`/`ExclusiveSystem`,
+`ResRead`/`ResWrite` (`type Resources`), `Listen`/`Emit` (`type Events`), `QueryParam`,
+`CommandsParam`, `RemovedComponents`.
 
-**НЕ входит (advanced / внутреннее / макро-уровень):** `UnsafeWorldCell`; низкоуровневый event-API
-(`EventCursor`/`PeekGuard`/`PartialReadGuard`/`EventIterator`/`add_reader`/`advance_reader_mut`);
-`RelationHookFn`; `WorldQuerySystemAccess`/`AccessDescriptor` (выводятся из параметров); `Resources`
-(pub(crate) после A5); `Dyn*`-семейство (скриптинг/IPC); `DenseQuery` (chunk-путь — advanced);
-`ResRead`/`ResWrite`/`Listen`/`Emit` (маркеры `system!`-макро-уровня); `SystemBuilder`;
-`QueryBuilder(Mut)`; `make_serde_fns*`. Депрекейтнутые алиасы (`Ref`) — тоже вне prelude.
+**НЕ входит (advanced / внутреннее):** `UnsafeWorldCell`; низкоуровневый event-API
+(`EventCursor`/`PeekGuard`/`PartialReadGuard`/`EventIterator`/`add_reader`/`advance_reader_mut`) и
+`DelayedQueue` (advanced-утилита, §1.5); `RelationHookFn`; `WorldQuerySystemAccess`/`AccessDescriptor`
+(выводятся из параметров); `Resources` (pub(crate) после A5); `Dyn*`-семейство (скриптинг/IPC);
+`DenseQuery` (chunk-путь — advanced); `SystemBuilder`; `QueryBuilder(Mut)`; `make_serde_fns*`.
+Депрекейтнутые алиасы (`Ref`) — тоже вне prelude.
 
 **Scheduler prelude.** У `apex-scheduler` prelude ЗАВОДИТСЯ (сегодня нет): `Scheduler`, `Stage`,
 `SystemConfig`, ordering-хелперы золотого пути.
