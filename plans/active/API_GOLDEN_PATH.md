@@ -293,15 +293,29 @@ C6-merge: soundness 🔴 не ждёт структурной схлопки. `&
 с C6: сигнатуры `_mut`-аксессоров переживают merge в unified `Query<'w,'s>`. **NEXT = C6** (структурная
 схлопка Query+CachedQuery+QueryState).
 
-**Волна 1b/2 — Unified Query + sound-аксессоры (🔴 S1 + C6, ОДНА работа — спайк GO).** Единый
-`Query<'w, 's, D, F>` держит `UnsafeWorldCell<'w>` + `StateSrc<'s>{Owned|Borrowed}`; `type ReadOnly`-
-проекция на `WorldQuery` (+impls на все формы) → `iter(&self)` read даже на write-форме; `iter_mut/
-get_mut(&mut self)` = S1-фикс сразу (аксессоры не трогаются дважды). `QueryState<D,F>` (+filter);
-`CachedQuery`/inline-`Query` схлопываются в него, ~35→12 pub fn, 7 конструкторов → new/new_mut+unsafe-
-эскейп; SubWorld-итерации pub(crate); Single в корневой реэкспорт; Ref-алиас deprecate; снять Clone с
-write-view. Лендится БЕЗ В3 (owned-inline покрывает plain-fn; В3 позже = Borrowed(&'s) fast-path).
-Атомарный кросс-репо проход (~53 ecs + 3 engine). PoC S1 перестаёт компилироваться. *Гейт: workspace+
-движок+goldens byte-identical; Miri TB (cell+read/write+alias).*
+**Волна 1b/2 — Unified Query + sound-аксессоры ✅ ЗАКРЫТА (2026-07-05, commit ecs `8301699`).**
+Единый `Query<'w, 's, D, F>` схлопнул `Query`(inline-owned) + `CachedQuery`(Arc-cache) + view-часть
+`QueryState`(borrowed) в ОДИН view поверх ленивой per-archetype fetch-машины. Источник индексов
+архетипов — приватный `StateSrc {Owned | Shared | Borrowed}`; данные всегда в колонках архетипа ⇒
+один метод-сет на все три пути. **Реализационное уточнение спайка:** view держит `&'w World` (НЕ
+`UnsafeWorldCell`) — write-путь идёт через сырые указатели колонок (`col.get_ptr as *mut T`), НЕ через
+`world_mut()`, поэтому cell не нужен для выразимости write-аксессора (проверено Miri TB); `&World`-модель
+уже была доказана в S1-part-2. Публичная сигнатура несёт `'s` (Bevy-паритет `Query<'w,'s>`): сегодня
+совпадает с `'w`, разнесена заранее ради стабильности до публикации + форвард-фита В3 (`Borrowed(&'s
+QueryState)`). **Транспарентно для потребителей:** элидированные fn-параметры (`Query<&A,&mut B>`)
+поглощают `'s` — ноль правок в движке (0 сайтов, не 3: `world.query`/`ctx.query`/`QueryState`-путь и
+141 Query-параметр мигрировали сами). Read/write split (S1) сохранён: `&self`-аксессоры требуют
+`ReadOnlyWorldQuery`-проекцию, write — `&mut self` `*_mut`. Конструкторы: new/new_with_tick +
+new_mut(_with_tick) + new_unchecked(_with_tick) + from_sub_world/from_state_parts; `World::query*` →
+cached `Shared`-путь; `QueryState<D,F=()>` (+filter). Убраны `CachedQuery`/`CachedQueryIter`/
+`ArchIndices`; `SubWorld::world()` → `&'w World`. Surface-diet: `Single` в корневой реэкспорт; `Ref<T>`
+депрекейтнут (semantic-trap алиас `Read<T>`) + убран из prelude; удалён МЁРТВЫЙ SubWorld
+row-iteration кластер (for_each_entity/row + par + arch_row_range — ноль вызовов, итерация через
+unified Query). Clone на write-view не было (нечего снимать). Нетто −597 строк. *Гейты ✅: workspace
+tests (245 core); clippy net-neutral (apex-core+scheduler 0 warns); движок `check --all-targets` чист;
+goldens 649/0/9 byte-identical; Miri TB чист (get/single/write-Mut/maybe/QueryState). **Отклонение от
+спайка:** `type ReadOnly`-проекция (f9f191c) уже была — новые impls не потребовались; `UnsafeWorldCell`
+не использован (см. выше).*
 
 **Волна 3 — Регистрация+конфиг+нейминг.** Ordering на конфигах (Р-3); merge sys/seq/par-дублей;
 SystemBuilder → pub(crate); ChunkConfig-единая модель (§1.7), глобалки deprecate; naming-sweep по

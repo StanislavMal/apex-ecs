@@ -146,17 +146,19 @@
 
 ## Крупные отложенные развилки (с обоснованием §0.2b — дом здесь)
 
-- **C6 🟡 — консолидация query-зоопарка** (аудит-C6 ядра, НЕ движка). Единый `Query<'w,'s>` поверх
-  per-system QueryState (Query/CachedQuery/QueryState → один тип). Переоценён в волне 6б: атомарный
-  кросс-репо рефактор ВСЕГО query-usage (движок не собирается до конца миграции), риск лайфтаймов
-  'w/'s, перф маргинален/плоский (arch-индексы уже zero-copy из SubWorld). Ценность = API-качество.
-  **Spike-first:** изолированный lifetime-спайк `Query<'w,'s>` → атомарная миграция. Детали: CORE_AUDIT
-  §8.В3, шапка архива WAVE6B. Здесь же живут В3 Phase B/C (реальный кэш-State) и leaf-sizing Ş2b.
-  **→ Взят в scope кампании `plans/active/API_GOLDEN_PATH.md` (волна 1b/2):** инвентаризация 2026-07-05
-  усилила ROI по обучаемости — три копии метод-сета, ~35→12 pub fn, 7 конструкторов → 2+эскейп.
-  **✅ Спайк 2026-07-05: GO** — прототип `Query<'w,'s,D,F>` (UnsafeWorldCell + `StateSrc{Owned|Borrowed}`
-  + `type ReadOnly`-проекция) скомпилирован+исполнён; лендится БЕЗ В3; сливается с S1-аксессорами в
-  одну работу. Детали — API §5 «Спайк C6 — результат».
+- **C6 ✅ ЗАКРЫТ (2026-07-05, commit ecs `8301699`) — консолидация query-зоопарка** (аудит-C6 ядра, НЕ
+  движка). `Query`(inline-owned) + `CachedQuery`(Arc-cache) + view-часть `QueryState`(borrowed) →
+  ЕДИНЫЙ `Query<'w, 's, D, F>` поверх ленивой per-archetype fetch-машины; источник индексов —
+  приватный `StateSrc {Owned|Shared|Borrowed}`. **Реализация отклонилась от спайка:** view держит
+  `&'w World` (НЕ `UnsafeWorldCell`) — write идёт через сырые указатели колонок, не `world_mut()`, cell
+  не нужен (Miri TB чист; `&World`-модель уже доказана S1-part-2). Публичный `'s` разнесён (Bevy-паритет,
+  форвард-фит В3), но элидированные fn-параметры поглощают его ⇒ **0 правок в движке** (не 3). Read/write
+  split (S1) сохранён. Убраны `CachedQuery`/`CachedQueryIter`/`ArchIndices`; `SubWorld::world()`→`&'w`;
+  `Single` в корневой реэкспорт; `Ref` deprecate+из prelude вон; удалён мёртвый SubWorld row-iteration
+  кластер. Нетто −597 строк. Гейты: workspace 245 core / clippy net-neutral / движок all-targets /
+  goldens 649/0/9 / Miri TB. **Остаток здесь же (НЕ закрыт C6):** В3 Phase B/C (реальный кэш-State
+  через `Borrowed(&'s QueryState)` fast-path — инфраструктура `'s` готова) и leaf-sizing Ş2b.
+  Детали — API §5 «Волна 1b/2».
 - **Ş5 / Ş6 / В2 🟡 — перф-спайки кампании PARALLELISM (ROI-gated).** **Ş5** dense-by-default для
   infallible-запросов (vs-Legion итерация 0.59–0.68×; goldens-рискован — семантика change-стампинга
   per-deref vs range, байт-identity как жёсткий гейт). **Ş6** heavy_compute leaf-sizing (0.83× vs
