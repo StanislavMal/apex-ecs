@@ -2371,6 +2371,15 @@ pub struct SystemContext<'w> {
     /// A local Commands for sequential systems or when deferred_cmds is not set.
     /// Used instead of the global static `DUMMY_COMMANDS`.
     pub(crate) inline_cmds: UnsafeCell<Commands>,
+    /// D6: this system's change-detection baseline — the tick at which THIS system
+    /// last ran (`Changed<T>`/`Added<T>` see everything written since). Per-SYSTEM,
+    /// not per-stage: a `run_if`-gated system that shares a stage with systems that
+    /// run while it is skipped still sees changes accumulated since IT last ran
+    /// (Bevy `SystemMeta::last_run` parity). Defaults to the world's stage window
+    /// (`last_run_tick`) in the constructors, so a directly-built context behaves
+    /// exactly as before; the scheduler OVERRIDES it per system via
+    /// [`with_last_run`](Self::with_last_run).
+    pub(crate) last_run: Tick,
 }
 
 unsafe impl Send for SystemContext<'_> {}
@@ -2379,6 +2388,7 @@ unsafe impl Sync for SystemContext<'_> {}
 impl<'w> SystemContext<'w> {
     pub fn new(sub_worlds: &'w [crate::sub_world::SubWorld<'w>]) -> Self {
         Self {
+            last_run: Self::default_last_run(sub_worlds),
             sub_worlds,
             deferred_cmds: None,
             inline_cmds: UnsafeCell::new(Commands::new()),
@@ -2388,10 +2398,41 @@ impl<'w> SystemContext<'w> {
     /// Creates a SystemContext from a single SubWorld (the most common case).
     pub fn from_sub_world(sub_world: &'w crate::sub_world::SubWorld<'w>) -> Self {
         Self {
+            last_run: sub_world.world().last_run_tick(),
             sub_worlds: std::slice::from_ref(sub_world),
             deferred_cmds: None,
             inline_cmds: UnsafeCell::new(Commands::new()),
         }
+    }
+
+    /// D6: the default change-detection baseline for a directly-built context — the
+    /// world's stage window (`last_run_tick`). Preserves pre-D6 behavior for any caller
+    /// that does not set a per-system tick via [`with_last_run`](Self::with_last_run).
+    #[inline]
+    fn default_last_run(sub_worlds: &[crate::sub_world::SubWorld<'_>]) -> Tick {
+        sub_worlds
+            .first()
+            .map(|s| s.world().last_run_tick())
+            .unwrap_or(Tick::ZERO)
+    }
+
+    /// D6: override the change-detection baseline with THIS system's `last_run` tick.
+    /// The scheduler calls this per system so `Changed<T>`/`Added<T>` see everything
+    /// written since the system itself last ran, independent of stage grouping.
+    ///
+    /// `#[doc(hidden)]`: an internal scheduler↔core seam (the scheduler owns the
+    /// per-system tick), not blessed public API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn with_last_run(mut self, last_run: Tick) -> Self {
+        self.last_run = last_run;
+        self
+    }
+
+    /// D6: this system's change-detection baseline (see the `last_run` field).
+    #[inline]
+    pub(crate) fn last_run(&self) -> Tick {
+        self.last_run
     }
 
     /// Create a context with a per-system command buffer (D8b).
@@ -2406,6 +2447,7 @@ impl<'w> SystemContext<'w> {
         deferred_cmds: *mut Commands,
     ) -> Self {
         Self {
+            last_run: Self::default_last_run(sub_worlds),
             sub_worlds,
             deferred_cmds: Some(deferred_cmds),
             inline_cmds: UnsafeCell::new(Commands::new()),
@@ -2462,10 +2504,10 @@ impl<'w> SystemContext<'w> {
     /// reaching for a mutable `ctx.query`.
     #[inline]
     pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(&self) -> crate::query::Query<'_, '_, Q> {
-        // The change-detection base is the world's `last_run_tick` (the previous
-        // frame boundary), so `Changed<T>` inside the system is reliable (TD-9)
-        // rather than "everything".
-        let last_run = self.sub_worlds[0].world().last_run_tick();
+        // D6: the change-detection base is THIS system's `last_run` (per-system, set by
+        // the scheduler), so `Changed<T>` sees everything written since the system last
+        // ran — reliable even for a gated system sharing a stage (TD-9 / Bevy parity).
+        let last_run = self.last_run;
         // SAFETY: read-only `Q` cannot alias `&mut`; the SubWorld is scheduler-vended.
         unsafe { crate::query::Query::from_sub_world(&self.sub_worlds[0], last_run) }
     }
@@ -2480,7 +2522,8 @@ impl<'w> SystemContext<'w> {
     #[doc(hidden)]
     #[inline]
     pub fn query_unchecked<Q: WorldQuery>(&self) -> crate::query::Query<'_, '_, Q> {
-        let last_run = self.sub_worlds[0].world().last_run_tick();
+        // D6: per-system change-detection base (see `query`).
+        let last_run = self.last_run;
         // SAFETY: the caller guarantees the access was declared (see doc); the
         // context's SubWorlds are scheduler-vended under that validated access.
         unsafe { crate::query::Query::from_sub_world(&self.sub_worlds[0], last_run) }

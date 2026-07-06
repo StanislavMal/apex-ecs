@@ -617,10 +617,11 @@ where
         Q::system_access().merge(&F::system_access())
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q, F> {
-        // The Changed/Added baseline is the world's last_run_tick (the previous
-        // frame's boundary), same as ctx.query() (TD-9).
+        // D6: the Changed/Added baseline is THIS system's per-system `last_run` (set by
+        // the scheduler), same as ctx.query() — so a gated system sharing a stage sees
+        // changes since IT last ran, not since the stage last ran (TD-9 / Bevy parity).
         let sub = &ctx.sub_worlds[0];
-        let last_run = sub.world().last_run_tick();
+        let last_run = ctx.last_run();
         // SAFETY: `ctx` (and its SubWorlds) is vended by the scheduler for a
         // system whose declared access (`Self::access()`) covers exactly this
         // shape; conflicting systems never run concurrently.

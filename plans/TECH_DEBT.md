@@ -97,9 +97,18 @@
   (Р-1: plain-fn = golden path). Фикс потребовал бы хранить курсоры в AutoSystem-инстансе (macro-хирургия
   `system!`). Golden-path (plain-fn) закрыт F4; это — хвост. **Смежно: S3/S4** (footgun-гонки `&self`
   event-мутации) F4 НЕ закрывает (по-прежнему registry + `ctx.event_reader` для standalone).
-- **D6-полное 🟡 → CORE_POLISH волна 1.2 — per-system `last_run` (Bevy-паритет change-окон).** Окно по-прежнему
-  per-execution-stage (`stage_last_run: Vec<Tick>`, `apex-scheduler/src/lib.rs:~740-747, 2449-2454`);
-  волна 2 закрыла только run_if-кейс. Значился в исходном scope волны 6б, исчез при формировании плана.
+- **D6-полное ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 1.2) — per-system `last_run` (Bevy-паритет
+  change-окон).** Было: окно change-detection per-execution-stage (`stage_last_run`); корректно только
+  для solo-gated систем. Дыра: run_if-gated система, ДЕЛЯЩАЯ стадию с ungated-системой (та держит
+  стадию живой, окно per-stage тикает), при возобновлении теряла `Changed<T>`, сделанные пока она
+  пропускала кадры. **Сделано (Bevy `SystemMeta::last_run`):** `SystemContext.last_run` per-system
+  (`with_last_run`/`last_run()`); `ctx.query`/`query_unchecked`/`Query`-SystemParam берут per-system
+  baseline; `Scheduler::system_last_run` map + `system_window`/`advance_system_windows` (обновление
+  ТОЛЬКО после фактического рана, не при skip); заврайрено во ВСЕХ 3 исполнителях (run_sequential,
+  run_hybrid_parallel fallback+parallel, run_stage_parallel inline+rayon-task через `AsdTask.last_run`).
+  Аддитивно: дефолт = world-тик → для every-frame систем поведение байт-идентично (goldens не сдвигаются).
+  Тест `co_stage_gated_reader_sees_changed_from_pause` (при per-stage окне seen=0, при per-system seen=1).
+  Гейты: 102 scheduler-lib + parity/determinism зелёные, clippy net-neutral.
 - **B5 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.3) — утечка Entity-резерваций при drop/clear
   Commands.** Было: `Commands::drop`/`clear()` дропали payload, но непотреблённые `spawn().id()`-
   резервации (продвинули high-water / съели lease-слоты) не возвращались → утечка id-пространства

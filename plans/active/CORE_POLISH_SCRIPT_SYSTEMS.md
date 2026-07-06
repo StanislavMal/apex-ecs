@@ -235,7 +235,16 @@ goldens `visual_tests` 649/0/9 БАЙТ-ИДЕНТИЧНЫ** (B6-паника и
 **Док:** руководство §6.6a — граница гарантии обновляется («безусловна, включая спайки в
 пределах эскроу; фолбэк громкий»); ADR-001 — addendum-строка.
 
-### 1.2 D6-полное — per-system `last_run` (Bevy-паритет change-окон)
+### 1.2 D6-полное — per-system `last_run` (Bevy-паритет change-окон) ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `SystemContext.last_run` per-system (`with_last_run`, дефолт = world-тик →
+> every-frame системы байт-идентичны, goldens не сдвигаются); `ctx.query`/`query_unchecked`/`Query`-
+> SystemParam берут per-system baseline; `Scheduler::system_last_run` + `system_window`/
+> `advance_system_windows` (апдейт только после рана, не при skip); заврайрено в 3 исполнителях
+> (`run_sequential`, `run_hybrid_parallel`, `run_stage_parallel` через `AsdTask.last_run` в rayon-таск).
+> Тест `co_stage_gated_reader_sees_changed_from_pause` (co-stage gated reader видит Changed из паузы —
+> per-stage окно давало 0). 102 scheduler-lib + parity/determinism зелёные; clippy net-neutral.
+> Осталось: Miri по change-detection + engine goldens (гейт волны 1).
 
 **Проблема:** окно change-detection — per-execution-stage
 (`stage_last_run: Vec<Tick>`, `apex-scheduler/src/lib.rs:~740-747, 2449-2454`); волна 2

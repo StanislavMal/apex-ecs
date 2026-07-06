@@ -443,6 +443,12 @@ struct AsdTask {
     /// (query-only) tasks carry `None` and use an inline buffer (they emit no
     /// commands). Applying slots in rank order gives deterministic command ordering.
     cmds: Option<SendPtr<Commands>>,
+    /// D6: this system's per-system change-detection baseline (the tick at which the
+    /// system last ran). Captured at task-build time on the main thread and applied to
+    /// the task's `SystemContext` so `Changed<T>`/`Added<T>` see changes since the
+    /// system itself last ran (Bevy parity), independent of stage grouping. `Tick` is
+    /// `Copy`/`Send`, so carrying it into the rayon task is trivially sound.
+    last_run: apex_core::Tick,
 }
 
 unsafe impl Send for AsdTask {}
@@ -876,6 +882,15 @@ pub struct Scheduler {
     /// overflow ids were not run-to-run deterministic. Diagnostics only (a `warn_once!`
     /// also fires); see `deterministic_overflow_count`.
     deterministic_overflow_count: u64,
+    /// D6: per-system change-detection baseline — the tick at which each system last
+    /// RAN (updated after a system runs, NOT when it is skipped by a run condition).
+    /// A system's `SystemContext.last_run` is set from this, so `Changed<T>`/`Added<T>`
+    /// see everything written since the system itself last ran, even when it shares an
+    /// execution stage with systems that ran while it was skipped (Bevy
+    /// `SystemMeta::last_run` parity; the per-execution-stage `stage_last_run` window
+    /// was correct only for solo-gated systems). Absent key ⇒ `Tick::ZERO` (first run
+    /// sees everything as new). Cleared on `compile` (system ids can change).
+    system_last_run: FxHashMap<SystemId, apex_core::Tick>,
 
     // ── Sh2: SEQ/PAR dispatch policy (ADR-003) ──────────────────────────────────
     /// Governs how each parallel-eligible stage picks SEQ vs PAR above the explicit

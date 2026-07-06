@@ -1628,6 +1628,90 @@
         );
     }
 
+    /// D6-full: a run_if-gated reader that SHARES an execution stage with an UNGATED
+    /// system (so the stage — and the old per-STAGE window — advances while the reader
+    /// is paused) still sees `Changed<T>` produced during the pause, because the window
+    /// is now PER-SYSTEM (Bevy `SystemMeta::last_run` parity). The solo-gated case above
+    /// was already correct via the whole-stage skip; this covers the co-stage case the
+    /// per-stage window got wrong (the reader's stage kept advancing on the keeper).
+    #[test]
+    fn co_stage_gated_reader_sees_changed_from_pause() {
+        use apex_core::prelude::*;
+
+        #[derive(apex_macros::Component)]
+        struct Mark(u32);
+        #[derive(Default)]
+        struct KeeperRuns(u32);
+        struct Ctl {
+            active: bool,
+            mutate: bool,
+            entity: Entity,
+            seen: u32,
+        }
+
+        let mut world = World::new();
+        let e = world.spawn((Mark(0),));
+        world.insert_resource(KeeperRuns::default());
+        world.insert_resource(Ctl {
+            active: false,
+            mutate: false,
+            entity: e,
+            seen: 0,
+        });
+
+        // Update: mutate Mark on demand (whole-world ⇒ its own stage).
+        fn mutator(w: &mut World) {
+            let (mutate, e) = {
+                let c = w.resource::<Ctl>();
+                (c.mutate, c.entity)
+            };
+            if mutate {
+                if let Some(mut m) = w.get_mut::<Mark>(e) {
+                    m.0 += 1;
+                }
+            }
+        }
+        // PostUpdate: an UNGATED keeper writes an unrelated resource — it keeps the
+        // PostUpdate stage running every frame WITHOUT conflicting with the reader
+        // (KeeperRuns vs Mark/Ctl), so the two share one execution stage.
+        fn keeper(mut k: ResMut<KeeperRuns>) {
+            k.0 += 1;
+        }
+        // PostUpdate: the gated reader counts Changed<Mark>. Narrow access (Changed<Mark>
+        // read + ResMut<Ctl>) ⇒ it shares the stage with keeper rather than getting its
+        // own. A `system!` system (so it can be wrapped by `sys(...).run_if`).
+        system! {
+            fn reader(q: (Changed<Mark>, Read<Mark>), out: ResMut<Ctl>) {
+                let mut n = 0u32;
+                q.for_each(|_, _| n += 1);
+                out.seen += n;
+            }
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, mutator);
+        sched.add_systems(StageLabel::PostUpdate, keeper);
+        sched.add_systems(
+            StageLabel::PostUpdate,
+            sys("reader", reader).run_if(|w: &World| w.resource::<Ctl>().active),
+        );
+
+        sched.run(&mut world); // frame 1: reader paused, keeper runs, no mutation
+        world.resource_mut::<Ctl>().mutate = true;
+        sched.run(&mut world); // frame 2: Mark mutated; reader paused; keeper advances the stage
+        world.resource_mut::<Ctl>().mutate = false;
+        world.resource_mut::<Ctl>().active = true;
+        sched.run(&mut world); // frame 3: reader resumes (shares the stage with keeper)
+
+        assert_eq!(
+            world.resource::<Ctl>().seen,
+            1,
+            "co-stage gated reader must see Changed<Mark> from the pause \
+             (per-system window; the per-stage window missed it because the keeper \
+             kept advancing the shared stage)"
+        );
+    }
+
     /// D4: a Filtered system in a later stage must see archetypes an earlier stage
     /// spawned THIS frame — the cached per-system archetype indices are refreshed
     /// before each stage (a non-parallel stage's new archetypes used to be missed

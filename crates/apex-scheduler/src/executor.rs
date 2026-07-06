@@ -231,11 +231,15 @@ impl Scheduler {
             {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
+                // D6: the tick this stage runs at (see `run_hybrid_parallel`).
+                let this_run = w.current_tick();
                 for &sys_id in system_ids {
                     if !enabled.contains(&sys_id) {
                         continue;
                     }
                     if let Some(&index) = self.system_indices.get(&sys_id) {
+                        // D6: per-system baseline (Copy — ends before `&mut systems`).
+                        let window = self.system_window(sys_id);
                         let system = &mut self.systems[index];
                         let prof_t = main_prof_enabled().then(std::time::Instant::now);
                         match &mut system.kind {
@@ -249,6 +253,7 @@ impl Scheduler {
                                         std::slice::from_ref(&sub_world),
                                         cmds_ptr,
                                     )
+                                    .with_last_run(window)
                                 };
                                 system.run(ctx);
                             }
@@ -267,6 +272,8 @@ impl Scheduler {
                 if !emit_event_types.is_empty() {
                     w.flush_events_by_type(emit_event_types);
                 }
+                // D6: advance each enabled system's baseline to this stage's tick.
+                self.advance_system_windows(&enabled, this_run);
             }
         }
 
@@ -411,6 +418,8 @@ impl Scheduler {
                 } else {
                     // A system with no entities (resources/events only) — run it immediately.
                     let slot = slot_of[&sys_id];
+                    // D6: per-system baseline (Copy — borrow ends before `&mut systems`).
+                    let window = self.system_window(sys_id);
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
@@ -423,6 +432,7 @@ impl Scheduler {
                                 &sws,
                                 (cmds_base as *mut Commands).add(slot),
                             )
+                            .with_last_run(window)
                         };
                         sys.run(ctx);
                     }
@@ -488,6 +498,9 @@ impl Scheduler {
                     arch_indices: SmallVec::from_slice(arch_slice),
                     chunk_ranges: SmallVec::new(), // empty = the whole SubWorld
                     cmds: Some(SendPtr((cmds_base as *mut Commands).wrapping_add(slot))),
+                    // D6: this system's per-system change-detection baseline, captured
+                    // now on the main thread and carried into the rayon task.
+                    last_run: self.system_window(info.sys_id),
                 });
             } else {
                 // A large multi-archetype system — ASD split
@@ -544,6 +557,8 @@ impl Scheduler {
                             arch_indices: chunk_arch_set,
                             chunk_ranges,
                             cmds: None,
+                            // D6: all row-split chunks of one system share its baseline.
+                            last_run: self.system_window(info.sys_id),
                         });
                     }
                 }
@@ -588,10 +603,12 @@ impl Scheduler {
                         // and use an inline buffer (they emit no commands).
                         // SAFETY: a command-emitting system is single-task (per-system
                         // scope), so exactly one task ever forms `&mut *slot.0`.
+                        // D6: apply this system's per-system change-detection baseline.
                         let ctx = match task.cmds {
                             Some(slot) => SystemContext::with_commands(sws, slot.0),
                             None => SystemContext::new(sws),
-                        };
+                        }
+                        .with_last_run(task.last_run);
                         sys.run(ctx);
                     }
                 });
@@ -744,6 +761,11 @@ impl Scheduler {
             }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
             self.open_stage_change_window(stage_idx, unsafe { &mut *world_ptr });
+            // D6: the tick this stage runs at. Each enabled system reads its OWN
+            // `system_window` baseline when building its context, and its baseline is
+            // advanced to `this_run` after it runs (below) — so a gated system sees
+            // changes since IT last ran, not since the stage last ran.
+            let this_run = unsafe { &*const_ptr }.current_tick();
 
             // D8b: (re)build per-system command slots for this stage in rank order
             // (position in `stage_ids`). One slot per system; command-emitting
@@ -802,6 +824,9 @@ impl Scheduler {
                             if !enabled.contains(&sys_id) {
                                 continue;
                             }
+                            // D6: this system's per-system change-detection baseline
+                            // (Copy, so the immutable borrow ends before `&mut systems`).
+                            let window = self.system_window(sys_id);
                             let system = &mut self.systems[sys_idx];
                             let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
@@ -816,6 +841,7 @@ impl Scheduler {
                                             std::slice::from_ref(&sub_world),
                                             cmds_base.add(slot),
                                         )
+                                        .with_last_run(window)
                                     };
                                     system.run(ctx);
                                 }
@@ -841,6 +867,8 @@ impl Scheduler {
                 if !emit_event_types.is_empty() {
                     unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
+                // D6: advance each enabled system's baseline to this stage's tick.
+                self.advance_system_windows(&enabled, this_run);
                 continue;
             }
 
@@ -888,6 +916,8 @@ impl Scheduler {
                             if !enabled.contains(&sys_id) {
                                 continue;
                             }
+                            // D6: per-system change-detection baseline (see branch above).
+                            let window = self.system_window(sys_id);
                             let system = &mut self.systems[sys_idx];
                             let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
@@ -902,6 +932,7 @@ impl Scheduler {
                                             std::slice::from_ref(&sub_world),
                                             cmds_base.add(slot),
                                         )
+                                        .with_last_run(window)
                                     };
                                     system.run(ctx);
                                 }
@@ -953,6 +984,9 @@ impl Scheduler {
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
+            // D6: advance each enabled system's baseline to this stage's tick (covers the
+            // SEQ-fallback and PAR branches).
+            self.advance_system_windows(&enabled, this_run);
             // Sh2: fold the measured stage time into the per-stage cost EMA (drives
             // the SEQ/PAR decision next frame). `should_fallback` = the mode we ran.
             self.record_stage_cost(stage_idx, stage_t0.elapsed(), should_fallback);

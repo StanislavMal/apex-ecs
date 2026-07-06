@@ -36,7 +36,34 @@ impl Scheduler {
             deterministic_spawn: false,
             system_spawn_history: FxHashMap::default(),
             deterministic_overflow_count: 0,
+            system_last_run: FxHashMap::default(),
             parallel_policy: ParallelPolicy::default(),
+        }
+    }
+
+    /// D6: this system's change-detection baseline — the tick at which it last ran, or
+    /// `Tick::ZERO` if it has not run yet (first run sees everything as new). Read when
+    /// building the system's `SystemContext`.
+    #[inline]
+    pub(crate) fn system_window(&self, sys_id: SystemId) -> apex_core::Tick {
+        self.system_last_run
+            .get(&sys_id)
+            .copied()
+            .unwrap_or(apex_core::Tick::ZERO)
+    }
+
+    /// D6: advance the baseline of every system that RAN this stage (the `enabled` set)
+    /// to `this_run`. Skipped systems are absent from `enabled`, so their baseline is
+    /// left untouched — that is the whole point: a gated system's window reaches back to
+    /// when it last ran, across the frames it sat out.
+    #[inline]
+    pub(crate) fn advance_system_windows(
+        &mut self,
+        enabled: &FxHashSet<SystemId>,
+        this_run: apex_core::Tick,
+    ) {
+        for &sys_id in enabled {
+            self.system_last_run.insert(sys_id, this_run);
         }
     }
 

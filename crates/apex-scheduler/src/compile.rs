@@ -20,6 +20,10 @@ impl Scheduler {
         // The plan (and thus execution-stage indices) is rebuilt — reset the per-stage
         // change-detection baselines (TD-52). One extra "everything changed" next frame is safe.
         self.stage_last_run.clear();
+        // D6: reset the per-system change-detection baselines too (same rationale — one
+        // "everything changed" frame after a recompile is safe; keeps the two windows
+        // consistent).
+        self.system_last_run.clear();
         // Sh2: stage indices changed — drop the cost-model history (it re-learns in a
         // couple of frames; a stale index would mis-classify a different stage).
         self.stage_cost_ema_ns.clear();
