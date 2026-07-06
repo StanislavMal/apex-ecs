@@ -2,7 +2,7 @@
     use apex_core::access_desc;
     use apex_core::{prelude::*, query::Query, world::World};
 
-    // ── Ш2: cost-model EMA + hysteresis (deterministic, no timing) ──────────
+    // ── Sh2: cost-model EMA + hysteresis (deterministic, no timing) ──────────
     #[test]
     fn cost_model_ema_and_hysteresis() {
         use std::time::Duration;
@@ -55,7 +55,7 @@
     #[derive(Clone, Copy)]
     struct DeltaTime(f32);
 
-    // ── AutoSystem тесты ──────────────────────────────────────
+    // ── AutoSystem tests ──────────────────────────────────────
 
     struct AutoMovement;
     impl AutoSystem for AutoMovement {
@@ -84,10 +84,10 @@
 
     #[test]
     fn auto_system_access_correct() {
-        // AutoMovement должен иметь read:Vel, write:Pos
+        // AutoMovement must have read:Vel, write:Pos
         let access = <(Read<Vel>, Write<Pos>) as WorldQuerySystemAccess>::system_access();
-        assert!(!access.reads.is_empty(), "должен читать Vel");
-        assert!(!access.writes.is_empty(), "должен писать Pos");
+        assert!(!access.reads.is_empty(), "must read Vel");
+        assert!(!access.writes.is_empty(), "must write Pos");
     }
 
     #[test]
@@ -228,21 +228,21 @@
 
     #[test]
     fn auto_system_no_conflict_same_stage() {
-        // AutoMovement (Write<Pos>) и AutoHealth (Write<Hp>) — нет конфликта
+        // AutoMovement (Write<Pos>) and AutoHealth (Write<Hp>) — no conflict
         let mut sched = Scheduler::new();
         sched.add_auto_system("movement", AutoMovement);
         sched.add_auto_system("health", AutoHealth);
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1, "нет конфликта — должен быть 1 Stage");
+        assert_eq!(stages.len(), 1, "no conflict — there should be 1 Stage");
         assert!(stages[0].all_parallel);
         assert_eq!(stages[0].system_count(), 2);
     }
 
     #[test]
     fn auto_system_conflict_separate_stages() {
-        // Два AutoSystem пишут в Pos — конфликт
+        // Two AutoSystems write Pos — a conflict
         struct AutoMovement2;
         impl AutoSystem for AutoMovement2 {
             type Query = Write<Pos>;
@@ -259,11 +259,11 @@
         assert_eq!(
             sched.stages().unwrap().len(),
             2,
-            "Write+Write должен дать 2 Stage"
+            "Write+Write must yield 2 Stages"
         );
     }
 
-    // ── ConflictKind тесты ────────────────────────────────────
+    // ── ConflictKind tests ────────────────────────────────────
 
     #[test]
     fn conflict_kind_in_edge_info() {
@@ -288,7 +288,7 @@
         sched.compile().unwrap();
 
         let conflicts = sched.conflicts_between(a, b);
-        assert!(!conflicts.is_empty(), "должен быть конфликт");
+        assert!(!conflicts.is_empty(), "there should be a conflict");
         assert!(matches!(conflicts[0], ConflictKind::WriteWrite { .. }));
     }
 
@@ -297,11 +297,11 @@
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
-        // Имитирует plain-fn `(Query<&Pos>, ResMut<Counter>)`: ШИРОКИЙ запрос (чтение Pos над
-        // многими сущностями) + мутация РЕСУРСА. До фикса TD-37 ASD дробил такую систему на чанки
-        // и звал ТЕЛО раз на чанк ⇒ мутация ресурса умножалась (баг many_foxes@10000: лисы в ~20×
-        // быстрее). С фиксом `resource_write` гейтит ASD ⇒ система = один таск ⇒ ровно один вызов.
-        struct Counter; // только носитель TypeId «ресурса»
+        // Mimics plain-fn `(Query<&Pos>, ResMut<Counter>)`: a WIDE query (reading Pos over
+        // many entities) + a RESOURCE mutation. Before the TD-37 fix, ASD split such a system into chunks
+        // and called the BODY once per chunk ⇒ the resource mutation was multiplied (many_foxes@10000 bug: foxes ~20×
+        // faster). With the fix `resource_write` gates ASD ⇒ the system = one task ⇒ exactly one call.
+        struct Counter; // only a carrier of the "resource" TypeId
         struct ResourceMutator(Arc<AtomicUsize>);
         impl ParSystem for ResourceMutator {
             fn access() -> AccessDescriptor {
@@ -320,7 +320,7 @@
         sched.add_par_system("res_mutator", ResourceMutator(calls.clone()));
 
         let mut world = World::new();
-        // Заведомо выше порога чанка — без фикса дало бы row-split на много чанков.
+        // Deliberately above the chunk threshold — without the fix it would row-split into many chunks.
         for _ in 0..50_000 {
             world.spawn((Pos { x: 0.0, y: 0.0 },));
         }
@@ -330,19 +330,19 @@
         assert_eq!(
             calls.load(Ordering::Relaxed),
             1,
-            "система с мутацией ресурса обязана выполняться РОВНО один раз, а не раз на ASD-чанк (TD-37)"
+            "a system mutating a resource must run EXACTLY once, not once per ASD chunk (TD-37)"
         );
     }
 
     #[test]
     fn asd_still_splits_pure_query_system() {
-        // Контроль: чистая система (только запрос, без ресурс-мутации/Commands) над многими
-        // сущностями ВСЁ ЕЩЁ декомпозируется (per-entity записи идемпотентны под чанками) —
-        // перф data-parallel путей фикс TD-37 не трогает. Проверяем, что её access НЕ помечен
-        // `writes_resource`/`uses_commands` (значит ASD-eligible).
+        // Control: a pure system (query only, no resource mutation/Commands) over many
+        // entities STILL decomposes (per-entity writes are idempotent under chunking) —
+        // the TD-37 fix does not touch data-parallel perf paths. Check that its access is NOT marked
+        // `writes_resource`/`uses_commands` (i.e. ASD-eligible).
         let access = AccessDescriptor::new().read::<Vel>().write::<Pos>();
-        assert!(!access.writes_resource, "чистая query-система не пишет ресурс");
-        assert!(!access.uses_commands, "чистая query-система не использует Commands");
+        assert!(!access.writes_resource, "a pure query system does not write a resource");
+        assert!(!access.uses_commands, "a pure query system does not use Commands");
     }
 
     #[test]
@@ -352,15 +352,15 @@
         let _seq = sched.add_system("barrier", |_| {}).id();
         sched.compile().unwrap();
 
-        // Должны быть рёбра с SequentialBarrier
+        // There should be SequentialBarrier edges
         let has_barrier = sched
             .edge_info
             .iter()
             .any(|e| matches!(e.kind, ConflictKind::SequentialBarrier));
-        assert!(has_barrier, "Sequential барьер должен быть в edge_info");
+        assert!(has_barrier, "the Sequential barrier must be in edge_info");
     }
 
-    // ── debug_plan_verbose тест ───────────────────────────────
+    // ── debug_plan_verbose test ───────────────────────────────
 
     #[test]
     fn debug_plan_verbose_works() {
@@ -371,23 +371,23 @@
         sched.compile().unwrap();
 
         let plan = sched.debug_plan_verbose();
-        assert!(plan.contains("PARALLEL"), "должен быть PARALLEL Stage");
-        assert!(plan.contains("sequential"), "должен быть sequential Stage");
-        assert!(plan.contains("Conflict"), "должен показывать конфликты");
-        assert!(plan.contains("Summary"), "должен показывать summary");
+        assert!(plan.contains("PARALLEL"), "there should be a PARALLEL Stage");
+        assert!(plan.contains("sequential"), "there should be a sequential Stage");
+        assert!(plan.contains("Conflict"), "must show conflicts");
+        assert!(plan.contains("Summary"), "must show a summary");
     }
 
     #[test]
     fn compile_with_world_shows_component_names() {
         let mut world = World::new();
 
-        // Явная регистрация компонентов нужна для populate_type_names.
-        // Auto-регистрация через #[derive(Component)] также работает,
-        // но для гарантии в этом диагностическом тесте регистрируем явно.
+        // Explicit component registration is needed for populate_type_names.
+        // Auto-registration via #[derive(Component)] also works,
+        // but for certainty in this diagnostic test we register explicitly.
         world.register_component::<Pos>();
         world.register_component::<Vel>();
 
-        // Система, использующая Pos и Vel — их имена появятся в reads/writes
+        // A system using Pos and Vel — their names will appear in reads/writes
         struct MovementSystem;
         impl ParSystem for MovementSystem {
             fn access() -> AccessDescriptor {
@@ -403,17 +403,17 @@
         let plan = sched.debug_plan_verbose();
         assert!(
             plan.contains("Pos"),
-            "debug_plan должен содержать 'Pos', содержит: {}",
+            "debug_plan must contain 'Pos', contains: {}",
             plan
         );
         assert!(
             plan.contains("Vel"),
-            "debug_plan должен содержать 'Vel', содержит: {}",
+            "debug_plan must contain 'Vel', contains: {}",
             plan
         );
     }
 
-    // ── Инкрементальность тест ────────────────────────────────
+    // ── Incrementality test ────────────────────────────────
 
     #[test]
     fn incremental_compile_after_add() {
@@ -421,22 +421,22 @@
         sched.add_auto_system("movement", AutoMovement);
         sched.compile().unwrap();
 
-        // Граф скомпилирован
+        // Graph compiled
         assert!(sched.execution_plan.is_some());
         assert!(!sched.graph_dirty);
 
-        // Добавляем новую систему — план инвалидируется
+        // Add a new system — the plan is invalidated
         sched.add_auto_system("health", AutoHealth);
         assert!(sched.execution_plan.is_none());
         assert!(sched.graph_dirty);
 
-        // Compile снова
+        // Compile again
         sched.compile().unwrap();
         assert!(sched.execution_plan.is_some());
         assert_eq!(sched.stages().unwrap().len(), 1);
     }
 
-    // ── Оригинальные тесты (совместимость) ───────────────────
+    // ── Original tests (compatibility) ───────────────────
 
     #[test]
     fn sequential_ordering() {
@@ -488,7 +488,7 @@
         sched.add_dependency(a, b);
         let err = sched.compile();
         assert!(err.is_err());
-        // Сообщение об ошибке должно содержать имена систем
+        // The error message must contain the system names
         if let Err(SchedulerError::CircularDependency { cycle_info }) = err {
             assert!(cycle_info.contains("a") || cycle_info.contains("b"));
         }
@@ -543,7 +543,7 @@
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // sequential больше не фрагментирует — параллельные группируются до него
+        // sequential no longer fragments — parallel ones are grouped before it
         assert_eq!(stages.len(), 2);
         assert!(stages[0].all_parallel);
         assert!(!stages[1].all_parallel);
@@ -581,7 +581,7 @@
         assert!((result.1 - 2.0).abs() < 1e-6);
     }
 
-    /// Параллельное выполнение: обе AutoSystem применяют изменения.
+    /// Parallel execution: both AutoSystems apply their changes.
     #[test]
     fn parallel_auto_systems_correctness() {
         let mut sched = Scheduler::new();
@@ -610,7 +610,7 @@
         assert!((hp_result - 0.0).abs() < 1e-6);
     }
 
-    // ── StageLabel тесты ────────────────────────────────────────
+    // ── StageLabel tests ────────────────────────────────────────
 
     #[test]
     fn startup_system_runs_once() {
@@ -624,20 +624,20 @@
 
         let mut world = World::new();
 
-        // Первый run() — Startup выполняется
+        // First run() — Startup runs
         sched.run_sequential(&mut world);
         assert_eq!(
             *startup_count.lock().unwrap(),
             1,
-            "Startup должен выполниться 1 раз"
+            "Startup must run once"
         );
 
-        // Второй run() — Startup НЕ выполняется
+        // Second run() — Startup does NOT run
         sched.run_sequential(&mut world);
         assert_eq!(
             *startup_count.lock().unwrap(),
             1,
-            "Startup НЕ должен выполниться повторно"
+            "Startup must NOT run again"
         );
     }
 
@@ -651,11 +651,11 @@
         let plan = sched.debug_plan();
         assert!(
             plan.contains("Startup"),
-            "debug_plan должен содержать Startup label"
+            "debug_plan must contain the Startup label"
         );
         assert!(
             plan.contains("Update"),
-            "debug_plan должен содержать Update label"
+            "debug_plan must contain the Update label"
         );
     }
 
@@ -663,28 +663,28 @@
     fn add_system_to_stage_custom_label() {
         let mut sched = Scheduler::new();
 
-        // Добавляем системы в разные этапы
+        // Add systems to different stages
         sched.add_system_to_stage("pre", |_| {}, StageLabel::PreUpdate);
         sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // Должно быть минимум 2 Stage: PreUpdate и Update
+        // There should be at least 2 Stages: PreUpdate and Update
         assert!(
             stages.len() >= 2,
-            "Должно быть минимум 2 Stage, получено {}",
+            "There should be at least 2 Stages, got {}",
             stages.len()
         );
 
-        // Проверяем что PreUpdate идут перед Update
+        // Check that PreUpdate comes before Update
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
-        assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
-        assert!(upd_idx.is_some(), "Должен быть Update Stage");
+        assert!(pre_idx.is_some(), "There should be a PreUpdate Stage");
+        assert!(upd_idx.is_some(), "There should be an Update Stage");
         assert!(
             pre_idx.unwrap() < upd_idx.unwrap(),
-            "PreUpdate должен быть перед Update"
+            "PreUpdate must come before Update"
         );
     }
 
@@ -692,26 +692,26 @@
     fn startup_auto_system() {
         let mut sched = Scheduler::new();
 
-        // AutoSystem на Startup
+        // AutoSystem on Startup
         sched.add_startup_auto_system("init_movement", AutoMovement);
 
-        // Обычная система на Update
+        // A regular system on Update
         sched.add_auto_system("update_health", AutoHealth);
 
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        assert!(stages.len() >= 2, "Должно быть минимум 2 Stage");
+        assert!(stages.len() >= 2, "There should be at least 2 Stages");
 
-        // Startup выполняется первым
+        // Startup runs first
         assert_eq!(
             stages[0].label,
             StageLabel::Startup,
-            "Первый Stage должен быть Startup"
+            "The first Stage must be Startup"
         );
         assert!(
             stages.iter().any(|s| s.label == StageLabel::Update),
-            "Должен быть Update Stage"
+            "There should be an Update Stage"
         );
     }
 
@@ -728,25 +728,25 @@
 
         let mut world = World::new();
 
-        // Первый run
+        // First run
         sched.run_sequential(&mut world);
         assert_eq!(
             *startup_val.lock().unwrap(),
             42,
-            "Startup система должна выполниться"
+            "The Startup system must run"
         );
         assert_eq!(
             *world.resource::<i32>(),
             42,
-            "Ресурс должен быть установлен"
+            "The resource must be set"
         );
 
-        // Второй run — ресурс должен остаться (Startup не перезаписывает)
+        // Second run — the resource must persist (Startup does not overwrite)
         sched.run_sequential(&mut world);
-        assert_eq!(*world.resource::<i32>(), 42, "Ресурс не должен измениться");
+        assert_eq!(*world.resource::<i32>(), 42, "The resource must not change");
     }
 
-    // ── Event конфликты ────────────────────────────────────────
+    // ── Event conflicts ────────────────────────────────────────
 
     struct EventWriterForTest;
     impl ParSystem for EventWriterForTest {
@@ -782,10 +782,10 @@
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // Два EventWriter одного типа → должны быть в разных Stage (конфликт)
+        // Two EventWriters of the same type → must be in different Stages (conflict)
         assert!(
             stages.len() >= 2,
-            "EventWriteWrite конфликт: ожидается минимум 2 Stage, получено {}",
+            "EventWriteWrite conflict: expected at least 2 Stages, got {}",
             stages.len()
         );
     }
@@ -800,10 +800,10 @@
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // EventWriter + EventReader одного типа → должны быть в разных Stage (конфликт)
+        // EventWriter + EventReader of the same type → must be in different Stages (conflict)
         assert!(
             stages.len() >= 2,
-            "EventWriteRead конфликт: ожидается минимум 2 Stage, получено {}",
+            "EventWriteRead conflict: expected at least 2 Stages, got {}",
             stages.len()
         );
     }
@@ -847,14 +847,14 @@
     #[test]
     fn event_read_different_events_no_conflict() {
         let mut sched = Scheduler::new();
-        // Слушают разные события — конфликта нет
+        // They listen to different events — no conflict
         sched.add_par_system("reader_i32", EventReaderForTest); // Listen<i32>
         sched.add_par_system("reader_f64", DifferentEventReader); // Listen<f64>
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
         assert!(
             stages.iter().any(|s| s.system_ids.len() >= 2),
-            "EventRead разных событий не должны конфликтовать: ожидается Stage с обеими системами"
+            "EventReads of different events must not conflict: expected a Stage with both systems"
         );
     }
 
@@ -870,14 +870,14 @@
         let conflicts = sched.conflicts_between(wid, rid);
         assert!(
             !conflicts.is_empty(),
-            "Должен быть конфликт между EventWriter и EventWriter"
+            "There should be a conflict between EventWriter and EventWriter"
         );
 
-        // Проверяем тип конфликта
+        // Check the conflict kind
         let has_event_conflict = conflicts
             .iter()
             .any(|c| matches!(c, ConflictKind::EventWriteWrite { .. }));
-        assert!(has_event_conflict, "Конфликт должен быть EventWriteWrite");
+        assert!(has_event_conflict, "The conflict must be EventWriteWrite");
     }
 
     #[test]
@@ -893,14 +893,14 @@
         let stages = sched.stages().unwrap();
         assert!(
             stages.iter().any(|s| s.system_ids.len() >= 2),
-            "При event_ordering=false Emit+Listen не должны конфликтовать"
+            "With event_ordering=false, Emit+Listen must not conflict"
         );
     }
 
     #[test]
     fn event_ordering_enabled_by_default() {
         let mut sched = Scheduler::new();
-        // По умолчанию enable_event_ordering не вызывается — должен быть true
+        // By default enable_event_ordering is not called — it must be true
 
         sched.add_par_system("emitter", EventWriterForTest); // Emit<i32>
         sched.add_par_system("listener", EventReaderForTest); // Listen<i32>
@@ -910,7 +910,7 @@
         let stages = sched.stages().unwrap();
         assert!(
             stages.len() >= 2,
-            "По умолчанию Emit+Listen должны быть в разных Stage, получено {}",
+            "By default Emit+Listen must be in different Stages, got {}",
             stages.len()
         );
     }
@@ -921,11 +921,11 @@
     fn configure_stages_custom_order() {
         let mut sched = Scheduler::new();
 
-        // Добавляем системы в Update и PreUpdate
+        // Add systems to Update and PreUpdate
         sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
         sched.add_system_to_stage("pre_work", |_| {}, StageLabel::PreUpdate);
 
-        // Меняем порядок: Update ДО PreUpdate
+        // Change the order: Update BEFORE PreUpdate
         sched.configure_stages(vec![
             StageLabel::Startup,
             StageLabel::Update,
@@ -939,15 +939,15 @@
 
         let stages = sched.stages().unwrap();
 
-        // Update должен быть перед PreUpdate
+        // Update must come before PreUpdate
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
 
-        assert!(upd_idx.is_some(), "Должен быть Update Stage");
-        assert!(pre_idx.is_some(), "Должен быть PreUpdate Stage");
+        assert!(upd_idx.is_some(), "There should be an Update Stage");
+        assert!(pre_idx.is_some(), "There should be a PreUpdate Stage");
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate при configure_stages"
+            "Update must come before PreUpdate with configure_stages"
         );
     }
 
@@ -984,12 +984,12 @@
     fn configure_stages_keeps_missing_at_end() {
         let mut sched = Scheduler::new();
 
-        // Добавляем системы в разные этапы
+        // Add systems to different stages
         sched.add_system_to_stage("pre", |_| {}, StageLabel::PreUpdate);
         sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
         sched.add_system_to_stage("last_work", |_| {}, StageLabel::Last);
 
-        // Указываем только Update и PreUpdate — Last не указан
+        // Specify only Update and PreUpdate — Last is not listed
         sched.configure_stages(vec![
             StageLabel::Startup,
             StageLabel::Update,
@@ -1000,29 +1000,29 @@
 
         let stages = sched.stages().unwrap();
 
-        // Update и PreUpdate должны быть (в указанном порядке)
+        // Update and PreUpdate must be present (in the given order)
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         assert!(upd_idx.is_some());
         assert!(pre_idx.is_some());
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate"
+            "Update must come before PreUpdate"
         );
 
-        // Last должен быть в конце (не указан в order, добавлен автоматически)
+        // Last must be at the end (not in order, appended automatically)
         let last_idx = stages.iter().position(|s| s.label == StageLabel::Last);
         assert!(
             last_idx.is_some(),
-            "Last должен присутствовать даже если не указан в configure_stages"
+            "Last must be present even if not listed in configure_stages"
         );
         assert!(
             last_idx.unwrap() > pre_idx.unwrap() || last_idx.unwrap() > upd_idx.unwrap(),
-            "Last (не указанный в order) должен быть в конце"
+            "Last (not listed in order) must be at the end"
         );
     }
 
-    // ── Pipeline тесты ─────────────────────────────────────────
+    // ── Pipeline tests ─────────────────────────────────────────
 
     #[derive(Clone, Copy)]
     struct DamageEvent;
@@ -1085,21 +1085,21 @@
 
         sched.compile().unwrap();
 
-        // Должно быть минимум 3 Stage: physics → armor → health
+        // There should be at least 3 Stages: physics → armor → health
         let stages = sched.stages().unwrap();
         assert!(
             stages.len() >= 3,
-            "Конвейер из 3 стадий должен создать минимум 3 Stage, получено: {}",
+            "A 3-stage pipeline must create at least 3 Stages, got: {}",
             stages.len()
         );
 
-        // Проверяем порядок плоского списка
+        // Check the order of the flat list
         let flat = &sched.execution_plan.as_ref().unwrap().flat_order;
         let pos_physics = flat.iter().position(|&id| id == physics_id).unwrap();
         let pos_armor = flat.iter().position(|&id| id == armor_id).unwrap();
         let pos_health = flat.iter().position(|&id| id == health_id).unwrap();
-        assert!(pos_physics < pos_armor, "physics должен быть до armor");
-        assert!(pos_armor < pos_health, "armor должен быть до health");
+        assert!(pos_physics < pos_armor, "physics must come before armor");
+        assert!(pos_armor < pos_health, "armor must come before health");
     }
 
     /// §0.2a hygiene: `Pipeline::build` naming an unregistered system used to
@@ -1149,7 +1149,7 @@
     fn pipeline_validation_catches_wrong_role() {
         let mut sched = Scheduler::new();
 
-        // ListenerOnly не имеет Emit<Damage> — не может быть Producer
+        // ListenerOnly has no Emit<Damage> — it cannot be a Producer
         let _bad_id = sched.add_par_system("bad_producer", ListenerOnly);
 
         let result = Scheduler::event_pipeline::<DamageEvent>()
@@ -1158,7 +1158,7 @@
 
         assert!(
             result.is_err(),
-            "Должна быть ошибка: система объявлена Producer но не имеет Emit"
+            "There should be an error: the system is declared a Producer but has no Emit"
         );
 
         let errors = result.unwrap_err();
@@ -1172,47 +1172,47 @@
     fn configure_stages_persists_across_compiles() {
         let mut sched = Scheduler::new();
 
-        // Добавляем системы в Update и PreUpdate
+        // Add systems to Update and PreUpdate
         sched.add_auto_system_to_stage("update_movement", AutoMovement, StageLabel::Update);
         sched.add_system_to_stage("pre_work", |_| {}, StageLabel::PreUpdate);
 
-        // Настраиваем порядок: Update ДО PreUpdate
+        // Configure the order: Update BEFORE PreUpdate
         sched.configure_stages(vec![
             StageLabel::Startup,
             StageLabel::Update,
             StageLabel::PreUpdate,
         ]);
 
-        // Первая компиляция
+        // First compilation
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate после первой компиляции"
+            "Update must come before PreUpdate after the first compilation"
         );
 
-        // Добавляем новую систему (триггерит invalidate_plan)
+        // Add a new system (triggers invalidate_plan)
         sched.add_system_to_stage("more_pre_work", |_| {}, StageLabel::PreUpdate);
 
-        // Вторая компиляция — stage_order должен сохраниться
+        // Second compilation — stage_order must persist
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
         let upd_idx = stages.iter().position(|s| s.label == StageLabel::Update);
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         assert!(
             upd_idx.is_some(),
-            "Update Stage должен быть после перекомпиляции"
+            "The Update Stage must exist after recompilation"
         );
         assert!(
             pre_idx.is_some(),
-            "PreUpdate Stage должен быть после перекомпиляции"
+            "The PreUpdate Stage must exist after recompilation"
         );
         assert!(upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update должен быть перед PreUpdate после перекомпиляции — stage_order должен сохраняться");
+            "Update must come before PreUpdate after recompilation — stage_order must persist");
 
-        // Третья компиляция — ещё один вызов для уверенности
+        // Third compilation — one more call for certainty
         sched.add_system_to_stage("extra", |_| {}, StageLabel::Last);
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
@@ -1220,36 +1220,36 @@
         let pre_idx = stages.iter().position(|s| s.label == StageLabel::PreUpdate);
         assert!(
             upd_idx.unwrap() < pre_idx.unwrap(),
-            "Update перед PreUpdate после третьей компиляции"
+            "Update before PreUpdate after the third compilation"
         );
     }
 
     #[test]
     fn archetype_indices_for_subworld_uses_any_criterion() {
-        // Две системы с перекрёстным Write/Read по Pos и Vel
-        // не должны создавать CircularDependency.
-        // Проверяем, что any()-критерий в compute_archetype_indices
-        // и BidirectionalWriteRead в detect_conflict_kind работают корректно.
+        // Two systems with cross Write/Read over Pos and Vel
+        // must not create a CircularDependency.
+        // Check that the any() criterion in compute_archetype_indices
+        // and BidirectionalWriteRead in detect_conflict_kind work correctly.
         let _world = World::new();
 
         let mut sched = Scheduler::new();
 
-        // Просто dummy-системы: проверяем, что компиляция проходит
+        // Just dummy systems: check that compilation succeeds
         sched.add_system("sys_a", |_: &mut World| {});
         sched.add_system("sys_b", |_: &mut World| {});
 
         let result = sched.compile();
         assert!(
             result.is_ok(),
-            "Компиляция должна пройти без ошибок: {:?}",
+            "Compilation must succeed without errors: {:?}",
             result.err()
         );
     }
 
     #[test]
     fn independent_resolves_bidirectional_write_read_deterministically() {
-        // A: Read<Vel>, Write<Pos>; B: Read<Pos>, Write<Vel> — настоящий BidirectionalWriteRead
-        // (без явного порядка → CircularDependency).
+        // A: Read<Vel>, Write<Pos>; B: Read<Pos>, Write<Vel> — a true BidirectionalWriteRead
+        // (without an explicit order → CircularDependency).
         struct A;
         impl ParSystem for A {
             fn access() -> AccessDescriptor {
@@ -1265,23 +1265,23 @@
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
-        // Без `independent` — цикл.
+        // Without `independent` — a cycle.
         let mut sched = Scheduler::new();
         sched.add_par_system("a", A);
         sched.add_par_system("b", B);
         assert!(
             matches!(sched.compile(), Err(SchedulerError::CircularDependency { .. })),
-            "перекрёстный write/read без явного порядка = CircularDependency"
+            "cross write/read without an explicit order = CircularDependency"
         );
 
-        // С `independent` — компилируется, порядок детерминирован (регистрация: a → b).
+        // With `independent` — it compiles, order is deterministic (registration: a → b).
         let mut sched = Scheduler::new();
         sched.add_par_system("a", A);
         sched.add_par_system("b", B);
         sched.independent(&["a", "b"]).unwrap();
         sched
             .compile()
-            .expect("independent снимает CircularDependency, сериализуя в порядке регистрации");
+            .expect("independent removes CircularDependency, serializing in registration order");
     }
 
     /// D5: a symmetric (WriteWrite) conflict plus an explicit ordering that runs
@@ -1323,7 +1323,7 @@
         assert!(b_stage < a_stage, "explicit before(\"b\",\"a\") must run b before a");
     }
 
-    // ── Р-3: ordering declared on configs (`.before/.after/.chain`) ────────
+    // ── R-3: ordering declared on configs (`.before/.after/.chain`) ────────
 
     /// Helper: index of the execution stage containing `name` after compile.
     #[cfg(test)]
@@ -1644,22 +1644,22 @@
     fn bidir_write_read_no_false_circular_dep() {
         // SystemA: Read<Vel>, Write<Pos>
         // SystemB: Read<Pos>, Write<Vel>
-        // Реальный конфликт должен быть LinearOrder (не цикл).
+        // The real conflict must be LinearOrder (not a cycle).
         let mut sched = Scheduler::new();
         sched.add_auto_system("sys_a", AutoMovement);
         sched.add_auto_system("sys_b", AutoMovement);
 
         let result = sched.compile();
-        // Одинаковые системы с Read<Vel>+Write<Pos> — конфликтуют
-        // (WriteWrite по Pos, WriteWrite по Vel), но не создают цикл.
+        // Identical systems with Read<Vel>+Write<Pos> — they conflict
+        // (WriteWrite over Pos, WriteWrite over Vel) but do not create a cycle.
         assert!(
             result.is_ok(),
-            "Компиляция должна пройти без CircularDependency: {:?}",
+            "Compilation must succeed without CircularDependency: {:?}",
             result.err()
         );
     }
 
-    // ── Run Condition тесты ────────────────────────────────────
+    // ── Run Condition tests ────────────────────────────────────
 
     #[test]
     fn run_condition_true_system_executes() {
@@ -1675,13 +1675,13 @@
         let mut world = World::new();
         sched.run_sequential(&mut world);
 
-        assert!(RAN.load(Ordering::SeqCst), "Система должна выполниться когда condition=true");
+        assert!(RAN.load(Ordering::SeqCst), "The system must run when condition=true");
     }
 
-    /// Регрессия (аудит 2026-06-12): scope-условие из `scoped`+`run_condition`
-    /// (а) применяется к системам, зарегистрированным через `add_systems`
-    /// (раньше этот путь его молча терял), и (б) НЕ прилипает к системам,
-    /// зарегистрированным ПОСЛЕ блока (раньше скоуп никогда не сбрасывался).
+    /// Regression (audit 2026-06-12): a scope condition from `scoped`+`run_condition`
+    /// (a) applies to systems registered via `add_systems`
+    /// (this path used to silently drop it), and (b) does NOT stick to systems
+    /// registered AFTER the block (the scope used to never reset).
     #[test]
     fn scoped_condition_applies_to_add_systems_and_does_not_leak() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1690,7 +1690,7 @@
 
         let mut sched = Scheduler::new();
         sched.scoped(|s| {
-            s.run_condition(|_| false); // скоуп всегда-false
+            s.run_condition(|_| false); // always-false scope
             s.add_systems(
                 StageLabel::Update,
                 seq("inside", |_w: &mut World| {
@@ -1698,7 +1698,7 @@
                 }),
             );
         });
-        // После блока скоуп снят — система выполняется безусловно.
+        // After the block the scope is cleared — the system runs unconditionally.
         sched.add_systems(
             StageLabel::Update,
             seq("outside", |_w: &mut World| {
@@ -1711,11 +1711,11 @@
 
         assert!(
             !INSIDE_RAN.load(Ordering::SeqCst),
-            "scoped-условие должно применяться к add_systems-пути"
+            "a scoped condition must apply to the add_systems path"
         );
         assert!(
             OUTSIDE_RAN.load(Ordering::SeqCst),
-            "scope-условие не должно прилипать к системам после блока"
+            "a scope condition must not stick to systems after the block"
         );
     }
 
@@ -1733,7 +1733,7 @@
         let mut world = World::new();
         sched.run_sequential(&mut world);
 
-        assert!(!RAN.load(Ordering::SeqCst), "Система НЕ должна выполниться когда condition=false");
+        assert!(!RAN.load(Ordering::SeqCst), "The system must NOT run when condition=false");
     }
 
     #[test]
@@ -1765,13 +1765,13 @@
         })
         .unwrap();
 
-        // paused = true → система не запускается
+        // paused = true → the system does not run
         let mut world = World::new();
         world.insert_resource(GameState { paused: true });
         sched.run_sequential(&mut world);
-        assert!(!RAN.load(Ordering::SeqCst), "Система не должна работать на паузе");
+        assert!(!RAN.load(Ordering::SeqCst), "The system must not run while paused");
 
-        // paused = false → система запускается
+        // paused = false → the system runs
         RAN.store(false, Ordering::SeqCst);
         let mut world2 = World::new();
         world2.insert_resource(GameState { paused: false });
@@ -1796,7 +1796,7 @@
         })
         .unwrap();
         sched2.run_sequential(&mut world2);
-        assert!(RAN.load(Ordering::SeqCst), "Система должна работать когда не пауза");
+        assert!(RAN.load(Ordering::SeqCst), "The system must run when not paused");
     }
 
     #[test]
@@ -1817,8 +1817,8 @@
         let mut world = World::new();
         sched.run_sequential(&mut world);
 
-        assert_eq!(COUNTER_A.load(Ordering::SeqCst), 1, "always_on должна выполниться");
-        assert_eq!(COUNTER_B.load(Ordering::SeqCst), 0, "conditionally_off НЕ должна выполниться");
+        assert_eq!(COUNTER_A.load(Ordering::SeqCst), 1, "always_on must run");
+        assert_eq!(COUNTER_B.load(Ordering::SeqCst), 0, "conditionally_off must NOT run");
     }
 
     #[test]
@@ -1843,7 +1843,7 @@
 
         let mut world = World::new();
         sched.run(&mut world);
-        assert!(!RAN.load(Ordering::SeqCst), "Параллельная система с condition=false НЕ запускается");
+        assert!(!RAN.load(Ordering::SeqCst), "A parallel system with condition=false does NOT run");
     }
 
     #[test]
@@ -1868,7 +1868,7 @@
 
         let mut world = World::new();
         sched.run(&mut world);
-        assert!(RAN.load(Ordering::SeqCst), "Параллельная система с condition=true запускается");
+        assert!(RAN.load(Ordering::SeqCst), "A parallel system with condition=true runs");
     }
 
     #[test]
@@ -1886,7 +1886,7 @@
         sched.run_sequential(&mut world);
         sched.run_sequential(&mut world);
 
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1, "Startup с condition=true должен выполниться ровно 1 раз");
+        assert_eq!(COUNTER.load(Ordering::SeqCst), 1, "Startup with condition=true must run exactly once");
     }
 
     #[test]
@@ -1918,7 +1918,7 @@
 
         let mut world = World::new();
         sched.run_sequential(&mut world);
-        assert!(!RAN.load(Ordering::SeqCst), "Без Flag ресурса — не запускается");
+        assert!(!RAN.load(Ordering::SeqCst), "Without the Flag resource — it does not run");
 
         RAN.store(false, Ordering::SeqCst);
     }
@@ -1953,10 +1953,10 @@
         sched.set_run_if("conditional2", Box::new(f)).unwrap();
 
         sched.run_sequential(&mut world);
-        assert!(RAN.load(Ordering::SeqCst), "С Flag(true) ресурсом — запускается");
+        assert!(RAN.load(Ordering::SeqCst), "With the Flag(true) resource — it runs");
     }
 
-    // ── Apply Deferred тесты ───────────────────────────────────
+    // ── Apply Deferred tests ───────────────────────────────────
 
     #[test]
     fn apply_deferred_splits_into_two_sub_stages() {
@@ -1969,9 +1969,9 @@
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1 + 1, "Должно быть 2 под-Stage'а: first + second");
-        assert_eq!(stages[0].system_ids.len(), 1, "Первый под-Stage: 1 система");
-        assert_eq!(stages[1].system_ids.len(), 1, "Второй под-Stage: 1 система");
+        assert_eq!(stages.len(), 1 + 1, "There should be 2 sub-stages: first + second");
+        assert_eq!(stages[0].system_ids.len(), 1, "First sub-stage: 1 system");
+        assert_eq!(stages[1].system_ids.len(), 1, "Second sub-stage: 1 system");
     }
 
     #[test]
@@ -1979,12 +1979,12 @@
         let mut sched = Scheduler::new();
         sched.staged(StageLabel::tag("test"), |s| {
             s.add_system("only", |_: &mut World| {});
-            s.apply_deferred(); // no-op: только одна система, split не нужен
+            s.apply_deferred(); // no-op: only one system, no split needed
         });
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1, "Без второй системы — split не создаётся");
+        assert_eq!(stages.len(), 1, "Without a second system — no split is created");
     }
 
     #[test]
@@ -2004,9 +2004,9 @@
             s.apply_deferred();
             s.add_system("check_sys", move |world: &mut World| {
                 let spawned = ENTITY_SPAWNED.load(Ordering::SeqCst);
-                assert!(spawned, "spawn_system должна выполниться перед check_system");
+                assert!(spawned, "spawn_system must run before check_system");
                 let count = Query::<Read<Spawned>>::new(world).iter().count();
-                assert_eq!(count, 1, "spawn должен быть видим в том же кадре");
+                assert_eq!(count, 1, "the spawn must be visible in the same frame");
             });
         });
 
@@ -2027,7 +2027,7 @@
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1 + 2, "3 под-Stage'а: [a], [b], [c]");
+        assert_eq!(stages.len(), 1 + 2, "3 sub-stages: [a], [b], [c]");
     }
 
     #[test]
@@ -2054,15 +2054,15 @@
             });
         });
 
-        // Flag = false → b пропускается
+        // Flag = false → b is skipped
         let mut world1 = World::new();
         world1.insert_resource(Flag(false));
         sched.compile_with_world(&world1).unwrap();
         sched.run_sequential(&mut world1);
-        assert!(A_RAN.load(Ordering::SeqCst), "a всегда должна выполняться");
-        assert!(!B_RAN.load(Ordering::SeqCst), "b НЕ должна выполняться при Flag=false");
+        assert!(A_RAN.load(Ordering::SeqCst), "a must always run");
+        assert!(!B_RAN.load(Ordering::SeqCst), "b must NOT run when Flag=false");
 
-        // Flag = true → b выполняется
+        // Flag = true → b runs
         A_RAN.store(false, Ordering::SeqCst);
         let mut sched2 = Scheduler::new();
         sched2.staged(StageLabel::tag("mixed2"), |s| {
@@ -2082,7 +2082,7 @@
         sched2.compile_with_world(&world2).unwrap();
         sched2.run_sequential(&mut world2);
         assert!(A_RAN.load(Ordering::SeqCst));
-        assert!(B_RAN.load(Ordering::SeqCst), "b должна выполняться при Flag=true");
+        assert!(B_RAN.load(Ordering::SeqCst), "b must run when Flag=true");
     }
 
     #[test]
@@ -2090,27 +2090,27 @@
         let mut sched = Scheduler::new();
         sched.staged(StageLabel::tag("test"), |s| {
             s.add_system("only", |_: &mut World| {});
-            s.apply_deferred(); // первая
-            s.apply_deferred(); // вторая — идемпотентна
+            s.apply_deferred(); // first
+            s.apply_deferred(); // second — idempotent
             s.add_system("after", |_: &mut World| {});
         });
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1 + 1, "Двойной apply_deferred не должен создавать пустых под-Stage'ей");
+        assert_eq!(stages.len(), 1 + 1, "A double apply_deferred must not create empty sub-stages");
     }
 
     #[test]
     fn apply_deferred_at_start_noop() {
         let mut sched = Scheduler::new();
         sched.staged(StageLabel::tag("test"), |s| {
-            s.apply_deferred(); // нет предыдущих систем → no-op
+            s.apply_deferred(); // no prior systems → no-op
             s.add_system("after", |_: &mut World| {});
         });
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1, "apply_deferred без предыдущей системы — no-op");
+        assert_eq!(stages.len(), 1, "apply_deferred with no prior system — a no-op");
     }
 
     #[test]
@@ -2132,9 +2132,9 @@
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 1 + 1, "AutoSystem + apply_deferred = 2 под-Stage'а");
-        assert!(stages[0].all_parallel, "Первый под-Stage: all_parallel=true");
-        assert!(stages[1].all_parallel, "Второй под-Stage: all_parallel=true");
+        assert_eq!(stages.len(), 1 + 1, "AutoSystem + apply_deferred = 2 sub-stages");
+        assert!(stages[0].all_parallel, "First sub-stage: all_parallel=true");
+        assert!(stages[1].all_parallel, "Second sub-stage: all_parallel=true");
     }
 
     #[test]
@@ -2158,7 +2158,7 @@
 
         sched.compile().unwrap();
         let stages = sched.stages().unwrap();
-        assert_eq!(stages.len(), 2, "2 под-Stage'а: [a,b] + [c,d]");
+        assert_eq!(stages.len(), 2, "2 sub-stages: [a,b] + [c,d]");
         assert_eq!(stages[0].system_ids.len(), 2);
         assert_eq!(stages[1].system_ids.len(), 2);
     }
@@ -2196,10 +2196,10 @@
         world.flush_all_events();
 
         sched.run_sequential(&mut world);
-        assert_eq!(VALUE_SEEN.load(Ordering::SeqCst), 1, "Событие видно между под-Stage'ями");
+        assert_eq!(VALUE_SEEN.load(Ordering::SeqCst), 1, "The event is visible between sub-stages");
     }
 
-    // ── Condition Trait тесты ──────────────────────────────
+    // ── Condition Trait tests ──────────────────────────────
 
     #[test]
     fn condition_trait_opaque_closure() {
@@ -2409,16 +2409,16 @@
         assert!(same_stage, "opaque condition should not cause conflicts");
     }
 
-    // ── D2-1: plain-fn системы (Bevy-стиль) ────────────────────
+    // ── D2-1: plain-fn systems (Bevy style) ────────────────────
 
-    /// Обычные функции с Bevy-параметрами регистрируются bare-идентификаторами
-    /// и работают: Res/ResMut/Query<(&T, &mut U)>/EventWriter/EventReader.
+    /// Plain functions with Bevy parameters are registered by bare identifiers
+    /// and work: Res/ResMut/Query<(&T, &mut U)>/EventWriter/EventReader.
     #[test]
     fn plain_fn_systems_bevy_style() {
         use apex_core::query::Query as Q;
 
-        // Именованное поле: `.0` на Res разрешается в публичный кортежный
-        // филд самого Res (&T), а не в Deref — известная шероховатость.
+        // Named field: `.0` on Res resolves to Res's public tuple
+        // field (&T), not to Deref — a known rough edge.
         struct Dt {
             step: f32,
         }
@@ -2438,7 +2438,7 @@
         }
 
         fn count_moved(mut evs: EventReader<Ping>, mut moved: ResMut<Moved>) {
-            // Главная Bevy-идиома (TD-24): прямая итерация по read().
+            // The main Bevy idiom (TD-24): direct iteration over read().
             for p in evs.read() {
                 moved.0 += p.0;
             }
@@ -2463,23 +2463,23 @@
         sched.run(&mut world);
         sched.run(&mut world);
 
-        // movement подвинул каждую entity дважды.
+        // movement moved each entity twice.
         let mut sum = 0.0;
         Q::<Read<Pos>>::new(&world).for_each(|_, p| sum += p.y);
-        assert_eq!(sum, 20.0, "movement отработал 2 кадра по 10 entity");
+        assert_eq!(sum, 20.0, "movement ran 2 frames over 10 entities");
 
-        // Конвейер событий: emit (10 на кадр) → reader (per-stage flush).
-        // Минимум один кадр доставлен (зависит от порядка в стадии — но за
-        // 2 кадра хотя бы 10 дойдёт).
+        // Event pipeline: emit (10 per frame) → reader (per-stage flush).
+        // At least one frame is delivered (depends on the in-stage order — but over
+        // 2 frames at least 10 arrive).
         assert!(
             world.resource::<Moved>().0 >= 10,
-            "события прошли через plain-fn writer/reader: {}",
+            "events passed through the plain-fn writer/reader: {}",
             world.resource::<Moved>().0
         );
     }
 
-    /// `&mut Commands` в plain-fn: has_deferred → команды применяются
-    /// планировщиком (auto-apply sync-точка).
+    /// `&mut Commands` in a plain-fn: has_deferred → commands are applied
+    /// by the scheduler (an auto-apply sync point).
     #[test]
     fn plain_fn_commands_are_applied() {
         fn spawner(cmd: &mut Commands) {
@@ -2495,10 +2495,10 @@
         let n = apex_core::query::Query::<Read<Pos>>::new(&world)
             .iter()
             .count();
-        assert_eq!(n, 1, "spawn из &mut Commands применён к концу кадра");
+        assert_eq!(n, 1, "the spawn from &mut Commands is applied by the end of the frame");
     }
 
-    /// Имя системы выводится из имени функции (D2-1/U.4).
+    /// The system name is derived from the function name (D2-1/U.4).
     #[test]
     fn plain_fn_name_derived_from_fn() {
         fn my_special_system(_q: apex_core::query::Query<'_, '_, Read<Pos>>) {}
@@ -2506,8 +2506,8 @@
         assert_eq!(cfg.name, "my_special_system");
     }
 
-    /// Plain-fn системы с непересекающимся доступом попадают в одну стадию
-    /// (параллельный батч), с пересекающимся — конфликтуют.
+    /// Plain-fn systems with disjoint access land in one stage
+    /// (a parallel batch); with overlapping access — they conflict.
     #[test]
     fn plain_fn_access_inferred_for_conflicts() {
         fn writes_pos(mut q: apex_core::query::Query<'_, '_, Write<Pos>>) {
@@ -2525,20 +2525,20 @@
         sched.compile().unwrap();
 
         let stages = sched.stages().unwrap();
-        // writes_pos конфликтует с reads_pos (W+R по Pos) → разные батчи;
-        // writes_vel ни с кем не пересекается → делит батч с одним из них.
-        // Минимальная проверка: доступ ВЫВЕДЕН (есть >1 стадии исполнения).
+        // writes_pos conflicts with reads_pos (W+R over Pos) → different batches;
+        // writes_vel overlaps with no one → shares a batch with one of them.
+        // Minimal check: access is DERIVED (there is >1 execution stage).
         assert!(
             stages.len() >= 2,
-            "W+R конфликт по Pos должен разнести системы по батчам: {} стадий",
+            "a W+R conflict over Pos must split systems across batches: {} stages",
             stages.len()
         );
     }
 
     // ── D2-5: FixedUpdate ──────────────────────────────────────
 
-    /// FixedUpdate исполняется по аккумулятору FixedTime: 0..N шагов за кадр,
-    /// остаток переносится; Update при этом — ровно раз за кадр.
+    /// FixedUpdate runs off the FixedTime accumulator: 0..N steps per frame,
+    /// the remainder carries over; Update meanwhile runs exactly once per frame.
     #[test]
     fn fixed_update_steps_by_accumulator() {
         struct Counts {
@@ -2564,7 +2564,7 @@
         sched.add_systems(StageLabel::FixedUpdate, fixed_step);
         sched.add_systems(StageLabel::Update, frame_step);
 
-        // Кадр 1: 35мс → 3 шага, остаток 5мс.
+        // Frame 1: 35ms → 3 steps, remainder 5ms.
         world
             .resource_mut::<crate::FixedTime>()
             .accumulate(0.035);
@@ -2572,12 +2572,12 @@
         assert_eq!(world.resource::<Counts>().fixed, 3);
         assert_eq!(world.resource::<Counts>().update, 1);
 
-        // Кадр 2: +0мс → 0 шагов (остаток 5мс < dt).
+        // Frame 2: +0ms → 0 steps (remainder 5ms < dt).
         sched.run(&mut world);
         assert_eq!(world.resource::<Counts>().fixed, 3);
         assert_eq!(world.resource::<Counts>().update, 2);
 
-        // Кадр 3: +6мс → остаток 11мс → 1 шаг.
+        // Frame 3: +6ms → remainder 11ms → 1 step.
         world
             .resource_mut::<crate::FixedTime>()
             .accumulate(0.006);
@@ -2626,7 +2626,7 @@
         );
     }
 
-    /// Защита от спирали смерти: шаги капятся, излишек отбрасывается.
+    /// Death-spiral guard: steps are capped, the excess is dropped.
     #[test]
     fn fixed_update_death_spiral_cap() {
         struct N(u32);
@@ -2638,22 +2638,22 @@
         world.insert_resource(N(0));
         let mut ft = crate::FixedTime::from_dt(0.001);
         ft.max_steps_per_frame = 4;
-        ft.accumulate(10.0); // 10000 шагов «задолженности»
+        ft.accumulate(10.0); // 10000 steps of "debt"
         world.insert_resource(ft);
 
         let mut sched = Scheduler::new();
         sched.add_systems(StageLabel::FixedUpdate, step);
         sched.run(&mut world);
 
-        assert_eq!(world.resource::<N>().0, 4, "кап шагов");
+        assert_eq!(world.resource::<N>().0, 4, "step cap");
         assert_eq!(
             world.resource::<crate::FixedTime>().overstep(),
             0.0,
-            "излишек отброшен"
+            "excess dropped"
         );
     }
 
-    /// Без ресурса FixedTime стадия FixedUpdate — обычная (1 раз за кадр).
+    /// Without a FixedTime resource the FixedUpdate stage is normal (once per frame).
     #[test]
     fn fixed_update_without_resource_runs_once() {
         struct N(u32);
@@ -2671,8 +2671,8 @@
 
     // ── D2-6: States ───────────────────────────────────────────
 
-    /// Полный жизненный цикл состояний: in_state гейтит системы, on_enter/
-    /// on_exit истинны ровно один кадр, переход — через NextState.
+    /// Full state lifecycle: in_state gates systems, on_enter/
+    /// on_exit are true for exactly one frame, transition via NextState.
     #[test]
     fn states_in_state_on_enter_on_exit() {
         use crate::states::{in_state, init_state, on_enter, on_exit, NextState};
@@ -2705,7 +2705,7 @@
         let mut sched = Scheduler::new();
         init_state(&mut world, &mut sched, Game::Menu);
 
-        // П4: run_if прямо на bare-fn (FnSystemExt), как в Bevy.
+        // P4: run_if directly on a bare fn (FnSystemExt), as in Bevy.
         use crate::config::FnSystemExt;
         sched.add_systems(
             StageLabel::Update,
@@ -2716,19 +2716,19 @@
             ),
         );
 
-        sched.run(&mut world); // кадр 1: Menu
-        sched.run(&mut world); // кадр 2: Menu
+        sched.run(&mut world); // frame 1: Menu
+        sched.run(&mut world); // frame 2: Menu
         assert_eq!(world.resource::<Log>().menu_frames, 2);
         assert_eq!(world.resource::<Log>().entered_playing, 0);
 
         world.resource_mut::<NextState<Game>>().set(Game::Playing);
-        sched.run(&mut world); // кадр 3: переход в начале кадра
+        sched.run(&mut world); // frame 3: transition at the start of the frame
         let log = world.resource::<Log>();
-        assert_eq!(log.menu_frames, 2, "in_state(Menu) больше не пускает");
-        assert_eq!(log.entered_playing, 1, "on_enter — ровно один кадр");
-        assert_eq!(log.exited_menu, 1, "on_exit — ровно один кадр");
+        assert_eq!(log.menu_frames, 2, "in_state(Menu) no longer lets it through");
+        assert_eq!(log.entered_playing, 1, "on_enter — exactly one frame");
+        assert_eq!(log.exited_menu, 1, "on_exit — exactly one frame");
 
-        sched.run(&mut world); // кадр 4: Playing, переходов нет
+        sched.run(&mut world); // frame 4: Playing, no transitions
         let log = world.resource::<Log>();
         assert_eq!(log.entered_playing, 1);
         assert_eq!(log.exited_menu, 1);
@@ -2803,7 +2803,7 @@
         );
     }
 
-    // ── Э5: Single<Q> / Option<Single<Q>> — skip-семантика ────
+    // ── E5: Single<Q> / Option<Single<Q>> — skip semantics ────
 
     #[test]
     fn single_param_skips_unless_exactly_one_match() {
@@ -2837,26 +2837,26 @@
         let mut sched = Scheduler::new();
         sched.add_systems(StageLabel::Update, (with_single, with_optional));
 
-        // 0 матчей: Single пропускается, Option<Single> получает None.
+        // 0 matches: Single is skipped, Option<Single> gets None.
         sched.run(&mut world);
         assert_eq!(world.resource::<Runs>().single, 0);
         assert_eq!(world.resource::<Runs>().optional_none, 1);
 
-        // 1 матч: обе работают.
+        // 1 match: both run.
         let p1 = world.spawn((Player(1.0),));
         sched.run(&mut world);
         assert_eq!(world.resource::<Runs>().single, 1);
         assert_eq!(world.resource::<Runs>().optional_some, 1);
 
-        // 2 матча: обе пропускаются.
+        // 2 matches: both are skipped.
         world.spawn((Player(2.0),));
         sched.run(&mut world);
         let runs = *world.resource::<Runs>();
-        assert_eq!(runs.single, 1, "Single при >1 матче пропускает кадр");
-        assert_eq!(runs.optional_some, 1, "Option<Single> при >1 тоже пропускает");
+        assert_eq!(runs.single, 1, "Single skips the frame when there is >1 match");
+        assert_eq!(runs.optional_some, 1, "Option<Single> also skips when there is >1");
         assert_eq!(runs.optional_none, 1);
 
-        // Снова 1 матч — работа возобновляется (мутабельная форма + фильтр).
+        // 1 match again — it resumes (mutable form + filter).
         world.despawn(p1);
         fn bump(mut p: Single<&mut Player, With<Player>>) {
             p.0 += 1.0;
@@ -2866,11 +2866,11 @@
         assert_eq!(world.resource::<Runs>().single, 2);
     }
 
-    // ── W3-4: стресс ASD row-split ────────────────────────────
+    // ── W3-4: ASD row-split stress ────────────────────────────
 
-    /// Stateless-система на большом мире ЧАНКУЕТСЯ (ASD row-split):
-    /// каждая строка должна быть обработана РОВНО один раз — ни пропусков
-    /// (полнота чанков), ни дублей (дизъюнктность диапазонов).
+    /// A stateless system on a large world is CHUNKED (ASD row-split):
+    /// each row must be processed EXACTLY once — no skips
+    /// (chunk completeness) and no duplicates (range disjointness).
     #[test]
     fn asd_row_split_visits_each_row_exactly_once() {
         #[derive(Component, Clone, Copy)]
@@ -2882,7 +2882,7 @@
             }
         }
 
-        const N: usize = 100_000; // заведомо больше effective_chunk
+        const N: usize = 100_000; // deliberately larger than effective_chunk
         let mut world = World::new();
         world.spawn_many(N, |_| (Hits(0),));
 
@@ -2898,7 +2898,7 @@
                 bad += 1;
             }
         });
-        assert_eq!(bad, 0, "каждая строка обработана ровно по разу за кадр");
+        assert_eq!(bad, 0, "each row is processed exactly once per frame");
     }
 
     /// D3 regression: concurrent row-split ASD tasks for one stateless system
@@ -2961,10 +2961,10 @@
         assert_eq!(bad, 0, "each row bumped exactly once across concurrent split tasks");
     }
 
-    /// Система с СОСТОЯНИЕМ не делится row-split'ом (W3-4): один экземпляр,
-    /// один вызов run на кадр, состояние видит ВСЕ строки. До фикса несколько
-    /// split-задач звали run(&mut self) конкурентно: гонка на состоянии +
-    /// каждая задача видела только свой диапазон.
+    /// A STATEFUL system is not row-split (W3-4): one instance,
+    /// one run call per frame, the state sees ALL rows. Before the fix several
+    /// split tasks called run(&mut self) concurrently: a race on the state +
+    /// each task saw only its own range.
     #[test]
     fn asd_does_not_split_stateful_system() {
         #[derive(Component, Clone, Copy)]
@@ -2993,7 +2993,7 @@
         assert_eq!(
             world.resource::<SeenTotal>().0,
             N as u64,
-            "stateful-система получает полный SubWorld (без row-split)"
+            "a stateful system gets a full SubWorld (no row-split)"
         );
     }
 
