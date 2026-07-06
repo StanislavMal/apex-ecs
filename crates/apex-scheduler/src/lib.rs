@@ -2583,15 +2583,23 @@ impl Scheduler {
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
+            // Evaluate each system's run_condition EXACTLY ONCE this frame and reuse
+            // the result below — a stateful condition (`run_until`/`every_n_frames`,
+            // whose internal counter advances on every `check`) must not be evaluated
+            // twice per frame. Matches the documented contract: conditions run on the
+            // main thread BEFORE the stage.
+            let mut enabled: FxHashSet<SystemId> = FxHashSet::default();
+            for &sys_id in system_ids {
+                if let Some(&idx) = self.system_indices.get(&sys_id) {
+                    if self.systems[idx].run_condition.evaluate(w) {
+                        enabled.insert(sys_id);
+                    }
+                }
+            }
             // D6: skip the stage (and the change window) when every system is
             // disabled by run_if, so stage_last_run doesn't advance past changes
             // made during the pause.
-            let any_active = system_ids.iter().any(|&sys_id| {
-                self.system_indices
-                    .get(&sys_id)
-                    .is_some_and(|&idx| self.systems[idx].run_condition.evaluate(w))
-            });
-            if !any_active {
+            if enabled.is_empty() {
                 continue;
             }
             // D4: rebuild the SubWorld per stage so a Parallel system sees new
@@ -2603,11 +2611,10 @@ impl Scheduler {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, w);
                 for &sys_id in system_ids {
+                    if !enabled.contains(&sys_id) {
+                        continue;
+                    }
                     if let Some(&index) = self.system_indices.get(&sys_id) {
-                        let system = &self.systems[index];
-                        if !system.run_condition.evaluate(w) {
-                            continue;
-                        }
                         let system = &mut self.systems[index];
                         let prof_t = main_prof_enabled().then(std::time::Instant::now);
                         match &mut system.kind {
@@ -2688,21 +2695,23 @@ impl Scheduler {
         world: &World,
         cmds_base: usize,
         slot_of: &FxHashMap<SystemId, usize>,
+        enabled: &FxHashSet<SystemId>,
     ) {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
 
-        // 0. Evaluate run conditions on main thread BEFORE any ASD task setup.
+        // 0. Run conditions were already evaluated ONCE this frame by the caller
+        //    (`enabled` set) — do NOT re-evaluate here, or a stateful condition
+        //    (`run_until`/`every_n_frames`) would be double-counted. Systems absent
+        //    from `enabled` are skipped.
         //    Ш1: buffers pooled in Scheduler scratch fields (detached via mem::take
         //    so `&mut self` method calls below don't alias them; restored at the end
         //    to retain capacity — zero steady-state allocation).
         let mut skipped_systems = std::mem::take(&mut self.scratch_skipped);
         skipped_systems.clear();
         for &sys_id in stage_ids {
-            if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                if !self.systems[sys_idx].run_condition.evaluate(world) {
-                    skipped_systems.insert(sys_id);
-                }
+            if !enabled.contains(&sys_id) {
+                skipped_systems.insert(sys_id);
             }
         }
 
@@ -3089,18 +3098,27 @@ impl Scheduler {
             let stage_ids = &stage.system_ids;
             let all_parallel = stage.all_parallel;
             let emit_event_types = &stage.emit_event_types;
+            // Evaluate each system's run_condition EXACTLY ONCE this frame into
+            // `enabled`, then reuse it in every branch below (SEQ-fallback, per-stage
+            // sequential, and `run_stage_parallel`). A stateful condition
+            // (`run_until`/`every_n_frames`) must not be evaluated more than once per
+            // frame. Contract: conditions run on the main thread BEFORE the stage.
+            let mut enabled: FxHashSet<SystemId> = FxHashSet::default();
+            for &sys_id in stage_ids {
+                if let Some(&idx) = self.system_indices.get(&sys_id) {
+                    if self.systems[idx]
+                        .run_condition
+                        .evaluate(unsafe { &*const_ptr })
+                    {
+                        enabled.insert(sys_id);
+                    }
+                }
+            }
             // D6: skip the whole stage — including opening the change window — when
             // every system is disabled by its run_condition. Otherwise the window
             // would advance stage_last_run past changes made during a run_if pause,
             // and a system resuming later would miss Changed<T> from those frames.
-            let any_active = stage_ids.iter().any(|&sys_id| {
-                self.system_indices.get(&sys_id).is_some_and(|&idx| {
-                    self.systems[idx]
-                        .run_condition
-                        .evaluate(unsafe { &*const_ptr })
-                })
-            });
-            if !any_active {
+            if enabled.is_empty() {
                 continue;
             }
             // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
@@ -3156,10 +3174,9 @@ impl Scheduler {
                     let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                            let system = &self.systems[sys_idx];
-                        if !system.run_condition.evaluate(unsafe { &*const_ptr }) {
-                            continue;
-                        }
+                            if !enabled.contains(&sys_id) {
+                                continue;
+                            }
                             let system = &mut self.systems[sys_idx];
                             let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
@@ -3254,10 +3271,9 @@ impl Scheduler {
                     let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
-                            let system = &self.systems[sys_idx];
-                        if !system.run_condition.evaluate(unsafe { &*const_ptr }) {
-                            continue;
-                        }
+                            if !enabled.contains(&sys_id) {
+                                continue;
+                            }
                             let system = &mut self.systems[sys_idx];
                             let prof_t = main_prof_enabled().then(std::time::Instant::now);
                             match &mut system.kind {
@@ -3297,6 +3313,7 @@ impl Scheduler {
                     unsafe { &*const_ptr },
                     cmds_base as usize,
                     &slot_of,
+                    &enabled,
                 );
 
                 {
@@ -6803,5 +6820,37 @@ mod tests {
             N as u64,
             "stateful-система получает полный SubWorld (без row-split)"
         );
+    }
+
+    /// Regression: a STATEFUL run condition (`run_until`/`every_n_frames`, whose
+    /// internal counter advances on every `check`) must be evaluated EXACTLY ONCE
+    /// per frame. Before the fix the D6 stage-skip pre-check (`any_active`)
+    /// evaluated it a SECOND time, so `run_until(5)` ran only ~2 times over 10
+    /// frames. Both executors (`run_sequential` and `run`) must give exactly 5.
+    #[test]
+    fn run_condition_evaluated_once_per_frame() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+
+        fn drive(run: impl Fn(&mut Scheduler, &mut World)) -> u32 {
+            COUNT.store(0, Ordering::SeqCst);
+            let mut sched = Scheduler::new();
+            sched.add_systems(
+                StageLabel::Update,
+                seq("counter", |_: &mut World| {
+                    COUNT.fetch_add(1, Ordering::SeqCst);
+                })
+                .run_if_cond(conditions::run_until(5)),
+            );
+            let mut world = World::new();
+            sched.compile_with_world(&world).unwrap();
+            for _ in 0..10 {
+                run(&mut sched, &mut world);
+            }
+            COUNT.load(Ordering::SeqCst)
+        }
+
+        assert_eq!(drive(|s, w| s.run_sequential(w)), 5, "run_sequential: run_until(5) → 5");
+        assert_eq!(drive(|s, w| s.run(w)), 5, "run(): run_until(5) → 5");
     }
 }
