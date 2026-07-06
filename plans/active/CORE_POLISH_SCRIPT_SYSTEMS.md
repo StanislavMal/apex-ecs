@@ -399,19 +399,24 @@ F4b ✅ полной реализацией персистентных курс�
 
 ### Фаза A — `iterators.rs` → DynQuery/DynQueryMut; S7/S8 становятся несущими
 
-> **Статус (2026-07-06): S7 ✅ + S8 ✅ (core-фундаменты сделаны, коммиты `5e50661`/`8e1f410`).**
-> S7 — `DynItemMut::get_mut/get_mut_ptr` гейтят по декларированным `writes` (id не в writes → None +
-> `anomaly!`; `DynItemMut` получил `writes`+`world`). S8 — Changed/Added-термы у обоих динамических
-> билдеров (`changed/added[_id/_name]` + `since(last_run)`, per-row post-фильтр через
-> `col.get_tick`/`get_added_tick`). Гейты: core+workspace зелёные, clippy net-neutral, Miri TB чист.
-> **ОСТАЛОСЬ в фазе A:** (1) миграция `apex-scripting/src/iterators.rs` с собственного `_meta`/
-> `columns_raw`-пути на DynQuery(read)/DynQueryMut(write) — дизайн: в каждом Lua `next()` свежий
-> `&World` (через `world_ptr`), строить DynQuery в пределах вызова, доступ к колонкам через
-> `DynItem::get_ptr(id)` / `DynItemMut::get_mut_ptr(id)` (теперь S7-гейт); матч-энтити снимок вперёд;
-> собственный unsafe УДАЛЯЕТСЯ. (2) ErrorHandler-хвост: 4 `warn_once!` незарег. компонентов в
-> iterators.rs → `anomaly!` (World в scope через DynQuery-путь). (3) `query_cache` (context.rs:110) —
-> пересобрать на DynQuery-снапшот ИЛИ удалить (замерить, решить письменно). (4) descriptor-парсер:
-> `"Changed:X"`/`"Added:X"` → `changed_name`/`added_name`. Гейт: scripting E2E (8) зелёные без ослабления.
+> **Статус (2026-07-06): ФАЗА A ✅ ЗАКРЫТА.** S7 ✅ + S8 ✅ (core-фундаменты, коммиты `5e50661`/`8e1f410`) +
+> миграция ✅ (этот коммит). S7 — `DynItemMut::get_mut/get_mut_ptr` гейтят по декларированным `writes`. S8 —
+> Changed/Added-термы у обоих динамических билдеров. **Миграция (все 4 пункта сделаны):**
+> (1) `iterators.rs` пересажен с `_meta`/`columns_raw` на DynQuery(read)/DynQueryMut(write): `query()`
+> снимает матч-энтити вперёд (`collect_matching_entities`), per-`next()` чтение — `DynItem::get_ptr(id)`,
+> `commit` — `DynQueryMut::get_mut(entity)` (E10 через allocator) + `DynItemMut::get_mut_ptr(id)` (S7-гейт +
+> change-tick); `build_arch_states`/`ArchState`/`ComponentState` УДАЛЕНЫ; `&mut World` — через новый
+> `ScriptContext::world_ptr_mut` (raw escape-hatch, gather-фаза освобождает займы до `&mut World`).
+> (2) 4 `warn_once!` → `anomaly!` (World в scope). (3) `query_cache` УДАЛЁН — §0.2b-переоценка: снимок
+> per-entity строится в любом случае, кэш+клон `Vec<Entity>` не дешевле пересборки (архетипов единицы),
+> второй источник истины устранён (структурный аргумент решающий, микробенч не нужен). (4) парсер:
+> `Changed:X`/`Added:X` → `changed_id`/`added_id` (фильтры как `With:`; значение — через `Read:X`).
+> **Трейд-офф:** write-set commit'а из `_meta.writes` → S7-гейт тавтологичен в фазе A (реальный enforcement —
+> фаза B); память безопасна независимо (id-резолв + allocator-lookup). Гейты: 6 unit + 9 E2E (flagship
+> commit-persist, forgery-reject stale-entity, Changed-фильтр применяется) + workspace зелёные, clippy
+> `--all-targets` net-neutral (4 pre-existing serialization/bench), Miri неприменим (mlua FFI, покрыт E2E).
+> §10.8 + script-часть ErrorHandler-хвоста закрыты в TECH_DEBT. **ДАЛЬШЕ — фаза B (Lua-системы =
+> первоклассные системы планировщика; см. ниже).**
 
 - **Миграция доступа:** парсер дескрипторов (`parse_one_desc`, `iterators.rs:100-114`)
   остаётся; сборка архетипов/чтение/запись — через `DynQuery`/`DynQueryMut`

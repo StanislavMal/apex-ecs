@@ -75,6 +75,47 @@ fn script_query_write_commit_persists_to_world() {
     );
 }
 
+// ── Changed: reactive filter is actually applied ──────────────────
+
+#[test]
+fn script_changed_filter_restricts_the_query() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_scriptable::<Position>(&mut engine);
+
+    world.spawn((Position { x: 0.0, y: 0.0 },));
+    world.spawn((Position { x: 1.0, y: 1.0 },));
+    // Advance the change tick so the two spawns are OLD relative to the query's
+    // baseline (world.last_run_tick()): nothing has changed "since the last run".
+    world.advance_change_tick();
+    world.advance_change_tick();
+
+    // The script spawns a marker per MATCHED entity. With `Changed:Position` and
+    // no recent mutation, zero rows match, so no markers are spawned. If the
+    // filter were silently dropped, all 2 rows would match and the count would
+    // grow — this pins that `Changed:` reaches the core filter.
+    engine
+        .load_script_str(
+            "reactive",
+            r#"
+            function run()
+                for _ in query({"Read:Position", "Changed:Position"}) do
+                    spawn_entity({ position = Position.new(9.0, 9.0) })
+                end
+            end
+        "#,
+        )
+        .expect("script must compile");
+
+    engine.run(0.016, &mut world);
+
+    assert_eq!(
+        world.entity_count(),
+        2,
+        "Changed:Position matched nothing (no recent change) — the filter is applied, not ignored"
+    );
+}
+
 // ── spawn_entity from Lua ─────────────────────────────────────────
 
 #[test]

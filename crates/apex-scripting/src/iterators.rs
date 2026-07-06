@@ -2,23 +2,32 @@
 //!
 //! # Query-iterator design
 //!
-//! Each iterator element is a Lua table with the structure:
+//! `query()` snapshots the MATCHING entities up front (a `Vec<Entity>` from a
+//! core [`DynQuery`](apex_core::query::DynQuery)); the Lua iterator walks that
+//! snapshot. Each element is a Lua table with the structure:
 //! ```text
 //! {
 //!     entity = "42:0",                   -- id "index:generation" (E10), not a bare index
 //!     position = { x = 1.0, y = 2.0 },   -- Read/Write components (lowercase keys)
 //!     velocity = { x = 0.5, y = 0.0 },
-//!     _meta = { arch = 0, row = 3, writes = { position = 1, velocity = 2 } }
+//!     _meta = { entity = "42:0", writes = { position = 1 } }
 //! }
 //! ```
 //!
-//! `commit(entity)` reads `_meta` to find the archetype columns
-//! and writes the changed values back into the ECS.
+//! Component access — reads AND the `commit` write-back — goes through the
+//! core dynamic-query surface ([`DynItem::get_ptr`](apex_core::query::DynItem)
+//! / [`DynItemMut::get_mut_ptr`](apex_core::query::DynItemMut)), so scripting
+//! shares the one archetype-access path the ECS validates (no private unsafe
+//! column walk). `commit(entity)` reads `_meta.entity` to re-resolve the row
+//! against the LIVE world and writes the declared components back.
 //!
 //! # Descriptor format
 //!
 //! `query({"Read:Position", "Write:Velocity"})` — a table of strings.
-//! Parsed into `QueryDesc` by `parse_query_descs()`.
+//! Parsed into `QueryDesc` by `parse_query_descs()`. Besides `Read:`/`Write:`/
+//! `With:`/`Without:`, the reactive filters `Changed:X` / `Added:X` restrict the
+//! snapshot to rows whose `X` changed / was added since the previous run (the
+//! value is exposed only if `X` is also requested via `Read:`/`Write:`).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -27,6 +36,7 @@ use apex_core::{
     component::ComponentId,
     entity::Entity,
     world::World,
+    Severity,
 };
 
 use crate::context::ScriptContext;
@@ -79,6 +89,10 @@ pub enum QueryMode {
     Write,
     With,
     Without,
+    /// Reactive filter: the component changed since the previous run.
+    Changed,
+    /// Reactive filter: the component was added since the previous run.
+    Added,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -99,219 +113,197 @@ pub fn parse_query_descs(table: &mlua::Table) -> mlua::Result<Vec<QueryDesc>> {
 
 fn parse_one_desc(s: &str) -> QueryDesc {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix("Write:").or_else(|| s.strip_prefix("write:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Write };
-    }
-    if let Some(rest) = s.strip_prefix("Read:").or_else(|| s.strip_prefix("read:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Read };
-    }
-    if let Some(rest) = s.strip_prefix("With:").or_else(|| s.strip_prefix("with:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::With };
-    }
-    if let Some(rest) = s.strip_prefix("Without:").or_else(|| s.strip_prefix("without:")) {
-        return QueryDesc { type_name: rest.trim().to_string(), mode: QueryMode::Without };
+    // Prefixes are case-insensitive on the first letter (`Write:`/`write:`).
+    let table: &[(&str, &str, QueryMode)] = &[
+        ("Write:",   "write:",   QueryMode::Write),
+        ("Read:",    "read:",    QueryMode::Read),
+        ("With:",    "with:",    QueryMode::With),
+        ("Without:", "without:", QueryMode::Without),
+        ("Changed:", "changed:", QueryMode::Changed),
+        ("Added:",   "added:",   QueryMode::Added),
+    ];
+    for (upper, lower, mode) in table {
+        if let Some(rest) = s.strip_prefix(*upper).or_else(|| s.strip_prefix(*lower)) {
+            return QueryDesc { type_name: rest.trim().to_string(), mode: *mode };
+        }
     }
     QueryDesc { type_name: s.to_string(), mode: QueryMode::Read }
 }
 
-// ── ArchState ──────────────────────────────────────────────────
+// ── Snapshot of matching entities ──────────────────────────────
 
-#[derive(Clone)]
-pub(crate) struct ArchState {
-    pub arch_idx: usize,
-    pub len: usize,
-    pub components: Vec<ComponentState>,
-}
+/// Read function pointer for a scriptable component (`ptr → Lua value`).
+type ReadFn = unsafe fn(*const u8, &mlua::Lua) -> mlua::Result<mlua::Value>;
+/// Write function pointer for a scriptable component (`Lua value → ptr`).
+type WriteFn = unsafe fn(*mut u8, &mlua::Value) -> bool;
 
-#[derive(Clone)]
-pub(crate) struct ComponentState {
-    pub col_idx:   usize,
-    pub type_name: String,
-    pub mode:      QueryMode,
-    #[allow(dead_code)]
-    pub comp_id:   ComponentId,
+/// Resolve the descriptors against the LIVE world and return the matching
+/// entities as an up-front snapshot.
+///
+/// The snapshot is taken through a core read [`DynQuery`], so scripting shares
+/// the archetype-matching + reactive-filter (`Changed`/`Added`, S8) logic the
+/// ECS validates instead of scanning archetypes itself. Structural changes are
+/// deferred until the script finishes, so the snapshot stays valid for the whole
+/// iteration.
+///
+/// §0.2a: an unregistered data / `With` / `Changed` / `Added` component empties
+/// the query (nothing can match a never-registered component); an unregistered
+/// `Without` silently disables that filter (over-match). Both are surfaced
+/// through the world's `ErrorHandler` (`anomaly!`) — the query never fails
+/// silently.
+pub(crate) fn collect_matching_entities(
+    world: &World,
+    ctx: &ScriptContext,
+    descs: &[QueryDesc],
+) -> Vec<Entity> {
+    let mut qb = world.query_builder();
+    for desc in descs {
+        let id = match ctx.binding(&desc.type_name) {
+            Some(b) => b.id,
+            None => {
+                // A missing binding empties every mode except `Without` (which
+                // only over-matches when its filter is dropped).
+                match desc.mode {
+                    QueryMode::Without => {
+                        apex_core::anomaly!(
+                            world, Severity::Warn, "script query", None, None,
+                            "Without filter component '{}' is not registered — filter ignored, query may over-match",
+                            desc.type_name
+                        );
+                        continue;
+                    }
+                    _ => {
+                        apex_core::anomaly!(
+                            world, Severity::Warn, "script query", None, None,
+                            "component '{}' is not registered — query yields no results",
+                            desc.type_name
+                        );
+                        return Vec::new();
+                    }
+                }
+            }
+        };
+        qb = match desc.mode {
+            // Read AND Write both need read access here (the snapshot only reads;
+            // the actual mutation happens in `commit` via `DynQueryMut`).
+            QueryMode::Read | QueryMode::Write => qb.read_id(id),
+            QueryMode::With     => qb.with_id(id),
+            QueryMode::Without  => qb.exclude_id(id),
+            QueryMode::Changed  => qb.changed_id(id),
+            QueryMode::Added    => qb.added_id(id),
+        };
+    }
+
+    // Build never errors here: we resolve names ourselves (no `read_name`, so no
+    // UnknownComponent) and never request writes on the read builder (so no
+    // WriteNotSupported). Treat any surprise as an empty result.
+    match qb.build() {
+        Ok(q) => q.iter().map(|item| item.entity()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 // ── QueryIteratorState ─────────────────────────────────────────
 
 struct IterState {
-    arch_states: Vec<ArchState>,
-    arch_cursor: usize,
-    row_cursor:  usize,
-    /// (arch_idx, row, entity_table) — for auto-commit on the next iteration
-    pending:     Option<(usize, usize, mlua::Table)>,
-}
-
-// ── Building arch states ───────────────────────────────────────
-
-pub(crate) fn build_arch_states(
-    world: &World,
-    ctx: &ScriptContext,
-    descs: &[QueryDesc],
-) -> Vec<ArchState> {
-    // Split into data components (Read/Write) and filters (With/Without)
-    let data_descs: Vec<&QueryDesc> = descs.iter()
-        .filter(|d| matches!(d.mode, QueryMode::Read | QueryMode::Write))
-        .collect();
-    let with_descs: Vec<&QueryDesc> = descs.iter()
-        .filter(|d| matches!(d.mode, QueryMode::With))
-        .collect();
-    let without_descs: Vec<&QueryDesc> = descs.iter()
-        .filter(|d| matches!(d.mode, QueryMode::Without))
-        .collect();
-
-    // Resolve data component names → ComponentId
-    let resolved_data: Vec<(ComponentId, &QueryDesc)> = data_descs.iter()
-        .filter_map(|d| ctx.binding(&d.type_name).map(|b| (b.id, *d)))
-        .collect();
-    if resolved_data.len() != data_descs.len() {
-        // §0.2a (E8): an unregistered data component makes the whole query
-        // silently yield nothing — the script sees an empty result and no
-        // reason why. Name the first missing type (throttled).
-        if let Some(d) = data_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
-            apex_core::warn_once!(
-                "script query: data component '{}' is not registered — query yields no results",
-                d.type_name,
-            );
-        }
-        return Vec::new();
-    }
-
-    // Resolve With/Without into ComponentId
-    let with_ids: Vec<ComponentId> = with_descs.iter()
-        .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
-        .collect();
-    if with_ids.len() != with_descs.len() {
-        // §0.2a (E8): an unregistered With filter also empties the query.
-        if let Some(d) = with_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
-            apex_core::warn_once!(
-                "script query: With filter component '{}' is not registered — query yields no results",
-                d.type_name,
-            );
-        }
-        return Vec::new();
-    }
-    let without_ids: Vec<ComponentId> = without_descs.iter()
-        .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
-        .collect();
-    // §0.2a (E8): an unregistered Without component silently disables that
-    // filter (the query then over-matches). Surface it (throttled).
-    if without_ids.len() != without_descs.len() {
-        if let Some(d) = without_descs.iter().find(|d| ctx.binding(&d.type_name).is_none()) {
-            apex_core::warn_once!(
-                "script query: Without filter component '{}' is not registered — filter ignored, query may over-match",
-                d.type_name,
-            );
-        }
-    }
-
-    world.archetypes()
-        .iter()
-        .enumerate()
-        .filter_map(|(arch_idx, arch)| {
-            if arch.is_empty() { return None; }
-
-            // Data components: all must be present
-            let components: Vec<ComponentState> = resolved_data.iter()
-                .filter_map(|(cid, desc)| {
-                    let col_idx = arch.column_index(*cid)?;
-                    Some(ComponentState {
-                        col_idx,
-                        type_name: desc.type_name.clone(),
-                        mode:      desc.mode,
-                        comp_id:   *cid,
-                    })
-                })
-                .collect();
-            if components.len() != resolved_data.len() {
-                return None;
-            }
-
-            // With filters: all must be present
-            for cid in &with_ids {
-                arch.column_index(*cid)?;
-            }
-
-            // Without filters: none must be present
-            for cid in &without_ids {
-                if arch.column_index(*cid).is_some() {
-                    return None;
-                }
-            }
-
-            Some(ArchState {
-                arch_idx,
-                len: arch.len(),
-                components,
-            })
-        })
-        .collect()
+    /// Matching entities, snapshotted at `query()` time (in iteration order).
+    entities: Vec<Entity>,
+    /// The parsed descriptors — needed to rebuild per-entity read access and the
+    /// `_meta.writes` set on each `next()`.
+    descs: Vec<QueryDesc>,
+    cursor: usize,
+    /// The previously yielded table — auto-committed on the next `next()`.
+    pending: Option<mlua::Table>,
 }
 
 // ── Building the entity table ──────────────────────────────────
 
+/// Build the Lua table for one entity, reading its Read/Write components through
+/// a core read [`DynQuery`]. Returns `None` if the entity no longer matches
+/// (it was snapshotted, so this only happens defensively).
 pub(crate) fn build_entity_table(
     lua: &mlua::Lua,
     world: &World,
     ctx: &ScriptContext,
-    arch_idx: usize,
-    row: usize,
-    components: &[ComponentState],
-) -> mlua::Result<mlua::Table> {
-    let arch = &world.archetypes()[arch_idx];
-    let entity: Entity = arch.entities()[row];
+    entity: Entity,
+    descs: &[QueryDesc],
+) -> mlua::Result<Option<mlua::Table>> {
+    // Resolve the data components (Read/Write modes) and build a read query over
+    // them. `With`/`Without`/`Changed`/`Added` are pure filters — already applied
+    // at snapshot time — so they are not part of the per-entity access.
+    let mut qb = world.query_builder();
+    let mut data: Vec<(&QueryDesc, ComponentId, ReadFn)> = Vec::new();
+    for desc in descs {
+        if !matches!(desc.mode, QueryMode::Read | QueryMode::Write) {
+            continue;
+        }
+        match ctx.binding(&desc.type_name) {
+            Some(b) => {
+                qb = qb.read_id(b.id);
+                data.push((desc, b.id, b.read));
+            }
+            None => {
+                // §0.2a (E8): the binding was present when the snapshot was built
+                // but is gone now — the component silently vanishes from the table
+                // the script sees. Should not happen; surface it (throttled).
+                apex_core::anomaly!(
+                    world, Severity::Warn, "script query", Some(entity), None,
+                    "binding for '{}' disappeared mid-iteration — component omitted from entity table",
+                    desc.type_name
+                );
+            }
+        }
+    }
+
+    let query = match qb.build() {
+        Ok(q) => q,
+        Err(_) => return Ok(None),
+    };
+    let item = match query.get(entity) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
 
     let entity_id = encode_entity_id(entity);
-
     let t = lua.create_table()?;
     // Full "index:generation" id (E10), not a bare index — see encode_entity_id.
     t.set("entity", entity_id.as_str())?;
 
     let meta = lua.create_table()?;
-    meta.set("arch", arch_idx as i32)?;
-    meta.set("row", row as i32)?;
-    // Mirror the id into `_meta` so commit can validate that the row still holds
-    // THIS entity (full generation), rejecting stale/forged tables (E1 + E10).
+    // Mirror the id into `_meta` so commit re-resolves THIS entity (full
+    // generation) against the live world, rejecting stale/forged tables (E1+E10).
     meta.set("entity", entity_id.as_str())?;
-
     let writes = lua.create_table()?;
-    for comp in components {
-        if matches!(comp.mode, QueryMode::Write) {
-            writes.set(comp.type_name.as_str(), comp.col_idx as i32)?;
+    for (desc, _id, _read) in &data {
+        if matches!(desc.mode, QueryMode::Write) {
+            // Marker set: the value is irrelevant, commit re-resolves the column
+            // by the binding's ComponentId (a forged col index cannot mislead it).
+            writes.set(desc.type_name.as_str(), 1)?;
         }
     }
     meta.set("writes", writes)?;
     t.set("_meta", meta)?;
 
-    for comp in components {
-        let binding = match ctx.binding(&comp.type_name) {
-            Some(b) => b,
-            // §0.2a (E8): the binding was present when the archetype state was
-            // built but is gone now — the component silently vanishes from the
-            // table the script sees. Should not happen; surface it (throttled).
-            None => {
-                apex_core::warn_once!(
-                    "script query: binding for '{}' disappeared mid-iteration — component omitted from entity table",
-                    comp.type_name,
-                );
-                continue;
-            }
+    for (desc, id, read) in &data {
+        let ptr = match item.get_ptr(*id) {
+            Some(p) => p,
+            None => continue, // archetype lacks it — should not happen post-match.
         };
+        // SAFETY: `ptr` points at this entity's component (id resolved against the
+        // matched archetype); `read` is the binding paired with `id`, so it
+        // interprets the bytes as the right type. The `&World` borrow keeps the
+        // storage alive and structurally frozen for the read.
+        let val = unsafe { (read)(ptr, lua)? };
 
-        let val = unsafe {
-            let col = &arch.columns_raw()[comp.col_idx];
-            let ptr = col.get_raw_ptr(row);
-            (binding.read)(ptr, lua)?
-        };
+        let key = desc.type_name.to_lowercase();
+        t.set(key.as_str(), val)?;
 
-        let key = comp.type_name.to_lowercase();
-        t.set(key.clone(), val)?;
-
-        // For Read components: set __newindex to warn about modification
-        if matches!(comp.mode, QueryMode::Read) {
+        // For Read components: warn if the script tries to modify the sub-table
+        // (a Read term grants no write-back).
+        if matches!(desc.mode, QueryMode::Read) {
             if let Ok(sub_table) = t.get::<mlua::Table>(key.as_str()) {
                 let mt = lua.create_table()?;
-                let type_name = comp.type_name.clone();
+                let type_name = desc.type_name.clone();
                 mt.set("__newindex", lua.create_function(move |_, (_t, field, _val): (mlua::Table, String, mlua::Value)| {
                     log::warn!(
                         "[script] attempt to modify Read component '{}' (field '{}') — use Write:{}",
@@ -324,14 +316,12 @@ pub(crate) fn build_entity_table(
         }
     }
 
-    Ok(t)
+    Ok(Some(t))
 }
 
 // ── commit(entity_table) ───────────────────────────────────────
 
 pub(crate) fn commit_entity_table(
-    _lua: &mlua::Lua,
-    world: &World,
     ctx: &ScriptContext,
     entity_table: &mlua::Table,
 ) -> mlua::Result<()> {
@@ -343,57 +333,23 @@ pub(crate) fn commit_entity_table(
         }
     };
 
-    let arch_idx: i32 = meta.get("arch")?;
-    let row: i32 = meta.get("row")?;
-    let meta_entity_raw: mlua::Value = meta.get("entity")?;
-    let writes: mlua::Table = meta.get("writes")?;
-
     // Decode the FULL entity id (index + generation) stored in `_meta` (E10).
-    // A missing/garbage id can't be trusted → reject cleanly.
-    let meta_entity = match parse_entity_id(&meta_entity_raw) {
+    let meta_entity_raw: mlua::Value = meta.get("entity")?;
+    let entity = match parse_entity_id(&meta_entity_raw) {
         Some(e) => e,
         None => {
             log::warn!("commit: _meta.entity is not a valid entity id, skipped");
             return Ok(());
         }
     };
+    let writes: mlua::Table = meta.get("writes")?;
 
-    // Never trust `_meta` coming from Lua: a script can forge arch/row/col or
-    // stash the table until the next frame, where the row has already been
-    // swap-removed. Validate everything against the LIVE world before any
-    // unsafe access (E1).
-    if arch_idx < 0 || row < 0 {
-        log::warn!("commit: negative _meta arch/row, skipped");
-        return Ok(());
-    }
-    let arch_idx = arch_idx as usize;
-    let row = row as usize;
-    let arch = match world.archetypes().get(arch_idx) {
-        Some(a) => a,
-        None => {
-            log::warn!("commit: _meta.arch {arch_idx} out of range, skipped");
-            return Ok(());
-        }
-    };
-    if row >= arch.len() {
-        log::warn!("commit: _meta.row {row} out of range for archetype {arch_idx}, skipped");
-        return Ok(());
-    }
-    // The row must still hold the entity the table was built for — otherwise a
-    // deferred structural change relocated it and we would write into a
-    // DIFFERENT entity (data corruption). Compare the FULL entity (index +
-    // generation): a reused slot with a new generation is caught as a mismatch
-    // and rejected (E1 + E10).
-    if arch.entities()[row] != meta_entity {
-        log::warn!(
-            "commit: entity at archetype {arch_idx} row {row} no longer matches table entity, skipped"
-        );
-        return Ok(());
-    }
-
-    for pair in writes.clone().pairs::<String, i32>() {
-        let (type_name, _lua_col): (String, i32) = pair?;
-
+    // Gather the write plan — (ComponentId, write fn, value) — while we still
+    // hold only the shared bindings + the Lua table. Collecting owned values here
+    // means the ctx/Lua reads finish BEFORE we materialize `&mut World`.
+    let mut plan: Vec<(ComponentId, WriteFn, mlua::Value)> = Vec::new();
+    for pair in writes.pairs::<String, mlua::Value>() {
+        let (type_name, _marker) = pair?;
         let binding = match ctx.binding(&type_name) {
             Some(b) => b,
             None => {
@@ -401,18 +357,6 @@ pub(crate) fn commit_entity_table(
                 continue;
             }
         };
-
-        // RE-resolve the column from the archetype by the binding's ComponentId —
-        // we don't trust the Lua col_idx value (forgery = OOB or type confusion
-        // in the write).
-        let col_idx = match arch.column_index(binding.id) {
-            Some(i) => i,
-            None => {
-                log::warn!("commit: component '{type_name}' not present in archetype, skipped");
-                continue;
-            }
-        };
-
         let key = type_name.to_lowercase();
         let val: mlua::Value = match entity_table.get::<mlua::Value>(key.as_str()) {
             Ok(v) => v,
@@ -421,16 +365,52 @@ pub(crate) fn commit_entity_table(
                 continue;
             }
         };
+        plan.push((binding.id, binding.write, val));
+    }
+    if plan.is_empty() {
+        return Ok(());
+    }
 
-        // SAFETY: arch_idx/row/col_idx were checked above against the live world,
-        // row is within the archetype bounds, and `binding.write` matches
-        // `binding.id` = the column type (col_idx was resolved by it) — type
-        // confusion is ruled out.
-        unsafe {
-            let col = &arch.columns_raw()[col_idx];
-            let ptr = col.get_raw_ptr(row) as *mut u8;
-            (binding.write)(ptr, &val);
-            arch.set_change_tick(row, binding.id, world.current_tick());
+    // SAFETY: the commit runs between Lua iterations, so no other borrow of the
+    // world is live, and the gather phase above already released its ctx/Lua
+    // reads (see `ScriptContext::world_ptr_mut`).
+    let world = unsafe { &mut *ctx.world_ptr_mut() };
+
+    // Build a dynamic WRITE query declaring exactly the components we intend to
+    // write. `get_mut(entity)` re-resolves the entity against the LIVE allocator:
+    // a stale generation or a slot reused by a new tenant yields `None` (E10), so
+    // a forged `_meta` can never steer a write into the wrong entity (E1). Column
+    // access goes through `DynItemMut::get_mut_ptr`, which enforces the write
+    // declaration (S7) and stamps the change tick.
+    //
+    // Trust boundary: the write-set comes from `_meta.writes` (script-authored),
+    // so the S7 gate is tautological in this phase-A path — its scheduler-visible
+    // enforcement arrives with phase-B script systems that declare access up
+    // front. Memory safety does not depend on it: id-resolution plus the
+    // allocator lookup rule out OOB and type confusion whatever `_meta` claims.
+    let mut qb = world.query_builder_mut();
+    for (id, _, _) in &plan {
+        qb = qb.write_id(*id);
+    }
+    let mut query = match qb.build() {
+        Ok(q) => q,
+        // The only reachable build error is a duplicate write id (forged
+        // `_meta.writes`) — reject the whole commit cleanly.
+        Err(_) => return Ok(()),
+    };
+    let mut item = match query.get_mut(entity) {
+        Some(i) => i,
+        // Entity dead / reused (E10) or no longer in a matching archetype — skip
+        // cleanly rather than write into a wrong row.
+        None => return Ok(()),
+    };
+    for (id, write_fn, val) in &plan {
+        // SAFETY: `get_mut_ptr` returns a pointer valid for this row (bounds +
+        // the query's exclusive world access); `write_fn` is paired with `id`, so
+        // it stores the right type. Scriptable components are non-ZST structs, so
+        // the ZST dangling-sentinel case does not arise.
+        if let Some(ptr) = item.get_mut_ptr(*id) {
+            unsafe { (write_fn)(ptr, val); }
         }
     }
 
@@ -441,64 +421,49 @@ pub(crate) fn commit_entity_table(
 
 pub(crate) fn create_query_iter_fn(
     lua: &mlua::Lua,
-    arch_states: Vec<ArchState>,
+    entities: Vec<Entity>,
+    descs: Vec<QueryDesc>,
 ) -> mlua::Result<mlua::Function> {
     let state = Rc::new(RefCell::new(IterState {
-        arch_states,
-        arch_cursor: 0,
-        row_cursor:  0,
-        pending:     None,
+        entities,
+        descs,
+        cursor:  0,
+        pending: None,
     }));
 
     lua.create_function(move |lua, ()| {
         let mut st = state.borrow_mut();
 
-        // Auto-commit the previous entity (if enabled)
-        if let Some((_arch_idx, _row, ref table)) = st.pending.take() {
+        // Auto-commit the previous entity (if enabled).
+        if let Some(table) = st.pending.take() {
             let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
                 .ok_or_else(|| mlua::Error::runtime("no ScriptContext in Lua app data"))?;
             let ctx_ref = ctx.borrow();
             if ctx_ref.auto_commit {
-                let world = ctx_ref.world_ref();
-                commit_entity_table(lua, world, &ctx_ref, table)?;
+                commit_entity_table(&ctx_ref, &table)?;
             }
         }
 
         loop {
-            let arch_state = match st.arch_states.get(st.arch_cursor) {
-                Some(s) => s.clone(),
-                None => return Ok(mlua::Value::Nil),
+            let entity = match st.entities.get(st.cursor).copied() {
+                Some(e) => e,
+                None    => return Ok(mlua::Value::Nil),
             };
-
-            if st.row_cursor >= arch_state.len {
-                st.arch_cursor += 1;
-                st.row_cursor  = 0;
-                continue;
-            }
-
-            let arch_idx   = arch_state.arch_idx;
-            let row        = st.row_cursor;
-            let components = arch_state.components;
-            st.row_cursor += 1;
+            st.cursor += 1;
 
             let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
                 .ok_or_else(|| mlua::Error::runtime("no ScriptContext in Lua app data"))?;
             let ctx_ref = ctx.borrow();
             let world = ctx_ref.world_ref();
 
-            let table = build_entity_table(
-                lua,
-                world,
-                &ctx_ref,
-                arch_idx,
-                row,
-                &components,
-            )?;
-
-            // Store for auto-commit on the next call
-            st.pending = Some((arch_idx, row, table.clone()));
-
-            return Ok(mlua::Value::Table(table));
+            match build_entity_table(lua, world, &ctx_ref, entity, &st.descs)? {
+                Some(table) => {
+                    // Store for auto-commit on the next call.
+                    st.pending = Some(table.clone());
+                    return Ok(mlua::Value::Table(table));
+                }
+                None => continue, // entity no longer matches — skip it.
+            }
         }
     })
 }
@@ -507,52 +472,106 @@ pub(crate) fn create_query_iter_fn(
 mod tests {
     use super::*;
     use apex_core::component::Component;
+    use crate::context::ComponentBinding;
 
-    struct Marker;
-    impl Component for Marker {}
+    #[derive(Clone, Copy)]
+    struct TestComp {
+        v: i32,
+    }
+    impl Component for TestComp {}
 
-    /// Build a forged `_meta` table. `entity` is the `"index:generation"` string
-    /// exactly as the real query path stores it (E10).
-    fn forged_meta(lua: &mlua::Lua, arch: i32, row: i32, entity: &str) -> mlua::Table {
+    fn test_comp_binding(id: ComponentId) -> ComponentBinding {
+        ComponentBinding {
+            name: "TestComp",
+            id,
+            read: |ptr: *const u8, _lua: &mlua::Lua| {
+                let c = unsafe { &*(ptr as *const TestComp) };
+                Ok(mlua::Value::Integer(c.v as i64))
+            },
+            write: |ptr: *mut u8, val: &mlua::Value| {
+                if let mlua::Value::Integer(i) = val {
+                    unsafe { (*(ptr as *mut TestComp)).v = *i as i32; }
+                    true
+                } else {
+                    false
+                }
+            },
+        }
+    }
+
+    /// Build a query-shaped table `{ testcomp = value, _meta = { entity, writes } }`.
+    fn write_table(lua: &mlua::Lua, entity: &str, value: i64) -> mlua::Table {
         let t = lua.create_table().unwrap();
+        t.set("testcomp", value).unwrap();
         let meta = lua.create_table().unwrap();
-        meta.set("arch", arch).unwrap();
-        meta.set("row", row).unwrap();
         meta.set("entity", entity).unwrap();
-        meta.set("writes", lua.create_table().unwrap()).unwrap();
+        let writes = lua.create_table().unwrap();
+        writes.set("TestComp", 1).unwrap();
+        meta.set("writes", writes).unwrap();
         t.set("_meta", meta).unwrap();
         t
     }
 
-    /// E1: a forged `_meta` (out-of-range archetype/row, or a row that no longer
-    /// holds the table's entity) must be rejected cleanly — never dereferenced
-    /// into an OOB / wrong-entity write.
+    /// The skip paths that need no world: a table with no `_meta`, a garbage
+    /// entity id, and an empty write-set all return cleanly (no panic).
     #[test]
-    fn commit_rejects_forged_meta() {
+    fn commit_skips_non_query_tables_cleanly() {
         let lua = mlua::Lua::new();
         let ctx = ScriptContext::new();
+
+        // No _meta at all.
+        let t = lua.create_table().unwrap();
+        commit_entity_table(&ctx, &t).expect("skips cleanly");
+
+        // _meta present but garbage entity id.
+        let t = lua.create_table().unwrap();
+        let meta = lua.create_table().unwrap();
+        meta.set("entity", "not-an-id").unwrap();
+        meta.set("writes", lua.create_table().unwrap()).unwrap();
+        t.set("_meta", meta).unwrap();
+        commit_entity_table(&ctx, &t).expect("skips cleanly");
+
+        // Valid id, empty writes → no-op (never touches the world, so no
+        // world_ptr is required).
+        let t = lua.create_table().unwrap();
+        let meta = lua.create_table().unwrap();
+        meta.set("entity", "0:0").unwrap();
+        meta.set("writes", lua.create_table().unwrap()).unwrap();
+        t.set("_meta", meta).unwrap();
+        commit_entity_table(&ctx, &t).expect("skips cleanly");
+    }
+
+    /// E1 + E10: a commit whose `_meta.entity` is stale (reused generation) must
+    /// NOT write; a commit for the LIVE entity must. The write goes through
+    /// `DynQueryMut::get_mut`, which resolves the entity against the allocator —
+    /// so forgery is rejected without any private OOB dereference.
+    #[test]
+    fn commit_rejects_stale_entity_and_writes_live_one() {
+        let lua = mlua::Lua::new();
         let mut world = World::new();
-        let e = world.spawn((Marker,)); // archetype 0, one row
-        let real_id = encode_entity_id(e);
+        let e = world.spawn((TestComp { v: 10 },));
+        let id = world.registry().get_id::<TestComp>().expect("registered on spawn");
 
-        // Out-of-range archetype.
-        let t = forged_meta(&lua, 9999, 0, &real_id);
-        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+        let mut ctx = ScriptContext::new();
+        ctx.add_binding(test_comp_binding(id));
+        // SAFETY: the ptr is used only for the commits below, all before
+        // `clear_world_ptr`; `world` is not otherwise borrowed meanwhile.
+        unsafe { ctx.set_world_ptr(&mut world); }
 
-        // Valid archetype, out-of-range row.
-        let t = forged_meta(&lua, 0, 9999, &real_id);
-        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+        // Stale generation → must be ignored.
+        let stale = format!("{}:{}", e.index(), e.generation().wrapping_add(1));
+        commit_entity_table(&ctx, &write_table(&lua, &stale, 999)).unwrap();
 
-        // Valid archetype/row, but the table claims a different entity than the
-        // one currently occupying that row.
-        let t = forged_meta(&lua, 0, 0, "424242:0");
-        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+        // Live entity → must apply.
+        let real = encode_entity_id(e);
+        commit_entity_table(&ctx, &write_table(&lua, &real, 42)).unwrap();
 
-        // E10: valid archetype/row and the CORRECT index, but a STALE generation
-        // (as if the slot were reused). Full-entity comparison must reject it.
-        let stale_gen = format!("{}:{}", e.index(), e.generation().wrapping_add(1));
-        let t = forged_meta(&lua, 0, 0, &stale_gen);
-        commit_entity_table(&lua, &world, &ctx, &t).expect("skips cleanly");
+        ctx.clear_world_ptr();
+        assert_eq!(
+            world.get::<TestComp>(e).map(|c| c.v),
+            Some(42),
+            "live-entity write applied; stale-generation write ignored"
+        );
     }
 
     /// E10: entity ids round-trip through the `"index:generation"` string form,
@@ -571,5 +590,26 @@ mod tests {
         // Garbage / bare index is rejected, not silently accepted.
         assert_eq!(parse_entity_id_str("5"), None);
         assert_eq!(parse_entity_id_str("abc:def"), None);
+    }
+
+    /// The descriptor parser maps every access keyword — including the reactive
+    /// `Changed:`/`Added:` filters — to the right `QueryMode`; a bare name
+    /// defaults to `Read`.
+    #[test]
+    fn parse_desc_covers_every_mode() {
+        let cases = [
+            ("Read:Position",    QueryMode::Read),
+            ("Write:Velocity",   QueryMode::Write),
+            ("With:Player",      QueryMode::With),
+            ("Without:Frozen",   QueryMode::Without),
+            ("Changed:Position", QueryMode::Changed),
+            ("added:Health",     QueryMode::Added), // lowercase prefix accepted
+            ("Position",         QueryMode::Read),  // bare name = Read
+        ];
+        for (input, mode) in cases {
+            let d = parse_one_desc(input);
+            assert_eq!(d.mode, mode, "mode of {input:?}");
+            assert!(!d.type_name.contains(':'), "prefix stripped from {input:?}");
+        }
     }
 }

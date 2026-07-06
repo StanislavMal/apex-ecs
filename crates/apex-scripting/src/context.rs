@@ -104,11 +104,6 @@ pub struct ScriptContext {
     /// Entity count — cached to avoid calling world through the ptr every time
     entity_count_cache: usize,
 
-    /// Cache of archetype assembly results — avoids rescanning
-    /// on repeated query() calls with the same descriptors.
-    /// Invalidated on every new script run (in set_world_ptr).
-    pub(crate) query_cache: HashMap<Vec<String>, Vec<crate::iterators::ArchState>>,
-
     /// Automatically call commit(entity) when moving to the next entity in the query iterator
     pub auto_commit: bool,
 }
@@ -126,7 +121,6 @@ impl ScriptContext {
             deferred_resource_writes: Vec::new(),
             deferred_events:         Vec::new(),
             entity_count_cache:      0,
-            query_cache:             HashMap::new(),
             auto_commit:             false,
         }
     }
@@ -140,7 +134,6 @@ impl ScriptContext {
         self.deferred.clear();
         self.deferred_resource_writes.clear();
         self.deferred_events.clear();
-        self.query_cache.clear();
     }
 
     /// Reset the world pointer after the script finishes.
@@ -162,6 +155,25 @@ impl ScriptContext {
         self.world_ptr
             .expect("ScriptContext::world_mut called outside run()")
             .as_mut()
+    }
+
+    /// Raw `*mut World` obtained from a SHARED `&self`.
+    ///
+    /// The dynamic write path (`commit_entity_table` → `DynQueryMut`) needs
+    /// exclusive world access, but the commit runs while the caller only holds a
+    /// shared `&ScriptContext` (the `RefCell` borrow that reaches the bindings).
+    /// The pointer targets the `World`, a distinct allocation from this
+    /// `ScriptContext`, so a `&mut World` derived from it does not alias the
+    /// `&self` borrow. Obtaining the pointer is safe; **dereferencing it** is
+    /// sound only when no other borrow of the pointed-to `World` is live — the
+    /// commit points satisfy this (a Lua `commit`/auto-commit runs BETWEEN query
+    /// iterations, after the previous `next()` returned its `&World`, and the
+    /// gather phase touches only bindings + the Lua table, never the world). See
+    /// the module invariant (ptr valid exactly within `run()`).
+    pub(crate) fn world_ptr_mut(&self) -> *mut World {
+        self.world_ptr
+            .expect("ScriptContext::world_ptr_mut called outside run()")
+            .as_ptr()
     }
 
     // ── API for Lua functions ─────────────────────────────────

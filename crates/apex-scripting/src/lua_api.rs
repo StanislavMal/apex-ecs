@@ -64,29 +64,16 @@ fn register_query(lua: &mlua::Lua) -> mlua::Result<()> {
         let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
 
-        let cache_key: Vec<String> = parsed.iter()
-            .map(|d| format!("{:?}:{}", d.mode, d.type_name))
-            .collect();
-
-        let arch_states = {
+        // Snapshot the matching entities up front through a core `DynQuery`
+        // (no private archetype scan / cache — the world is structurally frozen
+        // for the run, so one snapshot is authoritative).
+        let entities = {
             let ctx_ref = ctx.borrow();
-            if let Some(cached) = ctx_ref.query_cache.get(&cache_key) {
-                cached.clone()
-            } else {
-                let world = ctx_ref.world_ref();
-                
-                iterators::build_arch_states(world, &ctx_ref, &parsed)
-            }
+            let world = ctx_ref.world_ref();
+            iterators::collect_matching_entities(world, &ctx_ref, &parsed)
         };
 
-        if !arch_states.is_empty() {
-            let need_insert = !ctx.borrow().query_cache.contains_key(&cache_key);
-            if need_insert {
-                ctx.borrow_mut().query_cache.insert(cache_key, arch_states.clone());
-            }
-        }
-
-        iterators::create_query_iter_fn(lua, arch_states)
+        iterators::create_query_iter_fn(lua, entities, parsed)
     })?)
 }
 
@@ -97,8 +84,7 @@ fn register_commit(lua: &mlua::Lua) -> mlua::Result<()> {
         let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
         let ctx_ref = ctx.borrow();
-        let world = ctx_ref.world_ref();
-        iterators::commit_entity_table(lua, world, &ctx_ref, &entity_table)
+        iterators::commit_entity_table(&ctx_ref, &entity_table)
     })?)
 }
 

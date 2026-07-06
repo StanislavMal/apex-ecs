@@ -194,10 +194,24 @@
   unbounded, ремаппинга нет — эти два пункта бездомны намеренно: это отдельный дифференциатор (§0.9),
   не хвост полиша; берётся отдельной кампанией, не CORE_POLISH. Прямое требование §0.9 (козырь-прототип
   хуже отсутствия козыря).
-- **§10.8 🟡 → CORE_POLISH волна 3 (фаза A) — Lua-путь не пересажен на общий DynQuery.** Решение (волна 6 п.4): скриптинг «обязан
-  встать на общий, валидируемый ядром механизм». Факт: `apex-scripting/src` — ноль `DynQuery`;
-  `iterators.rs` — прежний собственный unsafe-путь через `_meta` (`:~301, 426`; E1-валидация есть,
-  но доступ свой). DynQuery (волна 6) сделан и назвал скриптинг консумером, но миграция не выполнена.
+- **§10.8 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 3 фаза A) — Lua-путь пересажен на общий DynQuery.**
+  Решение (волна 6 п.4): скриптинг «обязан встать на общий, валидируемый ядром механизм». **Сделано:**
+  `apex-scripting` собственный unsafe-путь через `_meta`/`columns_raw` УДАЛЁН (`build_arch_states`/`ArchState`/
+  `ComponentState` вырезаны). `query()` снимает матч-энтити вперёд через read-`DynQuery`
+  (`collect_matching_entities`); чтение per-`next()` — `DynItem::get_ptr(id)`; запись в `commit` —
+  `DynQueryMut::get_mut(entity)` (E10 через allocator-lookup) + `DynItemMut::get_mut_ptr(id)` (S7-гейт +
+  change-tick стампится ядром). `binding.read/write` fn-указатели сохранены — сменился лишь ИСТОЧНИК ptr.
+  `&mut World` в commit — через `ScriptContext::world_ptr_mut` (raw-ptr escape-hatch модуля; gather-фаза
+  освобождает ctx/Lua-займы до материализации `&mut World`; commit идёт между Lua-итерациями). `query_cache`
+  УДАЛЁН (§0.2b-переоценка: новый путь всё равно строит per-entity снимок; кэшировать+клонировать
+  `Vec<Entity>` не дешевле пересборки — архетипов единицы; второй источник истины устранён). Descriptor-парсер
+  расширен: `Changed:X`/`Added:X` → `changed_id`/`added_id` (S8-фильтры, симметрично `With:`; значение — через
+  отдельный `Read:X`). Гейты: apex-scripting 6 unit + 9 E2E (incl. flagship commit-persist + forgery-reject
+  stale-entity + Changed-фильтр применяется) + весь workspace зелёный, clippy `--all-targets` net-neutral;
+  Miri неприменим (mlua FFI) — покрыт E2E. **Трейд-офф (документирован в коде):** write-set в commit берётся из
+  `_meta.writes` (script-authored) → S7-гейт тавтологичен в фазе A; scheduler-visible enforcement — фаза B
+  (скрипт-системы декларируют доступ). Память безопасна независимо (id-резолв + allocator-lookup ⇒ ни OOB, ни
+  type-confusion). Коммиты S7/S8 — [ниже]; миграция — этот коммит.
 
 ## 🟢 Бездомные — чистота/эргономика/док-честность
 
@@ -210,6 +224,10 @@
   type-mismatch (`query.rs` ×3). Апгрейд потребует прокидывать `&ErrorHandler` в эти пути ИЛИ ввести
   процесс-глобальный фолбэк (частичная мимикрия Bevy-глобала — против нашей per-world модели §0.9).
   Осознанный фокусный охват, не полумера: golden-path мутаций покрыт; хвост — по спросу.
+  **Обновление (2026-07-06, CORE_POLISH волна 3 фаза A):** script-query незарег.-компоненты
+  (`apex-scripting/iterators.rs` ×4 `warn_once!`) переведены на `anomaly!` — миграция на DynQuery дала World
+  в scope (`collect_matching_entities`/`build_entity_table`). Остаются на `warn_once!`: `TemplateParams::set`,
+  `WorldBridge`/`CloneableBridge` (apex-isolated), `DynItem`/`DynItemMut` type-mismatch (`query.rs` ×3).
 
 - **ParallelPolicy ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.2) — реализован `Fixed`-откат.**
   Был: тип-политика обещана планом PARALLELISM §3.1, не реализована (пороги — захардкоженные `const`),
