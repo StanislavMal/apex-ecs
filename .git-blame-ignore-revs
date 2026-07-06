@@ -1,0 +1,11 @@
+# Revisions to skip in `git blame` — purely mechanical, no behavioral change.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# (GitHub/GitLab honor this file automatically.)
+
+# Wave 7 — EN-migration: Russian -> English in comments/rustdoc/string
+# literals across all *.rs (enforces "zero Cyrillic in *.rs"). Comments and
+# string literals only; no code/identifier/behavior changes.
+9d376a5b94e6e76995e5e037c08390f9cedbd462
+83cfa59f4e20350d3957f2907ed1f4d631a5eb30
+e44828e74986847909e9eaefacc8e1a57573a3ae
