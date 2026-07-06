@@ -399,6 +399,20 @@ F4b ✅ полной реализацией персистентных курс�
 
 ### Фаза A — `iterators.rs` → DynQuery/DynQueryMut; S7/S8 становятся несущими
 
+> **Статус (2026-07-06): S7 ✅ + S8 ✅ (core-фундаменты сделаны, коммиты `5e50661`/`8e1f410`).**
+> S7 — `DynItemMut::get_mut/get_mut_ptr` гейтят по декларированным `writes` (id не в writes → None +
+> `anomaly!`; `DynItemMut` получил `writes`+`world`). S8 — Changed/Added-термы у обоих динамических
+> билдеров (`changed/added[_id/_name]` + `since(last_run)`, per-row post-фильтр через
+> `col.get_tick`/`get_added_tick`). Гейты: core+workspace зелёные, clippy net-neutral, Miri TB чист.
+> **ОСТАЛОСЬ в фазе A:** (1) миграция `apex-scripting/src/iterators.rs` с собственного `_meta`/
+> `columns_raw`-пути на DynQuery(read)/DynQueryMut(write) — дизайн: в каждом Lua `next()` свежий
+> `&World` (через `world_ptr`), строить DynQuery в пределах вызова, доступ к колонкам через
+> `DynItem::get_ptr(id)` / `DynItemMut::get_mut_ptr(id)` (теперь S7-гейт); матч-энтити снимок вперёд;
+> собственный unsafe УДАЛЯЕТСЯ. (2) ErrorHandler-хвост: 4 `warn_once!` незарег. компонентов в
+> iterators.rs → `anomaly!` (World в scope через DynQuery-путь). (3) `query_cache` (context.rs:110) —
+> пересобрать на DynQuery-снапшот ИЛИ удалить (замерить, решить письменно). (4) descriptor-парсер:
+> `"Changed:X"`/`"Added:X"` → `changed_name`/`added_name`. Гейт: scripting E2E (8) зелёные без ослабления.
+
 - **Миграция доступа:** парсер дескрипторов (`parse_one_desc`, `iterators.rs:100-114`)
   остаётся; сборка архетипов/чтение/запись — через `DynQuery`/`DynQueryMut`
   (`apex-core/src/query.rs:2718/2922`) вместо собственного `_meta`-пути. Собственный
