@@ -425,7 +425,8 @@ system! {
         // …
     }
 }
-app.add_systems(Update, WaveSpawner::new(cfg)); // state без Default
+// cfg без дефолта ⇒ Default не генерируется, поля pub — конструируем литералом:
+app.add_systems(Update, WaveSpawner { cfg, timer: 0.0 });
 ```
 
 Это строго мощнее `Local<T>`: именованные поля вместо кортежа локалов, конструктор
@@ -1078,7 +1079,8 @@ println!("{} pending events", peek.len());
 
 ```rust
 // Обрабатываем по 32 события за тик, не теряя остальные:
-while let guard = queue.read_partial(&reader_a, 32) {
+loop {
+    let guard = queue.read_partial(&reader_a, 32);
     if guard.is_empty() { break; }
     for ev in guard.iter() { process(ev); }
     // При дропе курсор продвинется ровно на guard.len()
@@ -3662,6 +3664,8 @@ wall-time диспетча стадии и сравнивает с порого�
 `set_parallel_min_entities`/`set_parallel_auto_disable` **сняты** — все ручки теперь поля `ChunkConfig`:
 
 ```rust
+use apex_core::world::ChunkConfig;   // не в prelude — импортируется явно
+
 world.set_chunk_config(ChunkConfig {
     stage_parallel_min_entities: 10_000, // жёсткий пол PAR; usize::MAX = полностью sequential
     auto_disable_stage_parallel: true,   // cold-start entity-эвристика (по умолчанию)
