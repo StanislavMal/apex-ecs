@@ -39,8 +39,9 @@
   берут транзиентные `&mut *ptr`-записи, поэтому записи (дети raw-tag) его не дизаблят. `run_sequential`
   переписан с долгоживущего `&mut *world_ptr` на raw-ptr + транзиентные reborrow'ы (долгоживущий `&mut`
   делал каждое SubWorld-чтение foreign-доступом). **Гейты:** Miri SB+TB чисты (unified_system 5/0,
-  co_stage 0-UB, d8b параллельный 5/0); scheduler+core 12 ok, workspace 42 ok, clippy net-neutral.
-  Scheduler-CD-путь теперь в Miri-политике. **§0.2a — громкий баг найден и закрыт.**
+  co_stage 0-UB, d8b параллельный 5/0); scheduler+core 12 ok, workspace 42 ok, clippy net-neutral;
+  **движок собран + goldens 649/0/9 БАЙТ-ИДЕНТИЧНЫ** (фикс семантически прозрачен). Scheduler-CD-путь
+  теперь в Miri-политике. **§0.2a — громкий баг найден и закрыт.**
 
 - **S1 ✅ ЗАКРЫТ ЦЕЛИКОМ — ЧАСТЬ 1 (2026-07-05, commit e79ad1e) + ЧАСТЬ 2 (2026-07-05) — read/write-аксессоры.**
   **Часть 1 ✅ (документированный PoC закрыт):** `Query::get`/`single` возвращали ОДИН дублируемый item;
