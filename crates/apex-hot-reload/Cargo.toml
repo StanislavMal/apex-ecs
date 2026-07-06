@@ -8,11 +8,11 @@ apex-core          = { path = "../apex-core" }
 apex-serialization = { path = "../apex-serialization" }
 
 # File watcher — cross-platform.
-# notify 6.x автоматически выбирает OS-бэкенд через cfg:
+# notify 6.x picks the OS backend automatically via cfg:
 #   Windows → ReadDirectoryChangesWatcher
 #   Linux   → INotifyWatcher
 #   macOS   → KqueueWatcher / FSEventsWatcher
-# Никаких дополнительных feature флагов не нужно.
+# No extra feature flags are needed.
 notify = "6.1"
 
 serde      = { version = "1.0", features = ["derive"] }

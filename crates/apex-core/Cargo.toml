@@ -18,16 +18,16 @@ thiserror.workspace   = true
 log.workspace         = true
 rayon.workspace = true
 
-# Авторегистрация компонентов
+# Component auto-registration
 linkme.workspace = true
 apex-macros = { path = "../apex-macros" }
 
-# Сериализация — нужна для Serializable трейта и make_serde_fns
+# Serialization — needed for the Serializable trait and make_serde_fns
 serde      = { workspace = true }
 serde_json = { workspace = true }
 bincode    = { workspace = true }
 
-# Математика для трансформаций
+# Math for transforms
 glam = { workspace = true }
 cgmath = { workspace = true, optional = true }
 
