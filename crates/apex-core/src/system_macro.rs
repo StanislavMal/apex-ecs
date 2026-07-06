@@ -377,7 +377,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let $pname = $ctx.event_reader::<$ev>(); ],
+        @before: [ $( $before )* let $pname = $ctx.event_reader_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -436,7 +436,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_reader::<$ev>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader_unchecked::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -565,7 +565,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let $pname = $ctx.event_reader::<$ev>(); ],
+        @before: [ $( $before )* let $pname = $ctx.event_reader_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -621,7 +621,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_reader::<$ev>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader_unchecked::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};

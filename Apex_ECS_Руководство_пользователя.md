@@ -937,7 +937,8 @@ let old_cfg = world.remove_resource::<PhysicsConfig>();
 
 **Два способа создать EventReader:**
 - `EventReader::new(world.events_mut::<T>())` — низкоуровневый
-- `world.event_reader::<T>()` — convenience-метод на `World` (рекомендуется, зеркало `ctx.event_reader()`)
+- `world.event_reader::<T>()` — convenience-метод на `&mut World` (эксклюзивный путь; из
+  системы благословенный путь — параметр `EventReader<E>`, см. §6.7)
 
 > **Важно:** [`iter()`](crates/apex-core/src/events.rs:294) **не продвигает** курсор — события
 > будут повторно видны при следующем вызове. Для однократного чтения используйте
@@ -2321,9 +2322,10 @@ fn run(&mut self, ctx: SystemContext<'_>) {
     let mut s = ctx.resource_mut_unchecked::<FrameStats>();  // ResMut<T>
     s.frame += 1;
 
-    // События (чтение — обычный API; запись — escape):
-    let reader     = ctx.event_reader::<DamageEvent>();          // EventReader<T>
-    let mut writer = ctx.event_writer_unchecked::<DeathEvent>(); // EventWriter<T>
+    // События (чтение И запись из ctx — declared-access escape; благословенный
+    // путь из системы — параметры EventReader<E> / EventWriter<E>):
+    let reader     = ctx.event_reader_unchecked::<DamageEvent>();  // EventReader<T>
+    let mut writer = ctx.event_writer_unchecked::<DeathEvent>();   // EventWriter<T>
     writer.send(DeathEvent { entity });
 
     ctx.entity_count(); // -> usize
@@ -4306,8 +4308,8 @@ fn main() {
 | `event_reserve_by_type(type_id, cap)` | То же по `TypeId` (для планировщика) |
 | `events::<T>()` | Получить `Events<T>` (иммутабельно) |
 | `events_mut::<T>()` | Получить `Events<T>` (мутабельно) |
-| `event_reader::<T>()` | Создать `EventReader<T>` (рекомендуется, зеркало `ctx.event_reader()`) |
-| `event_writer::<T>()` | Создать `EventWriter<T>` |
+| `event_reader::<T>()` | Создать `EventReader<T>` (`&mut World`, эксклюзивный путь) |
+| `event_writer::<T>()` | Создать `EventWriter<T>` (`&mut World`) |
 | `tick()` | Инкрементировать счётчик тика (flush событий — Scheduler) |
 | `query::<Q>()` | Кешированный read-only запрос (`Q: ReadOnlyWorldQuery`) над архетип-кэшем мира |
 | `query_mut::<Q>()` | Кешированный запрос с write-формами (`&mut self`) |
@@ -4475,10 +4477,9 @@ generation entity не участвует — НЕ использовать дл
 | `query_changed::<Q>(tick)` | То же с change detection (Changed<T> как фильтр) |
 | `resource::<T>()` | Чтение ресурса (panic если нет) → `Res<T>` |
 | `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |
-| `event_reader::<T>()` | Чтение событий → `EventReader<T>` |
 | `entity_count()` | Количество entity |
 | `commands()` | Thread-local `&mut Commands` |
-| `query_unchecked::<Q>()` / `resource_mut_unchecked::<T>()` / `event_writer_unchecked::<T>()` | *advanced* (`#[doc(hidden)]`): write-доступ через declared-access escape (§6.7) |
+| `query_unchecked::<Q>()` / `resource_mut_unchecked::<T>()` / `event_reader_unchecked::<T>()` / `event_writer_unchecked::<T>()` | *advanced* (`#[doc(hidden)]`): доступ через declared-access escape (§6.7); благословенный путь чтения событий — параметр `EventReader<E>` |
 | `fetch_unchecked::<P>()` | *advanced*: извлечь `SystemParam`-кортеж `P` (§6.8) |
 | `query_relation::<R, Q>(kind, target)` | Query по relation R к target + компоненты Q |
 | `query_wildcard::<R, Q>(kind)` | Query по relation R (любой target) + компоненты Q |

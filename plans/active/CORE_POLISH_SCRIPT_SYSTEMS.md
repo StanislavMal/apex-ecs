@@ -327,7 +327,14 @@ Bevy-модель идиоматически верна (не мимикрия).
 **Тесты:** compile-fail (trybuild) на `&World`-мутацию событий из safe; существующие 23+
 event-теста зелёные.
 
-### 2.2 S4 — недекларированный `ctx.event_reader` мимо conflict-детекции
+### 2.2 S4 — недекларированный `ctx.event_reader` мимо conflict-детекции ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `SystemContext::event_reader` → `event_reader_unchecked` + `#[doc(hidden)]`
+> (симметрия с уже-`_unchecked` writer/resource). Благословенный путь чтения из системы = параметр
+> `EventReader<E>`/`Listen<E>`. Переведены на `_unchecked`: `Listen`/`EventReader` `fetch`, 4 сайта
+> `system!`-макро, 4 сайта apex-input AutoSystem (движок; декларируют `Listen<…>` — ADR-002-остаток).
+> Руководство §5.2.1/§6.7 + таблицы обновлены. Гейты: workspace + scripting E2E зелёные, clippy
+> net-neutral, Miri TB чист, движок check ✅. Детали — TECH_DEBT S4.
 
 **Проблема:** `ctx.event_reader` (`world.rs:2531`) благословлён как «read», но
 `EventReader::new` → `add_reader` пишет в реестр курсоров (push/realloc,

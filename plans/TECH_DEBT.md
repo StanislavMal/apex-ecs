@@ -97,11 +97,22 @@
   (E0596 на `&World`-мутацию reader И writer). Гейты: 260 core + весь workspace (102 scheduler, все
   integration) зелёные; clippy net-neutral (4 warn — pre-existing в serialization/bench); Miri TB чист
   (event 22, persistent/Extract, events_lag_threads 3 — multi-thread, ноль UB/гонок).
-- **S4 🟡 → CORE_POLISH волна 2.2 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне
-  conflict-детекции.** `ctx.event_reader` (`world.rs:2531`) благословлён как «read», но
-  `EventReader::new`→`add_reader` пишет в реестр курсоров (push/realloc, `events.rs:163-178`). Для
-  ДЕКЛАРИРОВАННЫХ читателей гонку закрывает F2 (`SharedEventReaders`), но недекларированный ctx-путь
-  планировщик не видит. Связан с F4.
+- **S4 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 2.2) — недекларированный `ctx.event_reader` мутировал
+  реестр курсоров вне conflict-детекции.** Было: `SystemContext::event_reader` благословлён как «read»,
+  но `EventReader::new`→`add_reader` пишет в реестр курсоров (push/realloc) — недекларированный ctx-путь
+  планировщик не видел (асимметрия: `event_writer`/`resource_mut` уже были `_unchecked` по F3.2, только
+  reader отставал). **Сделано (симметрично S2/F3.2, ADR-002):** `SystemContext::event_reader` →
+  `event_reader_unchecked` + `#[doc(hidden)]`; благословенный путь чтения событий из системы — ТОЛЬКО
+  параметр `EventReader<E>` (персистентный курсор F4, декларация видна планировщику) или `Listen<E>`.
+  Внутренние декларированные потребители переведены на `_unchecked`: `Listen<E>::fetch`,
+  `EventReader<E>::fetch` (stateless fallback), `system!`-макро (4 сайта event-reader — теперь
+  симметричны уже-`_unchecked` event-writer/resource-mut снипетам). Движок: apex-input AutoSystem'ы
+  (4 сайта) → `event_reader_unchecked` (декларируют `type Events = Listen<…>` → validated; тот же
+  принятый ADR-002-остаток, что оставил apex-input на AutoSystem+`_unchecked` для writer/resource —
+  reader был последним не-`_unchecked` держателем). Руководство §5.2.1/§6.7 + таблицы World/ctx
+  обновлены. Гейты: apex-core + весь workspace (scheduler 7 ok, scripting 8 E2E) зелёные; clippy
+  net-neutral; Miri TB чист (event/persistent); движок `check --all-targets` ✅. Связан с F4b (волна 2.3
+  — макро-путь всё ещё транзиентный курсор).
 
 ---
 

@@ -506,7 +506,9 @@ impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
         <Self as EventAccessList>::event_accesses()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
-        ctx.event_reader::<E>()
+        // Declared access (`Listen<E>`) validated by the scheduler; `_unchecked` is
+        // the honest signal (S4 / ADR-002).
+        ctx.event_reader_unchecked::<E>()
     }
 }
 
@@ -720,7 +722,8 @@ impl<'a, E: Send + Sync + 'static> SystemParam for EventReader<'a, E> {
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
         // Stateless fallback (no persistent cursor): a fresh one-shot reader.
-        ctx.event_reader::<E>()
+        // Declared `EventReader<E>` access validated by the scheduler (S4 / ADR-002).
+        ctx.event_reader_unchecked::<E>()
     }
     fn get_param<'w>(
         ctx: &'w crate::world::SystemContext<'w>,

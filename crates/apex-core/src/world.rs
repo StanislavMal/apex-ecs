@@ -2627,13 +2627,25 @@ impl<'w> SystemContext<'w> {
         }
     }
 
+    /// Event-reader access WITHOUT a declared-access check (S4 / ADR-002). Building
+    /// a reader calls `add_reader`, which mutates the event's cursor registry
+    /// (push/realloc); a reader obtained from `ctx` that the system did NOT declare
+    /// (`Listen<E>`) races with concurrent readers/writers of the same event that the
+    /// scheduler ran in parallel — it cannot see the undeclared access. Declare it as
+    /// an `EventReader<E>` PARAMETER — the scheduler validates it, serializes
+    /// conflicts, and (via `SystemParam::State`) keeps the cursor PERSISTENT across
+    /// frames (F4, no duplicate reads). The ONLY intended callers are `SystemParam`
+    /// (`EventReader`/`Listen`) and the `system!` macro, where access is validated.
+    /// `#[doc(hidden)]`: an internal escape mirroring `event_writer_unchecked`, not
+    /// blessed API.
+    #[doc(hidden)]
     #[inline]
-    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+    pub fn event_reader_unchecked<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
             let ptr = self
                 .world()
                 .event_queue_ptr::<T>()
-                .expect("event_reader: event type not registered");
+                .expect("event_reader_unchecked: event type not registered");
             EventReader::new(&mut *ptr)
         }
     }
