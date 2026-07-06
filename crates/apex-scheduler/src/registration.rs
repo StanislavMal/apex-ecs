@@ -289,7 +289,14 @@ impl Scheduler {
         if std::mem::size_of::<S>() > 0 {
             access.stateful = true;
         }
-        let adapter = AutoSystemAdapter { inner: system };
+        // F4b: an event-reading system must be single-task — a persistent cursor
+        // shared across ASD row-split chunks would re-read events per chunk. Forcing
+        // `stateful` keeps it whole (no row-split), so its adapter-owned cursor store
+        // is touched by exactly one task.
+        if !access.reads_event.is_empty() {
+            access.stateful = true;
+        }
+        let adapter = AutoSystemAdapter { inner: system, cursors: apex_core::EventCursors::default() };
         let index = self.systems.len();
         self.systems.push(SystemDescriptor {
             id,

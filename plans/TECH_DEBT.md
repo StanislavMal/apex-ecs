@@ -130,30 +130,28 @@
   события). Цена no-loss — сериализация читателей одного события (`SharedEventReaders`) — оставлена
   осознанно. Гейты: workspace + clippy net-neutral + движок check + Miri TB (F4-тест + 23 event) +
   goldens byte-identical. Регресс-тест `persistent_event_reader_no_duplicate_reads`.
-- **F4b ✅ ЗАКРЫТ ПЕРЕОЦЕНКОЙ (2026-07-06, CORE_POLISH волна 2.3, §0.2b) — `system!`/AutoSystem-путь
-  чтения событий НЕ персистентен; полная macro-персистентность признана несоразмерной/неисполнимой
-  чисто → золотой путь = plain-fn, макро-путь документирован честно.** Было (гипотеза плана): объявить
-  `EventReader<E>`-параметр в `system!`-теле → курсор персистентен через `SystemParam::State`
-  автоматически. **Верификация показала гипотезу неверной:** `system!` генерит `AutoSystem` (отдельный
-  трейт, декларирует доступ через associated-типы `type Query/Resources/Events`), а НЕ
-  `SystemParamFunction` — путь AutoSystem структурно НЕ прокидывает `SystemParam::State` (персистентность
-  plain-fn живёт в `config.rs::fn_sys`, `get_param(&ctx, &mut state)`). Свежий курсор (`add_reader` →
-  read → `remove_reader` на Drop) создаётся каждый ран. **Полное закрытие заблокировано (два независимых
-  блокера):** (1) хранить курсор в сгенерённой структуре — ломает stateless-`fn` (unit-struct без полей)
-  лишь добавлением полей+Default, но НЕПРЕОДОЛИМО для stateful-`struct` БЕЗ Default (вариант B', `struct {
-  pub field }` — юзер конструирует руками, скрытые поля ломают `MySystem { field }`) + коллизия с
-  `let s = &mut *self`-реборроу в теле with-state; (2) добавить event-state в трейт `AutoSystem` —
-  риплл сигнатуры `run` во ВСЕ импл-ы (рукописные apex-input, тесты, макро). **Решение (§0.2b —
-  переоценка, не полумера):** золотой путь персистентного чтения = plain-fn `EventReader<E>` (F4 ✅);
-  макро-путь оставлен свежим-per-run (КОРРЕКТЕН для per-frame Update: no-loss registry чистит батч после
-  прочтения, т.к. transient-курсор снимается на Drop → нет лаггеров → следующий кадр видит только новое)
-  и ДОКУМЕНТИРОВАН честно (§0.2a): rustdoc `system!` («Event readers use a fresh per-run cursor (F4b)») +
-  указатель на plain-fn для FixedUpdate-catchup. **Тест:** `apex-scheduler/tests/macro_event_reader.rs`
-  (`system!`-читатель через планировщик, 2 кадра, каждый батч ровно раз — supported-контракт зафиксирован).
-  Дубль-контраст (свежий курсор перечитывает) уже покрыт `persistent_event_reader_no_duplicate_reads`
-  (system_param). Гейты: apex-scheduler + workspace зелёные, clippy net-neutral, движок check ✅. Нулевых
-  реальных потребителей макро event-reader-сахара в обоих репо (кроме бенча events_load) —
-  переоценка низкорисковая. **Смежно: S3/S4 закрыты (волна 2.1/2.2).**
+- **F4b ✅ ЗАКРЫТ ПОЛНОСТЬЮ (2026-07-06, CORE_POLISH волна 2.3) — `system!`/AutoSystem event-reader
+  теперь ПЕРСИСТЕНТЕН (per-system курсор), паритет с plain-fn (F4).** Было: `system!` генерит
+  `AutoSystem` (отдельный трейт, не `SystemParamFunction`), который НЕ прокидывал `SystemParam::State`
+  → свежий курсор каждый ран → FixedUpdate-catchup читал дубли. Промежуточная переоценка (тот же день)
+  сочла полное закрытие несоразмерным, но пользователь потребовал золотой путь → сделано ПРАВИЛЬНОЕ
+  архитектурное решение. **Ключевой инсайт:** курсор не обязан жить в пользовательской структуре (оба
+  прежних блокера были про неё) — он живёт в **раннере системы** (адаптер AutoSystem), который и так
+  переживает кадры, ровно как plain-fn держит `SystemParam::State` в замыкании. **Сделано (паттерн
+  существующего `deferred_cmds`):** новый `EventCursors` (per-system store, TypeId-keyed) во владении
+  адаптера; `SystemContext.event_cursors: Option<*mut EventCursors>` (зеркало `deferred_cmds`, тот же
+  single-task soundness-инвариант) + `with_event_cursors` (unsafe builder) + благословенный
+  `event_reader_persistent_auto` (берёт слот из store, персистентно; фолбэк на transient без store);
+  оба адаптера (`AutoSystemAdapter` lib.rs + `Adapter` config.rs) владеют `EventCursors` и ставят ptr
+  через `addr_of_mut!` перед `inner.run`; макро-снипеты event-reader → `event_reader_persistent_auto`
+  (0 ripple по ~35 impl AutoSystem — курсор НЕ в структуре). **Инвариант single-task:** event-читающая
+  система форсится `stateful` (`!reads_event.is_empty()` в обоих registration-путях) → нет ASD row-split
+  → ровно один таск формирует `&mut *ptr` (иначе shared-курсор через чанки = дубли per-chunk — это
+  ЧИНИТ и латентный баг query+event row-split). **Тесты:** `macro_event_reader.rs` — per-frame (батч
+  ровно раз) + **catchup (3 рана в кадре без flush → батч ровно раз, НЕ per-run)** = доказательство
+  персистентности. Гейты: workspace зелёный, clippy net-neutral, **Miri TB чист на raw-ptr пути**
+  (macro_event_reader + unified_system parallel), движок build + **goldens 649/0/9 байт-идентичны**
+  (форс-stateful для event-читателей рендер не сдвинул). **Смежно: S3/S4 закрыты (волна 2.1/2.2).**
 - **D6-полное ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 1.2) — per-system `last_run` (Bevy-паритет
   change-окон).** Было: окно change-detection per-execution-stage (`stage_last_run`); корректно только
   для solo-gated систем. Дыра: run_if-gated система, ДЕЛЯЩАЯ стадию с ungated-системой (та держит

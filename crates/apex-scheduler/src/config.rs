@@ -140,14 +140,31 @@ impl SystemConfig {
         if std::mem::size_of::<S>() > 0 {
             access.stateful = true;
         }
-        struct Adapter<S: AutoSystem>(S);
+        // F4b: an event-reading system must be single-task — a persistent cursor
+        // shared across ASD row-split chunks would re-read events per chunk. Forcing
+        // `stateful` keeps it whole (no row-split), so its adapter-owned cursor store
+        // is touched by exactly one task.
+        if !access.reads_event.is_empty() {
+            access.stateful = true;
+        }
+        struct Adapter<S: AutoSystem> {
+            inner: S,
+            cursors: apex_core::EventCursors,
+        }
         impl<S: AutoSystem + 'static> ParSystem for Adapter<S> {
             fn access() -> AccessDescriptor { unreachable!() }
-            fn run(&mut self, ctx: SystemContext<'_>) { self.0.run(ctx); }
+            fn run(&mut self, ctx: SystemContext<'_>) {
+                // F4b: install the persistent cursor store (single-task ⇒ no alias).
+                let ctx = unsafe { ctx.with_event_cursors(std::ptr::addr_of_mut!(self.cursors)) };
+                self.inner.run(ctx);
+            }
         }
         Self {
             name: name.into(),
-            kind: SystemConfigKind::Auto(Box::new(Adapter(s)), access),
+            kind: SystemConfigKind::Auto(
+                Box::new(Adapter { inner: s, cursors: apex_core::EventCursors::default() }),
+                access,
+            ),
             condition: ConditionTree::default(),
             condition_access: AccessDescriptor::new(),
             has_deferred: S::HAS_DEFERRED,

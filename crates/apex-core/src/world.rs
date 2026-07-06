@@ -2401,6 +2401,41 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
         .min(entity_count)
 }
 
+/// Persistent per-system event-read cursors (F4b).
+///
+/// Owned by the system runner (the AutoSystem adapter in the scheduler) and
+/// reused across runs, so a `system!` event reader resumes where it left off —
+/// no duplicate reads on a FixedUpdate catch-up. This is the AutoSystem analogue
+/// of the plain-fn golden path, where the cursor lives in
+/// [`EventReaderState`](crate::system_param) (`SystemParam::State`).
+///
+/// Keyed by event `TypeId`. A system reads only a handful of event types, so a
+/// linear scan beats a hash map. Two readers of the SAME event type in one system
+/// share one cursor (read-once total) — a rare, well-defined degenerate case.
+///
+/// Soundness: the store is reachable from [`SystemContext`] via a raw pointer, set
+/// by the runner for a SINGLE-TASK system only (event-reading systems are forced
+/// `stateful` ⇒ never ASD row-split), so exactly one task ever forms `&mut *ptr`
+/// — the same invariant as [`deferred_cmds`](SystemContext).
+#[derive(Default)]
+pub struct EventCursors {
+    slots: Vec<(TypeId, Option<crate::events::EventCursor>)>,
+}
+
+impl EventCursors {
+    /// The persistent cursor slot for event type `tid`, created (as `None`) on
+    /// first access and reused thereafter.
+    #[inline]
+    pub fn slot_for(&mut self, tid: TypeId) -> &mut Option<crate::events::EventCursor> {
+        if let Some(i) = self.slots.iter().position(|(t, _)| *t == tid) {
+            &mut self.slots[i].1
+        } else {
+            self.slots.push((tid, None));
+            &mut self.slots.last_mut().unwrap().1
+        }
+    }
+}
+
 pub struct SystemContext<'w> {
     /// The SubWorlds this system sees. Usually one SubWorld, but there may be
     /// several if the system works with multiple groups of archetypes.
@@ -2426,6 +2461,14 @@ pub struct SystemContext<'w> {
     /// exactly as before; the scheduler OVERRIDES it per system via
     /// [`with_last_run`](Self::with_last_run).
     pub(crate) last_run: Tick,
+    /// F4b: this system's persistent event-read cursors, owned by the runner (the
+    /// AutoSystem adapter) and installed per run via
+    /// [`with_event_cursors`](Self::with_event_cursors). `Some` only for a
+    /// SINGLE-TASK system (event readers are forced `stateful` ⇒ no row-split), so
+    /// exactly one task ever forms `&mut *ptr` — same invariant as `deferred_cmds`.
+    /// `None` for directly-built contexts / non-event systems ⇒ readers fall back
+    /// to a fresh transient cursor.
+    pub(crate) event_cursors: Option<*mut EventCursors>,
 }
 
 unsafe impl Send for SystemContext<'_> {}
@@ -2438,6 +2481,7 @@ impl<'w> SystemContext<'w> {
             sub_worlds,
             deferred_cmds: None,
             inline_cmds: UnsafeCell::new(Commands::new()),
+            event_cursors: None,
         }
     }
 
@@ -2448,6 +2492,7 @@ impl<'w> SystemContext<'w> {
             sub_worlds: std::slice::from_ref(sub_world),
             deferred_cmds: None,
             inline_cmds: UnsafeCell::new(Commands::new()),
+            event_cursors: None,
         }
     }
 
@@ -2497,7 +2542,25 @@ impl<'w> SystemContext<'w> {
             sub_worlds,
             deferred_cmds: Some(deferred_cmds),
             inline_cmds: UnsafeCell::new(Commands::new()),
+            event_cursors: None,
         }
+    }
+
+    /// F4b: install this system's persistent event-cursor store for the run.
+    ///
+    /// # Safety
+    /// `cursors` must point to an [`EventCursors`] owned by the caller (the
+    /// AutoSystem adapter) and alive for the context's lifetime, handed only to a
+    /// SINGLE-TASK system (event readers are forced `stateful` ⇒ no row-split), so
+    /// no other task forms a concurrent `&mut` to the same store (mirrors
+    /// [`with_commands`](Self::with_commands)).
+    ///
+    /// `#[doc(hidden)]`: an internal scheduler↔core seam, not blessed public API.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn with_event_cursors(mut self, cursors: *mut EventCursors) -> Self {
+        self.event_cursors = Some(cursors);
+        self
     }
 
     /// Get the `Commands` for the current thread. Commands are applied by the
@@ -2680,6 +2743,37 @@ impl<'w> SystemContext<'w> {
                 }
             };
             EventReader::from_persistent(events, c)
+        }
+    }
+
+    /// F4b: build an [`EventReader`] over the running system's PERSISTENT cursor for
+    /// `T`, taken from the per-system [`EventCursors`] store installed by the runner
+    /// (the AutoSystem adapter) via [`with_event_cursors`](Self::with_event_cursors).
+    /// The cursor resumes across runs, so a `system!` event reader does not
+    /// re-read on a FixedUpdate catch-up (the AutoSystem analogue of the plain-fn
+    /// `EventReader<E>` param's `SystemParam::State` persistence, F4).
+    ///
+    /// Falls back to a fresh transient cursor when no store is installed (a
+    /// directly-built context, not run through the scheduler adapter).
+    ///
+    /// The ONLY intended caller is the `system!` macro's event-reader parameter,
+    /// where event access is declared (`Listen<E>`) and the scheduler forces the
+    /// system single-task. `#[doc(hidden)]`: an internal escape, not blessed API.
+    #[doc(hidden)]
+    #[inline]
+    pub fn event_reader_persistent_auto<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+        match self.event_cursors {
+            Some(ptr) => {
+                // SAFETY: `ptr` points to the runner-owned `EventCursors` for THIS
+                // system, installed via `with_event_cursors` for a single-task
+                // system (event readers are forced `stateful` ⇒ no row-split), so
+                // no other task aliases it. The `&mut` is transient (the returned
+                // reader borrows `&self`, not the store).
+                let slot = unsafe { &mut *ptr }.slot_for(TypeId::of::<T>());
+                self.event_reader_persistent::<T>(slot)
+            }
+            // No per-system store (direct/non-scheduler context): fresh cursor.
+            None => self.event_reader_unchecked::<T>(),
         }
     }
 

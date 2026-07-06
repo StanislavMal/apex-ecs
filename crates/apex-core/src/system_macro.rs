@@ -51,22 +51,19 @@
 /// | `name: Ctx` | SystemContext | Direct access to the context |
 /// | `__whole: WholeWorld` | NEEDS_WHOLE_WORLD | Global access to all entities |
 ///
-/// # Event readers use a fresh per-run cursor (F4b)
+/// # Event readers hold a persistent per-system cursor (F4b)
 ///
-/// An event-reader parameter (`name: &[E]` / `name: EventReader<E>`) creates a
-/// FRESH cursor each time the system runs and frees it when the run ends. It
-/// reads every event readable that run — correct for the common per-frame
-/// (`Update`) system, where events are flushed once per frame so each event is
-/// read exactly once.
+/// An event-reader parameter (`name: &[E]` / `name: EventReader<E>`) reads through
+/// a PERSISTENT per-system cursor that resumes across runs — so if the system runs
+/// several times within one frame without an intervening flush (a `FixedUpdate`
+/// catch-up), each event is read exactly once, no duplicates. This matches the
+/// plain-fn `EventReader<E>` golden path (F4); the cursor is owned by the system's
+/// scheduler adapter and installed into the `SystemContext` per run.
 ///
-/// It is NOT a persistent per-system cursor. If the SAME system runs several
-/// times within one frame WITHOUT an intervening flush (a `FixedUpdate`
-/// catch-up), each run restarts at zero and re-reads the same events. For
-/// persistent, no-duplicate reads across runs, use a plain-fn system with an
-/// `EventReader<E>` parameter — its cursor lives in `SystemParam::State` and
-/// survives across runs (F4). `system!` generates an `AutoSystem`, which does
-/// not thread `SystemParam::State`, so the macro path cannot offer that (see
-/// `plans/TECH_DEBT.md`, F4b).
+/// Because a shared cursor cannot be split across ASD row-split chunks, an
+/// event-reading system is automatically single-task (`stateful`) — it is never
+/// row-split. Two readers of the SAME event type in one system share one cursor
+/// (read-once total).
 ///
 /// # Only one Query parameter (F6)
 ///
@@ -394,7 +391,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let $pname = $ctx.event_reader_unchecked::<$ev>(); ],
+        @before: [ $( $before )* let $pname = $ctx.event_reader_persistent_auto::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -453,7 +450,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_reader_unchecked::<$ev>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader_persistent_auto::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -582,7 +579,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let $pname = $ctx.event_reader_unchecked::<$ev>(); ],
+        @before: [ $( $before )* let $pname = $ctx.event_reader_persistent_auto::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
@@ -638,7 +635,7 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
-        @before: [ $( $before )* let mut $pname = $ctx.event_reader_unchecked::<$ev>(); let _ = &mut $pname; ],
+        @before: [ $( $before )* let mut $pname = $ctx.event_reader_persistent_auto::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};

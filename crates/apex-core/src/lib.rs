@@ -128,7 +128,9 @@ pub use system_param::{
 };
 pub use transform::IndexStamp;
 pub use unsafe_world_cell::UnsafeWorldCell;
-pub use world::{ArchetypeStats, Bundle, ParallelWorld, QueryState, SystemContext, World};
+pub use world::{
+    ArchetypeStats, Bundle, EventCursors, ParallelWorld, QueryState, SystemContext, World,
+};
 
 /// Shortcut for `Default::default()` in struct-update literals (Bevy idiom):
 /// `PbrMaterial { roughness: 0.5, ..default() }` instead of `..Default::default()`.

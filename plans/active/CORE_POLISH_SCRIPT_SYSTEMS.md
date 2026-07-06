@@ -348,19 +348,19 @@ event-теста зелёные.
 декларация видна планировщику). Потребители ctx-пути мигрируются на параметр. Руководство —
 секция advanced обновляется (та же формула, что для `resource_mut_unchecked`).
 
-### 2.3 F4b — AutoSystem/`system!`-путь чтения событий не персистентен ⚠ ПЕРЕОЦЕНКА §0.2b ✅ 2026-07-06
+### 2.3 F4b — AutoSystem/`system!`-путь чтения событий → ПЕРСИСТЕНТЕН ✅ 2026-07-06
 
-> **✅ ЗАКРЫТО ПЕРЕОЦЕНКОЙ (§0.2b).** Гипотеза плана («`EventReader<E>`-параметр в `system!` → персистентен
-> через `SystemParam::State` автоматически») ВЕРНА НЕ БЫЛА: `system!` генерит `AutoSystem` (отдельный
-> трейт с associated-доступом), а не `SystemParamFunction` — путь AutoSystem структурно НЕ прокидывает
-> `SystemParam::State`. Полное закрытие заблокировано двумя независимыми блокерами: (1) хранение курсора в
-> сгенерённой структуре ломает stateful-`struct` БЕЗ Default (вариант B', скрытые поля рвут ручную
-> конструкцию юзера) + коллизия с `let s = &mut *self`; (2) event-state в трейте `AutoSystem` = риплл
-> сигнатуры `run` во все импл-ы. **Решение:** золотой путь персистентного чтения = plain-fn `EventReader<E>`
-> (F4 ✅); макро-путь оставлен свежим-per-run (КОРРЕКТЕН для per-frame Update — no-loss registry + снятие
-> transient-курсора на Drop) и документирован честно (rustdoc `system!` + указатель на plain-fn для
-> FixedUpdate). Тест `apex-scheduler/tests/macro_event_reader.rs` фиксирует supported-контракт. Нулевых
-> реальных потребителей сахара → низкий риск. Детали/блокеры — TECH_DEBT F4b.
+> **✅ ЗАКРЫТО ПОЛНОСТЬЮ (золотой путь, по требованию пользователя).** Первая переоценка сочла полное
+> закрытие несоразмерным, но верный архитектурный ход снимает оба блокера: курсор живёт НЕ в
+> пользовательской структуре (об неё бились блокеры), а в **раннере системы** — адаптере AutoSystem,
+> который и так переживает кадры (как plain-fn держит `SystemParam::State` в замыкании). Реализация
+> по паттерну существующего `deferred_cmds`: `EventCursors` (per-system, TypeId-keyed) во владении
+> адаптера; `SystemContext.event_cursors: Option<*mut EventCursors>` + `with_event_cursors` +
+> благословенный `event_reader_persistent_auto`; макро-снипеты → персистентный путь (0 ripple по ~35
+> impl AutoSystem). Инвариант: event-читатель форсится `stateful` → single-task (нет row-split → нет
+> aliasing; чинит и латентный query+event-баг). Тесты `macro_event_reader.rs`: per-frame + **catchup
+> (3 рана без flush → батч ровно раз)**. Гейты: workspace, clippy net-neutral, Miri TB чист (raw-ptr),
+> движок build + goldens 649/0/9 байт-идентичны. Детали — TECH_DEBT F4b.
 
 **Проблема:** `ctx.event_reader` внутри `system!`-тела даёт свежий курсор → FixedUpdate-катчап
 читает дубли (тот же баг, что F4 закрыл для plain-fn).

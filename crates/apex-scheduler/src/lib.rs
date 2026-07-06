@@ -539,6 +539,10 @@ pub(crate) trait ParSystem: Send + Sync {
 /// with no room for error.
 struct AutoSystemAdapter<S: AutoSystem> {
     inner: S,
+    /// F4b: this system's persistent event-read cursors, owned here so they
+    /// survive across frames (the adapter is stored by the scheduler). Installed
+    /// into the `SystemContext` per run.
+    cursors: apex_core::EventCursors,
 }
 
 impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
@@ -552,6 +556,10 @@ impl<S: AutoSystem + 'static> ParSystem for AutoSystemAdapter<S> {
     }
 
     fn run(&mut self, ctx: SystemContext<'_>) {
+        // F4b: install this system's persistent cursor store. SAFETY: `cursors` is
+        // owned by `self` (alive for the whole run) and an event-reading system is
+        // forced single-task (`stateful`), so no other task aliases the store.
+        let ctx = unsafe { ctx.with_event_cursors(std::ptr::addr_of_mut!(self.cursors)) };
         self.inner.run(ctx);
     }
 

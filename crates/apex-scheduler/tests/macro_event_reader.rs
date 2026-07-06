@@ -1,17 +1,13 @@
-//! F4b (CORE_POLISH wave 2.3): the `system!` macro's event-reader sugar
-//! (`EventReader<E>` / `&[E]`) uses a FRESH per-run cursor — it reads every
-//! event readable that run, then frees the cursor on drop. For the common
-//! per-frame system this is exactly right: events are flushed once per frame,
-//! no reader lags, so the no-loss registry clears each batch after it is read
-//! and the next frame's fresh cursor sees only the new events.
+//! F4b (CORE_POLISH wave 2.3): a `system!` macro event reader now holds a
+//! PERSISTENT per-system cursor — the AutoSystem analogue of the plain-fn
+//! `EventReader<E>` golden path (F4). The cursor is owned by the AutoSystem
+//! adapter (survives across runs) and installed into the `SystemContext` per run,
+//! so a FixedUpdate catch-up (several runs in one frame without a flush) does NOT
+//! re-read events, exactly like a plain-fn reader.
 //!
-//! What the macro path does NOT provide is a PERSISTENT per-system cursor across
-//! runs WITHOUT an intervening flush (a FixedUpdate catch-up) — that is the
-//! plain-fn `EventReader<E>` golden path (F4, `SystemParam::State`). `system!`
-//! generates an `AutoSystem`, which structurally does not thread
-//! `SystemParam::State`, so it cannot offer that persistence. This test locks
-//! the SUPPORTED per-frame contract; the reassessment is recorded in
-//! plans/TECH_DEBT.md (F4b).
+//! Event-reading AutoSystems are forced single-task (`stateful`), so the
+//! adapter-owned cursor store is touched by exactly one task (a shared cursor
+//! across ASD row-split chunks would be wrong).
 
 use apex_core::prelude::*;
 use apex_core::{system, World};
@@ -31,27 +27,25 @@ system! {
     }
 }
 
-/// Per-frame delivery: a `system!` event reader reads each flushed batch exactly
-/// once. Because the transient reader frees its cursor on drop, no reader lags
-/// between frames, so the no-loss registry clears the previous batch on the next
-/// flush and the fresh per-run cursor never re-reads it.
-#[test]
-fn macro_event_reader_reads_each_frame_batch_once() {
+fn setup() -> (World, Scheduler) {
     let mut world = World::new();
     world.insert_resource(PingLog::default());
-
     let mut sched = Scheduler::new();
     sched.add_systems(StageLabel::Update, record_pings);
     sched.compile_with_world(&world).unwrap();
+    (world, sched)
+}
 
-    // Frame 1: two pings become readable; the system reads both.
+/// Per-frame delivery: each flushed batch is read exactly once across frames.
+#[test]
+fn macro_event_reader_reads_each_frame_batch_once() {
+    let (mut world, mut sched) = setup();
+
     world.send_event(Ping(1));
     world.send_event(Ping(2));
     world.flush_all_events();
     sched.run_sequential(&mut world);
 
-    // Frame 2: a new ping. Frame 1's batch was cleared on this flush (no lagging
-    // reader), so the macro's fresh per-run cursor reads only the new event.
     world.send_event(Ping(3));
     world.flush_all_events();
     sched.run_sequential(&mut world);
@@ -60,6 +54,31 @@ fn macro_event_reader_reads_each_frame_batch_once() {
     assert_eq!(
         log.0,
         vec![1, 2, 3],
-        "each frame's flushed batch is read exactly once (no duplicate, no loss)"
+        "each frame's flushed batch is read exactly once"
+    );
+}
+
+/// F4b: a FixedUpdate-style catch-up — the SAME system runs several times in one
+/// frame WITHOUT an intervening flush. The persistent cursor resumes, so the
+/// events are read exactly ONCE across the extra runs (a fresh transient cursor
+/// would restart at zero every run and duplicate them — the bug F4b closes).
+#[test]
+fn macro_event_reader_persists_across_runs_no_duplicate() {
+    let (mut world, mut sched) = setup();
+
+    world.send_event(Ping(10));
+    world.send_event(Ping(20));
+    world.flush_all_events();
+
+    // Three runs in the same frame (no flush between) — a FixedUpdate catch-up.
+    sched.run_sequential(&mut world);
+    sched.run_sequential(&mut world);
+    sched.run_sequential(&mut world);
+
+    let log = world.try_resource::<PingLog>().unwrap();
+    assert_eq!(
+        log.0,
+        vec![10, 20],
+        "persistent cursor: the batch is read once total across the catch-up runs, not once per run"
     );
 }
