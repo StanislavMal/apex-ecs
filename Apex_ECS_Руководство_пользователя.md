@@ -144,6 +144,7 @@ fn main() {
     sched.compile().unwrap();
 
     for _ in 0..60 {
+        world.tick();            // инкремент тика кадра (база change detection)
         sched.run(&mut world);   // флашит события и продвигает change-tick сам
     }
 
@@ -4087,17 +4088,17 @@ use apex_core::prelude::*;
 use apex_scheduler::{Scheduler, StageLabel};
 use serde::{Serialize, Deserialize};
 
-// Компоненты
-#[derive(Clone, Copy, Serialize, Deserialize)]
+// Компоненты — #[derive(Component)] обязателен (авто-регистрация через linkme)
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
 struct Position { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
 struct Velocity { x: f32, y: f32 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Component, Clone, Copy, Serialize, Deserialize)]
 struct Health { current: f32, max: f32 }
 
-#[derive(Clone, Copy)]
+#[derive(Component, Clone, Copy)]
 struct Player;
 
 // Ресурс
@@ -4113,7 +4114,7 @@ system! {
         q: (Read<Velocity>, Write<Position>),
         dt: Res<DeltaTime>,
     ) {
-        q.for_each(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
+        q.for_each_mut(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
             pos.x += vel.x * dt.0;
             pos.y += vel.y * dt.0;
         });
@@ -4141,7 +4142,7 @@ fn main() {
     world.register_component_serde::<Position>();
     world.register_component_serde::<Velocity>();
     world.register_component_serde::<Health>();
-    world.register_component::<Player>();
+    // Player авторегистрируется через #[derive(Component)]; serde ему не нужен
     world.insert_resource(DeltaTime(0.016));
     world.add_event::<DeathEvent>();  // опционально — send_event регистрирует сам
 
@@ -4175,8 +4176,8 @@ fn main() {
 
     // Game loop
     for _ in 0..3 {
-        sched.run(&mut world);
         world.tick();
+        sched.run(&mut world);
     }
 
     println!("entities: {}", world.entity_count());
@@ -4270,7 +4271,8 @@ fn main() {
 | `spawn_many(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (возвращает Vec; bulk-copy для 2+ компонентов без Drop) |
 | `spawn_many_silent(n, \|i\| bundle)` | Batch-спавн N одинаковых бандлов (без возврата Vec) |
 | `spawn_batch(iter)` | Спавн из итератора бандлов (разные типы) |
-| `entity(entity)` | Получить `EntityRef` для операций над entity (insert, remove, despawn, get, add_relation и т.д.) |
+| `entity(entity)` | `EntityRef` (read-only): `get`, `has_relation`, `target_of`/`targets_of`; паникует если entity мертва (`get_entity` → `Option`) |
+| `entity_mut(entity)` | `EntityWorldMut` (полный доступ): `insert`/`remove`/`despawn`/`get_mut` + иерархия `set_parent`/`add_child`/`with_children` (`get_entity_mut` → `Option`) |
 | `despawn(entity)` | Уничтожить entity |
 | `insert(entity, component)` | Добавить компонент |
 | `remove::<T>(entity)` | Удалить компонент |
@@ -4295,9 +4297,11 @@ fn main() {
 | `event_reader::<T>()` | Создать `EventReader<T>` (рекомендуется, зеркало `ctx.event_reader()`) |
 | `event_writer::<T>()` | Создать `EventWriter<T>` |
 | `tick()` | Инкрементировать счётчик тика (flush событий — Scheduler) |
-| `query::<Q>()` | CachedQuery — кешированный типизированный запрос (Bevy 1:1) |
-| `query_changed::<Q>(tick)` | CachedQuery с change detection (используйте `Changed<T>`/`Added<T>` как фильтр в Q) |
-| `query_builder()` | Динамический запрос по runtime-`ComponentId` (скриптинг/инспектор) |
+| `query::<Q>()` | Кешированный read-only запрос (`Q: ReadOnlyWorldQuery`) над архетип-кэшем мира |
+| `query_mut::<Q>()` | Кешированный запрос с write-формами (`&mut self`) |
+| `query_changed::<Q>(tick)` | Read-only запрос с базой change detection (`Changed`/`Added` как фильтр) |
+| `query_mut_changed::<Q>(tick)` | То же для write-форм |
+| `query_builder()` / `query_builder_mut()` | Динамический запрос по runtime-`ComponentId` (скриптинг/инспектор) |
 | `query_relation::<K, Q>(kind, target)` | Query по relation |
 | `query_wildcard::<K, Q>(kind)` | Query по relation (любой target) |
 | `add_relation(s, kind, t)` | Создать связь subject→target (O(1), без структурных изменений; мёртвые s/t — no-op+warn) |
@@ -4336,9 +4340,9 @@ fn main() {
 `query_with_tick(&world, last_run)`; инкрементальное дополнение новыми архетипами,
 ноль локов/аллокаций на вызов; привязка к миру по `World::id()` (§4.3.2).
 
-**Плотная итерация** (W2-0.5): `for_each_chunk` / `par_for_each_chunk` на `Query` и
-`CachedQuery` — слайсы колонок (`&[T]`/`&mut [T]`/`Option<&[T]>`), write-слайс стампит
-change-tick всему диапазону; `Changed<T>`/`Added<T>` не компилируются (§4.3.1).
+**Плотная итерация:** `for_each_chunk`/`par_for_each_chunk` (read) и `for_each_chunk_mut`/
+`par_for_each_chunk_mut` (write) на `Query` — слайсы колонок (`&[T]`/`&mut [T]`/`Option<&[T]>`),
+write-слайс стампит change-tick всему диапазону; `Changed<T>`/`Added<T>` не компилируются (§4.3.1).
 
 **`Or<(F1,…)>`** (W2-5): дизъюнкция фильтров в запросе (§4.3).
 
@@ -4381,22 +4385,24 @@ generation entity не участвует — НЕ использовать дл
 | `compile()` | Скомпилировать план → `Result` (возвращает мгновенно если граф не изменился) |
 | `compile_with_world(&world)` | Компиляция с заполнением имён компонентов для диагностики |
 | `enable_event_ordering(bool)` | Вкл/выкл автоматическое упорядочивание по `Emit`/`Listen` (по умолч. `true`) |
-| `set_parallel_min_entities(n)` | Минимальное total entity в Stage для PAR (по умолч. `0` — без ограничений) |
-| `set_parallel_auto_disable(bool)` | Автоотключение PAR по per-system entity count (по умолч. **`true`**) |
 | `event_pipeline::<E>()` | Создать строитель конвейера для типа события E |
-| `par_for_each_used_by_name(name)` | Пометить систему как использующую `par_for_each` внутри (ASD не чанкует) |
 | `run(&mut world)` | Запустить (параллельно если возможно) |
 | `run_sequential(&mut world)` | Запустить последовательно |
 | `debug_plan()` | Краткий план выполнения |
 | `debug_plan_verbose()` | Подробная диагностика плана |
 
+> **Настройка параллелизма — на World, не на Scheduler.** PAR-gating (`stage_parallel_min_entities`,
+> `auto_disable_stage_parallel`, `max_chunk_size`) — поля `ChunkConfig` (`world.set_chunk_config(...)`,
+> §13.1.3). Пометка «система использует внутренний `par_for_each`» — метод конфига `.par_for_each_used()`
+> (`sys("имя", S).par_for_each_used()`), а не метод Scheduler.
+
 **Pipeline API:**
 
 | Метод | Описание |
 |-------|----------|
-| `EventPipelineBuilder::produced_by(id, name)` | Добавить Producer (Emit<E>) |
-| `EventPipelineBuilder::transformed_by(id, name)` | Добавить Transformer (Listen<E> + Emit<E>) |
-| `EventPipelineBuilder::consumed_by(id, name)` | Добавить Consumer (Listen<E>) |
+| `EventPipelineBuilder::produced_by(name)` | Добавить Producer по имени (Emit<E>) |
+| `EventPipelineBuilder::transformed_by(name)` | Добавить Transformer (Listen<E> + Emit<E>) |
+| `EventPipelineBuilder::consumed_by(name)` | Добавить Consumer (Listen<E>) |
 | `EventPipelineBuilder::build(sched)` | Применить зависимости к планировщику |
 | `EventPipelineBuilder::build_validated(sched)` | Применить с проверкой ролей |
 
@@ -4430,20 +4436,9 @@ generation entity не участвует — НЕ использовать дл
 | `StageLabel::standard_order()` | Стандартный порядок: Startup→First→PreUpdate→FixedUpdate→Update→PostUpdate→Last |
 | `StageLabel::priority()` | Числовой приоритет (меньше = раньше) |
 
-### `App` API
-
-| Метод | Описание |
-|---|---|
-| `add_plugins(plugins)` | Плагин / кортеж плагинов / группа (`DefaultPlugins`), D2-7 |
-| `add_systems(label, systems)` | **Единственный вход регистрации** — формы те же, что у `Scheduler::add_systems` |
-| `insert_resource(r)` / `init_resource::<T>()` | Вставка ресурсов (1:1 Bevy) |
-| `add_state(initial)` | App-состояния `State<S>`/`NextState<S>` (D2-6) |
-| `chain(names)` / `before(a,b)` / `after(a,b)` | Явный порядок систем по именам |
-| `configure_stages(order)` | Порядок этапов |
-| `world()` / `world_mut()` | Доступ к World |
-| `scheduler_mut()` | Доступ к Scheduler |
-| `update()` | Один кадр (tick + flush + run) |
-| `run()` / `run_headless()` | Главный цикл |
+> **`App` API — в движке, не в ядре.** Тип `App` (`add_plugins`/`DefaultPlugins`/`add_state`/`run`/
+> `update`) живёт в umbrella-крейте `apex-engine`, а не в `apex-ecs`. Его справочник — в руководстве
+> движка. Ядро использует напрямую `World` + `Scheduler` (см. выше).
 
 ### Макрос `system!` (раздел 6)
 
@@ -4464,16 +4459,15 @@ generation entity не участвует — НЕ использовать дл
 
 | Метод | Описание |
 |---|---|
-| `query::<Q>()` | `CachedQuery` с ленивым `fetch_state` + кеш архетипов (scoped к SubWorld) |
+| `query::<Q>()` | Read-only `Query` над per-system SubWorld (`Q: ReadOnlyWorldQuery`) |
 | `query_changed::<Q>(tick)` | То же с change detection (Changed<T> как фильтр) |
-| `resource::<T>()` | Чтение ресурса (panic если нет) |
-| `resource_mut::<T>()` | Изменение ресурса |
+| `resource::<T>()` | Чтение ресурса (panic если нет) → `Res<T>` |
 | `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |
-| `try_resource_mut::<T>()` | Безопасное мутабельное чтение → `Option<ResMut<T>>` |
-| `event_reader::<T>()` | Чтение событий |
-| `event_writer::<T>()` | Запись событий |
+| `event_reader::<T>()` | Чтение событий → `EventReader<T>` |
 | `entity_count()` | Количество entity |
-| **`commands()`** | Thread-local Commands (v0.1.0) |
+| `commands()` | Thread-local `&mut Commands` |
+| `query_unchecked::<Q>()` / `resource_mut_unchecked::<T>()` / `event_writer_unchecked::<T>()` | *advanced* (`#[doc(hidden)]`): write-доступ через declared-access escape (§6.7) |
+| `fetch_unchecked::<P>()` | *advanced*: извлечь `SystemParam`-кортеж `P` (§6.8) |
 | `query_relation::<R, Q>(kind, target)` | Query по relation R к target + компоненты Q |
 | `query_wildcard::<R, Q>(kind)` | Query по relation R (любой target) + компоненты Q |
 | `targets_of::<R>(kind, parent)` | Итератор по дочерним entity |
@@ -4558,19 +4552,12 @@ generation entity не участвует — НЕ использовать дл
 | `CloneableBridge::apply_incoming(world)` | Применить входящие события |
 | `sync_bridge_cloneable(world)` | Система синхронизации CloneableBridge |
 
-### Scheduler API (v0.3)
+### Регистрация, условия и порядок систем (справочник)
 
-**Регистрация систем**
-
-| Метод | Описание |
-|---|---|
-| `sched.add_systems(label, (...))` | **Единственный вход**: кортеж систем (до 12); plain-fn, bare-идентификаторы `system!`, `SystemConfig` |
-| bare `movement` (plain-fn) / `move_player` / `load_level` | plain-fn / параллельная / эксклюзивная `system!` — имя из fn |
-| `sys("name", struct)` | Конструктор AutoSystem с явным именем |
-| `seq("name", fn)` | Конструктор эксклюзивного замыкания `FnMut(&mut World)` |
-| `par("name", closure)` | Конструктор parallel-замыкания *(advanced)* |
-| `par_access("name", access, closure)` | parallel-замыкание с `AccessDescriptor` *(advanced)* |
-| `SystemConfig::exclusive(sys)` | Эксклюзивная `system!` как конфиг (для `.run_if*`) |
+**Конструкторы систем** (`use apex_scheduler::prelude::*`): `sys("name", struct)` (AutoSystem с явным
+именем), `seq("name", fn)` (эксклюзивное замыкание `FnMut(&mut World)`), `par("name", closure)` /
+`par_access("name", access, closure)` (*advanced*), `SystemConfig::exclusive(sys)` (эксклюзив как конфиг
+для `.run_if*`). Все передаются в `add_systems(label, …)`.
 
 **Run Conditions**
 
