@@ -970,11 +970,19 @@ impl World {
         self.events.get_raw_ptr::<T>()
     }
 
-    /// Create an event reader with a per-reader cursor.
+    /// Create an event reader with a per-reader cursor, from a system holding an
+    /// exclusive `&mut World`.
     ///
-    /// Analogous to `EventReader::new(world.events_mut::<T>())`.
+    /// Takes `&mut self` (S3 / ADR-002): reading advances the queue's read cursor,
+    /// so mutating it through a shared `&World` would be a safe-reachable data race
+    /// — `World: Sync` lets safe code share `&World` across threads and call this on
+    /// two threads at once, each doing `&mut *ptr` on the same queue. The exclusive
+    /// borrow makes that unrepresentable. Systems that declare event access as a
+    /// parameter (`EventReader<T>` / `Listen<E>`) go through the scheduler-validated
+    /// path instead, never this method.
     #[inline]
-    pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+    pub fn event_reader<T: Send + Sync + 'static>(&mut self) -> EventReader<'_, T> {
+        // SAFETY: `&mut self` is exclusive, so no other access to `T`'s queue aliases.
         unsafe {
             let ptr = self
                 .event_queue_ptr::<T>()
@@ -983,15 +991,53 @@ impl World {
         }
     }
 
-    /// Create an event writer.
+    /// Create an event writer from a system holding an exclusive `&mut World`.
     ///
-    /// Analogous to `EventWriter::from_ptr(...)`.
+    /// Takes `&mut self` for the same reason as [`event_reader`](Self::event_reader)
+    /// (S3 / ADR-002). For the common single-event case prefer
+    /// [`send_event`](Self::send_event).
     #[inline]
-    pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+    pub fn event_writer<T: Send + Sync + 'static>(&mut self) -> EventWriter<'_, T> {
+        // SAFETY: `&mut self` is exclusive, so no other access to `T`'s queue aliases.
         unsafe {
             let ptr = self
                 .event_queue_ptr::<T>()
                 .expect("event_writer: event type not registered");
+            EventWriter::from_ptr(ptr)
+        }
+    }
+
+    /// Read events through a shared `&World` WITHOUT the exclusivity guarantee
+    /// (S3 / ADR-002 escape hatch). Advancing the read cursor through `&self` races
+    /// if two threads share this `&World` (`World: Sync`). Sound ONLY when the caller
+    /// guarantees no concurrent access to `T`'s queue — e.g. the sequential Extract
+    /// stage, which reads MainWorld events under a declared `Extract<Listen<E>>`
+    /// access with no concurrent world access. `#[doc(hidden)]`: an internal escape,
+    /// not blessed API — prefer the `&mut self` [`event_reader`](Self::event_reader).
+    #[doc(hidden)]
+    #[inline]
+    pub fn event_reader_unchecked<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
+        unsafe {
+            let ptr = self
+                .event_queue_ptr::<T>()
+                .expect("event_reader_unchecked: event type not registered");
+            EventReader::new(&mut *ptr)
+        }
+    }
+
+    /// Send events through a shared `&World` WITHOUT the exclusivity guarantee —
+    /// symmetric escape hatch to
+    /// [`event_reader_unchecked`](Self::event_reader_unchecked) (S3 / ADR-002). Same
+    /// contract: sound only when the caller guarantees no concurrent access to `T`'s
+    /// queue. `#[doc(hidden)]`: an internal escape, prefer the `&mut self`
+    /// [`event_writer`](Self::event_writer).
+    #[doc(hidden)]
+    #[inline]
+    pub fn event_writer_unchecked<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
+        unsafe {
+            let ptr = self
+                .event_queue_ptr::<T>()
+                .expect("event_writer_unchecked: event type not registered");
             EventWriter::from_ptr(ptr)
         }
     }

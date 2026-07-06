@@ -1023,7 +1023,11 @@ impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
         let mw: Res<'w, crate::world::MainWorld> = ctx.resource();
         let world: &crate::world::World = mw.0.world();
-        world.event_reader::<E>()
+        // S3 / ADR-002: only a shared `&World` is available here (MainWorld is read
+        // through a `Res`). Sound because Extract runs in the sequential extract
+        // stage under a declared `Extract<Listen<E>>` access — no concurrent access
+        // to `E`'s queue — so the `_unchecked` cursor advance cannot race.
+        world.event_reader_unchecked::<E>()
     }
 }
 

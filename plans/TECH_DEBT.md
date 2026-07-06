@@ -80,11 +80,23 @@
   + `#[doc(hidden)]`** (ADR-002-консистентно с `query_unchecked`/`resource_mut_unchecked`); единственный
   потребитель — пример `system_param.rs` — мигрирован. Полное устранение (params-as-args, `fetch` не
   нужен) — Р-1/волна 3.
-- **S3 🟡 → CORE_POLISH волна 2.1 — `World::event_writer/event_reader(&self)` = гонка из safe-кода.**
-  `world.rs:977/990` мутируют event-очереди через `&World`; `World: Sync` → два потока с `&World` в safe.
-  **Реализуемо лишь при явном меж-поточном шеринге `&World`** (планировщик использует UnsafeWorldCell, не
-  `&World`) → футган-класс. Чистый фикс = `&mut self`+`_unchecked` по канону ADR-002 → **CORE_POLISH
-  волна 2.1** (rename-only был бы полумерой §0.2b; используется примером basic.rs И EventReader-SystemParam).
+- **S3 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 2.1) — `World::event_writer/event_reader(&self)` = гонка
+  из safe-кода.** Было: `world.rs:977/990` мутировали event-очереди (продвижение read-курсора / push)
+  через `&World`; `World: Sync` → safe-код мог шарить `&World` между потоками и звать метод на двух
+  потоках сразу (оба `&mut *ptr` на одну очередь) = data race из safe. **Сделано (канон ADR-002, как
+  S1/S2/F3):** благословенные `event_reader`/`event_writer` → `&mut self` (эксклюзив делает гонку
+  невыразимой); добавлены `event_reader_unchecked`/`event_writer_unchecked(&self)` + `#[doc(hidden)]` —
+  escape-hatch для путей с законным `&World`. Единственный такой потребитель — `Extract<Listen<E>>::fetch`
+  (`system_param.rs`, MainWorld через `Res`) — мигрирован на `event_reader_unchecked` (sound:
+  последовательная extract-стадия, декларированный `Listen<E>`, нет конкурентного доступа). Потребители
+  `&mut World` (тесты, пример basic.rs) не тронуты (auto-`&mut`). **SubWorld::event_reader/event_writer**
+  (`sub_world.rs`) оставлены `&self` (dead-code + недостижимы из safe: `SubWorld` строится лишь через
+  `unsafe fn from_raw`, чей контракт гарантирует не-алиасинг по декларированному доступу) — инвариант
+  soundness ЗАЖУРНАЛИРОВАН в doc-комментарии (зеркалит `SubWorld::resource_mut`). Rename-only без
+  `&mut`-пути был бы полумерой §0.2b. **Тест:** trybuild compile-fail `event_mut_needs_exclusive_world`
+  (E0596 на `&World`-мутацию reader И writer). Гейты: 260 core + весь workspace (102 scheduler, все
+  integration) зелёные; clippy net-neutral (4 warn — pre-existing в serialization/bench); Miri TB чист
+  (event 22, persistent/Extract, events_lag_threads 3 — multi-thread, ноль UB/гонок).
 - **S4 🟡 → CORE_POLISH волна 2.2 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне
   conflict-детекции.** `ctx.event_reader` (`world.rs:2531`) благословлён как «read», но
   `EventReader::new`→`add_reader` пишет в реестр курсоров (push/realloc, `events.rs:163-178`). Для

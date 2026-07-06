@@ -210,6 +210,14 @@ impl<'w> SubWorld<'w> {
     }
 
     // ── Event API ───────────────────────────────
+    //
+    // These advance the queue's read cursor / push through `&self`, mirroring
+    // `resource_mut` above. Unlike `World::event_reader` (S3: `&mut self`), the
+    // `&self` form is sound here because a `SubWorld` is NOT constructible from
+    // safe code — only through the `unsafe fn from_raw{,_with_ranges}` contract,
+    // whose caller (the scheduler) guarantees the vended view has exclusive,
+    // non-aliasing access to `T`'s queue per the system's DECLARED access. So the
+    // `World: Sync` safe-reachable race that S3 closes cannot arise for a SubWorld.
 
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {

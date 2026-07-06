@@ -1,0 +1,21 @@
+error[E0596]: cannot borrow `*world` as mutable, as it is behind a `&` reference
+  --> tests/compile_fail/event_mut_needs_exclusive_world.rs:12:14
+   |
+12 |     let _r = world.event_reader::<Ping>();
+   |              ^^^^^ `world` is a `&` reference, so it cannot be borrowed as mutable
+   |
+help: consider changing this to be a mutable reference
+   |
+11 | fn read_from_shared(world: &mut World) {
+   |                             +++
+
+error[E0596]: cannot borrow `*world` as mutable, as it is behind a `&` reference
+  --> tests/compile_fail/event_mut_needs_exclusive_world.rs:16:14
+   |
+16 |     let _w = world.event_writer::<Ping>();
+   |              ^^^^^ `world` is a `&` reference, so it cannot be borrowed as mutable
+   |
+help: consider changing this to be a mutable reference
+   |
+15 | fn write_from_shared(world: &mut World) {
+   |                              +++

@@ -303,7 +303,16 @@ Bevy-модель идиоматически верна (не мимикрия).
 > распространяет её на оставшиеся лазейки. Порядок внутри волны: 2.1 → 2.2 → 2.3
 > (2.3 зависит от решений 2.2).
 
-### 2.1 S3 — `World::event_writer/event_reader(&self)` = гонка из safe-кода
+### 2.1 S3 — `World::event_writer/event_reader(&self)` = гонка из safe-кода ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `event_reader`/`event_writer` → `&mut self` (благословенный эксклюзив);
+> `event_reader_unchecked`/`event_writer_unchecked(&self)` + `#[doc(hidden)]` (escape-hatch ADR-002).
+> Единственный `&World`-потребитель — `Extract<Listen<E>>::fetch` — мигрирован на `_unchecked`
+> (sound: sequential extract, декларированный `Listen<E>`). `SubWorld`-варианты оставлены `&self`
+> (dead-code, недостижимы из safe через `unsafe fn from_raw` — инвариант зажурналирован). Тест
+> trybuild `event_mut_needs_exclusive_world` (E0596). Гейты: workspace зелёный, clippy net-neutral,
+> Miri TB чист (вкл. multi-thread `events_lag_threads`). Движок S3 не задет (там только `ctx.event_reader`
+> = шаг 2.2). Детали — TECH_DEBT S3.
 
 **Проблема:** `world.rs:977/990` мутируют event-очереди через `&World`; `World: Sync` → два
 потока с `&World` в safe-коде — data race (тот же корень, что закрытый S1-part-2).
