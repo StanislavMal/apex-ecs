@@ -485,6 +485,141 @@ impl Scheduler {
         }
     }
 
+    // ── Dynamic (runtime-declared access) registration ─────────
+    //
+    // The lower layer of registration: a system built from an explicit
+    // `AccessDescriptor` + a runner closure, instead of a typed `AutoSystem`
+    // whose access is derived from `SystemParam` types at compile time. The typed
+    // `add_systems` path is the compile-time special case; both converge on the
+    // same `SystemDescriptor` backbone. Foundation for scripting / agent-IPC,
+    // whose access is known only at runtime (query strings, hot-reload).
+    //
+    // §0.2a contract: the caller MUST declare every component/resource/event the
+    // runner touches. An under-declared access is a data race under parallelism —
+    // exactly as for any hand-written `AccessDescriptor` (`add_par_access`).
+
+    /// Register a `Send` runner with an explicit access — dispatched to a rayon
+    /// worker like any parallel system. Runs in `default_stage_label`. Returns the
+    /// new system's [`SystemId`] (for `before`/`after` wiring or later removal).
+    pub fn add_dynamic_system<F>(
+        &mut self,
+        name: impl Into<String>,
+        access: AccessDescriptor,
+        runner: F,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        self.add_dynamic_system_to_stage(name, access, runner, self.default_stage_label.clone())
+    }
+
+    /// `add_dynamic_system` in a specific stage.
+    pub fn add_dynamic_system_to_stage<F>(
+        &mut self,
+        name: impl Into<String>,
+        mut access: AccessDescriptor,
+        runner: F,
+        stage_label: StageLabel,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + Send + Sync + 'static,
+    {
+        // A runtime-declared runner is opaque to row-split: its effects are not
+        // provably confined to a query partition, so it must run single-task.
+        access.stateful = true;
+        let has_deferred = access.uses_commands;
+        let system = FnParSystem { func: Box::new(runner), access: access.clone() };
+        self.push_descriptor(
+            name.into(),
+            SystemKind::Parallel { system: Box::new(system), access },
+            stage_label,
+            has_deferred,
+        )
+    }
+
+    /// Register a `!Send` main-thread runner with an explicit access (see
+    /// [`NonSendSystem`]). It runs on the main thread; its access still drives
+    /// conflict detection, so the scheduler serializes it against conflicting
+    /// systems (and, via a shared marker-resource write, against other NonSend
+    /// systems). Storing one makes the `Scheduler` `!Send`. Runs in
+    /// `default_stage_label`. Returns the new system's [`SystemId`].
+    pub fn add_dynamic_nonsend_system<F>(
+        &mut self,
+        name: impl Into<String>,
+        access: AccessDescriptor,
+        runner: F,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + 'static,
+    {
+        self.add_dynamic_nonsend_system_to_stage(
+            name,
+            access,
+            runner,
+            self.default_stage_label.clone(),
+        )
+    }
+
+    /// `add_dynamic_nonsend_system` in a specific stage.
+    pub fn add_dynamic_nonsend_system_to_stage<F>(
+        &mut self,
+        name: impl Into<String>,
+        mut access: AccessDescriptor,
+        runner: F,
+        stage_label: StageLabel,
+    ) -> SystemId
+    where
+        F: FnMut(SystemContext<'_>) + 'static,
+    {
+        access.stateful = true;
+        let has_deferred = access.uses_commands;
+        let system = FnNonSendSystem { func: Box::new(runner), access: access.clone() };
+        self.push_descriptor(
+            name.into(),
+            SystemKind::NonSend { system: Box::new(system), access },
+            stage_label,
+            has_deferred,
+        )
+    }
+
+    /// Shared backbone for the dynamic registration entry points: push one
+    /// `SystemDescriptor`, index it, and invalidate the plan.
+    ///
+    /// Both dynamic kinds (`Parallel` and `NonSend`) are ACCESS-DECLARED, so they
+    /// join `par_system_indices` — normal conflict detection resolves their
+    /// ordering (`compile.rs`), and they group before the sequential barrier.
+    /// Only full-world `Sequential` systems (no access) belong in
+    /// `seq_system_indices` (the global barrier). A `NonSend` system declares
+    /// access exactly like `Parallel`; it merely executes on the main thread.
+    fn push_descriptor(
+        &mut self,
+        name: String,
+        kind: SystemKind,
+        stage_label: StageLabel,
+        has_deferred: bool,
+    ) -> SystemId {
+        let id = SystemId(self.next_id);
+        self.next_id += 1;
+        self.last_added_system_id = Some(id);
+        let index = self.systems.len();
+        self.systems.push(SystemDescriptor {
+            id,
+            name,
+            kind,
+            after: Vec::new(),
+            before: Vec::new(),
+            stage_label,
+            run_condition: ConditionTree::default(),
+            apply_deferred_after: false,
+            has_deferred,
+        });
+        self.system_indices.insert(id, index);
+        self.par_system_indices.push(index);
+        self.invalidate_plan();
+        self.merge_scope_condition(id);
+        id
+    }
+
     // Stage-parallelism gating is configured on the World, not the scheduler
     // (wave 3, §1.7): `world.set_chunk_config(ChunkConfig {
     // stage_parallel_min_entities, auto_disable_stage_parallel, ..default() })`.

@@ -3090,9 +3090,6 @@
         });
         world.spawn_many(N, |_| (Hits(0),));
 
-        let mut sched = Scheduler::new();
-        sched.add_systems(StageLabel::Update, bump);
-
         // A dedicated 4-thread pool makes the concurrent split path run
         // regardless of the host CPU count (`rayon::scope` inside `run` uses the
         // installed pool).
@@ -3100,7 +3097,13 @@
             .num_threads(4)
             .build()
             .unwrap();
+        // The `Scheduler` is `!Send` (it may hold NonSend main-thread systems), so
+        // construct AND run it INSIDE the install closure — it lives entirely on a
+        // pool thread and never crosses a thread boundary. The closure captures
+        // only `&mut world` (Send) and the ZST `bump` system.
         pool.install(|| {
+            let mut sched = Scheduler::new();
+            sched.add_systems(StageLabel::Update, bump);
             sched.run(&mut world);
         });
 
@@ -3111,6 +3114,105 @@
             }
         });
         assert_eq!(bad, 0, "each row bumped exactly once across concurrent split tasks");
+    }
+
+    // ── B1: NonSend (main-thread) systems ────────────────────────────────
+
+    /// B1: a NonSend system holding genuinely `!Send` state (an `Rc`) is stored
+    /// and run by the scheduler on the main thread, and its DECLARED write
+    /// persists frame to frame. The `Rc` capture is exactly what forces
+    /// `Scheduler: !Send` — a `Send`-only registration could not accept it.
+    #[test]
+    fn nonsend_system_runs_and_writes() {
+        #[derive(Component, Clone, Copy)]
+        struct Counter(u32);
+
+        let mut world = World::new();
+        world.spawn((Counter(0),));
+        world.spawn((Counter(0),));
+
+        let runs = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let runs_in = runs.clone();
+
+        let mut sched = Scheduler::new();
+        sched.add_dynamic_nonsend_system(
+            "bump",
+            access_desc!(write<Counter>),
+            move |ctx: SystemContext<'_>| {
+                runs_in.set(runs_in.get() + 1);
+                ctx.query_unchecked::<Write<Counter>>()
+                    .for_each_mut(|_, mut c| c.0 += 1);
+            },
+        );
+
+        sched.run(&mut world);
+        sched.run(&mut world);
+
+        assert_eq!(runs.get(), 2, "the NonSend runner ran once per frame");
+        let mut vals = Vec::new();
+        Query::<Read<Counter>>::new(&world).for_each(|_, c| vals.push(c.0));
+        assert_eq!(vals, vec![2, 2], "declared write applied each frame to both entities");
+    }
+
+    /// B1: the public `add_dynamic_system` (Send runner + explicit access) — the
+    /// runtime-declared lower layer of registration — registers and runs.
+    #[test]
+    fn dynamic_send_system_runs_and_writes() {
+        #[derive(Component, Clone, Copy)]
+        struct Val(i32);
+
+        let mut world = World::new();
+        world.spawn((Val(10),));
+
+        let mut sched = Scheduler::new();
+        sched.add_dynamic_system("set", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
+            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 = 42);
+        });
+
+        sched.run(&mut world);
+
+        let mut got = None;
+        Query::<Read<Val>>::new(&world).for_each(|_, v| got = Some(v.0));
+        assert_eq!(got, Some(42));
+    }
+
+    /// B1: a NonSend system's declared access PARTICIPATES in conflict detection.
+    /// A NonSend writer and a Rust (parallel) writer of the SAME component both
+    /// run and both writes land (each entity +2) — the conflict is seen, so there
+    /// is no lost update. (B2 will additionally assert they never run concurrently.)
+    #[test]
+    fn nonsend_access_participates_in_conflict_detection() {
+        #[derive(Component, Clone, Copy)]
+        struct Hp(i32);
+
+        system! {
+            fn rust_bump(q: Write<Hp>) {
+                q.for_each_mut(|_, mut h| h.0 += 1);
+            }
+        }
+
+        let mut world = World::new();
+        world.spawn((Hp(0),));
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::Update, rust_bump);
+        sched.add_dynamic_nonsend_system(
+            "lua_bump",
+            access_desc!(write<Hp>),
+            |ctx: SystemContext<'_>| {
+                ctx.query_unchecked::<Write<Hp>>().for_each_mut(|_, mut h| h.0 += 1);
+            },
+        );
+
+        sched.run(&mut world);
+
+        let mut got = None;
+        Query::<Read<Hp>>::new(&world).for_each(|_, h| got = Some(h.0));
+        assert_eq!(
+            got,
+            Some(2),
+            "both the Rust and NonSend writers ran; the Write+Write conflict serialized them (no lost update)"
+        );
     }
 
     /// A STATEFUL system is not row-split (W3-4): one instance,

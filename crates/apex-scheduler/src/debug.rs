@@ -36,6 +36,9 @@ impl Scheduler {
                         SystemKind::Parallel { access, .. } => {
                             format!("par | R:{} W:{}", access.reads.len(), access.writes.len())
                         }
+                        SystemKind::NonSend { access, .. } => {
+                            format!("nonsend | R:{} W:{}", access.reads.len(), access.writes.len())
+                        }
                         SystemKind::Sequential(_) => "seq | full &mut World".to_string(),
                     };
                     out.push_str(&format!("  - {} [{}]\n", s.name, kind_str));
@@ -89,7 +92,13 @@ impl Scheduler {
                     .and_then(|&idx| self.systems.get(idx))
                 {
                     match &s.kind {
-                        SystemKind::Parallel { access, .. } => {
+                        SystemKind::Parallel { access, .. }
+                        | SystemKind::NonSend { access, .. } => {
+                            let tag = if matches!(s.kind, SystemKind::NonSend { .. }) {
+                                "nonsend"
+                            } else {
+                                "par"
+                            };
                             let reads: Vec<_> = access
                                 .reads
                                 .iter()
@@ -101,8 +110,9 @@ impl Scheduler {
                                 .map(|tid| component_type_name(*tid, &self.type_names))
                                 .collect();
                             out.push_str(&format!(
-                                "  - {} [par | R:{} W:{}]\n",
+                                "  - {} [{} | R:{} W:{}]\n",
                                 s.name,
+                                tag,
                                 access.reads.len(),
                                 access.writes.len(),
                             ));

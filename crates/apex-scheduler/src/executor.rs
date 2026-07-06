@@ -265,6 +265,18 @@ impl Scheduler {
                                 };
                                 system.run(ctx);
                             }
+                            SystemKind::NonSend { system, .. } => {
+                                // Main-thread system — run_sequential is already
+                                // single-threaded, so the same shared-buffer ctx is used.
+                                let ctx = unsafe {
+                                    SystemContext::with_commands(
+                                        std::slice::from_ref(&sub_world),
+                                        cmds_ptr,
+                                    )
+                                    .with_last_run(window)
+                                };
+                                system.run(ctx);
+                            }
                         }
                         if let Some(t) = prof_t {
                             main_prof_record(&self.systems[index].name, t.elapsed());
@@ -410,7 +422,10 @@ impl Scheduler {
                     // `Sequential` system has nothing to run on this path.
                     let par_ptr: *mut dyn ParSystem = match &mut self.systems[sys_idx].kind {
                         SystemKind::Parallel { system, .. } => &mut **system,
-                        SystemKind::Sequential(_) => continue,
+                        // A NonSend system forces its stage to `all_parallel = false`
+                        // (B1), so it never reaches this worker-dispatch path; a
+                        // Sequential system has nothing to run here.
+                        SystemKind::Sequential(_) | SystemKind::NonSend { .. } => continue,
                     };
                     total_entity_count += entity_count;
                     sys_infos.push(SysInfo {
@@ -859,6 +874,21 @@ impl Scheduler {
                                     };
                                     system.run(ctx);
                                 }
+                                SystemKind::NonSend { system, .. } => {
+                                    // Main-thread system (!Send state). Same private
+                                    // per-system slot + single-task guarantee as the
+                                    // Parallel arm — here it simply runs on the main
+                                    // thread by construction (this whole branch does).
+                                    let slot = slot_of[&sys_id];
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_base.add(slot),
+                                        )
+                                        .with_last_run(window)
+                                    };
+                                    system.run(ctx);
+                                }
                             }
                             if let Some(t) = prof_t {
                                 main_prof_record(&self.systems[sys_idx].name, t.elapsed());
@@ -943,6 +973,21 @@ impl Scheduler {
                                     // SAFETY: this system's private per-system slot
                                     // (D8b); it runs single-task on the main thread
                                     // here, so the `&mut` is unique.
+                                    let slot = slot_of[&sys_id];
+                                    let ctx = unsafe {
+                                        SystemContext::with_commands(
+                                            std::slice::from_ref(&sub_world),
+                                            cmds_base.add(slot),
+                                        )
+                                        .with_last_run(window)
+                                    };
+                                    system.run(ctx);
+                                }
+                                SystemKind::NonSend { system, .. } => {
+                                    // Main-thread system (!Send state). Same private
+                                    // per-system slot + single-task guarantee as the
+                                    // Parallel arm — here it simply runs on the main
+                                    // thread by construction (this whole branch does).
                                     let slot = slot_of[&sys_id];
                                     let ctx = unsafe {
                                         SystemContext::with_commands(

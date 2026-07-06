@@ -591,6 +591,37 @@ impl ParSystem for FnParSystem {
     }
 }
 
+// ── NonSendSystem (main-thread) ────────────────────────────────
+
+/// A system that MUST run on the main thread because it holds `!Send` state
+/// (e.g. a Lua VM). Unlike [`ParSystem`] it carries NO `Send + Sync` bound, so a
+/// `Scheduler` that stores one is itself `!Send` (create-and-run it on a single
+/// thread — see the scratch note on `stage_cmds`).
+///
+/// The executor never dispatches a NonSend system to a rayon worker: it runs
+/// inline on the main thread. Its declared [`AccessDescriptor`] still drives
+/// conflict detection, so the scheduler serializes it against conflicting
+/// systems — and, via a shared marker-resource write, against other NonSend
+/// systems — exactly like a parallel system. The exclusivity is expressed in the
+/// access model, not a lock (wave 3 §5 — no `Mutex`, no `Send` fiction).
+pub(crate) trait NonSendSystem {
+    fn run(&mut self, ctx: SystemContext<'_>);
+}
+
+/// A closure NonSend system with an explicit access (mirrors [`FnParSystem`],
+/// minus the `Send + Sync` bound on the closure).
+struct FnNonSendSystem {
+    func: Box<dyn FnMut(SystemContext<'_>)>,
+    #[allow(dead_code)]
+    access: AccessDescriptor,
+}
+
+impl NonSendSystem for FnNonSendSystem {
+    fn run(&mut self, ctx: SystemContext<'_>) {
+        (self.func)(ctx);
+    }
+}
+
 // ── SystemKind ─────────────────────────────────────────────────
 
 enum SystemKind {
@@ -599,9 +630,20 @@ enum SystemKind {
         system: Box<dyn ParSystem>,
         access: AccessDescriptor,
     },
+    /// A main-thread system with `!Send` state (see [`NonSendSystem`]). Its access
+    /// is declared like `Parallel` (drives conflict detection and stage grouping);
+    /// the executor pins its execution to the main thread.
+    NonSend {
+        system: Box<dyn NonSendSystem>,
+        access: AccessDescriptor,
+    },
 }
 
 impl SystemKind {
+    /// Dispatched to a rayon worker? Only `Parallel`. A `NonSend` system declares
+    /// access but runs on the main thread, so it is NOT worker-parallel — a stage
+    /// containing one runs through the main-thread path (B1). (B2 will let a
+    /// NonSend system run on the main thread *concurrently* with worker tasks.)
     fn is_parallel(&self) -> bool {
         matches!(self, SystemKind::Parallel { .. })
     }
@@ -609,6 +651,7 @@ impl SystemKind {
     fn access(&self) -> Option<&AccessDescriptor> {
         match self {
             SystemKind::Parallel { access, .. } => Some(access),
+            SystemKind::NonSend { access, .. } => Some(access),
             SystemKind::Sequential(_) => None,
         }
     }

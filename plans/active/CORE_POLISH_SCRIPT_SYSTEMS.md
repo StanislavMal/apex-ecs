@@ -462,6 +462,63 @@ F4b ✅ полной реализацией персистентных курс�
   НЕ параллелится с Rust-системой, пишущей Position, и параллелится с независимой;
   детерминизм-гейт волны 1 расширяется script-спавн-сценарием.
 
+#### ⚙ ДИЗАЙН ФАЗЫ B (утверждён 2026-07-06 после переоценки §0.2b + чекпоинт с юзером)
+
+**Стержневая находка (из кода):** ВСЕ системы планировщика обязаны быть `Send` (`SystemFn =
+Box<dyn FnMut(&mut World) + Send>`, `ParSystem: Send + Sync`; параллельные диспатчатся на
+rayon-воркеры через `SendPtr`, даже single-task stateful — `executor.rs:584`). Ресурсы —
+`Send+Sync`. **NonSend-концепции нет.** mlua `Lua` — `!Send`; `ScriptContext.world_ptr:
+NonNull<World>` — `!Send`. Итог: план неявно предполагал, что токен `ScriptVm` сам делает Lua
+обычной Parallel-системой — НЕВЕРНО: токен управляет только конфликтами/порядком, не снимает
+требование `Send` на бокс системы. Развилка: (A) mlua `send`-фича → тянет `Rc→Arc` +
+Send-легализацию `world_ptr` = отклонённая §5 `Arc<Mutex<ScriptContext>>`-территория; (C) новый
+вид систем **NonSend (main-thread)**. **Юзер выбрал (C)** — единственный путь без воскрешения
+§5-проблем; эксклюзив VM выражен исполнением на main-потоке (никакого Mutex/Send-фейка).
+
+**Следствие: `Scheduler` становится `!Send`** (хранит `!Send` NonSend-боксы в `self.systems` —
+единый дом регистрации, не второй реестр). Проверено: `run()` НЕ оборачивается в `pool.install`;
+движок/редактор Scheduler между потоками не двигают (драйвер play-режима живёт у хоста на своём
+потоке — `apex-editor/play.rs:25`). Единственный потребитель `Scheduler: Send` — тест
+`tests.rs:3103` (детерминированный 4-поточный пул) — адаптируется тривиально: создать+гонять
+scheduler ВНУТРИ `install`-замыкания (Scheduler живёт целиком на потоке пула, не пересекает
+границу). Future crash-isolation всё равно требует thread-affinity VM → `!Send` это корректно
+навязывает. Записать addendum-нотой при ротации.
+
+**Шаги (каждый — атомарный коммит со своими тестами + полные гейты шапки):**
+
+- **B1 — фундамент NonSend (корректность-first, БЕЗ параллелизма):** `trait NonSendSystem {
+  fn run(&mut self, ctx: SystemContext) }` (без Send/Sync); `SystemKind::NonSend { system:
+  Box<dyn NonSendSystem>, access }`; `kind.access()` → `Some` (участвует в конфликт-детекции —
+  `compile.rs:433/447`), `is_parallel()` → `false` (стадия с NonSend → `all_parallel=false` →
+  `!all_parallel`-ветка = исполнение на main). Регистрация: публичный `add_dynamic_system(name,
+  access, runner: FnMut(SystemContext)+Send)` (промоут тест-онли `add_par_access` → `Parallel`)
+  + `add_dynamic_nonsend_system(name, access, runner: FnMut(SystemContext))` → `NonSend`; оба —
+  тонкие обёртки над общим SystemDescriptor-backbone (типизированный `add_systems` = тот же
+  backbone → «нижний слой той же регистрации»). Executor: match-арм `NonSend => system.run(ctx)`
+  в `!all_parallel` + fallback-ветках (тот же `SystemContext::with_commands(..).with_last_run`).
+  `Scheduler: !Send` + фикс теста `install`. Тест: NonSend-Rust-замыкание бежит на main; две
+  системы с write одного ресурса сериализуются; NonSend↔Parallel-конфликт даёт правильный порядок.
+- **B2 — параллельный executor (Lua‖Rust):** NonSend участвует в parallel-группировке; в
+  `run_stage_parallel` NonSend-системы бегут на ГЛАВНОМ потоке ВНУТРИ `rayon::scope` (после
+  спавна Send-тасков → concurrent с воркерами). Sound: compile развёл конфликтующие системы по
+  стадиям → в одной стадии NonSend и Send-таски трогают непересекающиеся данные (тот же аргумент
+  дизъюнктности, что воркер↔воркер). Per-system Commands-слот + `last_run`-окно как у прочих
+  single-task. Тест: Lua-система `Write:Position` НЕ параллелится с Rust `Write:Position`,
+  параллелится с независимой; детерминизм-гейт; goldens байт-идентичны.
+- **B3 — ScriptVm-токен + registrar `system{}` + Lua-runner:** `ScriptVm` — ZST-маркер-ресурс;
+  Lua-система декларирует write на него (→ Lua↔Lua сериализация) + component reads/writes из
+  `QueryDesc` (через `ctx.binding`→`ComponentId`). Script-API `system{ name, query={...}, fn }`;
+  runner (NonSend) держит `Rc<Lua>`+`Rc<RefCell<ScriptContext>>`+fn-handle+**доверенный write-set**
+  (из декларации, НЕ `_meta` → S7-гейт становится СОДЕРЖАТЕЛЬНЫМ, закрывает трейд-офф фазы A);
+  на `run(ctx)` ставит `world_ptr`, гонит Lua (query()/commit() = путь фазы A), чистит. `run()`
+  без деклараций остаётся fallback = одна эксклюзивная (NonSend) система. Enforcement
+  «только декларированные компоненты»: ScriptContext получает декларированные read/write ids →
+  query()/commit() резолвят только их (undeclared → `anomaly!`).
+- **B4 — детерминизм спавнов + hot-reload:** script-спавны через per-system Commands-слот (D8b,
+  уже даёт детерминированные id для single-task на main); hot-reload = re-register скрипт-систем
+  при reload (декларации могли смениться) → `invalidate_plan` → re-compile (планировщик умеет по
+  dirty). Тест: детерминизм-гейт + script-спавн; hot-reload E2E.
+
 ### Фаза C — Lua↔Lua параллелизм (share-nothing VM-пул) — ⛔ ROI-gated, отдельное решение
 
 НЕ делать в этой кампании. Условие открытия: профиль реального потребителя (движок/редактор),
