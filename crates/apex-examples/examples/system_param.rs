@@ -1,12 +1,12 @@
 //! Apex ECS — SystemParam Trait Demo
 //!
-//! Демонстрирует все способы применения трейта SystemParam:
-//! - Одиночные параметры (ResRead, ResWrite, Listen, Emit, QueryParam, CommandsParam)
-//! - Кортежи 2–4 элемента
-//! - Механизм ctx.fetch_unchecked::<Self::Params>() (raw; сверки декларации нет — §0.2a)
-//! - Использование в эксклюзивной системе (`with_ctx`) через SystemContext
-//! - Доступ через access() без рантайма (проверка деклараций)
-//! - Корректность логики (фактическое применение параметров)
+//! Demonstrates every way to use the SystemParam trait:
+//! - Single parameters (ResRead, ResWrite, Listen, Emit, QueryParam, CommandsParam)
+//! - Tuples of 2–4 elements
+//! - The ctx.fetch_unchecked::<Self::Params>() mechanism (raw; no declaration check — §0.2a)
+//! - Use inside an exclusive system (`with_ctx`) via SystemContext
+//! - Access through access() without the runtime (declaration inspection)
+//! - Logic correctness (actual use of the parameters)
 //!
 //! cargo run -p apex-examples --example system_param
 
@@ -15,7 +15,7 @@ use apex_core::SubWorld;
 use apex_macros::Component;
 use apex_scheduler::{seq, Scheduler, StageLabel};
 
-// ── Компоненты ────────────────────────────────────────────────
+// ── Components ────────────────────────────────────────────────
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct Position { x: f32, y: f32 }
@@ -29,7 +29,7 @@ struct Health { current: f32, max: f32 }
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct Mass(f32);
 
-// ── Ресурсы ───────────────────────────────────────────────────
+// ── Resources ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PhysicsConfig { gravity: f32, dt: f32 }
@@ -37,13 +37,13 @@ struct PhysicsConfig { gravity: f32, dt: f32 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct FrameStats { frame: u32, entities: usize }
 
-// ── События ───────────────────────────────────────────────────
+// ── Events ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CollisionEvent { a: Entity, b: Entity }
 
 // ══════════════════════════════════════════════════════════════
-// Helper: создаёт SystemContext для World (все архетипы)
+// Helper: builds a SystemContext for the World (all archetypes)
 // ══════════════════════════════════════════════════════════════
 
 fn with_ctx<T>(world: &mut World, f: impl FnOnce(SystemContext<'_>) -> T) -> T {
@@ -56,7 +56,7 @@ fn with_ctx<T>(world: &mut World, f: impl FnOnce(SystemContext<'_>) -> T) -> T {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 1: ResRead<T> + ResWrite<T> — ресурсы
+// TEST 1: ResRead<T> + ResWrite<T> — resources
 // ══════════════════════════════════════════════════════════════
 
 fn test_resources() {
@@ -77,14 +77,14 @@ fn test_resources() {
 
         println!("  cfg.dt={:?}, frame={}, entities={}", cfg.dt, stats.frame, stats.entities);
 
-        // Проверка access()
+        // Check access()
         let access = P::access();
-        assert!(!access.reads.is_empty(), "ResRead должен декларировать read");
-        assert!(!access.writes.is_empty(), "ResWrite должен декларировать write");
+        assert!(!access.reads.is_empty(), "ResRead should declare a read");
+        assert!(!access.writes.is_empty(), "ResWrite should declare a write");
         println!("  access(): {} reads, {} writes", access.reads.len(), access.writes.len());
     });
 
-    // Проверяем что мутация применилась
+    // Verify the mutation was applied
     let stats = world.resource::<FrameStats>();
     assert_eq!(stats.frame, 42);
     assert_eq!(stats.entities, 100);
@@ -93,7 +93,7 @@ fn test_resources() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 2: Listen<E> + Emit<E> — события
+// TEST 2: Listen<E> + Emit<E> — events
 // ══════════════════════════════════════════════════════════════
 
 fn test_events() {
@@ -112,11 +112,11 @@ fn test_events() {
         println!("  emitted CollisionEvent({}, {})", a, b);
 
         let access = P::access();
-        assert!(!access.writes_event.is_empty(), "Emit должен декларировать write_event");
+        assert!(!access.writes_event.is_empty(), "Emit should declare a write_event");
         println!("  access(): {} write_events", access.writes_event.len());
     });
 
-    // Listen — нужно flush чтобы увидеть
+    // Listen — need a flush to see it
     world.flush_all_events();
 
     with_ctx(&mut world, |ctx| {
@@ -129,14 +129,14 @@ fn test_events() {
         println!("  read {} event(s)", events.len());
 
         let access = P::access();
-        assert!(!access.reads_event.is_empty(), "Listen должен декларировать read_event");
+        assert!(!access.reads_event.is_empty(), "Listen should declare a read_event");
     });
 
     println!("  ✅ PASSED\n");
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 3: QueryParam<Q> — запросы (Read, Write, With, много)
+// TEST 3: QueryParam<Q> — queries (Read, Write, With, multiple)
 // ══════════════════════════════════════════════════════════════
 
 fn test_query_param() {
@@ -148,7 +148,7 @@ fn test_query_param() {
     world.spawn((Position { x: 0.0, y: 0.0 }, Health { current: 100.0, max: 100.0 }));
 
     with_ctx(&mut world, |ctx| {
-        // Read<T> один
+        // Read<T> single
         {
             type P = QueryParam<Read<Position>>;
             let q = ctx.fetch_unchecked::<P>();
@@ -156,7 +156,7 @@ fn test_query_param() {
             println!("  Read<Position>: 3 entities");
         }
 
-        // (Read, Read, Read) — три компонента
+        // (Read, Read, Read) — three components
         {
             type P = QueryParam<(Read<Position>, Read<Velocity>, Read<Mass>)>;
             let q = ctx.fetch_unchecked::<P>();
@@ -173,12 +173,12 @@ fn test_query_param() {
             println!("  (Read<Pos>, Read<Vel>, Read<Mass>): 2 entities, vel_sum=({}, {})", vel_sum.0, vel_sum.1);
         }
 
-        // Read с With-фильтром
+        // Read with a With filter
         {
             type P = QueryParam<(Read<Position>, With<Mass>)>;
             let q = ctx.fetch_unchecked::<P>();
             let count = q.iter().count();
-            assert_eq!(count, 2, "With<Mass> должен отфильтровать до 2 entity");
+            assert_eq!(count, 2, "With<Mass> should filter down to 2 entities");
             println!("  (Read<Pos>, With<Mass>): {} entities", count);
 
             let access = P::access();
@@ -186,7 +186,7 @@ fn test_query_param() {
             println!("  access(): reads components");
         }
 
-        // Write<T> — мутабельный доступ
+        // Write<T> — mutable access
         {
             type P = QueryParam<Write<Position>>;
             let mut q = ctx.fetch_unchecked::<P>();
@@ -197,7 +197,7 @@ fn test_query_param() {
         }
     });
 
-    // Проверяем мутацию
+    // Verify the mutation
     let q = Query::<Read<Position>>::new(&world);
     let first = q.iter().next().unwrap();
     assert!((first.x - 101.0).abs() < 1e-6, "x should be 101.0 after mutation");
@@ -206,13 +206,13 @@ fn test_query_param() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 4: CommandsParam + () пустой
+// TEST 4: CommandsParam + () empty
 // ══════════════════════════════════════════════════════════════
 
 fn test_commands_and_empty() {
     println!("─── TEST 4: CommandsParam + () ───");
 
-    // CommandsParam — проверяем что fetch возвращает &mut Commands
+    // CommandsParam — verify that fetch returns &mut Commands
     {
         let mut world = World::new();
         world.spawn((Position { x: 0.0, y: 0.0 },));
@@ -222,13 +222,13 @@ fn test_commands_and_empty() {
         with_ctx(&mut world, |ctx| {
             type P = CommandsParam;
             let cmds = P::fetch(&ctx);
-            // Просто проверяем что можем вызвать spawn
+            // Just verify that we can call spawn
             cmds.spawn((Position { x: 10.0, y: 10.0 },));
             cmds.spawn((Velocity { x: 1.0, y: 0.0 },));
             println!("  CommandsParam: spawned 2 commands (pending)");
         });
 
-        // Применяем отдельно — избегаем &/&mut конфликта
+        // Apply separately — avoid a &/&mut conflict
         let mut cmds = Commands::new();
         cmds.spawn((Position { x: 10.0, y: 10.0 },));
         cmds.spawn((Velocity { x: 1.0, y: 0.0 },));
@@ -238,12 +238,12 @@ fn test_commands_and_empty() {
         println!("  CommandsParam: {} → {} entities", count_before, world.entity_count());
     }
 
-    // () — пустой набор
+    // () — empty set
     {
         let mut world = World::new();
         with_ctx(&mut world, |ctx| {
             type P = ();
-            ctx.fetch_unchecked::<P>(); // () — фетч ничего не возвращает
+            ctx.fetch_unchecked::<P>(); // () — fetch returns nothing
 
             let access = P::access();
             assert!(access.reads.is_empty());
@@ -256,7 +256,7 @@ fn test_commands_and_empty() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 5: Кортежи 2, 3, 4 элемента
+// TEST 5: Tuples of 2, 3, 4 elements
 // ══════════════════════════════════════════════════════════════
 
 fn test_tuples() {
@@ -269,7 +269,7 @@ fn test_tuples() {
     world.spawn((Position { x: 1.0, y: 2.0 }, Velocity { x: 3.0, y: 4.0 }));
 
     with_ctx(&mut world, |ctx| {
-        // Кортеж 2: ResRead + ResWrite
+        // Tuple 2: ResRead + ResWrite
         {
             type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>);
             let (cfg, mut stats) = ctx.fetch_unchecked::<P>();
@@ -279,7 +279,7 @@ fn test_tuples() {
             println!("  tuple2: cfg.dt={:?}, stats.frame={}", cfg.dt, stats.frame);
         }
 
-        // Кортеж 3: ResRead + Query + Emit
+        // Tuple 3: ResRead + Query + Emit
         {
             type P = (
                 ResRead<PhysicsConfig>,
@@ -300,7 +300,7 @@ fn test_tuples() {
             println!("  tuple3: cfg.gravity={}, entity found, event sent", cfg.gravity);
         }
 
-        // Кортеж 4: ResRead + ResWrite + Query + Commands
+        // Tuple 4: ResRead + ResWrite + Query + Commands
         {
             type P = (
                 ResRead<PhysicsConfig>,
@@ -310,7 +310,7 @@ fn test_tuples() {
             );
             let (cfg, stats, q, _cmds) = ctx.fetch_unchecked::<P>();
             assert!((cfg.dt - 0.016).abs() < 1e-6);
-            assert_eq!(stats.frame, 2); // инкрементирован в tuple2
+            assert_eq!(stats.frame, 2); // incremented in tuple2
             let count = q.iter().count();
             assert!(count >= 1);
             println!("  tuple4: cfg.dt={:?}, frame={}, positions={}", cfg.dt, stats.frame, count);
@@ -321,7 +321,7 @@ fn test_tuples() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 6: SystemParam внутри эксклюзивной системы + Scheduler
+// TEST 6: SystemParam inside an exclusive system + Scheduler
 // ══════════════════════════════════════════════════════════════
 
 fn test_inside_exclusive_system() {
@@ -349,7 +349,7 @@ fn test_inside_exclusive_system() {
                 found += 1;
                 println!("  pos=({},{}), vel=({},{})", pos.x, pos.y, vel.x, vel.y);
             });
-            assert_eq!(found, 2, "должно быть 2 entity с Position+Velocity");
+            assert_eq!(found, 2, "there should be 2 entities with Position+Velocity");
             println!("  [scheduler] cfg.gravity={}, found {} entities", cfg.gravity, found);
         });
     }));
@@ -361,7 +361,7 @@ fn test_inside_exclusive_system() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ТЕСТ 7: access() проверки — все варианты маркеров
+// TEST 7: access() checks — all marker variants
 // ══════════════════════════════════════════════════════════════
 
 fn test_access_descriptors() {
@@ -410,7 +410,7 @@ fn test_access_descriptors() {
     // CommandsParam
     {
         let a = <CommandsParam as SystemParam>::access();
-        // Commands не декларирует компонентных read/write — только структурные изменения
+        // Commands does not declare component read/write — only structural changes
         println!("  CommandsParam: {} reads, {} writes", a.reads.len(), a.writes.len());
     }
 
@@ -424,13 +424,13 @@ fn test_access_descriptors() {
         println!("  (): ALL empty");
     }
 
-    // Merge: tuple из 3
+    // Merge: tuple of 3
     {
         type P = (ResRead<PhysicsConfig>, ResWrite<FrameStats>, Emit<CollisionEvent>);
         let a = P::access();
-        assert!(!a.reads.is_empty(), "должен быть read от ResRead");
-        assert!(!a.writes.is_empty(), "должен быть write от ResWrite");
-        assert!(!a.writes_event.is_empty(), "должен быть write_event от Emit");
+        assert!(!a.reads.is_empty(), "there should be a read from ResRead");
+        assert!(!a.writes.is_empty(), "there should be a write from ResWrite");
+        assert!(!a.writes_event.is_empty(), "there should be a write_event from Emit");
         println!("  tuple merge: {} reads, {} writes, {} write_events",
             a.reads.len(), a.writes.len(), a.writes_event.len());
     }

@@ -1,21 +1,21 @@
 //! Apex ECS — Basic Example
 //!
-//! Демонстрирует все ключевые возможности движка:
+//! Demonstrates all the key capabilities of the engine:
 //! - Resources, Events
 //! - spawn_many (batch API)
 //! - Hybrid Scheduler (ParSystem + FnParSystem + Sequential)
-//! - Bevy-подобные Stages (Startup, PreUpdate, Update, PostUpdate)
-//! - Relations (ChildOf иерархии)
+//! - Bevy-like Stages (Startup, PreUpdate, Update, PostUpdate)
+//! - Relations (ChildOf hierarchies)
 //! - Commands
 //!
-//! Запуск: `cargo run -p apex-examples --example basic --release`
+//! Run: `cargo run -p apex-examples --example basic --release`
 
 use apex_core::prelude::*;
 
 use apex_macros::Component;
 use apex_scheduler::{sys, Scheduler, StageLabel};
 
-// ── Компоненты ────────────────────────────────────────────────
+// ── Components ────────────────────────────────────────────────
 
 #[derive(Component, Clone, Copy, Debug)] struct Position  { x: f32, y: f32 }
 #[derive(Component, Clone, Copy, Debug)] struct Velocity  { x: f32, y: f32 }
@@ -25,7 +25,7 @@ use apex_scheduler::{sys, Scheduler, StageLabel};
 #[derive(Component, Clone, Copy, Debug)] struct Enemy;
 #[derive(Component, Clone, Copy, Debug)] struct Name(pub &'static str);
 
-// ── Ресурсы ───────────────────────────────────────────────────
+// ── Resources ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 struct PhysicsConfig { gravity: f32, dt: f32 }
@@ -37,7 +37,7 @@ struct DeltaTime(f32);
 #[derive(Debug, Default, Clone, Copy)]
 struct FrameStats { frame: u32, total_entities_processed: usize }
 
-// ── События ───────────────────────────────────────────────────
+// ── Events ────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug)]
 struct DamageEvent { target: Entity, amount: f32 }
@@ -101,7 +101,7 @@ system! {
     }
 }
 
-// ── Sequential системы ────────────────────────────────────────
+// ── Sequential systems ────────────────────────────────────────
 
 system! {
     fn damage_apply(
@@ -156,8 +156,8 @@ system! {
     }
 }
 
-// ── Startup-системы ──────────────────────────────────────────
-// Выполняются один раз при первом run().
+// ── Startup systems ──────────────────────────────────────────
+// Executed once on the first run().
 
 system! {
     fn init_resources(
@@ -255,19 +255,19 @@ fn main() {
     let mut sched = Scheduler::new();
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  Startup — выполняется один раз при первом run()       ║
+    // ║  Startup — executed once on the first run()            ║
     // ╚══════════════════════════════════════════════════════════╝
-    // Bare-идентификаторы эксклюзивных system! — единый вход add_systems.
+    // Bare identifiers of exclusive system! — single add_systems entry point.
     sched.add_systems(StageLabel::Startup, (init_resources, spawn_player));
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  PreUpdate — AutoSystem (автовывод доступа)            ║
+    // ║  PreUpdate — AutoSystem (access auto-inference)        ║
     // ╚══════════════════════════════════════════════════════════╝
     sched.add_systems(StageLabel::PreUpdate, sys("movement", movement_system));
-    println!("  [Stage:PreUpdate] MovementSystem зарегистрирован как AutoSystem");
+    println!("  [Stage:PreUpdate] MovementSystem registered as AutoSystem");
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  Update — AutoSystem (параллельные)                    ║
+    // ║  Update — AutoSystem (parallel)                        ║
     // ╚══════════════════════════════════════════════════════════╝
     sched.add_systems(StageLabel::Update, (
         sys("physics", physics_system),
@@ -276,7 +276,7 @@ fn main() {
     ));
 
     // ╔══════════════════════════════════════════════════════════╗
-    // ║  PostUpdate — эксклюзивные системы + явный порядок      ║
+    // ║  PostUpdate — exclusive systems + explicit order       ║
     // ╚══════════════════════════════════════════════════════════╝
     sched.add_systems(StageLabel::PostUpdate, (damage_apply, despawn_dead, stats_update));
     sched.chain(&["damage_apply", "despawn_dead", "stats_update"]).unwrap();
@@ -286,11 +286,11 @@ fn main() {
     println!("\nCompiled plan:\n{}", sched.debug_plan());
     println!("\nVerbose diagnostics:\n{}", sched.debug_plan_verbose());
 
-    // ── Tick 1 (Startup + все стейджи) ───────────────────────
+    // ── Tick 1 (Startup + all stages) ────────────────────────
     println!("\n--- Running tick 1 (Startup + PreUpdate + Update + PostUpdate) ---\n");
     sched.run(&mut world);
 
-    // Находим player и goblin через query (они созданы в startup)
+    // Find player and goblin via query (created in startup)
     let player = Query::<(Entity, Read<Player>)>::new(&world)
         .iter().next().map(|(e, _)| e)
         .expect("Player entity not found");
@@ -307,13 +307,13 @@ fn main() {
     }
     println!("  FrameStats:     {:?}", world.resource::<FrameStats>());
 
-    // ── Tick 2 (без Startup) ─────────────────────────────────
-    // Посылаем события через world.send_event ДО scheduler.run,
-    // чтобы они попали в previous buffer после tick()
+    // ── Tick 2 (without Startup) ─────────────────────────────
+    // Send events via world.send_event BEFORE scheduler.run,
+    // so they land in the previous buffer after tick()
     world.send_event(DamageEvent { target: goblin, amount: 35.0 });
     world.send_event(DamageEvent { target: player, amount: 10.0 });
 
-    println!("\n--- Running tick 2 (без Startup — выполняется только PreUpdate → Update → PostUpdate) ---\n");
+    println!("\n--- Running tick 2 (without Startup — only PreUpdate → Update → PostUpdate run) ---\n");
     world.tick();
     sched.run(&mut world);
 
@@ -353,14 +353,14 @@ fn main() {
     // ── Batch Relations ───────────────────────────────────────
     println!("\n=== Batch Relations (add_relation_batch) ===");
 
-    // Создаём 100 дочерних entity + 1 родитель
+    // Create 100 child entities + 1 parent
     let parent = world.spawn((Name("BatchParent"),));
     let mut children: Vec<Entity> = Vec::with_capacity(100);
     for i in 0..100 {
         children.push(world.spawn((Name("BatchChild"), Position { x: i as f32, y: 0.0 })));
     }
 
-    // add_relation_batch — одна операция вместо 100 поштучных add_relation
+    // add_relation_batch — one operation instead of 100 individual add_relation calls
     let _before = world.entity_count();
     world.add_relation_batch(&children, ChildOf, parent);
     println!(
@@ -370,7 +370,7 @@ fn main() {
         world.entity_count(),
     );
 
-    // Проверяем что relations установлены
+    // Verify that relations are set
     let mut found = 0;
     for &child in &children {
         if world.has_relation(child, ChildOf, parent) {
@@ -379,11 +379,11 @@ fn main() {
     }
     println!("Verified: {}/{} children have ChildOf relation to parent", found, children.len());
 
-    // Проверяем targets_of (субъекты relation ChildOf к parent)
+    // Check targets_of (subjects of the ChildOf relation to parent)
     let direct: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
     println!("targets_of(ChildOf, parent) count: {} (expected 100)", direct.len());
 
-    // Очищаем
+    // Clean up
     world.despawn_recursive(ChildOf, parent);
     println!("despawn_recursive(parent): {} → {} entities", children.len() + 1, world.entity_count());
 

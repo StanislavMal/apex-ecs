@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 // Apex ECS — Performance Benchmark (corrected v2)
-// Запуск: cargo run -p apex-examples --example perf --release
+// Run: cargo run -p apex-examples --example perf --release
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
@@ -8,7 +8,7 @@ use apex_core::access_desc;
 use apex_macros::Component;
 use apex_scheduler::{seq, sys, Scheduler, StageLabel};
 
-// ── Компоненты ─────────────────────────────────────────────────
+// ── Components ─────────────────────────────────────────────────
 
 #[derive(Component, Clone, Copy)] struct Position    { x: f32, y: f32, z: f32 }
 #[derive(Component, Clone, Copy)] struct Velocity    { x: f32, y: f32, z: f32 }
@@ -27,18 +27,18 @@ use apex_scheduler::{seq, sys, Scheduler, StageLabel};
 
 // ── Harness ────────────────────────────────────────────────────
 //
-// Два harness'а:
+// Two harnesses:
 //
 //   bench_with_setup<S, T, F>(label, setup, f)
-//     • setup() → T   : подготовка состояния, не входит в измерение
-//     • f(T)   → u64  : только измеряемый код; возвращает ops
-//     • Warmup: setup()+f() один раз, результат выброшен
-//     • RUNS прогонов, медиана
+//     • setup() → T   : state preparation, not part of the measurement
+//     • f(T)   → u64  : measured code only; returns ops
+//     • Warmup: setup()+f() once, result discarded
+//     • RUNS runs, median
 //
 //   bench_seq_par<S, FS, FP>(label, setup, run_seq, run_par)
-//     • Измеряет frame_time = время одного run()
-//     • setup() → World : свежий мир на каждый прогон
-//     • Печатает SEQ / PAR / speedup
+//     • Measures frame_time = duration of one run()
+//     • setup() → World : fresh world for each run
+//     • Prints SEQ / PAR / speedup
 
 const RUNS: usize = 7;
 
@@ -55,9 +55,9 @@ where
 
     let mut times: Vec<(Duration, u64)> = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
-        let state   = setup();          // не входит в измерение
+        let state   = setup();          // not part of the measurement
         let t0      = Instant::now();
-        let ops     = f(state);         // только это измеряем
+        let ops     = f(state);         // this is the only thing we measure
         let elapsed = t0.elapsed();
         times.push((elapsed, ops));
     }
@@ -88,7 +88,7 @@ where
     FS: FnMut(&mut World),
     FP: FnMut(&mut World),
 {
-    // warmup — оба варианта
+    // warmup — both variants
     { let mut w = setup(); run_seq(&mut w); }
     { let mut w = setup(); run_par(&mut w); }
 
@@ -121,7 +121,7 @@ where
     (seq_ms, par_ms)
 }
 
-// ── Фабрики ────────────────────────────────────────────────────
+// ── Factories ──────────────────────────────────────────────────
 
 fn make_world_3comp(n: usize) -> World {
     let mut world = World::new();
@@ -136,8 +136,8 @@ fn make_world_3comp(n: usize) -> World {
     world
 }
 
-/// Возвращает (World, Vec<Entity>) — Vec нужен для тестов structural changes.
-/// Vec строится через query после spawn, чтобы не платить за него в spawn-тестах.
+/// Returns (World, Vec<Entity>) — the Vec is needed for structural-changes tests.
+/// The Vec is built via a query after spawn so we don't pay for it in spawn tests.
 fn make_world_3comp_with_entities(n: usize) -> (World, Vec<Entity>) {
     let world = make_world_3comp(n);
     let mut entities = Vec::with_capacity(n);
@@ -160,7 +160,7 @@ fn make_world_5comp(n: usize) -> World {
     world
 }
 
-// ── Системы ────────────────────────────────────────────────────
+// ── Systems ────────────────────────────────────────────────────
 
 system! {
     fn move_sys(
@@ -272,7 +272,7 @@ system! {
 fn bench_batch_allocator(n: usize) {
     println!("── Batch Entity Allocator ({n}k entities) ──────────────────────────────────────");
 
-    // setup = () : весь код внутри f(), так как мы измеряем именно спавн
+    // setup = () : all the code is inside f(), since spawning is exactly what we measure
     bench_with_setup(
         &format!("spawn loop      ({n}k) [baseline]"),
         || (),
@@ -389,8 +389,8 @@ fn bench_batch_allocator(n: usize) {
 
 // ── 2. has_relation ────────────────────────────────────────────
 //
-// Исправление: setup строит world + pairs, f() только проверяет.
-// Пары строятся в setup → не входят во время измерения.
+// Fix: setup builds world + pairs, f() only checks.
+// Pairs are built in setup → not part of the measurement.
 
 fn bench_has_relation(n: usize) {
     let checks = n * 1000;
@@ -417,11 +417,11 @@ fn bench_has_relation(n: usize) {
         (world, parents)
     };
 
-    // TRUE: pairs = (child, его настоящий parent)
+    // TRUE: pairs = (child, its actual parent)
     bench_with_setup(
         &format!("has_relation TRUE  ({checks})"),
         || {
-            // setup: строим мир и пары — не входит в измерение
+            // setup: build world and pairs — not part of the measurement
             let (world, parents) = build();
             let pairs: Vec<(Entity, Entity)> = parents.iter()
                 .filter_map(|&p| world.targets_of(ChildOf, p).next().map(|c| (c, p)))
@@ -430,7 +430,7 @@ fn bench_has_relation(n: usize) {
             (world, pairs)
         },
         |(world, pairs)| {
-            // f: только has_relation
+            // f: only has_relation
             let mut found = 0u64;
             for &(child, parent) in &pairs {
                 if world.has_relation(child, ChildOf, parent) { found += 1; }
@@ -440,7 +440,7 @@ fn bench_has_relation(n: usize) {
         },
     );
 
-    // FALSE: pairs = (child, «соседний» parent — всегда неверный)
+    // FALSE: pairs = (child, "neighboring" parent — always wrong)
     bench_with_setup(
         &format!("has_relation FALSE ({checks}, wrong parent, early-exit)"),
         || {
@@ -449,7 +449,7 @@ fn bench_has_relation(n: usize) {
                 .filter_map(|&p| world.targets_of(ChildOf, p).next().map(|c| (c, p)))
                 .take(checks)
                 .collect();
-            // Подменяем parent на соседний — всегда false
+            // Swap parent for the neighbor — always false
             let false_pairs: Vec<(Entity, Entity)> = true_pairs.iter()
                 .enumerate()
                 .map(|(i, &(child, _))| (child, parents[(i + 1) % parents.len()]))
@@ -469,12 +469,12 @@ fn bench_has_relation(n: usize) {
 
 // ── 3. Scheduler throughput ────────────────────────────────────
 //
-// Исправление: World строится в setup(), f() только запускает run().
-// Compile() вынесен за пределы обоих — выполняется один раз.
+// Fix: World is built in setup(), f() only invokes run().
+// Compile() is hoisted outside both — executed once.
 
 fn bench_scheduler_throughput(n: usize) {
-    println!("\n── Scheduler throughput ({n}k entities) — только run() ──────────────────────────");
-    println!("  setup=World, compile вне измерения, f=только sched.run()");
+    println!("\n── Scheduler throughput ({n}k entities) — run() only ──────────────────────────");
+    println!("  setup=World, compile outside measurement, f=sched.run() only");
 
     macro_rules! sched_bench {
         ($label:expr, $build_sched:expr, $world_fn:expr) => {{
@@ -483,7 +483,7 @@ fn bench_scheduler_throughput(n: usize) {
             bench_with_setup(
                 $label,
                 || $world_fn,          // setup → World
-                |mut world: World| {   // f → только run
+                |mut world: World| {   // f → run only
                     sched.run_sequential(&mut world);
                     std::hint::black_box(world.entity_count());
                     (n * 1000) as u64
@@ -504,7 +504,7 @@ fn bench_scheduler_throughput(n: usize) {
         sched.add_systems(StageLabel::Update, sys("hp", hp_sys));
         sched.compile().unwrap();
         let stages = sched.stages().unwrap().len();
-        debug_assert_eq!(stages, 1, "ожидаем 1 Stage без конфликтов");
+        debug_assert_eq!(stages, 1, "expected 1 Stage with no conflicts");
         bench_with_setup(
             &format!("2 AutoSystem no-conflict    ({n}k, 1 Stage)"),
             || make_world_3comp(n * 1000),
@@ -599,7 +599,7 @@ fn bench_compile_overhead() {
         fn run(&mut self, _: SystemContext<'_>) {}
     }
 
-    println!("  --- A. Фиксированный N ---");
+    println!("  --- A. Fixed N ---");
 
     for &n_sys in &[1usize, 5, 10, 20, 50] {
         bench_with_setup(
@@ -648,12 +648,12 @@ fn bench_compile_overhead() {
         },
     );
 
-    println!("\n  --- B. Инкрементальный ---");
-    println!("  Суммарно: compile(1)+compile(2)+...+compile(N), новый Scheduler per прогон");
+    println!("\n  --- B. Incremental ---");
+    println!("  Total: compile(1)+compile(2)+...+compile(N), fresh Scheduler per run");
 
     for &n_sys in &[1usize, 5, 10, 20] {
         bench_with_setup(
-            &format!("инкрементальный {n_sys:>2} sys ({n_sys} compile())"),
+            &format!("incremental {n_sys:>2} sys ({n_sys} compile())"),
             || (),
             |()| {
                 let mut sched = Scheduler::new();
@@ -667,12 +667,12 @@ fn bench_compile_overhead() {
         );
     }
 
-    println!("\n  --- C. batch vs инкрементальный ---");
-    println!("  Теория O(N²): инкрем. должен быть ~3.85x дороже для N=10");
+    println!("\n  --- C. batch vs incremental ---");
+    println!("  O(N²) theory: incremental should be ~3.85x more expensive for N=10");
 
     for &n_sys in &[10usize, 20] {
         bench_with_setup(
-            &format!("batch:          1 compile() для {n_sys} sys"),
+            &format!("batch:          1 compile() for {n_sys} sys"),
             || (),
             |()| {
                 let mut sched = Scheduler::new();
@@ -683,7 +683,7 @@ fn bench_compile_overhead() {
             },
         );
         bench_with_setup(
-            &format!("инкрементальный: {n_sys} compile() для {n_sys} sys"),
+            &format!("incremental: {n_sys} compile() for {n_sys} sys"),
             || (),
             |()| {
                 let mut sched = Scheduler::new();
@@ -698,21 +698,21 @@ fn bench_compile_overhead() {
         println!();
     }
 
-    println!("  --- D. Идемпотентность: только 2й compile() ---");
-    println!("  setup=первый compile(), f=только второй compile()");
+    println!("  --- D. Idempotency: 2nd compile() only ---");
+    println!("  setup=first compile(), f=second compile() only");
 
     for &n_sys in &[5usize, 10, 20] {
         bench_with_setup(
-            &format!("2й compile() (graph_dirty=false, N={n_sys})"),
+            &format!("2nd compile() (graph_dirty=false, N={n_sys})"),
             || {
-                // setup: первый compile — не входит в измерение
+                // setup: first compile — not part of the measurement
                 let mut sched = Scheduler::new();
                 for i in 0..n_sys { sched.add_systems(StageLabel::Update, sys(format!("s{i}"), OtherSys)); }
                 sched.compile().unwrap();
                 sched
             },
             |mut sched: Scheduler| {
-                // f: только второй compile()
+                // f: second compile() only
                 sched.compile().unwrap();
                 std::hint::black_box(sched.stages().unwrap().len());
                 1
@@ -720,7 +720,7 @@ fn bench_compile_overhead() {
         );
     }
 
-    println!("\n  --- E. recompile после изменений ---");
+    println!("\n  --- E. recompile after changes ---");
     println!("  setup=compile(N), f=add+recompile(N+1)");
 
     bench_with_setup(
@@ -760,10 +760,10 @@ fn bench_compile_overhead() {
 // ── 5. Resources ───────────────────────────────────────────────
 
 fn bench_resources(n: usize) {
-    println!("\n── Resources ({n}k операций) ─────────────────────────────────────────────────────");
+    println!("\n── Resources ({n}k operations) ─────────────────────────────────────────────────────");
 
-    // World с ресурсами — мал, всегда горячий в кеше.
-    // setup возвращает World, f только читает/пишет ресурс.
+    // World with resources — small, always hot in cache.
+    // setup returns World, f only reads/writes the resource.
     bench_with_setup(
         &format!("resource::<T>() read      ({n}k)"),
         || {
@@ -818,7 +818,7 @@ fn bench_resources(n: usize) {
 // ── 6. Events ──────────────────────────────────────────────────
 
 fn bench_events(n: usize) {
-    println!("\n── Events ({n}k событий) ─────────────────────────────────────────────────────────");
+    println!("\n── Events ({n}k events) ─────────────────────────────────────────────────────────");
 
     bench_with_setup(
         &format!("send→tick→iter        ({n}k)"),
@@ -865,11 +865,11 @@ fn bench_events(n: usize) {
 
 // ── 7. Query ───────────────────────────────────────────────────
 //
-// Исправления:
-//   • World строится в setup() — не входит во время query
-//   • «0 results» тест измеряет стоимость обхода архетипов без совпадений:
-//     ops = количество entity в мире (платим за обход, даже если 0 подходит)
-//   • Query::new vs world.query (кэш): оба измеряются честно (world готов в setup)
+// Fixes:
+//   • World is built in setup() — not part of the query timing
+//   • The "0 results" test measures the cost of walking archetypes with no matches:
+//     ops = number of entities in the world (we pay for the walk even if 0 match)
+//   • Query::new vs world.query (cache): both measured fairly (world ready in setup)
 
 fn bench_query(n: usize) {
     println!("\n── Query ({n}k entities) ─────────────────────────────────────────────────────────");
@@ -909,28 +909,28 @@ fn bench_query(n: usize) {
         },
     );
 
-    // «0 results»: With<Player> не совпадает ни с одним архетипом.
-    // ops = кол-во entity = стоимость обхода архетипов (реальная работа планировщика).
-    // Не делим на 1 — честный ns/entity для «пустого» запроса.
+    // "0 results": With<Player> matches no archetype.
+    // ops = entity count = cost of walking archetypes (the scheduler's real work).
+    // We don't divide by 1 — an honest ns/entity for an "empty" query.
     bench_with_setup(
-        &format!("Query<With<Player>> 0 results     ({n}k entities, обход архетипов)"),
+        &format!("Query<With<Player>> 0 results     ({n}k entities, archetype walk)"),
         || {
-            // Мир с Player-entity — чтобы архетип существовал, но был отдельным
+            // World with Player entities — so the archetype exists, but is separate
             let mut world = make_world_3comp(n * 1000);
 
-            // Добавляем несколько Player-entity в отдельный архетип
-            // (не совпадающий с запросом Read<Position> + With<Player>
-            //  потому что у них нет Position)
+            // Add a few Player entities in a separate archetype
+            // (not matching the Read<Position> + With<Player> query
+            //  because they have no Position)
             for _ in 0..100 { world.spawn((Player,)); }
             world
         },
         |world: World| {
             let mut c = 0u64;
-            // Запрос: нужны entity с Position И Player — таких нет
+            // Query: entities with both Position AND Player — there are none
             Query::<(Read<Position>, With<Player>)>::new(&world)
                 .for_each(|_, _| { c += 1; });
             std::hint::black_box(c);
-            // ops = кол-во entity в мире (обошли все архетипы)
+            // ops = entity count in the world (we walked every archetype)
             world.entity_count() as u64
         },
     );
@@ -938,18 +938,18 @@ fn bench_query(n: usize) {
 
 // ── 8. Structural changes ──────────────────────────────────────
 //
-// Исправления:
-//   • despawn и Commands тесты: entities строятся в setup() (Vec не входит)
-//   • insert: сначала спавн без Mass (в setup), потом insert Mass (в f)
+// Fixes:
+//   • despawn and Commands tests: entities are built in setup() (Vec excluded)
+//   • insert: first spawn without Mass (in setup), then insert Mass (in f)
 
 fn bench_structural(n: usize) {
-    println!("\n── Structural changes ({n}k entity) ─────────────────────────────────────────────");
+    println!("\n── Structural changes ({n}k entities) ─────────────────────────────────────────────");
 
-    // insert: спавн в setup, insert в f
+    // insert: spawn in setup, insert in f
     bench_with_setup(
-        &format!("insert component  ({n}k) [архетип-переход per entity]"),
+        &format!("insert component  ({n}k) [archetype transition per entity]"),
         || {
-            // setup: спавн без Mass
+            // setup: spawn without Mass
             let mut world = World::new();
 
 
@@ -965,14 +965,14 @@ fn bench_structural(n: usize) {
             (world, entities)
         },
         |(mut world, entities): (World, Vec<Entity>)| {
-            // f: только insert — переход архетипа для каждой entity
+            // f: insert only — archetype transition for each entity
             for &e in &entities { world.insert(e, Mass(1.0)); }
             std::hint::black_box(world.entity_count());
             entities.len() as u64
         },
     );
 
-    // despawn: спавн в setup, despawn в f
+    // despawn: spawn in setup, despawn in f
     bench_with_setup(
         &format!("despawn           ({n}k)"),
         || make_world_3comp_with_entities(n * 1000),
@@ -983,18 +983,18 @@ fn bench_structural(n: usize) {
         },
     );
 
-    // Commands: query в setup (собираем entity), apply в f
+    // Commands: query in setup (gather entities), apply in f
     bench_with_setup(
         &format!("Commands::despawn + apply ({n}k)"),
         || {
             let (world, entities) = make_world_3comp_with_entities(n * 1000);
-            // Собираем команды в setup — они дешёвые (просто Vec::push)
+            // Gather commands in setup — they're cheap (just Vec::push)
             let mut cmds = Commands::with_capacity(n * 1000);
             for &e in &entities { cmds.despawn(e); }
             (world, cmds)
         },
         |(mut world, mut cmds): (World, Commands)| {
-            // f: только apply — реальная работа
+            // f: apply only — the real work
             cmds.apply(&mut world);
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
@@ -1002,19 +1002,19 @@ fn bench_structural(n: usize) {
     );
 }
 
-// ── 9. Параллельный планировщик ────────────────────────────────
+// ── 9. Parallel Scheduler ────────────────────────────────
 
 fn bench_parallel_scheduler(n: usize) {
     println!(
         "\n── Parallel Scheduler — frame time (rayon threads: {}) ─────────",
         rayon::current_num_threads()
     );
-    println!("  Метрика: frame_time = время sched.run() | speedup = seq/par");
-    println!("  compile() в setup() — не входит в измерение");
+    println!("  Metric: frame_time = sched.run() time | speedup = seq/par");
+    println!("  compile() in setup() — not part of the measurement");
 
-    // ── Вспомогательная функция ──────────────────────────────
-    // Принимает готовый скомпилированный Scheduler, прогоняет bench_seq_par.
-    // compile() вызывается один раз в setup — честно.
+    // ── Helper function ──────────────────────────────
+    // Takes a pre-compiled Scheduler, runs bench_seq_par.
+    // compile() is called once in setup — fair.
     fn run_bench(
         label: &str,
         setup: impl FnMut() -> World,
@@ -1022,7 +1022,7 @@ fn bench_parallel_scheduler(n: usize) {
         mut par_sched: Scheduler,
     ) -> (f64, f64)
     where
-        // типы не нужны — замыкания строятся внутри
+        // no type bounds needed — closures are built inside
     {
         bench_seq_par(
             label,
@@ -1032,7 +1032,7 @@ fn bench_parallel_scheduler(n: usize) {
         )
     }
 
-    // ── Строим пары (seq_sched, par_sched) с одинаковым набором систем ──
+    // ── Build pairs (seq_sched, par_sched) with the same set of systems ──
     macro_rules! make_scheds {
         ($($add:expr),+ $(,)?) => {{
             let build = || {
@@ -1045,8 +1045,8 @@ fn bench_parallel_scheduler(n: usize) {
         }};
     }
 
-    // ── Лёгкая нагрузка (memory-bound) ──────────────────────
-    println!("\n  --- Лёгкая нагрузка (memory-bound) ---");
+    // ── Light workload (memory-bound) ──────────────────────
+    println!("\n  --- Light workload (memory-bound) ---");
 
     {
         let (seq, par) = make_scheds!(
@@ -1054,7 +1054,7 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("hp", hp_sys)); }
         );
         bench_seq_par(
-            &format!("2 лёгких системы ({n}k)  Move+Hp"),
+            &format!("2 light systems ({n}k)  Move+Hp"),
             || make_world_5comp(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
@@ -1068,29 +1068,29 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", temp_sys)); },
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", mana_sys)); }
         );
-        // Проверяем 1 Stage
+        // Check for 1 Stage
         debug_assert_eq!(seq.stages().unwrap().len(), 1);
         bench_seq_par(
-            &format!("4 лёгких системы ({n}k)  Move+Hp+Temp+Mana  [1 Stage]"),
+            &format!("4 light systems ({n}k)  Move+Hp+Temp+Mana  [1 Stage]"),
             || make_world_5comp(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Тяжёлая нагрузка — ИЗОЛИРОВАННЫЕ архетипы ────────────
+    // ── Heavy workload — ISOLATED archetypes ────────────
     //
-    // Ключевое исправление: каждая система работает со СВОИМ архетипом.
-    // Это устраняет false sharing кеш-линий между системами.
+    // Key fix: each system works on its OWN archetype.
+    // This eliminates false sharing of cache lines between systems.
     //
-    // Архетип A: Pos + Vel         → heavy_phys_sys (write Pos, write Vel)
-    // Архетип B: Temp              → heavy_temp_sys (write Temp)
-    // Архетип C: Mana              → heavy_mana_sys (write Mana)
+    // Archetype A: Pos + Vel         → heavy_phys_sys (write Pos, write Vel)
+    // Archetype B: Temp              → heavy_temp_sys (write Temp)
+    // Archetype C: Mana              → heavy_mana_sys (write Mana)
     //
-    // Системы не пересекаются ни по компонентам, ни по памяти.
+    // The systems overlap neither in components nor in memory.
 
-    println!("\n  --- Тяжёлая нагрузка (CPU-bound, ИЗОЛИРОВАННЫЕ архетипы) ---");
-    println!("  Архетип A: Pos+Vel → HeavyPhys | Архетип B: Temp → HeavyTemp");
+    println!("\n  --- Heavy workload (CPU-bound, ISOLATED archetypes) ---");
+    println!("  Archetype A: Pos+Vel → HeavyPhys | Archetype B: Temp → HeavyTemp");
 
     let make_isolated_world = |n: usize| {
         let mut world = World::new();
@@ -1099,7 +1099,7 @@ fn bench_parallel_scheduler(n: usize) {
 
 
 
-        // Архетип A: только Pos + Vel (для heavy_phys_sys)
+        // Archetype A: Pos + Vel only (for heavy_phys_sys)
         world.spawn_many_silent(n, |i| {
             let f = i as f32;
             (
@@ -1107,11 +1107,11 @@ fn bench_parallel_scheduler(n: usize) {
                 Velocity { x: 1.0, y: 0.5, z: 0.0 },
             )
         });
-        // Архетип B: только Temp (для heavy_temp_sys)
+        // Archetype B: Temp only (for heavy_temp_sys)
         world.spawn_many_silent(n, |i| {
             (Temperature(20.0 + i as f32 * 0.001),)
         });
-        // Архетип C: только Mana (для heavy_mana_sys)
+        // Archetype C: Mana only (for heavy_mana_sys)
         world.spawn_many_silent(n, |i| {
             (Mana { current: i as f32 % 100.0, max: 100.0 },)
         });
@@ -1124,7 +1124,7 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         bench_seq_par(
-            &format!("2 CPU-bound, изолированные архетипы ({n}k each)"),
+            &format!("2 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
@@ -1138,19 +1138,19 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         bench_seq_par(
-            &format!("3 CPU-bound, изолированные архетипы ({n}k each)"),
+            &format!("3 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Для сравнения: те же системы, общий архетип ───────────
+    // ── For comparison: the same systems, shared archetype ───────────
     //
-    // Разница с изолированным тестом показывает стоимость false sharing.
+    // The difference vs the isolated test shows the cost of false sharing.
 
-    println!("\n  --- Тяжёлая нагрузка (CPU-bound, ОБЩИЙ архетип — для сравнения) ---");
-    println!("  Все компоненты в одном архетипе → false sharing кеш-линий");
+    println!("\n  --- Heavy workload (CPU-bound, SHARED archetype — for comparison) ---");
+    println!("  All components in one archetype → false sharing of cache lines");
 
     {
         let (seq, par) = make_scheds!(
@@ -1158,7 +1158,7 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", heavy_temp_sys)); }
         );
         bench_seq_par(
-            &format!("2 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
+            &format!("2 CPU-bound, shared archetype Pos+Vel+Temp+Mana ({n}k)"),
             || make_world_5comp(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
@@ -1172,25 +1172,25 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", heavy_mana_sys)); }
         );
         bench_seq_par(
-            &format!("3 CPU-bound, общий архетип Pos+Vel+Temp+Mana ({n}k)"),
+            &format!("3 CPU-bound, shared archetype Pos+Vel+Temp+Mana ({n}k)"),
             || make_world_5comp(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Сравнение for_each vs par_for_each ──────────────────────────────
+    // ── for_each vs par_for_each comparison ──────────────────────────────
     //
-    // Ключевой тест: проверяем, даёт ли par_for_each (intra-system
-    // parallelism) прирост по сравнению с for_each (sequential)
-    // в межсистемном режиме.
+    // Key test: check whether par_for_each (intra-system
+    // parallelism) yields a gain over for_each (sequential)
+    // in the inter-system regime.
     //
-    // Системы: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
+    // Systems: HeavyPhysParSys (par_for_each) + HeavyTempParSys (par_for_each)
     // vs heavy_phys_sys (for_each) + heavy_temp_sys (for_each)
     //
-    // в то время как for_each использует только 1 ядро на систему.
+    // whereas for_each uses only 1 core per system.
 
-    println!("\n  --- Сравнение for_each vs par_for_each (межсистемный) ---");
+    println!("\n  --- for_each vs par_for_each comparison (inter-system) ---");
 
     struct HeavyPhysParSys;
     impl AutoSystem for HeavyPhysParSys {
@@ -1250,7 +1250,7 @@ fn bench_parallel_scheduler(n: usize) {
         }
     }
 
-    // Тест 1: for_each vs par_for_each, изолированные архетипы, 2 системы
+    // Test 1: for_each vs par_for_each, isolated archetypes, 2 systems
     {
         let (seq_sched, par_sched) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
@@ -1261,20 +1261,20 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("temp", HeavyTempParSys).par_for_each_used()); },
         );
         bench_seq_par(
-            &format!("[for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
+            &format!("[for_each] 2 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq_sched; move |w| s.run_sequential(w) },
             { let mut s = par_sched; move |w| s.run(w) },
         );
         bench_seq_par(
-            &format!("[par_for_each] 2 CPU-bound, изол. архетипы ({n}k each)"),
+            &format!("[par_for_each] 2 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq_par_sched; move |w| s.run_sequential(w) },
             { let mut s = par_par_sched; move |w| s.run(w) },
         );
     }
 
-    // Тест 2: for_each vs par_for_each, изолированные архетипы, 3 системы
+    // Test 2: for_each vs par_for_each, isolated archetypes, 3 systems
     {
         let (seq_sched, par_sched) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("phys", heavy_phys_sys)); },
@@ -1287,32 +1287,32 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("mana", HeavyManaParSys).par_for_each_used()); },
         );
         bench_seq_par(
-            &format!("[for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
+            &format!("[for_each] 3 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq_sched; move |w| s.run_sequential(w) },
             { let mut s = par_sched; move |w| s.run(w) },
         );
         bench_seq_par(
-            &format!("[par_for_each] 3 CPU-bound, изол. архетипы ({n}k each)"),
+            &format!("[par_for_each] 3 CPU-bound, isolated archetypes ({n}k each)"),
             || make_isolated_world(n * 1000),
             { let mut s = seq_par_sched; move |w| s.run_sequential(w) },
             { let mut s = par_par_sched; move |w| s.run(w) },
         );
     }
 
-    // ── Максимальный межсистемный параллелизм: N систем = N ядер ──
+    // ── Maximum inter-system parallelism: N systems = N cores ──
     //
-    // Ключевой тест: создаём 12 систем, каждая пишет в СВОЙ уникальный
-    // компонент. Каждая система работает со своим архетипом.
-    // Это позволяет измерить максимальный achievable speedup
-    // межсистемного параллелизма без конкуренции за данные.
+    // Key test: create 12 systems, each writing to its OWN unique
+    // component. Each system works on its own archetype.
+    // This lets us measure the maximum achievable speedup
+    // of inter-system parallelism without data contention.
     //
-    // Если speedup << 8x — проблема в планировщике (rayon::par_iter),
-    // а не в SubWorld или кеш-конкуренции.
+    // If speedup << 8x — the problem is in the scheduler (rayon::par_iter),
+    // not in SubWorld or cache contention.
 
-    println!("\n  --- Максимальный межсистемный параллелизм: 12 систем × 1 компонент ---");
+    println!("\n  --- Maximum inter-system parallelism: 12 systems × 1 component ---");
 
-    // ── 12 уникальных компонентов ─────────────────────────────
+    // ── 12 unique components ─────────────────────────────
     #[derive(Component, Clone, Copy)] struct C0(f32);
     #[derive(Component, Clone, Copy)] struct C1(f32);
     #[derive(Component, Clone, Copy)] struct C2(f32);
@@ -1326,7 +1326,7 @@ fn bench_parallel_scheduler(n: usize) {
     #[derive(Component, Clone, Copy)] struct C10(f32);
     #[derive(Component, Clone, Copy)] struct C11(f32);
 
-    // ── 12 систем, каждая пишет в свой компонент ──────────────
+    // ── 12 systems, each writing to its own component ──────────────
     macro_rules! make_solo_sys {
         ($name:ident, $comp:ty) => {
             system! {
@@ -1354,7 +1354,7 @@ fn bench_parallel_scheduler(n: usize) {
     make_solo_sys!(SoloSys10, C10);
     make_solo_sys!(SoloSys11, C11);
 
-    // ── Мир с 12 архетипами, по одному компоненту в каждом ────
+    // ── World with 12 archetypes, one component in each ────
     let make_12arch_world = |n: usize| {
         let mut world = World::new();
 
@@ -1385,21 +1385,21 @@ fn bench_parallel_scheduler(n: usize) {
         world
     };
 
-    // ── Тест 1: 2 системы ─────────────────────────────────────
+    // ── Test 1: 2 systems ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); }
         );
         bench_seq_par(
-            &format!("2 solo-системы, 2 архетипа ({n}k each)"),
+            &format!("2 solo systems, 2 archetypes ({n}k each)"),
             || make_12arch_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Тест 2: 4 системы ─────────────────────────────────────
+    // ── Test 2: 4 systems ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
@@ -1408,14 +1408,14 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); }
         );
         bench_seq_par(
-            &format!("4 solo-системы, 4 архетипа ({n}k each)"),
+            &format!("4 solo systems, 4 archetypes ({n}k each)"),
             || make_12arch_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Тест 3: 8 систем ─────────────────────────────────────
+    // ── Test 3: 8 systems ────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
@@ -1428,14 +1428,14 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", SoloSys7)); }
         );
         bench_seq_par(
-            &format!("8 solo-систем, 8 архетипов ({n}k each)"),
+            &format!("8 solo systems, 8 archetypes ({n}k each)"),
             || make_12arch_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Тест 4: 12 систем (полная загрузка всех ядер) ─────────
+    // ── Test 4: 12 systems (full load on all cores) ──────────
     {
         let (seq, par) = make_scheds!(
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
@@ -1452,15 +1452,15 @@ fn bench_parallel_scheduler(n: usize) {
             |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s11", SoloSys11)); }
         );
         bench_seq_par(
-            &format!("12 solo-систем, 12 архетипов ({n}k each)"),
+            &format!("12 solo systems, 12 archetypes ({n}k each)"),
             || make_12arch_world(n * 1000),
             { let mut s = seq; move |w| s.run_sequential(w) },
             { let mut s = par; move |w| s.run(w) },
         );
     }
 
-    // ── Pipeline с барьером ───────────────────────────────────
-    println!("\n  --- Pipeline с Sequential барьером ---");
+    // ── Pipeline with a barrier ───────────────────────────────
+    println!("\n  --- Pipeline with a Sequential barrier ---");
 
     {
         let build_sched = || {
@@ -1499,12 +1499,12 @@ fn bench_parallel_scheduler(n: usize) {
     }
 }
 
-// ── 10. Intra-system параллелизм ───────────────────────────────
+// ── 10. Intra-system parallelism ───────────────────────────────
 
 fn bench_intra_system_parallel(n: usize) {
     println!("\n── Intra-system Parallelism — par_for_each ────────────────────────────────────");
     println!("  rayon threads: {}", rayon::current_num_threads());
-    println!("  setup=World, f=только run() | speedup = seq_frame / par_frame");
+    println!("  setup=World, f=run() only | speedup = seq_frame / par_frame");
 
     let make_multiarch = || {
         let quarter = n * 25;
@@ -1609,7 +1609,7 @@ fn bench_intra_system_parallel(n: usize) {
         }
     }
 
-    println!("  --- Лёгкая нагрузка (memory-bound) ---");
+    println!("  --- Light workload (memory-bound) ---");
     bench_seq_par(
         &format!("for_each vs par_for_each ({n}k, 4 archetypes, sqrt)"),
         make_multiarch,
@@ -1623,11 +1623,11 @@ fn bench_intra_system_parallel(n: usize) {
             let mut s = Scheduler::new();
             s.add_systems(StageLabel::Update, sys("par", LightParSys));
             s.compile().unwrap();
-            s.run_sequential(world); // intra-sys par через rayon внутри системы
+            s.run_sequential(world); // intra-sys par via rayon inside the system
         },
     );
 
-    println!("  --- Тяжёлая нагрузка (CPU-bound: atan2 + cos) ---");
+    println!("  --- Heavy workload (CPU-bound: atan2 + cos) ---");
     bench_seq_par(
         &format!("for_each vs par_for_each ({n}k, 4 archetypes, atan2+cos)"),
         make_multiarch,
@@ -1645,7 +1645,7 @@ fn bench_intra_system_parallel(n: usize) {
         },
     );
 
-    println!("  Note: speedup при CPU-bound и кол-во entity >> max_chunk_size");
+    println!("  Note: speedup when CPU-bound and entity count >> max_chunk_size");
 }
 
 // ── main ───────────────────────────────────────────────────────
@@ -1657,7 +1657,7 @@ fn main() {
 
     println!("=== Apex ECS — Performance Benchmark v2 ===");
     println!("Build: {}",
-        if cfg!(debug_assertions) { "DEBUG ⚠  (запускайте с --release)" }
+        if cfg!(debug_assertions) { "DEBUG ⚠  (run with --release)" }
         else                      { "RELEASE ✓" }
     );
     println!("Mode:  PARALLEL (rayon threads: {})", rayon::current_num_threads());
@@ -1669,7 +1669,7 @@ fn main() {
     }
     println!();
 
-    const N: usize = 100; // → N*1000 entity в большинстве тестов
+    const N: usize = 100; // → N*1000 entities in most tests
 
     bench_batch_allocator(N);
     bench_has_relation(N);
@@ -1682,13 +1682,13 @@ fn main() {
     bench_parallel_scheduler(N);
     bench_intra_system_parallel(N);
 
-    println!("\n── Методология ─────────────────────────────────────────────────────────────────");
-    println!("  • {} прогонов на тест, медиана", RUNS);
-    println!("  • warmup = 1 прогон перед измерением (не входит в медиану)");
-    println!("  • bench_with_setup: setup() не входит во время — только f()");
-    println!("  • bench_seq_par: frame_time = время одного run(), speedup = seq/par");
-    println!("  • has_relation: pairs строятся в setup(), f() — только проверки");
-    println!("  • scheduler throughput: World в setup(), f() — только sched.run()");
-    println!("  • structural: spawn/entities в setup(), f() — только insert/despawn/apply");
-    println!("  • query «0 results»: ops = entity_count (стоимость обхода архетипов)");
+    println!("\n── Methodology ─────────────────────────────────────────────────────────────────");
+    println!("  • {} runs per test, median", RUNS);
+    println!("  • warmup = 1 run before measurement (not counted in the median)");
+    println!("  • bench_with_setup: setup() is excluded from timing — only f()");
+    println!("  • bench_seq_par: frame_time = time of one run(), speedup = seq/par");
+    println!("  • has_relation: pairs are built in setup(), f() = checks only");
+    println!("  • scheduler throughput: World in setup(), f() = sched.run() only");
+    println!("  • structural: spawn/entities in setup(), f() = insert/despawn/apply only");
+    println!("  • query \"0 results\": ops = entity_count (cost of scanning archetypes)");
 }

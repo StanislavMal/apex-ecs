@@ -1,23 +1,23 @@
 //! Apex ECS — Event Pipeline Example
 //!
-//! Демонстрирует конвейерную обработку событий:
+//! Demonstrates pipelined event processing:
 //! Producer → Transformer → [Consumer, Consumer (parallel)].
 //!
-//! Сценарий: CollisionSystem эмитирует DamageEvent → ArmorSystem применяет
-//! броню (модифицирует Health напрямую) и перевыпускает событие →
-//! HealthSystem читает Health (изменённый ArmorSystem в том же кадре) +
-//! SoundSystem читает события.
+//! Scenario: CollisionSystem emits DamageEvent → ArmorSystem applies
+//! armor (modifies Health directly) and re-emits the event →
+//! HealthSystem reads Health (modified by ArmorSystem in the same frame) +
+//! SoundSystem reads the events.
 //!
-//! ## Как работает пайплайн с per-Stage flush (v0.1.0)
+//! ## How the pipeline works with per-Stage flush (v0.1.0)
 //!
-//! Конвейер гарантирует порядок выполнения: collision → armor → [health, sound].
-//! Scheduler автоматически флашит события после каждого Stage,
-//! поэтому события, отправленные на Stage N, видны на Stage N+1 того же кадра.
+//! The pipeline guarantees execution order: collision → armor → [health, sound].
+//! The Scheduler automatically flushes events after each Stage,
+//! so events sent at Stage N are visible at Stage N+1 of the same frame.
 //!
-//! - ArmorSystem модифицирует Health (компонент) — изменения видны health
-//!   в том же кадре.
-//! - ArmorSystem перевыпускает DamageEvent → SoundSystem увидит его
-//!   на следующем Stage того же кадра (per-stage flush).
+//! - ArmorSystem modifies Health (a component) — changes are visible to health
+//!   in the same frame.
+//! - ArmorSystem re-emits DamageEvent → SoundSystem will see it
+//!   at the next Stage of the same frame (per-stage flush).
 //!
 //! cargo run -p apex-examples --example event_pipeline --release
 
@@ -25,7 +25,7 @@ use apex_core::prelude::*;
 use apex_macros::Component;
 use apex_scheduler::{Scheduler, StageLabel, sys};
 
-// ── Компоненты ─────────────────────────────────────────────────
+// ── Components ─────────────────────────────────────────────────
 
 #[derive(Component, Clone, Copy, Debug)]
 struct Collider;
@@ -39,7 +39,7 @@ struct Health {
 #[derive(Component, Clone, Copy, Debug)]
 struct Armor(f32);
 
-// ── Событие ────────────────────────────────────────────────────
+// ── Event ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DamageEvent {
@@ -63,8 +63,8 @@ system! {
 }
 
 // ── Transformer: ArmorSystem ───────────────────────────────────
-// Читает DamageEvent, МОДИФИЦИРУЕТ Health (компонент), перевыпускает
-// модифицированное событие для следующих этапов.
+// Reads DamageEvent, MODIFIES Health (a component), re-emits the
+// modified event for the following stages.
 
 system! {
     fn armor_system(
@@ -103,7 +103,7 @@ system! {
 }
 
 // ── Consumer: HealthSystem ─────────────────────────────────────
-// Просто читает Health — видит изменения ArmorSystem того же кадра.
+// Simply reads Health — sees ArmorSystem's changes from the same frame.
 
 system! {
     fn health_system(
@@ -134,13 +134,13 @@ system! {
 fn main() {
     println!("=== Apex ECS — Event Pipeline Example ===\n");
     println!("Pipeline: CollisionSystem → ArmorSystem → [HealthSystem, SoundSystem]\n");
-    println!("Техника: трансформер (ArmorSystem) модифицирует Health (компонент),\n\
-              поэтому изменения видны HealthSystem в том же кадре.\n");
+    println!("Technique: the transformer (ArmorSystem) modifies Health (a component),\n\
+              so the changes are visible to HealthSystem in the same frame.\n");
 
     let mut world = World::new();
     world.add_event::<DamageEvent>();
 
-    // Два персонажа: игрок с бронёй, враг без брони
+    // Two characters: a player with armor, an enemy without armor
     let _player = world.spawn((Collider, Health { current: 100.0, max: 100.0 }, Armor(50.0)));
     let _enemy  = world.spawn((Collider, Health { current: 80.0, max: 80.0 },  Armor(0.0)));
 
@@ -155,7 +155,7 @@ fn main() {
         sys("sound",     sound_system),
     ));
 
-    // Конвейер событий: явный порядок выполнения
+    // Event pipeline: explicit execution order
     Scheduler::event_pipeline::<DamageEvent>()
         .produced_by("collision")
         .transformed_by("armor")
@@ -168,49 +168,49 @@ fn main() {
     println!("--- Execution plan ---\n{}", sched.debug_plan());
 
     // ── Tick 1 ───────────────────────────────────────────────────
-    // tick() инкрементирует счётчик, sched.run() автоматически
-    // флашит события после каждого Stage.
-    //   1. Collision пишет DamageEvent (pending буфер)
-    //   2. Armor читает из events (пока пусто), пишет в Health
-    //   3. HealthSystem читает Health после Armor
-    //   4. SoundSystem читает из events (пусто)
+    // tick() increments the counter, sched.run() automatically
+    // flushes events after each Stage.
+    //   1. Collision writes DamageEvent (pending buffer)
+    //   2. Armor reads from events (empty so far), writes to Health
+    //   3. HealthSystem reads Health after Armor
+    //   4. SoundSystem reads from events (empty)
     //
-    // На Tick 1: коллизий ещё не генерировалось, буферы пусты.
+    // On Tick 1: no collisions generated yet, buffers are empty.
 
-    println!("\n--- Tick 1 (стартовый, буфер пуст) ---\n");
+    println!("\n--- Tick 1 (initial, buffer empty) ---\n");
     world.tick();
     sched.run(&mut world);
 
     // ── Tick 2 ───────────────────────────────────────────────────
-    // sched.run() на Tick 1 сгенерировал события, которые стали
-    // доступны в events-буфере после per-stage flush.
-    // Теперь Armor видит события от Collision с предыдущего Stage.
-    //   1. Collision пишет 3x DamageEvent (pending)
-    //   2. Armor читает 3 события, модифицирует Health, пишет 3 reduced
-    //   3. HealthSystem читает Health — видит ПОНИЖЕННЫЙ урон
-    //   4. SoundSystem читает события из предыдущего Stage
+    // sched.run() on Tick 1 generated events that became
+    // available in the events buffer after the per-stage flush.
+    // Now Armor sees the events from Collision at the previous Stage.
+    //   1. Collision writes 3x DamageEvent (pending)
+    //   2. Armor reads 3 events, modifies Health, writes 3 reduced
+    //   3. HealthSystem reads Health — sees the REDUCED damage
+    //   4. SoundSystem reads events from the previous Stage
 
-    println!("\n--- Tick 2 (Armor модифицирует Health, Sound читает оригиналы) ---\n");
+    println!("\n--- Tick 2 (Armor modifies Health, Sound reads originals) ---\n");
     world.tick();
     sched.run(&mut world);
 
     // ── Tick 3 ───────────────────────────────────────────────────
-    // В events-буфере теперь: original от Collision + reduced от Armor
-    //   1. Collision пишет 3x DamageEvent
-    //   2. Armor читает 6 событий, модифицирует Health, пишет 6 reduced
-    //   3. HealthSystem читает Health — пониженный урон
-    //   4. SoundSystem читает 6 событий
+    // The events buffer now holds: originals from Collision + reduced from Armor
+    //   1. Collision writes 3x DamageEvent
+    //   2. Armor reads 6 events, modifies Health, writes 6 reduced
+    //   3. HealthSystem reads Health — reduced damage
+    //   4. SoundSystem reads 6 events
 
-    println!("\n--- Tick 3 (Sound видит оригиналы + редуцированные Tick2) ---\n");
+    println!("\n--- Tick 3 (Sound sees originals + reduced from Tick2) ---\n");
     world.tick();
     sched.run(&mut world);
 
-    // ── Итоги ────────────────────────────────────────────────────
-    println!("\n=== Итоги ===");
-    println!(" - Порядок выполнения: collision → armor → [health, sound] (гарантирован pipeline)");
-    println!(" - Scheduler флашит события после каждого Stage, поэтому события видны в том же кадре");
-    println!(" - ArmorSystem модифицирует Health — HealthSystem читает изменённые значения в том же кадре");
-    println!(" - health и sound в одном Stage — выполняются параллельно (нет пересечения доступа)");
+    // ── Summary ──────────────────────────────────────────────────
+    println!("\n=== Summary ===");
+    println!(" - Execution order: collision → armor → [health, sound] (guaranteed by pipeline)");
+    println!(" - The Scheduler flushes events after each Stage, so events are visible in the same frame");
+    println!(" - ArmorSystem modifies Health — HealthSystem reads the changed values in the same frame");
+    println!(" - health and sound in the same Stage — run in parallel (no access overlap)");
 
     println!("\nEntities: {}", world.entity_count());
 }

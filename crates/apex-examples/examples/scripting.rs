@@ -1,28 +1,28 @@
 //! apex-examples: Lua scripting integration
 //!
-//! Демонстрирует:
-//! - `#[derive(Scriptable)]` — регистрация компонентов для скриптов
-//! - `ScriptEngine::register_component::<T>()` — подключение к движку
-//! - `ScriptEngine::load_script_str()` — встроенные скрипты
-//! - `ScriptEngine::with_dir()` — загрузка из файлов + хот-релоад
-//! - Game loop с `poll_hot_reload()` + `run()`
-//! - Vec, HashMap, C-like enum в компонентах
+//! Demonstrates:
+//! - `#[derive(Scriptable)]` — registering components for scripts
+//! - `ScriptEngine::register_component::<T>()` — hooking into the engine
+//! - `ScriptEngine::load_script_str()` — inline scripts
+//! - `ScriptEngine::with_dir()` — loading from files + hot reload
+//! - Game loop with `poll_hot_reload()` + `run()`
+//! - Vec, HashMap, C-like enum in components
 //!
-//! Запуск:
+//! Run:
 //!   cargo run -p apex-examples --example scripting
 
 use std::collections::HashMap;
 use apex_core::prelude::*;
 use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 
-// ── Компоненты ─────────────────────────────────────────────────────────────
+// ── Components ──────────────────────────────────────────────────────────────
 //
-// #[derive(Scriptable)] генерирует ScriptableRegistrar:
-//   - Position.new(x, y) конструктор в Lua
-//   - query({"Read:Position"}) распознаёт компонент
-//   - entity.position.x читается/пишется через Lua таблицу
-//   - Vec<T> → Lua таблица, HashMap<String, V> → Lua таблица
-//   - C-like enum → таблица-неймспейс (TileKind.Floor = 0)
+// #[derive(Scriptable)] generates a ScriptableRegistrar:
+//   - Position.new(x, y) constructor in Lua
+//   - query({"Read:Position"}) recognizes the component
+//   - entity.position.x is read/written through a Lua table
+//   - Vec<T> → Lua table, HashMap<String, V> → Lua table
+//   - C-like enum → namespace table (TileKind.Floor = 0)
 
 #[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Position { x: f32, y: f32 }
@@ -33,61 +33,61 @@ struct Velocity { x: f32, y: f32 }
 #[derive(Component, Clone, Copy, Debug, Scriptable)]
 struct Health { current: f32, max: f32 }
 
-// Компонент с Vec<String> — конвертируется в Lua таблицу
+// Component with Vec<String> — converted to a Lua table
 #[derive(Component, Clone, Debug, Scriptable)]
 struct Tags {
     list: Vec<String>,
 }
 
-// Компонент с HashMap<String, f32> — конвертируется в Lua таблицу
+// Component with HashMap<String, f32> — converted to a Lua table
 #[derive(Component, Clone, Debug, Scriptable)]
 struct Stats {
     values: HashMap<String, f32>,
 }
 
-// C-like enum — конвертируется в Lua таблицу-неймспейс
+// C-like enum — converted to a Lua namespace table
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq, Scriptable)]
 enum TileKind { Floor, Wall, Water }
 
-// ── Скрипт ────────────────────────────────────────────────────────────────
+// ── Script ──────────────────────────────────────────────────────────────────
 
 const GAME_SCRIPT: &str = r#"
 function run()
     local dt = delta_time()
 
-    -- Движение: Position += Velocity * dt
+    -- Movement: Position += Velocity * dt
     for entity in query({"Read:Velocity", "Write:Position"}) do
         entity.position.x = entity.position.x + entity.velocity.x * dt
         entity.position.y = entity.position.y + entity.velocity.y * dt
         commit(entity)
     end
 
-    -- Урон по HP
+    -- Damage over HP
     for entity in query({"Write:Health"}) do
         entity.health.current = entity.health.current - 0.5 * dt
         commit(entity)
     end
 
-    -- Чтение Vec<String> из компонента Tags
+    -- Reading Vec<String> from the Tags component
     for entity in query({"Read:Tags"}) do
         print("Entity " .. entity.entity .. " tags: " .. tostring(entity.tags.list))
     end
 
-    -- Чтение HashMap<String, f32> из компонента Stats
+    -- Reading HashMap<String, f32> from the Stats component
     for entity in query({"Read:Stats"}) do
         if entity.stats.values["hp"] > 50.0 then
             print("Entity " .. entity.entity .. " has high HP")
         end
     end
 
-    -- Сравнение C-like enum (TileKind = таблица-неймспейс)
+    -- Comparing a C-like enum (TileKind = namespace table)
     for entity in query({"Read:TileKind"}) do
         if entity.tilekind == TileKind.Wall then
             print("Entity " .. entity.entity .. " is a wall")
         end
     end
 
-    -- Спавн если мало entity
+    -- Spawn if there are few entities
     if entity_count() < 5 then
         spawn_entity({
             position = Position.new(0.0, 0.0),
@@ -100,7 +100,7 @@ function run()
         print("Spawned entity, total: " .. entity_count())
     end
 
-    -- Деспавн мёртвых
+    -- Despawn the dead
     for entity in query({"Read:Health"}) do
         if entity.health.current <= 0.0 then
             despawn(entity.entity)
@@ -110,19 +110,19 @@ end
 "#;
 
 fn main() {
-    // Простой stderr-логгер для наглядности
+    // Simple stderr logger for clarity
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
 
     println!("=== Apex ECS — Lua Scripting ===\n");
 
-    // ── Мир + ScriptEngine ──────────────────────────────────────
+    // ── World + ScriptEngine ────────────────────────────────────
 
     let mut world = World::new();
     let mut engine = ScriptEngine::new();
 
-    // Единая регистрация: и в ECS, и в ScriptEngine
+    // Single registration: both in the ECS and in the ScriptEngine
     world.register_scriptable::<Position>(&mut engine);
     world.register_scriptable::<Velocity>(&mut engine);
     world.register_scriptable::<Health>(&mut engine);
@@ -130,7 +130,7 @@ fn main() {
     world.register_scriptable::<Stats>(&mut engine);
     world.register_scriptable::<TileKind>(&mut engine);
 
-    // Создаём несколько entity вручную
+    // Create a few entities manually
     world.spawn((
         Position { x: 0.0,  y: 0.0 },
         Velocity { x: 1.0,  y: 0.5 },
@@ -142,45 +142,45 @@ fn main() {
         Health   { current: 50.0,  max: 50.0  },
     ));
 
-    println!("Начальное количество entity: {}", world.entity_count());
+    println!("Initial entity count: {}", world.entity_count());
 
-    // Загружаем встроенный скрипт
+    // Load the inline script
     engine.set_auto_commit(true);
     engine.load_script_str("game", GAME_SCRIPT)
-        .expect("ошибка компиляции скрипта");
+        .expect("script compilation error");
 
-    println!("Скрипты загружены: {:?}", engine.script_names().collect::<Vec<_>>());
-    println!("Активный скрипт: '{}'", engine.active_script());
+    println!("Scripts loaded: {:?}", engine.script_names().collect::<Vec<_>>());
+    println!("Active script: '{}'", engine.active_script());
 
-    // ── Game loop (5 тиков) ───────────────────────────────────────
+    // ── Game loop (5 ticks) ───────────────────────────────────────
 
     for tick in 1..=5 {
-        println!("\n--- Тик {} ---", tick);
+        println!("\n--- Tick {} ---", tick);
 
-        // В реальной игре: engine.poll_hot_reload();
+        // In a real game: engine.poll_hot_reload();
         engine.run(0.016, &mut world);
         world.tick();
 
-        println!("Entity после тика: {}", world.entity_count());
+        println!("Entities after tick: {}", world.entity_count());
     }
 
-    // ── Вариант B: хот-релоад из директории ──────────────────────
+    // ── Variant B: hot reload from a directory ───────────────────
     //
-    // В реальной игре:
+    // In a real game:
     //
     //   let mut engine = ScriptEngine::with_dir(Path::new("scripts/"));
     //   engine.register_component::<Position>(&world);
-    //   engine.load_scripts().expect("ошибка загрузки скриптов");
+    //   engine.load_scripts().expect("script loading error");
     //
     //   loop {
-    //       engine.poll_hot_reload();          // проверяет изменения файлов
-    //       engine.run(dt, &mut world);        // выполняет function run()
+    //       engine.poll_hot_reload();          // checks for file changes
+    //       engine.run(dt, &mut world);        // runs function run()
     //       world.tick();
     //   }
     //
-    // При сохранении .lua файла в редакторе — скрипт перезагружается
-    // автоматически без перезапуска игры.
+    // When a .lua file is saved in the editor, the script is reloaded
+    // automatically without restarting the game.
 
-    println!("\n=== Завершено ===");
-    println!("Итоговое количество entity: {}", world.entity_count());
+    println!("\n=== Done ===");
+    println!("Final entity count: {}", world.entity_count());
 }

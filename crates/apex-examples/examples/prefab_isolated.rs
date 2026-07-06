@@ -1,21 +1,21 @@
 //! apex-examples: Prefabs + EntityTemplate + IsolatedWorld + WorldBridge
 //!
-//! Демонстрирует четыре ключевые возможности Apex ECS:
+//! Demonstrates four key capabilities of Apex ECS:
 //!
-//! 1. **PrefabManifest / PrefabLoader** — загрузка entity из JSON-префаба
-//! 2. **EntityTemplate** — программный шаблон со спавном через `spawn_from_template()`
-//! 3. **IsolatedWorld** — изолированный мир с собственным Scheduler для AI-симуляции
-//! 4. **CloneableBridge** — коммуникация между основным миром и IsolatedWorld
+//! 1. **PrefabManifest / PrefabLoader** — loading an entity from a JSON prefab
+//! 2. **EntityTemplate** — a programmatic template spawned via `spawn_from_template()`
+//! 3. **IsolatedWorld** — an isolated world with its own Scheduler for AI simulation
+//! 4. **CloneableBridge** — communication between the main world and IsolatedWorld
 //!
 //! ```ignore
 //! cargo run --example prefab_isolated
 //! ```
 //!
-//! Сценарий:
-//! - Создаётся основной мир с NPC (enemy, player) через префабы и шаблоны
-//! - Запускается IsolatedWorld с AI-системой для врагов
-//! - CloneableBridge синхронизирует события из IsolatedWorld в основной мир
-//! - После тика основной мир печатает состояние
+//! Scenario:
+//! - A main world is created with NPCs (enemy, player) via prefabs and templates
+//! - An IsolatedWorld is started with an AI system for the enemies
+//! - CloneableBridge syncs events from IsolatedWorld into the main world
+//! - After the tick, the main world prints its state
 
 use apex_core::prelude::*;
 use apex_core::access_desc;
@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Компоненты
+// Components
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ struct Damage {
     amount: f32,
 }
 
-// Маркеры — кто есть кто
+// Markers — who is who
 #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Enemy;
 
@@ -77,7 +77,7 @@ impl EntityTemplate for EnemyTemplate {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Вспомогательная функция для печати сущности
+// Helper function for printing an entity
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn print_entity(world: &World, entity: Entity, label: &str) {
@@ -100,24 +100,24 @@ fn print_entity(world: &World, entity: Entity, label: &str) {
 fn main() {
     println!("=== Apex ECS — Prefabs + EntityTemplate + IsolatedWorld ===\n");
 
-    // ── 1. Создаём мир и регистрируем компоненты ────────────────────
+    // ── 1. Create the world and register components ─────────────────
 
     let mut world = World::new();
 
-    // Регистрируем сериализуемые компоненты (для префабов).
-    // Префабы используют JSON-формат, поэтому register_component_serde_json.
+    // Register serializable components (for prefabs).
+    // Prefabs use the JSON format, hence register_component_serde_json.
     world.register_component_serde_json::<Position>();
     world.register_component_serde_json::<Health>();
     world.register_component_serde_json::<Damage>();
     world.register_component_serde_json::<Enemy>();
     world.register_component_serde_json::<Player>();
 
-    // Регистрируем событие для коммуникации между мирами
+    // Register an event for communication between worlds
     world.add_event::<String>();
 
-    // ── 2. PrefabManifest — загрузка префаба из JSON ────────────────
+    // ── 2. PrefabManifest — loading a prefab from JSON ──────────────
 
-    println!("--- Prefab: Player из JSON ---");
+    println!("--- Prefab: Player from JSON ---");
 
     let player_json = r#"{
         "name": "player_prefab",
@@ -138,47 +138,47 @@ fn main() {
     }"#;
 
     let mut loader = PrefabLoader::new();
-    // load_json возвращает &PrefabManifest под mutable borrow.
-    // Клонируем, чтобы отпустить borrow и использовать instantiate ниже.
+    // load_json returns &PrefabManifest under a mutable borrow.
+    // Clone it to release the borrow and use instantiate below.
     let manifest = loader
         .load_json(player_json)
         .expect("failed to load player prefab JSON")
         .clone();
-    println!("  Загружен префаб: {}", manifest.name);
+    println!("  Loaded prefab: {}", manifest.name);
 
-    // Спавним игрока из префаба: instantiate(&self, world, manifest, overrides, parent)
+    // Spawn the player from the prefab: instantiate(&self, world, manifest, overrides, parent)
     let player = loader
         .instantiate(&mut world, &manifest, &[], None, None)
         .expect("failed to instantiate player prefab");
-    println!("  Игрок создан: entity={}", player);
+    println!("  Player created: entity={}", player);
 
-    // ── 3. EntityTemplate — создание врага через шаблон ────────────
+    // ── 3. EntityTemplate — creating an enemy from a template ──────
 
-    println!("\n--- EntityTemplate: Enemy через шаблон ---");
+    println!("\n--- EntityTemplate: Enemy from a template ---");
 
-    // Регистрируем шаблон: register_template(&mut self, name, template_instance)
+    // Register the template: register_template(&mut self, name, template_instance)
     world.register_template("enemy", EnemyTemplate);
 
     // spawn_from_template(&mut self, name, &TemplateParams)
     let enemy1 = world
         .spawn_template_with("enemy", &TemplateParams::new())
         .expect("failed to spawn enemy from template");
-    println!("  Враг создан из шаблона: entity={}", enemy1);
+    println!("  Enemy created from template: entity={}", enemy1);
 
-    // Второй враг
+    // Second enemy
     let enemy2 = world
         .spawn_template_with("enemy", &TemplateParams::new())
         .expect("failed to spawn enemy2 from template");
-    println!("  Враг 2 создан из шаблона: entity={}", enemy2);
+    println!("  Enemy 2 created from template: entity={}", enemy2);
 
-    // ── 4. Проверяем состояние мира ────────────────────────────────
+    // ── 4. Inspect the world state ─────────────────────────────────
 
-    println!("\n--- Состояние мира ---");
-    println!("  Всего entity: {}", world.entity_count());
+    println!("\n--- World state ---");
+    println!("  Total entities: {}", world.entity_count());
 
-    print_entity(&world, player, "Игрок");
-    print_entity(&world, enemy1, "Враг 1");
-    print_entity(&world, enemy2, "Враг 2");
+    print_entity(&world, player, "Player");
+    print_entity(&world, enemy1, "Enemy 1");
+    print_entity(&world, enemy2, "Enemy 2");
 
     // ── 5. Export entity → PrefabManifest ───────────────────────────
 
@@ -188,34 +188,34 @@ fn main() {
     match WorldSerializer::entity_to_prefab(&world, enemy1) {
         Ok(exported) => {
             let json = serde_json::to_string_pretty(&exported).unwrap();
-            println!("  Экспортированный префаб врага:\n{}", json);
+            println!("  Exported enemy prefab:\n{}", json);
         }
         Err(e) => {
-            println!("  Ошибка экспорта: {:?}", e);
+            println!("  Export error: {:?}", e);
         }
     }
 
     // ── 6. IsolatedWorld + CloneableBridge ─────────────────────────
-    //     Демонстрируются: send_action_event, register_event + send_event,
+    //     Demonstrates: send_action_event, register_event + send_event,
     //     ctx.try_resource
 
-    println!("\n--- IsolatedWorld: AI-симуляция ---");
+    println!("\n--- IsolatedWorld: AI simulation ---");
 
-    // Два независимых канала: main → sub и sub → main
+    // Two independent channels: main → sub and sub → main
     let (main_to_sub, sub_recv) = crossbeam_channel::unbounded(); // main  → sub
     let (sub_to_main, main_recv) = crossbeam_channel::unbounded(); // sub → main
 
-    // Мост для основного мира (хранится в Resources):
-    //   - to_sub    = main_to_sub  → отправляет в IsolatedWorld
-    //   - from_sub  = main_recv    ← принимает из IsolatedWorld
-    //   (исправлено: раньше каналы были перепутаны)
+    // Bridge for the main world (stored in Resources):
+    //   - to_sub    = main_to_sub  → sends into IsolatedWorld
+    //   - from_sub  = main_recv    ← receives from IsolatedWorld
+    //   (fixed: the channels used to be swapped)
     let main_bridge = CloneableBridge::new(main_to_sub, main_recv);
     world.insert_resource(main_bridge);
 
-    // Создаём изолированный мир
+    // Create the isolated world
     let mut iso = IsolatedWorld::new();
 
-    // Регистрируем те же компоненты в изолированном мире
+    // Register the same components in the isolated world
     iso.world_mut().register_component_serde::<Position>();
     iso.world_mut().register_component_serde::<Health>();
     iso.world_mut().register_component_serde::<Damage>();
@@ -223,7 +223,7 @@ fn main() {
     iso.world_mut().register_component_serde::<Player>();
     iso.world_mut().add_event::<String>();
 
-    // Спавним врага в изолированном мире
+    // Spawn an enemy in the isolated world
     let iso_enemy = iso.world_mut().spawn(());
     iso.world_mut().insert(iso_enemy, Position { x: 300.0, y: 400.0 });
     iso.world_mut().insert(iso_enemy, Health {
@@ -233,47 +233,47 @@ fn main() {
     iso.world_mut().insert(iso_enemy, Damage { amount: 15.0 });
     iso.world_mut().insert(iso_enemy, Enemy);
 
-    println!("  Враг в IsolatedWorld: entity={}", iso_enemy);
+    println!("  Enemy in IsolatedWorld: entity={}", iso_enemy);
     println!(
-        "  Всего entity в IsolatedWorld: {}",
+        "  Total entities in IsolatedWorld: {}",
         iso.world_mut().entity_count()
     );
 
     // ── 6a. register_event + send_event (main → sub) ──────────────
-    // send_event сериализует событие через bincode. На принимающей
-    // стороне нужен register_event, который регистрирует тип в EventQueue
-    // мира и сохраняет bincode-десериализатор в мосте.
+    // send_event serializes the event via bincode. On the receiving
+    // side register_event is required — it registers the type in the
+    // world's EventQueue and stores the bincode deserializer in the bridge.
     {
-        println!("\n  --- send_event: сериализованное событие main → sub ---");
-        // Достаём мост из ресурсов
+        println!("\n  --- send_event: serialized event main → sub ---");
+        // Fetch the bridge from resources
         let bridge = world.try_resource::<CloneableBridge>().unwrap();
-        // Регистрируем тип String в IsolatedWorld
+        // Register the String type in IsolatedWorld
         bridge.register_event::<String>(iso.world_mut());
-        // Отправляем сериализованное событие
+        // Send the serialized event
         bridge.send_event(&"Hello via bincode from main world!".to_string());
-        println!("  ✓ register_event + send_event: событие отправлено в IsolatedWorld");
+        println!("  ✓ register_event + send_event: event sent to IsolatedWorld");
     }
 
     // ── 6b. send_action_event (main → sub) ─────────────────────────
-    // send_action_event не требует сериализации и register_event.
-    // Это просто замыкание, которое вызовет world.send_event() на той стороне.
+    // send_action_event requires neither serialization nor register_event.
+    // It is simply a closure that calls world.send_event() on the other side.
     {
-        println!("\n  --- send_action_event: действие main → sub ---");
+        println!("\n  --- send_action_event: action main → sub ---");
         let bridge = world.try_resource::<CloneableBridge>().unwrap();
         bridge.send_action_event("Action event from main!".to_string());
-        println!("  ✓ send_action_event отправлено в IsolatedWorld");
+        println!("  ✓ send_action_event sent to IsolatedWorld");
     }
 
-    // ── 6c. AI-система с send_action_event и try_resource ─────────
+    // ── 6c. AI system with send_action_event and try_resource ─────
 
-    // Флаг для проверки, что AI-система выполнилась
+    // Flag to verify that the AI system ran
     let ai_ran = Arc::new(AtomicBool::new(false));
     let ai_flag = ai_ran.clone();
 
-    // CloneableBridge для IsolatedWorld: отправляет события в основной мир
+    // CloneableBridge for IsolatedWorld: sends events into the main world
     let iso_bridge = CloneableBridge::new(sub_to_main, sub_recv);
 
-    // Добавляем AI-систему в IsolatedWorld
+    // Add the AI system to IsolatedWorld
     iso.scheduler_mut().add_systems(
         apex_scheduler::StageLabel::Update,
         apex_scheduler::par_access(
@@ -282,44 +282,44 @@ fn main() {
         move |ctx| {
             ai_flag.store(true, Ordering::SeqCst);
 
-            // ── ctx.try_resource — безопасный доступ к ресурсу ──
-            // В IsolatedWorld нет ресурса String, поэтому вернётся None
+            // ── ctx.try_resource — safe resource access ──
+            // IsolatedWorld has no String resource, so this returns None
             if let Some(msg) = ctx.try_resource::<String>() {
                 println!("  [AI] Resource found: {}", *msg);
             } else {
-                // Этот else выполнится — ресурс не вставлен
+                // This else branch runs — the resource is not inserted
             }
 
-            // ── send_action_event — отправка действия в основной мир ──
-            // В отличие от send_event, не требует сериализации и регистрации
+            // ── send_action_event — send an action into the main world ──
+            // Unlike send_event, requires neither serialization nor registration
             iso_bridge.send_action_event("AI: enemy took damage!".to_string());
         },
     ));
 
-    // Выполняем один тик IsolatedWorld
+    // Run one tick of IsolatedWorld
     iso.tick();
 
-    // Проверяем результат
+    // Check the result
     if let Some(hp) = iso.world_mut().get::<Health>(iso_enemy) {
         println!(
-            "  После AI-тика: HP врага = {}/{}",
+            "  After the AI tick: enemy HP = {}/{}",
             hp.current, hp.max
         );
     }
 
     assert!(
         ai_ran.load(Ordering::SeqCst),
-        "AI-система не выполнилась!"
+        "AI system did not run!"
     );
 
-    // ── 7. Применяем события из IsolatedWorld в основном мире ─────
+    // ── 7. Apply events from IsolatedWorld in the main world ─────
 
-    println!("\n--- CloneableBridge: приём событий из IsolatedWorld ---");
+    println!("\n--- CloneableBridge: receiving events from IsolatedWorld ---");
 
-    // sync_bridge_cloneable применяет все накопленные сообщения
+    // sync_bridge_cloneable applies all accumulated messages
     sync_bridge_cloneable(&mut world);
 
-    // world.tick() инкрементирует тик, flush_all_events() продвигает очереди событий
+    // world.tick() increments the tick, flush_all_events() advances the event queues
     world.tick();
     world.flush_all_events();
 
@@ -327,7 +327,7 @@ fn main() {
 
     println!("\n--- Hierarchy export: parent-child ---");
 
-    // Создаём иерархию: player → child
+    // Create a hierarchy: player → child
     let child = world.spawn(());
     world.insert(child, Position { x: 5.0, y: 10.0 });
     world.insert(child, Health {
@@ -336,25 +336,25 @@ fn main() {
     });
     world.add_relation(child, ChildOf, player);
 
-    // Экспортируем иерархию начиная с игрока.
-    // hierarchy_to_prefab(&World, Entity) -> PrefabManifest — дети встроены (inline), так что префаб
-    // самодостаточен: инстанцируется без предзагрузки под-префабов.
+    // Export the hierarchy starting from the player.
+    // hierarchy_to_prefab(&World, Entity) -> PrefabManifest — children are inline, so the prefab
+    // is self-contained: it instantiates without preloading sub-prefabs.
     match WorldSerializer::hierarchy_to_prefab(&world, player) {
         Ok(hier) => {
             let json = serde_json::to_string_pretty(&hier).unwrap();
-            println!("  Иерархический префаб:\n{}", json);
-            println!("  Дочерних элементов: {}", hier.children.len());
+            println!("  Hierarchical prefab:\n{}", json);
+            println!("  Children: {}", hier.children.len());
             for (i, child) in hier.children.iter().enumerate() {
                 match child {
                     PrefabChild::Inline(m) => println!(
-                        "    Ребёнок {}: inline '{}', {} компонент(ов), {} вложенных",
+                        "    Child {}: inline '{}', {} component(s), {} nested",
                         i + 1,
                         m.name,
                         m.components.len(),
                         m.children.len()
                     ),
                     PrefabChild::Ref { prefab, overrides } => println!(
-                        "    Ребёнок {}: ссылка '{}', {} overrides",
+                        "    Child {}: reference '{}', {} overrides",
                         i + 1,
                         prefab,
                         overrides.len()
@@ -362,33 +362,33 @@ fn main() {
                 }
             }
 
-            // Round-trip: инстанцируем экспортированный префаб обратно в тот же мир. Loader пуст — ничего
-            // не предзагружаем, и всё равно работает, потому что дети встроены (самодостаточный префаб).
+            // Round-trip: instantiate the exported prefab back into the same world. The loader is empty —
+            // nothing is preloaded, and it still works because children are inline (self-contained prefab).
             let loader2 = PrefabLoader::new();
             match loader2.instantiate(&mut world, &hier, &[], None, None) {
                 Ok(new_root) => {
                     let kids = world.targets_of(ChildOf, new_root).count();
                     println!(
-                        "  ✓ Round-trip: префаб инстанцирован (entity={}, детей={})",
+                        "  ✓ Round-trip: prefab instantiated (entity={}, children={})",
                         new_root, kids
                     );
                 }
-                Err(e) => println!("  Ошибка инстанцирования: {:?}", e),
+                Err(e) => println!("  Instantiation error: {:?}", e),
             }
         }
         Err(e) => {
-            println!("  Ошибка экспорта иерархии: {:?}", e);
+            println!("  Hierarchy export error: {:?}", e);
         }
     }
 
-    // ── 9. PrefabPlugin (hot-reload префабов) ───────────────────────
+    // ── 9. PrefabPlugin (prefab hot-reload) ─────────────────────────
 
-    println!("\n--- PrefabPlugin: hot-reload префабов ---");
+    println!("\n--- PrefabPlugin: prefab hot-reload ---");
 
     let mut prefab_plugin = apex_hot_reload::PrefabPlugin::new();
     let mut registry = apex_hot_reload::AssetRegistry::new();
 
-    // PrefabPlugin работает с файлами — создаём временный файл
+    // PrefabPlugin works with files — create a temporary file
     let tmp_dir = std::env::temp_dir().join("apex_prefab_example");
     let _ = std::fs::create_dir_all(&tmp_dir);
     let prefab_path = tmp_dir.join("player.prefab.json");
@@ -398,35 +398,35 @@ fn main() {
         .load_file(&prefab_path, &mut registry)
         .expect("failed to load prefab file");
     println!(
-        "  Префабов в плагине: {} (AssetId={})",
+        "  Prefabs in the plugin: {} (AssetId={})",
         prefab_plugin.len(),
         asset_id.0
     );
 
-    // Получаем имя префаба по AssetId
+    // Look up the prefab name by AssetId
     if let Some(name) = prefab_plugin.prefab_name(asset_id) {
         println!("  Asset #{}: {}", asset_id.0, name);
     }
 
-    // Очищаем временные файлы
+    // Clean up temporary files
     let _ = std::fs::remove_file(&prefab_path);
     let _ = std::fs::remove_dir(&tmp_dir);
 
     // ═══════════════════════════════════════════════════════════════
-    // Итог
+    // Summary
     // ═══════════════════════════════════════════════════════════════
 
-    println!("\n=== ИТОГ ===");
-    println!("✅ PrefabManifest: загружен и instantiated");
-    println!("✅ EntityTemplate: зарегистрирован и использован");
-    println!("✅ IsolatedWorld: создан, AI-система выполнилась");
-    println!("✅ CloneableBridge: событие доставлено между мирами");
-    println!("✅ Hierarchy export: parent-child префаб создан");
-    println!("✅ PrefabPlugin: префаб загружен в hot-reload");
+    println!("\n=== SUMMARY ===");
+    println!("✅ PrefabManifest: loaded and instantiated");
+    println!("✅ EntityTemplate: registered and used");
+    println!("✅ IsolatedWorld: created, AI system ran");
+    println!("✅ CloneableBridge: event delivered between worlds");
+    println!("✅ Hierarchy export: parent-child prefab created");
+    println!("✅ PrefabPlugin: prefab loaded into hot-reload");
 
-    println!("\n  Основной мир: {} entity", world.entity_count());
+    println!("\n  Main world: {} entities", world.entity_count());
     println!(
-        "  IsolatedWorld: {} entity",
+        "  IsolatedWorld: {} entities",
         iso.world_mut().entity_count()
     );
 }

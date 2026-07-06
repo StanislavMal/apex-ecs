@@ -5,7 +5,7 @@
 //! ```
 //!
 //! Parts:
-//! 1. Scenarios (asserts in-systems) — 10 сценариев
+//! 1. Scenarios (asserts in-systems) — 10 scenarios
 //! 2. Performance benchmarks — 100 warmup + 300 measured frames
 //! 3. Auto-exit after 300 measured frames
 
@@ -109,7 +109,7 @@ fn check_s1(sched: &mut Scheduler, world: &mut World) {
 }
 
 // ── Scenario 2: run_if_cond typed ────────────────────────────────
-// .run_if_cond(conditions::any_with_component::<Player>()) — планировщик видит read<Player>
+// .run_if_cond(conditions::any_with_component::<Player>()) — the scheduler sees read<Player>
 
 system! {
     fn s2_system(q: (Read<Player>, Write<Pos>)) {
@@ -148,7 +148,7 @@ fn check_s2() {
 }
 
 // ── Scenario 3a: chained .run_if() AND ───────────────────────────
-// .run_if(a).run_if(b) → AND с шорт-циркутом
+// .run_if(a).run_if(b) → AND with short-circuit
 
 static S3A_FLAG: AtomicBool = AtomicBool::new(false);
 
@@ -186,8 +186,8 @@ fn check_s3a() {
     println!("  ✓ 3a. chained .run_if() AND — both conditions must be true");
 }
 
-// ── Scenario 3b: tuple AND с typed conditions ────────────────────
-// .run_if_cond((cond_a, cond_b)) → AND + автоперж access обоих
+// ── Scenario 3b: tuple AND with typed conditions ─────────────────
+// .run_if_cond((cond_a, cond_b)) → AND + auto-merge access of both
 
 static S3B_FLAG: AtomicBool = AtomicBool::new(false);
 
@@ -262,7 +262,7 @@ fn check_s4() {
 }
 
 // ── Scenario 5a: chain + sequential (immediate apply) ────────────
-// chain гарантирует порядок; world.spawn() — немедленная видимость
+// chain guarantees order; world.spawn() — immediate visibility
 
 system! {
     fn s5a_spawner(world: &mut World) {
@@ -293,8 +293,8 @@ fn check_s5a() {
 }
 
 // ── Scenario 5b: chain + auto-apply (HAS_DEFERRED) ──────────────
-// system! с cmd: Cmd → HAS_DEFERRED=true → chain() → compile() авто-split
-// + runtime проверка: reader видит заспавненный entity
+// system! with cmd: Cmd → HAS_DEFERRED=true → chain() → compile() auto-split
+// + runtime check: reader sees the spawned entity
 
 static S5B_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -305,7 +305,7 @@ system! {
 }
 
 fn check_s5b() {
-    // Часть A: проверка compile
+    // Part A: compile check
     let mut sched = Scheduler::new();
     sched.add_systems(StageLabel::Update, (
         sys("spawner_d", s5b_spawner),
@@ -320,7 +320,7 @@ fn check_s5b() {
         stages.len()
     );
 
-    // Часть B: проверка runtime — reader видит заспавненные entity
+    // Part B: runtime check — reader sees the spawned entities
     let mut sched2 = Scheduler::new();
     sched2.add_systems(StageLabel::Update, (
         sys("spawner_r", s5b_spawner),
@@ -343,7 +343,7 @@ fn check_s5b() {
 }
 
 // ── Scenario 6: scope condition ──────────────────────────────────
-// Все системы внутри staged наследуют scope condition
+// All systems inside staged inherit the scope condition
 
 fn check_s6() {
     let mut sched = Scheduler::new();
@@ -485,8 +485,8 @@ fn check_s10() {
     println!("  ✓ 10. every_n_frames(60) — executed once every 60 frames");
 }
 
-// ── Scenario 11: or_else — OR-композиция ──────────────────────────
-// Система выполнится если ХОТЯ БЫ одно из OR-условий true
+// ── Scenario 11: or_else — OR composition ─────────────────────────
+// The system runs if AT LEAST ONE of the OR conditions is true
 
 static S11_RAN: AtomicBool = AtomicBool::new(false);
 

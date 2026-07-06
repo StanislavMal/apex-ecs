@@ -1,15 +1,15 @@
 //! apex-examples: serialization + hot reload
 //!
-//! Демонстрирует:
-//! - register_component_serde::<T>() — регистрация сериализуемого компонента
-//! - WorldSerializer::snapshot()     — снэпшот мира в JSON и Bincode
-//! - WorldSerializer::restore()      — восстановление мира из снэпшота
-//! - SaveFormat::Bincode             — бинарный формат (в ~2.5x компактнее JSON)
-//! - WorldDiff                       — инкрементальные сохранения (только изменения)
-//! - HotReloadPlugin::watch_config() — горячая перезагрузка JSON-конфигов
-//! - Entity remapping после restore
+//! Demonstrates:
+//! - register_component_serde::<T>() — registering a serializable component
+//! - WorldSerializer::snapshot()     — world snapshot to JSON and Bincode
+//! - WorldSerializer::restore()      — restoring a world from a snapshot
+//! - SaveFormat::Bincode             — binary format (~2.5x more compact than JSON)
+//! - WorldDiff                       — incremental saves (changes only)
+//! - HotReloadPlugin::watch_config() — hot reload of JSON configs
+//! - Entity remapping after restore
 //!
-//! Запуск: `cargo run --example serialization_hot_reload --release`
+//! Run: `cargo run --example serialization_hot_reload --release`
 use apex_core::prelude::*;
 use apex_macros::Component;
 use apex_serialization::{SaveFormat, WorldDiff, WorldSerializer};
@@ -17,7 +17,7 @@ use apex_hot_reload::HotReloadPlugin;
 
 use serde::{Deserialize, Serialize};
 
-// ── Компоненты ─────────────────────────────────────────────────
+// ── Components ─────────────────────────────────────────────────
 //
 // Component provide basic registration; register_component_serde adds serialization.
 // Both are needed for serializable components.
@@ -31,12 +31,12 @@ struct Velocity { x: f32, y: f32 }
 #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
 struct Health { current: f32, max: f32 }
 
-// Non-serializable — runtime данные, не сохраняются
+// Non-serializable — runtime data, not saved
 #[derive(Component)]
 #[allow(dead_code)]
 struct RenderHandle(u64);
 
-// ── Конфиг (hot reload target) ─────────────────────────────────
+// ── Config (hot reload target) ─────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PhysicsConfig {
@@ -49,25 +49,25 @@ struct PhysicsConfig {
 fn main() {
     println!("=== Apex ECS — Serialization + Hot Reload ===\n");
 
-    // ── 1. Настройка мира ──────────────────────────────────────
+    // ── 1. World setup ──────────────────────────────────────
 
     let mut world = World::new();
 
-    // Регистрируем компоненты С сериализацией — попадут в снэпшот
+    // Register components WITH serialization — they will be in the snapshot
     world.register_component_serde::<Position>();
     world.register_component_serde::<Velocity>();
     world.register_component_serde::<Health>();
 
     world.insert_resource(PhysicsConfig { gravity: 9.8, dt: 0.016 });
 
-    // ── 2. Спавн entity ────────────────────────────────────────
+    // ── 2. Spawn entity ────────────────────────────────────────
 
     let player = world.spawn((
         Position { x: 0.0, y: 10.0 },
         Velocity { x: 1.0, y:  0.0 },
         Health   { current: 100.0, max: 100.0 },
     ));
-    // RenderHandle НЕ включаем в spawn — покажем insert отдельно
+    // RenderHandle is NOT included in spawn — we show insert separately
     world.insert(player, RenderHandle(42));
 
     let enemy = world.spawn((
@@ -110,12 +110,12 @@ fn main() {
     let dir = std::env::temp_dir().join("apex_serialization_example");
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Сохраняем как JSON
+    // Save as JSON
     let json_path = dir.join("save.json");
     WorldSerializer::write_to_file(&json_path, &snapshot, SaveFormat::Json)
         .expect("write_to_file (JSON) failed");
 
-    // Сохраняем как Bincode — в несколько раз меньше
+    // Save as Bincode — several times smaller
     let bin_path = dir.join("save.bin");
     WorldSerializer::write_to_file(&bin_path, &snapshot, SaveFormat::Bincode)
         .expect("write_to_file (Bincode) failed");
@@ -126,7 +126,7 @@ fn main() {
         std::fs::metadata(&bin_path).unwrap().len(),
     );
 
-    // Загружаем обратно — read_from_file определяет формат по расширению
+    // Load back — read_from_file determines the format by extension
     let loaded_json = WorldSerializer::read_from_file(&json_path)
         .expect("read_from_file (JSON) failed");
     let loaded_bin  = WorldSerializer::read_from_file(&bin_path)
@@ -136,19 +136,19 @@ fn main() {
     assert_eq!(loaded_bin.entities.len(),  snapshot.entities.len());
     println!("  ✓ Read from file: both formats loaded correctly");
 
-    // ── 6. WorldDiff: инкрементальные сохранения ───────────────
+    // ── 6. WorldDiff: incremental saves ───────────────
 
     let old_snapshot = WorldSerializer::snapshot(&world)
         .expect("snapshot for diff failed");
 
-    // Добавляем новую entity
+    // Add a new entity
     let _e3 = world.spawn((
         Position { x: 100.0, y: 200.0 },
         Health { current: 50.0, max: 50.0 },
     ));
     println!("  After adding 1 entity: {} entities", world.entity_count());
 
-    // Diff: только изменения
+    // Diff: changes only
     let diff = WorldSerializer::diff(&old_snapshot, &world)
         .expect("diff failed");
 
@@ -158,7 +158,7 @@ fn main() {
         diff.removed_components.len(),
     );
 
-    // Diff можно сериализовать в bincode
+    // The diff can be serialized to bincode
     let diff_bytes = diff.to_bincode().expect("diff.to_bincode failed");
     let loaded_diff = WorldDiff::from_bincode(&diff_bytes)
         .expect("WorldDiff::from_bincode failed");
@@ -173,7 +173,7 @@ fn main() {
     world2.register_component_serde::<Position>();
     world2.register_component_serde::<Velocity>();
     world2.register_component_serde::<Health>();
-    // Relations kinds нужно зарегистрировать чтобы restore смог восстановить их
+    // Relation kinds must be registered so that restore can recover them
     let parent = world2.spawn((Position { x: 0.0, y: 0.0 },));
     let child = world2.spawn((Position { x: 0.0, y: 0.0 },));
     world2.add_relation(
@@ -181,8 +181,8 @@ fn main() {
         apex_core::relations::ChildOf,
         parent,
     );
-    // NOTE: В реальном проекте все relation kinds регистрируются при старте
-    // мира независимо от того есть ли они в снэпшоте.
+    // NOTE: In a real project, all relation kinds are registered at world
+    // startup regardless of whether they are present in the snapshot.
 
     let entity_map = WorldSerializer::restore(&mut world2, &snapshot)
         .expect("restore failed");
@@ -193,51 +193,51 @@ fn main() {
         entity_map.len()
     );
 
-    // Проверяем что данные совпадают
+    // Verify that the data matches
     let new_player = entity_map[&player.index()];
     let pos = world2.get::<Position>(new_player).unwrap();
     println!("Restored player Position: ({:.1}, {:.1})", pos.x, pos.y);
     assert!((pos.x - 0.0).abs() < 1e-6);
     assert!((pos.y - 10.0).abs() < 1e-6);
 
-    // RenderHandle НЕ сохранялся — его нужно пересоздать
+    // RenderHandle was NOT saved — it needs to be recreated
     // world2.insert(new_player, RenderHandle(create_render_handle()));
 
     println!("✓ Serialization roundtrip OK\n");
 
     // ── 8. Hot Reload ──────────────────────────────────────────
     //
-    // Создаём временный конфиг-файл для демонстрации.
-    // В реальном проекте файл лежит в assets/.
+    // Create a temporary config file for demonstration.
+    // In a real project the file lives in assets/.
 
     let config_dir = std::env::temp_dir().join("apex_ecs_example");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("physics.json");
 
-    // Записываем начальный конфиг
+    // Write the initial config
     std::fs::write(&config_path, r#"{"gravity": 9.8, "dt": 0.016}"#).unwrap();
 
-    // Создаём HotReloadPlugin — следит за директорией
+    // Create HotReloadPlugin — watches the directory
     let mut hot = HotReloadPlugin::with_default_debounce(&config_dir)
         .expect("watcher init failed");
 
-    // Регистрируем конфиг — немедленная начальная загрузка
+    // Register the config — immediate initial load
     let _config_id = hot.watch_config::<PhysicsConfig>(&config_path, &mut world2)
         .expect("watch_config failed");
 
     println!("PhysicsConfig loaded: gravity={}", world2.resource::<PhysicsConfig>().gravity);
 
-    // Симулируем изменение файла пользователем
+    // Simulate a user modifying the file
     std::fs::write(&config_path, r#"{"gravity": 1.62, "dt": 0.016}"#).unwrap();
 
-    // Небольшая задержка чтобы notify успел поймать изменение
+    // A small delay so notify has time to catch the change
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // В game loop — apply_changes() вызывается каждый кадр
+    // In the game loop — apply_changes() is called every frame
     let changed = hot.apply_changes(&mut world2);
 
     if changed.is_empty() {
-        // В CI/тестовой среде watcher может не сработать — это нормально
+        // In a CI/test environment the watcher may not fire — this is normal
         println!("(no file changes detected in this run — OK in CI)");
     } else {
         println!(

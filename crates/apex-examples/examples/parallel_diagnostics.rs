@@ -1,16 +1,16 @@
-//! apex-examples: Диагностика параллелизма — scaling benchmark
+//! apex-examples: Parallelism diagnostics — scaling benchmark
 //!
-//! Запуск:
+//! Run:
 //!   cargo run -p apex-examples --example parallel_diagnostics --release
 //!   cargo run -p apex-examples --example parallel_diagnostics --release
 //!
-//! Что тестируется:
-//!   1. SEQ vs PAR — scaling по entity count
-//!   2. Внутрисистемный параллелизм — 1 система, много entity
-//!   3. Stage-level параллелизм — несколько систем в одном Stage
-//!   4. Фрагментация архетипов — 1 vs 4 архетипа
-//!   5. Event pipeline — overhead событий
-//!   6. ResWrite contention — конкуренция за ресурс
+//! What is tested:
+//!   1. SEQ vs PAR — scaling by entity count
+//!   2. Intra-system parallelism — 1 system, many entities
+//!   3. Stage-level parallelism — several systems in one Stage
+//!   4. Archetype fragmentation — 1 vs 4 archetypes
+//!   5. Event pipeline — event overhead
+//!   6. ResWrite contention — contention over a resource
 
 use std::time::{Duration, Instant};
 use apex_core::prelude::*;
@@ -18,7 +18,7 @@ use apex_macros::Component;
 use apex_scheduler::{par_access, sys, Scheduler, StageLabel};
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// КОМПОНЕНТЫ
+// COMPONENTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Component, Clone, Copy, Debug)]
@@ -50,7 +50,7 @@ struct Cooldown(f32);
 #[derive(Component, Clone, Copy, Debug)] struct TagD;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// РЕСУРСЫ
+// RESOURCES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Debug)]
@@ -64,7 +64,7 @@ struct Gravity(f32);
 struct GlobalCounter(u64);
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СОБЫТИЯ
+// EVENTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +72,7 @@ struct GlobalCounter(u64);
 struct DamageEvent { target: Entity, amount: f32 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СИСТЕМЫ
+// SYSTEMS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 system! {
@@ -185,12 +185,12 @@ system! {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ПРИМЕР: демонстрация флага par_for_each_used()
+// EXAMPLE: demonstration of the par_for_each_used() flag
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Система, добавляемая через par_access() с флагом .par_for_each_used().
-// Планировщик не будет чанковать её через ASD (избегает oversubscribe).
-// Используйте этот флаг когда ваша система внутренне вызывает par_for_each.
+// A system added via par_access() with the .par_for_each_used() flag.
+// The scheduler will not chunk it via ASD (avoids oversubscribe).
+// Use this flag when your system internally calls par_for_each.
 
 #[allow(dead_code)]
 fn register_par_for_each_demo(sched: &mut Scheduler) {
@@ -212,7 +212,7 @@ fn register_par_for_each_demo(sched: &mut Scheduler) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// УТИЛИТЫ ИЗМЕРЕНИЯ
+// MEASUREMENT UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
@@ -270,7 +270,7 @@ fn register_resources_and_events(world: &mut World) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ ДЛЯ ВЫВОДА
+// OUTPUT HELPER UTILITIES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn fmt_dur(us: f64) -> String {
@@ -282,7 +282,7 @@ fn fmt_meps(meps: f64) -> String {
     format!("{:>7.2}", meps)
 }
 
-/// Напечатать строку таблицы для SEQ vs PAR сравнения
+/// Print a table row for the SEQ vs PAR comparison
 fn table_row_seqpar(
     n: usize, seq_us: f64, par_us: f64,
     seq_meps: f64, par_meps: f64, speedup: f64, stages: usize,
@@ -303,7 +303,7 @@ fn table_row_seqpar(
     );
 }
 
-/// Напечатать строку таблицы для произвольных результатов
+/// Print a table row for arbitrary results
 fn table_row(label: &str, n: usize, us: f64, meps: f64, stages: usize) {
     println!("  {:30} │ {:>5} │ {} │ {} │ {:>2}",
         label, n, fmt_dur(us), fmt_meps(meps), stages);
@@ -316,7 +316,7 @@ fn table_sep() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// СЦЕНАРИИ
+// SCENARIOS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const ENTITY_COUNTS: &[usize] = &[100, 500, 1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 200_000];
@@ -331,7 +331,7 @@ struct IdealParResult {
 
 fn run_ideal_parallel() -> Vec<IdealParResult> {
     let mut results = Vec::new();
-    println!("\n═══ СЦЕНАРИЙ 1: SEQ vs PAR — 3 независимые системы ═══");
+    println!("\n═══ SCENARIO 1: SEQ vs PAR — 3 independent systems ═══");
     for &n in ENTITY_COUNTS {
         print!("  n={}...", n);
 
@@ -389,7 +389,7 @@ fn run_ideal_parallel() -> Vec<IdealParResult> {
     results
 }
 
-// ── 2. Внутрисистемный параллелизм ─────────────────────────────────────────
+// ── 2. Intra-system parallelism ─────────────────────────────────────────
 
 struct IntraSysResult {
     n:         usize,
@@ -399,12 +399,12 @@ struct IntraSysResult {
     par_four:  TimedResult,
 }
 
-/// Тест: 1 система MovementWriter на 1 vs 4 архетипах
-/// Показывает, насколько хорошо ASD режет одну систему на чанки
-/// и как влияет количество архетипов на распределение.
+/// Test: 1 MovementWriter system on 1 vs 4 archetypes
+/// Shows how well ASD splits a single system into chunks
+/// and how the number of archetypes affects distribution.
 fn run_intra_system_parallel() -> Vec<IntraSysResult> {
     let mut results = Vec::new();
-    println!("\n═══ СЦЕНАРИЙ 2: Внутрисистемный параллелизм (1 система, 1 vs 4 архетипа) ═══");
+    println!("\n═══ SCENARIO 2: Intra-system parallelism (1 system, 1 vs 4 archetypes) ═══");
     for &n in ENTITY_COUNTS {
         print!("  n={}...", n);
 
@@ -414,7 +414,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
 
         let seq_one;
         let par_one;
-        // 1 архетип
+        // 1 archetype
         {
             let mut world = World::new();
             register_resources_and_events(&mut world);
@@ -456,7 +456,7 @@ fn run_intra_system_parallel() -> Vec<IntraSysResult> {
 
         let seq_four;
         let par_four;
-        // 4 архетипа
+        // 4 archetypes
         {
             let mut world = World::new();
             register_resources_and_events(&mut world);
@@ -534,7 +534,7 @@ struct EventResult {
 
 fn run_event_pipeline() -> Vec<EventResult> {
     let mut results = Vec::new();
-    println!("\n═══ СЦЕНАРИЙ 3: Event pipeline (Emit→Listen) ═══");
+    println!("\n═══ SCENARIO 3: Event pipeline (Emit→Listen) ═══");
     for &n in ENTITY_COUNTS {
         print!("  n={}...", n);
 
@@ -576,7 +576,7 @@ struct FullPipeResult {
 
 fn run_full_pipeline() -> Vec<FullPipeResult> {
     let mut results = Vec::new();
-    println!("\n═══ СЦЕНАРИЙ 4: Полный пайплайн (6 систем) ═══");
+    println!("\n═══ SCENARIO 4: Full pipeline (6 systems) ═══");
     for &n in ENTITY_COUNTS {
         print!("  n={}...", n);
 
@@ -620,12 +620,12 @@ fn run_full_pipeline() -> Vec<FullPipeResult> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ВЫВОД СВОДНЫХ ТАБЛИЦ
+// SUMMARY TABLE OUTPUT
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn print_seqpar_table(results: &[IdealParResult]) {
     println!("\n┌──────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│           SEQ vs PAR — 3 независимые системы                                        │");
+    println!("│           SEQ vs PAR — 3 independent systems                                        │");
     println!("├{:─^7}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^12}┬{:─^10}┤",
         "", "", "", "", "", "", "");
     println!("│ {:>5} │ {:>10} │ {:>10} │ {:>10} │ {:>10} │ {:>10} │ {:>8} │",
@@ -643,7 +643,7 @@ fn print_seqpar_table(results: &[IdealParResult]) {
 
 fn print_intrasys_table(results: &[IntraSysResult]) {
     println!("\n┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐");
-    println!("│           Внутрисистемный параллелизм — 1 система MovementWriter                                     │");
+    println!("│           Intra-system parallelism — 1 MovementWriter system                                        │");
     println!("├{:─^7}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┬{:─^14}┤",
         "", "", "", "", "", "", "");
     println!("│ {:>5} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │ {:>12} │",
@@ -680,7 +680,7 @@ fn print_event_table(results: &[EventResult]) {
 
 fn print_fullpipe_table(results: &[FullPipeResult]) {
     println!("\n┌─────────────────────────────────────────────────────────────────┐");
-    println!("│           Полный пайплайн (6 систем)                              │");
+    println!("│           Full pipeline (6 systems)                              │");
     println!("├{:─^7}┬{:─^12}┬{:─^12}┬{:─^12}┤",
         "", "", "", "");
     println!("│ {:>5} │ {:>10} │ {:>10} │ {:>10} │", "N", "µs", "Meps", "Stages");
@@ -695,17 +695,17 @@ fn print_fullpipe_table(results: &[FullPipeResult]) {
 
 fn main() {
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║     APEX ECS — Диагностика параллелизма (scaling benchmark)     ║");
+    println!("║     APEX ECS — Parallelism diagnostics (scaling benchmark)       ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Ядер: {} | Режим: {} | Фича parallel: ✅",
+    println!("  Cores: {} | Mode: {} | parallel feature: ✅",
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" },
     );
     println!("  Entity counts: {:?}", ENTITY_COUNTS);
     println!("  {}", "─".repeat(90));
 
-    // ── ЗАМЕРЫ ─────────────────────────────────────────────────────
+    // ── MEASUREMENTS ─────────────────────────────────────────────────────
     let t_all = Instant::now();
 
     let r1 = run_ideal_parallel();
@@ -715,9 +715,9 @@ fn main() {
 
     let elapsed_all = t_all.elapsed();
 
-    // ── ВЫВОД ──────────────────────────────────────────────────────
+    // ── OUTPUT ──────────────────────────────────────────────────────
     println!("\n{}", "═".repeat(90));
-    println!("  СВОДНЫЕ ТАБЛИЦЫ");
+    println!("  SUMMARY TABLES");
     println!("{}", "═".repeat(90));
 
     print_seqpar_table(&r1);
@@ -725,23 +725,23 @@ fn main() {
     print_event_table(&r3);
     print_fullpipe_table(&r4);
 
-    // ── Анализ ─────────────────────────────────────────────────────
+    // ── Analysis ─────────────────────────────────────────────────────
     println!("\n{}", "═".repeat(90));
-    println!("  АНАЛИЗ");
+    println!("  ANALYSIS");
     println!("{}", "═".repeat(90));
 
-    // Время переключения между режимами (cross-over point)
-    println!("\n  ● Точка пересечения SEQ/PAR:");
+    // Switching point between modes (cross-over point)
+    println!("\n  ● SEQ/PAR cross-over point:");
     for r in &r1 {
         let speedup = r.seq.duration.as_secs_f64() / r.par.duration.as_secs_f64().max(1e-12);
-        let status = if speedup >= 1.5 { "✅ PAR быстрее" }
-                     else if speedup >= 1.0 { "ℹ️  слабое ускорение" }
-                     else { "⚠️  PAR медленнее" };
+        let status = if speedup >= 1.5 { "✅ PAR faster" }
+                     else if speedup >= 1.0 { "ℹ️  weak speedup" }
+                     else { "⚠️  PAR slower" };
         println!("    n={:>7}: speedup {:>5.2}x — {}", r.n, speedup, status);
     }
 
-    // Сравнение 1 vs 4 архетипов
-    println!("\n  ● Фрагментация: 1 архетип vs 4 (SEQ):");
+    // Comparison of 1 vs 4 archetypes
+    println!("\n  ● Fragmentation: 1 archetype vs 4 (SEQ):");
     for r in &r2 {
         let single = r.seq_one.duration.as_micros() as f64;
         let four   = r.seq_four.duration.as_micros() as f64;
@@ -750,8 +750,8 @@ fn main() {
             r.n, single, four, overhead);
     }
 
-    // Параллельный speedup 1arch vs 4arch
-    println!("\n  ● Внутрисистемный PAR speedup (1arch vs 4arch):");
+    // Parallel speedup 1arch vs 4arch
+    println!("\n  ● Intra-system PAR speedup (1arch vs 4arch):");
     for r in &r2 {
         let one_par_sp = r.seq_one.duration.as_secs_f64() / r.par_one.duration.as_secs_f64().max(1e-12);
         let four_par_sp = r.seq_four.duration.as_secs_f64() / r.par_four.duration.as_secs_f64().max(1e-12);
@@ -759,6 +759,6 @@ fn main() {
     }
 
     println!("\n{}", "═".repeat(90));
-    println!("  Все замеры выполнены за {:.1}s", elapsed_all.as_secs_f64());
+    println!("  All measurements completed in {:.1}s", elapsed_all.as_secs_f64());
     println!("{}", "═".repeat(90));
 }
