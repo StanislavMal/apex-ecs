@@ -7,7 +7,7 @@
 //! half of the bridge across, and assert the ARTIFACT that arrives (entity
 //! counts, deserialized events, a result echoed back) — not merely "no panic".
 //!
-//! Scope note (В4 / CORE_AUDIT §10.6): the bridge today is `unbounded` and has
+//! Scope note (V4 / CORE_AUDIT §10.6): the bridge today is `unbounded` and has
 //! no entity remapping. Bounded channels with telemetry and a remap protocol
 //! are still design debt — these tests pin the EXISTING mechanism across
 //! threads so that work can build on a verified baseline.
