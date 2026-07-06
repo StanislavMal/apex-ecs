@@ -89,11 +89,15 @@ impl Scheduler {
                 // Split into sub-stages at apply_deferred_after markers
                 let sub_groups = split_at_apply_boundaries(&ids, &self.systems, &self.explicit_orderings);
                 for group_ids in sub_groups {
+                    // A stage is "parallelizable" if every system is access-declared
+                    // (worker-dispatched `Parallel` OR main-thread `NonSend`) — B2 runs
+                    // NonSend on the main thread concurrently with the worker tasks. A
+                    // full-world `Sequential` system makes the stage run on main only.
                     let all_parallel = group_ids.iter().all(|sid| {
                         self.system_indices
                             .get(sid)
                             .and_then(|&idx| self.systems.get(idx))
-                            .map(|s| s.kind.is_parallel())
+                            .map(|s| s.kind.is_parallelizable())
                             .unwrap_or(false)
                     });
                     label_stages

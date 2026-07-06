@@ -3215,6 +3215,121 @@
         );
     }
 
+    // ── B2: NonSend runs on main concurrently with worker tasks ──────────
+
+    /// B2: a NonSend system and a `Parallel` system with DISJOINT access share one
+    /// parallelizable stage; the parallel path runs the Parallel system on a worker
+    /// and the NonSend system on the main thread. Both declared writes land
+    /// correctly (soundness of the concurrent path — disjoint components).
+    #[test]
+    fn nonsend_and_parallel_disjoint_both_write() {
+        #[derive(Component, Clone, Copy)]
+        struct A(u32);
+        #[derive(Component, Clone, Copy)]
+        struct B(u32);
+
+        let mut world = World::new();
+        // Force the concurrent parallel path (see the rendezvous test).
+        world.set_chunk_config(apex_core::world::ChunkConfig {
+            auto_disable_stage_parallel: false,
+            stage_parallel_min_entities: 0,
+            ..Default::default()
+        });
+        world.spawn_many(128, |_| (A(0),));
+        world.spawn_many(128, |_| (B(0),));
+
+        let mut sched = Scheduler::new();
+        sched.add_dynamic_system("rust_a", access_desc!(write<A>), |ctx: SystemContext<'_>| {
+            ctx.query_unchecked::<Write<A>>().for_each_mut(|_, mut a| a.0 += 1);
+        });
+        sched.add_dynamic_nonsend_system(
+            "lua_b",
+            access_desc!(write<B>),
+            |ctx: SystemContext<'_>| {
+                ctx.query_unchecked::<Write<B>>().for_each_mut(|_, mut b| b.0 += 1);
+            },
+        );
+
+        sched.run(&mut world);
+
+        let mut bad = 0;
+        Query::<Read<A>>::new(&world).for_each(|_, a| if a.0 != 1 { bad += 1 });
+        Query::<Read<B>>::new(&world).for_each(|_, b| if b.0 != 1 { bad += 1 });
+        assert_eq!(bad, 0, "both the worker (A) and main-thread NonSend (B) writes landed exactly once");
+    }
+
+    /// B2: the NonSend system runs CONCURRENTLY with a worker task — not before or
+    /// after. A rendezvous proves it: the NonSend system (registered FIRST, so a
+    /// sequential fallback would run it first and see nothing) spins waiting for a
+    /// flag set by the `Parallel` system on a worker. Only genuine concurrency lets
+    /// it observe the flag. A dedicated 4-thread pool guarantees a free worker.
+    #[test]
+    fn nonsend_observes_concurrent_parallel_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Component, Clone, Copy)]
+        struct A(u32);
+        #[derive(Component, Clone, Copy)]
+        struct B(u32);
+
+        let mut world = World::new();
+        // Force the PARALLEL dispatch path on the first (only) run: default
+        // `auto_disable_stage_parallel` sends a tiny stage to the sequential
+        // fallback (where NonSend, registered first, would run before the signal).
+        world.set_chunk_config(apex_core::world::ChunkConfig {
+            auto_disable_stage_parallel: false,
+            stage_parallel_min_entities: 0,
+            ..Default::default()
+        });
+        world.spawn((A(0),));
+        world.spawn((B(0),));
+
+        let flag = Arc::new(AtomicBool::new(false)); // set by the Parallel worker
+        let saw = Arc::new(AtomicBool::new(false)); // set by NonSend if it observes flag
+        let flag_p = flag.clone();
+        let flag_n = flag.clone();
+        let saw_n = saw.clone();
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        // Scheduler is `!Send` — build AND run it inside the pool context.
+        pool.install(move || {
+            let mut sched = Scheduler::new();
+            // NonSend registered FIRST: under a sequential fallback it would run
+            // before the signal and never see it → `saw` stays false. `saw == true`
+            // is therefore unique to concurrent execution.
+            sched.add_dynamic_nonsend_system(
+                "lua_wait",
+                access_desc!(write<B>),
+                move |ctx: SystemContext<'_>| {
+                    // Bounded spin (yields so it makes progress on any core count).
+                    for _ in 0..5_000_000 {
+                        if flag_n.load(Ordering::SeqCst) {
+                            saw_n.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    ctx.query_unchecked::<Write<B>>().for_each_mut(|_, mut b| b.0 += 1);
+                },
+            );
+            sched.add_dynamic_system(
+                "rust_signal",
+                access_desc!(write<A>),
+                move |ctx: SystemContext<'_>| {
+                    flag_p.store(true, Ordering::SeqCst);
+                    ctx.query_unchecked::<Write<A>>().for_each_mut(|_, mut a| a.0 += 1);
+                },
+            );
+            sched.run(&mut world);
+        });
+
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "the NonSend system observed the worker's signal → they ran concurrently (Lua \u{2016} Rust)"
+        );
+    }
+
     /// A STATEFUL system is not row-split (W3-4): one instance,
     /// one run call per frame, the state sees ALL rows. Before the fix several
     /// split tasks called run(&mut self) concurrently: a race on the state +

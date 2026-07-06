@@ -368,11 +368,32 @@ impl Scheduler {
         sys_infos.clear();
         let mut total_entity_count: usize = 0;
 
+        // B2: NonSend (main-thread) systems of this stage — run on the calling thread
+        // inside the scope below, concurrently with the worker tasks. Raw `!Send`
+        // pointers (never worker-dispatched): captured by the `in_place_scope` op,
+        // which runs on the current thread and carries no `Send` bound.
+        let mut nonsend_infos: Vec<(SystemId, *mut dyn NonSendSystem, apex_core::Tick)> =
+            Vec::new();
+
         for &sys_id in stage_ids {
             if skipped_systems.contains(&sys_id) {
                 continue;
             }
             if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
+                // B2: a NonSend system is never chunked or worker-dispatched — collect
+                // its box pointer + change-detection baseline and run it on the main
+                // thread inside the scope.
+                if matches!(self.systems[sys_idx].kind, SystemKind::NonSend { .. }) {
+                    let last_run = self.system_window(sys_id);
+                    if let SystemKind::NonSend { system, .. } = &mut self.systems[sys_idx].kind {
+                        nonsend_infos.push((
+                            sys_id,
+                            &mut **system as *mut dyn NonSendSystem,
+                            last_run,
+                        ));
+                    }
+                    continue;
+                }
                 // Only systems with a concrete component filter (Filtered) have a
                 // per-entity partition to split by rows. A system with `All` / no
                 // record declares no component access (only resources / events /
@@ -422,9 +443,9 @@ impl Scheduler {
                     // `Sequential` system has nothing to run on this path.
                     let par_ptr: *mut dyn ParSystem = match &mut self.systems[sys_idx].kind {
                         SystemKind::Parallel { system, .. } => &mut **system,
-                        // A NonSend system forces its stage to `all_parallel = false`
-                        // (B1), so it never reaches this worker-dispatch path; a
-                        // Sequential system has nothing to run here.
+                        // NonSend systems were already collected into `nonsend_infos`
+                        // above (they `continue` before reaching here); a Sequential
+                        // system cannot share a parallelizable stage. Defensive.
                         SystemKind::Sequential(_) | SystemKind::NonSend { .. } => continue,
                     };
                     total_entity_count += entity_count;
@@ -465,7 +486,7 @@ impl Scheduler {
             }
         }
 
-        if sys_infos.is_empty() {
+        if sys_infos.is_empty() && nonsend_infos.is_empty() {
             self.scratch_skipped = skipped_systems;
             self.scratch_sys_infos = sys_infos;
             return;
@@ -593,10 +614,20 @@ impl Scheduler {
         // 4. Sort chunks by archetype_id for cache locality
         tasks.sort_unstable_by_key(|t| t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0));
 
-        // 5. Run via rayon::scope. `task.cmds` (Option<SendPtr<Commands>>)
-        //    is Copy+Send — each single-task system carries the pointer to its own
-        //    per-system slot; row-split tasks carry `None`.
-        rayon::scope(|s| {
+        // B2: SubWorld index set (all archetypes) for the main-thread NonSend
+        // systems, materialized once. Empty when there are none (no cost).
+        let all_arch_indices: Vec<usize> = if nonsend_infos.is_empty() {
+            Vec::new()
+        } else {
+            (0..archetypes.len()).collect()
+        };
+
+        // 5. Run via rayon::in_place_scope — the op runs on THIS (main) thread, so it
+        //    carries no `Send` bound and may run `!Send` NonSend systems in place while
+        //    the spawned worker tasks run in parallel. `task.cmds`
+        //    (Option<SendPtr<Commands>>) is Copy+Send — each single-task system carries
+        //    the pointer to its own per-system slot; row-split tasks carry `None`.
+        rayon::in_place_scope(|s| {
             for task in &tasks {
                 s.spawn(move |_| {
                     // SAFETY (W3-4 + D3): multiple tasks of one system exist
@@ -637,6 +668,35 @@ impl Scheduler {
                         sys.run(ctx);
                     }
                 });
+            }
+
+            // B2: run this stage's NonSend systems on the current (main) thread,
+            // concurrently with the worker tasks spawned above. Their access is
+            // disjoint from every worker task's (compile placed conflicting systems in
+            // different stages), so this is the same disjoint-data argument that makes
+            // the worker tasks sound — extended to the main thread as one more actor.
+            for &(sys_id, ptr, last_run) in &nonsend_infos {
+                // SAFETY: `ptr` targets this system's `dyn NonSendSystem` box — distinct
+                // from every worker task's `AsdTask.ptr` (those target `Parallel`
+                // boxes), and only the main thread ever forms `&mut *ptr`. The full
+                // SubWorld read + this system's private per-system command slot are
+                // disjoint from every concurrent worker task (stage conflict-freedom).
+                // `!Send` is sound: `in_place_scope` runs this op on the main thread.
+                unsafe {
+                    let sys: &mut dyn NonSendSystem = &mut *ptr;
+                    let sub = apex_core::SubWorld::from_raw(
+                        world as *const World,
+                        &all_arch_indices,
+                    );
+                    let sws = std::slice::from_ref(&sub);
+                    let slot = slot_of[&sys_id];
+                    let ctx = SystemContext::with_commands(
+                        sws,
+                        (cmds_base as *mut Commands).add(slot),
+                    )
+                    .with_last_run(last_run);
+                    sys.run(ctx);
+                }
             }
         });
 

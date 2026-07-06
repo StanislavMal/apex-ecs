@@ -486,6 +486,10 @@ scheduler ВНУТРИ `install`-замыкания (Scheduler живёт цел
 
 **Шаги (каждый — атомарный коммит со своими тестами + полные гейты шапки):**
 
+**Прогресс:** B1 ✅ (коммит `b39e0b1`) — фундамент NonSend, `Scheduler: !Send`. B2 ✅ (этот коммит) —
+параллельный executor (Lua‖Rust через `rayon::in_place_scope`; concurrency-тест rendezvous + Miri TB
+чист + goldens 649/0/9). ДАЛЬШЕ: B3 (ScriptVm+registrar+Lua-runner), B4 (детерминизм+hot-reload).
+
 - **B1 — фундамент NonSend (корректность-first, БЕЗ параллелизма):** `trait NonSendSystem {
   fn run(&mut self, ctx: SystemContext) }` (без Send/Sync); `SystemKind::NonSend { system:
   Box<dyn NonSendSystem>, access }`; `kind.access()` → `Some` (участвует в конфликт-детекции —

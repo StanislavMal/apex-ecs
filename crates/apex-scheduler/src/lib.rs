@@ -640,12 +640,13 @@ enum SystemKind {
 }
 
 impl SystemKind {
-    /// Dispatched to a rayon worker? Only `Parallel`. A `NonSend` system declares
-    /// access but runs on the main thread, so it is NOT worker-parallel — a stage
-    /// containing one runs through the main-thread path (B1). (B2 will let a
-    /// NonSend system run on the main thread *concurrently* with worker tasks.)
-    fn is_parallel(&self) -> bool {
-        matches!(self, SystemKind::Parallel { .. })
+    /// Access-declared (conflict-detected) — eligible to share a *parallelizable*
+    /// stage: worker-dispatched `Parallel` systems and main-thread `NonSend`
+    /// systems (B2 runs the latter on the main thread concurrently with the
+    /// former). Only full-world `Sequential` systems are excluded (they run the
+    /// whole stage on the main thread).
+    fn is_parallelizable(&self) -> bool {
+        matches!(self, SystemKind::Parallel { .. } | SystemKind::NonSend { .. })
     }
 
     fn access(&self) -> Option<&AccessDescriptor> {
