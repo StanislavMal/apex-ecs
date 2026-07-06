@@ -2986,6 +2986,7 @@ impl<'w> DynQueryMut<'w> {
         let world = unsafe { self.world.world() };
         let this_run = world.current_tick();
         let registry = world.registry();
+        let writes: &[ComponentId] = &self.writes;
         for &arch_idx in &self.arch_ids {
             let arch = &world.archetypes()[arch_idx];
             for row in 0..arch.len() {
@@ -3000,6 +3001,8 @@ impl<'w> DynQueryMut<'w> {
                     row,
                     registry,
                     this_run,
+                    writes,
+                    world,
                 });
             }
         }
@@ -3023,6 +3026,8 @@ impl<'w> DynQueryMut<'w> {
             row: loc.row as usize,
             registry: world.registry(),
             this_run: world.current_tick(),
+            writes: &self.writes,
+            world,
         })
     }
 }
@@ -3037,6 +3042,11 @@ pub struct DynItemMut<'a> {
     row: usize,
     registry: &'a crate::component::ComponentRegistry,
     this_run: Tick,
+    /// S7: the query's DECLARED write ids. `get_mut`/`get_mut_ptr` refuse any id
+    /// not in this set, so the write declaration is enforced, not decorative.
+    writes: &'a [ComponentId],
+    /// For the S7 refusal path's `anomaly!` (the world's `ErrorHandler`).
+    world: &'a World,
 }
 
 impl std::fmt::Debug for DynItemMut<'_> {
@@ -3097,6 +3107,10 @@ impl<'a> DynItemMut<'a> {
     /// aligned sentinel and must not be written through.
     #[inline]
     pub fn get_mut_ptr(&mut self, id: ComponentId) -> Option<*mut u8> {
+        if !self.writes.contains(&id) {
+            self.refuse_undeclared_write("DynItemMut::get_mut_ptr", id);
+            return None;
+        }
         let col_idx = self.arch.column_index(id)?;
         let col = &self.arch.columns_raw()[col_idx];
         // SAFETY: `row < arch.len()`; the query holds the world's exclusive
@@ -3108,9 +3122,31 @@ impl<'a> DynItemMut<'a> {
         }
     }
 
+    /// S7: report an attempt to mutate a component the query did not declare as a
+    /// write. The declaration drives archetype matching AND the parallel access
+    /// model, so an undeclared `&mut` (e.g. from scripting / agent-IPC over a
+    /// dynamic query) would be a live-write the scheduler cannot see — refuse it
+    /// loudly (§0.2a) rather than hand out the pointer.
+    #[cold]
+    fn refuse_undeclared_write(&self, op: &'static str, id: ComponentId) {
+        crate::anomaly!(
+            self.world,
+            crate::Severity::Warn,
+            op,
+            Some(self.entity),
+            self.registry.get_info(id).map(|i| i.name),
+            "component id {id:?} is not in the query's declared writes \
+             — mutation refused (declare it via write/write_id/write_name)"
+        );
+    }
+
     /// Mutable typed view of component `id`, marking it changed. Type mismatch
     /// is a loud (throttled) warn + `None`.
     pub fn get_mut<T: Component>(&mut self, id: ComponentId) -> Option<&mut T> {
+        if !self.writes.contains(&id) {
+            self.refuse_undeclared_write("DynItemMut::get_mut", id);
+            return None;
+        }
         let col_idx = self.arch.column_index(id)?;
         let info = self.registry.get_info(id)?;
         if info.type_id != std::any::TypeId::of::<T>() {
@@ -4194,6 +4230,48 @@ mod dyn_query_tests {
             }
         });
         assert_eq!(world.get::<Hp>(a), Some(&Hp(1101)));
+    }
+
+    /// S7: a mutable accessor refuses any component the query did NOT declare as
+    /// a write — the write declaration is enforced, not decorative. A
+    /// read-declared component cannot be obtained mutably (typed or untyped),
+    /// while shared read of it still works.
+    #[test]
+    fn dyn_write_gate_refuses_undeclared_write() {
+        let mut world = World::new();
+        let a = world.spawn((Hp(100), Mana(50)));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let mana_id = world.component_id_by_name(type_name::<Mana>()).unwrap();
+
+        let mut q = world
+            .query_builder_mut()
+            .write::<Hp>()
+            .read::<Mana>()
+            .build()
+            .unwrap();
+
+        q.for_each_mut(|mut item| {
+            // Declared write: allowed.
+            item.get_mut::<Hp>(hp_id).unwrap().0 += 1;
+            // Read-declared (not a write): refused — typed and untyped.
+            assert!(
+                item.get_mut::<Mana>(mana_id).is_none(),
+                "read-declared Mana must not be writable"
+            );
+            assert!(
+                item.get_mut_ptr(mana_id).is_none(),
+                "read-declared Mana must not yield a mut ptr"
+            );
+            // Shared read of Mana still works.
+            assert_eq!(item.get::<Mana>(mana_id).map(|m| m.0), Some(50));
+        });
+
+        assert_eq!(world.get::<Hp>(a), Some(&Hp(101)));
+        assert_eq!(
+            world.get::<Mana>(a),
+            Some(&Mana(50)),
+            "Mana untouched — undeclared write refused"
+        );
     }
 
     #[test]

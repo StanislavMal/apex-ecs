@@ -272,11 +272,18 @@
   extract держать последовательным); (4) `TargetIndex::remove` O(N)-скан — коммент-компромисс
   (O(N) в fan-in target'а; малый для типичных relations; SmallVec inline бьёт вторичный индекс;
   деградация только на патологическом huge-fan-in). Гейты: 260 core-тестов, clippy net-neutral.
-- **DynQueryMut item-гейт 🟢 (S7/S8) → CORE_POLISH волна 3 (фаза A).** `DynItemMut::get_mut/get_mut_ptr` (`query.rs:~2711,2725`) не
-  проверяют вхождение id в декларированные `writes` — декларация влияет только на матчинг архетипов,
-  `AliasedWrite`-проверка при lending декоративна; для agent-IPC/скриптинга политику «что можно
-  писать» придётся enforcить слоем выше (S7). Нет Changed/Added-термов у динамического билдера —
-  инспектору для change-polling остаются полные сканы (S8). Гейтить в item либо явно задокументировать.
+- **DynQueryMut item-гейт: S7 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 3 фаза A) / S8 🟢 → волна 3 фаза A.**
+  **S7 ✅:** `DynItemMut::get_mut/get_mut_ptr` теперь ГЕЙТЯТ по декларированным `writes` — id не в
+  `writes` → `None` + `anomaly!` (`refuse_undeclared_write`, Severity::Warn, World в scope через новое
+  поле `DynItemMut.world`). Декларация write больше не декоративна: скриптинг/agent-IPC/редактор поверх
+  DynQueryMut не могут писать недекларированный компонент (read-declared компонент даёт только shared
+  read). `DynItemMut` получил поля `writes: &[ComponentId]` + `world: &World`; оба конструктора
+  (`for_each_mut`/`get_mut`) прокидывают их. Тест `dyn_write_gate_refuses_undeclared_write` (write:Hp +
+  read:Mana → get_mut::<Mana>/get_mut_ptr(mana) = None, Mana не тронута; get::<Mana> работает). Гейты:
+  260 core + workspace зелёные, clippy net-neutral, Miri TB чист (dyn_write 9). Нулевой blast radius
+  (движок DynItemMut не потребляет). **S8 🟢 (открыт):** нет Changed/Added-термов у динамического
+  билдера — инспектору для change-polling остаются полные сканы. Синтаксис дескриптора
+  `"Changed:Position"`/`"Added:Position"` (симметрично With/Without) — следующий пункт фазы A.
 
 ---
 
