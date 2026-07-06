@@ -380,7 +380,8 @@ state в AutoSystem-инстансе.
 integration, scripting 8 E2E) зелёный; clippy `--all-targets` net-neutral (4 pre-existing в
 serialization/bench); **движок `check --all-targets` ✅, goldens `visual_tests` 649/0/9 БАЙТ-ИДЕНТИЧНЫ**
 (S3/S4 рендер не трогают, apex-input rename семантически тождествен). TECH_DEBT: S3 ✅ (2.1), S4 ✅ (2.2),
-F4b ✅ переоценкой (2.3). Руководство §5.2.1/§6.7 + таблицы World/ctx отражают финальную поверхность.
+F4b ✅ полной реализацией персистентных курсоров (2.3, коммит c76e11c). Руководство §5.2.1/§6.7 +
+таблицы World/ctx отражают финальную поверхность.
 Коммиты: core `5150970`/`a70abf2`/`095dcd7` + engine `ced2f31` (ветка api-golden-path). НЕ запушено.
 
 **Волна 2 ✅ ЗАКРЫТА.** Далее — волна 3 (скриптинг: фаза A DynQuery/S7/S8, фаза B Lua-системы).
