@@ -143,9 +143,14 @@ impl Scheduler {
     /// conflicts — the exclusive `&mut World` receiver makes that re-derivation
     /// sound (no other view is live).
     pub fn run_sequential(&mut self, world: &mut World) {
+        // MIRI-CD: derive ONE raw pointer and route every access through it — the read
+        // view (SubWorld, built from `world_ptr`) and the interleaved `&mut World` writes
+        // (tick bump, Commands apply, sequential systems) are then all children of the
+        // same raw tag, so no write disables the SubWorld's read pointer. Holding a
+        // long-lived `&mut *world_ptr` instead would make every SubWorld read a foreign
+        // access to that outstanding `&mut` (UB under Stacked/Tree Borrows).
         let world_ptr = world as *mut World;
-        let w = unsafe { &mut *world_ptr };
-        self.populate_type_names(w.registry());
+        self.populate_type_names(unsafe { &*world_ptr }.registry());
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
@@ -155,7 +160,7 @@ impl Scheduler {
         for system in &self.systems {
             if let Some(access) = system.kind.access() {
                 for &(type_id, cap) in &access.event_reserves {
-                    w.event_reserve_by_type(type_id, cap);
+                    unsafe { &mut *world_ptr }.event_reserve_by_type(type_id, cap);
                 }
             }
         }
@@ -188,7 +193,7 @@ impl Scheduler {
                 while end < stages_meta.len() && stages_meta[end].0 == StageLabel::FixedUpdate {
                     end += 1;
                 }
-                let steps = Self::stage_steps(w, &StageLabel::FixedUpdate);
+                let steps = Self::stage_steps(unsafe { &mut *world_ptr }, &StageLabel::FixedUpdate);
                 for _ in 0..steps {
                     schedule.extend(si..end);
                 }
@@ -212,7 +217,7 @@ impl Scheduler {
             let mut enabled: FxHashSet<SystemId> = FxHashSet::default();
             for &sys_id in system_ids {
                 if let Some(&idx) = self.system_indices.get(&sys_id) {
-                    if self.systems[idx].run_condition.evaluate(w) {
+                    if self.systems[idx].run_condition.evaluate(unsafe { &*world_ptr }) {
                         enabled.insert(sys_id);
                     }
                 }
@@ -225,14 +230,17 @@ impl Scheduler {
             }
             // D4: rebuild the SubWorld per stage so a Parallel system sees new
             // archetypes created by an earlier stage this frame (it was built once
-            // before the loop and went stale).
-            let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-            let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
+            // before the loop and went stale). MIRI-CD: built from the RAW `world_ptr`
+            // (not a `&World` reborrow) so the interleaved `&mut *world_ptr` writes below
+            // do not invalidate it.
+            let all_indices: Vec<usize> = (0..unsafe { &*world_ptr }.archetypes().len()).collect();
+            let sub_world =
+                unsafe { apex_core::SubWorld::from_raw(world_ptr as *const World, &all_indices) };
             {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
-                self.open_stage_change_window(stage_idx, w);
+                self.open_stage_change_window(stage_idx, unsafe { &mut *world_ptr });
                 // D6: the tick this stage runs at (see `run_hybrid_parallel`).
-                let this_run = w.current_tick();
+                let this_run = unsafe { &*world_ptr }.current_tick();
                 for &sys_id in system_ids {
                     if !enabled.contains(&sys_id) {
                         continue;
@@ -243,7 +251,7 @@ impl Scheduler {
                         let system = &mut self.systems[index];
                         let prof_t = main_prof_enabled().then(std::time::Instant::now);
                         match &mut system.kind {
-                            SystemKind::Sequential(f) => f(w),
+                            SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                             SystemKind::Parallel { system, .. } => {
                                 // SAFETY: `cmds_ptr` points at `stage_cmds`, a single
                                 // buffer alive until the end of the run; systems run
@@ -266,11 +274,11 @@ impl Scheduler {
 
                 // Apply deferred commands after each stage/step (rank order —
                 // systems appended to `stage_cmds` in execution order).
-                stage_cmds.apply(w);
+                stage_cmds.apply(unsafe { &mut *world_ptr });
 
                 // Per-stage flush — makes events available to the next stage
                 if !emit_event_types.is_empty() {
-                    w.flush_events_by_type(emit_event_types);
+                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
                 }
                 // D6: advance each enabled system's baseline to this stage's tick.
                 self.advance_system_windows(&enabled, this_run);
@@ -278,7 +286,7 @@ impl Scheduler {
         }
 
         // Frame boundary: advance the change-tick (TD-9).
-        w.advance_change_tick();
+        unsafe { &mut *world_ptr }.advance_change_tick();
 
         self.startup_completed = true;
     }
@@ -423,7 +431,9 @@ impl Scheduler {
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
                         let all_indices: Vec<usize> = (0..archetypes.len()).collect();
-                        let sw = unsafe { apex_core::SubWorld::from_raw(world, &all_indices) };
+                        let sw = unsafe {
+                            apex_core::SubWorld::from_raw(world as *const World, &all_indices)
+                        };
                         let sws = [sw];
                         // SAFETY: this system's private per-system slot (D8b), run
                         // single-task on the main thread here → unique `&mut`.
@@ -587,11 +597,11 @@ impl Scheduler {
                         let sys: &mut dyn ParSystem = &mut *task.ptr.0;
                         let sub = if task.chunk_ranges.is_empty() {
                             // Full SubWorld — all of the system's archetypes, unrestricted
-                            apex_core::SubWorld::from_raw(world, &task.arch_indices)
+                            apex_core::SubWorld::from_raw(world as *const World, &task.arch_indices)
                         } else {
                             // SubWorld with range restrictions and narrowed arch_indices
                             apex_core::SubWorld::from_raw_with_ranges(
-                                world,
+                                world as *const World,
                                 &task.arch_indices,
                                 &task.chunk_ranges,
                             )
@@ -816,9 +826,13 @@ impl Scheduler {
 
             if !all_parallel {
                 {
-                    let w = unsafe { &*const_ptr };
-                    let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
+                    // MIRI-CD: build the SubWorld from the RAW `const_ptr` (= `world_ptr`),
+                    // not a `&*const_ptr` reborrow — the interleaved `&mut *world_ptr`
+                    // writes below are children of that same raw tag, so they never
+                    // invalidate the SubWorld's read pointer.
+                    let all_indices: Vec<usize> =
+                        (0..unsafe { &*const_ptr }.archetypes().len()).collect();
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(const_ptr, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             if !enabled.contains(&sys_id) {
@@ -908,9 +922,12 @@ impl Scheduler {
 
             if should_fallback {
                 {
-                    let w = unsafe { &*const_ptr };
-                    let all_indices: Vec<usize> = (0..w.archetypes().len()).collect();
-                    let sub_world = unsafe { apex_core::SubWorld::from_raw(w, &all_indices) };
+                    // MIRI-CD: SubWorld from the raw `const_ptr` (see the `!all_parallel`
+                    // branch) so the interleaved `&mut *world_ptr` writes do not
+                    // invalidate it.
+                    let all_indices: Vec<usize> =
+                        (0..unsafe { &*const_ptr }.archetypes().len()).collect();
+                    let sub_world = unsafe { apex_core::SubWorld::from_raw(const_ptr, &all_indices) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             if !enabled.contains(&sys_id) {

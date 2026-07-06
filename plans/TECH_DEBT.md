@@ -27,16 +27,20 @@
 > `World`/`SystemContext`-поверхности остались лазейками. Заявка «soundness в типах» до конца НЕ
 > выполнена. Приоритет — первым заходом.
 
-- **MIRI-CD 🔴 НОВОЕ (обнаружено 2026-07-06, CORE_POLISH волна 1.2 — PRE-EXISTING, НЕ регрессия) —
-  Miri UB в change-detection query-пути под планировщиком.** `apex-scheduler/tests/unified_system.rs`
-  `changed_in_system_detects_only_mutated` (система `detect_changed` с `(Changed<C>, Read<C>)` через
-  `system!`) даёт **реальный UB И под Stacked, И под Tree Borrows** (`reborrow ... forbidden` / `retag
-  ... tag does not exist`). **Подтверждено pre-existing:** идентичный фейл на pre-1.2 (commit b48ffd0),
-  до любых правок волны 1.2. Почему не замечено: аудит гонял Miri TB на apex-**core** lib-тестах, а
-  этот путь — в apex-**scheduler** integration-тесте (query-fetch через SubWorld+system! в scheduler-
-  контексте). §0.2a — записан громко. **Вне scope CORE_POLISH** (независимый pre-existing soundness-баг
-  query-слоя, не детерминизм/скриптинг); заведена отдельная задача. Приоритет 🔴 (UB в горячем
-  read-пути), но требует изолированного захода с локализацией retag'а.
+- **MIRI-CD ✅ ЗАКРЫТ (обнаружено + исправлено 2026-07-06, CORE_POLISH; был PRE-EXISTING, НЕ регрессия
+  1.2) — Miri UB в change-detection query-пути под планировщиком.** Было: `SubWorld::from_raw(world:
+  &World)` сохранял сырой указатель, НАСЛЕДУЯ borrow-tag этой `&World`; исполнитель затем мутировал тик
+  World через sibling `&mut World` (`world.rs:338` `tick()` — foreign write), что дизаблило tag →
+  последующий `SubWorld::world()` = **UB под Stacked И Tree Borrows**. Ловилось
+  `unified_system::changed_in_system_detects_only_mutated`; подтверждено pre-existing на b48ffd0. Не
+  замечено раньше: Miri гоняли на apex-**core** lib, а путь — в apex-**scheduler** integration.
+  **Фикс:** `from_raw`/`from_raw_with_ranges` берут сырой `*const World` (не `&World`) — указатель без
+  borrow-tag; исполнители строят SubWorld из ТОГО ЖЕ raw-ptr (`world_ptr`/`const_ptr`), из которого
+  берут транзиентные `&mut *ptr`-записи, поэтому записи (дети raw-tag) его не дизаблят. `run_sequential`
+  переписан с долгоживущего `&mut *world_ptr` на raw-ptr + транзиентные reborrow'ы (долгоживущий `&mut`
+  делал каждое SubWorld-чтение foreign-доступом). **Гейты:** Miri SB+TB чисты (unified_system 5/0,
+  co_stage 0-UB, d8b параллельный 5/0); scheduler+core 12 ok, workspace 42 ok, clippy net-neutral.
+  Scheduler-CD-путь теперь в Miri-политике. **§0.2a — громкий баг найден и закрыт.**
 
 - **S1 ✅ ЗАКРЫТ ЦЕЛИКОМ — ЧАСТЬ 1 (2026-07-05, commit e79ad1e) + ЧАСТЬ 2 (2026-07-05) — read/write-аксессоры.**
   **Часть 1 ✅ (документированный PoC закрыт):** `Query::get`/`single` возвращали ОДИН дублируемый item;

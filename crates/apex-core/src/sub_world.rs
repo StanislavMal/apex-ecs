@@ -81,20 +81,27 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// Build a SubWorld from references whose lifetimes are NOT tied to `'w`.
+    /// Build a SubWorld from a RAW `*const World` whose lifetime is NOT tied to `'w`.
+    ///
+    /// Takes a raw pointer (not `&World`) DELIBERATELY (MIRI-CD, 2026-07-06): the
+    /// scheduler interleaves this read view with `&mut World` writes (the per-stage tick
+    /// bump, `Commands` apply, sequential systems) through a sibling `*mut World`. If
+    /// this took `&World`, the stored pointer would inherit that reference's borrow tag,
+    /// which the later `&mut World` write would invalidate → reading `world()` afterwards
+    /// is UB under both Stacked and Tree Borrows. A raw pointer carries no such tag: the
+    /// caller passes the SAME raw `*const World` it derives its transient `&mut *ptr`
+    /// writes from, so those writes (children of that pointer) never disable it.
     ///
     /// # Safety
-    /// The caller guarantees that `world` and `archetype_indices` live at least
-    /// as long as the returned SubWorld, and that while it is in use there is no
-    /// live `&mut World` aliasing the covered archetypes. Intended for the
-    /// scheduler, which holds a `*mut World` under the discipline "no structural
-    /// changes while systems run" and interleaves `&World`/`&mut World` by hand —
-    /// so it cannot go through the safe [`new`](Self::new) (a `&World` borrow
-    /// would conflict with the subsequent `&mut World`).
+    /// `world` must point to a live `World` for at least the SubWorld's lifetime, and
+    /// while the SubWorld is in use there must be no CONCURRENT `&mut World` aliasing the
+    /// covered archetypes (the scheduler guarantees this: transient, non-overlapping
+    /// `&mut *ptr` reborrows, no structural changes while systems run). `archetype_indices`
+    /// must likewise outlive the SubWorld.
     #[inline]
-    pub unsafe fn from_raw(world: &World, archetype_indices: &[usize]) -> Self {
+    pub unsafe fn from_raw(world: *const World, archetype_indices: &[usize]) -> Self {
         Self {
-            world: world as *const World,
+            world,
             archetype_indices: archetype_indices as *const [usize],
             row_ranges: std::ptr::slice_from_raw_parts(
                 std::ptr::null::<(usize, usize, usize)>(),
@@ -111,12 +118,12 @@ impl<'w> SubWorld<'w> {
     /// least as long as the SubWorld.
     #[inline]
     pub unsafe fn from_raw_with_ranges(
-        world: &World,
+        world: *const World,
         archetype_indices: &[usize],
         row_ranges: &[(usize, usize, usize)],
     ) -> Self {
         Self {
-            world: world as *const World,
+            world,
             archetype_indices: archetype_indices as *const [usize],
             row_ranges: row_ranges as *const [(usize, usize, usize)],
             _phantom: std::marker::PhantomData,
