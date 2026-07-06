@@ -224,7 +224,7 @@ world.register_component_serde::<Position>();
 >
 > **Внешние типы (`cgmath::Matrix4<f32>`):** Для использования внешних типов как компонентов, включите feature-флаг `cgmath` в `apex-core` — он предоставляет `impl Component for cgmath::Matrix4<f32>`.
 
-### 2.2.1 Required components — `#[require(...)]` (D2-4, аналог Bevy 0.15+)
+### 2.2.1 Required components — `#[require(...)]` (аналог Bevy 0.15+)
 
 Компонент может объявить, какие компоненты ему нужны рядом — спавн/insert
 сам дотягивает недостающие дефолтами:
@@ -246,7 +246,7 @@ world.require_component::<Camera, LocalTransform>();
 - требуемый тип обязан реализовывать `Default`; **явно заданное значение
   всегда выигрывает** у дефолта (`spawn((MeshRenderer…, LocalTransform::at(…)))`);
 - требования **транзитивны** (если требуемый компонент сам что-то требует);
-- дотяжка происходит через очередь хуков состава (W3-1) сразу по завершении
+- дотяжка происходит через очередь хуков состава сразу по завершении
   spawn/insert — к моменту пользовательского `on_add` и к возврату из `spawn`
   состав уже полный;
 - движок объявляет requires для `MeshRenderer`/`Camera`/светов
@@ -449,7 +449,7 @@ stateless — это осознанная граница двух диалект
 
 ## 3. Архетипы и хранилище
 
-Apex ECS использует архетипное хранилище (Archetype Storage). Entity с одинаковым набором компонентов хранятся в одном архетипе — это обеспечивает cache-friendly итерацию.
+ApexForge_ECS использует архетипное хранилище (Archetype Storage). Entity с одинаковым набором компонентов хранятся в одном архетипе — это обеспечивает cache-friendly итерацию.
 
 ### 3.1 Как работает хранилище
 
@@ -522,7 +522,7 @@ stateDiagram-v2
 
 ## 4. Query API
 
-Query — основной способ итерации по компонентам. Apex ECS предоставляет несколько уровней Query API.
+Query — основной способ итерации по компонентам. ApexForge_ECS предоставляет несколько уровней Query API.
 
 ### 4.1 Параметры запроса
 
@@ -694,7 +694,7 @@ world.query_changed::<(Read<Velocity>, Changed<Position>)>(last_tick)
         // vel только для изменившегося Position
     });
 
-// Стандартный Iterator через .iter() — item-only (П1):
+// Стандартный Iterator через .iter() — выдаёт только item:
 let far = world.query::<(Entity, Read<Position>)>()
     .iter()
     .filter(|(_, pos)| pos.x > 100.0)
@@ -717,7 +717,7 @@ world.query::<Read<Position>>()
 > форма (`Read`/`Write`/`With`/`Changed`) с незарегистрированным T даёт честно пустой запрос; `Maybe<T>`
 > выдаёт `None`; `Without<T>` пропускает всех; позиция формы в кортеже не влияет на корректность.
 
-### 4.3 `Or<>` — дизъюнкция фильтров (W2-5)
+### 4.3 `Or<>` — дизъюнкция фильтров
 
 `Or<(F1, …, F8)>` пропускает строку, если проходит **хотя бы одна** ветка. Главный паттерн —
 «изменился любой из» вместо двух запросов с dedup-набором:
@@ -739,7 +739,7 @@ Query::<(Read<Position>, Or<(With<Player>, With<Npc>)>)>::new(&world)
 - ветки — фильтры (`With`/`Without`/`Changed`/вложенный `Or`/кортежи-конъюнкции из них);
 - `Or` не сужает кандидатов запроса — строка может пройти по любой ветке.
 
-### 4.3.1 Плотная chunk-итерация — `for_each_chunk` (W2-0.5)
+### 4.3.1 Плотная chunk-итерация — `for_each_chunk`
 
 Для массовых не-фильтрующих проходов колонки выдаются **слайсами** — без per-row обвязки,
 дружелюбно к автовекторизации (скорость уровня Legion, но с change-тиками):
@@ -768,7 +768,7 @@ world.query_mut::<(Read<Velocity>, Write<Position>)>()
 Ориентир (10k строк × 2 колонки, criterion): `for_each` ~9.2µs → `for_each_chunk` ~6.8µs
 (Legion без тиков — ~6.0µs; разрыв — полоса памяти на запись тиков).
 
-### 4.3.2 `QueryState<Q>` — per-system стейт запроса (W2-0)
+### 4.3.2 `QueryState<Q>` — per-system стейт запроса
 
 Долгоживущий стейт в духе Bevy `QueryState`: список матчащих архетипов хранится у владельца и
 дополняется **инкрементально** только новыми архетипами. В устоявшемся состоянии вызов —
@@ -789,7 +789,7 @@ self.q.query_with_tick(&world, last_run).for_each(|e, item| { /* ... */ });
 Стейт привязан к миру по `World::id()`: применение к другому миру (main/render/isolated)
 прозрачно перестраивает его; ленивая регистрация компонентов доразрешается сама.
 
-### 4.3.4 `Added<T>` и наблюдение за составом (W3-1)
+### 4.3.4 `Added<T>` и наблюдение за составом
 
 `Added<T>` — фильтр «компонент **добавлен** entity после `last_run`» (паритет Bevy). Каждая
 строка хранит отдельный added-tick рядом с change-tick'ом:
@@ -839,7 +839,7 @@ for item in &q {
 if let Some(item) = q.get(entity) { /* ... */ }
 ```
 
-Правила громкости (§0.2a): неизвестное имя — `DynQueryError::UnknownComponent`
+Правила громкости: неизвестное имя — `DynQueryError::UnknownComponent`
 при `build()`; НЕзарегистрированный *типовой* терм — запрос честно не матчит
 ничего (никто не может иметь незарегистрированный компонент); несоответствие
 `T` и `id` в `item.get::<T>(id)` — throttled-warn + `None`.
@@ -1115,7 +1115,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
 | `remove_reader(reader_id)` | Удалить читателя |
 | `iter(reader_id) -> &[T]` | Непрочитанные события для reader (без продвижения курсора) |
-| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (весь буфер); guard итерируется напрямую: `for e in queue.read(&c)` (`IntoIterator` → `EventIterator`, TD-24) |
+| `read(reader_id) -> EventReadGuard<T>` | Чтение с auto-advance на Drop (весь буфер); guard итерируется напрямую: `for e in queue.read(&c)` (`IntoIterator` → `EventIterator`) |
 | `read_partial(reader_id, max_count) -> PartialReadGuard<T>` | Чтение с продвижением ровно на N событий |
 | `advance_reader_mut(reader_id)` | Ручное продвижение курсора до конца буфера |
 | `advance_reader_by(reader_id, count)` | Ручное продвижение курсора на N событий |
@@ -1124,7 +1124,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 | `update()` | Переключить буферы: pending → events. Вызывается Scheduler'ом после каждого Stage (sequential и parallel), либо вручную через `world.flush_all_events()` |
 
 **`EventWriter<T>`** (декларируется как параметр системы `name: EventWriter<T>` — планировщик
-валидирует доступ; F3.2):
+валидирует доступ):
 
 | Метод | Описание |
 |-------|----------|
@@ -1231,7 +1231,7 @@ queue.send_batch_sync((0..100).map(|i| DamageEvent { target: e, amount: i as f32
 
 > **Примечание:** `update()` вызывается Scheduler'ом после каждого Stage (или через `world.flush_all_events()`). Ручной вызов `flush_sync()` нужен только если требуется прочитать события до следующего flush.
 
-#### 5.2.10 `Removed<T>` — события удаления компонентов + хуки состава (W3-1)
+#### 5.2.10 `Removed<T>` — события удаления компонентов + хуки состава
 
 Аналог Bevy `RemovedComponents`, реализованный поверх обычных событий (per-reader курсоры —
 без дублей и пропусков, обычная дисциплина флаша):
@@ -1250,7 +1250,7 @@ for r in reader.read() {
 
 Для невключённых типов удаления не записываются — нулевая стоимость.
 Bevy-совместимое имя — алиас `RemovedComponents<'w, T>` (= `EventReader<Removed<T>>`),
-работает и параметром plain-fn системы (D2-3).
+работает и параметром plain-fn системы.
 
 **Хуки состава** — синхронные наблюдатели (`fn(&mut World, Entity)`, без захватов; один хук
 на компонент на вид события — для нескольких подписчиков используйте события):
@@ -1340,7 +1340,7 @@ if let Err(errors) = result {
 
 #### 5.3.5 Особенности double-buffered events
 
-Конвейер управляет **порядком выполнения**, а не потоком данных. Начиная с v0.1.0, flush событий происходит после каждого Stage (через `world.flush_events_by_type()`), что означает: события, отправленные на Stage N, видны на Stage N+1 **того же кадра** (без задержки в 1 тик).
+Конвейер управляет **порядком выполнения**, а не потоком данных. Flush событий происходит после каждого Stage (через `world.flush_events_by_type()`), что означает: события, отправленные на Stage N, видны на Stage N+1 **того же кадра** (без задержки в 1 тик).
 
 При этом:
 - Трансформер может модифицировать **компоненты** — изменения видны консьюмерам того же кадра
@@ -1360,13 +1360,13 @@ if let Err(errors) = result {
 
 ## 6. Системы и планировщик
 
-Apex ECS предоставляет **единый макрос** `system!` для объявления систем — параллельных и
+ApexForge_ECS предоставляет **единый макрос** `system!` для объявления систем — параллельных и
 эксклюзивных (`world: &mut World`) — и единый API регистрации через `add_systems()`.
 
 ### 6.0 Регистрация систем — `add_systems()` (рекомендуемый способ)
 
 Единая точка регистрации. Принимает **обычные функции с Bevy-параметрами**
-(plain-fn системы, D2-1), **bare-идентификаторы** систем из `system!` (имя
+(plain-fn системы), **bare-идентификаторы** систем из `system!` (имя
 выводится из `fn`) — как параллельные, так и эксклюзивные — в одном кортеже:
 
 ```rust
@@ -1398,7 +1398,7 @@ sched.add_systems(StageLabel::Update, WaveSpawner::default());   // стейтф
 > РЕСУРС — ловушка для Bevy-мигранта; в plain-fn её нет. `system!` остаётся
 > рекомендованным диалектом для систем с состоянием (`struct {…}` удобнее
 > Bevy `Local<T>`). Plain-fn системы без захватов — кандидаты ASD row-split
-> (как stateless `system!`); замыкания с захватами планируются целиком (W3-4).
+> (как stateless `system!`); замыкания с захватами планируются целиком.
 
 Для условий/имён/доступа-замыканий доступны конструкторы `sys`/`seq`/`par`/`par_access` из `apex_scheduler`:
 
@@ -1419,7 +1419,7 @@ sched.add_systems(StageLabel::Update, (
 
 | Способ | Тип системы |
 |---|---|
-| bare `movement` (plain-fn) | обычная `fn` с Bevy-параметрами (D2-1) — имя из fn, access из параметров |
+| bare `movement` (plain-fn) | обычная `fn` с Bevy-параметрами — имя из fn, access из параметров |
 | bare `move_player` | `system!` (параллельная) — имя из fn |
 | bare `load_level` | `system!` + `world:&mut World` (эксклюзивная) — имя из fn |
 | `sys(name, struct)` | AutoSystem / `system!` struct с явным именем |
@@ -1582,7 +1582,7 @@ sched.chain(&["spawner", "camera"]).unwrap();
 | `run_sequential()` | Тесты, отладка | Commands работают (per-stage apply) |
 | `run()` | Production | Commands работают (per-thread + per-stage apply) |
 
-### 6.0d FixedUpdate — фиксированный шаг симуляции (D2-5)
+### 6.0d FixedUpdate — фиксированный шаг симуляции
 
 Стадия `StageLabel::FixedUpdate` шагает по аккумулятору ресурса
 `apex_scheduler::FixedTime` (0..N раз за кадр, остаток переносится; каждый шаг
@@ -1604,7 +1604,7 @@ sched.add_systems(StageLabel::FixedUpdate, physics_step); // dt шага = Fixed
 - DtConditioner (apex-window) кондиционирует ВХОДНОЙ dt — аккумулятор работает
   поверх него штатно, `FixedTime.dt` независим.
 
-### 6.0e App-состояния — `State<S>` / `NextState<S>` (D2-6)
+### 6.0e App-состояния — `State<S>` / `NextState<S>`
 
 Состояния поверх run conditions: `in_state` / `on_enter` / `on_exit`
 (переход применяется в начале кадра — кадр видит одно состояние;
@@ -1646,7 +1646,7 @@ world.resource_mut::<NextState<GameState>>().set(GameState::Playing);
 > **Как выводится доступ:** макрос анализирует типы параметров:
 > - `q: (Read<A>, Write<B>)` → `type Query = (...)`
 > - `name: Res<T>` → `ResRead<T>` · `name: ResMut<T>` → `ResWrite<T>` — **как в plain-fn**
->   (П2: bare `&T`/`&mut T` как ресурс — compile-ошибка с подсказкой; у Bevy `&T` означает
+>   (bare `&T`/`&mut T` как ресурс — compile-ошибка с подсказкой; у Bevy `&T` означает
 >   компонент запроса, двойная семантика была ловушкой мигранта)
 > - `name: &[E]` / `EventReader<E>` → `Listen<E>` (чтение) · `name: &mut Vec<E>` / `EventWriter<E>` → `Emit<E>` (`.send()`)
 > - `name: Cmd` → отложенные команды (`ctx.commands()`), не конфликтует
@@ -1702,7 +1702,7 @@ system! {
 system! {
     fn full_featured(
         q: (Read<Position>, Write<Velocity>),   // query
-        keys: Res<Input<KeyCode>>,               // resource read (П2: bare &T — ошибка)
+        keys: Res<Input<KeyCode>>,               // resource read (bare &T — ошибка)
         exit: ResMut<Exit>,                      // resource write
         events: &[CollisionEvent],               // event reader (биндится EventReader'ом)
         out: &mut Vec<DamageEvent>,              // event writer (.send())
@@ -1752,15 +1752,15 @@ system! {
 |----------|------------------------------|------------|
 | `q: (Read<A>, Write<B>, With<C>, Without<D>, MaybeWrite<E>)` | `type Query` | `Write<T>` → итерация `Mut<T>` (нужен `mut`-биндинг) |
 | `q: Read<A>` (bare) | `type Query = (Read<A>)` | одиночный компонент |
-| `name: Res<T>` | `ResRead<T>` | ресурс (чтение); bare `&T` — compile-ошибка (П2) |
-| `name: ResMut<T>` | `ResWrite<T>` | ресурс (запись); bare `&mut T` — compile-ошибка (П2) |
+| `name: Res<T>` | `ResRead<T>` | ресурс (чтение); bare `&T` — compile-ошибка |
+| `name: ResMut<T>` | `ResWrite<T>` | ресурс (запись); bare `&mut T` — compile-ошибка |
 | `name: &[E]` / `EventReader<E>` | `Listen<E>` | чтение событий |
 | `name: &mut Vec<E>` / `EventWriter<E>` | `Emit<E>` | запись событий (`.send()`) |
 | `name: Cmd` | `const HAS_DEFERRED = true` | отложенные команды, не конфликтует |
 | `name: Ctx` | *(none)* | `&SystemContext` |
 | `__whole: WholeWorld` | `const NEEDS_WHOLE_WORLD = true` | весь SubWorld (без ASD-чанков) |
 | `world: &mut World` | **ExclusiveSystem (FULL)** | **только один**; не комбинируется с другими |
-| `s: &mut Self` (+ `struct {…}`) | состояние системы | с/без дефолтов (U.5) |
+| `s: &mut Self` (+ `struct {…}`) | состояние системы | с/без дефолтов |
 
 При нераспознанном параметре (или `world` + другие) макрос выдаёт `compile_error!` с подсказкой.
 
@@ -1825,8 +1825,7 @@ system! {
 > регистрируется так же, как макрос-системы:
 > `app.add_systems(StageLabel::PostUpdate, propagate_transforms)`.
 
-> Большинство бывших sequential-систем после исправления change-detection (`Changed<T>` достоверен,
-> §C1/TD-9) и `Cmd` становятся **параллельными** `system!`. Оставляйте `world: &mut World` только там,
+> Большинство бывших sequential-систем после исправления change-detection (`Changed<T>` достоверен) и `Cmd` становятся **параллельными** `system!`. Оставляйте `world: &mut World` только там,
 > где реально нужен немедленный структурный доступ ко всему миру.
 
 ### 6.3 `AutoSystem` — ручная реализация (для понимания)
@@ -2045,7 +2044,7 @@ sched.add_systems(StageLabel::PostUpdate, seq("despawn_dead", |world: &mut World
 }));
 ```
 
-> **Автоматическое упорядочивание (v0.1.0):** Планировщик сам:
+> **Автоматическое упорядочивание:** Планировщик сам:
 > - Группирует параллельные системы в более ранних топологических уровнях, а Sequential — в более поздних, независимо от порядка регистрации.
 > - Обеспечивает порядок событий: все `Emit<E>` выполняются до `Listen<E>` (разные Stage), несколько `Listen<E>` — параллельно.
 > - **Sequential барьеры используют один dummy-узел** (N+M рёбер вместо N×M) — результат тот же, но `debug_plan_verbose()` чище.
@@ -2090,7 +2089,7 @@ sched.run(&mut world);   // ← автоматически флашит собы
 sched.run_sequential(&mut world);
 ```
 
-> **`compile_with_world()`:** Начиная с v0.1.0, доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
+> **`compile_with_world()`:** Доступен метод `compile_with_world(&mut self, world: &World)`, который заполняет имена компонентов в диагностике планировщика до компиляции:
 >
 > ```rust
 > sched.compile_with_world(&world).expect("circular dependency detected");
@@ -2247,7 +2246,7 @@ sched.enable_event_ordering(true);
 
 > **Важно:** `enable_event_ordering(false)` не влияет на компонентные и ресурсные конфликты — только на событийные (`Emit<E>` / `Listen<E>`). После вызова метода планировщик автоматически перекомпилирует граф при следующем `compile()`.
 
-### 6.6a Детерминированный параллельный спавн — `set_deterministic_spawn` (D8b, §0.9)
+### 6.6a Детерминированный параллельный спавн — `set_deterministic_spawn`
 
 По умолчанию при параллельном выполнении несколько систем, спавнящих entity через `Commands`,
 резервируют id из общего атомарного счётчика — порядок id зависит от того, в каком порядке rayon-потоки
@@ -2585,19 +2584,19 @@ fn setup(cmd: &mut Commands) {
 > всегда). Зарезервированная entity «не жива» до `apply` (как Bevy до sync-точки) — в запросах
 > появится после применения команд.
 
-> **Резервация переиспользует освобождённые слоты (TD-39).** `cmd.spawn()` не растит память
+> **Резервация переиспользует освобождённые слоты.** `cmd.spawn()` не растит память
 > безгранично под churn'ом: резерватор сперва переиспользует слоты, освобождённые `despawn`'ом
 > (аренда свободных слотов, переарендуется на sync-точке), а свежие индексы выдаёт лишь при их
 > исчерпании — `EntityAllocator.records` ≈ ПИК одновременных entity, а не сумма-всех-спавнов. Спавн
 > тысяч пуль/частиц через `Commands` + despawn безопасен по памяти.
 
-> **Группировка insert-бёрстов (W2-1).** Бёрст ПОДРЯД идущих `insert`'ов на одну entity
+> **Группировка insert-бёрстов.** Бёрст ПОДРЯД идущих `insert`'ов на одну entity
 > (`cmds.insert(e, A); cmds.insert(e, B); cmds.insert(e, C)`) применяется группой — **один**
 > archetype move на всю пачку вместо move-на-компонент (~1.4× быстрее apply на бёрст-паттерне).
 > Порядок применения команд сохраняется; дубликат компонента в пачке — выживает последний.
 > Вывод для кода: добавляете несколько компонентов одной entity — кладите команды подряд.
 
-> **Перезапись существующего компонента дропает старое значение (W2-1).** До 2026-06-11
+> **Перезапись существующего компонента дропает старое значение.** До 2026-06-11
 > `world.insert(e, X)` поверх уже существующего `X` молча терял старое значение —
 > Drop-типы (String, Vec, Arc, хэндлы) утекали. Теперь старое значение корректно
 > дропается на всех путях (одиночном, групповом, `insert_raw`).
@@ -2612,7 +2611,7 @@ fn setup(cmd: &mut Commands) {
 
 Relations позволяют создавать иерархии, ownership и произвольные связи между entity.
 
-**Модель хранения (с рефакторинга 2026-06-11, CR-M1):** пара `(kind, target)` НЕ
+**Модель хранения (с рефакторинга 2026-06-11):** пара `(kind, target)` НЕ
 является компонентом и не входит в состав архетипа. Связи живут в двух индексах мира:
 subject-индекс (`entity → её пары`, target хранится целиком — index + generation) и
 target-индекс (`(kind, target) → subjects`). Следствия:
@@ -2673,7 +2672,7 @@ let subjects = vec![entity1, entity2, entity3];
 world.add_relation_batch(&subjects, ChildOf, parent);
 ```
 
-> **Производительность:** после CR-M1 `add_relation` не делает структурных изменений,
+> **Производительность:** `add_relation` не делает структурных изменений,
 > поэтому batch — это просто bulk-вставка в индексы (O(N)); отдельный цикл
 > `add_relation()` стоит столько же. API сохранён для удобства и обратной совместимости.
 
@@ -2770,7 +2769,7 @@ system! {
 
 ---
 
-### 8.7 Хуки связей (W3-1)
+### 8.7 Хуки связей
 
 Наблюдатели за появлением/исчезновением пар вида `R` (один хук на вид на событие):
 
@@ -2837,7 +2836,7 @@ assert!(world.has_template("Monster"));
 
 ### 9.3 Параметры шаблонов (`TemplateParams`)
 
-Параметры позволяют переопределять значения при каждом спавне. Начиная с v0.1.0, `TemplateParams` использует **типизированные ключи** вместо строковых — ошибки в именах и типах обнаруживаются на этапе компиляции.
+Параметры позволяют переопределять значения при каждом спавне. `TemplateParams` использует **типизированные ключи** вместо строковых — ошибки в именах и типах обнаруживаются на этапе компиляции.
 
 ```rust
 use apex_core::template::{TemplateParams, TemplateParam};
@@ -2857,7 +2856,7 @@ let boss = world.spawn_template_with("Monster", &params)
 
 #### 9.3.1 Автоматические overrides для PrefabManifest
 
-Начиная с v0.1.0, параметры автоматически преобразуются в overrides компонентов при спавне через `PrefabManifest`. Для этого `TemplateParam` должен объявить полное имя типа компонента через `component_type_name()`:
+Параметры автоматически преобразуются в overrides компонентов при спавне через `PrefabManifest`. Для этого `TemplateParam` должен объявить полное имя типа компонента через `component_type_name()`:
 
 ```rust
 struct MonsterHealth;
@@ -3045,7 +3044,7 @@ println!("modified components: {}", diff.modified_components.len());
 
 > **Преимущество:** При частичных изменениях (например, изменилось 10% entity) размер диффа в ~10× меньше полного snapshot. Поле `modified_components` содержит только побайтово изменённые компоненты.
 
-### 10.3.2 Контекст-зависимая (де)сериализация — `SerdeContext` (TD-44)
+### 10.3.2 Контекст-зависимая (де)сериализация — `SerdeContext`
 
 Компонент с **внешней ссылкой** (хэндл ассета, `Entity`-референс, путь ресурса) нужно (де)сериализовать
 **через резолвер**: при сохранении ссылка → стабильный идентификатор (например путь), при загрузке обратно.
@@ -3231,7 +3230,7 @@ let root = loader.instantiate(&mut world, &hierarchy, &[], None, None).unwrap();
 
 ## 11. Hot Reload
 
-Apex ECS поддерживает три вида горячей перезагрузки:
+ApexForge_ECS поддерживает три вида горячей перезагрузки:
 
 - **JSON-конфиги** — через `apex-hot-reload` (ресурсы мира)
 - **Lua-скрипты** — через `apex-scripting` (игровая логика)
@@ -3626,7 +3625,7 @@ for each system:
 
 #### 13.1.2 Ключевое улучшение v0.1.0: Query через SubWorld
 
-Начиная с v0.1.0, `ctx.query::<Q>()` маршрутизируется через `SubWorld`, а не напрямую через `World`. Это означает:
+`ctx.query::<Q>()` маршрутизируется через `SubWorld`, а не напрямую через `World`. Это означает:
 - Query итерирует только архетипы SubWorld'а, а не весь мир
 - Query уважает `row_ranges` SubWorld'а — безопасное чанкование внутри одного архетипа
 - Одиночные архетипы режутся на чанки без data race (раньше это было невозможно)
@@ -3643,7 +3642,7 @@ for each system:
 Решение о параллельном запуске стадии принимает **cost-model по замеренной работе**, а НЕ по числу
 entity. Планировщик ведёт per-stage **EMA** (экспоненциальное скользящее среднее, α=0.2) фактического
 wall-time диспетча стадии и сравнивает с порогом `T_STAGE_SEQ_NS` (≈40µs) с гистерезисом ±20% (против
-дребезга на границе). Это §0.9-преимущество: ни Bevy (ручной `par_iter`), ни Legion (всегда DAG)
+дребезга на границе). Это наше преимущество: ни Bevy (ручной `par_iter`), ни Legion (всегда DAG)
 замеренной стоимостью не управляются.
 
 **Иерархия решения (в порядке приоритета):**
@@ -3826,7 +3825,7 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 - Используйте `spawn_many()` вместо цикла `spawn()` — один batch-аллокатор вместо N отдельных
 - `spawn_many_silent()` — то же что `spawn_many`, но без возврата `Vec<Entity>` — экономит heap-аллокацию
 - `spawn_batch()` — для спавна из итератора с разными типами бандлов (удобно в тестах/примерах)
-- **`spawn_many` и не-Copy компоненты:** начиная с v0.1.0, для бандлов, содержащих типы с Drop (String, Vec<T>, Arc<T>), `spawn_many` автоматически переключается на per-entity цикл, безопасный для некопируемых данных. Для `Copy`-бандлов используется bulk-copy — самый быстрый путь.
+- **`spawn_many` и не-Copy компоненты:** для бандлов, содержащих типы с Drop (String, Vec<T>, Arc<T>), `spawn_many` автоматически переключается на per-entity цикл, безопасный для некопируемых данных. Для `Copy`-бандлов используется bulk-copy — самый быстрый путь.
 - Определяйте компоненты для entity сразу при спавне — структурные изменения после спавна дороже
 
 ### 14.2 Query
@@ -3841,7 +3840,7 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 ### 14.3 Structural changes
 
 - Минимизируйте `insert`/`remove` в hot path — каждый вызов перемещает entity между архетипами
-- Группируйте изменения через `Commands.apply()` — один проход вместо N структурных изменений; бёрст `insert`'ов на одну entity кладите ПОДРЯД — он применится одним archetype move (W2-1)
+- Группируйте изменения через `Commands.apply()` — один проход вместо N структурных изменений; бёрст `insert`'ов на одну entity кладите ПОДРЯД — он применится одним archetype move
 - Маркерные компоненты (ZST) бесплатны по памяти, но всё равно вызывают переход архетипа
 
 ### 14.4 Планировщик
@@ -3987,11 +3986,11 @@ cargo run --release
 > при 5000–50000» была переоценкой. Автоотключатель гасит PAR в этой зоне (порог per-system выше),
 > переводя stage на sequential.
 
-**Фрагментированный мир (бенч `frag_world`, CR-M0 из `apex-engine/plans/CORE_REFACTORING.md`):**
+**Фрагментированный мир (бенч `frag_world`):**
 
 Профиль ~ many_foxes @1000: 28k entity, 1000 цепочек root→26 узлов→prim через `ChildOf`
 → 27k уникальных родителей. **ДО** рефакторинга (модель «пара = компонент архетипа») мир
-фрагментировался на **27 005 архетипов**; **ПОСЛЕ** (CR-M1…M4, 2026-06-11) тот же мир —
+фрагментировался на **27 005 архетипов**; **ПОСЛЕ** (2026-06-11) тот же мир —
 **5 архетипов**. Все таблицы выше меряны на мирах из единиц архетипов и фрагментированный
 профиль не ловили. Числа (i5-12400F, release + LTO, медиана из 9):
 
@@ -4008,16 +4007,14 @@ cargo run --release
 | `targets_of` ×27k родителей | 264 µs (9.8 ns/вызов) | **~190 µs (7 ns)** | 1.4× |
 | `target_of` ×27k | 1.64 ms (61 ns/вызов) | **80 µs (3 ns)** | 20× |
 | random `get_mut` ×28k (shuffle) | 3.25 ms (116 ns/вызов) | **195 µs (7 ns)** | 16× |
-| random `get_mut_by_id` ×28k (CR-M3) | — | **172 µs (6.1 ns)** | 19× от ДО-get_mut |
+| random `get_mut_by_id` ×28k | — | **172 µs (6.1 ns)** | 19× от ДО-get_mut |
 | `has_component` ×28k | 425 µs (15 ns/вызов) | **120 µs (4.3 ns)** | 3.5× |
 | extract-цикл (18 `Query::new` + iter) | **15.1 ms** | **~0.21 ms** | **73×** |
 | spawn поддерева (28 spawn + 27 `add_relation`) | 86.8 µs (3.2 µs/add_relation) | **~14 µs (0.5 µs)** | 6× |
 | построение мира 28k | 47.5 ms | **~7 ms** | 6× |
 
-> Что изменилось: CR-M1 — relations вне идентичности архетипа (27k архетипов → 5);
-> CR-M2 — кандидаты Query::new из component_arch_index + инкрементальный QueryCache;
-> CR-M3 — `component_id`/`get_by_id`/`get_mut_by_id` + линейный поиск колонки при ≤8
-> компонентах; CR-M4 — гигиена (см. apex-engine/plans/CORE_REFACTORING.md).
+> Причина ускорения: relations вынесены из идентичности архетипа (27k архетипов → 5), кандидаты
+> Query::new берутся из индекса по компоненту, доступ по ComponentId с линейным поиском колонки при ≤8 компонентах.
 > На DoD-сцене движка many_foxes @1000: ~160 → **~390 FPS** (Bevy ~235).
 > Бенч-страж: `cargo run --release -p apex-bench --bin frag_world` — падение >20% на нём
 > блокирует мерж.
@@ -4278,7 +4275,7 @@ fn main() {
 | `remove::<T>(entity)` | Удалить компонент |
 | `get::<T>(entity)` | Прочитать компонент → `Option<&T>` |
 | `get_mut::<T>(entity)` | Изменить компонент → `Option<&mut T>` |
-| `component_id::<T>()` | ComponentId типа → `Option<ComponentId>` (CR-M3) |
+| `component_id::<T>()` | ComponentId типа → `Option<ComponentId>` |
 | `get_by_id::<T>(entity, cid)` | `get` по заранее взятому ComponentId — без TypeId-hash на вызов (горячие циклы) |
 | `get_mut_by_id::<T>(entity, cid)` | `get_mut` по ComponentId (стампит change-tick) |
 | `insert_resource(value)` | Вставить ресурс |
@@ -4315,17 +4312,17 @@ fn main() {
 | `register_component::<T>()` | Зарегистрировать компонент |
 | `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
-| `require_component::<C, R>()` | Объявить: C требует R — спавн дотягивает `R::default()` (D2-4, §2.2.1; derive-атрибут `#[require(…)]`) |
-| `on_add::<T>(fn)` | Хук «компонент T появился у entity» (W3-1, §5.2.10); один хук на компонент, fn-pointer без захватов |
+| `require_component::<C, R>()` | Объявить: C требует R — спавн дотягивает `R::default()` (§2.2.1; derive-атрибут `#[require(…)]`) |
+| `on_add::<T>(fn)` | Хук «компонент T появился у entity» (§5.2.10); один хук на компонент, fn-pointer без захватов |
 | `on_remove::<T>(fn)` | Хук «entity потеряла T» (remove/despawn; значение уже уничтожено, при despawn entity мертва) |
 | `track_removals::<T>()` | Включить эмиссию событий `Removed<T>` при потере компонента (аналог Bevy `RemovedComponents`) |
 | `on_relation_add::<R>(fn)` | Хук появления пары вида R: `fn(&mut World, subject, target)` (§8.7) |
 | `on_relation_remove::<R>(fn)` | Хук исчезновения пары (явный remove ИЛИ despawn-вычистка, вкл. каскад) |
 | `entity_count()` | Количество живых entity → `usize` |
-| `archetype_stats()` | Сводка по архетипам → `ArchetypeStats` (всего/пустых/строк/максимум + память: `component_bytes`/`tick_bytes`/`entity_bytes`, `total_bytes()`; CR-M4, W3-5) |
+| `archetype_stats()` | Сводка по архетипам → `ArchetypeStats` (всего/пустых/строк/максимум + память: `component_bytes`/`tick_bytes`/`entity_bytes`, `total_bytes()`) |
 | `is_alive(entity)` | Проверить, жив ли entity → `bool` |
-| `has_component::<T>(entity)` | Проверить наличие компонента у entity (v0.1.0) → `bool` |
-| `clear_entities()` | Удалить все entity, сохранив ресурсы и события (v0.1.0) |
+| `has_component::<T>(entity)` | Проверить наличие компонента у entity → `bool` |
+| `clear_entities()` | Удалить все entity, сохранив ресурсы и события |
 | `current_tick()` | Текущий тик мира → `Tick` |
 | `advance_frame()` | Конец кадра (без планировщика): флаш событий + продвижение change-tick |
 | `advance_change_tick()` | Продвинуть change-tick на границе кадра (база `Changed<T>`); делает планировщик |
@@ -4333,10 +4330,10 @@ fn main() {
 | `register_template(name, tmpl)` | Зарегистрировать EntityTemplate по имени |
 | `spawn_template_with(name, params)` | Создать entity из шаблона с параметрами |
 | `has_template(name)` | Проверить наличие шаблона → `bool` |
-| `id()` | Уникальный id мира в процессе (привязка `QueryState`; W2-0) |
-| `check_change_ticks()` | Кламп старых change-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3); автозапуск из `tick()`/`advance_change_tick()` раз в ~67M тиков — вручную нужен только при собственном цикле без них |
+| `id()` | Уникальный id мира в процессе (привязка `QueryState`) |
+| `check_change_ticks()` | Кламп старых change-тиков к окну `Tick::MAX_CHANGE_AGE`; автозапуск из `tick()`/`advance_change_tick()` раз в ~67M тиков — вручную нужен только при собственном цикле без них |
 
-**`QueryState<Q>`** (W2-0): per-system стейт запроса — `new()`, `query(&world)`,
+**`QueryState<Q>`**: per-system стейт запроса — `new()`, `query(&world)`,
 `query_with_tick(&world, last_run)`; инкрементальное дополнение новыми архетипами,
 ноль локов/аллокаций на вызов; привязка к миру по `World::id()` (§4.3.2).
 
@@ -4344,25 +4341,25 @@ fn main() {
 `par_for_each_chunk_mut` (write) на `Query` — слайсы колонок (`&[T]`/`&mut [T]`/`Option<&[T]>`),
 write-слайс стампит change-tick всему диапазону; `Changed<T>`/`Added<T>` не компилируются (§4.3.1).
 
-**`Or<(F1,…)>`** (W2-5): дизъюнкция фильтров в запросе (§4.3).
+**`Or<(F1,…)>`**: дизъюнкция фильтров в запросе (§4.3).
 
-**`Added<T>`** (W3-1): фильтр «компонент добавлен после last_run»; переживает archetype
+**`Added<T>`**: фильтр «компонент добавлен после last_run»; переживает archetype
 move, replace не перезапускает; с плотной итерацией не компилируется (§4.3.4).
 
-**Итерация (П1/TD-8):** `iter()`/for-цикл/`single()`/`get(entity)` выдают `Q::Item`
+**Итерация:** `iter()`/for-цикл/`single()`/`get(entity)` выдают `Q::Item`
 (Bevy 1:1); entity — формой запроса `Query<(Entity, …)>`; `for_each(|e, item|)` —
-наш диалект с явной entity. `q.get(e)`/`q.get_mut(e)` — random-access O(1) (П3);
-`движение.run_if(...)` работает прямо на bare-fn (`FnSystemExt`, П4).
+наш диалект с явной entity. `q.get(e)`/`q.get_mut(e)` — random-access O(1);
+`movement.run_if(...)` работает прямо на bare-fn (`FnSystemExt`).
 
-**Generation-wrap (W3-3):** слот entity, чей generation дошёл до `u32::MAX`, ретируется
+**Generation-wrap:** слот entity, чей generation дошёл до `u32::MAX`, ретируется
 (не переиспользуется) — застрявший хэндл прошлой «жизни» слота никогда не укажет на чужую
 entity (ABA исключён; цена — одна запись на 2³² переиспользований слота).
 
-**Stateful-системы и ASD (W3-4):** системы с состоянием (`system!` со `struct {…}`,
+**Stateful-системы и ASD:** системы с состоянием (`system!` со `struct {…}`,
 замыкания с захватами) не делятся row-split'ом — один вызов `run` на кадр на весь
 SubWorld (внутри можно `par_for_each`). Параллельность МЕЖДУ системами не ограничена.
 
-**Утилита `apex_core::IndexStamp`** (CR-M4): генерационная «карта посещений» по
+**Утилита `apex_core::IndexStamp`**: генерационная «карта посещений» по
 `entity.index()` — O(1) `mark`/`contains` без хэширования, очистка — `next_generation()`.
 Замена `FxHashSet<Entity>`-на-кадр для ПЛОТНЫХ кадровых множеств (тысячи отметок;
 generation entity не участвует — НЕ использовать для множеств, переживающих кадр).
@@ -4371,9 +4368,9 @@ generation entity не участвует — НЕ использовать дл
 
 | Метод | Описание |
 |---|---|
-| `add_systems(label, systems)` | **Единственный вход регистрации**: plain-fn системы (D2-1), bare `system!`-идентификаторы (параллельные и эксклюзивные), `SystemConfig` (`sys`/`seq`/`par`/`par_access` + `.run_if*`) и кортежи до 12 — см. §6.0 |
-| `FixedTime` (ресурс) | Фиксированный шаг для `StageLabel::FixedUpdate`: `from_hz`/`accumulate`/`overstep_fraction`, кап шагов (D2-5, §6.0d) |
-| `init_state(world, sched, s)` / `in_state`/`on_enter`/`on_exit` | App-состояния поверх run conditions; переход через `NextState<S>` (D2-6, §6.0e) |
+| `add_systems(label, systems)` | **Единственный вход регистрации**: plain-fn системы, bare `system!`-идентификаторы (параллельные и эксклюзивные), `SystemConfig` (`sys`/`seq`/`par`/`par_access` + `.run_if*`) и кортежи до 12 — см. §6.0 |
+| `FixedTime` (ресурс) | Фиксированный шаг для `StageLabel::FixedUpdate`: `from_hz`/`accumulate`/`overstep_fraction`, кап шагов (§6.0d) |
+| `init_state(world, sched, s)` / `in_state`/`on_enter`/`on_exit` | App-состояния поверх run conditions; переход через `NextState<S>` (§6.0e) |
 | `scoped(\|s\| { ... })` | Скоуп условий: `run_condition` внутри блока применяется ко всем регистрациям; по выходе восстанавливается (§6.0b) |
 | `run_condition(f)` | Scope condition внутри `scoped()` (AND с собственными условиями систем) |
 | `chain(names)` | Цепочка систем: `chain(&["a","b","c"])` — каждая после предыдущей |
@@ -4415,7 +4412,7 @@ generation entity не участвует — НЕ использовать дл
 | `.write::<T>()` | Декларировать запись компонента T |
 | `.read_event::<T>()` | Декларировать чтение событий T |
 | `.write_event::<T>()` | Декларировать запись событий T |
-| `.event_reserve::<T>(cap)` | Зарезервировать буфер на cap событий T (v0.1.0) |
+| `.event_reserve::<T>(cap)` | Зарезервировать буфер на cap событий T |
 | `.par_for_each_used()` | Пометить, что система использует `par_for_each` внутри |
 | `.whole_world()` | Пометить, что системе нужен глобальный доступ ко всем entity (ASD-чанкование запрещено) |
 | `.merge(&other)` | Слить с другим дескриптором (max по резервам) |
@@ -4453,7 +4450,7 @@ generation entity не участвует — НЕ использовать дл
 `add_systems(...)`; с условиями — `SystemConfig::exclusive(sys).run_if(…)`.
 
 **Со состоянием** — `struct {…}` + `fn run(s: &mut Self, …)`; поля с `= default` → генерируется
-`Default`; поля без дефолтов (U.5) → `pub`, конструируйте значением.
+`Default`; поля без дефолтов → `pub`, конструируйте значением.
 
 ### SystemContext API (раздел 6.7)
 
@@ -4625,7 +4622,7 @@ generation entity не участвует — НЕ использовать дл
 
 ## 17. Lua Scripting
 
-`apex-scripting` интегрирует скриптовый язык **Lua 5.4** (через крейт `mlua`) в Apex ECS. Скрипты можно использовать для описания игровой логики, прототипирования и хот-релоада поведения без перекомпиляции Rust.
+`apex-scripting` интегрирует скриптовый язык **Lua 5.4** (через крейт `mlua`) в ApexForge_ECS. Скрипты можно использовать для описания игровой логики, прототипирования и хот-релоада поведения без перекомпиляции Rust.
 
 **Назначение — непроизводительные элементы.** Lua-скриптинг однопоточный внутренне
 (скрипты выполняются последовательно) и не может выполняться в параллельных
@@ -4710,7 +4707,7 @@ end
 | `query(descs)` | `→ iterator` | Итерация по компонентам. Возвращает Lua-итератор для `for-in` |
 | `commit(entity)` | — | Записать изменения Write-компонентов обратно в ECS |
 | `spawn_entity(components)` | — | Создать entity с компонентами (отложенно, **не возвращает индекс**) |
-| `despawn(entity_idx)` | — | Уничтожить entity по индексу |
+| `despawn(entity_id)` | — | Уничтожить entity по id-строке `"index:generation"` (напр. `despawn(entity.entity)`) |
 | `read_resource("TypeName")` | `→ table` | Прочитать ресурс (Lua таблица) |
 | `write_resource("TypeName", value)` | — | Записать ресурс (отложенно) |
 | `emit_event("TypeName", value)` | — | Отправить событие (отложенно) |
@@ -4764,7 +4761,7 @@ query({"Read:Pos", "Write:Vel", "With:Player", "Without:Dead"})  -- комбин
 for entity in query({"Read:Velocity", "Write:Position"}) do
     entity.velocity.x, entity.velocity.y   -- чтение Velocity
     entity.position.x, entity.position.y   -- чтение/запись Position
-    entity.entity                          -- индекс entity (integer)
+    entity.entity                          -- id entity: строка "index:generation" (НЕ голое число)
     commit(entity)                         -- записать изменения Position
 end
 
@@ -4964,4 +4961,4 @@ impl ScriptableRegistrar for Health {
 
 ---
 
-*Apex ECS v0.1.0 • Rust Edition 2021 • MIT License*
+*ApexForge_ECS v0.1.0 • Rust Edition 2021 • MIT License*
