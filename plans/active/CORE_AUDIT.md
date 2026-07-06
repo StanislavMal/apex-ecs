@@ -1005,6 +1005,15 @@ API-порядка НЕ зависят, можно вести параллель
 Rustdoc-полировка + CHANGELOG.
 *Гейт: grep-ноль кириллицы в *.rs (решено: да, §10.2); tests count↑.*
 
+> **СТАТУС Волны 7 (2026-07-06): ✅ по сути завершена.** EN-миграция ✅ (grep-ноль кириллицы в *.rs),
+> декомпозиция scheduler/lib.rs ✅ (6856→1090), **ТЕСТ-КАМПАНИИ ✅ ВСЕ ЗАКРЫТЫ** (7 коммитов,
+> +8 тест-таргетов, workspace зелёный 40 `test result: ok`, clippy net-neutral): trybuild (10 compile-fail),
+> serialization round-trip+fuzz+error-path, isolated кросс-поточные (6), hot-reload (temp-фильтр+OS-watch E2E),
+> scripting E2E (8), events (gated no-loss + concurrent send_sync), par-пути core (par_for_each/_chunk).
+> Детали — TECH_DEBT «Волна 7». **Открытый долг Волны 7 = ТОЛЬКО D9-фолд** (поведенческий рефактор
+> дублирующегося скелета стадии под byte-identical engine-goldens гейтом; запись D9). CHANGELOG/rustdoc-
+> полировка — по желанию, не блокирует.
+
 ---
 
 ## 10. Развилки — РЕШЕНИЯ (приняты 2026-07-03; критерий — золотой путь §0.2a/б, §0.9, §0.10)

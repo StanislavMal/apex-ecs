@@ -203,7 +203,18 @@
   **Декомпозиция `scheduler/lib.rs` ✅:** 6856→1090 строк — вынос `mod tests`→`tests.rs` + сплит
   `impl Scheduler`→`registration/compile/executor/debug.rs` (child-модули видят приватные поля родителя;
   16 методов→`pub(crate)` для кросс-модульного/тестового доступа). **D9-фолд ОТЛОЖЕН** (см. запись D9
-  выше — co-location сделана, фолд = поведенческий рефактор под goldens-гейтом). **⏳ ОСТАЁТСЯ =
-  тест-кампании** (от EN/декомпозиции независимы): scripting с нуля, isolated кросс-поточные + живые
-  ассерты, serialization round-trip relations/error-path/fuzz, hot-reload watcher, events lag/threads,
-  макро trybuild, par-пути core. Дом волны — CORE_AUDIT §9.
+  выше — co-location сделана, фолд = поведенческий рефактор под goldens-гейтом).
+  **✅ ТЕСТ-КАМПАНИИ ЗАКРЫТЫ (2026-07-06)** — 7 коммитов, +8 тест-таргетов, весь workspace зелёный
+  (40 `test result: ok`), clippy `--all-targets` net-neutral (core/scheduler/isolated 0):
+  (1) **макро trybuild** — 10 compile-fail фикстур на НАШИ `compile_error!`/`syn::Error` (derive
+  Bundle enum/union; Scriptable enum-with-data/union/пустой tuple-struct; `system!` `&T`/`&mut T`-resource,
+  two-query, world+params, unsupported-param) — `apex-core/tests/trybuild.rs` + `apex-scripting/tests/trybuild.rs`;
+  (2) **serialization** — полная эквивалентность round-trip (компоненты+relations+ресурс, JSON+bincode)
+  + детерминированный fuzz (64 мира) + 4 typed error-path — `apex-serialization/tests/roundtrip.rs`;
+  (3) **isolated** — 6 настоящих кросс-поточных (мост миров через `std::thread`, no-loss под контенцией,
+  IsolatedWorld на воркере) — `apex-isolated/tests/cross_thread.rs`;
+  (4) хвост: hot-reload (temp-фильтр inline + реальный OS-watch E2E), scripting E2E (query/commit/spawn/
+  despawn/resource/event/error/set_active, 8 тестов), events (multi-frame gated no-loss + concurrent
+  send_sync), par-пути core (par_for_each[_mut]/_chunk[_mut] полнота+ровно-один-раз+эквивалентность seq).
+  **Волна 7 → ✅ по сути завершена**; открытым долгом остаётся ТОЛЬКО D9-фолд (запись D9, под goldens-гейтом).
+  Дом волны — CORE_AUDIT §9.
