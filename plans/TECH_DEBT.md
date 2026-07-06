@@ -189,10 +189,16 @@
   `apex-scheduler/tests/executor_parity.rs` (5 тестов, incl. форс-параллельный ASD-путь через
   `set_chunk_config`). Co-location из волны 7 (всё в `executor.rs`) сохранена. `run_stage_parallel` —
   по-прежнему ASD-под-хелпер hybrid'а (не top-level копия).
-- **§1.4-хвосты 🟢 → CORE_POLISH волна 0.5 — гигиена, не сделана волной 4.** `EventCursor(pub u32)` — всё ещё pub
-  (`events.rs:761`); `by_id` — FxHashMap, не Vec (`component.rs:337`); `MainWorld unsafe impl
-  Send+Sync` — «проверить необходимость» не журналировано (`world.rs:~2112-2113`); `TargetIndex::remove`
-  O(N)-скан без обещанного коммента-компромисса (`relations.rs:~372-388`).
+- **§1.4-хвосты ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.5) — гигиена.** Все 4:
+  (1) `EventCursor(pub u32)` → поле `pub(crate)` (внешних потребителей нет, `events.rs:770`);
+  (2) `by_id` `FxHashMap<u32,_>` → `Vec<ComponentInfo>` (ids плотные с 0: `register` — единственный
+  аллокатор, `push` + инкремент, никогда не удаляются; O(1) индекс, без хеша, `debug_assert` плотности;
+  `iter()` теперь в id-порядке = детерминированнее); (3) `MainWorld unsafe Send+Sync` — journaled
+  инвариант (нужен: resource-хранилище Send+Sync-bounded → без impl extract не компилируется; sound:
+  MainWorld живёт только в sequential extract-стадии, concurrent-доступа нет; load-bearing —
+  extract держать последовательным); (4) `TargetIndex::remove` O(N)-скан — коммент-компромисс
+  (O(N) в fan-in target'а; малый для типичных relations; SmallVec inline бьёт вторичный индекс;
+  деградация только на патологическом huge-fan-in). Гейты: 260 core-тестов, clippy net-neutral.
 - **DynQueryMut item-гейт 🟢 (S7/S8) → CORE_POLISH волна 3 (фаза A).** `DynItemMut::get_mut/get_mut_ptr` (`query.rs:~2711,2725`) не
   проверяют вхождение id в декларированные `writes` — декларация влияет только на матчинг архетипов,
   `AliasedWrite`-проверка при lending декоративна; для agent-IPC/скриптинга политику «что можно

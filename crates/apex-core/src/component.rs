@@ -332,9 +332,11 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
 
 pub struct ComponentRegistry {
     type_to_id: FxHashMap<TypeId, ComponentId>,
-    /// HashMap instead of Vec — a historical decision (arbitrary relation IDs
-    /// before CR-M1); ids are now dense from 0.
-    by_id: FxHashMap<u32, ComponentInfo>,
+    /// Component metadata indexed by `ComponentId.0`. Ids are dense from 0 (allocated
+    /// by `register`, one contiguous `push` per new type, never removed), so a `Vec`
+    /// is the correct structure — O(1) indexed lookup, no hashing (§1.4: was an
+    /// `FxHashMap<u32, _>`, a leftover from pre-CR-M1 arbitrary relation ids).
+    by_id: Vec<ComponentInfo>,
     next_id: u32,
     /// Subscription bits per-ComponentId ([`FLAG_ON_ADD`]/[`FLAG_ON_REMOVE`]/
     /// [`FLAG_TRACK_REMOVED`]) — index = `ComponentId.0` (ids are dense).
@@ -355,7 +357,7 @@ impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
             type_to_id: FxHashMap::default(),
-            by_id: FxHashMap::default(),
+            by_id: Vec::new(),
             next_id: 0,
             flags: Vec::new(),
             hooks: FxHashMap::default(),
@@ -440,19 +442,18 @@ impl ComponentRegistry {
         }
         let id = ComponentId(self.next_id);
         self.next_id += 1;
-        self.by_id.insert(
-            id.0,
-            ComponentInfo {
-                id,
-                name: std::any::type_name::<T>(),
-                type_id,
-                size: std::mem::size_of::<T>(),
-                align: std::mem::align_of::<T>(),
-                drop_fn: drop_ptr::<T>,
-                serde: None,
-                map_entities: None,
-            },
-        );
+        // Dense push: id.0 == the current length, so `by_id[id.0]` is this entry.
+        debug_assert_eq!(self.by_id.len(), id.0 as usize, "component ids must stay dense");
+        self.by_id.push(ComponentInfo {
+            id,
+            name: std::any::type_name::<T>(),
+            type_id,
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+            drop_fn: drop_ptr::<T>,
+            serde: None,
+            map_entities: None,
+        });
         self.type_to_id.insert(type_id, id);
         // Register the required components (`#[require]`) EXACTLY ONCE — here, on the type's first
         // registration (a re-entrant `register::<T>` from `register_required` returns early, since T is already
@@ -467,7 +468,7 @@ impl ComponentRegistry {
     /// the ID and layout do not change.
     pub fn register_serde<T: Serializable>(&mut self) -> ComponentId {
         let id = self.register::<T>();
-        if let Some(info) = self.by_id.get_mut(&id.0) {
+        if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
             }
@@ -482,7 +483,7 @@ impl ComponentRegistry {
     /// the engine/editor — the core stays asset-agnostic.
     pub fn register_serde_with<T: Component>(&mut self, fns: ComponentSerdeFns) -> ComponentId {
         let id = self.register::<T>();
-        if let Some(info) = self.by_id.get_mut(&id.0) {
+        if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.serde = Some(fns);
         }
         id
@@ -491,7 +492,7 @@ impl ComponentRegistry {
     /// Set the component's [`MapEntitiesFn`] (E6). The component must already be
     /// registered (`id` from `get_or_register`).
     pub(crate) fn set_map_entities(&mut self, id: ComponentId, f: MapEntitiesFn) {
-        if let Some(info) = self.by_id.get_mut(&id.0) {
+        if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.map_entities = Some(f);
         }
     }
@@ -502,7 +503,7 @@ impl ComponentRegistry {
     /// the ID and layout do not change.
     pub fn register_serde_json<T: Serializable>(&mut self) -> ComponentId {
         let id = self.register::<T>();
-        if let Some(info) = self.by_id.get_mut(&id.0) {
+        if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns_json::<T>());
             }
@@ -524,17 +525,17 @@ impl ComponentRegistry {
     }
 
     pub fn get_info(&self, id: ComponentId) -> Option<&ComponentInfo> {
-        self.by_id.get(&id.0)
+        self.by_id.get(id.0 as usize)
     }
 
     /// Iterate over all registered components.
     pub fn iter(&self) -> impl Iterator<Item = &ComponentInfo> {
-        self.by_id.values()
+        self.by_id.iter()
     }
 
     /// Only components that have serde functions.
     pub fn iter_serializable(&self) -> impl Iterator<Item = &ComponentInfo> {
-        self.by_id.values().filter(|info| info.serde.is_some())
+        self.by_id.iter().filter(|info| info.serde.is_some())
     }
 
     pub fn len(&self) -> usize {

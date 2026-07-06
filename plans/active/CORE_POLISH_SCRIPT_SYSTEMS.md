@@ -132,7 +132,12 @@ apply the Commands to a World or use world-attached Commands»). Паника �
 **Тесты:** `#[should_panic]`-тест на insert-после-spawn у standalone; позитивный тест — тот же
 код через world-attached Commands работает.
 
-### 0.5 §1.4-хвосты — гигиена (4 микропункта одним заходом)
+### 0.5 §1.4-хвосты — гигиена (4 микропункта одним заходом) ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** (1) `EventCursor` поле → `pub(crate)`; (2) `by_id` `FxHashMap`→`Vec<ComponentInfo>`
+> (ids плотные, O(1) индекс, `iter()` детерминирован по id); (3) `MainWorld Send+Sync` journaled
+> (нужен для resource-хранилища; sound через sequential extract); (4) `TargetIndex::remove`
+> коммент-компромисс O(N)-fan-in. 260 core-тестов, clippy net-neutral.
 
 | Пункт | Где | Как |
 |---|---|---|

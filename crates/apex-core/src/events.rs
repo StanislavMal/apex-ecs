@@ -767,7 +767,7 @@ impl<T> std::ops::Deref for PeekGuard<'_, T> {
 /// Created via [`Events::add_reader`].
 /// Stored in [`EventReader`](crate::system_param::EventReader).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EventCursor(pub u32);
+pub struct EventCursor(pub(crate) u32);
 
 // ── EntityEvent ─────────────────────────────────────────────────
 

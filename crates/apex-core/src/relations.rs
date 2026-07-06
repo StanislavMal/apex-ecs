@@ -370,6 +370,17 @@ impl TargetIndex {
         self.target_counts[ti] += 1;
     }
 
+    /// Remove one `subject` from the `(kind, target)` entry.
+    ///
+    /// §1.4 compromise (documented, not a footgun): the `position` scan is O(N) in the
+    /// entry's FAN-IN — how many subjects point at THIS target via THIS kind (e.g. a
+    /// parent's direct children for `ChildOf`). That fan-in is small for typical
+    /// relations (dozens), so the inline `SmallVec<[Entity; 4]>` scan + O(1)
+    /// `swap_remove` beats maintaining a secondary per-entry index (a `HashSet` would
+    /// add hashing + an allocation per entry, losing the cache-friendly inline path for
+    /// the common small case). It degrades only under a pathological single target with
+    /// a huge fan-in whose subjects are removed one-by-one (O(N²) total) — if such a
+    /// workload appears, switch this entry's list to an indexed structure.
     #[inline]
     pub fn remove(&mut self, kind_idx: u32, target_index: u32, subject: Entity) -> bool {
         let Some(map) = self.by_kind.get_mut(kind_idx as usize) else {

@@ -2189,10 +2189,6 @@ impl Default for World {
 ///
 /// Used by extract systems to read the main world while running on the
 /// render world's scheduler. Bevy-compatible pattern.
-///
-/// # Safety
-/// `Send + Sync` are safe because World is only accessed through
-/// the resource system with proper scheduler synchronization.
 pub struct MainWorld(pub World);
 
 impl MainWorld {
@@ -2201,7 +2197,22 @@ impl MainWorld {
     }
 }
 
-// SAFETY: MainWorld access is guarded by scheduler's sequential extract stage.
+// §1.4 audit (2026-07-06): the unsafe impls ARE required and ARE sound; journaled here
+// so the invariant is explicit rather than assumed.
+//
+// WHY REQUIRED: `World` is not `Send`/`Sync` (it holds thread-affine internals). To let
+// an extract system read the main world, the main world is inserted into the RENDER
+// world as a `MainWorld` resource — and resource storage is `Send + Sync`-bounded (it is
+// shared with the parallel scheduler). So `MainWorld` must be `Send + Sync` to be a
+// resource at all; without these impls the extract path does not compile.
+//
+// WHY SOUND (load-bearing invariant): `MainWorld` exists in the render world ONLY for the
+// duration of the EXTRACT stage, which the scheduler runs SEQUENTIALLY (extract is a
+// whole-world/exclusive stage — no two systems touch `MainWorld` concurrently), and it is
+// removed and handed back to the main thread when extract ends. The type is marked
+// `Send + Sync`, but no concurrent access to the wrapped world ever occurs. If extract is
+// ever made to run in parallel with a system touching `MainWorld`, this becomes unsound —
+// keep extract sequential.
 unsafe impl Send for MainWorld {}
 unsafe impl Sync for MainWorld {}
 
