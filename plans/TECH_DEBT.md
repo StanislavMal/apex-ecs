@@ -146,9 +146,19 @@
 - **string-table снапшота 🟢 — `type_name` per-instance.** `serializer.rs:142` пишет
   `info.name.to_string()` на каждый инстанс компонента (E7-формат v2 string-table не включил).
   Выигрыш — только в РАЗМЕРЕ сейва (редкий путь), отдельный focused-заход.
-- **D9 🟢 — тройной копипаст исполнителя стадии.** `run_sequential`/`run_stage_parallel`/
-  `run_hybrid_parallel` (`apex-scheduler/src/lib.rs:~2526/2686/2987`) — три копии, поведение уже
-  разъезжалось (D4-класс). Волна 7 содержит декомпозицию scheduler/lib.rs — D9 туда поимённо.
+- **D9 🟢 — дублирование скелета исполнителя стадии. CO-LOCATION СДЕЛАНА (волна 7, 2026-07-06);
+  ФОЛД ОТЛОЖЕН с обоснованием.** Волна 7 декомпозировала `scheduler/lib.rs` (6856→1090): вынос
+  `mod tests`→`tests.rs`, сплит `impl Scheduler`→`registration/compile/executor/debug.rs`. Все три
+  исполнителя (`run_sequential`, `run_hybrid_parallel` + его под-хелпер `run_stage_parallel`) теперь
+  co-located в `executor.rs` — предпосылка фолда выполнена. **Почему фолд не выполнен тем же заходом
+  (§0.2b, не полумера):** это НЕ байт-в-байт экстракция — уточнение при чтении кода: `run()` →
+  `run_hybrid_parallel`; `run_stage_parallel` — ASD-под-хелпер hybrid'а (на стадию), НЕ третья
+  top-level копия. Реальное дублирование = скелет стадии (FixedUpdate-планирование, `enabled`-set +
+  D6-skip, event-reserve, frame-advance) между двумя top-level путями `run_sequential` и
+  `run_hybrid_parallel`, которые **уже разошлись** (D4-класс дрейф). Фолд = ПРИМИРЕНИЕ разошедшегося
+  поведения → поведенческий рефактор, чей жёсткий гейт — **byte-identical engine-goldens** (apex-render
+  visual_tests, кросс-репо) + детерминизм-тесты. Гнать его без этого гейта = риск регрессии горячего
+  executor'а. Дом: фокус-заход с полным goldens-гейтом. Файл: `apex-scheduler/src/executor.rs`.
 - **§1.4-хвосты 🟢 — гигиена, не сделана волной 4.** `EventCursor(pub u32)` — всё ещё pub
   (`events.rs:761`); `by_id` — FxHashMap, не Vec (`component.rs:337`); `MainWorld unsafe impl
   Send+Sync` — «проверить необходимость» не журналировано (`world.rs:~2112-2113`); `TargetIndex::remove`
@@ -186,10 +196,14 @@
 - **D8b-overflow 🟢 — детерминированный overflow блока (фронтир).** При overflow блока в кадре
   система падает в недетерминированный путь тот кадр, затем блок растёт. Rank-ordered
   детерминированный overflow — по спросу (после прогрева не наступает). Детали: ADR-001, entity.rs:183-185.
-- **Волна 7 🟡 — EN-миграция + тест-кампании + декомпозиция.** ~95 `.rs`-файлов с кириллицей
-  (комментарии/rustdoc; user-facing литералы — раньше) → ноль кириллицы в `*.rs` (правило движка
-  дословно, §10.2). Тест-дыры: scripting с нуля, isolated кросс-поточные + живые ассерты,
-  serialization round-trip relations/error-path, hot-reload watcher, events lag/threads, макро
-  trybuild, par-пути core. Декомпозиция `scheduler/lib.rs` (~5.9k строк) → registration/compile/
-  executor/debug + вынос inline-тестов. Планируемая волна CORE_AUDIT §9 — дом есть, дублируется здесь
-  как индекс.
+- **Волна 7 🔶 ЧАСТИЧНО (2026-07-06) — EN-миграция ✅ + декомпозиция ✅ + тест-кампании ⏳.**
+  **EN-миграция ✅ ЗАКРЫТА ЦЕЛИКОМ:** 90 `.rs`-файлов / 5513 вхождений кириллицы (комментарии/rustdoc/
+  строковые литералы) → **ноль кириллицы в `*.rs` всего apex-ecs** (grep-подтверждено; правило движка
+  §10.2). Все крейты + 14 примеров зелёные, clippy net-neutral, примеры запускаются без паник.
+  **Декомпозиция `scheduler/lib.rs` ✅:** 6856→1090 строк — вынос `mod tests`→`tests.rs` + сплит
+  `impl Scheduler`→`registration/compile/executor/debug.rs` (child-модули видят приватные поля родителя;
+  16 методов→`pub(crate)` для кросс-модульного/тестового доступа). **D9-фолд ОТЛОЖЕН** (см. запись D9
+  выше — co-location сделана, фолд = поведенческий рефактор под goldens-гейтом). **⏳ ОСТАЁТСЯ =
+  тест-кампании** (от EN/декомпозиции независимы): scripting с нуля, isolated кросс-поточные + живые
+  ассерты, serialization round-trip relations/error-path/fuzz, hot-reload watcher, events lag/threads,
+  макро trybuild, par-пути core. Дом волны — CORE_AUDIT §9.
