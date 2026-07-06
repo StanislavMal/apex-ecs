@@ -1010,9 +1010,11 @@ Rustdoc-полировка + CHANGELOG.
 > +8 тест-таргетов, workspace зелёный 40 `test result: ok`, clippy net-neutral): trybuild (10 compile-fail),
 > serialization round-trip+fuzz+error-path, isolated кросс-поточные (6), hot-reload (temp-фильтр+OS-watch E2E),
 > scripting E2E (8), events (gated no-loss + concurrent send_sync), par-пути core (par_for_each/_chunk).
-> Детали — TECH_DEBT «Волна 7». **Открытый долг Волны 7 = ТОЛЬКО D9-фолд** (поведенческий рефактор
-> дублирующегося скелета стадии под byte-identical engine-goldens гейтом; запись D9). CHANGELOG/rustdoc-
-> полировка — по желанию, не блокирует.
+> **D9 ✅ ЗАКРЫТ** — решение: НЕ фолд (испортил бы seq-перф-базлайн + сменил id-семантику ради нуля),
+> а дифференциальный parity-гейт `run_sequential`↔`run` (`apex-scheduler/tests/executor_parity.rs`, 5
+> тестов incl. форс-ASD): дрейф между исполнителями теперь ГРОМКИЙ (§0.2a). Детали — TECH_DEBT D9.
+> **Волна 7 ✅ ЗАВЕРШЕНА ПОЛНОСТЬЮ** (EN + декомпозиция + тест-кампании + D9), открытого долга нет.
+> CHANGELOG/rustdoc-полировка — по желанию, не блокирует.
 
 ---
 

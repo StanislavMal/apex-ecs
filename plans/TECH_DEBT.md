@@ -146,19 +146,26 @@
 - **string-table снапшота 🟢 — `type_name` per-instance.** `serializer.rs:142` пишет
   `info.name.to_string()` на каждый инстанс компонента (E7-формат v2 string-table не включил).
   Выигрыш — только в РАЗМЕРЕ сейва (редкий путь), отдельный focused-заход.
-- **D9 🟢 — дублирование скелета исполнителя стадии. CO-LOCATION СДЕЛАНА (волна 7, 2026-07-06);
-  ФОЛД ОТЛОЖЕН с обоснованием.** Волна 7 декомпозировала `scheduler/lib.rs` (6856→1090): вынос
-  `mod tests`→`tests.rs`, сплит `impl Scheduler`→`registration/compile/executor/debug.rs`. Все три
-  исполнителя (`run_sequential`, `run_hybrid_parallel` + его под-хелпер `run_stage_parallel`) теперь
-  co-located в `executor.rs` — предпосылка фолда выполнена. **Почему фолд не выполнен тем же заходом
-  (§0.2b, не полумера):** это НЕ байт-в-байт экстракция — уточнение при чтении кода: `run()` →
-  `run_hybrid_parallel`; `run_stage_parallel` — ASD-под-хелпер hybrid'а (на стадию), НЕ третья
-  top-level копия. Реальное дублирование = скелет стадии (FixedUpdate-планирование, `enabled`-set +
-  D6-skip, event-reserve, frame-advance) между двумя top-level путями `run_sequential` и
-  `run_hybrid_parallel`, которые **уже разошлись** (D4-класс дрейф). Фолд = ПРИМИРЕНИЕ разошедшегося
-  поведения → поведенческий рефактор, чей жёсткий гейт — **byte-identical engine-goldens** (apex-render
-  visual_tests, кросс-репо) + детерминизм-тесты. Гнать его без этого гейта = риск регрессии горячего
-  executor'а. Дом: фокус-заход с полным goldens-гейтом. Файл: `apex-scheduler/src/executor.rs`.
+- **D9 ✅ ЗАКРЫТ (2026-07-06) — РЕШЕНИЕ: не фолд, а дифференциальный parity-гейт.** Прежняя рамка
+  «свести `run_sequential` и `run_hybrid_parallel` в один путь под byte-identical goldens» — **оказалась
+  НЕВЕРНОЙ целью** при разборе кода. Установленные факты: (1) движок использует ТОЛЬКО `run()`
+  (→`run_hybrid_parallel`); `run_sequential` вызывается 0 раз в движке, ~97 раз в примерах/тестах ядра —
+  это (а) **чистый sequential-базлайн перф-A/B** (perf.rs, parallel_diagnostics.rs; методология
+  cost-model-кампании) и (б) простой reference-исполнитель для тестов; (2) расхождение per-stage тел
+  (общий `Commands`-буфер vs per-system D8b-слоты + cost-model + ASD) — **осознанное, привязано к ЦЕЛИ
+  пути**, не дрейф: единый буфер = честный «чистый seq» замер, per-system слоты = детерминизм под
+  параллелизмом. **Форс-слияние испортило бы seq-базлайн (D8b/cost-model-оверхед в замере) и сменило бы
+  id-семантику ради НУЛЯ выигрыша в корректности — регресс актива, не улучшение (§0.2b наоборот).**
+  Настоящий риск D9 — не дублирование, а **тихий дрейф наблюдаемого поведения** между путями (сегодня
+  ловился только тем тестом, что случайно взял нужный путь). **Правильное решение (§0.2a — громко):**
+  оставить оба исполнителя (by design), добавить **дифференциальный parity-харнесс** — репрезентативные
+  schedule'ы (spawn+move, run-condition gating, растущий мир, multi-stage ordering, форс-ASD-row-split
+  N=512) гоняются через ОБА исполнителя, ассерт идентичности семантического состояния (счётчики,
+  отсортированные значения компонентов, ресурсы; НЕ сырые id — стратегии аллокации разные легитимно).
+  Любой будущий дрейф → ГРОМКИЙ фейл, без дорогого кросс-репо goldens-гейта. Файл:
+  `apex-scheduler/tests/executor_parity.rs` (5 тестов, incl. форс-параллельный ASD-путь через
+  `set_chunk_config`). Co-location из волны 7 (всё в `executor.rs`) сохранена. `run_stage_parallel` —
+  по-прежнему ASD-под-хелпер hybrid'а (не top-level копия).
 - **§1.4-хвосты 🟢 — гигиена, не сделана волной 4.** `EventCursor(pub u32)` — всё ещё pub
   (`events.rs:761`); `by_id` — FxHashMap, не Vec (`component.rs:337`); `MainWorld unsafe impl
   Send+Sync` — «проверить необходимость» не журналировано (`world.rs:~2112-2113`); `TargetIndex::remove`
@@ -216,5 +223,6 @@
   (4) хвост: hot-reload (temp-фильтр inline + реальный OS-watch E2E), scripting E2E (query/commit/spawn/
   despawn/resource/event/error/set_active, 8 тестов), events (multi-frame gated no-loss + concurrent
   send_sync), par-пути core (par_for_each[_mut]/_chunk[_mut] полнота+ровно-один-раз+эквивалентность seq).
-  **Волна 7 → ✅ по сути завершена**; открытым долгом остаётся ТОЛЬКО D9-фолд (запись D9, под goldens-гейтом).
-  Дом волны — CORE_AUDIT §9.
+  **D9 ✅ ЗАКРЫТ** (2026-07-06) — дифференциальный parity-гейт `run_sequential`↔`run` вместо
+  рискованного фолда (см. запись D9). **Волна 7 → ✅ ЗАВЕРШЕНА ПОЛНОСТЬЮ** (EN + декомпозиция +
+  тест-кампании + D9); открытого долга волны 7 не осталось. Дом волны — CORE_AUDIT §9.
