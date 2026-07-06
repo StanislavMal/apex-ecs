@@ -1,14 +1,39 @@
 # Кампания: API Golden Path — унификация публичного API + переписывание руководства (ApexForge_ECS)
 
-> **Статус: ✅ ВСЕ ВОЛНЫ ЗАКРЫТЫ (2026-07-06).** Волны 0/1a/1b/2/3/4/6/P/5 сделаны; волна 5 (руководство) —
-> ФИНАЛ кампании (§5). Готова к ротации в `plans/archive/` + ADR Р-1..Р-5 (после ревизии руководства
-> пользователем; руководство = deliverable, контент оценивает пользователь). Источник истины кампании; статусы пунктов — ЗДЕСЬ.
-> Метод анализа: 4 параллельных агента (руководство целиком ×2, инвентаризация pub-поверхности по коду,
-> уроки API-дизайна по исходникам Bevy `C:\My\Projects\Rust_projects\bevy` — bevy_ecs **0.19.0-dev**).
-> Планка: `docs/CONVENTIONS.md` §0.2a/§0.2b/§0.9 (анти-mimicry: Bevy-паттерн перенимаем только где он
-> идиоматически верный Rust; козыри — relations/snapshot/dynamic query/детерминизм/cost-model — образцовы).
-> Связанный реестр: `plans/TECH_DEBT.md` (S1–S4, A5, C6, F4, guide-broken). **Развилки §5 требуют
-> решения пользователя ДО старта волн 2–4.** Брендинг: ядро будет называться **ApexForge_ECS**.
+> **🗄 АРХИВ — кампания ЗАКРЫТА 2026-07-06.** Ветка `api-golden-path` (НЕ запушена; пользователь пушит
+> в конце). Заморожен; правки не вносить. Дизайн-решения кампании (развилки Р-1..Р-5) вынесены в
+> **`decisions/ADR-004-api-golden-path-canon.md`**; статусы-указатели — в реестрах
+> (`plans/TECH_DEBT.md`: S1/S2/A5/C6/F4/guide-broken ✅ закрыты; хвосты F4b, reader-API→pub(crate),
+> ErrorHandler-world-less). Naming-канон + prelude-политика — `docs/CONVENTIONS.md`. Руководство
+> (deliverable) — `Apex_ECS_Руководство_пользователя.md` (бренд ApexForge_ECS в контенте); контент
+> оценивает пользователь.
+>
+> **Что сделано (диагноз §0/§1: pub-поверхность перегружена, руководство ей врало — УСТРАНЕНО):**
+> - **Волна 1a/1b/2 (soundness + C6):** унифицированный `Query<'w,'s,D,F>` поверх ленивой per-archetype
+>   fetch-машины (снёс `CachedQuery`/`QueryState`-дубли, ~35 pub fn → ~12; commit `8301699`, нетто −597
+>   строк); read/write split через `WorldQuery::ReadOnly`; `&mut self` на write-аксессорах (S1);
+>   `ctx.fetch` safe-обход закрыт (S2); pub-поля `World.archetypes/resources` приватизированы (A5).
+> - **Волна 3 (регистрация/конфиг/нейминг):** naming-канон Р-5 (`docs/CONVENTIONS.md`); ordering на
+>   конфигах Р-3 (`.before/.after/.chain`); ренеймы (`insert_raw_pub`→`insert_dyn`, `children_of`→
+>   `targets_of`, `get_relation_target`→`target_of`, `spawn_from_template`→`spawn_template_with`);
+>   `ChunkConfig` на World — единственный носитель параллелизм-конфига.
+> - **Волна 4 (события/ошибки):** `EventReader`/`EventWriter`-параметры golden-path (F4); системный
+>   `ErrorHandler`-ресурс (Severity+контекст — реализация §0.2a).
+> - **Волна 6 (relations-козырь):** честная лестница `EntityRef`/`EntityMut`/`EntityWorldMut` (Р-4);
+>   generic relation-nav.
+> - **Волна P (снос deprecated):** переходные `#[deprecated]`-алиасы удалены пред-релизно (ядро не
+>   публиковалось → без deprecation-цикла; migration-заметки — `CHANGELOG.md`).
+> - **Волна 5 (руководство, ФИНАЛ):** переписано под целевую структуру §3; брендинг **ApexForge_ECS**
+>   (Р-2); ≥6 классов битых примеров + stale-версия + internal-leak устранены (guide-broken ✅).
+>
+> **Что отложено (дом = `plans/TECH_DEBT.md`):** F4b (AutoSystem event-курсоры не персистентны),
+> reader-API→pub(crate) (заблокирован — движок использует `EventCursor`), ErrorHandler world-less хвост,
+> В3 Phase B/C (кэш-State через `Borrowed(&'s QueryState)`) + leaf-sizing Ş2b.
+>
+> **Метод анализа кампании:** 4 параллельных агента (руководство ×2, инвентаризация pub-поверхности по
+> коду, уроки API-дизайна по исходникам Bevy `bevy_ecs 0.19.0-dev`). Планка — §0.2a/§0.2b/§0.9
+> (анти-mimicry: Bevy-паттерн перенимаем только где идиоматически верный Rust; козыри relations/snapshot/
+> dynamic query/детерминизм/cost-model — образцовы). Ниже — замороженный текст плана.
 
 ## 0. TL;DR
 
