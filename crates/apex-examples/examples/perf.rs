@@ -869,7 +869,7 @@ fn bench_events(n: usize) {
 //   • World строится в setup() — не входит во время query
 //   • «0 results» тест измеряет стоимость обхода архетипов без совпадений:
 //     ops = количество entity в мире (платим за обход, даже если 0 подходит)
-//   • Query::new vs CachedQuery: оба измеряются честно (world готов в setup)
+//   • Query::new vs world.query (кэш): оба измеряются честно (world готов в setup)
 
 fn bench_query(n: usize) {
     println!("\n── Query ({n}k entities) ─────────────────────────────────────────────────────────");

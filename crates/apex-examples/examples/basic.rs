@@ -379,9 +379,9 @@ fn main() {
     }
     println!("Verified: {}/{} children have ChildOf relation to parent", found, children.len());
 
-    // Проверяем children_of
+    // Проверяем targets_of (субъекты relation ChildOf к parent)
     let direct: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
-    println!("children_of(parent) count: {} (expected 100)", direct.len());
+    println!("targets_of(ChildOf, parent) count: {} (expected 100)", direct.len());
 
     // Очищаем
     world.despawn_recursive(ChildOf, parent);
