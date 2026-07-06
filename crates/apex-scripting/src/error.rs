@@ -1,37 +1,37 @@
-//! Типы ошибок apex-scripting.
+//! apex-scripting error types.
 
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ScriptError {
-    #[error("Ошибка компиляции скрипта '{name}': {source}")]
+    #[error("Failed to compile script '{name}': {source}")]
     Compile {
         name:   String,
         #[source]
         source: mlua::Error,
     },
 
-    #[error("Ошибка выполнения скрипта '{name}': {source}")]
+    #[error("Failed to run script '{name}': {source}")]
     Runtime {
         name:   String,
         #[source]
         source: mlua::Error,
     },
 
-    #[error("Скрипт '{0}' не найден")]
+    #[error("Script '{0}' not found")]
     NotFound(String),
 
-    #[error("Ошибка чтения файла '{path}': {source}")]
+    #[error("Failed to read file '{path}': {source}")]
     Io {
         path:   String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("Ошибка файлового наблюдателя: {0}")]
+    #[error("File watcher error: {0}")]
     Watcher(String),
 
-    #[error("Директория скриптов не задана")]
+    #[error("Scripts directory is not set")]
     NoScriptDir,
 }
 

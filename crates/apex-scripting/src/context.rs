@@ -1,19 +1,19 @@
-//! `ScriptContext` — контекст между Rust и Lua в пределах одного `run()`.
+//! `ScriptContext` — the context between Rust and Lua within a single `run()`.
 //!
-//! # Lifetime и безопасность
+//! # Lifetime and safety
 //!
-//! `ScriptContext` живёт ровно столько, сколько `ScriptEngine::run()`.
-//! `world_ptr` устанавливается перед вызовом скрипта и сбрасывается (`null`) сразу после.
-//! Таким образом:
-//! - Всё время выполнения скрипта ptr валиден
-//! - Сохранить `ScriptContext` в статике и использовать после `run()` — невозможно
-//!   без `unsafe`, что явно сигнализирует об ошибке
+//! `ScriptContext` lives exactly as long as `ScriptEngine::run()`.
+//! `world_ptr` is set before the script call and reset (`null`) immediately after.
+//! Thus:
+//! - The ptr is valid for the entire script execution
+//! - Storing `ScriptContext` in a static and using it after `run()` is impossible
+//!   without `unsafe`, which clearly signals an error
 //!
-//! # Отложенные изменения
+//! # Deferred changes
 //!
-//! Lua-итератор удерживает shared borrow на World через ptr, поэтому
-//! структурные изменения (spawn/despawn) нельзя применять внутри итерации.
-//! Они накапливаются в `deferred: Commands` и применяются после завершения скрипта.
+//! The Lua iterator holds a shared borrow on World through the ptr, so
+//! structural changes (spawn/despawn) cannot be applied during iteration.
+//! They accumulate in `deferred: Commands` and are applied after the script finishes.
 
 use std::{
     collections::HashMap,
@@ -30,86 +30,86 @@ use crate::registrar::{ResourceBinding, EventBinding};
 
 // ── ComponentBinding ───────────────────────────────────────────
 
-/// Информация о компоненте зарегистрированном для скриптинга.
+/// Information about a component registered for scripting.
 ///
-/// Хранит функции конвертации компонент ↔ Lua без привязки к конкретному типу T.
+/// Holds component ↔ Lua conversion functions without being tied to a concrete type T.
 #[derive(Clone)]
 pub struct ComponentBinding {
-    /// Имя типа компонента (совпадает с ключом в query-таблице)
+    /// Component type name (matches the key in the query table)
     pub name: &'static str,
-    /// ComponentId для поиска в архетипах
+    /// ComponentId for lookup in archetypes
     pub id:   ComponentId,
-    /// Читать компонент из Column[row] → mlua::Value
+    /// Read a component from Column[row] → mlua::Value
     pub read:  unsafe fn(*const u8, &mlua::Lua) -> mlua::Result<mlua::Value>,
-    /// Записать компонент в Column[row] из mlua::Value; возвращает false если тип неверен
+    /// Write a component into Column[row] from mlua::Value; returns false if the type is wrong
     pub write: unsafe fn(*mut u8, &mlua::Value) -> bool,
 }
 
 // ── SpawnRequest ───────────────────────────────────────────────
 
-/// Запрос на создание entity, сформированный из скрипта.
+/// A request to create an entity, formed from a script.
 ///
-/// Хранит список (name, RegistryKey) пар — компоненты для нового entity.
-/// RegistryKey позволяет отложить извлечение mlua::Value до момента применения.
+/// Holds a list of (name, RegistryKey) pairs — components for the new entity.
+/// The RegistryKey allows deferring extraction of the mlua::Value until apply time.
 pub struct SpawnRequest {
-    /// Список компонентов: (имя типа, RegistryKey с Lua-значением)
+    /// List of components: (type name, RegistryKey with the Lua value)
     pub components: Vec<(String, mlua::RegistryKey)>,
 }
 
 // ── ScriptContext ──────────────────────────────────────────────
 
-/// Мост между Lua-скриптом и миром ECS.
+/// The bridge between a Lua script and the ECS world.
 ///
-/// Хранится в `Arc<RefCell<ScriptContext>>` в `ScriptEngine`.
-/// Доступ через `lua.set_app_data()` / `lua.app_data_ref()`.
+/// Stored in `Arc<RefCell<ScriptContext>>` inside `ScriptEngine`.
+/// Accessed via `lua.set_app_data()` / `lua.app_data_ref()`.
 pub struct ScriptContext {
-    /// Текущий delta time кадра — устанавливается перед `run()`
+    /// Current frame delta time — set before `run()`
     pub delta_time: f32,
 
-    /// Сырой указатель на мир. Живёт ровно в пределах `run()`.
-    /// `None` означает что мы вне `run()` — любое обращение через скрипт
-    /// вернёт ошибку вместо UB.
+    /// Raw pointer to the world. Lives exactly within `run()`.
+    /// `None` means we are outside `run()` — any access through a script
+    /// returns an error instead of UB.
     world_ptr: Option<NonNull<World>>,
 
-    /// Буфер отложенных команд spawn/despawn.
-    /// Применяется после завершения скрипта через `apply_deferred()`.
+    /// Buffer of deferred spawn/despawn commands.
+    /// Applied after the script finishes via `apply_deferred()`.
     pub(crate) deferred: Commands,
 
-    /// Буфер запросов spawn из скриптов.
+    /// Buffer of spawn requests from scripts.
     pub(crate) deferred_spawns: Vec<SpawnRequest>,
 
-    /// Реестр компонентов доступных из скриптов: name → binding
+    /// Registry of components accessible from scripts: name → binding
     pub(crate) bindings: HashMap<&'static str, ComponentBinding>,
 
-    /// Реестр ресурсов доступных из скриптов: name → binding
+    /// Registry of resources accessible from scripts: name → binding
     pub(crate) resource_bindings: HashMap<&'static str, ResourceBinding>,
 
-    /// Реестр событий доступных из скриптов: name → binding
+    /// Registry of events accessible from scripts: name → binding
     pub(crate) event_bindings: HashMap<&'static str, EventBinding>,
 
-    /// Буфер отложенных записей ресурсов: (type_name, RegistryKey)
-    /// Применяется после завершения скрипта.
+    /// Buffer of deferred resource writes: (type_name, RegistryKey)
+    /// Applied after the script finishes.
     ///
-    /// Ключ хранится как владеющий `String`, а не `&'static str`. Ранее
-    /// `write_resource` делал `Box::leak(name)` на КАЖДЫЙ вызов, что давало
-    /// линейную утечку памяти для скрипта, пишущего ресурс каждый кадр (E3).
-    /// Лукап биндинга и так по строке, поэтому владеющий ключ корректен и не течёт.
+    /// The key is stored as an owned `String`, not `&'static str`. Previously
+    /// `write_resource` did `Box::leak(name)` on EVERY call, which caused a
+    /// linear memory leak for a script writing a resource every frame (E3).
+    /// The binding lookup is by string anyway, so an owned key is correct and does not leak.
     pub(crate) deferred_resource_writes: Vec<(String, mlua::RegistryKey)>,
 
-    /// Буфер отложенных событий: (type_name, RegistryKey)
-    /// Применяется после завершения скрипта. Владеющий `String`-ключ — см. E3
-    /// в комментарии к `deferred_resource_writes`.
+    /// Buffer of deferred events: (type_name, RegistryKey)
+    /// Applied after the script finishes. Owned `String` key — see E3
+    /// in the comment on `deferred_resource_writes`.
     pub(crate) deferred_events: Vec<(String, mlua::RegistryKey)>,
 
-    /// Счётчик entity — кешируется чтобы не вызывать world через ptr каждый раз
+    /// Entity count — cached to avoid calling world through the ptr every time
     entity_count_cache: usize,
 
-    /// Кэш результатов сборки архетипов — избегает повторного сканирования
-    /// при повторных query() с теми же дескрипторами.
-    /// Инвалидируется при каждом новом запуске скрипта (в set_world_ptr).
+    /// Cache of archetype assembly results — avoids rescanning
+    /// on repeated query() calls with the same descriptors.
+    /// Invalidated on every new script run (in set_world_ptr).
     pub(crate) query_cache: HashMap<Vec<String>, Vec<crate::iterators::ArchState>>,
 
-    /// Автоматически вызывать commit(entity) при переходе к следующей entity в query-итераторе
+    /// Automatically call commit(entity) when moving to the next entity in the query iterator
     pub auto_commit: bool,
 }
 
@@ -133,7 +133,7 @@ impl ScriptContext {
 
     // ── Lifetime management ────────────────────────────────────
 
-    /// Установить указатель на мир перед выполнением скрипта.
+    /// Set the world pointer before executing the script.
     pub(crate) unsafe fn set_world_ptr(&mut self, world: &mut World) {
         self.world_ptr         = Some(NonNull::new_unchecked(world as *mut World));
         self.entity_count_cache = world.entity_count();
@@ -143,28 +143,28 @@ impl ScriptContext {
         self.query_cache.clear();
     }
 
-    /// Сбросить указатель на мир после завершения скрипта.
+    /// Reset the world pointer after the script finishes.
     pub(crate) fn clear_world_ptr(&mut self) {
         self.world_ptr = None;
     }
 
-    /// Получить `&World` — только для чтения (query-итераторы).
+    /// Get `&World` — read-only (query iterators).
     pub(crate) fn world_ref(&self) -> &World {
         unsafe {
             self.world_ptr
-                .expect("ScriptContext::world_ref вызван вне run()")
+                .expect("ScriptContext::world_ref called outside run()")
                 .as_ref()
         }
     }
 
-    /// Получить `&mut World` — для применения deferred команд.
+    /// Get `&mut World` — for applying deferred commands.
     pub(crate) unsafe fn world_mut(&mut self) -> &mut World {
         self.world_ptr
-            .expect("ScriptContext::world_mut вызван вне run()")
+            .expect("ScriptContext::world_mut called outside run()")
             .as_mut()
     }
 
-    // ── API для Lua-функций ───────────────────────────────────
+    // ── API for Lua functions ─────────────────────────────────
 
     pub fn delta_time(&self) -> f32 {
         self.delta_time
@@ -189,7 +189,7 @@ impl ScriptContext {
         self.deferred = deferred;
     }
 
-    /// Применить отложенные записи ресурсов и отправки событий.
+    /// Apply deferred resource writes and event emissions.
     pub(crate) fn apply_deferred_resources_and_events(
         &mut self,
         lua: &mlua::Lua,
@@ -201,7 +201,7 @@ impl ScriptContext {
             return;
         }
 
-        // Собираем биндинги до заимствования world
+        // Collect the bindings before borrowing world
         type ApplyFn = fn(&mlua::Value, &mut World) -> bool;
 
         let write_infos: Vec<(&'static str, ApplyFn)> = writes.iter()
@@ -247,7 +247,7 @@ impl ScriptContext {
         }
     }
 
-    // ── Регистрация ───────────────────────────────────────────
+    // ── Registration ──────────────────────────────────────────
 
     pub(crate) fn add_binding(&mut self, binding: ComponentBinding) {
         self.bindings.insert(binding.name, binding);
@@ -275,7 +275,7 @@ impl ScriptContext {
         self.event_bindings.get(name)
     }
 
-    // ── Доступ к ресурсам из Lua ──────────────────────────────
+    // ── Resource access from Lua ──────────────────────────────
 
     pub fn read_resource(
         &self,
@@ -287,11 +287,11 @@ impl ScriptContext {
         (binding.read)(lua, world).ok()
     }
 
-    /// Поставить в очередь отложенную запись ресурса.
+    /// Queue a deferred resource write.
     ///
-    /// Принимает `&str` (не `&'static str`) — имя копируется во владеющий
-    /// `String`-ключ. Без `Box::leak`, поэтому повторные вызовы с тем же именем
-    /// не накапливают утечку (E3).
+    /// Takes `&str` (not `&'static str`) — the name is copied into an owned
+    /// `String` key. No `Box::leak`, so repeated calls with the same name
+    /// do not accumulate a leak (E3).
     pub fn write_resource(
         &mut self,
         lua: &mlua::Lua,
@@ -299,7 +299,7 @@ impl ScriptContext {
         value: mlua::Value,
     ) -> mlua::Result<()> {
         if !self.resource_bindings.contains_key(type_name) {
-            log::warn!("write_resource: ресурс '{}' не зарегистрирован", type_name);
+            log::warn!("write_resource: resource '{}' is not registered", type_name);
             return Ok(());
         }
         let key = lua.create_registry_value(value)?;
@@ -307,8 +307,8 @@ impl ScriptContext {
         Ok(())
     }
 
-    /// Поставить в очередь отложенное событие. `&str` → владеющий `String`-ключ,
-    /// без `Box::leak` (E3).
+    /// Queue a deferred event. `&str` → owned `String` key,
+    /// without `Box::leak` (E3).
     pub fn emit_event(
         &mut self,
         lua: &mlua::Lua,
@@ -316,7 +316,7 @@ impl ScriptContext {
         value: mlua::Value,
     ) -> mlua::Result<()> {
         if !self.event_bindings.contains_key(type_name) {
-            log::warn!("emit_event: событие '{}' не зарегистрировано", type_name);
+            log::warn!("emit_event: event '{}' is not registered", type_name);
             return Ok(());
         }
         let key = lua.create_registry_value(value)?;

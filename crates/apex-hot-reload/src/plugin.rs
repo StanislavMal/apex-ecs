@@ -1,4 +1,4 @@
-//! HotReloadPlugin — главная точка входа для hot reload конфигов/ассетов.
+//! HotReloadPlugin — the main entry point for hot reload of configs/assets.
 
 use std::{
     collections::HashMap,
@@ -13,7 +13,7 @@ use crate::{
     watcher::FileWatcher,
 };
 
-// ── Ошибки ────────────────────────────────────────────────────
+// ── Errors ────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum HotReloadError {
@@ -29,18 +29,18 @@ pub enum HotReloadError {
 
 // ── ConfigLoader ───────────────────────────────────────────────
 
-/// Трейт загрузчика конфигурационного файла.
+/// Trait for a configuration-file loader.
 ///
-/// Реализуется для каждого типа конфигурации. Стандартная реализация
-/// предоставляется через `JsonConfigLoader<T>`.
+/// Implemented for each configuration type. A standard implementation
+/// is provided via `JsonConfigLoader<T>`.
 pub trait ConfigLoader: Send + Sync + 'static {
-    /// Загрузить файл по пути и вставить результат в мир как ресурс.
+    /// Load the file at `path` and insert the result into the world as a resource.
     ///
-    /// Возвращает `Err` если файл не читается или не десериализуется.
+    /// Returns `Err` if the file cannot be read or deserialized.
     fn reload(&self, path: &Path, world: &mut World) -> Result<(), HotReloadError>;
 }
 
-/// Загрузчик JSON-конфига → ресурс `T`.
+/// JSON-config loader → resource `T`.
 pub struct JsonConfigLoader<T: serde::de::DeserializeOwned + Send + Sync + 'static> {
     _marker: std::marker::PhantomData<T>,
 }
@@ -81,15 +81,15 @@ impl<T: serde::de::DeserializeOwned + Send + Sync + 'static> Default for JsonCon
 
 // ── HotReloadPlugin ────────────────────────────────────────────
 
-/// Главная точка входа для горячей перезагрузки ассетов.
+/// The main entry point for hot reloading of assets.
 ///
-/// # Жизненный цикл
+/// # Lifecycle
 ///
-/// 1. `HotReloadPlugin::new(watch_dir)` — создать, запустить watcher
-/// 2. `plugin.watch_config::<T>(path, &mut world)` — зарегистрировать файл
-/// 3. В game loop: `plugin.apply_changes(&mut world)` — применить изменения
+/// 1. `HotReloadPlugin::new(watch_dir)` — create and start the watcher
+/// 2. `plugin.watch_config::<T>(path, &mut world)` — register a file
+/// 3. In the game loop: `plugin.apply_changes(&mut world)` — apply changes
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// // setup:
@@ -107,17 +107,17 @@ impl<T: serde::de::DeserializeOwned + Send + Sync + 'static> Default for JsonCon
 pub struct HotReloadPlugin {
     watcher:       FileWatcher,
     asset_registry: AssetRegistry,
-    /// AssetId → загрузчик конкретного типа
+    /// AssetId → loader for the concrete type
     loaders:       HashMap<u32, Box<dyn ConfigLoader>>,
-    /// AssetId → канонический путь (для повторной загрузки)
+    /// AssetId → canonical path (for reloading)
     asset_paths:   HashMap<u32, PathBuf>,
 }
 
 impl HotReloadPlugin {
-    /// Создать plugin, запустить file watcher для директории `watch_dir`.
+    /// Create the plugin and start the file watcher for the `watch_dir` directory.
     ///
-    /// `debounce` — задержка дебаунсинга событий. 100ms — хорошее значение
-    /// для большинства случаев. Слишком маленькое (< 20ms) даёт ложные срабатывания.
+    /// `debounce` — the event debounce delay. 100ms is a good value
+    /// for most cases. Too small (< 20ms) causes false triggers.
     pub fn new(
         watch_dir: &Path,
         debounce:  Duration,
@@ -131,15 +131,15 @@ impl HotReloadPlugin {
         })
     }
 
-    /// Удобный конструктор с дебаунсом 100ms.
+    /// Convenience constructor with a 100ms debounce.
     pub fn with_default_debounce(watch_dir: &Path) -> Result<Self, HotReloadError> {
         Self::new(watch_dir, Duration::from_millis(100))
     }
 
-    /// Зарегистрировать JSON-файл конфига как ресурс типа `T`.
+    /// Register a JSON config file as a resource of type `T`.
     ///
-    /// Немедленно загружает файл и вставляет значение в мир.
-    /// При последующих изменениях файла — автоматически перезагружает.
+    /// Immediately loads the file and inserts the value into the world.
+    /// On subsequent changes to the file, reloads automatically.
     pub fn watch_config<T>(
         &mut self,
         path:  &Path,
@@ -151,16 +151,16 @@ impl HotReloadPlugin {
         self.watch_config_with_loader(path, world, JsonConfigLoader::<T>::new())
     }
 
-    /// Зарегистрировать файл с кастомным загрузчиком.
+    /// Register a file with a custom loader.
     ///
-    /// Используй если нужен нестандартный формат (RON, TOML, бинарный).
+    /// Use this if you need a non-standard format (RON, TOML, binary).
     pub fn watch_config_with_loader(
         &mut self,
         path:   &Path,
         world:  &mut World,
         loader: impl ConfigLoader,
     ) -> Result<AssetId, HotReloadError> {
-        // Нормализуем путь для стабильного matching
+        // Normalize the path for stable matching
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
         let id = self.asset_registry.register(canonical.clone());
@@ -199,15 +199,15 @@ impl HotReloadPlugin {
         Ok(id)
     }
 
-    /// Применить все накопившиеся изменения файлов к миру.
+    /// Apply all accumulated file changes to the world.
     ///
-    /// **Вызывать каждый кадр** в начале game loop до запуска планировщика.
+    /// **Call every frame** at the start of the game loop before running the scheduler.
     ///
-    /// Если изменений нет — возвращает пустой Vec, overhead < 1µs
-    /// (один `try_recv` на channel без блокировки).
+    /// If there are no changes, returns an empty Vec; overhead < 1µs
+    /// (a single non-blocking `try_recv` on the channel).
     ///
-    /// Ошибки загрузки логируются через `log::error!` но не прерывают выполнение —
-    /// предыдущее значение ресурса остаётся в мире.
+    /// Load errors are logged via `log::error!` but do not abort execution —
+    /// the previous resource value stays in the world.
     pub fn apply_changes(&mut self, world: &mut World) -> Vec<AssetChange> {
         let file_changes = self.watcher.poll();
         if file_changes.is_empty() {
@@ -239,7 +239,7 @@ impl HotReloadPlugin {
         applied
     }
 
-    /// Принудительно перезагрузить ассет по ID (не дожидаясь file event).
+    /// Force-reload an asset by ID (without waiting for a file event).
     pub fn force_reload(&mut self, id: AssetId, world: &mut World) -> Result<(), HotReloadError> {
         let path = self.asset_paths.get(&id.0)
             .ok_or_else(|| HotReloadError::FileRead {
@@ -257,7 +257,7 @@ impl HotReloadPlugin {
         loader.reload(&path, world)
     }
 
-    /// Количество зарегистрированных ассетов.
+    /// Number of registered assets.
     pub fn asset_count(&self) -> usize { self.asset_registry.len() }
 }
 

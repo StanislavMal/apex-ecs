@@ -4,14 +4,14 @@ use thunderdome::Index;
 use crate::{Graph, GraphError};
 
 impl<N, W> Graph<N, W> {
-    /// Проверяет, существует ли путь от `from` к `to` (BFS).
+    /// Checks whether a path exists from `from` to `to` (BFS).
     ///
-    /// Используется для предотвращения создания циклов при добавлении рёбер.
-    /// Проверяет, существует ли путь от `from` к `to` (BFS).
+    /// Used to prevent creating cycles when adding edges.
+    /// Checks whether a path exists from `from` to `to` (BFS).
     ///
-    /// Используется для предотвращения создания циклов при добавлении рёбер.
-    /// Оптимизация: переиспользует буферы `bfs_visited` и `bfs_queue` из Graph
-    /// вместо аллокации на каждый вызов.
+    /// Used to prevent creating cycles when adding edges.
+    /// Optimization: reuses the `bfs_visited` and `bfs_queue` buffers from Graph
+    /// instead of allocating on each call.
     pub fn has_path(&mut self, from: Index, to: Index) -> bool {
         if from == to {
             return true;
@@ -22,7 +22,7 @@ impl<N, W> Graph<N, W> {
 
         let slot_cap = self.slot_capacity();
 
-        // Переиспользуем буферы: resize вместо vec![] — избегаем аллокации
+        // Reuse buffers: resize instead of vec![] — avoids allocation
         self.bfs_visited.clear();
         self.bfs_visited.resize(slot_cap, false);
 
@@ -64,10 +64,10 @@ impl<N, W> Graph<N, W> {
         false
     }
 
-    /// Топологическая сортировка (алгоритм Кана) с кэшированием.
+    /// Topological sort (Kahn's algorithm) with caching.
     ///
-    /// Возвращает узлы в порядке зависимостей.
-    /// Корректна при удалениях (дырки в slot-space).
+    /// Returns nodes in dependency order.
+    /// Correct in the presence of removals (holes in slot-space).
     pub fn topological_sort(&mut self) -> Result<&[Index], GraphError> {
         if self.dirty || self.cached_topological.is_none() {
             let result = self.compute_topological_sort()?;
@@ -77,10 +77,10 @@ impl<N, W> Graph<N, W> {
         Ok(self.cached_topological.as_ref().unwrap())
     }
 
-    /// Внутренняя реализация топологической сортировки (без кэширования).
+    /// Internal implementation of the topological sort (without caching).
     ///
-    /// Оптимизация: in_degree берётся из adjacency_in[slot].len(),
-    /// т.е. без сканирования всех рёбер.
+    /// Optimization: in_degree is taken from adjacency_in[slot].len(),
+    /// i.e. without scanning all edges.
     pub fn compute_topological_sort(&self) -> Result<Vec<Index>, GraphError> {
         let live_nodes = self.nodes.len();
         if live_nodes == 0 {
@@ -90,15 +90,15 @@ impl<N, W> Graph<N, W> {
         let slot_cap = self.slot_capacity();
         let mut in_degree: Vec<usize> = vec![0; slot_cap];
 
-        // Заполняем indegree по входящим спискам.
-        // Важно: берём только живые узлы (iter по Arena).
+        // Fill indegree from the incoming lists.
+        // Important: take only live nodes (iter over the Arena).
         for (node, _) in self.nodes.iter() {
             let slot = node.slot() as usize;
             let deg = self.adjacency_in.get(slot).map(|v| v.len()).unwrap_or(0);
             in_degree[slot] = deg;
         }
 
-        // Очередь узлов без входящих рёбер: Vec + head быстрее VecDeque.
+        // Queue of nodes with no incoming edges: Vec + head is faster than VecDeque.
         let mut queue: Vec<Index> = Vec::with_capacity(live_nodes);
         for (node, _) in self.nodes.iter() {
             let slot = node.slot() as usize;
@@ -124,14 +124,14 @@ impl<N, W> Graph<N, W> {
                     };
 
                     let to = edge.to;
-                    // На всякий: если пользователь как-то оставил ребро на несуществующий узел.
+                    // Just in case: if the user somehow left an edge to a nonexistent node.
                     if self.nodes.get(to).is_none() {
                         continue;
                     }
 
                     let to_slot = to.slot() as usize;
 
-                    // indegree должен быть > 0, но защищаемся от underflow.
+                    // indegree should be > 0, but guard against underflow.
                     let deg = &mut in_degree[to_slot];
                     if *deg == 0 {
                         continue;
@@ -151,10 +151,10 @@ impl<N, W> Graph<N, W> {
         }
     }
 
-    /// BFS обход с заданного узла.
+    /// BFS traversal from the given node.
     ///
-    /// Оптимизация: visited = Vec<bool> по slot-space (быстрее HashSet).
-    /// Переиспользует буферы `bfs_visited` и `bfs_queue` из Graph.
+    /// Optimization: visited = Vec<bool> over slot-space (faster than HashSet).
+    /// Reuses the `bfs_visited` and `bfs_queue` buffers from Graph.
     pub fn bfs(&mut self, start: Index) -> Vec<Index> {
         if self.nodes.get(start).is_none() {
             return Vec::new();
@@ -162,7 +162,7 @@ impl<N, W> Graph<N, W> {
 
         let slot_cap = self.slot_capacity();
 
-        // Переиспользуем буферы из Graph
+        // Reuse the buffers from Graph
         self.bfs_visited.clear();
         self.bfs_visited.resize(slot_cap, false);
         self.bfs_queue.clear();
@@ -203,9 +203,9 @@ impl<N, W> Graph<N, W> {
         result
     }
 
-    /// DFS обход с заданного узла (итеративный, без рекурсии).
+    /// DFS traversal from the given node (iterative, no recursion).
     ///
-    /// Переиспользует буферы `dfs_visited` и `dfs_stack` из Graph.
+    /// Reuses the `dfs_visited` and `dfs_stack` buffers from Graph.
     pub fn dfs(&mut self, start: Index) -> Vec<Index> {
         if self.nodes.get(start).is_none() {
             return Vec::new();
@@ -227,8 +227,8 @@ impl<N, W> Graph<N, W> {
             self.dfs_visited[slot] = true;
             result.push(node);
 
-            // Чтобы порядок был ближе к рекурсивному DFS,
-            // добавляем successors в обратном порядке.
+            // To keep the order closer to recursive DFS,
+            // push successors in reverse order.
             if let Some(edges) = self.adjacency_out.get(slot) {
                 for &edge_idx in edges.iter().rev() {
                     let Some(edge) = self.edges.get(edge_idx) else {
@@ -249,11 +249,11 @@ impl<N, W> Graph<N, W> {
         result
     }
 
-    /// Параллельные уровни — группы узлов которые можно выполнять одновременно.
+    /// Parallel levels — groups of nodes that can be executed simultaneously.
     ///
-    /// Использует кэшированную топологическую сортировку (через topological_sort()).
+    /// Uses the cached topological sort (via topological_sort()).
     pub fn parallel_levels(&mut self) -> Result<Vec<Vec<Index>>, GraphError> {
-        // Клонируем срез в Vec<Index>, чтобы разорвать borrow
+        // Clone the slice into a Vec<Index> to break the borrow
         let sorted = self.topological_sort()?.to_vec(); // Vec<Index>
 
         let slot_cap = self.slot_capacity();
@@ -298,7 +298,7 @@ impl<N, W> Graph<N, W> {
             }
         }
 
-        // Если граф пустой (sorted пуст), вернём пустой Vec
+        // If the graph is empty (sorted is empty), return an empty Vec
         if sorted.is_empty() {
             Ok(Vec::new())
         } else {
@@ -306,12 +306,12 @@ impl<N, W> Graph<N, W> {
         }
     }
 
-    /// Проверка наличия цикла.
+    /// Check whether a cycle is present.
     pub fn has_cycle(&mut self) -> bool {
         self.topological_sort().is_err()
     }
 
-    /// Все узлы достижимые из start.
+    /// All nodes reachable from start.
     pub fn reachable_from(&mut self, start: Index) -> FxHashSet<Index> {
         self.bfs(start).into_iter().collect()
     }
@@ -382,7 +382,7 @@ mod tests {
         let b = g.add_node("B");
 
         g.add_edge(a, b, ());
-        g.add_edge(b, a, ()); // цикл
+        g.add_edge(b, a, ()); // cycle
 
         assert!(g.has_cycle());
     }
@@ -419,7 +419,7 @@ mod tests {
         g.add_edge(a, b, ());
         g.add_edge(b, c, ());
 
-        // Удаляем B: должны исчезнуть оба ребра, останутся A и C без связей
+        // Remove B: both edges should disappear, leaving A and C unconnected
         assert!(g.remove_node(b).is_some());
 
         let sorted = g.compute_topological_sort().unwrap();

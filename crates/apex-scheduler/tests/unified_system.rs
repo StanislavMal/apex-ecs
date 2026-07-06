@@ -1,5 +1,5 @@
-//! U: единый `system!` для параллельных и эксклюзивных систем + единый вход
-//! регистрации `add_systems` с bare-идентификаторами (имя выводится из fn).
+//! U: unified `system!` for parallel and exclusive systems + a single
+//! registration entry point `add_systems` with bare identifiers (name derived from fn).
 
 use apex_core::prelude::*;
 use apex_core::{system, World};
@@ -9,7 +9,7 @@ use apex_scheduler::{Scheduler, StageLabel};
 #[derive(Component)]
 struct Counter(u32);
 
-// Параллельная система — доступ выведен из параметров (Write<Counter>).
+// Parallel system — access derived from the parameters (Write<Counter>).
 system! {
     fn parallel_inc(q: Write<Counter>) {
         q.for_each_mut(|_, mut c| {
@@ -18,15 +18,15 @@ system! {
     }
 }
 
-// Эксклюзивная система — ТОТ ЖЕ макрос, режим выбран по `world: &mut World`.
+// Exclusive system — THE SAME macro, mode chosen by `world: &mut World`.
 system! {
     fn exclusive_spawn(world: &mut World) {
         world.spawn((Counter(100),));
     }
 }
 
-/// `add_systems(stage, (parallel, exclusive))` — bare-идентификаторы,
-/// имена выведены из fn; маркер-дизамбигуация различает Auto/Exclusive.
+/// `add_systems(stage, (parallel, exclusive))` — bare identifiers,
+/// names derived from fn; marker disambiguation distinguishes Auto/Exclusive.
 #[test]
 fn unified_add_systems_bare_identifiers() {
     let mut world = World::new();
@@ -42,16 +42,16 @@ fn unified_add_systems_bare_identifiers() {
         .map(|c| c.0)
         .collect();
 
-    // exclusive_spawn создал второй entity ⇒ всего 2.
-    assert_eq!(counters.len(), 2, "exclusive система должна была заспавнить entity");
-    // parallel_inc проинкрементил исходный Counter(0) ⇒ ни один счётчик не остался 0.
+    // exclusive_spawn created a second entity ⇒ 2 in total.
+    assert_eq!(counters.len(), 2, "exclusive system should have spawned an entity");
+    // parallel_inc incremented the original Counter(0) ⇒ no counter stayed at 0.
     assert!(
         counters.iter().all(|&v| v > 0),
-        "параллельная система должна была исполниться (counters={counters:?})"
+        "parallel system should have run (counters={counters:?})"
     );
 }
 
-// State без обязательного Default (U.5) — поля pub, конструируется вручную.
+// State without a required Default (U.5) — pub fields, constructed manually.
 system! {
     struct Accumulator { step: u32 }
     fn run(s: &mut Self, q: Write<Counter>) {
@@ -61,7 +61,7 @@ system! {
     }
 }
 
-/// Система со state без `Default`: регистрируется значением через `add_systems`.
+/// A stateful system without `Default`: registered by value via `add_systems`.
 #[test]
 fn stateful_system_without_default() {
     let mut world = World::new();
@@ -78,10 +78,10 @@ fn stateful_system_without_default() {
         .next()
         .map(|c| c.0)
         .unwrap();
-    assert_eq!(v, 10, "state-система без Default должна аккумулировать (2×step)");
+    assert_eq!(v, 10, "stateful system without Default should accumulate (2×step)");
 }
 
-/// Эксклюзивная система исполняется и видит/меняет весь мир.
+/// An exclusive system runs and sees/mutates the whole world.
 #[test]
 fn exclusive_system_full_world_access() {
     let mut world = World::new();
@@ -89,15 +89,15 @@ fn exclusive_system_full_world_access() {
     world.spawn((Counter(7),));
 
     let mut sched = Scheduler::new();
-    // Bare-идентификатор эксклюзивной system! в едином входе add_systems.
+    // Bare identifier of an exclusive system! in the unified add_systems entry.
     sched.add_systems(StageLabel::Update, exclusive_spawn);
     sched.compile_with_world(&world).unwrap();
     sched.run_sequential(&mut world);
 
-    assert_eq!(world.entity_count(), 3, "эксклюзивная система должна заспавнить 1 entity");
+    assert_eq!(world.entity_count(), 3, "exclusive system should spawn 1 entity");
 }
 
-// ── TD-9: достоверный Changed<T> внутри систем ──────────────────
+// ── TD-9: reliable Changed<T> inside systems ──────────────────
 
 struct ChangedCount(usize);
 
@@ -109,8 +109,9 @@ system! {
     }
 }
 
-/// `Changed<T>` внутри системы детектит только мутации текущего кадра —
-/// планировщик продвигает change-tick на границе кадра (база — `last_run_tick`).
+/// `Changed<T>` inside a system detects only current-frame mutations —
+/// the scheduler advances the change-tick at the frame boundary (base is
+/// `last_run_tick`).
 #[test]
 fn changed_in_system_detects_only_mutated() {
     let mut world = World::new();
@@ -121,23 +122,23 @@ fn changed_in_system_detects_only_mutated() {
     let mut sched = Scheduler::new();
     sched.add_systems(StageLabel::Update, detect_changed);
 
-    // Кадр 1: все entity «новые» (база last_run = 0) → detect видит обе.
+    // Frame 1: all entities are "new" (base last_run = 0) → detect sees both.
     sched.run_sequential(&mut world);
-    assert_eq!(world.resource::<ChangedCount>().0, 2, "кадр 1: все entity новые");
+    assert_eq!(world.resource::<ChangedCount>().0, 2, "frame 1: all entities new");
 
-    // Мутируем ТОЛЬКО e0 между кадрами.
+    // Mutate ONLY e0 between frames.
     world.get_mut::<Counter>(e0).unwrap().0 = 99;
 
-    // Кадр 2: detect видит только изменённый e0.
+    // Frame 2: detect sees only the changed e0.
     sched.run_sequential(&mut world);
-    assert_eq!(world.resource::<ChangedCount>().0, 1, "кадр 2: только изменённый");
+    assert_eq!(world.resource::<ChangedCount>().0, 1, "frame 2: only the changed one");
 
-    // Кадр 3: изменений нет → 0.
+    // Frame 3: no changes → 0.
     sched.run_sequential(&mut world);
-    assert_eq!(world.resource::<ChangedCount>().0, 0, "кадр 3: изменений нет");
+    assert_eq!(world.resource::<ChangedCount>().0, 0, "frame 3: no changes");
 }
 
-/// То же, но через параллельный путь `run()` (run_hybrid_parallel).
+/// Same, but via the parallel path `run()` (run_hybrid_parallel).
 #[test]
 fn changed_in_system_parallel_path() {
     let mut world = World::new();
@@ -151,10 +152,10 @@ fn changed_in_system_parallel_path() {
     sched.add_systems(StageLabel::Update, detect_changed);
 
     sched.run(&mut world);
-    assert_eq!(world.resource::<ChangedCount>().0, 51, "кадр 1: все новые (parallel)");
+    assert_eq!(world.resource::<ChangedCount>().0, 51, "frame 1: all new (parallel)");
 
     world.get_mut::<Counter>(e0).unwrap().0 = 7;
 
     sched.run(&mut world);
-    assert_eq!(world.resource::<ChangedCount>().0, 1, "кадр 2: только изменённый (parallel)");
+    assert_eq!(world.resource::<ChangedCount>().0, 1, "frame 2: only the changed one (parallel)");
 }

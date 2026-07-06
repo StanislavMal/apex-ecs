@@ -1,37 +1,37 @@
-//! apex-hot-reload — файловый watcher + горячая перезагрузка ассетов/конфигов.
+//! apex-hot-reload — file watcher + hot reload of assets/configs.
 //!
-//! # Фаза 2: Asset Hot Reload
+//! # Phase 2: Asset Hot Reload
 //!
-//! Перезагружает файлы конфигурации и ассетов без остановки мира.
-//! Не требует dylib, ABI проблем нет — работает с любыми типами
-//! реализующими `serde::Deserialize`.
+//! Reloads configuration and asset files without stopping the world.
+//! Requires no dylib and has no ABI problems — works with any type
+//! implementing `serde::Deserialize`.
 //!
-//! # Архитектура
+//! # Architecture
 //!
 //! ```text
 //!   FileWatcher (background thread)
 //!       │  notify::Event (path changed)
 //!       ▼
-//!   AssetRegistry::poll_changes() ← вызывается в game loop
+//!   AssetRegistry::poll_changes() ← called in the game loop
 //!       │  AssetChange { path, asset_id }
 //!       ▼
 //!   HotReloadPlugin::apply_changes(&mut world)
-//!       │  перезагружает файл → десериализует → вставляет как Resource
+//!       │  reloads the file → deserializes → inserts as a Resource
 //!       ▼
 //!   World::insert_resource::<T>(new_value)
 //! ```
 //!
-//! # Использование
+//! # Usage
 //!
 //! ```ignore
 //! let mut hot = HotReloadPlugin::new();
 //!
-//! // Регистрируем файл конфига как ресурс PhysicsConfig
+//! // Register the config file as a PhysicsConfig resource
 //! hot.watch_config::<PhysicsConfig>("assets/physics.json", &mut world);
 //!
-//! // В game loop:
+//! // In the game loop:
 //! loop {
-//!     hot.apply_changes(&mut world);  // < 1µs если нет изменений
+//!     hot.apply_changes(&mut world);  // < 1µs if there are no changes
 //!     scheduler.run(&mut world);
 //! }
 //! ```

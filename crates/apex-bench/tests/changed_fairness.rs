@@ -1,5 +1,5 @@
-//! Страж честности `changed_iter`: apex и bevy ОБЯЗАНЫ выдавать одинаковое число изменённых
-//! сущностей каждый кадр (иначе бенч сравнивает разную работу). Прогоняем несколько кадров.
+//! `changed_iter` fairness guard: apex and bevy MUST yield the same number of changed
+//! entities each frame (otherwise the bench compares different work). We run several frames.
 
 #[cfg(all(feature = "bevy"))]
 #[test]
@@ -10,15 +10,15 @@ fn changed_iter_apex_and_bevy_yield_same_count() {
     let mut a = ChangedIter::new();
     let mut b = BevyChanged::new();
 
-    // Первый кадр — прогрев (начальный last_run у движков может отличаться).
+    // First frame is warmup (the engines' initial last_run may differ).
     let _ = a.run();
     let _ = b.run();
 
-    // Установившийся режим: оба должны видеть РОВНО 1000 изменённых (10% из 10k).
+    // Steady state: both must see EXACTLY 1000 changed (10% of 10k).
     for frame in 0..5 {
         let ca = a.run();
         let cb = b.run();
-        assert_eq!(ca, 1000, "apex кадр {frame}: ожидалось 1000 changed, got {ca}");
-        assert_eq!(cb, 1000, "bevy кадр {frame}: ожидалось 1000 changed, got {cb}");
+        assert_eq!(ca, 1000, "apex frame {frame}: expected 1000 changed, got {ca}");
+        assert_eq!(cb, 1000, "bevy frame {frame}: expected 1000 changed, got {cb}");
     }
 }

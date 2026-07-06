@@ -18,9 +18,9 @@ declare_markers!(
 #[derive(Component)]
 pub struct Data(pub f32);
 
-// FragIter — итерация по 26 архетипам × 20 сущностей с фрагментированным доступом.
-// Персистентный QueryState (идиоматичный путь apex = аналог bevy QueryState) — матч
-// архетипов вычисляется один раз, не каждый вызов.
+// FragIter — iteration over 26 archetypes × 20 entities with fragmented access.
+// Persistent QueryState (the idiomatic apex path = analog of bevy QueryState) — the archetype
+// match is computed once, not on every call.
 pub struct FragIter {
     world: World,
     state: QueryState<Write<Data>>,

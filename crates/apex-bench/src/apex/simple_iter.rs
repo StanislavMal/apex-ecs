@@ -2,11 +2,11 @@ use apex_core::prelude::*;
 use crate::{Transform, Position, Rotation, Velocity};
 use cgmath::{Matrix4, Vector3};
 
-// SimpleIter — итерация по 10K сущностей, Position += Velocity
-// CachedQuery кешируется через QueryCache внутри query()
+// SimpleIter — iteration over 10K entities, Position += Velocity
+// CachedQuery is cached via QueryCache inside query()
 pub struct SimpleIter {
     world: World,
-    // W2-0/W2-0.5: per-state запрос для chunked-варианта (модель Bevy QueryState)
+    // W2-0/W2-0.5: per-state query for the chunked variant (Bevy QueryState model)
     state: QueryState<(Read<Velocity>, Write<Position>)>,
 }
 
@@ -30,18 +30,18 @@ impl SimpleIter {
         Self { world, state: QueryState::new() }
     }
 
-    /// Per-element итерация через ПЕРСИСТЕНТНЫЙ `QueryState` — идиоматичный
-    /// быстрый путь apex, прямой аналог bevy `QueryState::iter_mut` (bevy-бенч
-    /// тоже хранит состояние между вызовами). Прежний вариант звал
-    /// `world.query()` каждую итерацию (пересборка матча архетипов) — это был
-    /// нечестный гандикап apex против кэширующего bevy.
+    /// Per-element iteration via a PERSISTENT `QueryState` — the idiomatic
+    /// fast apex path, a direct analog of bevy `QueryState::iter_mut` (the bevy bench
+    /// also keeps state between calls). The previous variant called
+    /// `world.query()` on every iteration (rebuilding the archetype match) — this was
+    /// an unfair handicap of apex against the caching bevy.
     pub fn run(&mut self) {
         self.state.query_mut(&mut self.world).for_each_mut(|_, (vel, mut pos)| {
             pos.0 += vel.0;
         });
     }
 
-    /// W2-0.5: плотная chunk-итерация (слайсы колонок + stamp_range).
+    /// W2-0.5: dense chunk iteration (column slices + stamp_range).
     pub fn run_chunked(&mut self) {
         self.state.query_mut(&mut self.world).for_each_chunk_mut(|_, (vel, pos)| {
             for (p, v) in pos.iter_mut().zip(vel) {

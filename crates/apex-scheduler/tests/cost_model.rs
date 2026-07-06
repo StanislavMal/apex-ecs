@@ -1,4 +1,4 @@
-//! Ш2 cost-model guard: heavy work at LOW entity count must parallelize.
+//! Sh2 cost-model guard: heavy work at LOW entity count must parallelize.
 //!
 //! The entity-count heuristic serializes a 2-system stage below ~25k entities.
 //! With heavy per-entity work at N=3000, parallelism still wins big — the

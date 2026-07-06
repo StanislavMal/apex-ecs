@@ -1,10 +1,10 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// CommandsInsert — структурное изменение через ОТЛОЖЕННЫЙ буфер Commands (insert компонента + apply),
-// а не прямой world.insert. Путь Command::Insert + insert-group apply. Реальные системы добавляют
-// компоненты через Commands из параллельного контекста. iter_batched: setup (мир с 10k A) вне
-// измерения; run — записать 10k insert-команд B + apply (10k archetype-move'ов).
+// CommandsInsert — a structural change through the DEFERRED Commands buffer (component insert + apply),
+// rather than a direct world.insert. Path: Command::Insert + insert-group apply. Real systems add
+// components through Commands from a parallel context. iter_batched: setup (a world with 10k A) is
+// outside the measurement; run — record 10k insert commands for B + apply (10k archetype moves).
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 

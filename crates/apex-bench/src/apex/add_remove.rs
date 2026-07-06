@@ -21,7 +21,7 @@ impl Default for AddRemove {
 impl AddRemove {
     pub fn new() -> Self {
         let mut world = World::new();
-        // ✅ Кортеж из одного компонента реализует Bundle
+        // ✅ A single-component tuple implements Bundle
         let entities = world.spawn_many(10_000, |_| (A(0.0),));
 
         Self { world, entities }

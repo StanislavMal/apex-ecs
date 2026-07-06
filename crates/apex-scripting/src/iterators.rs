@@ -1,24 +1,24 @@
-//! Lua-совместимые итераторы для `query()`.
+//! Lua-compatible iterators for `query()`.
 //!
-//! # Дизайн query-итератора
+//! # Query-iterator design
 //!
-//! Каждый элемент итератора — Lua таблица со структурой:
+//! Each iterator element is a Lua table with the structure:
 //! ```text
 //! {
-//!     entity = "42:0",                   -- id "index:generation" (E10), не голый индекс
-//!     position = { x = 1.0, y = 2.0 },   -- Read/Write компоненты (lowercase ключи)
+//!     entity = "42:0",                   -- id "index:generation" (E10), not a bare index
+//!     position = { x = 1.0, y = 2.0 },   -- Read/Write components (lowercase keys)
 //!     velocity = { x = 0.5, y = 0.0 },
 //!     _meta = { arch = 0, row = 3, writes = { position = 1, velocity = 2 } }
 //! }
 //! ```
 //!
-//! `commit(entity)` читает `_meta` чтобы найти колонки архетипа
-//! и записывает изменённые значения обратно в ECS.
+//! `commit(entity)` reads `_meta` to find the archetype columns
+//! and writes the changed values back into the ECS.
 //!
-//! # Формат дескрипторов
+//! # Descriptor format
 //!
-//! `query({"Read:Position", "Write:Velocity"})` — таблица строк.
-//! Парсится в `QueryDesc` в `parse_query_descs()`.
+//! `query({"Read:Position", "Write:Velocity"})` — a table of strings.
+//! Parsed into `QueryDesc` by `parse_query_descs()`.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -72,7 +72,7 @@ pub(crate) fn parse_entity_id_str(s: &str) -> Option<Entity> {
 
 // ── QueryDesc ──────────────────────────────────────────────────
 
-/// Режим доступа к компоненту в query-дескрипторе.
+/// Component access mode in a query descriptor.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum QueryMode {
     Read,
@@ -138,18 +138,18 @@ struct IterState {
     arch_states: Vec<ArchState>,
     arch_cursor: usize,
     row_cursor:  usize,
-    /// (arch_idx, row, entity_table) — для авто-commit на следующей итерации
+    /// (arch_idx, row, entity_table) — for auto-commit on the next iteration
     pending:     Option<(usize, usize, mlua::Table)>,
 }
 
-// ── Построение arch states ─────────────────────────────────────
+// ── Building arch states ───────────────────────────────────────
 
 pub(crate) fn build_arch_states(
     world: &World,
     ctx: &ScriptContext,
     descs: &[QueryDesc],
 ) -> Vec<ArchState> {
-    // Разделяем на data-компоненты (Read/Write) и фильтры (With/Without)
+    // Split into data components (Read/Write) and filters (With/Without)
     let data_descs: Vec<&QueryDesc> = descs.iter()
         .filter(|d| matches!(d.mode, QueryMode::Read | QueryMode::Write))
         .collect();
@@ -160,7 +160,7 @@ pub(crate) fn build_arch_states(
         .filter(|d| matches!(d.mode, QueryMode::Without))
         .collect();
 
-    // Разрешаем имена data-компонентов → ComponentId
+    // Resolve data component names → ComponentId
     let resolved_data: Vec<(ComponentId, &QueryDesc)> = data_descs.iter()
         .filter_map(|d| ctx.binding(&d.type_name).map(|b| (b.id, *d)))
         .collect();
@@ -177,7 +177,7 @@ pub(crate) fn build_arch_states(
         return Vec::new();
     }
 
-    // Разрешаем With/Without в ComponentId
+    // Resolve With/Without into ComponentId
     let with_ids: Vec<ComponentId> = with_descs.iter()
         .filter_map(|d| ctx.binding(&d.type_name).map(|b| b.id))
         .collect();
@@ -211,7 +211,7 @@ pub(crate) fn build_arch_states(
         .filter_map(|(arch_idx, arch)| {
             if arch.is_empty() { return None; }
 
-            // Data-компоненты: все должны присутствовать
+            // Data components: all must be present
             let components: Vec<ComponentState> = resolved_data.iter()
                 .filter_map(|(cid, desc)| {
                     let col_idx = arch.column_index(*cid)?;
@@ -227,12 +227,12 @@ pub(crate) fn build_arch_states(
                 return None;
             }
 
-            // With-фильтры: все должны присутствовать
+            // With filters: all must be present
             for cid in &with_ids {
                 arch.column_index(*cid)?;
             }
 
-            // Without-фильтры: ни один не должен присутствовать
+            // Without filters: none must be present
             for cid in &without_ids {
                 if arch.column_index(*cid).is_some() {
                     return None;
@@ -248,7 +248,7 @@ pub(crate) fn build_arch_states(
         .collect()
 }
 
-// ── Построение entity таблицы ──────────────────────────────────
+// ── Building the entity table ──────────────────────────────────
 
 pub(crate) fn build_entity_table(
     lua: &mlua::Lua,
@@ -307,14 +307,14 @@ pub(crate) fn build_entity_table(
         let key = comp.type_name.to_lowercase();
         t.set(key.clone(), val)?;
 
-        // Для Read-компонентов: ставим __newindex для предупреждения о модификации
+        // For Read components: set __newindex to warn about modification
         if matches!(comp.mode, QueryMode::Read) {
             if let Ok(sub_table) = t.get::<mlua::Table>(key.as_str()) {
                 let mt = lua.create_table()?;
                 let type_name = comp.type_name.clone();
                 mt.set("__newindex", lua.create_function(move |_, (_t, field, _val): (mlua::Table, String, mlua::Value)| {
                     log::warn!(
-                        "[script] попытка изменить Read-компонент '{}' (поле '{}') — используй Write:{}",
+                        "[script] attempt to modify Read component '{}' (field '{}') — use Write:{}",
                         type_name, field, type_name
                     );
                     Ok(())
@@ -338,7 +338,7 @@ pub(crate) fn commit_entity_table(
     let meta: mlua::Table = match entity_table.get("_meta") {
         Ok(m) => m,
         Err(_) => {
-            log::warn!("commit: таблица не из query (нет _meta), пропущена");
+            log::warn!("commit: table is not from a query (no _meta), skipped");
             return Ok(());
         }
     };
@@ -358,9 +358,10 @@ pub(crate) fn commit_entity_table(
         }
     };
 
-    // Никогда НЕ доверяем `_meta` из Lua: скрипт может подделать arch/row/col
-    // или сохранить таблицу до следующего кадра, где строку уже swap-removed'нули.
-    // Валидируем всё против ЖИВОГО мира до любого unsafe-доступа (E1).
+    // Never trust `_meta` coming from Lua: a script can forge arch/row/col or
+    // stash the table until the next frame, where the row has already been
+    // swap-removed. Validate everything against the LIVE world before any
+    // unsafe access (E1).
     if arch_idx < 0 || row < 0 {
         log::warn!("commit: negative _meta arch/row, skipped");
         return Ok(());
@@ -378,11 +379,11 @@ pub(crate) fn commit_entity_table(
         log::warn!("commit: _meta.row {row} out of range for archetype {arch_idx}, skipped");
         return Ok(());
     }
-    // Строка обязана всё ещё нести ту entity, для которой построена таблица —
-    // иначе отложенное структурное изменение переселило её, и мы бы записали
-    // в ЧУЖУЮ entity (порча данных). Сравниваем ПОЛНУЮ entity (index +
-    // generation): переиспользованный слот с новым поколением ловится как
-    // несовпадение и отвергается (E1 + E10).
+    // The row must still hold the entity the table was built for — otherwise a
+    // deferred structural change relocated it and we would write into a
+    // DIFFERENT entity (data corruption). Compare the FULL entity (index +
+    // generation): a reused slot with a new generation is caught as a mismatch
+    // and rejected (E1 + E10).
     if arch.entities()[row] != meta_entity {
         log::warn!(
             "commit: entity at archetype {arch_idx} row {row} no longer matches table entity, skipped"
@@ -401,8 +402,9 @@ pub(crate) fn commit_entity_table(
             }
         };
 
-        // РЕ-резолвим колонку из архетипа по ComponentId биндинга — Lua-значению
-        // col_idx не верим (подделка = OOB или type confusion в write).
+        // RE-resolve the column from the archetype by the binding's ComponentId —
+        // we don't trust the Lua col_idx value (forgery = OOB or type confusion
+        // in the write).
         let col_idx = match arch.column_index(binding.id) {
             Some(i) => i,
             None => {
@@ -420,9 +422,10 @@ pub(crate) fn commit_entity_table(
             }
         };
 
-        // SAFETY: arch_idx/row/col_idx проверены выше против живого мира, row в
-        // границах архетипа, а `binding.write` соответствует `binding.id` = типу
-        // колонки (col_idx резолвнут именно по нему) — type confusion исключена.
+        // SAFETY: arch_idx/row/col_idx were checked above against the live world,
+        // row is within the archetype bounds, and `binding.write` matches
+        // `binding.id` = the column type (col_idx was resolved by it) — type
+        // confusion is ruled out.
         unsafe {
             let col = &arch.columns_raw()[col_idx];
             let ptr = col.get_raw_ptr(row) as *mut u8;
@@ -434,7 +437,7 @@ pub(crate) fn commit_entity_table(
     Ok(())
 }
 
-// ── Создание Lua iterator factory ──────────────────────────────
+// ── Creating the Lua iterator factory ──────────────────────────
 
 pub(crate) fn create_query_iter_fn(
     lua: &mlua::Lua,
@@ -450,7 +453,7 @@ pub(crate) fn create_query_iter_fn(
     lua.create_function(move |lua, ()| {
         let mut st = state.borrow_mut();
 
-        // Авто-commit предыдущей entity (если включён)
+        // Auto-commit the previous entity (if enabled)
         if let Some((_arch_idx, _row, ref table)) = st.pending.take() {
             let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
                 .ok_or_else(|| mlua::Error::runtime("no ScriptContext in Lua app data"))?;
@@ -492,7 +495,7 @@ pub(crate) fn create_query_iter_fn(
                 &components,
             )?;
 
-            // Сохраняем для авто-commit на следующем вызове
+            // Store for auto-commit on the next call
             st.pending = Some((arch_idx, row, table.clone()));
 
             return Ok(mlua::Value::Table(table));

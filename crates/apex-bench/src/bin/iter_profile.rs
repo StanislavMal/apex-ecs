@@ -1,12 +1,12 @@
-//! Микро-профиль регресса simple_iter: конструктор vs итерация.
+//! Micro-profile of the simple_iter regression: constructor vs iteration.
 //!
-//! Мир 1:1 с criterion-бенчем simple_iter (10k × 4 компонента), меряем раздельно:
-//!   1. только конструктор CachedQuery (query без итерации);
-//!   2. только конструктор Query::new;
-//!   3. полный query().for_each (как в бенче);
-//!   4. полный Query::new().for_each.
+//! World 1:1 with the simple_iter criterion bench (10k × 4 components), measured separately:
+//!   1. CachedQuery constructor only (query without iteration);
+//!   2. Query::new constructor only;
+//!   3. full query().for_each (as in the bench);
+//!   4. full Query::new().for_each.
 //!
-//! Запуск: `cargo run --release -p apex-bench --bin iter_profile`
+//! Run: `cargo run --release -p apex-bench --bin iter_profile`
 
 use apex_bench::{Position, Rotation, Transform, Velocity};
 use apex_core::prelude::*;
@@ -45,7 +45,7 @@ fn main() {
         },
         9,
     );
-    println!("CachedQuery конструктор:      {t:.3} µs");
+    println!("CachedQuery constructor:      {t:.3} µs");
 
     let t = median_us(
         || {
@@ -58,7 +58,7 @@ fn main() {
         },
         9,
     );
-    println!("Query::new конструктор:       {t:.3} µs");
+    println!("Query::new constructor:       {t:.3} µs");
 
     let t = median_us(
         || {
@@ -92,7 +92,7 @@ fn main() {
     );
     println!("Query::new + for_each 10k:    {t:.3} µs");
 
-    // ── W2-0: QueryState (per-system стейт, ноль локов/аллокаций) ──
+    // ── W2-0: QueryState (per-system state, zero locks/allocations) ──
     let mut state = QueryState::<(Read<Velocity>, Write<Position>)>::new();
     let t = median_us(
         || {
@@ -105,7 +105,7 @@ fn main() {
         },
         9,
     );
-    println!("QueryState конструктор:       {t:.3} µs");
+    println!("QueryState constructor:       {t:.3} µs");
 
     let t = median_us(
         || {
@@ -121,7 +121,7 @@ fn main() {
     );
     println!("QueryState + for_each 10k:    {t:.3} µs");
 
-    // ── W2-0.5: плотная chunk-итерация (слайсы + stamp_range) ──
+    // ── W2-0.5: dense chunk iteration (slices + stamp_range) ──
     let t = median_us(
         || {
             let t = Instant::now();

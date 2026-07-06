@@ -2,10 +2,10 @@ use apex_core::prelude::*;
 use apex_core::transform::{propagate_transforms, GlobalTransform, LocalTransform, TransformPlugin};
 use glam::{Mat4, Quat, Vec3};
 
-// Propagate — иерархическая пропагация трансформов (наш дифференциатор; перф-чувствительна, в прошлом
-// был перф-баг дублирования поддеревьев). 200 корней × цепочка из 50 = 10k узлов; каждый кадр все
-// LocalTransform двигаются (worst-case толпа, весь граф dirty) + пропагация. Apex-фокус (bevy
-// propagate — отдельный crate/schedule); criterion-страж от регрессий пропагации.
+// Propagate — hierarchical transform propagation (our differentiator; perf-sensitive, in the past
+// there was a perf bug of subtree duplication). 200 roots × a chain of 50 = 10k nodes; every frame all
+// LocalTransforms move (worst-case crowd, the whole graph dirty) + propagation. Apex focus (bevy
+// propagate — a separate crate/schedule); a criterion guard against propagation regressions.
 fn lt(seed: f32) -> LocalTransform {
     LocalTransform {
         translation: Vec3::new(seed, 0.0, 0.0),
@@ -41,12 +41,12 @@ impl Propagate {
                 parent = child;
             }
         }
-        propagate_transforms(&mut world); // первичная пропагация (стабилизирует кэш)
+        propagate_transforms(&mut world); // initial propagation (stabilizes the cache)
         Self { world, nodes }
     }
 
     pub fn run(&mut self) {
-        // Кадр толпы: двигаем все LocalTransform (стампит dirty) + пропагация по всему графу.
+        // Crowd frame: move all LocalTransforms (stamps dirty) + propagation over the whole graph.
         self.world.tick();
         for &e in &self.nodes {
             if let Some(mut l) = self.world.get_mut::<LocalTransform>(e) {

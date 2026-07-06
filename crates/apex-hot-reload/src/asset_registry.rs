@@ -1,25 +1,25 @@
-//! AssetRegistry — маппинг путей к файлам на зарегистрированные ассеты.
+//! AssetRegistry — maps file paths to registered assets.
 
 use std::path::PathBuf;
 
 use rustc_hash::FxHashMap;
 
-/// Уникальный идентификатор зарегистрированного ассета.
+/// Unique identifier of a registered asset.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AssetId(pub u32);
 
-/// Изменение ассета — результат `AssetRegistry::process_changes`.
+/// An asset change — the result of `AssetRegistry::process_changes`.
 #[derive(Debug, Clone)]
 pub struct AssetChange {
     pub id:   AssetId,
     pub path: PathBuf,
 }
 
-/// Маппинг `PathBuf → AssetId` для быстрого поиска при получении file event.
+/// Maps `PathBuf → AssetId` for fast lookup when a file event is received.
 pub struct AssetRegistry {
     /// path → (asset_id, loader_key)
     path_to_asset: FxHashMap<PathBuf, AssetId>,
-    /// asset_id → path (для диагностики)
+    /// asset_id → path (for diagnostics)
     asset_to_path: FxHashMap<u32, PathBuf>,
     next_id:       u32,
 }
@@ -33,9 +33,9 @@ impl AssetRegistry {
         }
     }
 
-    /// Зарегистрировать путь к файлу, получить AssetId.
+    /// Register a file path, obtaining an AssetId.
     ///
-    /// Если путь уже зарегистрирован — возвращает существующий ID.
+    /// If the path is already registered — returns the existing ID.
     pub fn register(&mut self, path: PathBuf) -> AssetId {
         if let Some(&id) = self.path_to_asset.get(&path) {
             return id;
@@ -47,16 +47,16 @@ impl AssetRegistry {
         id
     }
 
-    /// Преобразовать список изменённых путей в список изменённых AssetId.
+    /// Convert a list of changed paths into a list of changed AssetIds.
     ///
-    /// Пути не зарегистрированные в registry — игнорируются.
+    /// Paths not registered in the registry are ignored.
     pub fn process_changes<'a>(
         &self,
         changed_paths: impl Iterator<Item = &'a PathBuf>,
     ) -> Vec<AssetChange> {
         changed_paths
             .filter_map(|path| {
-                // Нормализуем путь (абсолютный vs относительный)
+                // Normalize the path (absolute vs relative)
                 let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
                 self.path_to_asset
                     .get(&canonical)

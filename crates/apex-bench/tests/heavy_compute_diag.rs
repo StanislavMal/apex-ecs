@@ -1,5 +1,5 @@
-//! Диагностика регресса heavy_compute: (1) матрицы после spawn_many здоровы (от from_angle_x),
-//! (2) par_for_each посещает каждую сущность РОВНО раз (не дублирует работу).
+//! heavy_compute regression diagnostics: (1) matrices after spawn_many are healthy (from from_angle_x),
+//! (2) par_for_each visits each entity EXACTLY once (does not duplicate work).
 
 use apex_core::prelude::*;
 use cgmath::{Matrix4, Rad, SquareMatrix, Vector3};
@@ -18,17 +18,17 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     });
     assert_eq!(entities.len(), 1000);
 
-    // (1a) ЧЕРЕЗ world.get (random-access, путь НЕ менялся): row 0 (write_into_batch) vs
-    // row 1/500/999 (bulk-copy) — изолирует «данные при спавне» от «чтение for_each».
+    // (1a) VIA world.get (random-access, path did NOT change): row 0 (write_into_batch) vs
+    // row 1/500/999 (bulk-copy) — isolates "data at spawn" from "for_each read".
     for &i in &[0usize, 1, 500, 999] {
         let det = world.get::<Matrix4<f32>>(entities[i]).unwrap().determinant();
         assert!(
             (det - 1.0).abs() < 1e-4,
-            "get: матрица entity[{i}] повреждена при spawn: det={det} (≈1.0 ожид.)"
+            "get: matrix entity[{i}] corrupted at spawn: det={det} (≈1.0 expected)"
         );
     }
 
-    // (1b) ЧЕРЕЗ for_each (путь lazy-entity, который я менял).
+    // (1b) VIA for_each (the lazy-entity path that I changed).
     let mut count = 0u64;
     let mut bad = 0u64;
     world.query::<Read<Matrix4<f32>>>().for_each(|_, m| {
@@ -37,10 +37,10 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
             bad += 1;
         }
     });
-    assert_eq!(count, 1000, "spawn_many создал не 1000 сущностей с Matrix4");
-    assert_eq!(bad, 0, "for_each: {bad} матриц прочитаны повреждёнными (read-путь)");
+    assert_eq!(count, 1000, "spawn_many did not create 1000 entities with Matrix4");
+    assert_eq!(bad, 0, "for_each: {bad} matrices read corrupted (read path)");
 
-    // (2) par_for_each посещает каждую сущность РОВНО раз.
+    // (2) par_for_each visits each entity EXACTLY once.
     let visits = AtomicU64::new(0);
     world
         .query::<Read<Matrix4<f32>>>()
@@ -50,10 +50,10 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     assert_eq!(
         visits.load(Ordering::Relaxed),
         1000,
-        "par_for_each посетил не 1000 раз — дублирование/перекрытие чанков!"
+        "par_for_each did not visit 1000 times — chunk duplication/overlap!"
     );
 
-    // (3) ПАРАЛЛЕЛИЗМ: par_for_each с реальной нагрузкой (100 инверсий) должен быть быстрее serial.
+    // (3) PARALLELISM: par_for_each with a real workload (100 inversions) must be faster than serial.
     use std::time::Instant;
     let heavy = |m0: Matrix4<f32>| {
         let mut m = m0;
@@ -83,6 +83,6 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     );
     assert!(
         par < seq,
-        "par_for_each НЕ быстрее serial (seq={seq:?} par={par:?}) — параллелизм потерян!"
+        "par_for_each NOT faster than serial (seq={seq:?} par={par:?}) — parallelism lost!"
     );
 }

@@ -1,42 +1,42 @@
-//! apex-scripting — интеграция Lua-скриптинга с Apex ECS.
+//! apex-scripting — Lua scripting integration with Apex ECS.
 //!
-//! # Архитектура
+//! # Architecture
 //!
 //! ```text
 //! ScriptEngine
 //!   ├── mlua::Lua             — Lua 5.4 VM
-//!   ├── ScriptContext         — мост World ↔ Lua (Rc<RefCell<>>)
-//!   ├── HashMap<name, RegistryKey> — скомпилированные скрипты
-//!   └── FileWatcher           — хот-релоад .lua файлов
+//!   ├── ScriptContext         — World ↔ Lua bridge (Rc<RefCell<>>)
+//!   ├── HashMap<name, RegistryKey> — compiled scripts
+//!   └── FileWatcher           — hot-reload of .lua files
 //!
 //! ScriptContext
 //!   ├── delta_time: f32
-//!   ├── world_ptr:  NonNull<World>   — живёт ≤ ScriptEngine::run()
-//!   └── deferred:   Commands         — буфер spawn/despawn
+//!   ├── world_ptr:  NonNull<World>   — lives ≤ ScriptEngine::run()
+//!   └── deferred:   Commands         — spawn/despawn buffer
 //! ```
 //!
-//! # Использование
+//! # Usage
 //!
 //! ```ignore
 //! use std::path::Path;
 //! use apex_scripting::{ScriptEngine, Scriptable};
 //!
-//! // Регистрация компонентов как Scriptable
+//! // Register components as Scriptable
 //! #[derive(Clone, Copy, Scriptable)]
 //! struct Position { x: f32, y: f32 }
 //!
 //! #[derive(Clone, Copy, Scriptable)]
 //! struct Velocity { x: f32, y: f32 }
 //!
-//! // Создание движка с директорией скриптов
+//! // Create the engine with a scripts directory
 //! let mut engine = ScriptEngine::with_dir(Path::new("scripts/"));
 //!
-//! // Регистрация компонентов для доступа из скриптов
+//! // Register components for access from scripts
 //! engine.register_component::<Position>(&world);
 //! engine.register_component::<Velocity>(&world);
 //!
-//! // Загрузка .lua файлов
-//! engine.load_scripts().expect("ошибка загрузки скриптов");
+//! // Load .lua files
+//! engine.load_scripts().expect("failed to load scripts");
 //!
 //! // Game loop
 //! loop {
@@ -46,7 +46,7 @@
 //! }
 //! ```
 //!
-//! # Пример скрипта (scripts/game.lua)
+//! # Script example (scripts/game.lua)
 //!
 //! ```lua
 //! function run()
@@ -81,21 +81,21 @@ pub use error::ScriptError;
 pub use registrar::ScriptableRegistrar;
 pub use script_engine::ScriptEngine;
 
-// Re-export макроса из apex-macros чтобы пользователи писали
-// `use apex_scripting::Scriptable` а не импортировали отдельно
+// Re-export the macro from apex-macros so users write
+// `use apex_scripting::Scriptable` instead of importing it separately
 pub use apex_macros::Scriptable;
 
 use apex_core::world::World;
 
-/// Extension trait: регистрирует типы одновременно в World и ScriptEngine.
+/// Extension trait: registers types in both World and ScriptEngine at once.
 ///
-/// Устраняет необходимость двойной регистрации:
+/// Removes the need for double registration:
 /// ```ignore
-/// // Было:
+/// // Before:
 /// world.register_component::<Position>();
 /// engine.register_component::<Position>(&world);
 ///
-/// // Стало:
+/// // After:
 /// world.register_scriptable::<Position>(&mut engine);
 /// ```
 pub trait WorldScriptingExt {

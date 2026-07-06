@@ -1,4 +1,4 @@
-//! FileWatcher — обёртка над `notify` с каналом изменений.
+//! FileWatcher — a wrapper around `notify` with a change channel.
 
 use std::{
     collections::HashMap,
@@ -9,17 +9,17 @@ use std::{
 
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-/// Изменение файла — приходит из background watcher thread.
+/// A file change — arrives from the background watcher thread.
 #[derive(Debug, Clone)]
 pub struct FileChange {
     pub path: PathBuf,
 }
 
-/// FileWatcher — запускает notify в отдельном потоке, отдаёт изменения через channel.
+/// FileWatcher — runs notify on a separate thread, delivering changes through a channel.
 ///
 /// # Thread model
-/// `notify` запускает внутренний OS-watcher поток. События приходят в `Sender`
-/// и читаются из `Receiver` в game loop через `poll()` — без блокировки.
+/// `notify` starts an internal OS-watcher thread. Events arrive in the `Sender`
+/// and are read from the `Receiver` in the game loop via `poll()` — without blocking.
 ///
 /// # Debounce (9b)
 /// `notify`'s `Config::with_poll_interval` only affects the polling backend
@@ -35,7 +35,7 @@ pub struct FileChange {
 /// stayed quiet for the debounce window. Re-touching a still-pending path
 /// pushes its deadline back, coalescing a burst of writes into a single change.
 pub struct FileWatcher {
-    _watcher: RecommendedWatcher, // держим живым
+    _watcher: RecommendedWatcher, // kept alive
     rx:       Receiver<FileChange>,
     debounce: Duration,
     /// Paths seen but not yet settled: path → deadline (`first_seen + debounce`).
@@ -44,10 +44,10 @@ pub struct FileWatcher {
 }
 
 impl FileWatcher {
-    /// Создать watcher для директории `watch_dir`.
+    /// Create a watcher for the `watch_dir` directory.
     ///
-    /// Рекурсивно следит за всеми файлами внутри.
-    /// События дебаунсируются на `debounce` — типично 50–200ms (см. `poll`).
+    /// Recursively watches all files inside it.
+    /// Events are debounced by `debounce` — typically 50–200ms (see `poll`).
     pub fn new(watch_dir: &Path, debounce: Duration) -> Result<Self, notify::Error> {
         let (tx, rx) = mpsc::channel::<FileChange>();
         let tx_clone = tx.clone();
@@ -55,11 +55,11 @@ impl FileWatcher {
         let mut watcher = RecommendedWatcher::new(
             move |res: notify::Result<Event>| {
                 if let Ok(event) = res {
-                    // Нас интересуют только события изменения содержимого файла
+                    // We only care about file-content change events
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
                             for path in event.paths {
-                                // Игнорируем временные файлы редакторов
+                                // Ignore editor temporary files
                                 if Self::is_temp_file(&path) { continue; }
                                 let _ = tx_clone.send(FileChange { path });
                             }
@@ -83,10 +83,10 @@ impl FileWatcher {
         })
     }
 
-    /// Опросить все накопившиеся события без блокировки.
+    /// Poll all accumulated events without blocking.
     ///
-    /// Возвращает `Vec<FileChange>` — может быть пустым если изменений нет.
-    /// Вызывается каждый кадр из game loop.
+    /// Returns `Vec<FileChange>` — may be empty if there are no changes.
+    /// Called every frame from the game loop.
     ///
     /// Applies the manual debounce (9b): raw events are folded into the pending
     /// map and only paths that have stayed quiet for `debounce` are emitted.
@@ -119,12 +119,12 @@ impl FileWatcher {
             changes.push(FileChange { path });
         }
 
-        // Стабильный порядок для детерминизма (map-итерация неупорядочена).
+        // Stable order for determinism (map iteration is unordered).
         changes.sort_by(|a, b| a.path.cmp(&b.path));
         changes
     }
 
-    /// Временные файлы редакторов которые не нужно перезагружать.
+    /// Editor temporary files that must not be reloaded.
     fn is_temp_file(path: &Path) -> bool {
         let name = path.file_name()
             .and_then(|n| n.to_str())

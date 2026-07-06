@@ -1,22 +1,22 @@
-//! Структуры данных снэпшота мира — формат хранения/передачи.
+//! World snapshot data structures — the storage/transfer format.
 //!
-//! # Форматы
+//! # Formats
 //!
-//! - **JSON** — человекочитаемый, для отладки и конфигов
-//! - **Bincode** — компактный бинарный, для быстрых сохранений/загрузок
+//! - **JSON** — human-readable, for debugging and configs
+//! - **Bincode** — compact binary, for fast saves/loads
 //!
-//! Компоненты всегда хранятся как сырые байты (`Vec<u8>`).
-//! При JSON-сериализации снэпшота байты интерпретируются как JSON.
-//! При Bincode-сериализации — как бинарные данные.
+//! Components are always stored as raw bytes (`Vec<u8>`).
+//! When the snapshot is JSON-serialized, the bytes are interpreted as JSON.
+//! When it is Bincode-serialized, they are interpreted as binary data.
 
 use serde::{Deserialize, Serialize};
 
-// ── Версионирование ──────────────────────────────────────────────
+// ── Versioning ───────────────────────────────────────────────────
 
-/// Версия формата снэпшота — мажорная + минорная.
+/// Snapshot format version — major + minor.
 ///
-/// - Мажорная версия меняется при breaking change
-/// - Минорная версия меняется при обратно-совместимых изменениях
+/// - The major version changes on a breaking change
+/// - The minor version changes on backward-compatible changes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotVersion {
     pub major: u32,
@@ -30,8 +30,8 @@ impl SnapshotVersion {
         Self { major, minor }
     }
 
-    /// Проверить, совместима ли эта версия с указанной.
-    /// Совместимость = совпадает мажорная, минорная >= ожидаемой.
+    /// Check whether this version is compatible with the given one.
+    /// Compatible = same major, minor >= expected.
     pub fn is_compatible_with(&self, expected: SnapshotVersion) -> bool {
         self.major == expected.major && self.minor >= expected.minor
     }
@@ -43,40 +43,41 @@ impl std::fmt::Display for SnapshotVersion {
     }
 }
 
-// ── Формат хранения данных компонента ───────────────────────────
+// ── Component data storage format ───────────────────────────────
 
-/// Формат, в котором хранятся байты компонента.
+/// The format in which a component's bytes are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataFormat {
-    /// JSON-байты (человекочитаемые).
+    /// JSON bytes (human-readable).
     Json,
-    /// Бинарные байты (bincode).
+    /// Binary bytes (bincode).
     Binary,
 }
 
 // ── WorldSnapshot ────────────────────────────────────────────────
 
-/// Сериализованный ресурс (E7): `type_name` + bincode-байты.
+/// A serialized resource (E7): `type_name` + bincode bytes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceSnapshot {
     pub type_name: String,
     pub data:      Vec<u8>,
 }
 
-/// Полный снимок мира — всё что нужно для восстановления state.
+/// A full world snapshot — everything needed to restore state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSnapshot {
-    /// Версия формата снэпшота — для будущей миграции.
+    /// Snapshot format version — for future migration.
     pub version:   u32,
-    /// Тик мира на момент снэпшота.
+    /// World tick at the moment of the snapshot.
     pub tick:      u32,
-    /// Все живые entity с их компонентами.
+    /// All live entities with their components.
     pub entities:  Vec<EntitySnapshot>,
-    /// Relations между entity.
+    /// Relations between entities.
     pub relations: Vec<RelationSnapshot>,
-    /// Зарегистрированные ресурсы (E7, формат v2). `serde(default)` — JSON-снимки
-    /// v1 (без поля) читаются как пустой список. Bincode v1 несовместим с v2
-    /// (dev-снимки эфемерны; версия читается и мигрируется на load-пути).
+    /// Registered resources (E7, format v2). `serde(default)` — v1 JSON
+    /// snapshots (without the field) read as an empty list. Bincode v1 is not
+    /// compatible with v2 (dev snapshots are ephemeral; the version is read and
+    /// migrated on the load path).
     #[serde(default)]
     pub resources: Vec<ResourceSnapshot>,
 }
@@ -96,35 +97,35 @@ impl WorldSnapshot {
 
     // ── JSON ─────────────────────────────────────────────────────
 
-    /// Сериализовать снэпшот в JSON-байты.
+    /// Serialize the snapshot into JSON bytes.
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
     }
 
-    /// Десериализовать снэпшот из JSON-байт.
+    /// Deserialize the snapshot from JSON bytes.
     pub fn from_json(data: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(data)
     }
 
     // ── Bincode ──────────────────────────────────────────────────
 
-    /// Сериализовать снэпшот в бинарный формат (bincode).
+    /// Serialize the snapshot into the binary format (bincode).
     ///
-    /// Размер в 5-10x меньше JSON, скорость в 2-3x выше.
+    /// 5-10x smaller than JSON, 2-3x faster.
     pub fn to_bincode(&self) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
         bincode::serialize(self)
     }
 
-    /// Десериализовать снэпшот из бинарного формата (bincode).
+    /// Deserialize the snapshot from the binary format (bincode).
     ///
-    /// Проверяет совместимость версии снэпшота.
+    /// Checks the snapshot version compatibility.
     pub fn from_bincode(data: &[u8]) -> Result<Self, Box<bincode::ErrorKind>> {
         bincode::deserialize(data)
     }
 
-    // ── Миграция ─────────────────────────────────────────────────
+    // ── Migration ────────────────────────────────────────────────
 
-    /// Запустить цепочку миграций, приводя снэпшот к текущей версии.
+    /// Run the migration chain, bringing the snapshot up to the current version.
     pub fn migrate(&mut self) -> Result<(), String> {
         while self.version < Self::CURRENT_VERSION {
             let migrator = migration_for(self.version)
@@ -135,7 +136,7 @@ impl WorldSnapshot {
         Ok(())
     }
 
-    /// Проверить совместимость версии снэпшота с текущей.
+    /// Check the snapshot version's compatibility with the current one.
     pub fn is_version_compatible(&self) -> bool {
         let expected = SnapshotVersion::CURRENT;
         let found = SnapshotVersion::new(self.version, 0);
@@ -153,34 +154,34 @@ impl WorldSnapshot {
 
 // ── EntitySnapshot ───────────────────────────────────────────────
 
-/// Снимок одной entity.
+/// A snapshot of a single entity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntitySnapshot {
-    /// Оригинальный index entity — для remapping при restore.
+    /// Original entity index — for remapping on restore.
     pub original_index: u32,
-    /// Сериализованные компоненты entity.
+    /// Serialized components of the entity.
     pub components: Vec<ComponentSnapshot>,
 }
 
 // ── ComponentSnapshot ────────────────────────────────────────────
 
-/// Снимок одного компонента.
+/// A snapshot of a single component.
 ///
-/// `data` всегда содержит сырые байты в формате, указанном `format`.
-/// - `Json`: байты = текст JSON
-/// - `Binary`: байты = бинарная сериализация (bincode)
+/// `data` always holds raw bytes in the format specified by `format`.
+/// - `Json`: bytes = JSON text
+/// - `Binary`: bytes = binary serialization (bincode)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentSnapshot {
-    /// Имя типа компонента.
+    /// Component type name.
     pub type_name: String,
-    /// Сырые байты данных компонента.
+    /// Raw component data bytes.
     pub data: Vec<u8>,
-    /// Формат данных.
+    /// Data format.
     pub format: DataFormat,
 }
 
 impl ComponentSnapshot {
-    /// Создать снэпшот из JSON-байт.
+    /// Create a snapshot from JSON bytes.
     pub fn new_json(type_name: impl Into<String>, json_bytes: Vec<u8>) -> Self {
         Self {
             type_name: type_name.into(),
@@ -189,7 +190,7 @@ impl ComponentSnapshot {
         }
     }
 
-    /// Создать снэпшот из бинарных байт.
+    /// Create a snapshot from binary bytes.
     pub fn new_binary(type_name: impl Into<String>, bytes: Vec<u8>) -> Self {
         Self {
             type_name: type_name.into(),
@@ -198,12 +199,12 @@ impl ComponentSnapshot {
         }
     }
 
-    /// Получить данные как slice.
+    /// Get the data as a slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
-    /// Являются ли данные JSON.
+    /// Whether the data is JSON.
     pub fn is_json(&self) -> bool {
         self.format == DataFormat::Json
     }
@@ -211,7 +212,7 @@ impl ComponentSnapshot {
 
 // ── RelationSnapshot ─────────────────────────────────────────────
 
-/// Снимок одной relation между entity.
+/// A snapshot of a single relation between entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationSnapshot {
     pub subject_index: u32,
@@ -219,44 +220,44 @@ pub struct RelationSnapshot {
     pub kind_name:     String,
 }
 
-// ── Миграции ─────────────────────────────────────────────────────
+// ── Migrations ───────────────────────────────────────────────────
 
 type MigrationFn = fn(&mut WorldSnapshot) -> Result<(), String>;
 
 fn migration_for(version: u32) -> Option<MigrationFn> {
     match version {
-        0 => Some(|_data| Ok(())), // no-op: формат данных не менялся между v0 и v1
-        // v1 → v2 (E7): `resources` добавлено; для v1 оно `serde(default)` пустое.
+        0 => Some(|_data| Ok(())), // no-op: the data format did not change between v0 and v1
+        // v1 → v2 (E7): `resources` was added; for v1 it is `serde(default)` empty.
         1 => Some(|_data| Ok(())),
         _ => None,
     }
 }
 
-// ── WorldDiff (инкрементальные изменения) ───────────────────────
+// ── WorldDiff (incremental changes) ──────────────────────────────
 
-/// Разница между двумя снэпшотами для инкрементального сохранения.
+/// The difference between two snapshots, for incremental saving.
 ///
 /// # Byte-level delta (3.1)
-/// Компоненты, присутствующие в обоих снэпшотах с одинаковым `type_name`,
-/// сравниваются побайтово. Если данные совпадают — компонент не включается в diff.
-/// Если отличаются — компонент попадает в `modified_components`.
-/// Это сокращает размер diff при небольшой доле изменённых данных.
+/// Components present in both snapshots with the same `type_name` are compared
+/// byte-by-byte. If the data matches — the component is not included in the diff.
+/// If it differs — the component goes into `modified_components`.
+/// This shrinks the diff size when only a small fraction of the data changed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldDiff {
     pub version: u32,
-    /// Добавленные entity.
+    /// Added entities.
     pub added_entities: Vec<EntitySnapshot>,
-    /// Удалённые entity (original_index).
+    /// Removed entities (original_index).
     pub removed_entities: Vec<u32>,
-    /// Компоненты, добавленные к существующим entity.
+    /// Components added to existing entities.
     pub added_components: Vec<(u32, Vec<ComponentSnapshot>)>,
-    /// Компоненты, удалённые у существующих entity.
+    /// Components removed from existing entities.
     pub removed_components: Vec<(u32, Vec<String>)>,
-    /// Компоненты, изменённые у существующих entity (byte-level delta).
+    /// Components modified on existing entities (byte-level delta).
     pub modified_components: Vec<(u32, Vec<ComponentSnapshot>)>,
-    /// Добавленные relations.
+    /// Added relations.
     pub added_relations: Vec<RelationSnapshot>,
-    /// Удалённые relations.
+    /// Removed relations.
     pub removed_relations: Vec<RelationSnapshot>,
 }
 
@@ -303,14 +304,14 @@ impl Default for WorldDiff {
 
 // ── Format enum ──────────────────────────────────────────────────
 
-/// Формат сериализации для файлового I/O.
+/// Serialization format for file I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveFormat {
     Json,
     Bincode,
 }
 
-// ── Тесты ────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -372,7 +373,7 @@ mod tests {
         assert_eq!(restored.tick, 42);
         assert_eq!(restored.entities.len(), 1);
         assert_eq!(restored.relations.len(), 1);
-        // Проверяем что JSON-байты сохранились
+        // Verify the JSON bytes were preserved
         assert!(restored.entities[0].components[0].is_json());
         assert_eq!(restored.entities[0].components[0].as_bytes(), br#"{"x":1.0,"y":2.0}"#);
     }

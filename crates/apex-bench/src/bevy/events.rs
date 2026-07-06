@@ -1,5 +1,5 @@
-// Bevy 0.18 переименовал буферные `Events<T>` → `Messages<T>` (а `Event` стал триггер-типом
-// наблюдателей). `Messages<T>` — точный аналог apex `Events<T>`: очередь + курсоры-читатели.
+// Bevy 0.18 renamed the buffered `Events<T>` → `Messages<T>` (and `Event` became the observer
+// trigger type). `Messages<T>` is the exact counterpart of apex `Events<T>`: a queue + reader cursors.
 use bevy_ecs::message::{Message, Messages};
 
 #[derive(Message)]
@@ -26,9 +26,9 @@ impl Benchmark {
     }
 }
 
-// Steady-state кадровый цикл — bevy-аналог apex `FrameLoopBench`: каждый кадр write пачки +
-// read персистентным курсором + update (ротация). Standalone `Messages<T>` (тот же уровень,
-// что apex standalone `Events<T>`), одинаковая работа: N send + N read + 1 rotate на кадр.
+// Steady-state frame loop — bevy counterpart of apex `FrameLoopBench`: each frame write a batch +
+// read with a persistent cursor + update (rotation). Standalone `Messages<T>` (same level as apex
+// standalone `Events<T>`), identical work: N send + N read + 1 rotate per frame.
 pub struct FrameLoopBenchmark {
     frames: u64,
     per_frame: u64,
@@ -52,7 +52,7 @@ impl FrameLoopBenchmark {
             for e in cursor.read(&messages) {
                 sum += e.0;
             }
-            messages.update(); // ротация буфера (per-кадр)
+            messages.update(); // buffer rotation (per-frame)
         }
         sum
     }

@@ -1,20 +1,20 @@
-//! Tier-0 спайк-доказательство: стоит ли flattened SoA depth-sorted пропагация трансформов
-//! (Unity DOTS / Unreal-стиль) против текущего `propagate_transforms` (обход связей + scattered
-//! get/set). Меряем ЧЕСТНО — не только кэш-ядро, но и gather (затащить changed `LocalTransform` в
-//! плоский массив) и scatter (вернуть `GlobalTransform` в ECS), т.к. именно они могут съесть выигрыш,
-//! если трансформы остаются ECS-компонентами.
+//! Tier-0 spike proof: is a flattened SoA depth-sorted transform propagation
+//! (Unity DOTS / Unreal style) worth it against the current `propagate_transforms` (relation walk +
+//! scattered get/set)? We measure HONESTLY — not just the cache kernel, but also gather (pull changed
+//! `LocalTransform` into a flat array) and scatter (write `GlobalTransform` back into ECS), since these
+//! are exactly what can eat the win if transforms stay ECS components.
 //!
-//! Профиль ~ many_foxes ring-parent @10000: 50 колец → 200 персонажей → цепочка из 27 «костей»
-//! ≈ 280k узлов, немного корней — кейс, вскрывший перф-баг пропагации.
+//! Profile ~ many_foxes ring-parent @10000: 50 rings → 200 characters → a chain of 27 "bones"
+//! ≈ 280k nodes, few roots — the case that exposed the propagation perf bug.
 //!
-//! Два сценария:
-//!   A. ВСЁ анимируется (worst case толпы): весь граф dirty каждый кадр.
-//!   B. Мало движется (1000 листьев): текущая пропагация спускается лишь по их поддеревьям, а
-//!      наивный flat-свип всё равно пересчитывает ВЕСЬ массив — показывает слабость flat без
+//! Two scenarios:
+//!   A. EVERYTHING animates (crowd worst case): the whole graph is dirty every frame.
+//!   B. Little moves (1000 leaves): the current propagation only descends into their subtrees, whereas
+//!      the naive flat sweep still recomputes the WHOLE array — showing the weakness of flat without
 //!      dirty-range.
 //!
-//! Запуск: `cargo run --release -p apex-bench --bin propagate_soa`
-//! Тюнинг: `RINGS=50 CHARS=200 BONES=27 cargo run --release -p apex-bench --bin propagate_soa`
+//! Run: `cargo run --release -p apex-bench --bin propagate_soa`
+//! Tuning: `RINGS=50 CHARS=200 BONES=27 cargo run --release -p apex-bench --bin propagate_soa`
 
 use apex_core::prelude::*;
 use apex_core::transform::{
@@ -46,7 +46,7 @@ fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// «Кадр анимации»: тикнуть мир и сдвинуть `LocalTransform` у списка узлов (стампит change-tick).
+/// "Animation frame": tick the world and shift `LocalTransform` on a list of nodes (stamps change-tick).
 fn animate(world: &mut World, list: &[Entity]) {
     world.tick();
     for &e in list {
@@ -60,9 +60,9 @@ fn main() {
     let rings = env_usize("RINGS", 50);
     let chars = env_usize("CHARS", 200);
     let bones = env_usize("BONES", 27);
-    println!("=== Tier-0 спайк: flat SoA пропагация vs текущая (measure-first) ===\n");
+    println!("=== Tier-0 spike: flat SoA propagation vs current (measure-first) ===\n");
 
-    // ── Построение мира: кольцо(root) → персонаж → цепочка костей ──
+    // ── Building the world: ring(root) → character → bone chain ──
     let mut world = World::new();
     TransformPlugin::register_components(&mut world);
     let t = Instant::now();
@@ -88,7 +88,7 @@ fn main() {
     }
     let n = world.entity_count();
     println!(
-        "Мир: {} узлов, {} корней-колец × {} персонажей × {} костей (построен за {:.1} ms)\n",
+        "World: {} nodes, {} ring roots × {} characters × {} bones (built in {:.1} ms)\n",
         n,
         rings,
         chars,
@@ -96,8 +96,8 @@ fn main() {
         ms(t.elapsed())
     );
 
-    // ── Построение плоской depth-sorted структуры (BFS по уровням) ──
-    // slot = позиция в BFS-порядке: родитель всегда раньше ребёнка (parent_slot[i] < i).
+    // ── Building the flat depth-sorted structure (BFS by levels) ──
+    // slot = position in BFS order: parent is always before its child (parent_slot[i] < i).
     let mut order: Vec<Entity> = Vec::with_capacity(n);
     let mut level_ranges: Vec<(usize, usize)> = Vec::new();
     let mut parent_of: Vec<Entity> = Vec::with_capacity(n);
@@ -129,7 +129,7 @@ fn main() {
     for (slot, &e) in order.iter().enumerate() {
         entity_to_slot[e.index() as usize] = slot as u32;
     }
-    let is_root_level0 = level_ranges[0].1; // slots [0..is_root_level0) — корни
+    let is_root_level0 = level_ranges[0].1; // slots [0..is_root_level0) — roots
     let parent_slot: Vec<i32> = order
         .iter()
         .enumerate()
@@ -142,7 +142,7 @@ fn main() {
         })
         .collect();
 
-    // Gather начальных local (Mat4 + Affine3A) и буферы global.
+    // Gather initial local (Mat4 + Affine3A) and global buffers.
     let local_mat: Vec<Mat4> = order
         .iter()
         .map(|&e| world.get::<LocalTransform>(e).unwrap().to_matrix())
@@ -157,13 +157,13 @@ fn main() {
     let mut global_mat = vec![Mat4::IDENTITY; n];
     let mut global_aff = vec![Affine3A::IDENTITY; n];
     println!(
-        "Плоская структура: {} уровней (ширина уровня 1 = {}, последнего = {})\n",
+        "Flat structure: {} levels (width of level 1 = {}, of last = {})\n",
         level_ranges.len(),
         level_ranges.get(1).map(|r| r.1 - r.0).unwrap_or(0),
         level_ranges.last().map(|r| r.1 - r.0).unwrap_or(0),
     );
 
-    // ── Ядра flat-свипа ──
+    // ── Flat-sweep kernels ──
     let kernel_seq_mat4 = |gm: &mut [Mat4]| {
         for slot in 0..n {
             let ps = parent_slot[slot];
@@ -171,7 +171,7 @@ fn main() {
             gm[slot] = pg * local_mat[slot];
         }
     };
-    // Параллельно по уровням: все узлы уровня независимы; родитель (предыдущий уровень) уже записан.
+    // Parallel by level: all nodes of a level are independent; the parent (previous level) is already written.
     let kernel_par_mat4 = |gm: &mut [Mat4]| {
         use rayon::prelude::*;
         let gptr = gm.as_mut_ptr() as usize;
@@ -179,8 +179,8 @@ fn main() {
             (s..e).into_par_iter().for_each(|i| {
                 let g = gptr as *mut Mat4;
                 let ps = parent_slot[i];
-                // SAFETY: уровень-барьер (par_iter блокирует до конца уровня): родитель из ПРЕДЫДУЩЕГО
-                // уровня уже записан и не пишется сейчас; узлы текущего уровня дизъюнктны.
+                // SAFETY: level barrier (par_iter blocks until the level ends): the parent from the PREVIOUS
+                // level is already written and is not being written now; nodes of the current level are disjoint.
                 let pg = if ps < 0 { Mat4::IDENTITY } else { unsafe { *g.add(ps as usize) } };
                 unsafe { *g.add(i) = pg * local_mat[i] };
             });
@@ -199,7 +199,7 @@ fn main() {
         }
     };
 
-    // ── Sanity: flat-ядро == текущая пропагация (та же математика) ──
+    // ── Sanity: flat kernel == current propagation (same math) ──
     propagate_transforms(&mut world);
     kernel_seq_mat4(&mut global_mat);
     let mut max_err = 0.0f32;
@@ -208,10 +208,10 @@ fn main() {
         let err = (wg - global_mat[slot]).to_cols_array().iter().map(|x| x.abs()).fold(0.0, f32::max);
         max_err = max_err.max(err);
     }
-    println!("Sanity: max |flat_global − world_global| = {max_err:.2e} (должно быть ~0)\n");
-    assert!(max_err < 1e-3, "flat-ядро разошлось с пропагацией");
+    println!("Sanity: max |flat_global − world_global| = {max_err:.2e} (should be ~0)\n");
+    assert!(max_err < 1e-3, "flat kernel diverged from propagation");
 
-    // Списки для анимации.
+    // Lists for animation.
     let all_nodes: Vec<Entity> = order[is_root_level0..].to_vec();
     let leaves: Vec<Entity> = {
         let (s, e) = *level_ranges.last().unwrap();
@@ -224,11 +224,11 @@ fn main() {
         v
     };
 
-    // ── Замеры ──
-    println!("Замеры (медиана из {SAMPLES}):\n");
+    // ── Measurements ──
+    println!("Measurements (median of {SAMPLES}):\n");
 
-    // Baseline: ТОЛЬКО пропагация (анимация — общая для обоих миров и upstream, не таймится; иначе
-    // baseline раздут на стоимость записи 280k local и сравнение смещено в пользу flat).
+    // Baseline: ONLY propagation (animation is shared by both worlds and upstream, not timed; otherwise
+    // the baseline is inflated by the cost of writing 280k local and the comparison is biased toward flat).
     let bench_propagate = |world: &mut World, list: &[Entity]| -> Duration {
         let mut times = Vec::with_capacity(SAMPLES);
         for _ in 0..SAMPLES {
@@ -243,7 +243,7 @@ fn main() {
     let b_all = bench_propagate(&mut world, &all_nodes);
     let b_few = bench_propagate(&mut world, &leaves);
 
-    // Gather: затащить changed local из ECS в плоский массив (scattered read).
+    // Gather: pull changed local from ECS into a flat array (scattered read).
     let mut local_scratch = local_mat.clone();
     let (g_all, _) = median_of(|| {
         for &e in &all_nodes {
@@ -260,7 +260,7 @@ fn main() {
         local_scratch[0].col(0).x.to_bits() as u64
     });
 
-    // Kernels (мир не трогают).
+    // Kernels (do not touch the world).
     let (k_seq, _) = median_of(|| {
         kernel_seq_mat4(&mut global_mat);
         global_mat[n - 1].col(3).x.to_bits() as u64
@@ -274,7 +274,7 @@ fn main() {
         global_aff[n - 1].translation.x.to_bits() as u64
     });
 
-    // Scatter: вернуть global в ECS GlobalTransform (scattered write).
+    // Scatter: write global back into ECS GlobalTransform (scattered write).
     let (s_all, _) = median_of(|| {
         for &e in &all_nodes {
             let slot = entity_to_slot[e.index() as usize] as usize;
@@ -294,19 +294,19 @@ fn main() {
         0
     });
 
-    // ── Отчёт ──
+    // ── Report ──
     let row = |name: &str, d: Duration| {
-        println!("  {:<52} {:>9.3} ms   ({:.1} ns/узел)", name, ms(d), ms(d) * 1e6 / n as f64);
+        println!("  {:<52} {:>9.3} ms   ({:.1} ns/node)", name, ms(d), ms(d) * 1e6 / n as f64);
     };
-    println!("Примитивы:");
-    row("current propagate — ВСЁ dirty", b_all);
-    row("current propagate — 1000 листьев dirty", b_few);
-    row("flat gather (всё, scattered read local)", g_all);
+    println!("Primitives:");
+    row("current propagate — ALL dirty", b_all);
+    row("current propagate — 1000 leaves dirty", b_few);
+    row("flat gather (all, scattered read local)", g_all);
     row("flat gather (1000, scattered read local)", g_few);
     row("flat kernel seq (Mat4)", k_seq);
     row("flat kernel par-by-level (Mat4)", k_par);
     row("flat kernel par-by-level (Affine3A)", k_aff);
-    row("flat scatter (всё, scattered write global)", s_all);
+    row("flat scatter (all, scattered write global)", s_all);
     row("flat scatter (1000, scattered write global)", s_few);
 
     let combo = |label: &str, parts: &[(&str, Duration)], base: Duration| {
@@ -318,12 +318,12 @@ fn main() {
             label, sum, ms(base), speedup, names
         );
     };
-    println!("\nСценарий A — ВСЁ анимируется (worst-case толпа, {} dirty):", n);
-    combo("flat, потребители читают ECS", &[("gather", g_all), ("kernel_aff", k_aff), ("scatter", s_all)], b_all);
-    combo("flat, потребители читают FLAT", &[("gather", g_all), ("kernel_aff", k_aff)], b_all);
-    combo("flat, потолок (только ядро)", &[("kernel_aff", k_aff)], b_all);
+    println!("\nScenario A — EVERYTHING animates (worst-case crowd, {} dirty):", n);
+    combo("flat, consumers read ECS", &[("gather", g_all), ("kernel_aff", k_aff), ("scatter", s_all)], b_all);
+    combo("flat, consumers read FLAT", &[("gather", g_all), ("kernel_aff", k_aff)], b_all);
+    combo("flat, ceiling (kernel only)", &[("kernel_aff", k_aff)], b_all);
 
-    println!("\nСценарий B — мало движется (1000 листьев):");
-    combo("flat наивный (полное ядро!)", &[("gather", g_few), ("kernel_aff", k_aff), ("scatter", s_few)], b_few);
-    println!("  current спускается лишь по поддеревьям листьев → дёшево; flat без dirty-range гонит ВЕСЬ свип.");
+    println!("\nScenario B — little moves (1000 leaves):");
+    combo("flat naive (full kernel!)", &[("gather", g_few), ("kernel_aff", k_aff), ("scatter", s_few)], b_few);
+    println!("  current only descends into leaf subtrees → cheap; flat without dirty-range runs the WHOLE sweep.");
 }

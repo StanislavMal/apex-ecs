@@ -1,9 +1,9 @@
-//! apex-macros — процедурные макросы для Apex ECS.
+//! apex-macros — procedural macros for Apex ECS.
 //!
 //! # `#[derive(Component)]`
 //!
-//! Реализует трейт `Component` и добавляет статический регистратор через
-//! `linkme::distributed_slice`, вызываемый при создании `World::new()`.
+//! Implements the `Component` trait and adds a static registrar via
+//! `linkme::distributed_slice`, invoked when `World::new()` is created.
 //!
 //! ```ignore
 //! #[derive(Component, Debug, Clone)]
@@ -12,9 +12,9 @@
 //!
 //! # `#[derive(Bundle)]`
 //!
-//! Реализует трейт `Bundle` для struct с именованными полями.
-//! Поддерживает произвольное число полей (без ограничения в 8 компонентов)
-//! и вложенные Bundle (поля-под-Bundle рекурсивно разворачиваются).
+//! Implements the `Bundle` trait for a struct with named fields.
+//! Supports an arbitrary number of fields (no 8-component limit)
+//! and nested Bundles (sub-Bundle fields are expanded recursively).
 //!
 //! ```ignore
 //! #[derive(Bundle)]
@@ -25,18 +25,18 @@
 //!
 //! #[derive(Bundle)]
 //! struct ArmedPlayer {
-//!     base: PlayerBase,   // <— вложенный Bundle
+//!     base: PlayerBase,   // <— nested Bundle
 //!     weapon: Weapon,
 //!     armor: Armor,
 //! }
 //!
-//! // Кортежи Bundle тоже работают:
+//! // Bundle tuples work too:
 //! world.spawn((PlayerBase { pos, hp }, Weapon { .. }));
 //! ```
 //!
 //! # `#[derive(Scriptable)]`
 //!
-//! Генерирует реализацию трейта `ScriptableRegistrar` для struct с именованными полями.
+//! Generates a `ScriptableRegistrar` trait implementation for a struct with named fields.
 //!
 //! ```ignore
 //! #[derive(Clone, Copy, Scriptable)]
@@ -45,12 +45,12 @@
 //!
 //! - `ScriptableRegistrar::to_lua(&self, lua)` — struct → mlua::Table
 //! - `ScriptableRegistrar::from_lua(val)` — mlua::Table → struct (Option)
-//! - `ScriptableRegistrar::register_lua_type(lua)` — конструктор `Position.new(x, y)` в Lua
-//! - `ScriptableRegistrar::field_names()` — список имён полей
-//! - `ScriptableRegistrar::type_name_str()` — имя типа как &'static str
+//! - `ScriptableRegistrar::register_lua_type(lua)` — the `Position.new(x, y)` constructor in Lua
+//! - `ScriptableRegistrar::field_names()` — the list of field names
+//! - `ScriptableRegistrar::type_name_str()` — the type name as &'static str
 //!
-//! Также генерирует `IntoLua` и `FromLua` для типа,
-//! чтобы поля компонента могли использоваться с `table.set()` напрямую.
+//! Also generates `IntoLua` and `FromLua` for the type,
+//! so that the component's fields can be used with `table.set()` directly.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -59,26 +59,26 @@ use syn::{parse_macro_input, DeriveInput, Data, Fields, Type};
 
 // ── Component derive ────────────────────────────────────────────
 
-/// `#[derive(Component)]` — авторегистрация через `linkme::distributed_slice`
-/// и реализация трейта `Component`.
+/// `#[derive(Component)]` — auto-registration via `linkme::distributed_slice`
+/// and the `Component` trait implementation.
 ///
-/// Генерирует:
-/// - `impl Component for Type {}` (трейт с границами `Send + Sync + 'static`)
-/// - статический регистратор в `COMPONENT_REGISTRARS`, вызываемый при `World::new()`
+/// Generates:
+/// - `impl Component for Type {}` (a trait with `Send + Sync + 'static` bounds)
+/// - a static registrar in `COMPONENT_REGISTRARS`, invoked on `World::new()`
 ///
-/// # `#[require(A, B, …)]` — required components (D2-4, аналог Bevy 0.15+)
+/// # `#[require(A, B, …)]` — required components (D2-4, analogous to Bevy 0.15+)
 ///
 /// ```ignore
 /// #[derive(Component)]
 /// #[require(LocalTransform, GlobalTransform)]
 /// struct MeshRenderer { /* … */ }
 ///
-/// // спавн сам дотягивает недостающие трансформы дефолтами:
+/// // the spawn pulls in the missing transforms with defaults on its own:
 /// world.spawn((MeshRenderer::new(mesh, mat),));
 /// ```
 ///
-/// Требуемые типы обязаны реализовывать `Default`; явно заданное значение
-/// всегда выигрывает у дефолта; требования транзитивны.
+/// Required types must implement `Default`; an explicitly provided value
+/// always wins over the default; requirements are transitive.
 #[proc_macro_derive(Component, attributes(require))]
 pub fn derive_component(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -89,7 +89,7 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let is_generic = !input.generics.params.is_empty();
 
-    // #[require(A, B, …)] — список типов через запятую (атрибутов может быть несколько).
+    // #[require(A, B, …)] — a comma-separated list of types (there may be several attributes).
     let mut required: Vec<Type> = Vec::new();
     for attr in &input.attrs {
         if attr.path().is_ident("require") {
@@ -102,8 +102,8 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         }
     }
 
-    // Тело `Component::register_requires` — по одному `register_required::<Self, R>()` на каждый `#[require]`.
-    // Эмитим метод ТОЛЬКО когда требования есть (иначе работает дефолт трейта = нет требований).
+    // Body of `Component::register_requires` — one `register_required::<Self, R>()` per `#[require]`.
+    // Emit the method ONLY when there are requirements (otherwise the trait default applies = no requirements).
     let register_requires_impl = if required.is_empty() {
         quote! {}
     } else {
@@ -117,15 +117,15 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
         }
     };
 
-    // Авторегистрация на старте `World::new()` через `linkme::distributed_slice` (линкер собирает
-    // регистраторы из всех крейтов). На wasm32 и под Miri linkme не эмитится — но это лишь
-    // ОПТИМИЗАЦИЯ (пре-регистрация): компонент И его `#[require]` всё равно регистрируются ЛЕНИВО
-    // при первом использовании (`register` → `Component::register_requires`), поэтому `#[require]`
-    // работает и там. TD-25 (wasm); Miri — linkme distributed-slice даёт overflow, тот же путь.
+    // Auto-registration at `World::new()` startup via `linkme::distributed_slice` (the linker collects
+    // registrars from all crates). On wasm32 and under Miri linkme is not emitted — but that is only an
+    // OPTIMIZATION (pre-registration): the component AND its `#[require]` are still registered LAZILY
+    // on first use (`register` → `Component::register_requires`), so `#[require]`
+    // works there too. TD-25 (wasm); Miri — the linkme distributed-slice causes overflow, same path.
     //
-    // F7: для ОБОБЩЁННОГО компонента статический регистратор невозможен (нет
-    // конкретного типа для `get_or_register`), поэтому опускаем его — обобщённый
-    // тип регистрируется ЛЕНИВО при первом использовании конкретной подстановки.
+    // F7: for a GENERIC component a static registrar is impossible (there is no
+    // concrete type for `get_or_register`), so we omit it — a generic
+    // type is registered LAZILY on first use of a concrete substitution.
     let registrar = if is_generic {
         quote! {}
     } else {
@@ -153,15 +153,15 @@ pub fn derive_component(input: TokenStream) -> TokenStream {
 
 // ── Bundle derive ───────────────────────────────────────────────
 
-/// `#[derive(Bundle)]` — реализует трейт `Bundle` для struct.
+/// `#[derive(Bundle)]` — implements the `Bundle` trait for a struct.
 ///
-/// Поддерживает struct с именованными полями и произвольное число компонентов
-/// (в отличие от `impl_bundle!`, который ограничен 12).
+/// Supports a struct with named fields and an arbitrary number of components
+/// (unlike `impl_bundle!`, which is limited to 12).
 ///
-/// Поля могут быть:
-/// - компонентами (любой тип с `Component` — автоматически является Bundle)
-/// - другими Bundle-структурами (вложенность, рекурсивное разворачивание)
-/// - кортежами Bundle
+/// Fields may be:
+/// - components (any type with `Component` — automatically a Bundle)
+/// - other Bundle structs (nesting, recursive expansion)
+/// - Bundle tuples
 #[proc_macro_derive(Bundle)]
 pub fn derive_bundle(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -203,10 +203,10 @@ pub fn derive_bundle(input: TokenStream) -> TokenStream {
                 0usize #( + <#field_types as ::apex_core::Bundle>::component_count() )*
             }
 
-            // Порядок ПОЛЕЙ (= порядок обхода write_into_batch / write_data_into_batch); БЕЗ сортировки.
-            // col_indices для batch-спавна строится отсюда, иначе компонент пишется в чужую колонку (UB).
-            // Отсортированный ключ архетипа даёт дефолтный `component_ids` trait'а. Статический (по
-            // ТИПАМ полей) — не требует значения бандла (§10.10, убирает make_bundle-probe footgun).
+            // FIELD order (= traversal order of write_into_batch / write_data_into_batch); NO sorting.
+            // col_indices for batch spawn is built from here, otherwise a component is written into the wrong column (UB).
+            // The sorted archetype key is produced by the trait's default `component_ids`. The static one (by
+            // field TYPES) requires no bundle value (§10.10, removes the make_bundle-probe footgun).
             fn static_component_ids(
                 registry: &mut ::apex_core::ComponentRegistry,
                 out: &mut ::apex_core::smallvec::SmallVec<[::apex_core::ComponentId; 8]>,
@@ -281,7 +281,7 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
                 if !variant.fields.is_empty() {
                     return Err(syn::Error::new_spanned(
                         &variant.ident,
-                        "#[derive(Scriptable)] для enum поддерживает только варианты без данных (C-like enum). Для enum с данными реализуйте ScriptableRegistrar вручную.",
+                        "#[derive(Scriptable)] for an enum supports only data-less variants (a C-like enum). For an enum with data, implement ScriptableRegistrar manually.",
                     ));
                 }
             }
@@ -290,12 +290,12 @@ fn expand_scriptable(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         Data::Union(_) => Err(syn::Error::new_spanned(
             ident,
-            "#[derive(Scriptable)] не поддерживает union",
+            "#[derive(Scriptable)] does not support union",
         )),
     }
 }
 
-/// Struct с именованными полями → mlua::Table
+/// A struct with named fields → mlua::Table
 fn expand_named_struct(
     ident: &syn::Ident,
     type_name: &str,
@@ -333,7 +333,7 @@ fn expand_named_struct(
     let struct_fields = field_idents.iter().map(|fi| quote! { #fi });
     let field_names_arr = field_names.iter().map(|n| quote! { #n });
 
-    // Параметры для конструктора Lua: (f0, f1, ...): (Type0, Type1, ...)
+    // Parameters for the Lua constructor: (f0, f1, ...): (Type0, Type1, ...)
     let reg_arg_names: Vec<syn::Ident> = (0..n_fields)
         .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
         .collect();
@@ -388,7 +388,7 @@ fn expand_named_struct(
     })
 }
 
-/// Tuple struct (например `struct Gravity(f32)`) → scalar
+/// A tuple struct (for example `struct Gravity(f32)`) → scalar
 fn expand_tuple_struct(
     ident: &syn::Ident,
     type_name: &str,
@@ -399,14 +399,14 @@ fn expand_tuple_struct(
     if field_count == 0 {
         return Err(syn::Error::new_spanned(
             ident,
-            "#[derive(Scriptable)] не поддерживает tuple struct без полей",
+            "#[derive(Scriptable)] does not support a tuple struct without fields",
         ));
     }
 
     let field_types: Vec<&Type> = unnamed_fields.iter().map(|f| &f.ty).collect();
 
     if field_count == 1 {
-        // Одиночное поле → таблица { _value = ... } (консистентно с конструктором)
+        // A single field → table { _value = ... } (consistent with the constructor)
         let ft = &field_types[0];
         Ok(quote! {
             impl ::apex_scripting::ScriptableRegistrar for #ident {
@@ -452,15 +452,15 @@ fn expand_tuple_struct(
             }
         })
     } else {
-        // Несколько полей → таблица с позиционными строковыми ключами "0","1",…
-        // ВАЖНО: генерировать локальные переменные через `f{i}` (f0, f1, …), а НЕ через
-        // `syn::Index` — иначе `let 0: T = …` даёт литеральный refutable-паттерн (E0005),
-        // а `Self(0, 1)` конструирует из ЛИТЕРАЛОВ вместо переменных.
+        // Multiple fields → table with positional string keys "0","1",…
+        // IMPORTANT: generate local variables via `f{i}` (f0, f1, …), NOT via
+        // `syn::Index` — otherwise `let 0: T = …` produces a literal refutable pattern (E0005),
+        // and `Self(0, 1)` constructs from LITERALS instead of variables.
         let local_idents: Vec<syn::Ident> = (0..field_count)
             .map(|i| syn::Ident::new(&format!("f{}", i), proc_macro2::Span::call_site()))
             .collect();
 
-        // Строковые ключи полей — те же "0","1",… что и в field_names() (согласованность).
+        // Field string keys — the same "0","1",… as in field_names() (consistency).
         let field_keys: Vec<String> = (0..field_count).map(|i| i.to_string()).collect();
 
         let to_lua_stmts = (0..field_count).zip(field_keys.iter()).map(|(i, key)| {
@@ -536,7 +536,7 @@ fn expand_tuple_struct(
     }
 }
 
-/// Unit struct (маркер) → boolean true + регистрация как empty table
+/// A unit struct (marker) → boolean true + registration as an empty table
 fn expand_unit_struct(
     ident: &syn::Ident,
     type_name: &str,
@@ -577,11 +577,11 @@ fn expand_unit_struct(
     })
 }
 
-/// C-like enum → таблица-неймспейс в Lua
+/// A C-like enum → a namespace table in Lua
 ///
 /// ```lua
-/// -- Генерируется: TileKind = { Floor = 0, Wall = 1, Water = 2 }
-/// TileKind.Floor  -- число 0
+/// -- Generated: TileKind = { Floor = 0, Wall = 1, Water = 2 }
+/// TileKind.Floor  -- the number 0
 /// ```
 fn expand_c_like_enum(
     ident: &syn::Ident,

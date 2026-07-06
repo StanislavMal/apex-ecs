@@ -1,9 +1,9 @@
-//! PrefabManifest — файловые префабы (JSON-формат).
+//! PrefabManifest — file-based prefabs (JSON format).
 //!
-//! Позволяет описывать entity и их иерархии в JSON-файлах,
-//! загружать их через [`PrefabLoader`] и спавнить в [`World`].
+//! Lets you describe entities and their hierarchies in JSON files,
+//! load them via [`PrefabLoader`] and spawn them into a [`World`].
 //!
-//! # Формат
+//! # Format
 //!
 //! ```json
 //! {
@@ -35,46 +35,47 @@ use crate::serializer::SerializationError;
 
 // ── Structures ────────────────────────────────────────────────────
 
-/// Описание одного компонента в префабе.
+/// Description of a single component in a prefab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefabComponent {
-    /// Полное имя типа (должно совпадать с `ComponentInfo.name`).
+    /// Full type name (must match `ComponentInfo.name`).
     pub type_name: String,
-    /// JSON-значение компонента.
+    /// JSON value of the component.
     pub value:     serde_json::Value,
 }
 
-/// Ребёнок в иерархии префаба — либо ссылка на именованный под-префаб (композиция; должен быть
-/// загружен в [`PrefabLoader`]), либо **встроенный** манифест поддерева (самодостаточный).
+/// A child in a prefab hierarchy — either a reference to a named sub-prefab (composition; must be
+/// loaded into [`PrefabLoader`]), or an **inline** sub-tree manifest (self-contained).
 ///
-/// `untagged`: ссылка сериализуется как `{ "prefab": "...", "overrides": [...] }`, а встроенный — как
-/// обычный [`PrefabManifest`] (`{ "name", "components", "children" }`). Поля не пересекаются (`prefab`
-/// vs `name`+`components`), поэтому формат однозначен и **обратно совместим** со старыми файлами-ссылками.
-/// [`hierarchy_to_prefab`](crate::WorldSerializer::hierarchy_to_prefab) строит `Inline`-детей, так что
-/// иерархический префаб — один самодостаточный файл (инстанцируется без предзагрузки под-префабов).
+/// `untagged`: a reference serializes as `{ "prefab": "...", "overrides": [...] }`, while an inline one
+/// serializes as an ordinary [`PrefabManifest`] (`{ "name", "components", "children" }`). The fields do
+/// not overlap (`prefab` vs `name`+`components`), so the format is unambiguous and **backward compatible**
+/// with old reference files. [`hierarchy_to_prefab`](crate::WorldSerializer::hierarchy_to_prefab) builds
+/// `Inline` children, so a hierarchical prefab is a single self-contained file (instantiated without
+/// pre-loading sub-prefabs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PrefabChild {
-    /// Ссылка на под-префаб по имени (+ переопределения компонентов).
+    /// Reference to a sub-prefab by name (+ component overrides).
     Ref {
-        /// Имя под-префаба (должен быть загружен в `PrefabLoader`).
+        /// Name of the sub-prefab (must be loaded into `PrefabLoader`).
         prefab:    String,
-        /// Переопределения компонентов для этого ребёнка.
+        /// Component overrides for this child.
         #[serde(default)]
         overrides: Vec<PrefabComponent>,
     },
-    /// Встроенное самодостаточное поддерево.
+    /// Inline self-contained sub-tree.
     Inline(PrefabManifest),
 }
 
-/// Манифест префаба — JSON-файл, описывающий entity и его детей.
+/// Prefab manifest — a JSON file describing an entity and its children.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefabManifest {
-    /// Имя префаба (для отладки и поиска).
+    /// Prefab name (for debugging and lookup).
     pub name:       String,
-    /// Компоненты корневой entity.
+    /// Components of the root entity.
     pub components: Vec<PrefabComponent>,
-    /// Дочерние entity (рекурсивно).
+    /// Child entities (recursive).
     #[serde(default)]
     pub children:   Vec<PrefabChild>,
 }
@@ -115,12 +116,12 @@ const MAX_PREFAB_DEPTH: usize = 256;
 
 // ── PrefabLoader ──────────────────────────────────────────────────
 
-/// Загрузчик и кеш префабов.
+/// Prefab loader and cache.
 ///
-/// Хранит загруженные манифесты в памяти и предоставляет метод
-/// [`instantiate`](PrefabLoader::instantiate) для создания entity.
+/// Keeps loaded manifests in memory and provides the
+/// [`instantiate`](PrefabLoader::instantiate) method for creating entities.
 pub struct PrefabLoader {
-    /// Кеш загруженных манифестов (имя → манифест).
+    /// Cache of loaded manifests (name → manifest).
     cache: FxHashMap<String, PrefabManifest>,
 }
 
@@ -129,32 +130,32 @@ impl PrefabLoader {
         Self { cache: FxHashMap::default() }
     }
 
-    /// Загрузить манифест из JSON-строки.
+    /// Load a manifest from a JSON string.
     pub fn load_json(&mut self, json: &str) -> Result<&PrefabManifest, PrefabError> {
         let manifest: PrefabManifest = serde_json::from_str(json)?;
         let name = manifest.name.clone();
         self.cache.insert(name.clone(), manifest);
-        // Гарантированно существует — только что вставили
+        // Guaranteed to exist — just inserted it
         Ok(self.cache.get(&name).unwrap())
     }
 
-    /// Загрузить манифест из файла.
+    /// Load a manifest from a file.
     pub fn load_file(&mut self, path: &Path) -> Result<&PrefabManifest, PrefabError> {
         let content = std::fs::read_to_string(path)?;
         self.load_json(&content)
     }
 
-    /// Получить манифест из кеша по имени.
+    /// Get a manifest from the cache by name.
     pub fn get(&self, name: &str) -> Option<&PrefabManifest> {
         self.cache.get(name)
     }
 
-    /// Есть ли префаб в кеше?
+    /// Is the prefab in the cache?
     pub fn has(&self, name: &str) -> bool {
         self.cache.contains_key(name)
     }
 
-    /// Количество загруженных префабов.
+    /// Number of loaded prefabs.
     pub fn len(&self) -> usize {
         self.cache.len()
     }
@@ -165,14 +166,14 @@ impl PrefabLoader {
 
     // ── Instantiate ──────────────────────────────────────────────
 
-    /// Создать entity из префаба (рекурсивно, с учётом children).
+    /// Create an entity from a prefab (recursively, including children).
     ///
-    /// * `overrides` — переопределения компонентов корневой entity.
-    /// * `parent` — если указан, entity становится ребёнком через `ChildOf`.
-    /// * `params` — параметры шаблона для проброса (могут быть использованы
-    ///   кастомными компонентами, реализующими `EntityTemplate`).
-    // `params` сейчас лишь пробрасывается вглубь рекурсии — это публичный
-    // контракт под кастомные EntityTemplate-компоненты, не мёртвый код.
+    /// * `overrides` — component overrides for the root entity.
+    /// * `parent` — if provided, the entity becomes a child via `ChildOf`.
+    /// * `params` — template parameters to thread through (may be used by
+    ///   custom components implementing `EntityTemplate`).
+    // `params` is currently only threaded down the recursion — this is a public
+    // contract for custom EntityTemplate components, not dead code.
     #[allow(clippy::only_used_in_recursion)]
     pub fn instantiate(
         &self,
@@ -185,9 +186,9 @@ impl PrefabLoader {
         self.instantiate_with(world, manifest, overrides, parent, params, &mut apex_core::NoContext)
     }
 
-    /// `instantiate` с **контекстом (де)сериализации** (TD-44): компоненты префаба с внешними ссылками
-    /// (Handle ассета и т.п.) резолвят их через `ctx` — консистентно со снэпшотами. Контекст
-    /// прокидывается во всю иерархию. Обычные компоненты `ctx` игнорируют.
+    /// `instantiate` with a **(de)serialization context** (TD-44): prefab components with external refs
+    /// (asset Handle, etc.) resolve them through `ctx` — consistently with snapshots. The context is
+    /// threaded through the whole hierarchy. Ordinary components ignore `ctx`.
     #[allow(clippy::too_many_arguments)]
     pub fn instantiate_with(
         &self,
@@ -277,7 +278,7 @@ impl PrefabLoader {
         Ok(entity)
     }
 
-    /// Внутренний метод: создаёт одну entity с компонентами из manifest + overrides (через `ctx`).
+    /// Internal method: creates a single entity with components from manifest + overrides (via `ctx`).
     fn spawn_entity(
         &self,
         world: &mut World,
@@ -288,24 +289,24 @@ impl PrefabLoader {
         let entity = world.spawn(());
         let tick = world.current_tick();
 
-        // Строим HashMap overrides для быстрого поиска
+        // Build a HashMap of overrides for fast lookup
         let override_map: HashMap<&str, &serde_json::Value> = overrides
             .iter()
             .map(|c| (c.type_name.as_str(), &c.value))
             .collect();
 
-        // Объединяем: overrides заменяют компоненты из manifest.
-        // Если в manifest есть дубликаты type_name — побеждает последний.
+        // Merge: overrides replace components from the manifest.
+        // If the manifest has duplicate type_names — the last one wins.
         let mut seen: HashMap<&str, &serde_json::Value> = HashMap::new();
         for comp in &manifest.components {
             seen.insert(&comp.type_name, &comp.value);
         }
-        // Overrides перезаписывают
+        // Overrides take precedence
         for (type_name, value) in &override_map {
             seen.insert(type_name, value);
         }
 
-        // Применяем компоненты
+        // Apply the components
         for (type_name, json_value) in &seen {
             let component_id = match world.component_id_by_name(type_name) {
                 Some(id) => id,
@@ -329,8 +330,8 @@ impl PrefabLoader {
                 }),
             };
 
-            // Сериализуем JSON Value → JSON строка → байты → deserialize_fn через контекст (TD-44):
-            // компоненты с внешними ссылками резолвят их; обычные компоненты `ctx` игнорируют.
+            // Serialize JSON Value → JSON string → bytes → deserialize_fn via context (TD-44):
+            // components with external refs resolve them; ordinary components ignore `ctx`.
             let json_bytes = serde_json::to_vec(json_value)?;
             let component_bytes = (serde_fns.deserialize_fn)(&json_bytes, ctx)
                 .map_err(|e| PrefabError::Serialization(
@@ -351,15 +352,15 @@ impl Default for PrefabLoader {
     fn default() -> Self { Self::new() }
 }
 
-// ── EntityTemplate для PrefabManifest ─────────────────────────────
+// ── EntityTemplate for PrefabManifest ─────────────────────────────
 
 impl apex_core::template::EntityTemplate for PrefabManifest {
     fn spawn(&self, world: &mut World, params: &apex_core::template::TemplateParams) -> Entity {
         let loader = PrefabLoader::new();
 
-        // Преобразуем TemplateParams в overrides.
-        // TemplateParam с component_type_name() преобразуются в PrefabComponent
-        // и подменяют компоненты с совпадающим type_name.
+        // Convert TemplateParams into overrides.
+        // TemplateParams with a component_type_name() become PrefabComponents
+        // and replace components with a matching type_name.
         let overrides: Vec<PrefabComponent> = params.json_overrides_iter()
             .map(|(name, json)| PrefabComponent {
                 type_name: name.to_string(),
@@ -367,9 +368,9 @@ impl apex_core::template::EntityTemplate for PrefabManifest {
             })
             .collect();
 
-        // NOTE: дочерние префабы из self.children не будут найдены
-        // если они не были загружены в этот loader. Это известное ограничение —
-        // EntityTemplate::spawn() не имеет доступа к оригинальному PrefabLoader.
+        // NOTE: child prefabs from self.children will not be found
+        // if they were not loaded into this loader. This is a known limitation —
+        // EntityTemplate::spawn() has no access to the original PrefabLoader.
         // §0.2a: the `EntityTemplate` trait returns `Entity`, so a failed
         // instantiation cannot propagate a `Result` here (a `try_spawn` on the
         // trait is a wave-6 API change). Until then, panic LOUDLY with the
@@ -391,7 +392,7 @@ mod tests {
     use apex_core::prelude::*;
     use serde::{Deserialize, Serialize};
 
-    // Тестовые компоненты
+    // Test components
     #[derive(Component, Serialize, Deserialize, Debug, PartialEq)]
     struct Health {
         current: f32,
@@ -507,7 +508,7 @@ mod tests {
         let parent_name = world.get::<Name>(parent).unwrap();
         assert_eq!(parent_name.0, "Parent");
 
-        // Ищем ребёнка через ChildOf
+        // Find the child via ChildOf
         let children: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
         assert_eq!(children.len(), 1);
 
@@ -579,11 +580,12 @@ mod tests {
 
         let name = world.get::<Name>(entity).unwrap();
         assert_eq!(name.0, "Monster");  // default
+
     }
 
     #[test]
     fn prefab_component_not_registered() {
-        let mut world = World::new();  // Health зарегистрирован (auto), но без serde-функций — должен быть сбой
+        let mut world = World::new();  // Health is registered (auto) but has no serde functions — must fail
         let mut loader = PrefabLoader::new();
 
         let json = r#"{
@@ -596,8 +598,8 @@ mod tests {
         let manifest = loader.load_json(json).unwrap().clone();
         let result = loader.instantiate(&mut world, &manifest, &[], None, None);
 
-        // Health зарегистрирован (auto-reg), но без serde-функций —
-        // десериализация упадёт. Ожидаем любую ошибку.
+        // Health is registered (auto-reg) but has no serde functions —
+        // deserialization will fail. Expect any error.
         assert!(result.is_err());
     }
 
@@ -664,7 +666,7 @@ mod tests {
         let mut world = setup_world();
         let mut loader = PrefabLoader::new();
 
-        // Child prefab — будет переопределён
+        // Child prefab — will be overridden
         loader.load_json(r#"{
             "name": "Child",
             "components": [
@@ -673,7 +675,7 @@ mod tests {
             ]
         }"#).unwrap();
 
-        // Parent prefab с дочерним prefab + overrides
+        // Parent prefab with a child prefab + overrides
         loader.load_json(r#"{
             "name": "Parent",
             "components": [
@@ -693,24 +695,24 @@ mod tests {
         let manifest = loader.get("Parent").unwrap();
         let parent = loader.instantiate(&mut world, manifest, &[], None, None).unwrap();
 
-        // Проверяем parent
+        // Check the parent
         let parent_name = world.get::<Name>(parent).unwrap();
         assert_eq!(parent_name.0, "Parent");
 
-        // Ищем ребёнка
+        // Find the child
         use apex_core::relations::ChildOf;
         let children: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
-        assert_eq!(children.len(), 1, "parent должен иметь ровно одного ребёнка");
+        assert_eq!(children.len(), 1, "parent must have exactly one child");
 
         let child = children[0];
 
-        // Проверяем, что overrides применились
+        // Check that the overrides were applied
         let child_health = world.get::<Health>(child).unwrap();
-        assert_eq!(child_health.current, 999.0, "Health.current должен быть из overrides");
-        assert_eq!(child_health.max, 999.0, "Health.max должен быть из overrides");
+        assert_eq!(child_health.current, 999.0, "Health.current must come from overrides");
+        assert_eq!(child_health.max, 999.0, "Health.max must come from overrides");
 
         let child_name = world.get::<Name>(child).unwrap();
-        assert_eq!(child_name.0, "OverriddenChild", "Name должен быть из overrides");
+        assert_eq!(child_name.0, "OverriddenChild", "Name must come from overrides");
     }
 
     /// TD-44 gap-close: `SerdeContext` threads through BOTH the **diff** path (`diff_with`) and the

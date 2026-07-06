@@ -1,19 +1,19 @@
-//! W3-2 — events под нагрузкой (plans/CORE_REFACTORING.md §8, apex-engine).
+//! W3-2 — events under load (plans/CORE_REFACTORING.md §8, apex-engine).
 //!
-//! Бенчи руководства меряли throughput одного типа на чистом мире. Здесь —
-//! профиль «движок под нагрузкой»:
-//!   1. send: 100k мелких событий одного типа (бейзлайн pending-пути);
-//!   2. flush_all при 64 ЗАРЕГИСТРИРОВАННЫХ типах, из которых активны 2
-//!      (типовой кадр: зарегистрировано много, шлют единицы) — цена свипа
-//!      пустых очередей;
-//!   3. flush_events_by_type (точечный per-stage путь планировщика) — те же
-//!      64 типа, флашим 2 активных;
-//!   4. flush с ОТСТАЮЩИМ читателем (append-путь update: перенос старых
-//!      событий + восстановление capacity) — аллокационно худший случай;
-//!   5. цикл планировщика: 16 систем × (writer→reader) через 8 типов событий,
-//!      пустой мир — оверхед event-ordering барьеров и per-stage флаша.
+//! The guide benches measured single-type throughput on a clean world. Here it is
+//! the "engine under load" profile:
+//!   1. send: 100k small events of a single type (baseline of the pending path);
+//!   2. flush_all with 64 REGISTERED types, of which 2 are active
+//!      (typical frame: many registered, only a few send) — the cost of sweeping
+//!      empty queues;
+//!   3. flush_events_by_type (the scheduler's targeted per-stage path) — the same
+//!      64 types, flushing the 2 active ones;
+//!   4. flush with a LAGGING reader (the update append path: moving old
+//!      events + restoring capacity) — the allocation worst case;
+//!   5. scheduler cycle: 16 systems × (writer→reader) over 8 event types,
+//!      empty world — the overhead of event-ordering barriers and the per-stage flush.
 //!
-//! Запуск: `cargo run --release -p apex-bench --bin events_load`
+//! Run: `cargo run --release -p apex-bench --bin events_load`
 
 use apex_core::prelude::*;
 use std::hint::black_box;
@@ -37,7 +37,7 @@ fn print_row(name: &str, t: Duration, per: f64, unit: &str) {
     println!("  {:<52} {:>10.3?}   {:.1} {}", name, t, per, unit);
 }
 
-// 64 типа событий — генерим макросом обёртки над u64.
+// 64 event types — generate u64 wrappers with a macro.
 macro_rules! ev_types {
     ($($name:ident),+) => {
         $( #[allow(dead_code)] #[derive(Clone, Copy)] struct $name(u64); )+
@@ -55,9 +55,9 @@ ev_types!(
 );
 
 fn main() {
-    println!("=== W3-2: events под нагрузкой ===\n");
+    println!("=== W3-2: events under load ===\n");
 
-    // ── [1] send 100k одного типа ──────────────────────────────
+    // ── [1] send 100k of a single type ─────────────────────────
     {
         let mut world = World::new();
         world.add_event::<E00>();
@@ -65,18 +65,18 @@ fn main() {
             for i in 0..100_000u64 {
                 world.send_event(E00(i));
             }
-            world.flush_all_events(); // очистка к следующему сэмплу
+            world.flush_all_events(); // clear before the next sample
             100_000
         });
         print_row(
-            "[1] send ×100k одного типа (+flush)",
+            "[1] send ×100k of a single type (+flush)",
             t,
             t.as_nanos() as f64 / 100_000.0,
             "ns/send",
         );
     }
 
-    // ── [2] flush_all: 64 зарегистрированных, 2 активных ───────
+    // ── [2] flush_all: 64 registered, 2 active ─────────────────
     {
         let mut world = World::new();
         register_all(&mut world);
@@ -89,14 +89,14 @@ fn main() {
             64
         });
         print_row(
-            "[2] flush_all (64 типов, 2 активных, 200 событий)",
+            "[2] flush_all (64 types, 2 active, 200 events)",
             t,
             t.as_nanos() as f64 / 64.0,
-            "ns/тип",
+            "ns/type",
         );
     }
 
-    // ── [3] flush_events_by_type (путь планировщика) ───────────
+    // ── [3] flush_events_by_type (scheduler path) ──────────────
     {
         let mut world = World::new();
         register_all(&mut world);
@@ -113,23 +113,23 @@ fn main() {
             2
         });
         print_row(
-            "[3] flush_events_by_type (2 из 64, 200 событий)",
+            "[3] flush_events_by_type (2 of 64, 200 events)",
             t,
             t.as_nanos() as f64 / 2.0,
-            "ns/тип",
+            "ns/type",
         );
     }
 
-    // ── [4] flush с отстающим читателем (append-путь) ──────────
+    // ── [4] flush with a lagging reader (append path) ──────────
     {
         let mut world = World::new();
         world.add_event::<E00>();
-        // Курсор регистрируем и НИКОГДА не читаем — каждый update идёт по
-        // ветке «не все догнали»: append старых + восстановление capacity.
+        // We register a cursor and NEVER read it — every update takes the
+        // "not everyone caught up" branch: append of old + restore of capacity.
         let _lagging = world.events_mut::<E00>().add_reader();
         let (t, _) = median_of(|| {
-            // Ограничиваем рост: читатель отстал, но буфер чистится раз в
-            // сэмпл сторонним read_all-проходом ниже.
+            // Bound the growth: the reader lags, but the buffer is cleared once per
+            // sample by the separate read_all pass below.
             for i in 0..1_000u64 {
                 world.send_event(E00(i));
             }
@@ -140,22 +140,22 @@ fn main() {
                 evs.advance_reader_mut(&_lagging);
                 n
             };
-            world.flush_all_events(); // теперь читатель догнал — буфер очистится
+            world.flush_all_events(); // the reader has now caught up — the buffer is cleared
             drained
         });
         print_row(
-            "[4] flush с отстающим читателем (1k событий)",
+            "[4] flush with a lagging reader (1k events)",
             t,
             t.as_nanos() as f64 / 1_000.0,
-            "ns/событие",
+            "ns/event",
         );
     }
 
-    // ── [5] планировщик: 16 систем, 8 типов событий ────────────
+    // ── [5] scheduler: 16 systems, 8 event types ───────────────
     {
         use apex_scheduler::{Scheduler, StageLabel};
 
-        /// Счётчик доставленных событий (ресурс).
+        /// Counter of delivered events (resource).
         struct Sink(u64);
 
         macro_rules! pipe {
@@ -203,13 +203,13 @@ fn main() {
             world.resource::<Sink>().0
         });
         print_row(
-            "[5] scheduler: 16 систем / 8 event-пайплайн, 1k кадров",
+            "[5] scheduler: 16 systems / 8 event pipelines, 1k frames",
             t,
             t.as_nanos() as f64 / FRAMES as f64,
-            "ns/кадр",
+            "ns/frame",
         );
-        println!("      (sink={}, событий доставлено за все сэмплы)", sink);
+        println!("      (sink={}, events delivered across all samples)", sink);
     }
 
-    println!("\nГотово.");
+    println!("\nDone.");
 }

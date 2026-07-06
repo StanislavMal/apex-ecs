@@ -30,7 +30,7 @@ fn bench_simple_iter(c: &mut Criterion) {
         let mut bench = apex::simple_iter::SimpleIter::new();
         b.iter(move || bench.run());
     });
-    // W2-0.5: плотная chunk-итерация (графа «скорость Legion + тики Bevy»)
+    // W2-0.5: dense chunk iteration (the "Legion speed + Bevy ticks" column)
     group.bench_function("apex_chunked", |b| {
         let mut bench = apex::simple_iter::SimpleIter::new();
         b.iter(move || bench.run_chunked());
@@ -154,7 +154,7 @@ fn bench_commands_spawn(c: &mut Criterion) {
 
 fn bench_despawn(c: &mut Criterion) {
     let mut group = c.benchmark_group("despawn");
-    // iter_batched: setup (населить мир) — вне измерения; измеряем только despawn.
+    // iter_batched: setup (populate the world) — outside measurement; we measure only despawn.
     group.bench_function("apex", |b| {
         b.iter_batched(
             apex::despawn::setup,
@@ -224,8 +224,8 @@ fn bench_events(c: &mut Criterion) {
     });
 }
 
-// Steady-state кадровый профиль: 10k кадров × (8 send + read персист. курсором + rotate).
-// Другой профиль, чем разовый батч (bench_events): амортизирует per-кадр rotate.
+// Steady-state frame profile: 10k frames × (8 send + read with persistent cursor + rotate).
+// A different profile than the one-shot batch (bench_events): it amortizes the per-frame rotate.
 fn bench_events_frame_loop(c: &mut Criterion) {
     let mut group = c.benchmark_group("events_frame_loop");
     group.bench_function("apex", |b| {
@@ -309,7 +309,7 @@ fn bench_wide_iter(c: &mut Criterion) {
 }
 
 fn bench_propagate(c: &mut Criterion) {
-    // Apex-фокус (наш дифференциатор; bevy propagate — отдельный crate/schedule). Регресс-страж.
+    // Apex-focused (our differentiator; bevy propagate is a separate crate/schedule). Regression guard.
     let mut group = c.benchmark_group("propagate");
     group.bench_function("apex", |b| {
         let mut bench = apex::propagate::Propagate::new();

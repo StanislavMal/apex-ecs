@@ -1,9 +1,9 @@
-//! Регистрация глобальных Lua-функций: `delta_time`, `entity_count`,
+//! Registration of the global Lua functions: `delta_time`, `entity_count`,
 //! `query`, `commit`, `spawn_entity`, `despawn`, `read_resource`,
 //! `write_resource`, `emit_event`, `log`.
 //!
-//! Все функции получают контекст через `lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()`
-//! и работают с миром через него в пределах вызова `ScriptEngine::run()`.
+//! All functions obtain the context via `lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()`
+//! and work with the world through it within the scope of a `ScriptEngine::run()` call.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -13,7 +13,7 @@ use crate::{
     iterators,
 };
 
-/// Зарегистрировать все глобальные API-функции в Lua.
+/// Register all global API functions in Lua.
 pub fn register_globals(lua: &mlua::Lua) -> mlua::Result<()> {
     register_delta_time(lua)?;
     register_entity_count(lua)?;
@@ -171,7 +171,7 @@ fn register_resource_api(lua: &mlua::Lua) -> mlua::Result<()> {
         match ctx_ref.read_resource(lua, &type_name) {
             Some(val) => Ok(val),
             None => {
-                log::warn!("read_resource: ресурс '{}' не найден", type_name);
+                log::warn!("read_resource: resource '{}' not found", type_name);
                 Ok(mlua::Value::Nil)
             }
         }
@@ -241,14 +241,14 @@ fn inspect_value(val: &mlua::Value, depth: usize) -> String {
             let mut parts = Vec::new();
             let indent = "  ".repeat(depth + 1);
 
-            // Array part (индексы 1..N)
+            // Array part (indices 1..N)
             let len = t.raw_len();
             for i in 1..=len {
                 if let Ok(v) = t.get::<mlua::Value>(i) {
                     parts.push(inspect_value(&v, depth + 1));
                 }
             }
-            // Hash part (строковые ключи)
+            // Hash part (string keys)
             for (k, v) in t.clone().pairs::<String, mlua::Value>().flatten() {
                 if k == "_meta" { continue; }
                 let val_str = inspect_value(&v, depth + 1);
@@ -258,7 +258,7 @@ fn inspect_value(val: &mlua::Value, depth: usize) -> String {
             if parts.is_empty() {
                 "{}".to_string()
             } else if parts.len() <= 4 && parts.iter().all(|p| !p.contains('=')) {
-                // Компактный массив
+                // Compact array
                 format!("{{ {} }}", parts.join(", "))
             } else {
                 let inner = parts.iter()

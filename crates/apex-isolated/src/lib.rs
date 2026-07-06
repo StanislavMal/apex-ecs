@@ -1,11 +1,11 @@
-//! apex-isolated — изолированные ECS-миры с коммуникацией через каналы.
+//! apex-isolated — isolated ECS worlds communicating over channels.
 //!
-//! Содержит:
-//! - [`IsolatedWorld`] — полностью изолированный мир с собственным планировщиком
-//! - [`WorldBridge`] — канал связи между IsolatedWorld и основным World
-//! - [`CloneableBridge`] — клонируемая обёртка для хранения в ресурсах
-//! - [`BridgeEvent`] — события, передаваемые через WorldBridge
-//! - [`sync_bridge_cloneable`] — система синхронизации для Scheduler'а
+//! Contains:
+//! - [`IsolatedWorld`] — a fully isolated world with its own scheduler
+//! - [`WorldBridge`] — a communication channel between an IsolatedWorld and the main World
+//! - [`CloneableBridge`] — a cloneable wrapper for storing in resources
+//! - [`BridgeEvent`] — events passed through a WorldBridge
+//! - [`sync_bridge_cloneable`] — a synchronization system for the Scheduler
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -17,11 +17,11 @@ use apex_scheduler::Scheduler;
 // BridgeEvent
 // ---------------------------------------------------------------------------
 
-/// Событие, передаваемое через [`WorldBridge`] или [`CloneableBridge`].
+/// An event passed through a [`WorldBridge`] or [`CloneableBridge`].
 pub enum BridgeEvent {
-    /// Произвольное вызываемое действие.
+    /// An arbitrary callable action.
     Action(Box<dyn FnOnce(&mut World) + Send>),
-    /// Типизированное событие (сериализованное через bincode).
+    /// A typed event (serialized via bincode).
     Event { type_name: String, data: Vec<u8> },
 }
 
@@ -29,34 +29,34 @@ pub enum BridgeEvent {
 // WorldBridge
 // ---------------------------------------------------------------------------
 
-/// Двунаправленный канал связи между [`IsolatedWorld`] и основным [`World`].
+/// A bidirectional communication channel between an [`IsolatedWorld`] and the main [`World`].
 ///
-/// Использует lock-free очередь (`crossbeam::channel`) для передачи событий.
+/// Uses a lock-free queue (`crossbeam::channel`) to pass events.
 ///
-/// # Создание
+/// # Creation
 ///
 /// ```ignore
 /// let (to_sub, from_sub) = WorldBridge::new();
-/// // to_sub   — отправляет в IsolatedWorld
-/// // from_sub — получает из IsolatedWorld
+/// // to_sub   — sends into the IsolatedWorld
+/// // from_sub — receives from the IsolatedWorld
 /// ```
 type EventHandler = Box<dyn Fn(&[u8], &mut World) + Send + Sync>;
 
 pub struct WorldBridge {
-    /// События из основного мира в IsolatedWorld.
+    /// Events from the main world into the IsolatedWorld.
     inbound: crossbeam_channel::Sender<BridgeEvent>,
-    /// События из IsolatedWorld в основной мир.
+    /// Events from the IsolatedWorld into the main world.
     outbound: crossbeam_channel::Receiver<BridgeEvent>,
-    /// Реестр десериализаторов: type_name → (data, world).
+    /// Registry of deserializers: type_name → (data, world).
     event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
 }
 
 impl WorldBridge {
-    /// Создать пару связанных мостов.
+    /// Create a pair of linked bridges.
     ///
-    /// Возвращает `(main_to_sub, sub_to_main)`, где:
-    /// - `main_to_sub` — используется основным миром для отправки в IsolatedWorld
-    /// - `sub_to_main` — используется IsolatedWorld для отправки в основной мир
+    /// Returns `(main_to_sub, sub_to_main)`, where:
+    /// - `main_to_sub` — used by the main world to send into the IsolatedWorld
+    /// - `sub_to_main` — used by the IsolatedWorld to send into the main world
     pub fn new() -> (Self, Self) {
         let (main_tx, sub_rx) = crossbeam_channel::unbounded();
         let (sub_tx, main_rx) = crossbeam_channel::unbounded();
@@ -78,10 +78,10 @@ impl WorldBridge {
         (main_to_sub, sub_to_main)
     }
 
-    /// Зарегистрировать тип события для десериализации на принимающей стороне.
+    /// Register an event type for deserialization on the receiving side.
     ///
-    /// Вызывает `world.add_event::<T>()` и сохраняет десериализатор
-    /// в общий реестр моста.
+    /// Calls `world.add_event::<T>()` and stores the deserializer
+    /// in the bridge's shared registry.
     pub fn register_event<T>(&self, world: &mut World)
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -103,7 +103,7 @@ impl WorldBridge {
         );
     }
 
-    /// Отправить действие в целевой мир.
+    /// Send an action to the target world.
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
         // §0.2a (E12): a closed channel (peer world torn down) silently dropped
         // the action. Surface it (throttled).
@@ -114,10 +114,10 @@ impl WorldBridge {
         }
     }
 
-    /// Отправить типизированное событие в целевой мир.
+    /// Send a typed event to the target world.
     ///
-    /// Событие сериализуется с помощью `bincode` перед отправкой.
-    /// На принимающей стороне должен быть вызван [`register_event::<T>`](Self::register_event).
+    /// The event is serialized with `bincode` before sending.
+    /// [`register_event::<T>`](Self::register_event) must be called on the receiving side.
     pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
         let type_name = std::any::type_name::<T>().to_string();
         let data = match bincode::serialize(event) {
@@ -142,12 +142,12 @@ impl WorldBridge {
         }
     }
 
-    /// Применить все накопленные сообщения к миру.
+    /// Apply all accumulated messages to the world.
     ///
-    /// Вычитывает все сообщения из `outbound` канала и применяет их:
-    /// - `Action(f)` — вызывает `f(world)`
-    /// - `Event { type_name, data }` — десериализует через зарегистрированный
-    ///   обработчик и вызывает `world.send_event()`
+    /// Drains all messages from the `outbound` channel and applies them:
+    /// - `Action(f)` — calls `f(world)`
+    /// - `Event { type_name, data }` — deserializes via the registered
+    ///   handler and calls `world.send_event()`
     pub fn apply_incoming(&self, world: &mut World) {
         while let Ok(event) = self.outbound.try_recv() {
             match event {
@@ -169,11 +169,11 @@ impl WorldBridge {
         }
     }
 
-    /// Отправить событие как `Action`.
+    /// Send an event as an `Action`.
     ///
-    /// Позволяет отправить замыкание, которое вызовет `world.send_event(event)`.
-    /// В отличие от [`send_event`](Self::send_event), не требует сериализации и
-    /// работает без реестра на принимающей стороне.
+    /// Lets you send a closure that will call `world.send_event(event)`.
+    /// Unlike [`send_event`](Self::send_event), it requires no serialization and
+    /// works without a registry on the receiving side.
     pub fn send_action_event<T: Send + Sync + 'static>(&self, event: T) {
         self.send_action(Box::new(move |world: &mut World| {
             world.send_event(event);
@@ -185,14 +185,14 @@ impl WorldBridge {
 // IsolatedWorld
 // ---------------------------------------------------------------------------
 
-/// Полностью изолированный мир с собственным планировщиком.
+/// A fully isolated world with its own scheduler.
 ///
-/// Полезен для:
-/// - Симуляции (физика, AI) в отдельном потоке
-/// - Под-миры уровней (каждый уровень — свой мир)
-/// - Тестирования (изолированный мир для юнит-тестов)
+/// Useful for:
+/// - Simulation (physics, AI) on a separate thread
+/// - Level sub-worlds (each level is its own world)
+/// - Testing (an isolated world for unit tests)
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// let mut iso = IsolatedWorld::new();
@@ -211,7 +211,7 @@ unsafe impl Send for IsolatedWorld {}
 unsafe impl Sync for IsolatedWorld {}
 
 impl IsolatedWorld {
-    /// Создать новый изолированный мир.
+    /// Create a new isolated world.
     pub fn new() -> Self {
         Self {
             world: World::new(),
@@ -219,7 +219,7 @@ impl IsolatedWorld {
         }
     }
 
-    /// Доступ к внутреннему [`World`] (осторожно: structural changes).
+    /// Access to the internal [`World`] (careful: structural changes).
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
@@ -230,15 +230,15 @@ impl IsolatedWorld {
         std::mem::swap(&mut self.world, other);
     }
 
-    /// Доступ к [`Scheduler`] для конфигурации.
+    /// Access to the [`Scheduler`] for configuration.
     pub fn scheduler_mut(&mut self) -> &mut Scheduler {
         &mut self.scheduler
     }
 
-    /// Выполнить один тик: tick() → scheduler.run().
+    /// Perform a single tick: tick() → scheduler.run().
     ///
-    /// `compile` вызывается явно для мягкого логирования ошибки (иначе `run`
-    /// паникует); маппинг систем→архетипы `run` пересчитывает сам каждый вызов.
+    /// `compile` is called explicitly to log the error gracefully (otherwise `run`
+    /// panics); the systems→archetypes mapping is recomputed by `run` itself on each call.
     pub fn tick(&mut self) {
         self.world.tick();
         if let Err(e) = self.scheduler.compile() {
@@ -248,12 +248,12 @@ impl IsolatedWorld {
         self.scheduler.run(&mut self.world);
     }
 
-    /// Прочитать ресурс по типу.
+    /// Read a resource by type.
     pub fn read_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.world.try_resource::<T>()
     }
 
-    /// Отправить событие в IsolatedWorld.
+    /// Send an event into the IsolatedWorld.
     pub fn send_event<T: Send + Sync + 'static>(&mut self, event: T) {
         self.world.send_event(event);
     }
@@ -269,23 +269,23 @@ impl Default for IsolatedWorld {
 // CloneableBridge
 // ---------------------------------------------------------------------------
 
-/// Клонируемая обёртка над каналами WorldBridge для хранения в ресурсах.
+/// A cloneable wrapper over WorldBridge channels for storing in resources.
 ///
-/// `WorldBridge` не реализует `Clone`, но его внутренние каналы
-/// (`crossbeam_channel::Sender`/`Receiver`) клонируются.
-/// Эта обёртка пригодна для хранения в `Resources`.
+/// `WorldBridge` does not implement `Clone`, but its internal channels
+/// (`crossbeam_channel::Sender`/`Receiver`) are cloneable.
+/// This wrapper is suitable for storing in `Resources`.
 #[derive(Clone)]
 pub struct CloneableBridge {
-    /// Sender для отправки событий в IsolatedWorld.
+    /// Sender for sending events into the IsolatedWorld.
     to_sub: crossbeam_channel::Sender<BridgeEvent>,
-    /// Receiver для получения событий из IsolatedWorld.
+    /// Receiver for receiving events from the IsolatedWorld.
     from_sub: crossbeam_channel::Receiver<BridgeEvent>,
-    /// Реестр десериализаторов.
+    /// Registry of deserializers.
     event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
 }
 
 impl CloneableBridge {
-    /// Создать `CloneableBridge` из пары каналов.
+    /// Create a `CloneableBridge` from a pair of channels.
     pub fn new(
         to_sub: crossbeam_channel::Sender<BridgeEvent>,
         from_sub: crossbeam_channel::Receiver<BridgeEvent>,
@@ -297,9 +297,9 @@ impl CloneableBridge {
         }
     }
 
-    /// Зарегистрировать тип события для десериализации на принимающей стороне.
+    /// Register an event type for deserialization on the receiving side.
     ///
-    /// Вызывает `world.add_event::<T>()` и сохраняет десериализатор.
+    /// Calls `world.add_event::<T>()` and stores the deserializer.
     pub fn register_event<T>(&self, world: &mut World)
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
@@ -321,7 +321,7 @@ impl CloneableBridge {
         );
     }
 
-    /// Отправить действие в IsolatedWorld.
+    /// Send an action into the IsolatedWorld.
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
         // §0.2a (E12): a closed channel silently dropped the action.
         if self.to_sub.send(BridgeEvent::Action(f)).is_err() {
@@ -331,9 +331,9 @@ impl CloneableBridge {
         }
     }
 
-    /// Отправить типизированное событие в целевой мир (сериализуется через bincode).
+    /// Send a typed event to the target world (serialized via bincode).
     ///
-    /// На принимающей стороне должен быть вызван [`register_event::<T>`](Self::register_event).
+    /// [`register_event::<T>`](Self::register_event) must be called on the receiving side.
     pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
         let type_name = std::any::type_name::<T>().to_string();
         let data = match bincode::serialize(event) {
@@ -358,17 +358,17 @@ impl CloneableBridge {
         }
     }
 
-    /// Отправить событие как `Action`.
+    /// Send an event as an `Action`.
     ///
-    /// В отличие от [`send_event`](Self::send_event) не требует сериализации
-    /// и регистрации на принимающей стороне.
+    /// Unlike [`send_event`](Self::send_event), it requires no serialization
+    /// and no registration on the receiving side.
     pub fn send_action_event<T: Send + Sync + 'static>(&self, event: T) {
         self.send_action(Box::new(move |world: &mut World| {
             world.send_event(event);
         }));
     }
 
-    /// Применить все накопленные сообщения ИЗ IsolatedWorld.
+    /// Apply all accumulated messages FROM the IsolatedWorld.
     pub fn apply_incoming(&self, world: &mut World) {
         while let Ok(event) = self.from_sub.try_recv() {
             match event {
@@ -395,12 +395,12 @@ impl CloneableBridge {
 // SyncBridgeSystem
 // ---------------------------------------------------------------------------
 
-/// Система синхронизации, работающая с [`CloneableBridge`].
+/// A synchronization system that works with a [`CloneableBridge`].
 ///
-/// Добавляется в Scheduler основного мира. На каждом тике вызывает
-/// `bridge.apply_incoming(world)` для применения событий из IsolatedWorld.
+/// Added to the main world's Scheduler. On every tick it calls
+/// `bridge.apply_incoming(world)` to apply events from the IsolatedWorld.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// use apex_isolated::{CloneableBridge, sync_bridge_cloneable};
@@ -412,10 +412,10 @@ impl CloneableBridge {
 /// scheduler.add_system("sync_bridge", sync_bridge_cloneable);
 /// ```
 pub fn sync_bridge_cloneable(world: &mut World) {
-    // Клонируем мост (его каналы/реестр — Arc-разделяемые, клон драйвит ТЕ ЖЕ
-    // очереди) и отпускаем заём ресурса ДО дренажа. Входящий Action может
-    // удалить/заменить ресурс CloneableBridge — заём, удержанный через
-    // apply_incoming, тогда бы повис (UAF, E2). Клон делает это безопасно.
+    // Clone the bridge (its channels/registry are Arc-shared, so the clone drives
+    // the SAME queues) and release the resource borrow BEFORE draining. An incoming
+    // Action may remove/replace the CloneableBridge resource — a borrow held across
+    // apply_incoming would then dangle (UAF, E2). Cloning does this safely.
     let bridge = match world.try_resource::<CloneableBridge>() {
         Some(b) => b.clone(),
         None => return,
@@ -488,10 +488,10 @@ mod tests {
         let mut main_world = World::new();
         let iso = IsolatedWorld::new();
 
-        // Спавним сущность в основном мире
+        // Spawn an entity in the main world
         main_world.spawn(());
 
-        // В изолированном мире ничего нет
+        // The isolated world contains nothing
         assert_eq!(iso.world.entity_count(), 0);
         assert_eq!(main_world.entity_count(), 1);
     }
@@ -517,10 +517,10 @@ mod tests {
     #[test]
     fn isolated_world_send_event() {
         let mut iso = IsolatedWorld::new();
-        // Регистрируем тип события, затем отправляем
+        // Register the event type, then send
         iso.world_mut().add_event::<u32>();
         iso.send_event(42u32);
-        iso.world_mut().tick(); // инкрементирует тик
+        iso.world_mut().tick(); // increments the tick
     }
 
     // -----------------------------------------------------------------------
@@ -619,7 +619,7 @@ mod tests {
         let to_main = CloneableBridge::new(main_tx, main_rx);
         let to_sub_bridge = CloneableBridge::new(sub_tx, sub_rx);
 
-        // Отправляем действие из под-мира в основной
+        // Send an action from the sub-world into the main one
         to_sub_bridge.send_action(Box::new(|world: &mut World| {
             world.spawn(());
         }));
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn sync_bridge_system_works() {
-        // Создаём IsolatedWorld с системой, считающей entity_count
+        // Create an IsolatedWorld with a system that counts entity_count
         let mut iso = IsolatedWorld::new();
 
         let entity_count = Arc::new(AtomicUsize::new(0));

@@ -14,6 +14,6 @@ pub fn setup() -> (World, Entity) {
 }
 
 pub fn run((mut world, parent): (World, Entity)) {
-    // bevy 0.16+: despawn каскадно сносит детей через relationship-хуки ChildOf/Children.
+    // bevy 0.16+: despawn cascades to children via the ChildOf/Children relationship hooks.
     world.entity_mut(parent).despawn();
 }

@@ -1,30 +1,30 @@
-//! FixedUpdate — фиксированный шаг симуляции (D2-5, аналог Bevy `Time<Fixed>`).
+//! FixedUpdate — fixed simulation step (D2-5, analogous to Bevy `Time<Fixed>`).
 //!
-//! Ресурс [`FixedTime`] накапливает реальное время кадра; планировщик перед
-//! стадией `StageLabel::FixedUpdate` спрашивает у него число шагов и
-//! исполняет стадию столько раз (каждый шаг — со своим применением команд и
-//! per-stage флашем событий). Остаток времени переносится на следующий кадр.
+//! The [`FixedTime`] resource accumulates real frame time; before the
+//! `StageLabel::FixedUpdate` stage the scheduler asks it for the number of steps
+//! and runs the stage that many times (each step — with its own command
+//! application and per-stage event flush). Leftover time carries over to the next frame.
 //!
-//! Подключение:
-//! - в движке `apex-app` вставляет `FixedTime` по умолчанию и кормит его
-//!   `Time.delta_seconds` каждый кадр;
-//! - в чистом ядре: `world.insert_resource(FixedTime::from_hz(60.0))` и
-//!   `world.resource_mut::<FixedTime>().accumulate(frame_dt)` перед `run()`.
-//! - БЕЗ ресурса стадия FixedUpdate выполняется один раз за кадр (как любая).
+//! Wiring:
+//! - in the engine `apex-app` inserts a default `FixedTime` and feeds it
+//!   `Time.delta_seconds` each frame;
+//! - in the bare core: `world.insert_resource(FixedTime::from_hz(60.0))` and
+//!   `world.resource_mut::<FixedTime>().accumulate(frame_dt)` before `run()`.
+//! - WITHOUT the resource the FixedUpdate stage runs once per frame (like any other).
 //!
-//! ⚠ Взаимодействие с DtConditioner (apex-window): кондиционированный sim-dt
-//! почти кратен периоду дисплея — аккумулятор работает поверх него штатно,
-//! `dt` фиксированного шага независим (типично 1/60). EMA/deadband
-//! кондиционера убирает джиттер ВХОДА; спираль смерти ограничена
-//! `max_steps_per_frame`.
+//! ⚠ Interaction with DtConditioner (apex-window): the conditioned sim-dt is
+//! almost a multiple of the display period — the accumulator works on top of it
+//! normally, the fixed step's `dt` is independent (typically 1/60). The
+//! conditioner's EMA/deadband removes INPUT jitter; the death spiral is bounded
+//! by `max_steps_per_frame`.
 
-/// Ресурс фиксированного шага (см. модульную документацию).
+/// Fixed-step resource (see the module documentation).
 #[derive(Debug, Clone)]
 pub struct FixedTime {
-    /// Фиксированный шаг симуляции, секунды (типично 1/60).
+    /// Fixed simulation step, seconds (typically 1/60).
     pub dt: f32,
-    /// Кап шагов за кадр — защита от «спирали смерти» (медленный кадр →
-    /// больше шагов → ещё медленнее). Излишек времени ОТБРАСЫВАЕТСЯ.
+    /// Cap of steps per frame — protection against the "death spiral" (slow frame →
+    /// more steps → even slower). Excess time is DISCARDED.
     pub max_steps_per_frame: u32,
     accumulator: f32,
 }
@@ -52,34 +52,34 @@ impl FixedTime {
         }
     }
 
-    /// Накопить реальное время кадра (зовётся раз в кадр до `run()`).
+    /// Accumulate real frame time (called once per frame before `run()`).
     #[inline]
     pub fn accumulate(&mut self, frame_dt: f32) {
         self.accumulator += frame_dt.max(0.0);
     }
 
-    /// Накопленное, ещё не отработанное время (для интерполяции рендера:
+    /// Accumulated, not yet processed time (for render interpolation:
     /// `alpha = overstep_fraction()`).
     #[inline]
     pub fn overstep(&self) -> f32 {
         self.accumulator
     }
 
-    /// Доля недоработанного шага `[0, 1)` — коэффициент интерполяции.
+    /// Fraction of the unprocessed step `[0, 1)` — interpolation coefficient.
     #[inline]
     pub fn overstep_fraction(&self) -> f32 {
         (self.accumulator / self.dt).fract()
     }
 
-    /// Сколько шагов исполнить в этом кадре; списывает их из аккумулятора.
-    /// Вызывается планировщиком перед стадией FixedUpdate.
+    /// How many steps to run this frame; deducts them from the accumulator.
+    /// Called by the scheduler before the FixedUpdate stage.
     pub fn drain_steps(&mut self) -> usize {
         if self.dt <= 0.0 {
             return 0;
         }
         let steps = (self.accumulator / self.dt) as u32;
         if steps > self.max_steps_per_frame {
-            // Спираль смерти: исполняем кап, излишек отбрасываем.
+            // Death spiral: run the cap, discard the excess.
             self.accumulator = 0.0;
             return self.max_steps_per_frame as usize;
         }

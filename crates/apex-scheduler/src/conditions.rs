@@ -1,9 +1,9 @@
-//! Common run conditions — из коробки.
+//! Common run conditions — out of the box.
 //!
-//! Каждый built-in condition реализует [`Condition`] с типизированным `access()`.
-//! Планировщик знает какие данные читает условие → автоматически строит dependency edges.
+//! Each built-in condition implements [`Condition`] with a typed `access()`.
+//! The scheduler knows which data a condition reads → automatically builds dependency edges.
 //!
-//! # Использование
+//! # Usage
 //!
 //! ```ignore
 //! use apex_scheduler::conditions;

@@ -24,7 +24,7 @@ impl Benchmark {
     }
 
     pub fn run(&mut self) -> u32 {
-        // Продвигаем change-tick, чтобы мутации этого кадра были новее `last_change_tick`.
+        // Advance the change-tick so that this frame's mutations are newer than `last_change_tick`.
         self.world.increment_change_tick();
         for &e in &self.entities[..1000] {
             if let Some(mut d) = self.world.get_mut::<Data>(e) {
@@ -35,8 +35,8 @@ impl Benchmark {
         for _ in self.query.iter(&self.world) {
             count += 1;
         }
-        // Граница кадра: `clear_trackers` продвигает `last_change_tick` до текущего ⇒ в СЛЕДУЮЩЕМ
-        // кадре `Changed` отфильтрует ровно мутации следующего кадра (а не все spawn-изменённые).
+        // Frame boundary: `clear_trackers` advances `last_change_tick` to the current one ⇒ on the
+        // NEXT frame `Changed` filters exactly the next frame's mutations (not all spawn-changed).
         self.world.clear_trackers();
         count
     }

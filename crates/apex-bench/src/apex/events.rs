@@ -1,9 +1,9 @@
 use apex_core::events::Events;
 
-// Events — send 10k событий + чтение всех одним читателем (полный round-trip). Не покрыто другими
-// бенчами; базовый путь межсистемной коммуникации. Standalone `Events<T>` — тот же уровень
-// абстракции, что и bevy `Events<T>` (без World/регистрации). Возвращает сумму (страж честности:
-// обе реализации обязаны прочитать все 10k ⇒ sum == 49995000).
+// Events — send 10k events + read all with a single reader (full round-trip). Not covered by other
+// benches; the baseline inter-system communication path. Standalone `Events<T>` — the same level of
+// abstraction as bevy `Events<T>` (without World/registration). Returns the sum (honesty guard:
+// both implementations must read all 10k ⇒ sum == 49995000).
 #[derive(Clone, Copy)]
 pub struct E(pub u64);
 
@@ -26,7 +26,7 @@ impl EventsBench {
         for i in 0..10_000u64 {
             events.send(E(i));
         }
-        events.update(); // pending → читаемо
+        events.update(); // pending → readable
         let mut sum = 0u64;
         for e in events.read(&cursor).iter() {
             sum += e.0;
@@ -35,10 +35,10 @@ impl EventsBench {
     }
 }
 
-// Steady-state кадровый цикл: КАЖДЫЙ кадр — послать пачку, прочитать персистентным читателем,
-// ротировать буфер. В отличие от разового батча (EventsBench) амортизирует per-кадр стоимость
-// send+read+rotate (ротация вызывается КАЖДЫЙ кадр) — ближе к реальному кадру движка.
-// Персистентный курсор — как у системного читателя. Обе реализации читают все события.
+// Steady-state frame loop: EVERY frame — send a batch, read with a persistent reader,
+// rotate the buffer. Unlike a one-off batch (EventsBench) it amortizes the per-frame cost of
+// send+read+rotate (rotation is called EVERY frame) — closer to a real engine frame.
+// A persistent cursor — like a system reader. Both implementations read all events.
 pub struct FrameLoopBench {
     frames: u64,
     per_frame: u64,
@@ -65,7 +65,7 @@ impl FrameLoopBench {
                 events.send(E(n));
                 n += 1;
             }
-            events.update(); // pending → читаемо (ротация)
+            events.update(); // pending → readable (rotation)
             for e in events.read(&cursor).iter() {
                 sum += e.0;
             }

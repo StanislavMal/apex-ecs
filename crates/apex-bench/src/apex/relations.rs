@@ -1,10 +1,10 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// Relations — НАША фича (у legion нет, у bevy 0.16+ есть как relationships). Строим родитель + 10k
-// детей через `add_relation(ChildOf)`, затем итерируем `children_of`. Меряет вставку связи (O(1)
-// двусторонний индекс) + обход детей. Должна быть AAA-быстрой — фича без производительности не AAA.
-// Возвращает число детей (страж честности: обе реализации обязаны увидеть 10000).
+// Relations — OUR feature (legion has none, bevy 0.16+ has it as relationships). We build a parent + 10k
+// children via `add_relation(ChildOf)`, then iterate `children_of`. Measures relation insertion (O(1)
+// two-way index) + child traversal. Must be AAA-fast — a feature without performance is not AAA.
+// Returns the number of children (honesty guard: both implementations must see 10000).
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 

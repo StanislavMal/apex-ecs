@@ -1,9 +1,9 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// DespawnRecursive — каскадный despawn иерархии (наша фича + bevy 0.16+). Родитель + 1000 детей
-// через ChildOf; `despawn_recursive` сносит всё поддерево. Изолировано `iter_batched` (setup строит
-// иерархию вне измерения). Не покрыто; реальный путь выгрузки сцен/смерти агрегатов.
+// DespawnRecursive — cascading despawn of a hierarchy (our feature + bevy 0.16+). A parent + 1000 children
+// via ChildOf; `despawn_recursive` tears down the whole subtree. Isolated with `iter_batched` (setup builds
+// the hierarchy outside measurement). Not covered; a real path for scene unloading / aggregate death.
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 

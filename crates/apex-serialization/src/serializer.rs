@@ -1,10 +1,10 @@
-//! WorldSerializer — логика снэпшота и восстановления мира.
+//! WorldSerializer — world snapshot and restore logic.
 //!
-//! Поддерживает:
-//! - JSON и Bincode форматы
-//! - Версионирование с автоматической миграцией
-//! - Инкрементальные diff-сохранения
-//! - Файловый I/O с произвольным форматом
+//! Supports:
+//! - JSON and Bincode formats
+//! - Versioning with automatic migration
+//! - Incremental diff-saves
+//! - File I/O with arbitrary format
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,7 +22,7 @@ use crate::snapshot::{
     WorldSnapshot,
 };
 
-// ── Ошибки ────────────────────────────────────────────────────
+// ── Errors ────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum SerializationError {
@@ -59,7 +59,7 @@ pub enum SerializationError {
 
 // ── RestoreEntityMap ───────────────────────────────────────────
 
-/// Маппинг старых index → новые Entity, возвращается из `restore`.
+/// Mapping of old index → new Entity, returned from `restore`.
 pub type RestoreEntityMap = HashMap<u32, Entity>;
 
 // ── WorldSerializer ────────────────────────────────────────────
@@ -69,15 +69,15 @@ pub struct WorldSerializer;
 impl WorldSerializer {
     // ── Snapshot ───────────────────────────────────────────────
 
-    /// Создать полный снэпшот мира. Обычная (де)сериализация без резолва внешних ссылок — для сцен с
-    /// компонентами, ссылающимися на ассеты/entity, используйте [`snapshot_with`](Self::snapshot_with).
+    /// Create a full world snapshot. Plain (de)serialization without resolving external references — for
+    /// scenes with components that reference assets/entities, use [`snapshot_with`](Self::snapshot_with).
     pub fn snapshot(world: &World) -> Result<WorldSnapshot, SerializationError> {
         Self::snapshot_with(world, &mut apex_core::NoContext)
     }
 
-    /// Снэпшот с **контекстом (де)сериализации** (TD-44): контекст-зависимые компоненты (Handle ассета,
-    /// Entity-референс) резолвят ссылки через `ctx` (его реализует движок/редактор). Обычные компоненты
-    /// `ctx` игнорируют ⇒ результат идентичен [`snapshot`](Self::snapshot).
+    /// Snapshot with a **(de)serialization context** (TD-44): context-dependent components (asset Handle,
+    /// Entity reference) resolve their references through `ctx` (implemented by the engine/editor). Plain
+    /// components ignore `ctx` ⇒ the result is identical to [`snapshot`](Self::snapshot).
     pub fn snapshot_with(
         world: &World,
         ctx: &mut dyn apex_core::SerdeContext,
@@ -121,15 +121,15 @@ impl WorldSerializer {
                         None    => continue,
                     };
 
-                    // Компоненты без serde пропускаем
+                    // Components without serde are skipped
                     let serde_fns = match &info.serde {
                         Some(s) => s,
                         None    => continue,
                     };
 
-                    // ZST-маркер (Folder/Model/Hidden/…): байтов нет, но его ПРИСУТСТВИЕ и есть данные —
-                    // пишем пустой снэпшот, чтобы restore переинсертил компонент. (Раньше `continue`
-                    // молча терял маркер-компоненты на save/load.)
+                    // ZST marker (Folder/Model/Hidden/…): no bytes, but its PRESENCE is the data —
+                    // write an empty snapshot so that restore re-inserts the component. (Previously
+                    // `continue` silently lost marker components on save/load.)
                     if info.size == 0 {
                         entity_snap
                             .components
@@ -143,7 +143,7 @@ impl WorldSerializer {
                             reason:    e.to_string(),
                         })?;
 
-                    // Сохраняем в зависимости от формата сериализации
+                    // Save depending on the serialization format
                     match serde_fns.format {
                         "json" => {
                             entity_snap.components.push(ComponentSnapshot::new_json(
@@ -152,7 +152,7 @@ impl WorldSerializer {
                             ));
                         }
                         _ => {
-                            // Бинарный формат — сохраняем как есть
+                            // Binary format — save as-is
                             entity_snap.components.push(ComponentSnapshot::new_binary(
                                 info.name.to_string(),
                                 raw_bytes,
@@ -166,8 +166,8 @@ impl WorldSerializer {
         }
 
         // ── Relations ──────────────────────────────────────────
-        // SubjectIndex — источник истины: записи чистятся при despawn,
-        // поэтому iter_relations отдаёт только связи живых entity.
+        // SubjectIndex — source of truth: entries are cleaned up on despawn,
+        // so iter_relations yields only relations of live entities.
         for (subject_index, kind_idx, target) in world.iter_relations() {
             // Only keep relations between snapshotted entities — a relation to a filtered-out entity
             // (e.g. a scene instance's inner node) can't restore, so don't save it (avoids restore warns).
@@ -199,10 +199,10 @@ impl WorldSerializer {
 
     // ── Restore ────────────────────────────────────────────────
 
-    /// Восстановить мир из снэпшота. Обычная (де)сериализация — для компонентов с внешними ссылками см.
-    /// [`restore_with`](Self::restore_with).
+    /// Restore a world from a snapshot. Plain (de)serialization — for components with external references
+    /// see [`restore_with`](Self::restore_with).
     ///
-    /// Перед вызовом можно вызвать `snapshot.migrate()` если версия устарела.
+    /// Before calling, you can call `snapshot.migrate()` if the version is outdated.
     pub fn restore(
         world:    &mut World,
         snapshot: &WorldSnapshot,
@@ -210,8 +210,8 @@ impl WorldSerializer {
         Self::restore_with(world, snapshot, &mut apex_core::NoContext)
     }
 
-    /// Восстановить мир из снэпшота с **контекстом (де)сериализации** (TD-44): контекст-зависимые
-    /// компоненты резолвят внешние ссылки через `ctx`. Обычные компоненты `ctx` игнорируют.
+    /// Restore a world from a snapshot with a **(de)serialization context** (TD-44): context-dependent
+    /// components resolve external references through `ctx`. Plain components ignore `ctx`.
     pub fn restore_with(
         world:    &mut World,
         snapshot: &WorldSnapshot,
@@ -234,14 +234,14 @@ impl WorldSerializer {
         world.advance_change_tick();
         let tick = world.current_tick();
 
-        // Строим маппинг type_name → ComponentId из зарегистрированных компонентов.
+        // Build a type_name → ComponentId mapping from the registered components.
         let name_to_id: HashMap<String, ComponentId> = world
             .registry()
             .iter()
             .map(|info| (info.name.to_string(), info.id))
             .collect();
 
-        // ── Шаг 1: Entity + компоненты ────────────────────────
+        // ── Step 1: Entity + components ───────────────────────
         for entity_snap in &snapshot.entities {
             let new_entity = world.spawn(());
             entity_map.insert(entity_snap.original_index, new_entity);
@@ -254,14 +254,14 @@ impl WorldSerializer {
                     }),
                 };
 
-                // ZST-маркер: байтов нет, восстанавливаем по присутствию (пустой инсерт), не вызывая
-                // deserialize_fn (данные пусты — парсить нечего). Парный к ZST-ветке в snapshot.
+                // ZST marker: no bytes, restore by presence (empty insert), without calling
+                // deserialize_fn (data is empty — nothing to parse). Paired with the ZST branch in snapshot.
                 if world.registry().get_info(component_id).map(|i| i.size).unwrap_or(0) == 0 {
                     world.insert_dyn(new_entity, component_id, Vec::new(), tick);
                     continue;
                 }
 
-                // Десериализуем в отдельном scope
+                // Deserialize in a separate scope
                 let component_bytes = {
                     let info = world.registry().get_info(component_id).unwrap();
                     let serde_fns = match &info.serde {
@@ -282,7 +282,7 @@ impl WorldSerializer {
                         }
                     };
 
-                    // Данные уже в нужном формате — используем как есть
+                    // Data is already in the right format — use as-is
                     let raw = &comp_snap.data;
 
                     (serde_fns.deserialize_fn)(raw, ctx)
@@ -296,11 +296,11 @@ impl WorldSerializer {
             }
         }
 
-        // ── Шаг 1.5: E6 — ремап Entity-ссылок внутри компонентов ───
-        // Карта old→new теперь ПОЛНА (все entity созданы, forward-ссылки тоже),
-        // поэтому обновляем Entity-поля компонентов (напр. `Target(Entity)`),
-        // зарегистрировавших `MapEntities`. Внешние (не из snapshot) ссылки
-        // остаются как есть.
+        // ── Step 1.5: E6 — remap Entity references inside components ───
+        // The old→new map is now COMPLETE (all entities created, forward refs too),
+        // so we update the Entity fields of components (e.g. `Target(Entity)`) that
+        // registered `MapEntities`. External references (not from the snapshot)
+        // stay as-is.
         {
             let new_entities: Vec<apex_core::Entity> = entity_map.values().copied().collect();
             let mut remap = |old: apex_core::Entity| -> apex_core::Entity {
@@ -311,7 +311,7 @@ impl WorldSerializer {
             }
         }
 
-        // ── Шаг 2: Relations ───────────────────────────────────
+        // ── Step 2: Relations ──────────────────────────────────
         for rel_snap in &snapshot.relations {
             let subject = match entity_map.get(&rel_snap.subject_index) {
                 Some(&e) => e,
@@ -344,7 +344,7 @@ impl WorldSerializer {
             }
         }
 
-        // ── Шаг 3: Resources (E7) ──────────────────────────────
+        // ── Step 3: Resources (E7) ─────────────────────────────
         for res in &snapshot.resources {
             match world.restore_resource_serde(&res.type_name, &res.data) {
                 Ok(true) => {}
@@ -366,10 +366,10 @@ impl WorldSerializer {
 
     // ── Diff ──────────────────────────────────────────────────
 
-    /// Вычислить разницу между старым снэпшотом и текущим состоянием мира.
+    /// Compute the difference between an old snapshot and the current world state.
     ///
-    /// Полезно для инкрементальных сохранений: вместо полного снэпшота
-    /// сохраняется только diff, который можно применить позже.
+    /// Useful for incremental saves: instead of a full snapshot,
+    /// only the diff is saved, which can be applied later.
     pub fn diff(
         old_snapshot: &WorldSnapshot,
         new_world:    &World,
@@ -377,9 +377,9 @@ impl WorldSerializer {
         Self::diff_with(old_snapshot, new_world, &mut apex_core::NoContext)
     }
 
-    /// `diff` с **контекстом (де)сериализации** (TD-44): внутренний снэпшот строится через
-    /// [`snapshot_with`](Self::snapshot_with), поэтому контекст-зависимые компоненты резолвят внешние
-    /// ссылки и в инкрементальном сейве — консистентно с полным `snapshot_with` (нет тихого `NoContext`).
+    /// `diff` with a **(de)serialization context** (TD-44): the internal snapshot is built via
+    /// [`snapshot_with`](Self::snapshot_with), so context-dependent components resolve external
+    /// references in the incremental save too — consistent with full `snapshot_with` (no silent `NoContext`).
     pub fn diff_with(
         old_snapshot: &WorldSnapshot,
         new_world:    &World,
@@ -389,14 +389,14 @@ impl WorldSerializer {
         Self::diff_snapshots(old_snapshot, &new_snapshot)
     }
 
-    /// Вычислить разницу между двумя снэпшотами.
+    /// Compute the difference between two snapshots.
     pub fn diff_snapshots(
         old: &WorldSnapshot,
         new: &WorldSnapshot,
     ) -> Result<WorldDiff, SerializationError> {
         let mut diff = WorldDiff::new();
 
-        // Старые entity по original_index для быстрого поиска
+        // Old entities keyed by original_index for fast lookup
         let old_entities: HashMap<u32, &EntitySnapshot> = old.entities
             .iter()
             .map(|e| (e.original_index, e))
@@ -407,22 +407,22 @@ impl WorldSerializer {
             .map(|e| (e.original_index, e))
             .collect();
 
-        // Удалённые entity
+        // Removed entities
         for old_entity in &old.entities {
             if !new_entities.contains_key(&old_entity.original_index) {
                 diff.removed_entities.push(old_entity.original_index);
             }
         }
 
-        // Добавленные и изменённые entity
+        // Added and modified entities
         for new_entity in &new.entities {
             match old_entities.get(&new_entity.original_index) {
                 None => {
-                    // Новая entity — добавляем целиком
+                    // New entity — add it in full
                     diff.added_entities.push(new_entity.clone());
                 }
                 Some(old_entity) => {
-                    // Существующая — сравниваем компоненты с byte-level delta
+                    // Existing — compare components with a byte-level delta
                     let old_comps: HashMap<&str, &ComponentSnapshot> = old_entity.components
                         .iter()
                         .map(|c| (c.type_name.as_str(), c))
@@ -436,11 +436,11 @@ impl WorldSerializer {
                         match old_comps.get(new_comp.type_name.as_str()) {
                             None => added.push(new_comp.clone()),
                             Some(old_comp) => {
-                                // Byte-level delta: сравниваем данные компонента
+                                // Byte-level delta: compare component data
                                 if new_comp.data != old_comp.data {
                                     modified.push(new_comp.clone());
                                 }
-                                // Если данные совпадают — не включаем в diff
+                                // If the data matches — don't include it in the diff
                             }
                         }
                     }
@@ -489,22 +489,22 @@ impl WorldSerializer {
         Ok(diff)
     }
 
-    /// Применить diff к базовому снэпшоту, получив новый снэпшот.
+    /// Apply a diff to a base snapshot, producing a new snapshot.
     ///
-    /// Это snapshot-level операция: не требует прямого доступа к `World`.
-    /// Результат можно сохранить или восстановить через `restore()`.
+    /// This is a snapshot-level operation: it does not require direct access to `World`.
+    /// The result can be saved or restored via `restore()`.
     pub fn apply_diff_to_snapshot(
         base: &WorldSnapshot,
         diff: &WorldDiff,
     ) -> Result<WorldSnapshot, SerializationError> {
         let mut result = base.clone();
 
-        // Удаляем entity
+        // Remove entities
         for idx in &diff.removed_entities {
             result.entities.retain(|e| e.original_index != *idx);
         }
 
-        // Удаляем relations
+        // Remove relations
         for rel in &diff.removed_relations {
             result.relations.retain(|r| {
                 !(r.subject_index == rel.subject_index
@@ -513,14 +513,14 @@ impl WorldSerializer {
             });
         }
 
-        // Удаляем компоненты
+        // Remove components
         for (entity_idx, type_names) in &diff.removed_components {
             if let Some(entity) = result.entities.iter_mut().find(|e| e.original_index == *entity_idx) {
                 entity.components.retain(|c| !type_names.contains(&c.type_name));
             }
         }
 
-        // Добавляем entity
+        // Add entities
         let max_index = result.entities.iter()
             .map(|e| e.original_index)
             .max()
@@ -528,21 +528,21 @@ impl WorldSerializer {
 
         for (i, entity_snap) in diff.added_entities.iter().enumerate() {
             let mut snap = entity_snap.clone();
-            // Присваиваем новый index если конфликтует
+            // Assign a new index if it conflicts
             if result.entities.iter().any(|e| e.original_index == snap.original_index) {
                 snap.original_index = max_index + 1 + i as u32;
             }
             result.entities.push(snap);
         }
 
-        // Добавляем компоненты к существующим entity
+        // Add components to existing entities
         for (entity_idx, components) in &diff.added_components {
             if let Some(entity) = result.entities.iter_mut().find(|e| e.original_index == *entity_idx) {
                 entity.components.extend(components.clone());
             }
         }
 
-        // Применяем modified компоненты (byte-level delta) — заменяем старые версии новыми
+        // Apply modified components (byte-level delta) — replace old versions with new
         for (entity_idx, components) in &diff.modified_components {
             if let Some(entity) = result.entities.iter_mut().find(|e| e.original_index == *entity_idx) {
                 for new_comp in components {
@@ -554,13 +554,13 @@ impl WorldSerializer {
             }
         }
 
-        // Добавляем relations
+        // Add relations
         result.relations.extend(diff.added_relations.clone());
 
         Ok(result)
     }
 
-    // ── Сохранение на диск ────────────────────────────────────
+    // ── Saving to disk ────────────────────────────────────────
 
     /// Atomically write `data` to `path` (§0.2a hygiene).
     ///
@@ -587,7 +587,7 @@ impl WorldSerializer {
         Ok(())
     }
 
-    /// Сохранить снэпшот в файл в указанном формате.
+    /// Save a snapshot to a file in the given format.
     pub fn write_to_file(
         path:   &Path,
         snap:   &WorldSnapshot,
@@ -601,9 +601,9 @@ impl WorldSerializer {
         Ok(())
     }
 
-    /// Прочитать снэпшот из файла, автоматически определяя формат по расширению.
+    /// Read a snapshot from a file, auto-detecting the format by extension.
     ///
-    /// Поддерживаемые расширения:
+    /// Supported extensions:
     /// - `.json` → JSON
     /// - `.bin` → Bincode
     pub fn read_from_file(path: &Path) -> Result<WorldSnapshot, SerializationError> {
@@ -616,7 +616,7 @@ impl WorldSerializer {
             "json" => WorldSnapshot::from_json(&data)?,
             "bin" => WorldSnapshot::from_bincode(&data)?,
             _ => {
-                // Пробуем JSON, потом Bincode
+                // Try JSON, then Bincode
                 if let Ok(snap) = WorldSnapshot::from_json(&data) {
                     snap
                 } else if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
@@ -638,14 +638,14 @@ impl WorldSerializer {
         Ok(snap)
     }
 
-    /// Сохранить diff в файл (всегда в бинарном формате).
+    /// Save a diff to a file (always in binary format).
     pub fn write_diff_to_file(path: &Path, diff: &WorldDiff) -> Result<(), SerializationError> {
         let data = diff.to_bincode()?;
         Self::atomic_write(path, &data)?;
         Ok(())
     }
 
-    /// Прочитать diff из файла.
+    /// Read a diff from a file.
     pub fn read_diff_from_file(path: &Path) -> Result<WorldDiff, SerializationError> {
         let data = std::fs::read(path)?;
         let diff = WorldDiff::from_bincode(&data)?;
@@ -654,11 +654,11 @@ impl WorldSerializer {
 
     // ── Prefab export ─────────────────────────────────────────────
 
-    /// Создать [`PrefabManifest`] из одной entity.
+    /// Create a [`PrefabManifest`] from a single entity.
     ///
-    /// Сериализуются только компоненты, зарегистрированные через
-    /// `world.register_component_serde::<T>()`. Relation-компоненты пропускаются; ZST-маркеры
-    /// сохраняются по присутствию (`value: null`) и переинсертятся при instantiate.
+    /// Only components registered via `world.register_component_serde::<T>()` are serialized.
+    /// Relation components are skipped; ZST markers are saved by presence (`value: null`) and
+    /// re-inserted on instantiate.
     pub fn entity_to_prefab(
         world: &World,
         entity: Entity,
@@ -666,8 +666,8 @@ impl WorldSerializer {
         Self::entity_to_prefab_with(world, entity, &mut apex_core::NoContext)
     }
 
-    /// `entity_to_prefab` с **контекстом (де)сериализации** (TD-44): компоненты с внешними ссылками
-    /// резолвят их в префаб через `ctx` — консистентно со снэпшотами. Обычные компоненты `ctx` игнорируют.
+    /// `entity_to_prefab` with a **(de)serialization context** (TD-44): components with external references
+    /// resolve them into the prefab through `ctx` — consistent with snapshots. Plain components ignore `ctx`.
     pub fn entity_to_prefab_with(
         world: &World,
         entity: Entity,
@@ -688,15 +688,15 @@ impl WorldSerializer {
                 None => continue,
             };
 
-            // Компоненты без serde пропускаем
+            // Components without serde are skipped
             let serde_fns = match &info.serde {
                 Some(s) => s,
                 None => continue,
             };
 
-            // ZST-маркер (Folder/Model/Hidden/…): данных нет, но присутствие значимо — пишем `null`,
-            // чтобы instantiate переинсертил компонент (его deserialize_fn даёт unit из `null`). Раньше
-            // `continue` молча терял маркеры на prefab/capture-пути (как и в снэпшотах).
+            // ZST marker (Folder/Model/Hidden/…): no data, but presence is meaningful — write `null`
+            // so that instantiate re-inserts the component (its deserialize_fn produces a unit from `null`).
+            // Previously `continue` silently lost markers on the prefab/capture path (as in snapshots).
             if info.size == 0 {
                 components.push(PrefabComponent {
                     type_name: info.name.to_string(),
@@ -705,7 +705,7 @@ impl WorldSerializer {
                 continue;
             }
 
-            // Сериализуем сырые данные компонента в байты через контекст (TD-44) — консистентно со снэпшотами.
+            // Serialize the component's raw data into bytes through the context (TD-44) — consistent with snapshots.
             let raw_bytes =
                 unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(location.row as usize), ctx) }
                     .map_err(|e| SerializationError::SerializeFailed {
@@ -713,7 +713,7 @@ impl WorldSerializer {
                         reason: e.to_string(),
                     })?;
 
-            // Парсим JSON-байты в serde_json::Value
+            // Parse the JSON bytes into a serde_json::Value
             let json_value: serde_json::Value = serde_json::from_slice(&raw_bytes)?;
 
             components.push(PrefabComponent {
@@ -729,10 +729,10 @@ impl WorldSerializer {
         })
     }
 
-    /// Создать [`PrefabManifest`] из entity и всей её иерархии детей.
+    /// Create a [`PrefabManifest`] from an entity and its entire hierarchy of children.
     ///
-    /// Рекурсивно обходит детей через `ChildOf` relation, создавая
-    /// вложенные `PrefabChild` записи.
+    /// Recursively traverses children through the `ChildOf` relation, creating
+    /// nested `PrefabChild` records.
     pub fn hierarchy_to_prefab(
         world: &World,
         root: Entity,
@@ -740,8 +740,8 @@ impl WorldSerializer {
         Self::hierarchy_to_prefab_with(world, root, &mut apex_core::NoContext)
     }
 
-    /// `hierarchy_to_prefab` с **контекстом (де)сериализации** (TD-44): контекст прокидывается во всю
-    /// иерархию (каждый узел — через [`entity_to_prefab_with`](Self::entity_to_prefab_with)).
+    /// `hierarchy_to_prefab` with a **(de)serialization context** (TD-44): the context is threaded through
+    /// the entire hierarchy (each node — via [`entity_to_prefab_with`](Self::entity_to_prefab_with)).
     pub fn hierarchy_to_prefab_with(
         world: &World,
         root: Entity,
@@ -749,9 +749,9 @@ impl WorldSerializer {
     ) -> Result<PrefabManifest, SerializationError> {
         let mut manifest = Self::entity_to_prefab_with(world, root, ctx)?;
 
-        // Рекурсивно собираем детей как ВСТРОЕННЫЕ (inline) поддеревья — так префаб самодостаточен:
-        // один файл инстанцируется без предзагрузки под-префабов (раньше клалось только имя ребёнка, и
-        // сам суб-манифест терялся ⇒ `instantiate` падал с `SubPrefabNotFound`).
+        // Recursively collect children as INLINE (embedded) subtrees — this makes the prefab self-contained:
+        // a single file instantiates without preloading sub-prefabs (previously only the child's name was
+        // stored, and the sub-manifest itself was lost ⇒ `instantiate` failed with `SubPrefabNotFound`).
         let children: Vec<Entity> = world.targets_of(ChildOf, root).collect();
         for child in children {
             let child_manifest = Self::hierarchy_to_prefab_with(world, child, ctx)?;
@@ -762,7 +762,7 @@ impl WorldSerializer {
     }
 }
 
-// ── Тесты ────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -874,7 +874,7 @@ mod tests {
         restored_world.register_component_serde_json::<Position>();
         restored_world.register_component_serde_json::<Health>();
 
-        // Регистрируем ChildOf, чтобы restore нашёл kind
+        // Register ChildOf so that restore finds the kind
         let p = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         let c = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);
@@ -884,8 +884,8 @@ mod tests {
 
         assert!(!entity_map.is_empty());
 
-        // Проверяем что Position восстановился для первой entity
-        let new_e1 = entity_map[&0u32]; // original_index первой созданной entity
+        // Verify that Position was restored for the first entity
+        let new_e1 = entity_map[&0u32]; // original_index of the first created entity
         let pos = restored_world.get::<Position>(new_e1).unwrap();
         assert!((pos.x - 10.0).abs() < 1e-6);
         assert!((pos.y - 20.0).abs() < 1e-6);
@@ -930,16 +930,16 @@ mod tests {
     fn diff_add_entity() {
         let mut world = setup_world();
 
-        // Старый снэпшот
+        // Old snapshot
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Добавляем entity
+        // Add an entity
         let _e3 = world.spawn((
             Position { x: 50.0, y: 60.0 },
             Health { current: 50.0, max: 50.0 },
         ));
 
-        // Вычисляем diff
+        // Compute the diff
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
 
         assert_eq!(diff.added_entities.len(), 1);
@@ -951,14 +951,14 @@ mod tests {
         let mut world = World::new();
         world.register_component_serde::<Position>();
 
-        // Спавним entity, запоминаем index
+        // Spawn entities, remember the index
         let e1 = world.spawn((Position { x: 1.0, y: 2.0 },));
         let e1_idx = e1.index();
         let _e2 = world.spawn((Position { x: 3.0, y: 4.0 },));
 
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Удаляем e1
+        // Remove e1
         world.despawn(e1);
 
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
@@ -986,7 +986,7 @@ mod tests {
         let loaded_bin = WorldSerializer::read_from_file(&bin_path).unwrap();
         assert_eq!(loaded_bin.entities.len(), snap.entities.len());
 
-        // Bincode файл должен быть меньше
+        // The Bincode file must be smaller
         let json_meta = std::fs::metadata(&json_path).unwrap();
         let bin_meta = std::fs::metadata(&bin_path).unwrap();
         assert!(bin_meta.len() < json_meta.len(),
@@ -1052,7 +1052,7 @@ mod tests {
         let mut world = setup_world();
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Модифицируем мир
+        // Modify the world
         let _e3 = world.spawn((
             Position { x: 100.0, y: 200.0 },
         ));
@@ -1061,7 +1061,7 @@ mod tests {
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
         assert_eq!(diff.added_entities.len(), 1);
 
-        // Сохраняем diff и загружаем
+        // Save the diff and load it back
         let diff_bytes = diff.to_bincode().unwrap();
         let loaded_diff = WorldDiff::from_bincode(&diff_bytes).unwrap();
         assert_eq!(loaded_diff.added_entities.len(), 1);
@@ -1074,7 +1074,7 @@ mod tests {
         let mut world = setup_world();
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Находим entity с Health через итерацию по архетипам
+        // Find the entity with Health by iterating over archetypes
         let health_id = world.registry().get_id::<Health>().unwrap();
         let e1 = *world.archetypes().iter()
             .filter(|a| a.column_index(health_id).is_some())
@@ -1083,23 +1083,23 @@ mod tests {
             .unwrap();
         *world.get_mut::<Health>(e1).unwrap() = Health { current: 50.0, max: 100.0 };
 
-        // Diff — компонент должен попасть в modified_components, а НЕ в added_components
+        // Diff — the component must land in modified_components, NOT in added_components
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
-        assert!(diff.added_entities.is_empty(), "нет новых entity");
-        assert!(diff.added_components.is_empty(), "нет добавленных компонентов");
-        assert_eq!(diff.modified_components.len(), 1, "один entity с изменённым компонентом");
-        assert_eq!(diff.modified_components[0].1.len(), 1, "один изменённый компонент");
+        assert!(diff.added_entities.is_empty(), "no new entities");
+        assert!(diff.added_components.is_empty(), "no added components");
+        assert_eq!(diff.modified_components.len(), 1, "one entity with a modified component");
+        assert_eq!(diff.modified_components[0].1.len(), 1, "one modified component");
         assert_eq!(diff.modified_components[0].1[0].type_name, "apex_serialization::serializer::tests::Health");
 
-        // Применяем diff к base snapshot — данные должны обновиться
+        // Apply the diff to the base snapshot — the data must update
         let new_snap = WorldSerializer::apply_diff_to_snapshot(&old_snap, &diff).unwrap();
         let health_snap = new_snap.entities.iter()
             .find(|e| e.original_index == diff.modified_components[0].0)
             .and_then(|e| e.components.iter().find(|c| c.type_name == "apex_serialization::serializer::tests::Health"))
             .unwrap();
-        // Проверяем что данные изменились: старые данные (100.0) → новые (50.0)
+        // Verify that the data changed: old data (100.0) → new (50.0)
         let health_str = String::from_utf8_lossy(&health_snap.data);
-        assert!(health_str.contains("50.0"), "Health.current должен быть 50.0, получено: {health_str}");
+        assert!(health_str.contains("50.0"), "Health.current must be 50.0, got: {health_str}");
     }
 
     #[test]
@@ -1107,10 +1107,10 @@ mod tests {
         let world = setup_world();
         let old_snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Ничего не меняем — diff должен быть пустым (все компоненты совпадают)
+        // Change nothing — the diff must be empty (all components match)
         let diff = WorldSerializer::diff(&old_snap, &world).unwrap();
-        assert!(diff.is_empty(), "diff должен быть пустым для неизменённого мира");
-        assert!(diff.modified_components.is_empty(), "нет изменённых компонентов");
+        assert!(diff.is_empty(), "diff must be empty for an unchanged world");
+        assert!(diff.modified_components.is_empty(), "no modified components");
     }
 
     /// F7: `#[derive(Component)]` and `#[derive(Bundle)]` work on GENERIC types
@@ -1271,14 +1271,14 @@ mod tests {
         let world = setup_world();
         let mut snap = WorldSerializer::snapshot(&world).unwrap();
 
-        // Симулируем старую версию
+        // Simulate an old version
         snap.version = 1;
 
-        // Миграция (v1 → v1 — no-op, так как v1 и есть CURRENT)
+        // Migration (v1 → v1 — no-op, since v1 is CURRENT)
         snap.migrate().unwrap();
         assert_eq!(snap.version, WorldSnapshot::CURRENT_VERSION);
 
-        // Restore после миграции
+        // Restore after migration
         let mut restored_world = World::new();
         restored_world.register_component::<RenderHandle>();
         restored_world.register_component_serde_json::<Position>();

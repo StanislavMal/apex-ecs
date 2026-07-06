@@ -1,5 +1,5 @@
-//! App-состояния (D2-6, аналог Bevy `States`): `State<S>` / `NextState<S>` +
-//! условия `in_state` / `on_enter` / `on_exit` поверх существующих run
+//! App states (D2-6, analogous to Bevy `States`): `State<S>` / `NextState<S>` +
+//! the `in_state` / `on_enter` / `on_exit` conditions on top of the existing run
 //! conditions.
 //!
 //! ```ignore
@@ -7,7 +7,7 @@
 //! enum GameState { Menu, Playing }
 //!
 //! init_state(app.world_mut(), app.scheduler_mut(), GameState::Menu);
-//! // или app.add_state(GameState::Menu) в apex-app.
+//! // or app.add_state(GameState::Menu) in apex-app.
 //!
 //! sched.add_systems(StageLabel::Update, (
 //!     sys("menu_ui", MenuUi).run_if(in_state(GameState::Menu)),
@@ -15,26 +15,26 @@
 //!     sys("save", Save).run_if(on_exit(GameState::Playing)),
 //! ));
 //!
-//! // Переход — из любой системы (ресурс NextState):
+//! // Transition — from any system (the NextState resource):
 //! next.set(GameState::Playing);
 //! ```
 //!
-//! Семантика: переход применяется эксклюзивной системой в начале кадра
-//! (`StageLabel::First`) — кадр целиком видит ОДНО состояние; `on_enter`/
-//! `on_exit`-условия истинны ровно один кадр (кадр применения перехода;
-//! `on_enter(initial)` — первый кадр после `init_state`). Это
-//! condition-модель, а не отдельные расписания Bevy `OnEnter`-schedule;
-//! функционально покрывает те же сценарии и дружит с любым этапом.
+//! Semantics: the transition is applied by an exclusive system at the start of the
+//! frame (`StageLabel::First`) — the whole frame sees ONE state; the `on_enter`/
+//! `on_exit` conditions are true for exactly one frame (the frame the transition is
+//! applied; `on_enter(initial)` — the first frame after `init_state`). This is a
+//! condition model, not separate Bevy `OnEnter` schedules; functionally it covers
+//! the same scenarios and plays well with any stage.
 
 use apex_core::world::World;
 
 use crate::{seq, Scheduler, StageLabel};
 
-/// Маркер-границы типа состояния (enum'ы со `derive(Clone, Copy, PartialEq)`).
+/// Marker/bound for a state type (enums with `derive(Clone, Copy, PartialEq)`).
 pub trait States: Clone + Copy + PartialEq + Send + Sync + 'static {}
 impl<T: Clone + Copy + PartialEq + Send + Sync + 'static> States for T {}
 
-/// Текущее состояние (ресурс; читать через [`in_state`] или напрямую).
+/// Current state (resource; read via [`in_state`] or directly).
 pub struct State<S: States>(pub S);
 
 impl<S: States> State<S> {
@@ -44,8 +44,8 @@ impl<S: States> State<S> {
     }
 }
 
-/// Запрос перехода (ресурс). Применяется в начале СЛЕДУЮЩЕГО кадра.
-/// Несколько `set` за кадр — выигрывает последний.
+/// Transition request (resource). Applied at the start of the NEXT frame.
+/// Multiple `set` calls per frame — the last one wins.
 pub struct NextState<S: States>(pub Option<S>);
 
 impl<S: States> NextState<S> {
@@ -55,8 +55,8 @@ impl<S: States> NextState<S> {
     }
 }
 
-/// Переходы ТЕКУЩЕГО кадра (ресурс, выставляется системой переходов):
-/// основа условий [`on_enter`]/[`on_exit`].
+/// Transitions of the CURRENT frame (resource, set by the transition system):
+/// the basis of the [`on_enter`]/[`on_exit`] conditions.
 pub struct StateTransitions<S: States> {
     pub entered: Option<S>,
     pub exited: Option<S>,
@@ -66,9 +66,9 @@ pub struct StateTransitions<S: States> {
     first_apply: bool,
 }
 
-/// Зарегистрировать состояние: ресурсы `State`/`NextState`/`StateTransitions`
-/// плюс эксклюзивная система применения переходов в `StageLabel::First`;
-/// `on_enter(initial)` сработает на первом кадре.
+/// Register a state: the `State`/`NextState`/`StateTransitions` resources
+/// plus an exclusive transition-applying system in `StageLabel::First`;
+/// `on_enter(initial)` fires on the first frame.
 pub fn init_state<S: States>(world: &mut World, sched: &mut Scheduler, initial: S) {
     // Registering the state twice would add a second transition system that
     // clears the flags the first one sets — on_enter/on_exit would then never be
@@ -98,7 +98,7 @@ pub fn init_state<S: States>(world: &mut World, sched: &mut Scheduler, initial: 
     );
 }
 
-/// Система применения перехода (эксклюзивная, начало кадра).
+/// Transition-applying system (exclusive, start of frame).
 fn apply_state_transition<S: States>(world: &mut World) {
     // Clear the previous frame's transitions (on_enter/on_exit last one frame) —
     // EXCEPT on the very first run, where the initial-enter set by init_state must
@@ -126,7 +126,7 @@ fn apply_state_transition<S: States>(world: &mut World) {
     tr.entered = Some(next);
 }
 
-/// Условие «мир в состоянии `s`» — для `run_if`.
+/// Condition "world is in state `s`" — for `run_if`.
 pub fn in_state<S: States>(s: S) -> impl Fn(&World) -> bool + Send + Sync + 'static {
     move |world: &World| {
         world
@@ -136,7 +136,7 @@ pub fn in_state<S: States>(s: S) -> impl Fn(&World) -> bool + Send + Sync + 'sta
     }
 }
 
-/// Условие «в ЭТОМ кадре вошли в `s`» (истинно один кадр).
+/// Condition "entered `s` on THIS frame" (true for one frame).
 pub fn on_enter<S: States>(s: S) -> impl Fn(&World) -> bool + Send + Sync + 'static {
     move |world: &World| {
         world
@@ -146,7 +146,7 @@ pub fn on_enter<S: States>(s: S) -> impl Fn(&World) -> bool + Send + Sync + 'sta
     }
 }
 
-/// Условие «в ЭТОМ кадре вышли из `s`» (истинно один кадр).
+/// Condition "exited `s` on THIS frame" (true for one frame).
 pub fn on_exit<S: States>(s: S) -> impl Fn(&World) -> bool + Send + Sync + 'static {
     move |world: &World| {
         world

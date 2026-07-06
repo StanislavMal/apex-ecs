@@ -1,9 +1,9 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// GetComponent — random-access `world.get::<T>(entity)` по 10k сущностям. Меряет путь
-// entity → location (generational records) → archetype → колонка → строка. Не покрыт другими
-// бенчами (итерация идёт по архетипам, не по entity-id). Горячий путь геймплея (доступ по хэндлу).
+// GetComponent — random-access `world.get::<T>(entity)` over 10k entities. Measures the path
+// entity → location (generational records) → archetype → column → row. Not covered by other
+// benches (iteration goes by archetypes, not by entity-id). Hot gameplay path (access by handle).
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 

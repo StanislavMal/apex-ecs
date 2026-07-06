@@ -1,10 +1,10 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// CommandsSpawn — 10k спавнов через ОТЛОЖЕННЫЙ путь `Commands` (запись в буфер + apply),
-// а не прямой `world.spawn`. Реальные игры гонят структурные изменения через Commands из
-// параллельных систем — этот путь не покрыт simple_insert (тот прямой). Меряем запись команд
-// + их применение (резервация + материализация).
+// CommandsSpawn — 10k spawns via the DEFERRED `Commands` path (write to a buffer + apply),
+// not the direct `world.spawn`. Real games drive structural changes through Commands from
+// parallel systems — this path is not covered by simple_insert (which is direct). We measure command
+// recording + their application (reservation + materialization).
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 

@@ -2,37 +2,37 @@ use crate::SystemId;
 use std::any::TypeId;
 use std::fmt;
 
-/// Метка этапа выполнения (Bevy-подобные именованные фазы).
+/// Execution stage label (Bevy-like named phases).
 ///
-/// Этапы выполняются строго последовательно: все системы этапа N
-/// завершаются до начала этапа N+1.
+/// Stages run strictly sequentially: all systems of stage N
+/// finish before stage N+1 begins.
 ///
-/// Стандартный порядок: Startup → First → PreUpdate → FixedUpdate → Update → PostUpdate → Last
+/// Standard order: Startup → First → PreUpdate → FixedUpdate → Update → PostUpdate → Last
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum StageLabel {
-    /// Однократный запуск при первом `run()`.
+    /// Runs once on the first `run()`.
     Startup,
-    /// Выполняется до всех остальных этапов.
+    /// Runs before all other stages.
     First,
-    /// Обработка ввода, получение данных извне.
+    /// Input handling, fetching external data.
     PreUpdate,
-    /// Фиксированный временной шаг (физика, детерминированная логика).
-    /// Выполняется с гарантированным фиксированным dt (например 60 Hz).
+    /// Fixed time step (physics, deterministic logic).
+    /// Runs with a guaranteed fixed dt (e.g. 60 Hz).
     FixedUpdate,
-    /// Основная игровая логика (движение, AI).
+    /// Core game logic (movement, AI).
     Update,
-    /// Пост-обработка: трансформации, коллизии, эффекты.
+    /// Post-processing: transforms, collisions, effects.
     PostUpdate,
-    /// Финальная обработка, сбор статистики.
+    /// Final processing, statistics gathering.
     Last,
-    /// Пользовательский этап с произвольным именем.
+    /// User-defined stage with an arbitrary name.
     Custom(String),
 }
 
 impl StageLabel {
-    /// Создать пользовательский этап по имени (аналог `StageLabel::Custom`).
+    /// Create a user-defined stage by name (alias for `StageLabel::Custom`).
     ///
-    /// Это краткий конструктор для группировки систем::
+    /// A short constructor for grouping systems::
     /// ```
     /// # use apex_scheduler::StageLabel;
     /// let sim = StageLabel::tag("simulation");
@@ -42,7 +42,7 @@ impl StageLabel {
         StageLabel::Custom(name.into())
     }
 
-    /// Все стандартные этапы в порядке выполнения.
+    /// All standard stages in execution order.
     pub fn standard_order() -> &'static [StageLabel] {
         &[
             StageLabel::Startup,
@@ -55,7 +55,7 @@ impl StageLabel {
         ]
     }
 
-    /// Приоритет этапа для сортировки (меньше = раньше).
+    /// Stage priority for sorting (lower = earlier).
     pub fn priority(&self) -> u8 {
         match self {
             StageLabel::Startup => 0,
@@ -85,21 +85,21 @@ impl fmt::Display for StageLabel {
     }
 }
 
-/// Stage — группа систем которые можно выполнять параллельно.
+/// Stage — a group of systems that can run in parallel.
 ///
-/// Все ParSystem внутри одного Stage не имеют Read/Write конфликтов
-/// между собой (инвариант гарантируется Scheduler::compile).
-/// Sequential системы всегда выполняются одиночно в своём Stage.
+/// All ParSystems within a single Stage have no Read/Write conflicts
+/// with each other (invariant guaranteed by Scheduler::compile).
+/// Sequential systems always run alone in their Stage.
 #[derive(Debug, Clone)]
 pub struct Stage {
-    /// Метка этапа, к которому относится эта группа.
+    /// Label of the stage this group belongs to.
     pub label: StageLabel,
     pub system_ids: Vec<SystemId>,
-    /// True если все системы этого Stage — ParSystem без конфликтов.
-    /// False если хотя бы одна Sequential система присутствует.
+    /// True if all systems of this Stage are conflict-free ParSystems.
+    /// False if at least one Sequential system is present.
     pub(crate) all_parallel: bool,
-    /// TypeId событий, которые системы этого Stage могут писать (emit).
-    /// После выполнения Stage вызывается per-Stage flush именно этих типов.
+    /// TypeIds of events the systems of this Stage may emit.
+    /// After the Stage runs, a per-Stage flush of exactly these types is invoked.
     pub(crate) emit_event_types: Vec<TypeId>,
 }
 
@@ -113,13 +113,13 @@ impl Stage {
         }
     }
 
-    /// Можно ли запускать системы этого Stage параллельно?
+    /// Can the systems of this Stage be run in parallel?
     pub fn is_parallelizable(&self) -> bool {
         self.all_parallel && self.system_ids.len() > 1
     }
 
-    /// Возвращает `true`, если Stage был скомпилирован в параллельном режиме
-    /// (все системы внутри не имеют конфликтов доступа).
+    /// Returns `true` if the Stage was compiled in parallel mode
+    /// (all systems within have no access conflicts).
     pub fn is_parallel(&self) -> bool {
         self.all_parallel
     }

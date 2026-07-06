@@ -33,7 +33,7 @@ pub trait Benchmark {
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark modules (всегда доступны, feature-gating внутри)
+// Benchmark modules (always available, feature-gating inside)
 // ---------------------------------------------------------------------------
 pub mod apex;
 #[cfg(feature = "flecs")]

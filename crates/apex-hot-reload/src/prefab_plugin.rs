@@ -1,9 +1,9 @@
-//! PrefabPlugin — интеграция префабов с AssetRegistry и hot-reload.
+//! PrefabPlugin — integration of prefabs with AssetRegistry and hot-reload.
 //!
-//! Позволяет загружать `.prefab.json` файлы как ассеты,
-//! автоматически отслеживать их изменения и перезагружать кеш.
+//! Lets you load `.prefab.json` files as assets,
+//! automatically track their changes, and reload the cache.
 //!
-//! # Использование
+//! # Usage
 //!
 //! ```ignore
 //! use apex_hot_reload::PrefabPlugin;
@@ -11,10 +11,10 @@
 //! let mut plugin = PrefabPlugin::new();
 //! let mut registry = apex_hot_reload::AssetRegistry::new();
 //!
-//! // Загрузить все префабы из директории
+//! // Load all prefabs from a directory
 //! plugin.load_directory("assets/prefabs/", &mut registry).unwrap();
 //!
-//! // В game loop — проверить изменения
+//! // In the game loop — check for changes
 //! if let Some(changes) = check_for_changes() {
 //!     for change in changes {
 //!         plugin.on_asset_changed(&change);
@@ -52,34 +52,34 @@ pub struct PrefabInstance {
     pub overrides: Vec<PrefabComponent>,
 }
 
-/// Ассет, представляющий загруженный префаб.
+/// An asset representing a loaded prefab.
 ///
-/// Хранит манифест префаба и список инстансов, созданных из него
-/// (для поддержки hot-reload — пересоздания entity при изменении файла).
+/// Stores the prefab manifest and the list of instances created from it
+/// (to support hot-reload — recreating entities when the file changes).
 #[derive(Debug, Clone)]
 pub struct PrefabAsset {
-    /// Манифест префаба (компоненты + дети).
+    /// The prefab manifest (components + children).
     pub manifest: PrefabManifest,
-    /// Инстансы, созданные из этого префаба.
-    /// Заполняется внешним кодом при спавне (см. [`PrefabPlugin::track_entity`]).
+    /// Instances created from this prefab.
+    /// Populated by external code on spawn (see [`PrefabPlugin::track_entity`]).
     ///
     /// Each entry keeps its own parent/overrides so hot-reload recreates every
     /// instance in place, not a single collapsed one (E4 fix).
     pub spawned_entities: Vec<PrefabInstance>,
 }
 
-/// Плагин для интеграции префабов с AssetRegistry.
+/// Plugin for integrating prefabs with AssetRegistry.
 ///
-/// * Сканирует директорию на `.prefab.json` файлы
-/// * Регистрирует их в `AssetRegistry`
-/// * Загружает в `PrefabLoader`
-/// * При изменении файла — перезагружает префаб в кеш
+/// * Scans a directory for `.prefab.json` files
+/// * Registers them in `AssetRegistry`
+/// * Loads them into `PrefabLoader`
+/// * On a file change — reloads the prefab into the cache
 pub struct PrefabPlugin {
-    /// Внутренний загрузчик префабов с кешем.
+    /// The internal prefab loader with a cache.
     loader: PrefabLoader,
-    /// AssetId → имя префаба (для поиска в loader после перезагрузки).
+    /// AssetId → prefab name (for lookup in the loader after reload).
     prefab_names: HashMap<u32, String>,
-    /// AssetId → информация о загруженном префабе (опционально).
+    /// AssetId → info about the loaded prefab (optional).
     assets: HashMap<u32, PrefabAsset>,
 }
 
@@ -92,12 +92,12 @@ impl PrefabPlugin {
         }
     }
 
-    /// Загрузить все `.prefab.json` файлы из указанной директории.
+    /// Load all `.prefab.json` files from the given directory.
     ///
-    /// Каждый найденный файл:
-    /// 1. Регистрируется в `AssetRegistry` (получает `AssetId`)
-    /// 2. Загружается в `PrefabLoader`
-    /// 3. Сохраняется маппинг `AssetId → имя префаба`
+    /// Each file found is:
+    /// 1. Registered in `AssetRegistry` (gets an `AssetId`)
+    /// 2. Loaded into `PrefabLoader`
+    /// 3. The `AssetId → prefab name` mapping is stored
     pub fn load_directory(
         &mut self,
         dir: &Path,
@@ -128,9 +128,9 @@ impl PrefabPlugin {
         Ok(())
     }
 
-    /// Загрузить один `.prefab.json` файл.
+    /// Load a single `.prefab.json` file.
     ///
-    /// Возвращает `AssetId` зарегистрированного ассета.
+    /// Returns the `AssetId` of the registered asset.
     pub fn load_file(
         &mut self,
         path: &Path,
@@ -139,7 +139,7 @@ impl PrefabPlugin {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let id = registry.register(canonical.clone());
 
-        // Читаем и загружаем в PrefabLoader
+        // Read and load into PrefabLoader
         let content = std::fs::read_to_string(path).map_err(|e| HotReloadError::FileRead {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -153,7 +153,7 @@ impl PrefabPlugin {
 
         let prefab_name = manifest.name.clone();
 
-        // Загружаем в кеш
+        // Load into the cache
         self.loader
             .load_json(&content)
             .map_err(|e| HotReloadError::Deserialize {
@@ -181,13 +181,13 @@ impl PrefabPlugin {
         Ok(id)
     }
 
-    /// Обработать изменение файла префаба.
+    /// Handle a change to a prefab file.
     ///
-    /// Перезагружает префаб в кеш `PrefabLoader`.
-    /// Если префаб был загружен — обновляет манифест в `assets`.
+    /// Reloads the prefab into the `PrefabLoader` cache.
+    /// If the prefab was loaded — updates the manifest in `assets`.
     ///
-    /// **Не пересоздаёт entity** — используйте [`reapply_asset`](PrefabPlugin::reapply_asset)
-    /// после вызова этого метода, если нужно пересоздать entity из обновлённого префаба.
+    /// **Does not recreate entities** — use [`reapply_asset`](PrefabPlugin::reapply_asset)
+    /// after calling this method if you need to recreate entities from the updated prefab.
     pub fn on_asset_changed(&mut self, change: &AssetChange) -> Result<(), HotReloadError> {
         let path = &change.path;
 
@@ -196,7 +196,7 @@ impl PrefabPlugin {
             reason: e.to_string(),
         })?;
 
-        // Перезагружаем в кеш (load_json перезаписывает существующий префаб)
+        // Reload into the cache (load_json overwrites the existing prefab)
         self.loader
             .load_json(&content)
             .map_err(|e| HotReloadError::Deserialize {
@@ -204,7 +204,7 @@ impl PrefabPlugin {
                 reason: e.to_string(),
             })?;
 
-        // Обновляем манифест в assets
+        // Update the manifest in assets
         if let Ok(manifest) = serde_json::from_str::<PrefabManifest>(&content) {
             let prefab_name = manifest.name.clone();
             if let Some(asset) = self.assets.get_mut(&change.id.0) {
@@ -222,32 +222,32 @@ impl PrefabPlugin {
         Ok(())
     }
 
-    /// Получить ссылку на внутренний PrefabLoader.
+    /// Get a reference to the internal PrefabLoader.
     pub fn loader(&self) -> &PrefabLoader {
         &self.loader
     }
 
-    /// Получить мутабельную ссылку на внутренний PrefabLoader.
+    /// Get a mutable reference to the internal PrefabLoader.
     pub fn loader_mut(&mut self) -> &mut PrefabLoader {
         &mut self.loader
     }
 
-    /// Получить информацию об ассете префаба по AssetId.
+    /// Get info about a prefab asset by AssetId.
     pub fn get_asset(&self, id: AssetId) -> Option<&PrefabAsset> {
         self.assets.get(&id.0)
     }
 
-    /// Получить мутабельную ссылку на ассет префаба.
+    /// Get a mutable reference to a prefab asset.
     pub fn get_asset_mut(&mut self, id: AssetId) -> Option<&mut PrefabAsset> {
         self.assets.get_mut(&id.0)
     }
 
-    /// Имя префаба по AssetId.
+    /// Prefab name by AssetId.
     pub fn prefab_name(&self, id: AssetId) -> Option<&str> {
         self.prefab_names.get(&id.0).map(|s| s.as_str())
     }
 
-    /// Количество загруженных префабов.
+    /// Number of loaded prefabs.
     pub fn len(&self) -> usize {
         self.loader.len()
     }
@@ -256,10 +256,10 @@ impl PrefabPlugin {
         self.loader.is_empty()
     }
 
-    /// Добавить entity в список отслеживаемых для указанного префаба.
+    /// Add an entity to the tracked list for the given prefab.
     ///
-    /// При вызове [`reapply_asset`](PrefabPlugin::reapply_asset) все отслеживаемые entity
-    /// будут деспавнены и созданы заново из обновлённого манифеста.
+    /// On a call to [`reapply_asset`](PrefabPlugin::reapply_asset) all tracked entities
+    /// will be despawned and recreated from the updated manifest.
     ///
     /// This records the instance with no parent and no overrides. When the
     /// instance was spawned under a parent or with per-instance overrides, use
@@ -292,7 +292,7 @@ impl PrefabPlugin {
         }
     }
 
-    /// Пересоздать все инстансы префаба по `AssetId`.
+    /// Recreate all instances of a prefab by `AssetId`.
     ///
     /// For **every** tracked instance (E4 fix — not just one):
     /// 1. Recursively despawns the old root entity (together with its children).
@@ -379,9 +379,9 @@ impl PrefabPlugin {
         Ok(())
     }
 
-    /// Пересоздать все entity из всех зарегистрированных префабов.
+    /// Recreate all entities from all registered prefabs.
     ///
-    /// Полезно для полного обновления сцены после массовых изменений.
+    /// Useful for a full scene refresh after bulk changes.
     pub fn reapply_all(&mut self, world: &mut World) -> Result<(), HotReloadError> {
         let ids: Vec<AssetId> = self.prefab_names.keys().copied().map(AssetId).collect();
         for id in ids {
@@ -519,7 +519,7 @@ mod tests {
         let mut plugin = PrefabPlugin::new();
         let mut registry = AssetRegistry::new();
 
-        // Создаём временный .prefab.json файл
+        // Create a temporary .prefab.json file
         let dir = std::env::temp_dir().join("apex_prefab_test");
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("test_entity.prefab.json");
@@ -551,7 +551,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file_path = dir.join("reload_test.prefab.json");
 
-        // Первая версия
+        // First version
         std::fs::write(
             &file_path,
             r#"{"name": "V1", "components": []}"#,
@@ -561,7 +561,7 @@ mod tests {
         let id = plugin.load_file(&file_path, &mut registry).unwrap();
         assert!(plugin.loader().has("V1"));
 
-        // Вторая версия — перезаписываем файл
+        // Second version — overwrite the file
         std::fs::write(
             &file_path,
             r#"{"name": "V2", "components": []}"#,
@@ -574,7 +574,7 @@ mod tests {
         };
         plugin.on_asset_changed(&change).unwrap();
 
-        // После reload — имя должно обновиться
+        // After reload — the name must update
         assert!(plugin.loader().has("V2"));
         assert_eq!(plugin.prefab_name(id), Some("V2"));
 
@@ -591,7 +591,7 @@ mod tests {
         let dir = std::env::temp_dir().join("apex_prefab_dir_test");
         let _ = std::fs::create_dir_all(&dir);
 
-        // Создаём несколько prefab файлов
+        // Create several prefab files
         std::fs::write(
             dir.join("a.prefab.json"),
             r#"{"name": "A", "components": []}"#,
@@ -603,7 +603,7 @@ mod tests {
         )
         .unwrap();
 
-        // Не prefab файл — игнорируется
+        // Not a prefab file — ignored
         std::fs::write(dir.join("not_prefab.json"), r#"{}"#).unwrap();
 
         plugin.load_directory(&dir, &mut registry).unwrap();

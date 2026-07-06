@@ -1,29 +1,29 @@
-//! apex-serialization — сериализация/десериализация состояния ECS мира.
+//! apex-serialization — serialization/deserialization of ECS world state.
 //!
-//! # Концепция
+//! # Concept
 //!
-//! Не все компоненты сериализуются — только те, которые явно зарегистрированы
-//! через `world.register_component_serde::<T>()`. Это разделение принципиально:
+//! Not all components are serialized — only those explicitly registered via
+//! `world.register_component_serde::<T>()`. This split is fundamental:
 //!
 //! **Serializable** (persist state):
 //!   `Position`, `Velocity`, `Health`, `Name`, `Inventory`, …
 //!
-//! **Non-serializable** (runtime state, пересоздаётся):
+//! **Non-serializable** (runtime state, recreated):
 //!   `RenderHandle`, `PhysicsBody`, `AudioSource`, `GpuBuffer`, …
 //!
-//! # Использование
+//! # Usage
 //!
 //! ```ignore
-//! // Сохранение
+//! // Saving
 //! let snapshot = WorldSerializer::snapshot(&world)?;
 //! let json = snapshot.to_json()?;
 //! std::fs::write("save.json", &json)?;
 //!
-//! // Загрузка
+//! // Loading
 //! let json = std::fs::read("save.json")?;
 //! let snapshot = WorldSnapshot::from_json(&json)?;
 //! let entity_map = WorldSerializer::restore(&mut world, &snapshot)?;
-//! // entity_map: HashMap<old_index, new_Entity> — для патча внешних ссылок
+//! // entity_map: HashMap<old_index, new_Entity> — for patching external references
 //! ```
 
 pub mod prefab;

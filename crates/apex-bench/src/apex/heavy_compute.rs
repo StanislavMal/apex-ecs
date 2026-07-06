@@ -2,8 +2,8 @@ use apex_core::prelude::*;
 use cgmath::{Matrix4, Rad, Vector3, SquareMatrix, Transform as _};
 use crate::{Position, Rotation, Velocity};
 
-// HeavyCompute — тяжёлые вычисления: invert матрицы + transform_vector
-// CachedQuery кешируется через QueryCache внутри query()
+// HeavyCompute — heavy computation: matrix invert + transform_vector
+// CachedQuery is cached via QueryCache inside query()
 pub struct HeavyCompute {
     world: World,
 }
@@ -29,11 +29,11 @@ impl HeavyCompute {
     }
 
     pub fn run(&mut self) {
-        // Матрица читается (Read), а не пишется обратно: иначе результат вырождается за ~1M
-        // инверсий (random-walk FP-дрейф → NaN/денормалы → cgmath None / на x86 денормальная
-        // арифметика ~100× медленнее → недетерминированный death-spiral). Чтение healthy-seed
-        // каждую итерацию делает бенч детерминированным и честным для всех движков; нагрузка
-        // (100 инверсий на сущность + запись позиции) сохранена. unwrap_or — страховка.
+        // The matrix is read (Read), not written back: otherwise the result degenerates over ~1M
+        // inversions (random-walk FP drift → NaN/denormals → cgmath None / on x86 denormal
+        // arithmetic ~100× slower → a nondeterministic death-spiral). Reading a healthy seed
+        // on every iteration makes the bench deterministic and fair for all engines; the load
+        // (100 inversions per entity + position write) is preserved. unwrap_or — a safeguard.
         self.world.query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
             .par_for_each_mut(|_, (mat, mut pos)| {
                 let mut m = *mat;

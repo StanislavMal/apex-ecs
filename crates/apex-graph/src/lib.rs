@@ -4,42 +4,42 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use thunderdome::{Arena, Index};
 
-/// Универсальный направленный граф.
+/// Generic directed graph.
 ///
-/// - N: данные узла
-/// - W: вес ребра (или любые данные ребра)
+/// - N: node data
+/// - W: edge weight (or any edge data)
 ///
-/// Важное свойство реализации:
-/// - `Index::slot()` используется как адресация в adjacency-векторах.
-/// - Узлы/рёбра можно удалять: образуются "дырки" (sparse slots).
-///   Алгоритмы должны работать в slot-space, а не через `nodes.len()`.
+/// Important implementation property:
+/// - `Index::slot()` is used as the addressing into the adjacency vectors.
+/// - Nodes/edges can be removed: this creates "holes" (sparse slots).
+///   Algorithms must operate in slot-space, not via `nodes.len()`.
 pub struct Graph<N, W> {
     pub(crate) nodes: Arena<N>,
     pub(crate) edges: Arena<EdgeData<W>>,
 
-    /// Исходящие рёбра для каждого slot узла (храним индексы рёбер).
+    /// Outgoing edges for each node slot (we store edge indices).
     pub(crate) adjacency_out: Vec<SmallVec<[Index; 4]>>,
-    /// Входящие рёбра для каждого slot узла (храним индексы рёбер).
+    /// Incoming edges for each node slot (we store edge indices).
     pub(crate) adjacency_in: Vec<SmallVec<[Index; 4]>>,
 
-    /// Кэш топологической сортировки.
+    /// Cache of the topological sort.
     pub(crate) cached_topological: Option<Vec<Index>>,
-    /// Флаг изменения графа.
+    /// Graph-modification flag.
     pub(crate) dirty: bool,
 
-    // ── Переиспользуемые буферы для BFS/DFS ──────────────────────
-    /// Буфер visited для has_path/bfs — избегает аллокации на каждый вызов.
+    // ── Reusable buffers for BFS/DFS ──────────────────────
+    /// visited buffer for has_path/bfs — avoids an allocation on each call.
     pub(crate) bfs_visited: Vec<bool>,
-    /// Буфер очереди для has_path/bfs — избегает аллокации на каждый вызов.
+    /// queue buffer for has_path/bfs — avoids an allocation on each call.
     pub(crate) bfs_queue: Vec<Index>,
 
-    /// Буфер visited для dfs — избегает аллокации на каждый вызов.
+    /// visited buffer for dfs — avoids an allocation on each call.
     pub(crate) dfs_visited: Vec<bool>,
-    /// Буфер стека для dfs — избегает аллокации на каждый вызов.
+    /// stack buffer for dfs — avoids an allocation on each call.
     pub(crate) dfs_stack: Vec<Index>,
 }
 
-/// Данные ребра.
+/// Edge data.
 #[derive(Clone)]
 pub struct EdgeData<W> {
     pub from: Index,
@@ -98,25 +98,25 @@ impl<N, W> Graph<N, W> {
         self.cached_topological = None;
     }
 
-    // ── Узлы ─────────────────────────────────────────────────────────────
+    // ── Nodes ─────────────────────────────────────────────────────────────
 
-    /// Добавить узел, вернуть его Index.
+    /// Add a node, return its Index.
     pub fn add_node(&mut self, data: N) -> Index {
         self.mark_dirty();
         let idx = self.nodes.insert(data);
         let slot = self.index_to_usize(idx);
         self.ensure_slot_capacity(slot);
 
-        // Если slot переиспользован после удаления — гарантируем чистоту adjacency.
+        // If the slot was reused after removal — guarantee clean adjacency.
         self.adjacency_out[slot].clear();
         self.adjacency_in[slot].clear();
 
         idx
     }
 
-    /// Удалить узел и все инцидентные рёбра.
+    /// Remove a node and all incident edges.
     ///
-    /// Возвращает данные узла (если существовал).
+    /// Returns the node data (if it existed).
     pub fn remove_node(&mut self, node: Index) -> Option<N> {
         self.nodes.get(node)?;
 
@@ -125,8 +125,8 @@ impl<N, W> Graph<N, W> {
         let slot = self.index_to_usize(node);
         self.ensure_slot_capacity(slot);
 
-        // Собираем все инцидентные рёбра. Возможны дубликаты (self-loop),
-        // поэтому делаем dedup через FxHashSet.
+        // Collect all incident edges. Duplicates are possible (self-loop),
+        // so we dedup via FxHashSet.
         use rustc_hash::FxHashSet;
         let mut incident: FxHashSet<Index> = FxHashSet::default();
 
@@ -137,16 +137,16 @@ impl<N, W> Graph<N, W> {
             incident.insert(e);
         }
 
-        // Удаляем рёбра.
+        // Remove the edges.
         for e in incident {
             let _ = self.remove_edge(e);
         }
 
-        // Очищаем adjacency списки slot.
+        // Clear the slot's adjacency lists.
         self.adjacency_out[slot].clear();
         self.adjacency_in[slot].clear();
 
-        // Удаляем сам узел.
+        // Remove the node itself.
         self.nodes.remove(node)
     }
 
@@ -164,9 +164,9 @@ impl<N, W> Graph<N, W> {
         self.nodes.get_mut(idx)
     }
 
-    // ── Рёбра ────────────────────────────────────────────────────────────
+    // ── Edges ────────────────────────────────────────────────────────────
 
-    /// Безопасный вариант: возвращает ошибку если `from/to` не существуют.
+    /// Safe variant: returns an error if `from/to` do not exist.
     pub fn try_add_edge(&mut self, from: Index, to: Index, weight: W) -> Result<Index, GraphError> {
         if self.nodes.get(from).is_none() || self.nodes.get(to).is_none() {
             return Err(GraphError::NodeNotFound);
@@ -186,17 +186,17 @@ impl<N, W> Graph<N, W> {
         Ok(edge)
     }
 
-    /// Добавить направленное ребро from → to.
+    /// Add a directed edge from → to.
     ///
-    /// Совместимо со старым API (panic при неверных узлах).
+    /// Compatible with the old API (panics on invalid nodes).
     pub fn add_edge(&mut self, from: Index, to: Index, weight: W) -> Index {
         self.try_add_edge(from, to, weight)
             .expect("add_edge: node not found")
     }
 
-    /// Удалить ребро.
+    /// Remove an edge.
     pub fn remove_edge(&mut self, edge: Index) -> Option<EdgeData<W>> {
-        // Сначала копируем данные ребра, чтобы разорвать borrow
+        // First copy the edge data to break the borrow
         let (from, to) = {
             let e = self.edges.get(edge)?;
             (e.from, e.to)
@@ -216,7 +216,7 @@ impl<N, W> Graph<N, W> {
         self.edges.remove(edge)
     }
 
-    /// Обновить endpoints ребра (from/to), с корректным обновлением adjacency.
+    /// Update an edge's endpoints (from/to), correctly updating adjacency.
     pub fn update_edge_endpoints(
         &mut self,
         edge: Index,
@@ -232,7 +232,7 @@ impl<N, W> Graph<N, W> {
 
         self.mark_dirty();
 
-        // Старые значения.
+        // Old values.
         let (old_from, old_to) = {
             let e = self.edges.get(edge).ok_or(GraphError::EdgeNotFound)?;
             (e.from, e.to)
@@ -255,7 +255,7 @@ impl<N, W> Graph<N, W> {
         self.adjacency_out[new_from_slot].push(edge);
         self.adjacency_in[new_to_slot].push(edge);
 
-        // Обновляем данные edge в арене.
+        // Update the edge data in the arena.
         let e_mut = self.edges.get_mut(edge).ok_or(GraphError::EdgeNotFound)?;
         e_mut.from = new_from;
         e_mut.to = new_to;
@@ -263,7 +263,7 @@ impl<N, W> Graph<N, W> {
         Ok(())
     }
 
-    /// Обновить вес ребра.
+    /// Update an edge's weight.
     pub fn update_edge_weight(&mut self, edge: Index, new_weight: W) -> Result<(), GraphError> {
         self.mark_dirty();
         let e = self.edges.get_mut(edge).ok_or(GraphError::EdgeNotFound)?;
@@ -294,9 +294,9 @@ impl<N, W> Graph<N, W> {
         self.edges.get_mut(idx).map(|e| &mut e.weight)
     }
 
-    // ── Навигация ─────────────────────────────────────────────────────────
+    // ── Navigation ─────────────────────────────────────────────────────────
 
-    /// Узлы из которых есть ребро в данный.
+    /// Nodes that have an edge into the given node.
     pub fn predecessors(&self, node: Index) -> impl Iterator<Item = Index> + '_ {
         let slot = self.index_to_usize(node);
         self.adjacency_in
@@ -307,7 +307,7 @@ impl<N, W> Graph<N, W> {
             .filter(move |&pred| self.nodes.get(pred).is_some())
     }
 
-    /// Узлы в которые есть ребро из данного.
+    /// Nodes that have an edge from the given node.
     pub fn successors(&self, node: Index) -> impl Iterator<Item = Index> + '_ {
         let slot = self.index_to_usize(node);
         self.adjacency_out
@@ -318,7 +318,7 @@ impl<N, W> Graph<N, W> {
             .filter(move |&succ| self.nodes.get(succ).is_some())
     }
 
-    // ── Статистика/итераторы ──────────────────────────────────────────────
+    // ── Statistics/iterators ──────────────────────────────────────────────
 
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -328,17 +328,17 @@ impl<N, W> Graph<N, W> {
         self.edges.len()
     }
 
-    /// Итерация по всем живым узлам.
+    /// Iterate over all live nodes.
     pub fn nodes(&self) -> impl Iterator<Item = (Index, &N)> {
         self.nodes.iter()
     }
 
-    /// Итерация по всем живым рёбрам.
+    /// Iterate over all live edges.
     pub fn edges(&self) -> impl Iterator<Item = (Index, &EdgeData<W>)> {
         self.edges.iter()
     }
 
-    /// Текущая "ёмкость" slot-space (в т.ч. дырки).
+    /// Current slot-space "capacity" (including holes).
     #[inline]
     pub fn slot_capacity(&self) -> usize {
         self.adjacency_out.len().max(self.adjacency_in.len())
@@ -387,7 +387,7 @@ mod tests {
 
         let removed = g.remove_node(b);
         assert_eq!(removed, Some("B"));
-        // Осталось только ребро A->C
+        // Only the A->C edge remains
         assert_eq!(g.node_count(), 2);
         assert_eq!(g.edge_count(), 1);
     }

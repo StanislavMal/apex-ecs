@@ -1,11 +1,11 @@
-//! `ScriptableRegistrar` — трейт, реализуемый через `#[derive(Scriptable)]`.
+//! `ScriptableRegistrar` — a trait implemented via `#[derive(Scriptable)]`.
 //!
-//! Обеспечивает двустороннее преобразование компонента в/из `mlua::Value`
-//! и регистрацию конструктора в Lua.
+//! Provides two-way conversion of a component to/from `mlua::Value`
+//! and registration of its constructor in Lua.
 //!
-//! Также содержит `ResourceBinding` — для доступа к глобальным ресурсам из скриптов.
+//! Also contains `ResourceBinding` — for accessing global resources from scripts.
 //!
-//! # Ручная реализация
+//! # Manual implementation
 //!
 //! ```ignore
 //! struct Health { current: f32, max: f32 }
@@ -42,59 +42,59 @@
 //! }
 //! ```
 
-/// Трейт для компонентов, доступных из Lua-скриптов.
+/// Trait for components accessible from Lua scripts.
 ///
-/// Генерируется автоматически через `#[derive(Scriptable)]`.
-/// Можно реализовать вручную для нестандартных типов.
+/// Generated automatically via `#[derive(Scriptable)]`.
+/// Can be implemented manually for non-standard types.
 pub trait ScriptableRegistrar: Sized + 'static {
-    /// Строковое имя типа — используется как ключ в таблице внутри query-итератора.
+    /// String type name — used as the key in the table inside the query iterator.
     fn type_name_str() -> &'static str;
 
-    /// Имена полей структуры — для документации и отладки.
+    /// Names of the struct fields — for documentation and debugging.
     fn field_names() -> &'static [&'static str];
 
-    /// Конвертировать значение компонента в mlua::Value (обычно Table).
+    /// Convert the component value into an mlua::Value (usually a Table).
     fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value>;
 
-    /// Восстановить компонент из mlua::Value.
+    /// Reconstruct the component from an mlua::Value.
     ///
-    /// Возвращает `None` если Value не является Table или поля отсутствуют/имеют
-    /// неверный тип. Это штатная ситуация при работе со скриптами.
+    /// Returns `None` if the Value is not a Table or the fields are missing/have
+    /// the wrong type. This is a normal situation when working with scripts.
     fn from_lua(val: &mlua::Value) -> Option<Self>;
 
-    /// Зарегистрировать конструктор типа в глобалах Lua.
+    /// Register the type's constructor in the Lua globals.
     ///
-    /// Например: `Position.new(x, y)`, `TileKind.Floor = 0`
+    /// For example: `Position.new(x, y)`, `TileKind.Floor = 0`
     ///
-    /// Вызывается один раз при `ScriptEngine::register_component::<T>()`.
+    /// Called once during `ScriptEngine::register_component::<T>()`.
     fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()>;
 }
 
 // ── ResourceBinding ─────────────────────────────────────────────
 
-/// Информация о ресурсе, зарегистрированном для доступа из Lua-скриптов.
+/// Information about a resource registered for access from Lua scripts.
 ///
-/// Аналогичен `ComponentBinding`, но для глобальных ресурсов (`World.resources`).
+/// Analogous to `ComponentBinding`, but for global resources (`World.resources`).
 #[derive(Clone)]
 pub struct ResourceBinding {
-    /// Строковое имя типа ресурса.
+    /// String type name of the resource.
     pub name: &'static str,
-    /// Прочитать ресурс из `&World` → mlua::Value.
-    /// Принимает Lua чтобы создавать таблицы.
+    /// Read the resource from `&World` → mlua::Value.
+    /// Takes Lua so it can create tables.
     pub read:   fn(&mlua::Lua, &apex_core::World) -> mlua::Result<mlua::Value>,
-    /// Записать ресурс в `&mut World` из mlua::Value.
-    /// Возвращает `false` если тип неверен.
+    /// Write the resource into `&mut World` from an mlua::Value.
+    /// Returns `false` if the type is wrong.
     pub write:  fn(&mlua::Value, &mut apex_core::World) -> bool,
 }
 
 // ── EventBinding ────────────────────────────────────────────────
 
-/// Информация о событии, зарегистрированном для отправки из Lua-скриптов.
+/// Information about an event registered for emission from Lua scripts.
 #[derive(Clone)]
 pub struct EventBinding {
-    /// Строковое имя типа события.
+    /// String type name of the event.
     pub name: &'static str,
-    /// Отправить событие в `&mut World` (принимает mlua::Value, конвертирует в T).
-    /// Возвращает `false` если событие не зарегистрировано или тип неверен.
+    /// Emit the event into `&mut World` (takes mlua::Value, converts to T).
+    /// Returns `false` if the event is not registered or the type is wrong.
     pub emit: fn(&mlua::Value, &mut apex_core::World) -> bool,
 }

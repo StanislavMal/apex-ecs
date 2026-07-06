@@ -2,53 +2,53 @@ use crate::{Scheduler, SystemId};
 use std::any::TypeId;
 use std::marker::PhantomData;
 
-/// Запись о системе в конвейере.
+/// A record of a system in the pipeline.
 struct PipelineEntry {
     name: String,
     role: PipelineRole,
 }
 
-/// Роль системы в конвейере — используется для валидации AccessDescriptor.
+/// Role of a system in the pipeline — used for AccessDescriptor validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineRole {
-    /// Только отправляет событие — Emit<E> обязателен.
+    /// Only emits the event — Emit<E> is required.
     Producer,
-    /// Читает и перевыпускает — Listen<E> + Emit<E> обязательны.
+    /// Reads and re-emits — Listen<E> + Emit<E> are required.
     Transformer,
-    /// Только читает — Listen<E> обязателен.
+    /// Only reads — Listen<E> is required.
     Consumer,
 }
 
-/// Строитель конвейера событий.
+/// Event pipeline builder.
 ///
-/// Создаётся через `Scheduler::event_pipeline::<E>()`.
-/// Зависимости добавляются в Scheduler при вызове `build()`.
+/// Created via `Scheduler::event_pipeline::<E>()`.
+/// Dependencies are added to the Scheduler when `build()` is called.
 pub struct EventPipelineBuilder<E: Send + Sync + 'static> {
     entries: Vec<PipelineEntry>,
     _phantom: PhantomData<E>,
 }
 
-// ── Ошибки валидации ──────────────────────────────────────────
+// ── Validation errors ──────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum PipelineValidationError {
-    /// Система объявлена как Producer, но не имеет Emit<E>.
+    /// The system is declared as Producer but has no Emit<E>.
     ProducerMissingEmit {
         system_name: String,
         event: &'static str,
     },
-    /// Система объявлена как Consumer, но не имеет Listen<E>.
+    /// The system is declared as Consumer but has no Listen<E>.
     ConsumerMissingListen {
         system_name: String,
         event: &'static str,
     },
-    /// Система объявлена как Transformer, но не имеет Listen<E> или Emit<E>.
+    /// The system is declared as Transformer but lacks Listen<E> or Emit<E>.
     TransformerIncomplete {
         system_name: String,
         event: &'static str,
         missing: &'static str,
     },
-    /// Система не найдена в планировщике.
+    /// The system was not found in the scheduler.
     SystemNotFound { system_name: String },
 }
 
@@ -57,14 +57,14 @@ impl std::fmt::Display for PipelineValidationError {
         match self {
             Self::ProducerMissingEmit { system_name, event } => write!(
                 f,
-                "Pipeline: система '{}' объявлена как Producer для '{}', \
-                           но не имеет Emit<{}>. Добавь в type Events.",
+                "Pipeline: system '{}' is declared as Producer for '{}', \
+                           but has no Emit<{}>. Add it to type Events.",
                 system_name, event, event
             ),
             Self::ConsumerMissingListen { system_name, event } => write!(
                 f,
-                "Pipeline: система '{}' объявлена как Consumer для '{}', \
-                           но не имеет Listen<{}>. Добавь в type Events.",
+                "Pipeline: system '{}' is declared as Consumer for '{}', \
+                           but has no Listen<{}>. Add it to type Events.",
                 system_name, event, event
             ),
             Self::TransformerIncomplete {
@@ -73,14 +73,14 @@ impl std::fmt::Display for PipelineValidationError {
                 missing,
             } => write!(
                 f,
-                "Pipeline: система '{}' объявлена как Transformer для '{}', \
-                           но не имеет {}. Transformer должен иметь оба: Listen<{}> + Emit<{}>.",
+                "Pipeline: system '{}' is declared as Transformer for '{}', \
+                           but lacks {}. A Transformer must have both: Listen<{}> + Emit<{}>.",
                 system_name, event, missing, event, event
             ),
             Self::SystemNotFound { system_name } => write!(
                 f,
-                "Pipeline: система '{}' не найдена в планировщике. \
-                           Убедись, что система зарегистрирована до вызова .build().",
+                "Pipeline: system '{}' was not found in the scheduler. \
+                           Make sure the system is registered before calling .build().",
                 system_name
             ),
         }
@@ -97,7 +97,7 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         }
     }
 
-    /// Добавить систему-производитель (только Emit<E>).
+    /// Add a producer system (Emit<E> only).
     pub fn produced_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
             role: PipelineRole::Producer,
@@ -106,7 +106,7 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         self
     }
 
-    /// Добавить систему-трансформер (Listen<E> + Emit<E>).
+    /// Add a transformer system (Listen<E> + Emit<E>).
     pub fn transformed_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
             role: PipelineRole::Transformer,
@@ -115,7 +115,7 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         self
     }
 
-    /// Добавить систему-потребитель (только Listen<E>).
+    /// Add a consumer system (Listen<E> only).
     pub fn consumed_by(mut self, name: impl Into<String>) -> Self {
         self.entries.push(PipelineEntry {
             role: PipelineRole::Consumer,
@@ -124,7 +124,7 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         self
     }
 
-    /// Применить конвейер к планировщику — добавить зависимости.
+    /// Apply the pipeline to the scheduler — add the dependencies.
     pub fn build(self, sched: &mut Scheduler) {
         if self.entries.len() < 2 {
             return;
@@ -182,10 +182,10 @@ impl<E: Send + Sync + 'static> EventPipelineBuilder<E> {
         }
     }
 
-    /// Применить конвейер с предварительной валидацией ролей.
+    /// Apply the pipeline with prior role validation.
     ///
-    /// Проверяет, что AccessDescriptor каждой системы соответствует
-    /// заявленной роли. При ошибках возвращает список проблем.
+    /// Checks that each system's AccessDescriptor matches its declared
+    /// role. On errors, returns the list of problems.
     pub fn build_validated(
         self,
         sched: &mut Scheduler,

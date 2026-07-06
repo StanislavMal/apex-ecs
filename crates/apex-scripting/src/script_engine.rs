@@ -1,17 +1,17 @@
-//! `ScriptEngine` — центральная точка управления Lua-скриптингом.
+//! `ScriptEngine` — the central control point for Lua scripting.
 //!
-//! # Жизненный цикл
+//! # Lifecycle
 //!
 //! ```text
 //! ScriptEngine::new()
-//!   └── lua.globals().set(...)    ← регистрация API функций
-//!   └── register_component::<T>() ← регистрация компонентов
-//!       └── load_scripts()        ← компилирует все .lua файлы
+//!   └── lua.globals().set(...)    ← register API functions
+//!   └── register_component::<T>() ← register components
+//!       └── load_scripts()        ← compiles all .lua files
 //!
 //! // Game loop:
 //! loop {
-//!     engine.poll_hot_reload();   ← проверяет изменения файлов
-//!     engine.run(dt, &mut world); ← выполняет активный скрипт
+//!     engine.poll_hot_reload();   ← checks for file changes
+//!     engine.run(dt, &mut world); ← runs the active script
 //!     world.tick();
 //! }
 //! ```
@@ -40,7 +40,7 @@ use crate::{
 
 struct CompiledScript {
     chunk_key: mlua::RegistryKey,
-    /// Sandbox-окружение (_ENV) для изоляции скрипта
+    /// Sandbox environment (_ENV) for script isolation
     env_key:   mlua::RegistryKey,
     #[allow(dead_code)]
     path: PathBuf,
@@ -66,7 +66,7 @@ pub struct ScriptEngine {
 }
 
 impl ScriptEngine {
-    // ── Конструктор ────────────────────────────────────────────
+    // ── Constructor ────────────────────────────────────────────
 
     pub fn new() -> Self {
         let lua = mlua::Lua::new();
@@ -74,7 +74,7 @@ impl ScriptEngine {
         let ctx = Rc::new(RefCell::new(ScriptContext::new()));
 
         if let Err(e) = lua_api::register_globals(&lua) {
-            log::error!("ScriptEngine: ошибка регистрации Lua API: {}", e);
+            log::error!("ScriptEngine: error registering Lua API: {}", e);
         }
 
         lua.set_app_data(ctx.clone());
@@ -107,15 +107,15 @@ impl ScriptEngine {
         match watcher_result {
             Ok(mut w) => {
                 if let Err(e) = w.watch(script_dir, RecursiveMode::Recursive) {
-                    log::warn!("ScriptEngine: не удалось установить watcher на {:?}: {}", script_dir, e);
+                    log::warn!("ScriptEngine: failed to set watcher on {:?}: {}", script_dir, e);
                 } else {
-                    log::debug!("ScriptEngine: наблюдение за {:?}", script_dir);
+                    log::debug!("ScriptEngine: watching {:?}", script_dir);
                     this.watcher  = Some(Box::new(w));
                     this.watch_rx = Some(rx);
                 }
             }
             Err(e) => {
-                log::warn!("ScriptEngine: не удалось создать watcher: {}", e);
+                log::warn!("ScriptEngine: failed to create watcher: {}", e);
             }
         }
 
@@ -125,12 +125,12 @@ impl ScriptEngine {
 
     // ── Sandbox ─────────────────────────────────────────────────
 
-    /// Создать изолированное окружение для скрипта.
-    /// Включает стандартные библиотеки Lua, API-функции и конструкторы компонентов.
+    /// Create an isolated environment for a script.
+    /// Includes the Lua standard libraries, API functions, and component constructors.
     fn make_sandbox_env(&self) -> mlua::Result<mlua::Table> {
         let env = self.lua.create_table()?;
 
-        // Стандартные библиотеки
+        // Standard libraries
         for name in &["math", "string", "table", "ipairs", "pairs", "next",
                       "select", "tonumber", "tostring", "type", "unpack"] {
             if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
@@ -138,7 +138,7 @@ impl ScriptEngine {
             }
         }
 
-        // API-функции
+        // API functions
         for name in &["delta_time", "entity_count", "query", "commit",
                       "spawn_entity", "despawn", "read_resource", "write_resource",
                       "emit_event", "log", "print", "log_debug", "log_warn", "log_error",
@@ -148,7 +148,7 @@ impl ScriptEngine {
             }
         }
 
-        // Конструкторы компонентов (Position.new, Velocity.new, ...)
+        // Component constructors (Position.new, Velocity.new, ...)
         for name in &self.registered_components {
             if let Ok(val) = self.lua.globals().get::<mlua::Value>(name.as_str()) {
                 env.set(name.as_str(), val)?;
@@ -158,7 +158,7 @@ impl ScriptEngine {
         Ok(env)
     }
 
-    // ── Регистрация компонентов ────────────────────────────────
+    // ── Component registration ─────────────────────────────────
 
     pub fn register_component<T>(&mut self, world: &World)
     where
@@ -168,8 +168,8 @@ impl ScriptEngine {
             Some(id) => id,
             None => {
                 log::warn!(
-                    "ScriptEngine::register_component: {} не зарегистрирован в World. \
-                     Вызови world.register_component::<{}>() сначала.",
+                    "ScriptEngine::register_component: {} is not registered in World. \
+                     Call world.register_component::<{}>() first.",
                     T::type_name_str(),
                     T::type_name_str(),
                 );
@@ -189,7 +189,7 @@ impl ScriptEngine {
                     unsafe { *(ptr as *mut T) = new_val; }
                     true
                 } else {
-                    log::warn!("commit: не удалось конвертировать Lua value в {}", T::type_name_str());
+                    log::warn!("commit: failed to convert Lua value to {}", T::type_name_str());
                     false
                 }
             },
@@ -198,7 +198,7 @@ impl ScriptEngine {
         self.ctx.borrow_mut().add_binding(binding);
 
         if let Err(e) = T::register_lua_type(&self.lua) {
-            log::error!("ScriptEngine: ошибка регистрации {}: {}", T::type_name_str(), e);
+            log::error!("ScriptEngine: error registering {}: {}", T::type_name_str(), e);
         }
 
         self.registered_components.push(T::type_name_str().to_string());
@@ -210,7 +210,7 @@ impl ScriptEngine {
                 if let Some(component) = T::from_lua(val) {
                     world.insert(entity, component);
                 } else {
-                    log::warn!("spawn: не удалось конвертировать Lua value в {}", T::type_name_str());
+                    log::warn!("spawn: failed to convert Lua value to {}", T::type_name_str());
                 }
             }),
         );
@@ -227,10 +227,10 @@ impl ScriptEngine {
             );
         }
 
-        log::debug!("ScriptEngine: зарегистрирован компонент '{}'", T::type_name_str());
+        log::debug!("ScriptEngine: registered component '{}'", T::type_name_str());
     }
 
-    // ── Регистрация ресурсов ───────────────────────────────────
+    // ── Resource registration ──────────────────────────────────
 
     pub fn register_resource<T>(&mut self)
     where
@@ -248,20 +248,20 @@ impl ScriptEngine {
                     world.insert_resource(new_val);
                     true
                 } else {
-                    log::warn!("write_resource: не удалось конвертировать Lua value в {}", T::type_name_str());
+                    log::warn!("write_resource: failed to convert Lua value to {}", T::type_name_str());
                     false
                 }
             },
         };
         self.ctx.borrow_mut().add_resource_binding(binding);
         if let Err(e) = T::register_lua_type(&self.lua) {
-            log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
+            log::error!("ScriptEngine: error registering constructor {}: {}", T::type_name_str(), e);
         }
         self.registered_components.push(T::type_name_str().to_string());
-        log::debug!("ScriptEngine: зарегистрирован ресурс '{}'", T::type_name_str());
+        log::debug!("ScriptEngine: registered resource '{}'", T::type_name_str());
     }
 
-    // ── Регистрация событий ────────────────────────────────────
+    // ── Event registration ─────────────────────────────────────
 
     pub fn register_event<T>(&mut self)
     where
@@ -271,24 +271,24 @@ impl ScriptEngine {
             name: T::type_name_str(),
             emit: |value: &mlua::Value, world: &mut World| -> bool {
                 if let Some(event) = T::from_lua(value) {
-                    // send_event авторегистрирует тип — отправка всегда успешна.
+                    // send_event auto-registers the type — sending always succeeds.
                     world.send_event(event);
                     true
                 } else {
-                    log::warn!("emit_event: не удалось конвертировать Lua value в {}", T::type_name_str());
+                    log::warn!("emit_event: failed to convert Lua value to {}", T::type_name_str());
                     false
                 }
             },
         };
         self.ctx.borrow_mut().add_event_binding(binding);
         if let Err(e) = T::register_lua_type(&self.lua) {
-            log::error!("ScriptEngine: ошибка регистрации конструктора {}: {}", T::type_name_str(), e);
+            log::error!("ScriptEngine: error registering constructor {}: {}", T::type_name_str(), e);
         }
         self.registered_components.push(T::type_name_str().to_string());
-        log::debug!("ScriptEngine: зарегистрировано событие '{}'", T::type_name_str());
+        log::debug!("ScriptEngine: registered event '{}'", T::type_name_str());
     }
 
-    // ── Загрузка скриптов ──────────────────────────────────────
+    // ── Script loading ─────────────────────────────────────────
 
     pub fn load_scripts(&mut self) -> Result<(), ScriptError> {
         let script_dir = self.script_dir.clone().ok_or(ScriptError::NoScriptDir)?;
@@ -312,14 +312,14 @@ impl ScriptEngine {
 
             match self.compile_file(&path) {
                 Ok((chunk_key, env_key)) => {
-                    log::info!("ScriptEngine: загружен скрипт '{}'", name);
+                    log::info!("ScriptEngine: loaded script '{}'", name);
                     self.scripts.insert(name.clone(), CompiledScript { chunk_key, env_key, path });
                     if first_name.is_none() {
                         first_name = Some(name);
                     }
                 }
                 Err(e) => {
-                    log::error!("ScriptEngine: ошибка компиляции '{}': {}", name, e);
+                    log::error!("ScriptEngine: compilation error '{}': {}", name, e);
                     return Err(e);
                 }
             }
@@ -342,7 +342,7 @@ impl ScriptEngine {
         let env_key = self.lua.create_registry_value(mlua::Value::Table(env))
             .map_err(|e| ScriptError::runtime(&name, e))?;
 
-        // Пересоздаём env из registry — set_environment забирает владение
+        // Recreate env from the registry — set_environment takes ownership
         let env: mlua::Table = self.lua.registry_value(&env_key)
             .map_err(|e| ScriptError::runtime(&name, e))?;
 
@@ -378,7 +378,7 @@ impl ScriptEngine {
         }
     }
 
-    // ── Выполнение ─────────────────────────────────────────────
+    // ── Execution ──────────────────────────────────────────────
 
     pub fn run(&mut self, dt: f32, world: &mut World) {
         if self.active_script.is_empty() {
@@ -395,22 +395,22 @@ impl ScriptEngine {
             let chunk: mlua::Function = match self.lua.registry_value(&script.chunk_key) {
                 Ok(f) => f,
                 Err(e) => {
-                    log::error!("ScriptEngine: не удалось получить chunk '{}': {}", self.active_script, e);
+                    log::error!("ScriptEngine: failed to get chunk '{}': {}", self.active_script, e);
                     self.ctx.borrow_mut().clear_world_ptr();
                     return;
                 }
             };
 
-            // Выполняем чанк — определяет функции в sandbox _ENV
+            // Run the chunk — defines functions in the sandbox _ENV
             if let Err(e) = chunk.call::<()>(()) {
-                log::error!("ScriptEngine: ошибка выполнения '{}': {}", self.active_script, e);
+                log::error!("ScriptEngine: execution error '{}': {}", self.active_script, e);
             }
 
-            // Вызываем run() из sandbox-окружения
+            // Call run() from the sandbox environment
             let env: mlua::Table = match self.lua.registry_value(&script.env_key) {
                 Ok(t) => t,
                 Err(e) => {
-                    log::error!("ScriptEngine: не удалось получить sandbox '{}': {}", self.active_script, e);
+                    log::error!("ScriptEngine: failed to get sandbox '{}': {}", self.active_script, e);
                     self.ctx.borrow_mut().clear_world_ptr();
                     return;
                 }
@@ -418,15 +418,15 @@ impl ScriptEngine {
             match env.get::<mlua::Function>("run") {
                 Ok(run_fn) => {
                     if let Err(e) = run_fn.call::<()>(()) {
-                        log::error!("ScriptEngine: ошибка в run() '{}': {}", self.active_script, e);
+                        log::error!("ScriptEngine: error in run() '{}': {}", self.active_script, e);
                     }
                 }
                 Err(_) => {
-                    // run() не определена — скрипт без функции, только top-level код (уже выполнен)
+                    // run() is not defined — script without a function, only top-level code (already run)
                 }
             }
         } else {
-            log::warn!("ScriptEngine::run: активный скрипт '{}' не найден", self.active_script);
+            log::warn!("ScriptEngine::run: active script '{}' not found", self.active_script);
             self.ctx.borrow_mut().clear_world_ptr();
             return;
         }
@@ -473,20 +473,20 @@ impl ScriptEngine {
                     let val: mlua::Value = match self.lua.registry_value(&reg_key) {
                         Ok(v) => v,
                         Err(e) => {
-                            log::warn!("spawn: не удалось извлечь значение для '{}': {}", key, e);
+                            log::warn!("spawn: failed to extract value for '{}': {}", key, e);
                             continue;
                         }
                     };
                     applier(&key, &val, entity, world);
                     let _ = self.lua.remove_registry_value(reg_key);
                 } else {
-                    log::warn!("spawn: нет обработчика для компонента '{}'", key);
+                    log::warn!("spawn: no handler for component '{}'", key);
                 }
             }
         }
     }
 
-    // ── Хот-релоад ─────────────────────────────────────────────
+    // ── Hot reload ─────────────────────────────────────────────
 
     pub fn poll_hot_reload(&mut self) {
         let rx = match &self.watch_rx {
@@ -508,7 +508,7 @@ impl ScriptEngine {
                 }
                 Err(mpsc::TryRecvError::Empty)        => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    log::warn!("ScriptEngine: watcher отключён");
+                    log::warn!("ScriptEngine: watcher disconnected");
                     break;
                 }
             }
@@ -544,9 +544,9 @@ impl ScriptEngine {
         };
 
         if !self.scripts.contains_key(&name) {
-            log::info!("ScriptEngine: новый скрипт '{}'", name);
+            log::info!("ScriptEngine: new script '{}'", name);
         } else {
-            log::info!("ScriptEngine: перезагрузка скрипта '{}'", name);
+            log::info!("ScriptEngine: reloading script '{}'", name);
         }
 
         match self.compile_file(path) {
@@ -554,12 +554,12 @@ impl ScriptEngine {
                 self.scripts.insert(name, CompiledScript { chunk_key, env_key, path: path.to_path_buf() });
             }
             Err(e) => {
-                log::error!("ScriptEngine: ошибка перекомпиляции '{}': {}", name, e);
+                log::error!("ScriptEngine: recompilation error '{}': {}", name, e);
             }
         }
     }
 
-    // ── Вспомогательные ───────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────
 
     fn compile_file(&self, path: &Path) -> Result<(mlua::RegistryKey, mlua::RegistryKey), ScriptError> {
         let code = std::fs::read_to_string(path)
@@ -600,9 +600,9 @@ impl ScriptEngine {
         !self.scripts.is_empty()
     }
 
-    /// Включить/выключить авто-commit в query-итераторах.
-    /// Когда включено, `commit(entity)` вызывается автоматически при переходе
-    /// к следующей entity в цикле `for entity in query(...) do ... end`.
+    /// Enable/disable auto-commit in query iterators.
+    /// When enabled, `commit(entity)` is called automatically when moving
+    /// to the next entity in the `for entity in query(...) do ... end` loop.
     pub fn set_auto_commit(&mut self, enabled: bool) {
         self.ctx.borrow_mut().auto_commit = enabled;
     }
@@ -612,7 +612,7 @@ impl Default for ScriptEngine {
     fn default() -> Self { Self::new() }
 }
 
-// ── Вспомогательные функции ────────────────────────────────────
+// ── Helper functions ───────────────────────────────────────────
 
 fn is_lua_modify_event(event: &Event) -> bool {
     match event.kind {

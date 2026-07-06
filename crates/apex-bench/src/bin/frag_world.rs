@@ -1,22 +1,22 @@
-//! CR-M0 — бенч «фрагментированный мир» (plans/CORE_REFACTORING.md, apex-engine).
+//! CR-M0 — "fragmented world" bench (plans/CORE_REFACTORING.md, apex-engine).
 //!
-//! Профиль ~ many_foxes @1000: ~28k entity, 1000 деревьев
-//! root → n1 → … → n26 → prim (цепочка), т.е. 27 уникальных родителей на дерево
-//! → ~27k уникальных родителей → при текущей модели relations (пара в идентичности
-//! архетипа) мир фрагментируется на ~27k архетипов.
+//! Profile ~ many_foxes @1000: ~28k entities, 1000 trees
+//! root → n1 → … → n26 → prim (chain), i.e. 27 unique parents per tree
+//! → ~27k unique parents → under the current relations model (pair in the
+//! archetype identity) the world fragments into ~27k archetypes.
 //!
-//! Меряем (порядок прогона: 1, 3, 4, 5 на стабильном мире; 2 — спавн — последним,
-//! т.к. он растит мир и добавляет архетипы):
-//!   1. `Query::new` ×8 типовых форм (1-3 компонента, Maybe/Without/With/Changed/редкий);
-//!   2. spawn поддерева (28 spawn + 27 add_relation);
-//!   3. `children_of` по всем родителям; `get_relation_target` по всем subjects;
-//!   4. random `get_mut` по всем entity;
-//!   5. «extract-подобный» цикл: 18 Query::new + полные итерации (прокси MAIN commit).
+//! We measure (run order: 1, 3, 4, 5 on a stable world; 2 — spawn — last,
+//! since it grows the world and adds archetypes):
+//!   1. `Query::new` ×8 typical shapes (1-3 components, Maybe/Without/With/Changed/rare);
+//!   2. subtree spawn (28 spawn + 27 add_relation);
+//!   3. `children_of` over all parents; `get_relation_target` over all subjects;
+//!   4. random `get_mut` over all entities;
+//!   5. "extract-like" cycle: 18 Query::new + full iterations (proxy for the MAIN commit).
 //!
-//! Числа ДО/ПОСЛЕ фиксируются в CORE_REFACTORING.md и §14.7 руководства.
-//! Регресс-страж: падение >20% на этом бенче — блокер мержа.
+//! Before/after numbers are recorded in CORE_REFACTORING.md and §14.7 of the guide.
+//! Regression guard: a >20% drop on this bench is a merge blocker.
 //!
-//! Запуск: `cargo run --release -p apex-bench --bin frag_world`
+//! Run: `cargo run --release -p apex-bench --bin frag_world`
 
 use apex_bench::{Position, Rotation, Transform, Velocity};
 use apex_core::prelude::*;
@@ -26,16 +26,16 @@ use cgmath::{Matrix4, Vector3};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-// ── Дополнительные компоненты профиля ──────────────────────────
+// ── Additional profile components ──────────────────────────────
 
-/// Редкий компонент (8 шт. на мир) — аналог «8 пустых Query::new по свету»
-/// из extract'а движка (находка C-4: «lights 0.46ms»).
+/// Rare component (8 per world) — analog of the "8 empty Query::new over lights"
+/// from the engine's extract (finding C-4: "lights 0.46ms").
 #[derive(Component, Clone, Copy)]
 struct Light {
     intensity: f32,
 }
 
-/// Маркер прим-листа (как mesh-prim у лисы).
+/// Prim-leaf marker (like the fox's mesh-prim).
 #[derive(Component, Clone, Copy)]
 struct Prim {
     lod: u32,
@@ -45,22 +45,22 @@ const TREES: usize = 1000;
 const CHAIN: usize = 26; // root → n1..n26 → prim
 const LIGHTS: usize = 8;
 
-/// CI-страж структурного класса CR-M1: relations НЕ должны попадать в
-/// идентичность архетипа. Здоровый профиль — 5 архетипов; регресс класса
-/// даёт ~27 000 (по уникальному родителю на архетип). Порог с запасом на
-/// новые формы компонентов. Таймерные пороги в CI не ставим — раннеры
-/// шумят; правило «падение >20% = блокер» остаётся локальной дисциплиной.
+/// CI guard for the CR-M1 structural class: relations must NOT leak into the
+/// archetype identity. A healthy profile is 5 archetypes; a class regression
+/// yields ~27,000 (one archetype per unique parent). Threshold has headroom for
+/// new component shapes. We don't set timing thresholds in CI — runners are
+/// noisy; the "drop >20% = blocker" rule stays a local discipline.
 const MAX_ARCHETYPES: usize = 64;
 
 fn assert_archetype_guard(world: &World, when: &str) {
     assert!(
         world.archetype_count() <= MAX_ARCHETYPES,
-        "СТРАЖ ({when}): {} архетипов (> {MAX_ARCHETYPES}) — relations снова в идентичности архетипа? (CR-M1)",
+        "GUARD ({when}): {} archetypes (> {MAX_ARCHETYPES}) — relations back in the archetype identity? (CR-M1)",
         world.archetype_count(),
     );
 }
 
-// ── Тайминг: медиана из SAMPLES прогонов ───────────────────────
+// ── Timing: median of SAMPLES runs ─────────────────────────────
 
 const SAMPLES: usize = 9;
 
@@ -69,7 +69,7 @@ fn median_of<F: FnMut() -> u64>(mut f: F) -> (Duration, u64) {
     let mut sink = 0u64;
     for _ in 0..SAMPLES {
         let t = Instant::now();
-        sink = black_box(f()); // значение ПОСЛЕДНЕГО сэмпла (для assert'ов)
+        sink = black_box(f()); // value of the LAST sample (for asserts)
         times.push(t.elapsed());
     }
     times.sort();
@@ -107,16 +107,16 @@ impl Report {
     }
 }
 
-// ── Построение фрагментированного мира ─────────────────────────
+// ── Building the fragmented world ──────────────────────────────
 
 struct FragWorld {
     world: World,
     roots: Vec<Entity>,
-    /// Все родители (root + 26 узлов на дерево), 27k шт.
+    /// All parents (root + 26 nodes per tree), 27k of them.
     parents: Vec<Entity>,
-    /// Все subjects связей (узлы + прим), 27k шт.
+    /// All relation subjects (nodes + prim), 27k of them.
     subjects: Vec<Entity>,
-    /// Все entity деревьев (28k) в перемешанном порядке — для random get_mut.
+    /// All tree entities (28k) in shuffled order — for random get_mut.
     shuffled: Vec<Entity>,
 }
 
@@ -153,7 +153,7 @@ fn spawn_tree(world: &mut World, idx: usize) -> (Entity, Vec<Entity>, Vec<Entity
     world.add_relation(prim, ChildOf, parent);
     subjects.push(prim);
     all.push(prim);
-    // последний узел — родитель прима, но он уже в parents
+    // the last node is the prim's parent, but it is already in parents
     (root, parents, subjects, all)
 }
 
@@ -174,7 +174,7 @@ fn build() -> FragWorld {
         all.extend(a);
     }
 
-    // 8 «светильников» — редкий компонент.
+    // 8 "lights" — rare component.
     for i in 0..LIGHTS {
         let e = world.spawn((
             Transform(Matrix4::from_scale(1.0)),
@@ -185,7 +185,7 @@ fn build() -> FragWorld {
     }
     let build_time = t.elapsed();
 
-    // Детерминированный шафл (LCG) — без зависимости от rand.
+    // Deterministic shuffle (LCG) — no dependency on rand.
     let mut shuffled = all;
     let mut state = 0x9e3779b97f4a7c15u64;
     for i in (1..shuffled.len()).rev() {
@@ -195,7 +195,7 @@ fn build() -> FragWorld {
     }
 
     println!(
-        "Мир построен за {}: {} entity, {} архетипов, {} деревьев × (root→{}→prim)",
+        "World built in {}: {} entities, {} archetypes, {} trees × (root→{}→prim)",
         fmt_dur(build_time),
         world.entity_count(),
         world.archetype_count(),
@@ -212,13 +212,13 @@ fn build() -> FragWorld {
     }
 }
 
-// ── 1. Query::new ×8 форм ──────────────────────────────────────
+// ── 1. Query::new ×8 shapes ────────────────────────────────────
 
 fn bench_query_new(fw: &FragWorld, rep: &mut Report) {
     let w = &fw.world;
-    const N: u64 = 20; // конструирований на сэмпл
+    const N: u64 = 20; // constructions per sample
 
-    println!("\n[1] Query::new — только конструирование, {N}×/сэмпл, медиана из {SAMPLES}:");
+    println!("\n[1] Query::new — construction only, {N}×/sample, median of {SAMPLES}:");
 
     macro_rules! qbench {
         ($name:expr, $q:ty) => {{
@@ -234,15 +234,15 @@ fn bench_query_new(fw: &FragWorld, rep: &mut Report) {
         }};
     }
 
-    qbench!("Q1  Read<Transform>            (28k строк)", Read<Transform>);
+    qbench!("Q1  Read<Transform>            (28k rows)", Read<Transform>);
     qbench!("Q2  (Read<Position>, Read<Velocity>)  (1k)", (Read<Position>, Read<Velocity>));
     qbench!("Q3  (Transform, Position, Rotation) (27k)", (Read<Transform>, Read<Position>, Read<Rotation>));
     qbench!("Q4  (Read<Position>, Maybe<Velocity>)", (Read<Position>, Maybe<Velocity>));
     qbench!("Q5  (Read<Position>, Without<Velocity>)", (Read<Position>, Without<Velocity>));
     qbench!("Q7  (Read<Transform>, With<Prim>)    (1k)", (Read<Transform>, With<Prim>));
-    qbench!("Q8  (Read<Light>, Read<Position>)  (8 шт)", (Read<Light>, Read<Position>));
+    qbench!("Q8  (Read<Light>, Read<Position>)  (8 of)", (Read<Light>, Read<Position>));
 
-    // Q6: Changed — через new_with_tick (как extract движка).
+    // Q6: Changed — via new_with_tick (like the engine's extract).
     let last = w.current_tick();
     let (t, _) = median_of(|| {
         let mut acc = 0u64;
@@ -259,7 +259,7 @@ fn bench_query_new(fw: &FragWorld, rep: &mut Report) {
 
 fn bench_relations_read(fw: &FragWorld, rep: &mut Report) {
     let w = &fw.world;
-    println!("\n[3] Обход связей (медиана из {SAMPLES}):");
+    println!("\n[3] Relation walk (median of {SAMPLES}):");
 
     let n_parents = fw.parents.len() as u64;
     let (t, sink) = median_of(|| {
@@ -270,11 +270,11 @@ fn bench_relations_read(fw: &FragWorld, rep: &mut Report) {
         acc
     });
     rep.add(
-        &format!("children_of по {} родителям", n_parents),
+        &format!("children_of over {} parents", n_parents),
         t,
-        Some((n_parents, "вызов")),
+        Some((n_parents, "call")),
     );
-    assert_eq!(sink, fw.subjects.len() as u64, "children_of насчитал не всех детей");
+    assert_eq!(sink, fw.subjects.len() as u64, "children_of did not count all children");
 
     let n_subj = fw.subjects.len() as u64;
     let (t, sink) = median_of(|| {
@@ -290,14 +290,14 @@ fn bench_relations_read(fw: &FragWorld, rep: &mut Report) {
     rep.add(
         &format!("get_relation_target ×{}", n_subj),
         t,
-        Some((n_subj, "вызов")),
+        Some((n_subj, "call")),
     );
 }
 
 // ── 4. random get_mut ──────────────────────────────────────────
 
 fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
-    println!("\n[4] Random-access (медиана из {SAMPLES}):");
+    println!("\n[4] Random-access (median of {SAMPLES}):");
     let n = fw.shuffled.len() as u64;
     let entities = std::mem::take(&mut fw.shuffled);
     let w = &mut fw.world;
@@ -313,10 +313,10 @@ fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
         acc
     });
     black_box(sink);
-    rep.add(&format!("get_mut::<Position> ×{} (shuffle)", n), t, Some((n, "вызов")));
+    rep.add(&format!("get_mut::<Position> ×{} (shuffle)", n), t, Some((n, "call")));
 
-    // CR-M3: ComponentId берётся один раз на проход — без TypeId-hash на вызов.
-    let pos_id = w.component_id::<Position>().expect("Position зарегистрирован");
+    // CR-M3: ComponentId is taken once per pass — no TypeId hash per call.
+    let pos_id = w.component_id::<Position>().expect("Position is registered");
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
         for &e in &entities {
@@ -328,7 +328,7 @@ fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
         acc
     });
     black_box(sink);
-    rep.add(&format!("get_mut_by_id::<Position> ×{} (CR-M3)", n), t, Some((n, "вызов")));
+    rep.add(&format!("get_mut_by_id::<Position> ×{} (CR-M3)", n), t, Some((n, "call")));
 
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
@@ -338,27 +338,27 @@ fn bench_random_access(fw: &mut FragWorld, rep: &mut Report) {
         acc
     });
     black_box(sink);
-    rep.add(&format!("has_component::<Velocity> ×{}", n), t, Some((n, "вызов")));
+    rep.add(&format!("has_component::<Velocity> ×{}", n), t, Some((n, "call")));
 
     fw.shuffled = entities;
 }
 
-// ── 5. extract-подобный цикл ───────────────────────────────────
+// ── 5. extract-like cycle ──────────────────────────────────────
 
-/// Прокси extract'а движка: ~18 Query::new за «кадр» + полные итерации.
-/// Состав запросов имитирует реальный extract: меши (3 комп.), трансформы,
-/// Changed-детекция, 8 запросов по редким (свет), маркеры.
+/// Proxy for the engine's extract: ~18 Query::new per "frame" + full iterations.
+/// The query mix mimics a real extract: meshes (3 comp.), transforms,
+/// Changed detection, 8 queries over rare (light), markers.
 fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
-    println!("\n[5] Extract-подобный цикл, 18 Query::new + итерации (медиана из {SAMPLES}):");
+    println!("\n[5] Extract-like cycle, 18 Query::new + iterations (median of {SAMPLES}):");
 
-    // «Кадр» движка: между extract'ами что-то меняется — двигаем корни.
+    // Engine "frame": something changes between extracts — we move the roots.
     let roots = fw.roots.clone();
     let w = &mut fw.world;
 
     let (t, sink) = median_of(|| {
         let mut acc = 0u64;
 
-        // симуляция: двигаем 1000 корней (как муверы many_foxes)
+        // simulation: move 1000 roots (like the many_foxes movers)
         let prev = w.current_tick();
         w.tick();
         for &r in &roots {
@@ -367,35 +367,35 @@ fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
             }
         }
 
-        // extract: 3 «мешовых» запроса
+        // extract: 3 "mesh" queries
         for _ in 0..3 {
             let q = Query::<(Read<Transform>, Read<Position>, Read<Rotation>)>::new(w);
             q.for_each(|_, (t, p, _)| {
                 acc = acc.wrapping_add((t.0.x.x + p.0.x) as u64);
             });
         }
-        // 2 запроса трансформов целиком
+        // 2 whole-transform queries
         for _ in 0..2 {
             let q = Query::<Read<Transform>>::new(w);
             q.for_each(|_, t| {
                 acc = acc.wrapping_add(t.0.w.w as u64);
             });
         }
-        // 2 Changed-запроса (дельта кадра)
+        // 2 Changed queries (frame delta)
         for _ in 0..2 {
             let q = Query::<Changed<Position>>::new_with_tick(w, prev);
             q.for_each(|_, _| {
                 acc = acc.wrapping_add(1);
             });
         }
-        // 8 запросов по редким компонентам (свет: 8 entity)
+        // 8 queries over rare components (light: 8 entities)
         for _ in 0..8 {
             let q = Query::<(Read<Light>, Read<Position>)>::new(w);
             q.for_each(|_, (l, p)| {
                 acc = acc.wrapping_add((l.intensity + p.0.x) as u64);
             });
         }
-        // 2 маркерных (Prim — 1k строк; Velocity — 1k корней)
+        // 2 marker queries (Prim — 1k rows; Velocity — 1k roots)
         let q = Query::<(Read<Position>, Read<Prim>)>::new(w);
         q.for_each(|_, (p, prim)| {
             acc = acc.wrapping_add(p.0.z as u64 + prim.lod as u64);
@@ -408,13 +408,13 @@ fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
         acc
     });
     black_box(sink);
-    rep.add("extract-цикл (18 Query::new + iter)", t, Some((18, "Query::new")));
+    rep.add("extract cycle (18 Query::new + iter)", t, Some((18, "Query::new")));
 }
 
-// ── 2. spawn поддерева (растит мир — гоняем последним) ─────────
+// ── 2. spawn subtree (grows the world — run last) ──────────────
 
 fn bench_spawn_subtree(fw: &mut FragWorld, rep: &mut Report) {
-    println!("\n[2] Spawn поддерева (28 spawn + 27 add_relation), мир растёт, среднее по 100:");
+    println!("\n[2] Spawn subtree (28 spawn + 27 add_relation), world grows, average of 100:");
     let w = &mut fw.world;
     let archetypes_before = w.archetype_count();
 
@@ -427,12 +427,12 @@ fn bench_spawn_subtree(fw: &mut FragWorld, rep: &mut Report) {
     let total = t.elapsed();
 
     rep.add(
-        &format!("spawn поддерева (среднее по {NEW_TREES})"),
+        &format!("spawn subtree (average of {NEW_TREES})"),
         total / NEW_TREES as u32,
         Some((CHAIN as u64 + 1, "add_relation")),
     );
     println!(
-        "    архетипов: {} → {} (+{} за {} деревьев)",
+        "    archetypes: {} → {} (+{} for {} trees)",
         archetypes_before,
         w.archetype_count(),
         w.archetype_count() - archetypes_before,
@@ -443,9 +443,9 @@ fn bench_spawn_subtree(fw: &mut FragWorld, rep: &mut Report) {
 // ── main ───────────────────────────────────────────────────────
 
 fn main() {
-    println!("=== CR-M0: фрагментированный мир (профиль many_foxes @1000) ===\n");
+    println!("=== CR-M0: fragmented world (many_foxes profile @1000) ===\n");
     let mut fw = build();
-    assert_archetype_guard(&fw.world, "после build");
+    assert_archetype_guard(&fw.world, "after build");
     let mut rep = Report { rows: Vec::new() };
 
     bench_query_new(&fw, &mut rep);
@@ -454,16 +454,16 @@ fn main() {
     bench_extract_cycle(&mut fw, &mut rep);
     bench_spawn_subtree(&mut fw, &mut rep);
 
-    println!("\n=== Сводка (markdown для CORE_REFACTORING.md / §14.7) ===\n");
-    println!("| Операция | Время | На операцию |");
+    println!("\n=== Summary (markdown for CORE_REFACTORING.md / §14.7) ===\n");
+    println!("| Operation | Time | Per operation |");
     println!("|----------|-------|-------------|");
     for (name, d, note) in &rep.rows {
         println!("| {} | {} | {} |", name.trim(), fmt_dur(*d).trim(), note);
     }
     println!(
-        "\nМир: {} entity, {} архетипов (после spawn-бенча).",
+        "\nWorld: {} entities, {} archetypes (after the spawn bench).",
         fw.world.entity_count(),
         fw.world.archetype_count()
     );
-    assert_archetype_guard(&fw.world, "после spawn-бенча");
+    assert_archetype_guard(&fw.world, "after the spawn bench");
 }

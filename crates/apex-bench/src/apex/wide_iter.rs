@@ -1,9 +1,9 @@
 use apex_core::prelude::*;
 use apex_macros::Component;
 
-// WideIter — итерация ШИРОКОГО запроса (5 компонентов: 4 read + 1 write) по 10k. Реальные системы
-// читают много компонентов, не 2 (как simple_iter). Меряет fetch широкого кортежа + per-row
-// конструирование. Персистентный QueryState (как bevy).
+// WideIter — iteration of a WIDE query (5 components: 4 read + 1 write) over 10k. Real systems
+// read many components, not 2 (like simple_iter). Measures the fetch of a wide tuple + per-row
+// construction. Persistent QueryState (like bevy).
 #[derive(Component, Clone, Copy)]
 pub struct A(pub f32);
 #[derive(Component, Clone, Copy)]
