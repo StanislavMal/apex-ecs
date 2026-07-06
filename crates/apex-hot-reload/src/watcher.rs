@@ -226,4 +226,32 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].path, p);
     }
+
+    #[test]
+    fn temp_files_are_excluded() {
+        // Editor scratch/lock files must never trigger a reload.
+        for name in [
+            ".hidden",
+            ".#emacs.lock",
+            "config.json~",
+            "scene.swp",
+            "asset.tmp",
+            "level.bak",
+        ] {
+            assert!(
+                FileWatcher::is_temp_file(Path::new(name)),
+                "{name} must be treated as an editor temp file"
+            );
+        }
+    }
+
+    #[test]
+    fn real_asset_files_are_not_excluded() {
+        for name in ["config.json", "scene.prefab.json", "model.glb", "shader.wgsl"] {
+            assert!(
+                !FileWatcher::is_temp_file(Path::new(name)),
+                "{name} is a real asset and must not be filtered"
+            );
+        }
+    }
 }
