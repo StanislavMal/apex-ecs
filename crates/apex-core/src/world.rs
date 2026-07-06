@@ -23,24 +23,26 @@ use crate::{
 
 struct CacheEntry {
     arch_indices: Arc<[usize]>,
-    /// Сколько архетипов мира запись уже видела (архетипы append-only —
-    /// дополняем список только хвостом `archetypes[seen_arch_count..]`).
+    /// How many of the world's archetypes this entry has already seen (archetypes
+    /// are append-only — the list is only extended by the tail
+    /// `archetypes[seen_arch_count..]`).
     seen_arch_count: usize,
 }
 
-/// Ключ кэша запросов. ТОЛЬКО списка `ids` недостаточно: `(Read<A>, Read<B>)`
-/// и `(Read<A>, Without<B>)` дают одинаковый `fill_ids`, но разную семантику
-/// matches — ключ по одним ids отравлял бы кэш между ними. Тройка
-/// (ids, positive, required) однозначно задаёт матч-семантику формы:
-/// without-набор = ids − positive, optional-набор = positive − required.
-/// Ключ кэша запросов (CR-M2b): по одному `u64` на компонент — ComponentId в
-/// нижних 32 битах, роль (required/without/optional) в верхних
-/// (`WorldQuery::fill_cache_key`). Однозначно кодирует матч-семантику формы:
-/// `(Read<A>, Read<B>)`, `(Read<A>, Without<B>)` и `(Read<A>, Maybe<B>)` —
-/// РАЗНЫЕ записи (раньше делили одну — отравление кэша).
+/// Query cache key. The `ids` list ALONE is not enough: `(Read<A>, Read<B>)`
+/// and `(Read<A>, Without<B>)` produce the same `fill_ids` but different match
+/// semantics — a key on ids alone would poison the cache between them. The
+/// triple (ids, positive, required) uniquely defines the shape's match
+/// semantics: without-set = ids − positive, optional-set = positive − required.
+/// Query cache key (CR-M2b): one `u64` per component — ComponentId in the
+/// lower 32 bits, role (required/without/optional) in the upper bits
+/// (`WorldQuery::fill_cache_key`). Uniquely encodes the shape's match semantics:
+/// `(Read<A>, Read<B>)`, `(Read<A>, Without<B>)` and `(Read<A>, Maybe<B>)` are
+/// DISTINCT entries (they previously shared one — cache poisoning).
 ///
-/// Hot-path без аллокаций: ключ строится одним проходом в inline-SmallVec,
-/// lookup — zero-copy по `&[u64]` (Borrow), владение — только при вставке.
+/// Allocation-free hot path: the key is built in a single pass into an inline
+/// SmallVec, lookup is zero-copy over `&[u64]` (Borrow), ownership is taken only
+/// on insertion.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct QueryCacheKey(SmallVec<[u64; 8]>);
 
@@ -53,13 +55,15 @@ impl std::borrow::Borrow<[u64]> for QueryCacheKey {
 /// Archetype-index-list cache backing `World::query` (the `Query` `Shared`
 /// source; incremental, CR-M2).
 ///
-/// Инварианты, на которых построен:
-/// - архетипы append-only (никогда не удаляются и не меняют состав) →
-///   запись дополняется ТОЛЬКО новыми архетипами с индекса `seen_arch_count`;
-/// - перемещение entity между архетипами список НЕ инвалидирует: какие
-///   архетипы матчат запрос — свойство состава архетипа, а не его строк;
-/// - пустые архетипы ВКЛЮЧАЮТСЯ в список (потребитель пропускает их на
-///   итерации) — иначе entity, въехавшая в опустевший архетип, терялась бы.
+/// The invariants it relies on:
+/// - archetypes are append-only (never removed, never change composition) →
+///   an entry is extended ONLY by new archetypes from index `seen_arch_count`;
+/// - moving an entity between archetypes does NOT invalidate the list: which
+///   archetypes match a query is a property of the archetype's composition, not
+///   of its rows;
+/// - empty archetypes ARE INCLUDED in the list (the consumer skips them during
+///   iteration) — otherwise an entity moving into an emptied archetype would be
+///   lost.
 pub(crate) struct QueryCache {
     entries: RwLock<FxHashMap<QueryCacheKey, CacheEntry>>,
 }
@@ -79,8 +83,8 @@ impl QueryCache {
     ) -> Arc<[usize]> {
         let total = archetypes.len();
 
-        // Hit path: запись актуальна, если видела все текущие архетипы.
-        // Lookup по &[u64] — без построения владеющего ключа.
+        // Hit path: an entry is current if it has seen all current archetypes.
+        // Lookup by &[u64] — without building an owning key.
         {
             // Poison is benign here: the map is an append-only cache of derived
             // data — a panic elsewhere while holding the lock cannot leave it in
@@ -95,7 +99,8 @@ impl QueryCache {
         }
 
         let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        // Двойная проверка: другой поток мог дополнить между read и write lock.
+        // Double-check: another thread may have extended it between the read and
+        // write lock.
         let (mut indices, start) = match map.get(key.as_slice()) {
             Some(entry) if entry.seen_arch_count == total => {
                 return entry.arch_indices.clone();
@@ -104,7 +109,7 @@ impl QueryCache {
             None => (Vec::new(), 0),
         };
 
-        // Дополняем только новыми архетипами (append-only инвариант).
+        // Extend only with new archetypes (append-only invariant).
         indices.extend(
             archetypes[start..]
                 .iter()
@@ -125,9 +130,9 @@ impl QueryCache {
         arch_indices
     }
 
-    /// Полная инвалидация. Не нужна в текущей модели (архетипы append-only);
-    /// останется точкой подключения despawn-компакции (CR-M4), если та
-    /// когда-нибудь появится.
+    /// Full invalidation. Not needed in the current model (archetypes are
+    /// append-only); it stays as a hook point for despawn compaction (CR-M4),
+    /// should that ever appear.
     #[allow(dead_code)]
     pub fn invalidate(&self) {
         self.entries
@@ -139,24 +144,25 @@ impl QueryCache {
 
 // ── ArchetypeStats ─────────────────────────────────────────────
 
-/// Сводка [`World::archetype_stats`]: число архетипов, пустых среди них,
-/// суммарные живые строки, максимум строк в одном архетипе и память (W3-5).
+/// Summary from [`World::archetype_stats`]: number of archetypes, how many are
+/// empty, total live rows, the maximum rows in a single archetype, and memory
+/// (W3-5).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ArchetypeStats {
     pub archetypes: usize,
     pub empty_archetypes: usize,
     pub total_rows: usize,
     pub max_rows_in_archetype: usize,
-    /// Аллоцировано под данные компонентов (Σ capacity × item_size).
+    /// Allocated for component data (Σ capacity × item_size).
     pub component_bytes: usize,
-    /// Аллоцировано под change/added-тики (Σ capacity × 4 × 2).
+    /// Allocated for change/added ticks (Σ capacity × 4 × 2).
     pub tick_bytes: usize,
-    /// Аллоцировано под списки entity архетипов (Σ capacity × 8).
+    /// Allocated for archetype entity lists (Σ capacity × 8).
     pub entity_bytes: usize,
 }
 
 impl ArchetypeStats {
-    /// Суммарная память хранилища (компоненты + тики + entity-списки).
+    /// Total storage memory (components + ticks + entity lists).
     #[inline]
     pub fn total_bytes(&self) -> usize {
         self.component_bytes + self.tick_bytes + self.entity_bytes
@@ -165,8 +171,8 @@ impl ArchetypeStats {
 
 // ── ArchetypeKey ───────────────────────────────────────────────
 
-/// Ключ для archetype_index — хэшируется без heap-аллокации.
-/// Внутри хранит компоненты inline до 12 штук через SmallVec.
+/// Key for archetype_index — hashed without a heap allocation.
+/// Stores components inline up to 12 of them via SmallVec.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ArchetypeKey(SmallVec<[ComponentId; 12]>);
 
@@ -176,8 +182,8 @@ impl From<&[ComponentId]> for ArchetypeKey {
     }
 }
 
-/// Zero-copy lookup: позволяет `archetype_index.get(components)` работать
-/// напрямую с `&[ComponentId]` без создания временного ArchetypeKey.
+/// Zero-copy lookup: lets `archetype_index.get(components)` work directly with
+/// `&[ComponentId]` without creating a temporary ArchetypeKey.
 impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
     fn borrow(&self) -> &[ComponentId] {
         &self.0
@@ -186,26 +192,27 @@ impl std::borrow::Borrow<[ComponentId]> for ArchetypeKey {
 
 // ── World ──────────────────────────────────────────────────────
 
-/// Генератор уникальных id миров (для привязки [`QueryState`] к миру).
-/// Начинается с 1: id 0 зарезервирован как «ничей» (свежий QueryState).
+/// Generator of unique world ids (for binding [`QueryState`] to a world).
+/// Starts at 1: id 0 is reserved as "nobody's" (a fresh QueryState).
 static WORLD_ID_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub struct World {
-    /// Уникален в пределах процесса; `QueryState` сверяет его, чтобы не
-    /// применить стейт одного мира к другому (main vs render vs isolated).
+    /// Unique within the process; `QueryState` checks it so state from one world
+    /// is not applied to another (main vs render vs isolated).
     pub(crate) world_id: u64,
     pub(crate) entities: EntityAllocator,
     pub(crate) registry: ComponentRegistry,
     pub(crate) archetypes: Vec<Archetype>,
     pub(crate) archetype_index: FxHashMap<ArchetypeKey, ArchetypeId>,
-    /// Индекс компонент → список архетипов, содержащих этот компонент.
-    /// Используется в Query::new_with_tick для O(1) поиска архетипов-кандидатов
-    /// вместо линейного обхода всех архетипов.
+    /// Index component → list of archetypes containing that component.
+    /// Used in Query::new_with_tick for O(1) lookup of candidate archetypes
+    /// instead of a linear scan over all archetypes.
     pub(crate) component_arch_index: FxHashMap<ComponentId, SmallVec<[ArchetypeId; 16]>>,
     pub(crate) current_tick: Tick,
-    /// База change-detection для систем: тик предыдущей границы кадра.
-    /// `Changed<T>` внутри систем сравнивает change-tick строки с этим значением
-    /// (продвигается планировщиком в конце кадра / `advance_change_tick`).
+    /// The change-detection base for systems: the tick of the previous frame
+    /// boundary. `Changed<T>` inside systems compares a row's change-tick against
+    /// this value (advanced by the scheduler at the end of the frame /
+    /// `advance_change_tick`).
     pub(crate) last_run_tick: Tick,
     pub(crate) query_cache: QueryCache,
     pub(crate) relations: RelationRegistry,
@@ -213,23 +220,24 @@ pub struct World {
     pub(crate) target_index: TargetIndex,
     pub(crate) resources: Resources,
     pub(crate) events: EventRegistry,
-    /// Реестр именованных шаблонов (EntityTemplate).
+    /// Registry of named templates (EntityTemplate).
     pub(crate) templates: TemplateRegistry,
-    /// Конфигурация чанкования для параллельной итерации.
+    /// Chunking configuration for parallel iteration.
     pub(crate) chunk_config: ChunkConfig,
     /// §0.2a policy: what to do with conscious drops/refusals (log/panic/
     /// silent/custom) + anomaly counters. Per-world (see [`crate::error`]).
     pub(crate) error_handler: ErrorHandler,
-    /// Очередь хуков состава (W3-1): структурные операции СНАЧАЛА завершаются,
-    /// потом диспетчер вызывает хуки на консистентном мире. Вложенные
-    /// структурные операции из хуков дописывают в ту же очередь — обрабатывает
-    /// тот же (внешний) диспетчер, без рекурсии.
+    /// Composition-hook queue (W3-1): structural operations complete FIRST, then
+    /// the dispatcher invokes hooks on a consistent world. Nested structural
+    /// operations from hooks append to the same queue — processed by the same
+    /// (outer) dispatcher, without recursion.
     pub(crate) hook_queue: Vec<HookEvent>,
-    /// Диспетчер хуков уже работает выше по стеку (re-entrancy guard).
+    /// The hook dispatcher is already running higher up the stack (re-entrancy
+    /// guard).
     pub(crate) hook_dispatch_active: bool,
 }
 
-/// Отложенное событие состава для диспетчера хуков (W3-1).
+/// A deferred composition event for the hook dispatcher (W3-1).
 #[derive(Clone, Copy)]
 pub(crate) enum HookEvent {
     Added(Entity, ComponentId),
@@ -311,20 +319,21 @@ impl World {
         world
     }
 
-    /// Уникальный id мира в пределах процесса (привязка [`QueryState`]).
+    /// The world's unique id within the process (binds [`QueryState`]).
     #[inline]
     pub fn id(&self) -> u64 {
         self.world_id
     }
 
-    /// Интервал автозапуска [`check_change_ticks`](Self::check_change_ticks):
-    /// каждые 2²⁶ тиков (~3 дня @250Hz). Должен быть много меньше
-    /// `2³¹ − Tick::MAX_CHANGE_AGE`, чтобы тик не успел «перевернуться»
-    /// между проходами клампа.
+    /// Auto-run interval for [`check_change_ticks`](Self::check_change_ticks):
+    /// every 2²⁶ ticks (~3 days @250Hz). Must be much smaller than
+    /// `2³¹ − Tick::MAX_CHANGE_AGE`, so a tick cannot "wrap around" between clamp
+    /// passes.
     const TICK_CHECK_INTERVAL: u32 = 1 << 26;
 
-    /// Продвигает глобальный tick. **Не делает flush событий** — это ответственность Scheduler.
-    /// Для использования без Scheduler вызывайте [`flush_all_events()`](Self::flush_all_events) вручную.
+    /// Advances the global tick. **Does not flush events** — that is the
+    /// Scheduler's responsibility. For use without a Scheduler, call
+    /// [`flush_all_events()`](Self::flush_all_events) manually.
     pub fn tick(&mut self) {
         self.current_tick.0 = self.current_tick.0.wrapping_add(1);
         if self.current_tick.0.is_multiple_of(Self::TICK_CHECK_INTERVAL) {
@@ -332,12 +341,13 @@ impl World {
         }
     }
 
-    /// Продвинуть change-tick на границе кадра: запомнить текущий тик как базу
-    /// `Changed<T>` для следующего кадра и инкрементировать `current_tick`.
+    /// Advance the change-tick at the frame boundary: remember the current tick
+    /// as the `Changed<T>` base for the next frame and increment `current_tick`.
     ///
-    /// Вызывается планировщиком в конце `run()`/`run_sequential()`. После этого
-    /// `Changed<T>` внутри систем достоверно детектирует мутации **этого** кадра
-    /// (а не «всё подряд»). На первом кадре база = `Tick::ZERO` (всё новое видно).
+    /// Called by the scheduler at the end of `run()`/`run_sequential()`. After
+    /// this, `Changed<T>` inside systems reliably detects mutations from **this**
+    /// frame (rather than "everything"). On the first frame the base is
+    /// `Tick::ZERO` (everything new is visible).
     #[inline]
     pub fn advance_change_tick(&mut self) {
         self.last_run_tick = self.current_tick;
@@ -347,16 +357,16 @@ impl World {
         }
     }
 
-    /// Кламп старых change-тиков к окну [`Tick::MAX_CHANGE_AGE`] (W2-3,
-    /// аналог Bevy `check_change_ticks`).
+    /// Clamp stale change-ticks to the [`Tick::MAX_CHANGE_AGE`] window (W2-3,
+    /// analogous to Bevy's `check_change_ticks`).
     ///
-    /// `Changed<T>` использует wrapping-сравнение, корректное при разнице
-    /// < 2³¹: строка, не менявшаяся дольше, стала бы ложно-Changed (~99 дней
-    /// аптайма @250Hz). Кламп подтягивает такие тики к границе окна, сохраняя
-    /// «давно не менялась» навсегда. Запускается автоматически из
+    /// `Changed<T>` uses wrapping comparison, correct for a difference < 2³¹: a
+    /// row unchanged for longer would become falsely Changed (~99 days of uptime
+    /// @250Hz). The clamp pulls such ticks to the window boundary, keeping
+    /// "unchanged for a long time" forever. Runs automatically from
     /// [`tick`](Self::tick)/[`advance_change_tick`](Self::advance_change_tick)
-    /// раз в `TICK_CHECK_INTERVAL`; публичен для прод-серверов/редактора с
-    /// собственным циклом.
+    /// once every `TICK_CHECK_INTERVAL`; public for prod servers / editors with
+    /// their own loop.
     pub fn check_change_ticks(&mut self) {
         let current = self.current_tick;
         for arch in &mut self.archetypes {
@@ -367,47 +377,50 @@ impl World {
         self.last_run_tick.check_against(current);
     }
 
-    /// База change-detection для систем (тик предыдущей границы кадра).
+    /// The change-detection base for systems (the tick of the previous frame
+    /// boundary).
     #[inline]
     pub fn last_run_tick(&self) -> Tick {
         self.last_run_tick
     }
 
-    /// Выставить базу change-detection (`Changed<T>`/`Added<T>` сравнивают change-tick строки с ней).
-    /// **Внутренний API планировщика:** он ставит её перед каждой СТАДИЕЙ равной тику, на котором эта
-    /// стадия выполнялась в прошлый раз. Вместе с продвижением `current_tick` между стадиями ([`tick`])
-    /// это даёт **cross-stage change detection**: запись в поздней стадии кадра N видна более ранней
-    /// стадии кадра N+1 (закрывает слепую зону per-frame-тика, TD-52). Прямое использование вне
-    /// планировщика обычно не нужно.
+    /// Set the change-detection base (`Changed<T>`/`Added<T>` compare a row's
+    /// change-tick against it). **Internal scheduler API:** it sets this before
+    /// each STAGE equal to the tick at which that stage last ran. Together with
+    /// advancing `current_tick` between stages ([`tick`]) this gives **cross-stage
+    /// change detection**: a write in a late stage of frame N is visible to an
+    /// earlier stage of frame N+1 (closing the per-frame-tick blind spot, TD-52).
+    /// Direct use outside the scheduler is usually unnecessary.
     #[inline]
     pub fn set_last_run_tick(&mut self, tick: Tick) {
         self.last_run_tick = tick;
     }
 
-    /// Flush конкретных типов событий (по TypeId). Используется Scheduler для per-Stage flush.
+    /// Flush specific event types (by TypeId). Used by the Scheduler for
+    /// per-Stage flush.
     pub fn flush_events_by_type(&mut self, type_ids: &[std::any::TypeId]) {
         self.events.flush_by_type_id(type_ids);
     }
 
-    /// Flush всех событий. Используется при работе без Scheduler.
+    /// Flush all events. Used when running without a Scheduler.
     pub fn flush_all_events(&mut self) {
         self.events.flush_all();
     }
 
-    /// Завершить кадр: **флаш всех событий + продвижение change-tick**.
+    /// End the frame: **flush all events + advance the change-tick**.
     ///
-    /// Самодостаточная замена ручной паре `flush_all_events()` + `tick()` при
-    /// работе **без планировщика** (#9). Вызывайте один раз в конце каждой
-    /// итерации игрового цикла:
+    /// A self-contained replacement for the manual `flush_all_events()` +
+    /// `tick()` pair when running **without a scheduler** (#9). Call it once at
+    /// the end of each game-loop iteration:
     ///
     /// ```ignore
     /// loop {
-    ///     // ... мутации, отправка событий ...
-    ///     world.advance_frame(); // события видны на следующем кадре, change-tick++
+    ///     // ... mutations, sending events ...
+    ///     world.advance_frame(); // events visible next frame, change-tick++
     /// }
     /// ```
     ///
-    /// Планировщик делает per-stage флаш сам; там это звать не нужно.
+    /// The scheduler does per-stage flush itself; there it need not be called.
     pub fn advance_frame(&mut self) {
         self.flush_all_events();
         self.advance_change_tick();
@@ -426,13 +439,13 @@ impl World {
         self.resources.len()
     }
 
-    /// Получить текущую конфигурацию чанкования.
+    /// Get the current chunking configuration.
     #[inline]
     pub fn chunk_config(&self) -> &ChunkConfig {
         &self.chunk_config
     }
 
-    /// Установить конфигурацию чанкования.
+    /// Set the chunking configuration.
     #[inline]
     pub fn set_chunk_config(&mut self, config: ChunkConfig) {
         self.chunk_config = config;
@@ -465,10 +478,12 @@ impl World {
         self.error_handler.set_mode(mode);
     }
 
-    /// Удалить все сущности, сохранив ресурсы, зарегистрированные компоненты и события.
+    /// Remove all entities, preserving resources, registered components, and
+    /// events.
     ///
-    /// Аналог `World::clear()` в Bevy. Полезно для перезапуска уровня или сброса симуляции.
-    /// После вызова `entity_count()` вернёт 0, но ресурсы и компоненты останутся.
+    /// Analogous to `World::clear()` in Bevy. Useful for restarting a level or
+    /// resetting a simulation. After the call `entity_count()` returns 0, but
+    /// resources and components remain.
     pub fn clear_entities(&mut self) {
         // Collect all entity IDs first to avoid borrow issues
         let entities: Vec<Entity> = self
@@ -489,17 +504,19 @@ impl World {
         self.registry.register_serde::<T>()
     }
 
-    /// Зарегистрировать компонент с поддержкой сериализации в JSON-формате.
+    /// Register a component with JSON serialization support.
     pub fn register_component_serde_json<T: crate::component::Serializable>(
         &mut self,
     ) -> ComponentId {
         self.registry.register_serde_json::<T>()
     }
 
-    /// Зарегистрировать компонент с **контекст-зависимыми** serde-функциями (TD-44): компонент с внешней
-    /// ссылкой (Handle ассета, Entity-референс) (де)сериализуется через [`SerdeContext`](crate::SerdeContext),
-    /// который передаётся в `WorldSerializer::snapshot_with`/`restore_with`. Резолвер живёт в движке/
-    /// редакторе ⇒ apex-ecs остаётся ассет-агностичным. См. [`ComponentRegistry::register_serde_with`].
+    /// Register a component with **context-dependent** serde functions (TD-44): a
+    /// component with an external reference (asset Handle, Entity reference) is
+    /// (de)serialized through [`SerdeContext`](crate::SerdeContext), which is
+    /// passed into `WorldSerializer::snapshot_with`/`restore_with`. The resolver
+    /// lives in the engine/editor ⇒ apex-ecs stays asset-agnostic. See
+    /// [`ComponentRegistry::register_serde_with`].
     pub fn register_component_serde_with<T: Component>(
         &mut self,
         fns: crate::component::ComponentSerdeFns,
@@ -507,10 +524,10 @@ impl World {
         self.registry.register_serde_with::<T>(fns)
     }
 
-    /// Зарегистрировать ремап Entity-ссылок компонента `T` (E6): при `restore`
-    /// snapshot старые Entity-id ВНУТРИ `T` (напр. `Target(Entity)`) обновляются
-    /// на новые вторым проходом restore через [`MapEntities::map_entities`]. Без
-    /// этого Entity-ссылки после restore указывают в пустоту.
+    /// Register Entity-reference remapping for component `T` (E6): on snapshot
+    /// `restore`, old Entity ids INSIDE `T` (e.g. `Target(Entity)`) are updated to
+    /// the new ones by a second restore pass via [`MapEntities::map_entities`].
+    /// Without this, Entity references point into the void after restore.
     pub fn register_map_entities<T: Component + crate::component::MapEntities>(
         &mut self,
     ) -> ComponentId {
@@ -524,10 +541,10 @@ impl World {
         id
     }
 
-    /// E6: ремапнуть Entity-ссылки внутри всех компонентов `entity`, которые
-    /// зарегистрировали [`MapEntitiesFn`](crate::component::MapEntitiesFn), через
-    /// `f`. Вызывается `restore` ПОСЛЕ построения полной карты old→new (в т.ч.
-    /// forward-ссылки). No-op для мёртвой entity / компонентов без ремапа.
+    /// E6: remap Entity references inside all of `entity`'s components that
+    /// registered a [`MapEntitiesFn`](crate::component::MapEntitiesFn), via `f`.
+    /// Called by `restore` AFTER the full old→new map is built (including forward
+    /// references). No-op for a dead entity / components without remapping.
     pub fn map_entity_refs(&mut self, entity: Entity, f: &mut dyn FnMut(Entity) -> Entity) {
         let Some(loc) = self.entities.get_location(entity) else {
             return;
@@ -558,71 +575,72 @@ impl World {
         }
     }
 
-    // ── Хуки состава (W3-1) ────────────────────────────────────
+    // ── Composition hooks (W3-1) ───────────────────────────────
 
-    /// Зарегистрировать `on_add`-хук компонента `T`: вызывается после того,
-    /// как `T` ПОЯВИЛСЯ у entity (spawn / insert нового; замена значения
-    /// существующего компонента хук НЕ дёргает — это `Changed`, не `Added`).
+    /// Register an `on_add` hook for component `T`: called after `T` APPEARED on
+    /// an entity (spawn / insert of a new one; replacing the value of an existing
+    /// component does NOT fire the hook — that is `Changed`, not `Added`).
     ///
-    /// Хук вызывается на консистентном мире (после завершения структурной
-    /// операции) и может делать любые операции, включая структурные.
-    /// Один хук на компонент; повторная регистрация — panic (для нескольких
-    /// подписчиков используйте события).
+    /// The hook is invoked on a consistent world (after the structural operation
+    /// completes) and may perform any operations, including structural ones.
+    /// One hook per component; re-registration panics (for multiple subscribers
+    /// use events).
     pub fn on_add<T: Component>(&mut self, hook: crate::component::ComponentHookFn) {
         let cid = self.registry.get_or_register::<T>();
         let hooks = self.registry.hooks_mut(cid);
         assert!(
             hooks.on_add.is_none(),
-            "on_add-хук для `{}` уже зарегистрирован (один хук на компонент; \
-             для нескольких подписчиков используйте события)",
+            "on_add hook for `{}` is already registered (one hook per component; \
+             use events for multiple subscribers)",
             std::any::type_name::<T>()
         );
         hooks.on_add = Some(hook);
         self.registry.set_flag(cid, crate::component::FLAG_ON_ADD);
     }
 
-    /// Зарегистрировать `on_remove`-хук компонента `T`: вызывается после того,
-    /// как entity ПОТЕРЯЛА `T` (`remove` или `despawn` — в последнем случае
-    /// entity уже мертва, `is_alive == false`). Значение компонента к моменту
-    /// вызова уже уничтожено — хук получает только entity.
+    /// Register an `on_remove` hook for component `T`: called after an entity
+    /// LOST `T` (`remove` or `despawn` — in the latter case the entity is already
+    /// dead, `is_alive == false`). The component value is already destroyed by the
+    /// time of the call — the hook receives only the entity.
     ///
-    /// Один хук на компонент; повторная регистрация — panic.
+    /// One hook per component; re-registration panics.
     pub fn on_remove<T: Component>(&mut self, hook: crate::component::ComponentHookFn) {
         let cid = self.registry.get_or_register::<T>();
         let hooks = self.registry.hooks_mut(cid);
         assert!(
             hooks.on_remove.is_none(),
-            "on_remove-хук для `{}` уже зарегистрирован (один хук на компонент; \
-             для нескольких подписчиков используйте события)",
+            "on_remove hook for `{}` is already registered (one hook per component; \
+             use events for multiple subscribers)",
             std::any::type_name::<T>()
         );
         hooks.on_remove = Some(hook);
         self.registry.set_flag(cid, crate::component::FLAG_ON_REMOVE);
     }
 
-    /// Объявить: компонент `C` требует `R` (D2-4, аналог Bevy `#[require]`).
+    /// Declare: component `C` requires `R` (D2-4, analogous to Bevy's
+    /// `#[require]`).
     ///
-    /// При появлении `C` у entity (spawn / insert) недостающий `R`
-    /// дотягивается `R::default()` — явно заданное значение всегда выигрывает.
-    /// Требования транзитивны (если `R` сам что-то требует). Для derive-типов
-    /// удобнее атрибут: `#[derive(Component)] #[require(LocalTransform)]`.
+    /// When `C` appears on an entity (spawn / insert), a missing `R` is pulled in
+    /// via `R::default()` — an explicitly given value always wins. Requirements
+    /// are transitive (if `R` itself requires something). For derive types the
+    /// attribute is more convenient: `#[derive(Component)]
+    /// #[require(LocalTransform)]`.
     ///
     /// ```ignore
     /// world.require_component::<MeshRenderer, LocalTransform>();
     /// world.require_component::<MeshRenderer, GlobalTransform>();
-    /// let e = world.spawn((MeshRenderer::new(mesh, mat),)); // трансформы дотянутся
+    /// let e = world.spawn((MeshRenderer::new(mesh, mat),)); // transforms pulled in
     /// ```
     pub fn require_component<C: Component, R: Component + Default>(&mut self) {
         self.registry.register_required::<C, R>();
     }
 
-    /// Включить эмиссию событий [`Removed<T>`](crate::events::Removed) при
-    /// потере компонента `T` (remove/despawn) — аналог Bevy
-    /// `RemovedComponents`. Чтение — обычными путями событий (`&[Removed<T>]`
-    /// в `system!`, `event_reader`), per-reader курсоры исключают дубли.
+    /// Enable emission of [`Removed<T>`](crate::events::Removed) events when
+    /// component `T` is lost (remove/despawn) — analogous to Bevy's
+    /// `RemovedComponents`. Read via the usual event paths (`&[Removed<T>]` in
+    /// `system!`, `event_reader`); per-reader cursors exclude duplicates.
     ///
-    /// Идемпотентна. Для невключённых типов удаления не записываются
-    /// (нулевая стоимость).
+    /// Idempotent. For non-enabled types, removals are not recorded (zero cost).
     pub fn track_removals<T: Component>(&mut self) {
         let cid = self.registry.get_or_register::<T>();
         self.events.register::<crate::events::Removed<T>>();
@@ -635,9 +653,9 @@ impl World {
             .set_flag(cid, crate::component::FLAG_TRACK_REMOVED);
     }
 
-    /// Зарегистрировать `on_add`-хук связи вида `R`: вызывается после
-    /// успешного `add_relation` с `(subject, target)`.
-    /// Один хук на вид; повторная регистрация — panic.
+    /// Register an `on_add` hook for relation kind `R`: called after a successful
+    /// `add_relation` with `(subject, target)`.
+    /// One hook per kind; re-registration panics.
     pub fn on_relation_add<R: crate::relations::RelationKind>(
         &mut self,
         hook: crate::relations::RelationHookFn,
@@ -646,10 +664,10 @@ impl World {
         self.relations.set_on_add(kind_idx, hook);
     }
 
-    /// Зарегистрировать `on_remove`-хук связи вида `R`: вызывается после
-    /// исчезновения пары — явный `remove_relation` ИЛИ вычистка при despawn
-    /// subject'а/target'а (включая каскад; entity к этому моменту могут быть
-    /// мертвы). Один хук на вид; повторная регистрация — panic.
+    /// Register an `on_remove` hook for relation kind `R`: called after a pair
+    /// disappears — an explicit `remove_relation` OR cleanup on despawn of the
+    /// subject/target (including cascade; the entities may be dead by then). One
+    /// hook per kind; re-registration panics.
     pub fn on_relation_remove<R: crate::relations::RelationKind>(
         &mut self,
         hook: crate::relations::RelationHookFn,
@@ -658,8 +676,8 @@ impl World {
         self.relations.set_on_remove(kind_idx, hook);
     }
 
-    /// Диспетчер хуков: вызывается в КОНЦЕ публичных структурных операций.
-    /// Быстрый путь (нет подписчиков/очередь пуста) — одна проверка.
+    /// Hook dispatcher: called at the END of public structural operations.
+    /// Fast path (no subscribers / queue empty) — a single check.
     #[inline]
     pub(crate) fn flush_hooks(&mut self) {
         if self.hook_queue.is_empty() || self.hook_dispatch_active {
@@ -689,17 +707,17 @@ impl World {
         let world = &mut *guard.world;
 
         let mut i = 0;
-        // Хуки могут дописывать события в хвост очереди (вложенные структурные
-        // операции) — обычный while по растущему Vec, без рекурсии.
+        // Hooks may append events to the tail of the queue (nested structural
+        // operations) — a plain while over a growing Vec, without recursion.
         while i < world.hook_queue.len() {
             let ev = world.hook_queue[i];
             i += 1;
             match ev {
                 HookEvent::Added(entity, cid) => {
-                    // Required-компоненты (D2-4) — ДО пользовательского
-                    // on_add: хук видит entity уже с полным составом.
-                    // Транзитивные requires идут через эту же очередь
-                    // (вставка R ставит своё Added-событие).
+                    // Required components (D2-4) — BEFORE the user's on_add: the
+                    // hook sees the entity already with its full composition.
+                    // Transitive requires go through this same queue (inserting R
+                    // queues its own Added event).
                     if world.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
                         let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = world
                             .registry
@@ -744,8 +762,8 @@ impl World {
         // `guard` drops here → clears the queue and resets the flag (also on panic).
     }
 
-    /// Поставить `Added`-хуки для свежесозданной entity по списку её
-    /// компонентов (вызывающий уже проверил `registry.any_flags()`).
+    /// Queue `Added` hooks for a freshly created entity by the list of its
+    /// components (the caller has already checked `registry.any_flags()`).
     fn queue_added_hooks(&mut self, entity: Entity, ids: &[ComponentId]) {
         for &cid in ids {
             if self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
@@ -754,8 +772,8 @@ impl World {
         }
     }
 
-    /// Уведомления о ПОТЕРЕ компонента: `on_remove`-хук в очередь +
-    /// немедленная эмиссия `Removed<T>`-события (вызывающий уже проверил
+    /// Notifications about component LOSS: queue the `on_remove` hook + immediate
+    /// emission of the `Removed<T>` event (the caller has already checked
     /// `registry.any_flags()`).
     fn notify_removed(&mut self, entity: Entity, cid: ComponentId) {
         let flags = self.registry.flags(cid);
@@ -774,7 +792,7 @@ impl World {
         &self.registry
     }
 
-    /// Мутабельный доступ к реестру компонентов.
+    /// Mutable access to the component registry.
     pub fn registry_mut(&mut self) -> &mut ComponentRegistry {
         &mut self.registry
     }
@@ -783,11 +801,12 @@ impl World {
         &self.archetypes
     }
 
-    /// Сводка по архетипам — дебаг/профилирование (CR-M4).
+    /// Archetype summary — debug / profiling (CR-M4).
     ///
-    /// Пустые архетипы не переиспользуются под другой состав и не компактируются
-    /// (append-only инвариант дешевле; слот по СОВПАДАЮЩЕМУ составу переиспользуется
-    /// через archetype_index). Эта сводка — инструмент наблюдения за их числом.
+    /// Empty archetypes are not reused for another composition and are not
+    /// compacted (the append-only invariant is cheaper; a slot for a MATCHING
+    /// composition is reused via archetype_index). This summary is a tool for
+    /// observing their count.
     pub fn archetype_stats(&self) -> ArchetypeStats {
         let mut stats = ArchetypeStats {
             archetypes: self.archetypes.len(),
@@ -832,11 +851,11 @@ impl World {
         self.insert_raw(entity, component_id, data, tick);
     }
 
-    // ── Параллельный доступ ────────────────────────────────────
+    // ── Parallel access ────────────────────────────────────────
 
     /// # Safety
-    /// Вызывающий гарантирует отсутствие structural changes
-    /// и корректность AccessDescriptor всех параллельных систем.
+    /// The caller guarantees the absence of structural changes and the
+    /// correctness of the AccessDescriptor of all parallel systems.
     pub unsafe fn as_parallel_world(&self) -> ParallelWorld<'_> {
         ParallelWorld {
             world: self as *const World,
@@ -854,10 +873,10 @@ impl World {
         self.resources.insert(value);
     }
 
-    /// E7: включить ресурс `R` в snapshot (opt-in, bincode). После этого
-    /// `WorldSerializer::snapshot` сохраняет присутствующий ресурс `R`, а
-    /// `restore` его восстанавливает. Без регистрации ресурсы в snapshot НЕ
-    /// попадают (мир может содержать не-сериализуемые ресурсы — GPU-хэндлы и пр.).
+    /// E7: include resource `R` in the snapshot (opt-in, bincode). After this,
+    /// `WorldSerializer::snapshot` saves the present resource `R`, and `restore`
+    /// restores it. Without registration, resources do NOT go into the snapshot
+    /// (the world may contain non-serializable resources — GPU handles, etc.).
     pub fn register_resource_serde<
         R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     >(
@@ -922,25 +941,25 @@ impl World {
         self.events.get_mut::<T>()
     }
 
-    /// Отправить событие.
+    /// Send an event.
     ///
-    /// Если тип события ещё не зарегистрирован — регистрирует автоматически
-    /// (вызов `world.add_event::<T>()` не требуется).
+    /// If the event type is not yet registered, it is registered automatically
+    /// (a call to `world.add_event::<T>()` is not required).
     pub fn send_event<T: Send + Sync + 'static>(&mut self, event: T) {
         self.events.get_or_register_mut::<T>().send(event);
     }
 
-    /// Предварительно выделить capacity для событий указанного типа.
+    /// Pre-allocate capacity for events of the given type.
     ///
-    /// Позволяет избежать многократных реаллокаций при массовой отправке
-    /// событий в одном тике. Вызывать перед циклом отправки.
+    /// Avoids repeated reallocations when sending events in bulk within one tick.
+    /// Call before the send loop.
     pub fn event_reserve<T: Send + Sync + 'static>(&mut self, capacity: usize) {
         self.events.get_or_register_mut::<T>().reserve(capacity);
     }
 
-    /// Зарезервировать capacity для событий по TypeId.
+    /// Reserve capacity for events by TypeId.
     ///
-    /// Вызывается планировщиком на основе `AccessDescriptor::event_reserve()`.
+    /// Called by the scheduler based on `AccessDescriptor::event_reserve()`.
     pub fn event_reserve_by_type(&mut self, type_id: TypeId, capacity: usize) {
         self.events.reserve_by_type(type_id, capacity);
     }
@@ -951,9 +970,9 @@ impl World {
         self.events.get_raw_ptr::<T>()
     }
 
-    /// Создать читатель событий с per-reader курсором.
+    /// Create an event reader with a per-reader cursor.
     ///
-    /// Аналог `EventReader::new(world.events_mut::<T>())`.
+    /// Analogous to `EventReader::new(world.events_mut::<T>())`.
     #[inline]
     pub fn event_reader<T: Send + Sync + 'static>(&self) -> EventReader<'_, T> {
         unsafe {
@@ -964,9 +983,9 @@ impl World {
         }
     }
 
-    /// Создать писатель событий.
+    /// Create an event writer.
     ///
-    /// Аналог `EventWriter::from_ptr(...)`.
+    /// Analogous to `EventWriter::from_ptr(...)`.
     #[inline]
     pub fn event_writer<T: Send + Sync + 'static>(&self) -> EventWriter<'_, T> {
         unsafe {
@@ -979,63 +998,70 @@ impl World {
 
     // ── Spawn ──────────────────────────────────────────────────
 
-    /// Создать entity из Bundle.
+    /// Create an entity from a Bundle.
     ///
-    /// Для пустой сущности (без компонентов) используйте `spawn(())`.
-    /// Для единичного компонента — `spawn((MyComponent,))`.
-    /// Для нескольких — `spawn((A, B, C))`.
+    /// For an empty entity (no components) use `spawn(())`.
+    /// For a single component — `spawn((MyComponent,))`.
+    /// For several — `spawn((A, B, C))`.
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let entity = self.entities.allocate();
         self.spawn_at(entity, bundle);
         entity
     }
 
-    /// Дескриптор-резерватор entity (делит атомарный high-water с аллокатором). Клонируется в
-    /// [`Commands`](crate::commands::Commands), чтобы `commands.spawn().id()` отдавал настоящий
-    /// `Entity` из параллельной системы (1:1 Bevy `Entities::reserve_entity`).
+    /// Entity reserver descriptor (shares the atomic high-water with the
+    /// allocator). Cloned into [`Commands`](crate::commands::Commands) so that
+    /// `commands.spawn().id()` yields a real `Entity` from a parallel system (1:1
+    /// Bevy `Entities::reserve_entity`).
     #[inline]
     pub fn entity_reserver(&self) -> crate::entity::EntityReserver {
         self.entities.reserver()
     }
 
-    /// D8b: зарезервировать детерминированный reuse-aware блок из `size` entity-индексов
-    /// (сперва освобождённые слоты, затем свежие) и вернуть привязанный резерватор.
-    /// Планировщик вызывает на главном потоке в порядке ранга систем стадии → базы/срезы
-    /// блоков детерминированы, переиспользование ограничивает id-пространство под churn
-    /// (см. [`EntityReserver`], [`reclaim_entity_block_tail`](Self::reclaim_entity_block_tail)).
+    /// D8b: reserve a deterministic reuse-aware block of `size` entity indices
+    /// (freed slots first, then fresh ones) and return a bound reserver. The
+    /// scheduler calls this on the main thread in the rank order of the stage's
+    /// systems → block bases/slices are deterministic, and reuse bounds the id
+    /// space under churn (see [`EntityReserver`],
+    /// [`reclaim_entity_block_tail`](Self::reclaim_entity_block_tail)).
     #[inline]
     pub fn reserve_entity_block(&self, size: u32) -> crate::entity::EntityReserver {
         self.entities.reserve_block(size)
     }
 
-    /// D8b: вернуть неиспользованный хвост блока в reuse-пул (индексы, зарезервированные
-    /// блоком, но не заспавненные). Планировщик зовёт это ПОСЛЕ применения команд стадии
-    /// (`flush` вырастил records), в порядке ранга → детерминированный reuse и ограниченное
-    /// id-пространство под despawn+respawn churn.
+    /// D8b: return the unused tail of a block to the reuse pool (indices reserved
+    /// by the block but not spawned). The scheduler calls this AFTER applying the
+    /// stage's commands (`flush` grew the records), in rank order → deterministic
+    /// reuse and a bounded id space under despawn+respawn churn.
     #[inline]
     pub fn reclaim_entity_block_tail(&mut self, unused: &[crate::entity::Entity]) {
         self.entities.reclaim_block_tail(unused);
     }
 
-    /// Материализовать записи под все зарезервированные через [`World::entity_reserver`] индексы.
-    /// Вызывается [`Commands::apply`](crate::commands::Commands::apply) перед обработкой очереди, до
-    /// того как spawn-команды проставят компоненты зарезервированным entity. Идемпотентно/дёшево.
+    /// Materialize records for all indices reserved via
+    /// [`World::entity_reserver`]. Called by
+    /// [`Commands::apply`](crate::commands::Commands::apply) before processing the
+    /// queue, before spawn commands set components on reserved entities.
+    /// Idempotent / cheap.
     #[inline]
     pub fn flush_reserved(&mut self) {
         self.entities.flush();
     }
 
-    /// Заспавнить компоненты на УЖЕ зарезервированную (через [`World::entity_reserver`]) entity —
-    /// путь `commands.spawn().id()`. Семантически идентичен [`World::spawn`], но не аллоцирует новый
-    /// id, а наполняет переданный (его записи гарантирует [`World::flush_reserved`] на границе apply).
+    /// Spawn components onto an ALREADY reserved (via [`World::entity_reserver`])
+    /// entity — the `commands.spawn().id()` path. Semantically identical to
+    /// [`World::spawn`], but does not allocate a new id; it fills the passed one
+    /// (its record is guaranteed by [`World::flush_reserved`] at the apply
+    /// boundary).
     #[inline]
     pub fn spawn_reserved<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         self.spawn_at(entity, bundle);
     }
 
-    /// Общее тело спавна: наполнить КОНКРЕТНУЮ entity компонентами `bundle`. Запись entity при
-    /// необходимости создаётся (`ensure_record`) — нужно для зарезервированных id, опередивших flush;
-    /// для прямого `spawn` (аллокатор уже создал запись) это no-op.
+    /// Shared spawn body: fill a SPECIFIC entity with the components of `bundle`.
+    /// The entity's record is created if needed (`ensure_record`) — required for
+    /// reserved ids that ran ahead of the flush; for a direct `spawn` (the
+    /// allocator already created the record) this is a no-op.
     fn spawn_at<B: Bundle>(&mut self, entity: Entity, bundle: B) {
         // §0.2a (A10): spawning onto an entity that is ALREADY located would
         // orphan its current row (a phantom duplicate that later iterations walk
@@ -1062,7 +1088,7 @@ impl World {
         self.entities.ensure_record(entity.index());
         let ids = bundle.component_ids(&mut self.registry);
         if ids.is_empty() {
-            // Быстрый путь для пустой entity (spawn(()))
+            // Fast path for an empty entity (spawn(()))
             let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
             self.entities.set_location(
                 entity,
@@ -1073,7 +1099,7 @@ impl World {
             );
             return;
         }
-        // Обычный путь
+        // Normal path
         let archetype_id = self.get_or_create_archetype(&ids);
         let row = self.archetypes[archetype_id.0 as usize].entities.len();
         let tick = self.current_tick;
@@ -1094,9 +1120,9 @@ impl World {
         }
     }
 
-    /// Внутренний общий метод для `spawn_many` / `spawn_many_silent`.
-    /// Всегда возвращает `Vec<Entity>`, а публичные обёртки решают,
-    /// возвращать его или игнорировать.
+    /// Internal shared method for `spawn_many` / `spawn_many_silent`.
+    /// Always returns `Vec<Entity>`; the public wrappers decide whether to return
+    /// it or ignore it.
     fn spawn_many_inner<B, F>(&mut self, count: usize, mut make_bundle: F) -> Vec<Entity>
     where
         B: Bundle,
@@ -1106,11 +1132,13 @@ impl World {
             return Vec::new();
         }
 
-        // `decl_ids` — порядок ОБЪЯВЛЕНИЯ бандла (= порядок обхода `write_into_batch`); `ids` —
-        // ОТСОРТИРОВАННЫЙ (для архетипа). Их РАЗДЕЛЕНИЕ критично: col_indices ОБЯЗАН быть в порядке
-        // обхода, иначе компонент пишется в чужую колонку (UB). §10.10: состав берётся СТАТИЧЕСКИ
-        // (по типу `B`), без `make_bundle(0)`-probe — замыкание больше не зовётся лишний раз ради
-        // состава и не обязано быть чистым.
+        // `decl_ids` — the bundle's DECLARATION order (= `write_into_batch`
+        // traversal order); `ids` — SORTED (for the archetype). Their SEPARATION
+        // is critical: col_indices MUST be in traversal order, otherwise a
+        // component is written to the wrong column (UB). §10.10: the composition
+        // is taken STATICALLY (by the type `B`), without a `make_bundle(0)` probe
+        // — the closure is no longer called an extra time for composition and need
+        // not be pure.
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
         B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
@@ -1128,21 +1156,25 @@ impl World {
 
         let entities = self.entities.allocate_batch(count);
 
-        // Предвычисляем column indices в порядке ОБЪЯВЛЕНИЯ (`decl_ids`) — РОВНО как их потребляет
-        // `write_into_batch`. Избегает повторных get_or_register/column_index в write_into для
-        // каждой entity (~40k HashMap lookup'ов при 10k). КРИТИЧНО из `decl_ids`, НЕ из
-        // отсортированных `ids` (иначе при «порядок объявления ≠ порядок id» — запись в чужую колонку).
+        // Precompute column indices in DECLARATION order (`decl_ids`) — EXACTLY as
+        // `write_into_batch` consumes them. Avoids repeated
+        // get_or_register/column_index in write_into for each entity (~40k HashMap
+        // lookups at 10k). CRITICALLY from `decl_ids`, NOT from the sorted `ids`
+        // (otherwise, when "declaration order ≠ id order", a write goes to the
+        // wrong column).
         let col_indices: SmallVec<[usize; 8]> = decl_ids
             .iter()
             .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
             .collect();
 
-        // ВСЕГДА per-entity: `make_bundle(i)` вызывается для КАЖДОЙ сущности (контракт замыкания —
-        // данные per-index). Прежний bulk-copy «копировать строку 0 во все» БЫЛ НЕКОРРЕКТЕН: звал
-        // `make_bundle` лишь для строки 0 ⇒ `spawn_many(n, |i| A(i))` молча давал ВСЕМ A(0) (потеря
-        // per-entity данных). `col_indices` (порядок ОБХОДА) делает запись по колонкам правильной.
-        // Перф: пишем ДАННЫЕ per-entity (`write_data_into_batch`, без тиков/len), а тики/`len`
-        // проставляем ПОКОЛОНОЧНО один раз на пачку (resize вместо count×ncols push'ей).
+        // ALWAYS per-entity: `make_bundle(i)` is called for EACH entity (the
+        // closure contract is per-index data). The former bulk-copy "copy row 0 to
+        // all" WAS INCORRECT: it called `make_bundle` only for row 0 ⇒
+        // `spawn_many(n, |i| A(i))` silently gave ALL of them A(0) (loss of
+        // per-entity data). `col_indices` (traversal order) makes the per-column
+        // write correct. Perf: we write DATA per-entity (`write_data_into_batch`,
+        // without ticks/len), and set ticks/`len` PER-COLUMN once per batch (resize
+        // instead of count×ncols pushes).
         {
             // A6: if `make_bundle(i)` panics mid-loop, roll the archetype back to
             // a consistent state (entities.len() == col.len) instead of leaving
@@ -1164,9 +1196,10 @@ impl World {
             }
             guard.armed = false;
             drop(guard);
-            // Тики + len — ПОКОЛОНОЧНО, к АБСОЛЮТНОМУ target (start_row+count). Это устойчиво к ОБОИМ
-            // путям записи: для data-only override'ов (leaf/tuple/derive) — заполняет count новых
-            // слотов; для дефолта (ручной impl → write_into_batch уже выставил тики/len) — no-op.
+            // Ticks + len — PER-COLUMN, to the ABSOLUTE target (start_row+count).
+            // This is robust to BOTH write paths: for data-only overrides
+            // (leaf/tuple/derive) it fills count new slots; for the default (manual
+            // impl → write_into_batch already set ticks/len) it is a no-op.
             let target_len = start_row + count;
             let arch = &mut self.archetypes[arch_idx];
             for &col_idx in &col_indices {
@@ -1216,13 +1249,15 @@ impl World {
         self.spawn_many_inner(count, make_bundle);
     }
 
-    /// Bulk-спавн пачки сущностей с ПО-ЭЛЕМЕНТНЫМИ бандлами одного типа `B` в ОДИН архетип одним
-    /// резолвом (`component_ids`/архетип/колонки — раз на пачку, НЕ на каждый спавн). Путь
-    /// `Commands::apply` для подряд идущих одно-типных spawn-команд (см. `spawn_apply_batch`):
-    /// снимает per-spawn `spawn_at`-налог (10k архетип-поисков на 10k спавнов). `entities` — либо
-    /// все зарезервированы (системный путь; их записи материализовал предшествующий
-    /// `flush_reserved`), либо все `PLACEHOLDER` (standalone-`Commands` — тогда id аллоцируются здесь
-    /// одним `allocate_batch`).
+    /// Bulk-spawn a batch of entities with PER-ELEMENT bundles of a single type
+    /// `B` into ONE archetype with a single resolve
+    /// (`component_ids`/archetype/columns — once per batch, NOT per spawn). The
+    /// `Commands::apply` path for consecutive same-type spawn commands (see
+    /// `spawn_apply_batch`): removes the per-spawn `spawn_at` tax (10k archetype
+    /// lookups for 10k spawns). `entities` — either all reserved (the system path;
+    /// their records were materialized by a preceding `flush_reserved`), or all
+    /// `PLACEHOLDER` (standalone `Commands` — then the ids are allocated here with
+    /// a single `allocate_batch`).
     pub(crate) fn spawn_bundles_bulk<B: Bundle>(&mut self, entities: Vec<Entity>, bundles: Vec<B>) {
         let count = bundles.len();
         if count == 0 {
@@ -1230,13 +1265,14 @@ impl World {
         }
         debug_assert_eq!(entities.len(), count);
 
-        // PLACEHOLDER (standalone) ⇒ аллоцируем свежие id; иначе берём зарезервированные.
+        // PLACEHOLDER (standalone) ⇒ allocate fresh ids; otherwise take the
+        // reserved ones.
         let placeholder = entities[0] == Entity::PLACEHOLDER;
         debug_assert!(
             entities
                 .iter()
                 .all(|&e| (e == Entity::PLACEHOLDER) == placeholder),
-            "пачка spawn-команд одного Commands однородна по наличию резерватора"
+            "a batch of spawn commands from one Commands is homogeneous in reserver presence"
         );
         let entities: Vec<Entity> = if placeholder {
             self.entities.allocate_batch(count)
@@ -1247,15 +1283,17 @@ impl World {
             entities
         };
 
-        // Резолв архетипа/ids/колонок — ОДИН раз на пачку (вместо per-spawn в spawn_at).
-        // `decl_ids` (порядок объявления = обхода write_into_batch) ОТДЕЛЬНО от `ids` (сорт. для
-        // архетипа) — col_indices строится из decl_ids, иначе компонент пишется в чужую колонку (UB).
+        // Resolve archetype/ids/columns — ONCE per batch (instead of per-spawn in
+        // spawn_at). `decl_ids` (declaration order = write_into_batch traversal
+        // order) SEPARATE from `ids` (sorted for the archetype) — col_indices is
+        // built from decl_ids, otherwise a component is written to the wrong column
+        // (UB).
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
         B::static_component_ids(&mut self.registry, &mut decl_ids);
         let mut ids = decl_ids.clone();
         ids.sort_unstable();
         if ids.is_empty() {
-            // Пустой бандл (`spawn(())`) — в EMPTY-архетип.
+            // Empty bundle (`spawn(())`) — into the EMPTY archetype.
             for (i, _bundle) in bundles.into_iter().enumerate() {
                 let entity = entities[i];
                 let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
@@ -1282,9 +1320,11 @@ impl World {
             .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
             .collect();
 
-        // Бандлы РАЗНЫЕ per-item ⇒ пишем ДАННЫЕ каждого через write_data_into_batch (с предвычисленными
-        // col_indices в порядке обхода — без повторного get_or_register/архетип-поиска); тики/len —
-        // поколоночно к абсолютному target (устойчиво к data-only override и дефолту).
+        // Bundles are DIFFERENT per item ⇒ write the DATA of each via
+        // write_data_into_batch (with precomputed col_indices in traversal order —
+        // without repeated get_or_register / archetype lookup); ticks/len —
+        // per-column to the absolute target (robust to data-only override and the
+        // default).
         {
             // A6: a custom `Bundle::write_data_into_batch` that panics mid-loop
             // must not leave ghost entity rows over uninitialized column memory.
@@ -1335,9 +1375,9 @@ impl World {
         }
     }
 
-    /// Создать entity из итератора бандлов (как Bevy `spawn_batch`).
+    /// Create entities from an iterator of bundles (like Bevy's `spawn_batch`).
     ///
-    /// Позволяет порождать entity с разными наборами компонентов в одной пачке:
+    /// Lets you spawn entities with different component sets in one batch:
     ///
     /// ```rust
     /// # use apex_core::prelude::*;
@@ -1350,9 +1390,9 @@ impl World {
     /// ]);
     /// ```
     ///
-    /// Внутри собирает итератор в `Vec` и вызывает `spawn` для каждого элемента.
-    /// Для массового спавна **одинаковых** бандлов используйте [`spawn_many`] —
-    /// он оптимизирован через bulk-copy.
+    /// Internally collects the iterator into a `Vec` and calls `spawn` for each
+    /// element. For bulk-spawning **identical** bundles use [`spawn_many`] — it is
+    /// optimized via bulk-copy.
     pub fn spawn_batch<I>(&mut self, iter: I) -> Vec<Entity>
     where
         I: IntoIterator,
@@ -1391,8 +1431,8 @@ impl World {
             unsafe {
                 if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                     let col = &mut self.archetypes[current_idx].columns[col_idx];
-                    // replace_at дропает СТАРОЕ значение (W2-1: write_at молча
-                    // терял его — утечка для Drop-типов: String, Vec, Arc…).
+                    // replace_at drops the OLD value (W2-1: write_at silently lost
+                    // it — a leak for Drop types: String, Vec, Arc…).
                     col.replace_at(
                         location.row as usize,
                         &component as *const T as *const u8,
@@ -1431,10 +1471,10 @@ impl World {
         }
     }
 
-    /// Вставить компонент по raw данным.
+    /// Insert a component from raw data.
     ///
-    /// `data` — байтовое представление владеемого `T` (источник `forget`-нут
-    /// вызывающим). Длина ОБЯЗАНА совпадать с размером компонента.
+    /// `data` — the byte representation of an owned `T` (the source is
+    /// `forget`-ten by the caller). The length MUST match the component size.
     pub(crate) fn insert_raw(
         &mut self,
         entity: Entity,
@@ -1498,7 +1538,7 @@ impl World {
                 unsafe {
                     if let Some(col_idx) = self.archetypes[current_idx].column_index(component_id) {
                         let col = &mut self.archetypes[current_idx].columns[col_idx];
-                        // replace_at: дроп старого значения (см. W2-1).
+                        // replace_at: drop of the old value (see W2-1).
                         col.replace_at(location.row as usize, data.as_ptr(), tick);
                     }
                 }
@@ -1531,18 +1571,18 @@ impl World {
         }
     }
 
-    /// Групповая вставка компонентов одной entity (W2-1): ОДИН archetype move
-    /// на всю пачку вместо move-на-компонент. Используется `Commands::apply`
-    /// для бёрстов `insert` на одну entity.
+    /// Batch insertion of components for one entity (W2-1): ONE archetype move
+    /// for the whole batch instead of a move per component. Used by
+    /// `Commands::apply` for bursts of `insert` on a single entity.
     ///
-    /// `parts` — (ComponentId, указатель на значение, tick). Значения
-    /// ПЕРЕДАЮТСЯ ВО ВЛАДЕНИЕ (байтовая копия в колонку; вызывающий обязан
-    /// `forget`-нуть источник / не дропать байты). Уже существующие компоненты
-    /// перезаписываются с дропом старого значения; дубликаты в пачке
-    /// применяются по порядку (выживает последний, промежуточные дропаются).
+    /// `parts` — (ComponentId, pointer to value, tick). Values are TRANSFERRED BY
+    /// OWNERSHIP (byte copy into the column; the caller must `forget` the source /
+    /// not drop the bytes). Already-existing components are overwritten with a
+    /// drop of the old value; duplicates in the batch are applied in order (the
+    /// last one survives, intermediate ones are dropped).
     ///
-    /// Возвращает `false` (ничего не записано), если entity мертва —
-    /// вызывающий обязан сам освободить payload'ы.
+    /// Returns `false` (nothing written) if the entity is dead — the caller must
+    /// free the payloads itself.
     pub(crate) fn insert_parts(
         &mut self,
         entity: Entity,
@@ -1564,10 +1604,10 @@ impl World {
             }
         };
 
-        // Финальный архетип — цепочкой add_edges, БЕЗ перемещения данных.
-        // Попутно собираем СВЕЖЕдобавленные компоненты с on_add-подпиской
-        // (дубликат в пачке второй раз сюда не попадает — компонент уже в
-        // target-составе).
+        // Final archetype — via a chain of add_edges, WITHOUT moving data. Along
+        // the way we collect FRESHLY added components with an on_add subscription
+        // (a duplicate in the batch does not reach here a second time — the
+        // component is already in the target composition).
         let any_flags = self.registry.any_flags();
         let mut added_hooked: SmallVec<[ComponentId; 8]> = SmallVec::new();
         let mut target = location.archetype_id;
@@ -1596,8 +1636,8 @@ impl World {
 
         let arch = &mut self.archetypes[target.0 as usize];
         for &(cid, ptr, tick) in parts {
-            // Новая колонка (len == row) — push; существующая — replace с
-            // дропом старого значения.
+            // New column (len == row) — push; existing — replace with a drop of
+            // the old value.
             unsafe { arch.write_or_replace_component(row, cid, ptr, tick) };
         }
         for &cid in &added_hooked {
@@ -1607,7 +1647,7 @@ impl World {
         true
     }
 
-    /// Удалить компонент по raw ComponentId.
+    /// Remove a component by raw ComponentId.
     pub(crate) fn remove_raw(&mut self, entity: Entity, component_id: ComponentId) {
         let location = match self.entities.get_location(entity) {
             Some(loc) => loc,
@@ -1679,12 +1719,12 @@ impl World {
         true
     }
 
-    /// Удалить entity и ВСЕ её связи (как subject и как target).
+    /// Remove an entity and ALL of its relations (as subject and as target).
     ///
-    /// Для видов связи с `cascade_delete_on_target_despawn()` (например,
-    /// `ChildOf`) subjects деспавнятся каскадом — итеративно, без рекурсии.
-    /// Для остальных видов пары вычищаются из индексов: ни одна связь не
-    /// переживает свой target (generation-честность TargetIndex).
+    /// For relation kinds with `cascade_delete_on_target_despawn()` (e.g.
+    /// `ChildOf`) subjects are despawned in cascade — iteratively, without
+    /// recursion. For other kinds the pairs are cleaned out of the indices: no
+    /// relation outlives its target (the generation-honesty of TargetIndex).
     pub fn despawn(&mut self, entity: Entity) -> bool {
         if !self.entities.is_alive(entity) {
             return false;
@@ -1694,10 +1734,10 @@ impl World {
 
         while let Some(cur) = stack.pop() {
             if !self.entities.is_alive(cur) {
-                continue; // уже снесён каскадом по другому пути
+                continue; // already removed by cascade via another path
             }
 
-            // ── Связи, где cur — target ────────────────────────
+            // ── Relations where cur is the target ──────────────
             if self.target_index.has_target(cur.index) {
                 for kind_idx in 0..self.relations.kind_count() as u32 {
                     let Some(subjects) = self.target_index.take_subjects(kind_idx, cur.index)
@@ -1726,7 +1766,7 @@ impl World {
                 }
             }
 
-            // ── Связи, где cur — subject ───────────────────────
+            // ── Relations where cur is the subject ─────────────
             for pair in self.subject_index.take_all(cur.index) {
                 self.target_index
                     .remove(pair.kind_idx, pair.target.index, cur);
@@ -1739,7 +1779,7 @@ impl World {
                 }
             }
 
-            // ── Строка хранилища ───────────────────────────────
+            // ── Storage row ────────────────────────────────────
             let location = match self.entities.get_location(cur) {
                 Some(loc) => loc,
                 None => {
@@ -1749,8 +1789,9 @@ impl World {
             };
             let arch_idx = location.archetype_id.0 as usize;
 
-            // Уведомления о потере ВСЕХ компонентов entity (on_remove /
-            // Removed<T>); хуки увидят entity уже мёртвой — после despawn.
+            // Notifications about the loss of ALL of the entity's components
+            // (on_remove / Removed<T>); hooks will see the entity already dead —
+            // after despawn.
             if self.registry.any_flags() {
                 let ids: SmallVec<[ComponentId; 8]> = self.archetypes[arch_idx]
                     .component_ids
@@ -1794,10 +1835,10 @@ impl World {
         }
     }
 
-    /// Мутабельный доступ с обновлением change-tick строки (change detection).
+    /// Mutable access that updates the row's change-tick (change detection).
     ///
-    /// Стампит текущий тик мира → `Changed<T>` срабатывает (как и при мутации
-    /// через `Query<&mut T>`/`Write<T>`, C1).
+    /// Stamps the world's current tick → `Changed<T>` fires (as with a mutation
+    /// through `Query<&mut T>`/`Write<T>`, C1).
     #[inline]
     /// Mutable access with LAZY change-detection (A13): the returned [`Mut<T>`]
     /// stamps the change-tick only when the caller actually mutates it (via
@@ -1813,25 +1854,25 @@ impl World {
 
     // ── Random-access fast path (CR-M3) ────────────────────────
     //
-    // Горячие циклы (анимация: ~22k get_mut/кадр) берут ComponentId ОДИН раз
-    // на проход через `component_id::<T>()` и дальше ходят `get_by_id`/
-    // `get_mut_by_id` — без TypeId-hash на каждый вызов.
+    // Hot loops (animation: ~22k get_mut/frame) take the ComponentId ONCE per
+    // pass via `component_id::<T>()` and then go through `get_by_id`/
+    // `get_mut_by_id` — without a TypeId hash on every call.
 
-    /// ComponentId типа `T`, если тот зарегистрирован.
+    /// The ComponentId of type `T`, if it is registered.
     #[inline]
     pub fn component_id<T: Component>(&self) -> Option<ComponentId> {
         self.registry.get_id::<T>()
     }
 
-    /// `get` по заранее взятому ComponentId (см. [`component_id`](Self::component_id)).
+    /// `get` by a pre-taken ComponentId (see [`component_id`](Self::component_id)).
     ///
-    /// `component_id` обязан соответствовать `T` (debug_assert).
+    /// `component_id` must correspond to `T` (debug_assert).
     #[inline]
     pub fn get_by_id<T: Component>(&self, entity: Entity, component_id: ComponentId) -> Option<&T> {
         debug_assert_eq!(
             self.registry.get_id::<T>(),
             Some(component_id),
-            "get_by_id: ComponentId не соответствует T"
+            "get_by_id: ComponentId does not correspond to T"
         );
         let location = self.entities.get_location(entity)?;
         unsafe {
@@ -1840,8 +1881,8 @@ impl World {
         }
     }
 
-    /// `get_mut` по заранее взятому ComponentId — с ЛЕНИВОЙ change-detection
-    /// через [`Mut<T>`](crate::query::Mut) (A13; см. [`get_mut`](Self::get_mut)).
+    /// `get_mut` by a pre-taken ComponentId — with LAZY change-detection through
+    /// [`Mut<T>`](crate::query::Mut) (A13; see [`get_mut`](Self::get_mut)).
     #[inline]
     pub fn get_mut_by_id<T: Component>(
         &mut self,
@@ -1851,7 +1892,7 @@ impl World {
         debug_assert_eq!(
             self.registry.get_id::<T>(),
             Some(component_id),
-            "get_mut_by_id: ComponentId не соответствует T"
+            "get_mut_by_id: ComponentId does not correspond to T"
         );
         let location = self.entities.get_location(entity)?;
         let this_run = self.current_tick;
@@ -1880,9 +1921,9 @@ impl World {
         self.entities.is_alive(entity)
     }
 
-    /// Проверить, есть ли у сущности компонент `T`.
+    /// Check whether the entity has component `T`.
     ///
-    /// O(1) после первого вызова для данного archetype (column_index кешируется).
+    /// O(1) after the first call for the given archetype (column_index is cached).
     #[inline]
     pub fn has_component<T: Component>(&self, entity: Entity) -> bool {
         let Some(cid) = self.registry.get_id::<T>() else {
@@ -1896,17 +1937,18 @@ impl World {
 
     // ── Query API ──────────────────────────────────────────────
 
-    /// Кешированный типизированный read-only запрос (как Bevy
-    /// `world.query::<Q>()`; зеркало `ctx.query` в системах). Список
-    /// архетипов берётся из инкрементального глобального кэша. Write-формы —
-    /// через [`query_mut`](Self::query_mut) (эксклюзивный заём).
+    /// Cached typed read-only query (like Bevy's `world.query::<Q>()`; a mirror
+    /// of `ctx.query` in systems). The archetype list is taken from the
+    /// incremental global cache. Write shapes — via
+    /// [`query_mut`](Self::query_mut) (exclusive borrow).
     pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(
         &self,
     ) -> crate::query::Query<'_, '_, Q> {
         crate::query::Query::from_world_cached(self, Tick::ZERO)
     }
 
-    /// То же с явной базой change-detection (`Changed<T>`/`Added<T>` в Q).
+    /// The same with an explicit change-detection base (`Changed<T>`/`Added<T>`
+    /// in Q).
     pub fn query_changed<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(
         &self,
         last_run: Tick,
@@ -1914,12 +1956,13 @@ impl World {
         crate::query::Query::from_world_cached(self, last_run)
     }
 
-    /// Запрос любой формы (включая `Write<T>`) под эксклюзивным заёмом мира.
+    /// A query of any shape (including `Write<T>`) under an exclusive world
+    /// borrow.
     pub fn query_mut<Q: WorldQuery>(&mut self) -> crate::query::Query<'_, '_, Q> {
         crate::query::Query::from_world_cached(self, Tick::ZERO)
     }
 
-    /// [`query_mut`](Self::query_mut) с явной базой change-detection.
+    /// [`query_mut`](Self::query_mut) with an explicit change-detection base.
     pub fn query_mut_changed<Q: WorldQuery>(
         &mut self,
         last_run: Tick,
@@ -1927,22 +1970,22 @@ impl World {
         crate::query::Query::from_world_cached(self, last_run)
     }
 
-    /// Динамический READ-запрос по runtime-`ComponentId`/имени (редкий случай:
-    /// типы не известны статически — скриптинг/инспектор/agent-IPC). Для
-    /// обычного кода — типизированный [`query`](Self::query). Мутация —
+    /// Dynamic READ query by runtime `ComponentId`/name (rare case: types not
+    /// known statically — scripting/inspector/agent-IPC). For ordinary code — the
+    /// typed [`query`](Self::query). Mutation —
     /// [`query_builder_mut`](Self::query_builder_mut).
     pub fn query_builder(&self) -> QueryBuilder<'_> {
         QueryBuilder::new(self)
     }
 
-    /// Динамический READ/WRITE-запрос (эксклюзивный заём мира ⇒ выдаваемые
-    /// `&mut T` заведомо не алиасят — B1(в)). См.
+    /// Dynamic READ/WRITE query (exclusive world borrow ⇒ the yielded `&mut T`
+    /// are guaranteed not to alias — B1(v)). See
     /// [`QueryBuilderMut`](crate::query::QueryBuilderMut).
     pub fn query_builder_mut(&mut self) -> crate::query::QueryBuilderMut<'_> {
         crate::query::QueryBuilderMut::new(self)
     }
 
-    // ── Внутренние методы ──────────────────────────────────────
+    // ── Internal methods ───────────────────────────────────────
 
     pub(crate) fn find_or_create_archetype_with(
         &mut self,
@@ -1998,7 +2041,7 @@ impl World {
 
     #[inline(never)]
     pub(crate) fn get_or_create_archetype(&mut self, components: &[ComponentId]) -> ArchetypeId {
-        // Borrow<[ComponentId]> — zero-copy lookup без создания ArchetypeKey
+        // Borrow<[ComponentId]> — zero-copy lookup without creating an ArchetypeKey
         if let Some(&id) = self.archetype_index.get(components) {
             return id;
         }
@@ -2034,8 +2077,9 @@ impl World {
         self.archetypes.push(arch);
         self.archetype_index
             .insert(ArchetypeKey::from(components), id);
-        // QueryCache не инвалидируем: новые архетипы записи кэша подхватывают
-        // инкрементально (seen_arch_count), перемещения entity список не меняют.
+        // We do not invalidate the QueryCache: cache entries pick up new
+        // archetypes incrementally (seen_arch_count), and entity moves do not
+        // change the list.
         id
     }
 
@@ -2052,8 +2096,8 @@ impl World {
         let to_row = self.archetypes[to_idx].entities.len();
         self.archetypes[to_idx].entities.push(entity);
 
-        // Единственный проход: для каждой колонки из исходного архетипа
-        // определяем наличие в целевом и сразу копируем или дропаем.
+        // Single pass: for each column of the source archetype, determine its
+        // presence in the target and immediately copy or drop.
         let from_len = self.archetypes[from_idx].columns.len();
 
         for i in 0..from_len {
@@ -2061,7 +2105,7 @@ impl World {
             let item_size = self.archetypes[from_idx].columns[i].item_size;
 
             if let Some(to_col_idx) = self.archetypes[to_idx].column_index(cid) {
-                // Компонент присутствует в обоих архетипах — копируем
+                // Component present in both archetypes — copy
                 unsafe {
                     if item_size > 0 {
                         if self.archetypes[to_idx].columns[to_col_idx].len
@@ -2073,24 +2117,25 @@ impl World {
                         let dst = self.archetypes[to_idx].columns[to_col_idx].get_ptr(to_row);
                         std::ptr::copy_nonoverlapping(src, dst, item_size);
                     }
-                    // Перенос строки сохраняет ОБА тика: archetype move не
-                    // «обновляет» ни Changed<T>, ни Added<T> (W3-1).
+                    // Moving the row preserves BOTH ticks: an archetype move does
+                    // not "update" either Changed<T> or Added<T> (W3-1).
                     let changed = self.archetypes[from_idx].columns[i].get_tick(from_row);
                     let added = self.archetypes[from_idx].columns[i].get_added_tick(from_row);
                     self.archetypes[to_idx].columns[to_col_idx].push_moved_ticks(changed, added);
 
-                    // swap_remove без drop (данные перемещены в целевой архетип)
+                    // swap_remove without drop (data moved into the target
+                    // archetype)
                     self.archetypes[from_idx].columns[i].swap_remove_no_drop(from_row);
                 }
             } else {
-                // Компонент отсутствует в целевом — дропаем
+                // Component absent in the target — drop
                 unsafe {
                     self.archetypes[from_idx].columns[i].swap_remove_and_drop(from_row);
                 }
             }
         }
 
-        // Исправляем location для вытесненной entity (swap_remove)
+        // Fix up the location for the displaced entity (swap_remove)
         let from_last = self.archetypes[from_idx].entities.len() - 1;
         if from_row != from_last {
             let displaced = self.archetypes[from_idx].entities[from_last];
@@ -2110,12 +2155,12 @@ impl World {
         to_row as u32
     }
 
-    // ── Оптимизация 4.1: add_relation_batch ───────────────────
+    // ── Optimization 4.1: add_relation_batch ───────────────────
 
-    /// Batch-добавление одинаковой relation от множества субъектов к одному target.
+    /// Batch-add the same relation from many subjects to a single target.
     ///
-    /// После CR-M1 relations не входят в идентичность архетипа, поэтому это
-    /// просто bulk-вставка в индексы — O(S), без структурных изменений мира.
+    /// After CR-M1 relations are not part of archetype identity, so this is just a
+    /// bulk insert into the indices — O(S), without structural world changes.
     pub fn add_relation_batch<R: crate::relations::RelationKind>(
         &mut self,
         subjects: &[Entity],
@@ -2162,25 +2207,25 @@ unsafe impl Sync for MainWorld {}
 
 // ── SystemContext ──────────────────────────────────────────────
 
-// Константы заменены адаптивной логикой в adaptive_chunk_size.
-// MIN_CHUNK_SIZE и MAX_CHUNK_SIZE больше не используются.
-// Оставляем только для обратной совместимости, если нужно.
+// The constants were replaced by adaptive logic in adaptive_chunk_size.
+// MIN_CHUNK_SIZE and MAX_CHUNK_SIZE are no longer used.
+// Kept only for backward compatibility, if needed.
 
 pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
 
-/// Конфигурация стратегии параллельного чанкования.
+/// Configuration of the parallel chunking strategy.
 ///
-/// Определяет, как [`adaptive_chunk_size`] разбивает entity на чанки
-/// для параллельной итерации (`par_for_each`).
+/// Defines how [`adaptive_chunk_size`] splits entities into chunks for parallel
+/// iteration (`par_for_each`).
 ///
-/// Единственный носитель тюнинга параллелизма: и chunk-sizing
-/// ([`adaptive_chunk_size`]), и stage-level gating планировщика (нужно ли вообще
-/// параллелить стадию). Передаётся через `World::set_chunk_config()`; планировщик
-/// читает stage-gating-поля из `world.chunk_config()`. Если не задана явно —
-/// [`ChunkConfig::default()`]; [`ChunkConfig::from_env()`] читает переопределения
-/// из окружения.
+/// The single carrier of parallelism tuning: both chunk-sizing
+/// ([`adaptive_chunk_size`]) and the scheduler's stage-level gating (whether to
+/// parallelize a stage at all). Passed via `World::set_chunk_config()`; the
+/// scheduler reads the stage-gating fields from `world.chunk_config()`. If not
+/// set explicitly — [`ChunkConfig::default()`]; [`ChunkConfig::from_env()`] reads
+/// overrides from the environment.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// let config = ChunkConfig {
@@ -2192,32 +2237,34 @@ pub const DEFAULT_MAX_CHUNK_SIZE: usize = 65536;
 /// ```
 #[derive(Debug, Clone)]
 pub struct ChunkConfig {
-    /// Минимальное число entity на поток, ниже которого параллелизм не выгоден.
-    /// Для 8 потоков с `min = 16` миры до 128 entity идут в один чанк (serial).
+    /// The minimum number of entities per thread below which parallelism is not
+    /// worthwhile. For 8 threads with `min = 16`, worlds up to 128 entities go
+    /// into a single chunk (serial).
     ///
     /// Default: 16.
     pub min_entities_per_thread: usize,
 
-    /// Динамический минимум размера чанка — защита от микро-задач rayon.
-    /// Если вычисленный размер чанка меньше этого значения — поднимается до него.
+    /// Dynamic minimum chunk size — protection against rayon micro-tasks. If the
+    /// computed chunk size is smaller than this value, it is raised to it.
     ///
-    /// Default: 128/32/64 (зависит от размера мира, как до рефакторинга).
+    /// Default: 128/32/64 (depends on world size, as before the refactoring).
     pub dynamic_min_chunk: usize,
 
-    /// Максимальный размер чанка (ограничитель роста при огромных мирах).
+    /// Maximum chunk size (a growth limiter for huge worlds).
     ///
-    /// Default: 65536 (или из `PAR_CHUNK_SIZE`, если задан).
+    /// Default: 65536 (or from `PAR_CHUNK_SIZE`, if set).
     pub max_chunk_size: usize,
 
-    /// Если `true` — всегда использовать один чанк для `N < min_entities_per_thread * threads`.
-    /// Если `false` — всегда разбивать на `threads` чанков (даже мелких).
+    /// If `true` — always use a single chunk for `N < min_entities_per_thread *
+    /// threads`. If `false` — always split into `threads` chunks (even small
+    /// ones).
     ///
     /// Default: `true`.
     pub auto_serial_fallback: bool,
 
-    /// Во сколько раз больше задач создавать чем потоков Rayon.
-    /// 1.0 = ровно num_threads задач, 2.0 = вдвое больше.
-    /// Больше задач → лучше work-stealing, но больше per-task overhead.
+    /// How many times more tasks to create than Rayon threads. 1.0 = exactly
+    /// num_threads tasks, 2.0 = twice as many. More tasks → better work-stealing,
+    /// but more per-task overhead.
     ///
     /// Default: `2.0`.
     pub task_multiplier: f32,
@@ -2273,11 +2320,11 @@ impl ChunkConfig {
     }
 }
 
-/// Вычислить адаптивный размер чанка на основе количества entity и конфигурации.
+/// Compute the adaptive chunk size based on the entity count and configuration.
 ///
-/// Логика (с учётом `task_multiplier` для work-stealing Rayon):
-/// 1. Если `auto_serial_fallback` и `entity_count < min_entities_per_thread * thread_count` — один чанк (serial).
-/// 2. Иначе — `ceil(entity_count / thread_count / task_multiplier)`, зажато в `[dynamic_min_chunk, max_chunk_size]`.
+/// Logic (accounting for `task_multiplier` for Rayon work-stealing):
+/// 1. If `auto_serial_fallback` and `entity_count < min_entities_per_thread * thread_count` — one chunk (serial).
+/// 2. Otherwise — `ceil(entity_count / thread_count / task_multiplier)`, clamped to `[dynamic_min_chunk, max_chunk_size]`.
 pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &ChunkConfig) -> usize {
     if entity_count == 0 {
         return 1;
@@ -2298,9 +2345,8 @@ pub fn adaptive_chunk_size(entity_count: usize, num_threads: usize, config: &Chu
 }
 
 pub struct SystemContext<'w> {
-    /// SubWorld'ы, которые видит эта система.
-    /// Обычно один SubWorld, но может быть несколько если система
-    /// работает с несколькими группами архетипов.
+    /// The SubWorlds this system sees. Usually one SubWorld, but there may be
+    /// several if the system works with multiple groups of archetypes.
     pub(crate) sub_worlds: &'w [crate::sub_world::SubWorld<'w>],
     /// D8b: per-system command slot. Points at THIS system's private `Commands`
     /// buffer, owned by the scheduler for the duration of the stage. The scheduler
@@ -2311,8 +2357,8 @@ pub struct SystemContext<'w> {
     /// per-system buffers in rank order gives deterministic command ordering (D8b).
     /// If `None` — `inline_cmds` is used (sequential / undeclared paths).
     pub(crate) deferred_cmds: Option<*mut Commands>,
-    /// Локальный Commands для sequential систем или когда deferred_cmds не задан.
-    /// Используется вместо глобального статического `DUMMY_COMMANDS`.
+    /// A local Commands for sequential systems or when deferred_cmds is not set.
+    /// Used instead of the global static `DUMMY_COMMANDS`.
     pub(crate) inline_cmds: UnsafeCell<Commands>,
 }
 
@@ -2328,7 +2374,7 @@ impl<'w> SystemContext<'w> {
         }
     }
 
-    /// Создаёт SystemContext из одного SubWorld (наиболее частый случай).
+    /// Creates a SystemContext from a single SubWorld (the most common case).
     pub fn from_sub_world(sub_world: &'w crate::sub_world::SubWorld<'w>) -> Self {
         Self {
             sub_worlds: std::slice::from_ref(sub_world),
@@ -2337,7 +2383,7 @@ impl<'w> SystemContext<'w> {
         }
     }
 
-    /// Создать контекст с per-system командным буфером (D8b).
+    /// Create a context with a per-system command buffer (D8b).
     ///
     /// # Safety
     /// `deferred_cmds` must point to a `Commands` owned by the caller (scheduler)
@@ -2355,39 +2401,43 @@ impl<'w> SystemContext<'w> {
         }
     }
 
-    /// Получить `Commands` для текущего потока.
-    /// Команды применяются планировщиком после завершения Stage.
+    /// Get the `Commands` for the current thread. Commands are applied by the
+    /// scheduler after the Stage completes.
     ///
-    /// `&self → &mut Commands` намеренно: буфер команд — либо приватный per-system
-    /// слот (D8b: система-владелец single-task, т.е. не row-split, → уникальный
-    /// доступ одним потоком), либо `UnsafeCell` в sequential/undeclared-режиме,
-    /// поэтому уникальность `&mut` гарантирована без `&mut self`.
+    /// `&self → &mut Commands` is intentional: the command buffer is either a
+    /// private per-system slot (D8b: the owner system is single-task, i.e. not
+    /// row-split, → unique access from one thread) or an `UnsafeCell` in
+    /// sequential/undeclared mode, so the uniqueness of `&mut` is guaranteed
+    /// without `&mut self`.
     #[allow(clippy::mut_from_ref)]
     #[inline]
     pub fn commands(&self) -> &mut Commands {
         let cmds = if let Some(ptr) = self.deferred_cmds {
-            // SAFETY: `ptr` — приватный командный слот этой системы (D8b). Планировщик
-            // выдаёт слот ТОЛЬКО single-task системам (command-emitting система несёт
-            // `uses_commands` ⇒ `non_query_side_effects` ⇒ никогда не row-split), поэтому
-            // ровно одна задача формирует этот `&mut`. Row-split (query-only) задачи
-            // получают `None` и не алиасят слот.
+            // SAFETY: `ptr` is this system's private command slot (D8b). The
+            // scheduler hands a slot ONLY to single-task systems (a
+            // command-emitting system carries `uses_commands` ⇒
+            // `non_query_side_effects` ⇒ never row-split), so exactly one task
+            // forms this `&mut`. Row-split (query-only) tasks get `None` and do not
+            // alias the slot.
             unsafe { &mut *ptr }
         } else {
-            // SAFETY: inline_cmds используется только когда per-system слот не задан
-            // (sequential / row-split-inline). Доступ exclusive — один поток, свой ctx.
+            // SAFETY: inline_cmds is used only when a per-system slot is not set
+            // (sequential / row-split-inline). Access is exclusive — one thread,
+            // its own ctx.
             unsafe { &mut *self.inline_cmds.get() }
         };
-        // Единая точка внедрения резерватора: любой `cmd.spawn().id()` из системы получает
-        // настоящий cross-frame `Entity` (резерватор делит атомарный high-water с аллокатором того
-        // же мира, к которому команды и применятся). Идемпотентно — Arc-clone раз на жизнь Commands.
+        // The single point of reserver injection: any `cmd.spawn().id()` from a
+        // system gets a real cross-frame `Entity` (the reserver shares the atomic
+        // high-water with the allocator of the same world the commands are applied
+        // to). Idempotent — an Arc clone once per Commands lifetime.
         if !cmds.has_reserver() {
             cmds.set_reserver(self.world().entity_reserver());
         }
         cmds
     }
 
-    /// Получить World (для обратной совместимости).
-    /// Используется для query, resource, event доступа.
+    /// Get the World (for backward compatibility).
+    /// Used for query, resource, and event access.
     fn world(&self) -> &'w World {
         self.sub_worlds[0].world()
     }
@@ -2395,14 +2445,15 @@ impl<'w> SystemContext<'w> {
     /// Read-only query over the system's SubWorld. Requires `Q: ReadOnlyWorldQuery`
     /// (F3): a mutable query obtained from `ctx` is UNDECLARED write access, and the
     /// scheduler parallelizes systems by their DECLARED access — an undeclared `&mut`
-    /// is a safe-reachable data race (the exact class B1(в) closed for `Query::new`).
+    /// is a safe-reachable data race (the exact class B1(v) closed for `Query::new`).
     /// Declare mutable access as a system PARAMETER (`q: Query<Write<T>>` in the
     /// signature) — the scheduler validates it and serializes conflicts — rather than
     /// reaching for a mutable `ctx.query`.
     #[inline]
     pub fn query<Q: WorldQuery + crate::query::ReadOnlyWorldQuery>(&self) -> crate::query::Query<'_, '_, Q> {
-        // База change-detection — `last_run_tick` мира (граница прошлого кадра),
-        // так `Changed<T>` внутри системы достоверен (TD-9), а не «всё подряд».
+        // The change-detection base is the world's `last_run_tick` (the previous
+        // frame boundary), so `Changed<T>` inside the system is reliable (TD-9)
+        // rather than "everything".
         let last_run = self.sub_worlds[0].world().last_run_tick();
         // SAFETY: read-only `Q` cannot alias `&mut`; the SubWorld is scheduler-vended.
         unsafe { crate::query::Query::from_sub_world(&self.sub_worlds[0], last_run) }
@@ -2557,15 +2608,15 @@ impl<'w> SystemContext<'w> {
         P::fetch(self)
     }
 
-    // Итерация только через ctx.query::<Q>().for_each(...)
-    // или ctx.query::<Q>().par_for_each(...)
+    // Iteration only via ctx.query::<Q>().for_each(...)
+    // or ctx.query::<Q>().par_for_each(...)
 }
 
 // ── Relations API on SystemContext ─────────────────────────────────
 
 impl<'w> SystemContext<'w> {
-    /// Запрос по relation: найти все entity с relation `R` к `target`,
-    /// у которых также есть компоненты `Q`.
+    /// Query by relation: find all entities with relation `R` to `target` that
+    /// also have components `Q`.
     #[inline]
     pub fn query_relation<R: crate::relations::RelationKind, Q: WorldQuery>(
         &self,
@@ -2575,8 +2626,8 @@ impl<'w> SystemContext<'w> {
         self.world().query_relation::<R, Q>(_kind, target)
     }
 
-    /// Wildcard-запрос: найти все entity с любым relation вида `R`,
-    /// у которых также есть компоненты `Q`.
+    /// Wildcard query: find all entities with any relation of kind `R` that also
+    /// have components `Q`.
     #[inline]
     pub fn query_wildcard<R: crate::relations::RelationKind, Q: WorldQuery>(
         &self,
@@ -2596,7 +2647,7 @@ impl<'w> SystemContext<'w> {
         self.world().targets_of(kind, parent)
     }
 
-    /// Проверить наличие relation `R` между `subject` и `target`.
+    /// Check for a relation `R` between `subject` and `target`.
     #[inline]
     pub fn has_relation<R: crate::relations::RelationKind>(
         &self,
@@ -2795,21 +2846,21 @@ impl<D: WorldQuery, F: WorldQuery> QueryState<D, F> {
 // ── Bundle ─────────────────────────────────────────────────────
 
 pub trait Bundle: Sized {
-    /// Состав бандла в порядке ОБЪЯВЛЕНИЯ (declaration order) БЕЗ конструирования
-    /// значения (§10.10): derive/кортежи знают его статически по типам. Это
-    /// устраняет footgun `make_bundle(0)`-probe в `spawn_many` (замыкание больше
-    /// не обязано быть чистым и не зовётся лишний раз ради состава).
+    /// The bundle composition in DECLARATION order WITHOUT constructing a value
+    /// (§10.10): derive/tuples know it statically from the types. This removes the
+    /// `make_bundle(0)` probe footgun in `spawn_many` (the closure no longer has
+    /// to be pure and is not called an extra time for the composition).
     ///
-    /// Порядок — ОБЪЯВЛЕНИЯ, НЕ сортированный: `col_indices` для
-    /// `write_into_batch` обязан быть в порядке обхода (иначе запись в чужую
-    /// колонку — UB). Отсортированный ключ архетипа даёт [`component_ids`].
+    /// The order is DECLARATION order, NOT sorted: `col_indices` for
+    /// `write_into_batch` must be in traversal order (otherwise a write to the
+    /// wrong column — UB). The sorted archetype key is given by [`component_ids`].
     fn static_component_ids(
         registry: &mut ComponentRegistry,
         out: &mut SmallVec<[ComponentId; 8]>,
     );
 
-    /// Состав как ОТСОРТИРОВАННЫЙ владеемый `SmallVec` — ключ архетипа. Делегирует
-    /// к [`static_component_ids`](Bundle::static_component_ids) + `sort_unstable`.
+    /// The composition as a SORTED owned `SmallVec` — the archetype key. Delegates
+    /// to [`static_component_ids`](Bundle::static_component_ids) + `sort_unstable`.
     fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
         let mut out = SmallVec::new();
         Self::static_component_ids(registry, &mut out);
@@ -2817,8 +2868,8 @@ pub trait Bundle: Sized {
         out
     }
 
-    /// Записать ComponentId'ы в порядке ОБЪЯВЛЕНИЯ в `out` (без промежуточного
-    /// SmallVec) — для обхода `write_into_batch`.
+    /// Write the ComponentIds in DECLARATION order into `out` (without an
+    /// intermediate SmallVec) — for the `write_into_batch` traversal.
     fn push_component_ids(
         &self,
         registry: &mut ComponentRegistry,
@@ -2829,14 +2880,15 @@ pub trait Bundle: Sized {
 
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
 
-    /// Количество компонентов в этом Bundle (статически, для разбивки col_indices).
+    /// The number of components in this Bundle (statically, for splitting
+    /// col_indices).
     fn component_count() -> usize;
 
-    /// Пакетная запись компонентов с предвычисленными column indices.
+    /// Batch write of components with precomputed column indices.
     ///
-    /// По умолчанию вызывает `write_into`. Переопределяется для оптимизации:
-    /// использует переданные `col_indices` вместо повторного
-    /// вызова `get_or_register` и `column_index` для каждой entity.
+    /// By default calls `write_into`. Overridden for optimization: uses the passed
+    /// `col_indices` instead of repeatedly calling `get_or_register` and
+    /// `column_index` for each entity.
     fn write_into_batch(
         self,
         world: &mut World,
@@ -2848,13 +2900,15 @@ pub trait Bundle: Sized {
         self.write_into(world, archetype_id, row, tick);
     }
 
-    /// Записать данные компонентов для batch-спавна ([`spawn_many`]). ПЕРЕОПРЕДЕЛЯЕТСЯ (leaf/tuple/
-    /// derive) на data-only: пишет ТОЛЬКО данные (без change/added-тиков и без `col.len`), а тики/`len`
-    /// вызывающий проставляет ПОКОЛОНОЧНО один раз на пачку (резко дешевле `count×ncols` push'ей).
-    /// **Дефолт** (для ручных `impl Bundle`) — полный `write_into_batch` (данные+тики+len). Вызывающий
-    /// устойчив к ОБОИМ: использует АБСОЛЮТНЫЙ target (`start_row+count`) при `resize`/`len`, поэтому
-    /// уже-выставленные дефолтом тики/len — no-op, а для data-only override — заполняются. `tick`
-    /// дефолтом используется, override'ами игнорируется.
+    /// Write component data for a batch spawn ([`spawn_many`]). OVERRIDDEN
+    /// (leaf/tuple/derive) to be data-only: writes ONLY data (without change/added
+    /// ticks and without `col.len`), while the caller sets ticks/`len` PER-COLUMN
+    /// once per batch (much cheaper than `count×ncols` pushes). The **default**
+    /// (for manual `impl Bundle`) is the full `write_into_batch` (data+ticks+len).
+    /// The caller is robust to BOTH: it uses the ABSOLUTE target
+    /// (`start_row+count`) for `resize`/`len`, so ticks/len already set by the
+    /// default are a no-op, and for a data-only override they are filled in.
+    /// `tick` is used by the default and ignored by overrides.
     fn write_data_into_batch(
         self,
         world: &mut World,
@@ -2866,16 +2920,17 @@ pub trait Bundle: Sized {
         self.write_into_batch(world, archetype_id, row, tick, col_indices);
     }
 
-    /// Возвращает true, если хотя бы один компонент Bundle имеет Drop (нужно для spawn_many).
+    /// Returns true if at least one component of the Bundle has Drop (needed for
+    /// spawn_many).
     ///
-    /// Для типов с Drop bulk-copy через `copy_nonoverlapping` небезопасен,
-    /// используется per-entity цикл.
+    /// For types with Drop, bulk-copy via `copy_nonoverlapping` is unsafe, so a
+    /// per-entity loop is used.
     fn needs_drop() -> bool {
         false
     }
 }
 
-// ── Blanket impl: любой Component является Bundle (из одного компонента) ──
+// ── Blanket impl: any Component is a Bundle (of a single component) ──
 
 impl<T: Component> Bundle for T {
     #[inline(always)]
@@ -2952,8 +3007,9 @@ impl<T: Component> Bundle for T {
         col_indices: &[usize],
     ) {
         let col_idx = col_indices[0];
-        // SAFETY: ёмкость зарезервирована вызывающим (`reserve(count)`), `row` в пределах; тики/`len`
-        // вызывающий проставит поколоночно ПОСЛЕ записи данных всех строк (data-only).
+        // SAFETY: capacity is reserved by the caller (`reserve(count)`), `row` is
+        // within bounds; ticks/`len` are set by the caller per-column AFTER writing
+        // the data of all rows (data-only).
         unsafe {
             let col = &mut world.archetypes[archetype_id.0 as usize].columns[col_idx];
             if col.item_size > 0 {
@@ -2970,10 +3026,10 @@ impl<T: Component> Bundle for T {
     }
 }
 
-// ── Рекурсивный impl_bundle! для кортежей Bundle ──
+// ── Recursive impl_bundle! for Bundle tuples ──
 //
-// Элементы кортежа — любые Bundle (компоненты, другие Bundle-структуры, кортежи).
-// Число аритетей — 12 (как Bevy).
+// Tuple elements are any Bundle (components, other Bundle structs, tuples).
+// The arity count is 12 (like Bevy).
 
 macro_rules! impl_bundle {
     ($($T:ident),+) => {
@@ -2984,11 +3040,14 @@ macro_rules! impl_bundle {
                 0usize $( + $T::component_count() )+
             }
 
-            /// ВАЖНО (корректность batch-спавна): пушит id в порядке ОБЪЯВЛЕНИЯ кортежа — том же,
-            /// в котором `write_into_batch` обходит компоненты. `component_ids` (дефолт trait'а)
-            /// СОРТИРУЕТ (ключ архетипа), а `col_indices` для `write_into_batch` ОБЯЗАН быть в
-            /// порядке обхода, иначе компонент пишется в чужую колонку (UB: запись 64B Matrix4 в 12B
-            /// колонку). См. `spawn_many_inner`/`spawn_bundles_bulk` — строят `col_indices` отсюда.
+            /// IMPORTANT (batch-spawn correctness): pushes ids in the tuple's
+            /// DECLARATION order — the same one in which `write_into_batch`
+            /// traverses the components. `component_ids` (the trait default) SORTS
+            /// (the archetype key), whereas `col_indices` for `write_into_batch`
+            /// MUST be in traversal order, otherwise a component is written to the
+            /// wrong column (UB: writing a 64B Matrix4 into a 12B column). See
+            /// `spawn_many_inner`/`spawn_bundles_bulk` — they build `col_indices`
+            /// from here.
             #[inline]
             fn static_component_ids(
                 registry: &mut ComponentRegistry,
@@ -3090,7 +3149,7 @@ impl Bundle for () {
     }
 }
 
-// ── Entity accessor ladder (Р-4) ───────────────────────────────
+// ── Entity accessor ladder (R-4) ───────────────────────────────
 //
 // Honest names for the three access levels (Bevy-parity ladder):
 //   • `EntityRef`      — read-only view over `&World`  (get / relation reads);
@@ -3157,44 +3216,43 @@ pub struct EntityWorldMut<'w> {
 }
 
 impl<'w> EntityWorldMut<'w> {
-    /// Вернуть идентификатор entity.
+    /// Return the entity id.
     pub fn id(&self) -> Entity {
         self.entity
     }
 
-    /// Проверить, жива ли entity.
+    /// Check whether the entity is alive.
     pub fn is_alive(&self) -> bool {
         self.world.entities.is_alive(self.entity)
     }
 
-    /// Вставить компонент в entity.
+    /// Insert a component into the entity.
     pub fn insert<T: Component>(&mut self, component: T) -> &mut Self {
         self.world.insert(self.entity, component);
         self
     }
 
-    /// Удалить компонент типа T из entity.
+    /// Remove a component of type T from the entity.
     pub fn remove<T: Component>(&mut self) -> bool {
         self.world.remove::<T>(self.entity)
     }
 
-    /// Деспавнить entity.
+    /// Despawn the entity.
     pub fn despawn(&mut self) -> bool {
         self.world.despawn(self.entity)
     }
 
-    /// Прочитать компонент T.
+    /// Read component T.
     pub fn get<T: Component>(&self) -> Option<&T> {
         self.world.get::<T>(self.entity)
     }
 
-    /// Прочитать компонент T мутабельно (ленивая change-detection — [`Mut<T>`],
-    /// A13).
+    /// Read component T mutably (lazy change-detection — [`Mut<T>`], A13).
     pub fn get_mut<T: Component>(&mut self) -> Option<crate::query::Mut<'_, T>> {
         self.world.get_mut::<T>(self.entity)
     }
 
-    /// Добавить relation между этой entity и target.
+    /// Add a relation between this entity and target.
     pub fn add_relation<R: crate::relations::RelationKind>(
         &mut self,
         kind: R,
@@ -3204,7 +3262,7 @@ impl<'w> EntityWorldMut<'w> {
         self
     }
 
-    /// Удалить relation.
+    /// Remove a relation.
     pub fn remove_relation<R: crate::relations::RelationKind>(
         &mut self,
         kind: R,
@@ -3214,7 +3272,7 @@ impl<'w> EntityWorldMut<'w> {
         self
     }
 
-    /// Проверить наличие relation.
+    /// Check for a relation.
     pub fn has_relation<R: crate::relations::RelationKind>(&self, kind: R, target: Entity) -> bool {
         self.world.has_relation(self.entity, kind, target)
     }
@@ -3354,24 +3412,24 @@ impl World {
 
 // ── Scripting API ──────────────────────────────────────────────────────────
 //
-// Публичные accessor'ы для apex-scripting.
-// Отделены от основного impl World чтобы было ясно: это внешний API,
-// не внутренняя логика мира.
+// Public accessors for apex-scripting.
+// Separated from the main impl World to make clear: this is external API,
+// not the world's internal logic.
 
 impl World {
-    /// Доступ к аллокатору entity — для получения Entity по index.
+    /// Access to the entity allocator — for obtaining an Entity by index.
     ///
-    /// Используется `despawn()` из Rhai-скриптов.
+    /// Used by `despawn()` from Rhai scripts.
     #[inline]
     pub fn entity_allocator(&self) -> &crate::entity::EntityAllocator {
         &self.entities
     }
 
-    /// Получить ComponentId по строковому имени типа.
+    /// Get the ComponentId by the type's string name.
     ///
-    /// Используется `apex-scripting` для разрешения имён из скриптов.
-    /// Поиск линейный (O(N) по числу зарегистрированных компонентов),
-    /// но вызывается только при инициализации движка — не в hot path.
+    /// Used by `apex-scripting` to resolve names from scripts. The search is
+    /// linear (O(N) over the number of registered components), but is called only
+    /// at engine initialization — not in the hot path.
     pub fn component_id_by_name(&self, name: &str) -> Option<crate::component::ComponentId> {
         self.registry
             .iter()
@@ -3381,7 +3439,7 @@ impl World {
 
     // ── EntityTemplate API ────────────────────────────────────────
 
-    /// Зарегистрировать именованный шаблон сущности.
+    /// Register a named entity template.
     pub fn register_template(
         &mut self,
         name: &str,
@@ -3390,19 +3448,19 @@ impl World {
         self.templates.register(name, template);
     }
 
-    /// Создать entity из зарегистрированного шаблона с параметрами.
+    /// Create an entity from a registered template with parameters.
     ///
-    /// Если шаблон возвращает `Some(parent)` из [`EntityTemplate::parent()`],
-    /// то после спавна автоматически устанавливается `ChildOf(parent)`.
-    /// Пара к [`spawn_template`](Self::spawn_template) (параметры по умолчанию),
-    /// `_with`-канон (см. `docs/CONVENTIONS.md`).
+    /// If the template returns `Some(parent)` from [`EntityTemplate::parent()`],
+    /// then after spawn `ChildOf(parent)` is set automatically. The counterpart to
+    /// [`spawn_template`](Self::spawn_template) (default parameters), following the
+    /// `_with` canon (see `docs/CONVENTIONS.md`).
     pub fn spawn_template_with(
         &mut self,
         name: &str,
         params: &crate::template::TemplateParams,
     ) -> Option<crate::entity::Entity> {
-        // Клонируем Arc и отпускаем заём реестра — теперь `&mut World` свободен
-        // для `spawn`, а шаблон переживает даже собственную перерегистрацию (B4).
+        // Clone the Arc and release the registry borrow — now `&mut World` is free
+        // for `spawn`, and the template survives even its own re-registration (B4).
         let template = self.templates.get_arc(name)?;
         let entity = template.spawn(self, params);
         if let Some(parent) = template.parent() {
@@ -3411,12 +3469,12 @@ impl World {
         Some(entity)
     }
 
-    /// Создать entity из шаблона с параметрами по умолчанию.
+    /// Create an entity from a template with default parameters.
     pub fn spawn_template(&mut self, name: &str) -> Option<crate::entity::Entity> {
         self.spawn_template_with(name, &crate::template::TemplateParams::new())
     }
 
-    /// Доступ к реестру шаблонов (только для чтения).
+    /// Access to the template registry (read-only).
     pub fn template_registry(&self) -> &crate::template::TemplateRegistry {
         &self.templates
     }
@@ -3429,7 +3487,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct Score(u32);
 
-    // ── W2-3: tick-wrap кламп ──────────────────────────────────
+    // ── W2-3: tick-wrap clamp ──────────────────────────────────
 
     #[test]
     fn check_change_ticks_clamps_stale_rows() {
@@ -3439,23 +3497,23 @@ mod tests {
         impl crate::component::Component for P {}
 
         let mut world = World::new();
-        let _e = world.spawn((P(0.0),)); // change-tick строки = текущий тик
+        let _e = world.spawn((P(0.0),)); // the row's change-tick = current tick
 
-        // Симулируем долгий аптайм: прыжки < 2³¹ с клампом между ними —
-        // суммарно далеко за период переполнения.
+        // Simulate long uptime: jumps < 2³¹ with a clamp between them — in total
+        // far past the overflow period.
         for _ in 0..4 {
             world.current_tick.0 = world.current_tick.0.wrapping_add(1 << 30);
             world.check_change_ticks();
         }
 
-        // last_run «вчера»: строка очень старая и НЕ должна быть Changed.
+        // last_run is "yesterday": the row is very old and must NOT be Changed.
         let last_run = Tick(world.current_tick.0.wrapping_sub(2));
         let changed = crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world, last_run)
             .iter()
             .count();
-        assert_eq!(changed, 0, "кламп удержал строку в «давно не менялась»");
+        assert_eq!(changed, 0, "the clamp kept the row as 'unchanged for a long time'");
 
-        // Контроль: БЕЗ клампа тот же сценарий даёт ложно-Changed.
+        // Control: WITHOUT the clamp the same scenario produces a false Changed.
         let mut world2 = World::new();
         let _e2 = world2.spawn((P(0.0),));
         world2.current_tick.0 = world2.current_tick.0.wrapping_add(1 << 31).wrapping_add(8);
@@ -3464,10 +3522,10 @@ mod tests {
             crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world2, last_run2)
                 .iter()
                 .count();
-        assert_eq!(false_changed, 1, "санити: без клампа wrap даёт ложный Changed");
+        assert_eq!(false_changed, 1, "sanity: without the clamp, wrap gives a false Changed");
     }
 
-    // ── Р-4: entity accessor ladder + immediate hierarchy sugar ──────
+    // ── R-4: entity accessor ladder + immediate hierarchy sugar ──────
 
     #[test]
     fn entity_accessor_ladder_and_hierarchy_sugar() {
@@ -3588,11 +3646,11 @@ mod tests {
         let mut state = QueryState::<Read<P>>::new();
         assert_eq!(state.query(&world).iter().count(), 1);
 
-        // Новый архетип ПОСЛЕ первого запроса — стейт дополняется хвостом.
+        // A new archetype AFTER the first query — the state is extended by the tail.
         world.spawn((P(2.0), Tag));
         assert_eq!(state.query(&world).iter().count(), 2);
 
-        // Повторный вызов без изменений — чистый hit (ничего не пересканируется).
+        // A repeat call with no changes — a pure hit (nothing is rescanned).
         assert_eq!(state.query(&world).iter().count(), 2);
         let mut sum = 0.0;
         state.query(&world).for_each(|_, p| sum += p.0);
@@ -3614,8 +3672,8 @@ mod tests {
 
         let mut state = QueryState::<Read<P>>::new();
         assert_eq!(state.query(&a).iter().count(), 1);
-        assert_eq!(state.query(&b).iter().count(), 2, "стейт перепривязался к миру B");
-        assert_eq!(state.query(&a).iter().count(), 1, "и обратно к A");
+        assert_eq!(state.query(&b).iter().count(), 2, "the state rebound to world B");
+        assert_eq!(state.query(&a).iter().count(), 1, "and back to A");
     }
 
     #[test]
@@ -3627,11 +3685,11 @@ mod tests {
 
         let mut world = World::new();
         let mut state = QueryState::<Read<Late>>::new();
-        // Компонент ещё не зарегистрирован — запрос пуст, но не падает.
+        // The component is not yet registered — the query is empty but does not panic.
         assert_eq!(state.query(&world).iter().count(), 0);
 
         world.spawn((Late(7),));
-        assert_eq!(state.query(&world).iter().count(), 1, "ids доразрешились после регистрации");
+        assert_eq!(state.query(&world).iter().count(), 1, "ids resolved after registration");
     }
 
     #[test]
@@ -3838,7 +3896,7 @@ mod tests {
     fn cached_query_iter_does_not_skip_first_archetype() {
         use crate::query::Read;
 
-        // Один архетип (только Pos).
+        // One archetype (only Pos).
         let mut world = World::new();
         let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
@@ -3847,27 +3905,27 @@ mod tests {
             .iter()
             .map(|(e, _)| e)
             .collect();
-        assert_eq!(got.len(), 2, "iter() должен вернуть ОБА entity (не пропустить первый)");
+        assert_eq!(got.len(), 2, "iter() must return BOTH entities (not skip the first)");
         assert!(got.contains(&a) && got.contains(&b));
 
-        // Несколько архетипов: (Pos) и (Pos, Vel).
+        // Several archetypes: (Pos) and (Pos, Vel).
         let c = world.spawn((Pos { x: 3.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         let got2: Vec<_> = world
             .query_changed::<(Entity, Read<Pos>)>(Tick::ZERO)
             .iter()
             .map(|(e, _)| e)
             .collect();
-        assert_eq!(got2.len(), 3, "iter() должен охватить все архетипы, включая первый");
+        assert_eq!(got2.len(), 3, "iter() must cover all archetypes, including the first");
         assert!(got2.contains(&a) && got2.contains(&b) && got2.contains(&c));
 
-        // for_each и iter дают одинаковый набор.
+        // for_each and iter produce the same set.
         let mut fe = 0usize;
         world.query_changed::<Read<Pos>>(Tick::ZERO).for_each(|_, _| fe += 1);
-        assert_eq!(fe, got2.len(), "for_each и iter должны быть согласованы");
+        assert_eq!(fe, got2.len(), "for_each and iter must be consistent");
     }
 
-    /// CR-M2: `(Read<A>, Read<B>)` и `(Read<A>, Without<B>)` имеют одинаковый
-    /// fill_ids — записи кэша НЕ должны отравлять друг друга.
+    /// CR-M2: `(Read<A>, Read<B>)` and `(Read<A>, Without<B>)` have the same
+    /// fill_ids — the cache entries must NOT poison each other.
     #[test]
     fn cached_query_without_does_not_share_entry_with_read() {
         use crate::query::{Read, Without};
@@ -3876,20 +3934,20 @@ mod tests {
         let _both = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         let only_pos = world.spawn((Pos { x: 2.0, y: 0.0 },));
 
-        // Сначала прогреваем кэш формой (Read, Read)…
+        // First warm the cache with the shape (Read, Read)…
         let with_vel = world.query::<(Read<Pos>, Read<Vel>)>().len();
         assert_eq!(with_vel, 1);
 
-        // …затем (Read, Without) обязан увидеть СВОЙ список архетипов.
+        // …then (Read, Without) must see ITS OWN archetype list.
         let mut seen = Vec::new();
         world
             .query::<(Read<Pos>, Without<Vel>)>()
             .for_each(|e, _| seen.push(e));
-        assert_eq!(seen, vec![only_pos], "Without-форма не должна делить запись кэша с Read-формой");
+        assert_eq!(seen, vec![only_pos], "the Without shape must not share a cache entry with the Read shape");
     }
 
-    /// CR-M2: запись кэша инкрементально дополняется архетипами, созданными
-    /// ПОСЛЕ первого построения списка.
+    /// CR-M2: a cache entry is incrementally extended with archetypes created
+    /// AFTER the list was first built.
     #[test]
     fn cached_query_picks_up_new_archetypes() {
         use crate::query::Read;
@@ -3898,13 +3956,14 @@ mod tests {
         world.spawn((Pos { x: 1.0, y: 0.0 },));
         assert_eq!(world.query::<Read<Pos>>().len(), 1);
 
-        // Новый архетип (Pos, Vel) после прогрева кэша.
+        // A new archetype (Pos, Vel) after warming the cache.
         world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         assert_eq!(world.query::<Read<Pos>>().len(), 2);
     }
 
-    /// CR-M2: entity, въехавшая в ОПУСТЕВШИЙ архетип, не теряется кэшем
-    /// (пустые архетипы остаются в списках; insert/remove кэш не сбрасывают).
+    /// CR-M2: an entity that moved into an EMPTIED archetype is not lost by the
+    /// cache (empty archetypes stay in the lists; insert/remove do not reset the
+    /// cache).
     #[test]
     fn cached_query_sees_entity_in_repopulated_archetype() {
         use crate::query::Read;
@@ -3913,11 +3972,11 @@ mod tests {
         let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 3.0, y: 0.0 }));
         assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 1);
 
-        // Архетип (Pos, Vel) пустеет…
+        // The (Pos, Vel) archetype empties…
         world.remove::<Vel>(e);
         assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 0);
 
-        // …и снова наполняется — кэшированный список обязан его видеть.
+        // …and fills up again — the cached list must see it.
         world.insert(e, Vel { x: 4.0, y: 0.0 });
         let mut seen = Vec::new();
         world
@@ -3926,8 +3985,8 @@ mod tests {
         assert_eq!(seen, vec![e]);
     }
 
-    /// CR-M2 (C-4): на мире >128 архетипов Query::new берёт кандидатов из
-    /// component_arch_index по САМОМУ РЕДКОМУ обязательному компоненту.
+    /// CR-M2 (C-4): on a world with >128 archetypes, Query::new takes candidates
+    /// from component_arch_index by the RAREST required component.
     #[test]
     fn query_new_candidates_from_rarest_component_on_large_world() {
         use crate::query::{Query, Read, With};
@@ -3953,7 +4012,7 @@ mod tests {
 
         let mut world = World::new();
         let mut rare_holder = None;
-        // 200 уникальных составов → >128 архетипов (кандидат-путь).
+        // 200 unique compositions → >128 archetypes (the candidate path).
         for i in 0..200u32 {
             let e = world.spawn((Pos { x: i as f32, y: 0.0 },));
             if i & 1 != 0 { world.insert(e, F0); }
@@ -3969,25 +4028,25 @@ mod tests {
                 rare_holder = Some(e);
             }
         }
-        assert!(world.archetype_count() > 128, "тесту нужен кандидат-путь");
+        assert!(world.archetype_count() > 128, "the test needs the candidate path");
 
-        // Редкий компонент: кандидаты = 1 архетип, результат корректен.
+        // Rare component: candidates = 1 archetype, the result is correct.
         let got: Vec<_> = Query::<(Entity, Read<Pos>, Read<Rare>)>::new(&world)
             .iter()
             .map(|(e, _, _)| e)
             .collect();
         assert_eq!(got, vec![rare_holder.unwrap()]);
 
-        // With-форма тем же путём.
+        // The With shape via the same path.
         let cnt = Query::<(Read<Pos>, With<Rare>)>::new(&world).iter().count();
         assert_eq!(cnt, 1);
 
-        // Широкий запрос на том же мире — все 200 строк на месте.
+        // A wide query on the same world — all 200 rows are present.
         let all = Query::<Read<Pos>>::new(&world).iter().count();
         assert_eq!(all, 200);
     }
 
-    // Вложенные Bundle — ручная реализация (proc-макросы не работают внутри apex-core)
+    // Nested Bundle — manual implementation (proc-macros do not work inside apex-core)
     struct PlayerBase {
         pos: Pos,
         hp: Hp,
@@ -4074,7 +4133,7 @@ mod tests {
             armor: Armor(50.0),
         });
 
-        // Все компоненты на месте
+        // All components are present
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 10.0, y: 20.0 }));
         assert_eq!(world.get::<Hp>(e), Some(&Hp(100.0)));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { x: 1.0, y: 0.5 }));
@@ -4094,7 +4153,7 @@ mod tests {
             Team(1),
         ));
 
-        // Кортеж из Bundle-структуры + компонентов работает
+        // A tuple of a Bundle struct + components works
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 1.0, y: 2.0 }));
         assert_eq!(world.get::<Hp>(e), Some(&Hp(75.0)));
         assert_eq!(world.get::<Vel>(e), Some(&Vel { x: 3.0, y: 4.0 }));
@@ -4105,7 +4164,7 @@ mod tests {
     #[test]
     fn bundle_single_component_direct_spawn() {
         let mut world = World::new();
-        // Компонент напрямую в spawn (blanket impl<T: Component> Bundle for T)
+        // Component directly in spawn (blanket impl<T: Component> Bundle for T)
         let e = world.spawn(Pos { x: 5.0, y: 6.0 });
         assert_eq!(world.get::<Pos>(e), Some(&Pos { x: 5.0, y: 6.0 }));
     }
@@ -4113,8 +4172,8 @@ mod tests {
     #[test]
     fn bundle_mixed_tuple_of_components_and_bundles() {
         let mut world = World::new();
-        // Смесь: одиночные компоненты + Bundle-структура + ещё компонент (без
-        // дублирующих компонентов между кортежем и вложенным Bundle).
+        // Mix: single components + a Bundle struct + one more component (without
+        // duplicate components between the tuple and the nested Bundle).
         let e = world.spawn((
             PlayerBase {
                 pos: Pos { x: 7.0, y: 8.0 },
@@ -4150,7 +4209,7 @@ mod tests {
     #[test]
     fn bundle_spawn_many_with_bundle_struct() {
         let mut world = World::new();
-        // spawn_many работает с вложенными Bundle (bulk-copy при needs_drop() == false)
+        // spawn_many works with nested Bundle (bulk-copy when needs_drop() == false)
         let entities = world.spawn_many(10, |_| ArmedPlayer {
             base: PlayerBase {
                 pos: Pos { x: 50.0, y: 50.0 },
@@ -4161,7 +4220,7 @@ mod tests {
         });
 
         assert_eq!(entities.len(), 10);
-        // Проверяем через прямой get, не через query
+        // Check via direct get, not via query
         for &e in &entities {
             assert!(world.get::<Pos>(e).is_some(), "Entity {:?} missing Pos", e);
             assert!(world.get::<Hp>(e).is_some(), "Entity {:?} missing Hp", e);
@@ -4174,23 +4233,25 @@ mod tests {
         }
     }
 
-    /// Регресс: `spawn_many`/bulk-path обязан писать компоненты в КОЛОНКУ ПО ИХ ID, а не позиционно
-    /// в порядке объявления. Баг (до фикса col_indices): `col_indices` строился из ОТСОРТИРОВАННЫХ
-    /// id, а `write_into_batch` потреблял их в порядке ОБЪЯВЛЕНИЯ ⇒ при «порядок объявления ≠ порядок
-    /// id» компонент писался в чужую колонку (UB: 64B в 1B-колонку, повреждение данных — проявлялось
-    /// как heavy_compute-регресс). Здесь порядок объявления (Big, Small) ОБРАТЕН порядку id
-    /// (Small зарегистрирован первым ⇒ меньший id).
+    /// Regression: `spawn_many`/bulk-path must write components to the COLUMN BY
+    /// THEIR ID, not positionally in declaration order. The bug (before the
+    /// col_indices fix): `col_indices` was built from SORTED ids, but
+    /// `write_into_batch` consumed them in DECLARATION order ⇒ when "declaration
+    /// order ≠ id order" a component was written to the wrong column (UB: 64B into
+    /// a 1B column, data corruption — manifested as a heavy_compute regression).
+    /// Here the declaration order (Big, Small) is the REVERSE of the id order
+    /// (Small registered first ⇒ smaller id).
     #[test]
     fn spawn_many_writes_components_by_id_not_declaration_position() {
         #[derive(Clone, Copy, PartialEq, Debug)]
-        struct BigComp([u64; 8]); // 64 байта
+        struct BigComp([u64; 8]); // 64 bytes
         impl Component for BigComp {}
         #[derive(Clone, Copy, PartialEq, Debug)]
-        struct SmallComp(u8); // 1 байт
+        struct SmallComp(u8); // 1 byte
         impl Component for SmallComp {}
 
         let mut world = World::new();
-        // Small РАНЬШЕ Big ⇒ id(Small) < id(Big). Порядок объявления бандла — ОБРАТНЫЙ.
+        // Small BEFORE Big ⇒ id(Small) < id(Big). The bundle declaration order is the REVERSE.
         world.register_component::<SmallComp>();
         world.register_component::<BigComp>();
 
@@ -4198,20 +4259,20 @@ mod tests {
         assert_eq!(entities.len(), 256);
 
         for (i, &e) in entities.iter().enumerate() {
-            let big = world.get::<BigComp>(e).expect("BigComp присутствует");
-            let small = world.get::<SmallComp>(e).expect("SmallComp присутствует");
+            let big = world.get::<BigComp>(e).expect("BigComp present");
+            let small = world.get::<SmallComp>(e).expect("SmallComp present");
             assert_eq!(
                 big.0, [i as u64; 8],
-                "BigComp entity[{i}] повреждён — компонент записан в чужую колонку (col_indices order)"
+                "BigComp entity[{i}] corrupted — component written to the wrong column (col_indices order)"
             );
-            assert_eq!(small.0, 0xAB, "SmallComp entity[{i}] повреждён");
+            assert_eq!(small.0, 0xAB, "SmallComp entity[{i}] corrupted");
         }
     }
 
     #[test]
     fn bundle_spawn_batch_heterogeneous_bundles() {
         let mut world = World::new();
-        // Разные способы spawn в одном тесте
+        // Different spawn approaches in one test
         let boss = world.spawn(ArmedPlayer {
             base: PlayerBase {
                 pos: Pos { x: 1.0, y: 1.0 },
@@ -4246,7 +4307,7 @@ mod hooks_and_added_tests {
     struct Armor(u32);
     impl Component for Armor {}
 
-    /// Лог вызовов хуков (ресурс — состояние подписчика живёт в ресурсах).
+    /// Log of hook calls (a resource — the subscriber's state lives in resources).
     #[derive(Default)]
     struct HookLog {
         added: Vec<Entity>,
@@ -4273,14 +4334,14 @@ mod hooks_and_added_tests {
         let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
             .count();
-        assert_eq!(n, 1, "свежий spawn виден Added<T>");
+        assert_eq!(n, 1, "a fresh spawn is visible to Added<T>");
 
         world.advance_change_tick();
         let lr = world.last_run_tick();
         let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
             .count();
-        assert_eq!(n, 0, "на следующем кадре Added<T> истекает");
+        assert_eq!(n, 0, "on the next frame Added<T> expires");
     }
 
     #[test]
@@ -4290,8 +4351,8 @@ mod hooks_and_added_tests {
         world.advance_change_tick();
         let lr = world.last_run_tick();
 
-        // insert Armor двигает entity в новый архетип: Added<Armor> — да,
-        // Added<Hp> — НЕТ (added-тик пережил перенос).
+        // insert Armor moves the entity into a new archetype: Added<Armor> — yes,
+        // Added<Hp> — NO (the added-tick survived the move).
         world.insert(e, Armor(5));
         let added_armor = Query::<(Added<Armor>, Read<Armor>)>::new_with_tick(&world, lr)
             .iter()
@@ -4300,7 +4361,7 @@ mod hooks_and_added_tests {
             .iter()
             .count();
         assert_eq!(added_armor, 1);
-        assert_eq!(added_hp, 0, "archetype move не «обновляет» Added");
+        assert_eq!(added_hp, 0, "an archetype move does not 'update' Added");
     }
 
     #[test]
@@ -4310,15 +4371,15 @@ mod hooks_and_added_tests {
         world.advance_change_tick();
         let lr = world.last_run_tick();
 
-        world.insert(e, Hp(2)); // replace существующего
+        world.insert(e, Hp(2)); // replace of an existing one
         let added = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
             .count();
         let changed = Query::<(Changed<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
             .count();
-        assert_eq!(added, 0, "replace не перезапускает Added (как Bevy)");
-        assert_eq!(changed, 1, "replace помечает Changed");
+        assert_eq!(added, 0, "replace does not re-trigger Added (like Bevy)");
+        assert_eq!(changed, 1, "replace marks Changed");
         assert_eq!(world.get::<Hp>(e), Some(&Hp(2)));
     }
 
@@ -4331,8 +4392,8 @@ mod hooks_and_added_tests {
         world.advance_change_tick();
         let lr = world.last_run_tick();
 
-        let e3 = world.spawn((Hp(3),)); // единственный «свежий»
-        world.despawn(e0); // swap_remove: e3 переедет на строку 0
+        let e3 = world.spawn((Hp(3),)); // the only "fresh" one
+        world.despawn(e0); // swap_remove: e3 moves to row 0
 
         let fresh: Vec<Entity> = Query::<(Entity, Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
             .iter()
@@ -4341,7 +4402,7 @@ mod hooks_and_added_tests {
         assert_eq!(
             fresh,
             vec![e3],
-            "swap_remove сохраняет выравнивание added-тиков"
+            "swap_remove preserves added-tick alignment"
         );
     }
 
@@ -4356,11 +4417,11 @@ mod hooks_and_added_tests {
         let b = world.spawn((Armor(0),));
         world.insert(b, Hp(2)); // insert (archetype move)
 
-        // Commands-бёрст → insert_parts (групповой путь W2-1).
+        // Commands burst → insert_parts (the batch path W2-1).
         let c = world.spawn((Armor(0),));
         let mut cmds = Commands::new();
         cmds.insert(c, Hp(3));
-        cmds.insert(c, Armor(1)); // replace — НЕ on_add
+        cmds.insert(c, Armor(1)); // replace — NOT on_add
         cmds.apply(&mut world);
 
         assert_eq!(world.resource::<HookLog>().added, vec![a, b, c]);
@@ -4404,8 +4465,8 @@ mod hooks_and_added_tests {
 
     #[test]
     fn on_add_hook_can_do_structural_changes() {
-        // Хук дотягивает Armor каждому, кто получил Hp (прообраз required
-        // components D2-4). Вложенный insert идёт через ту же очередь.
+        // The hook pulls in Armor for everyone who got Hp (a precursor to required
+        // components D2-4). The nested insert goes through the same queue.
         let mut world = World::new();
         world.on_add::<Hp>(|w, e| {
             if !w.has_component::<Armor>(e) {
@@ -4428,9 +4489,9 @@ mod hooks_and_added_tests {
         });
 
         let a = world.spawn((Hp(1),));
-        world.remove::<Hp>(a); // remove: entity жива
+        world.remove::<Hp>(a); // remove: entity is alive
         let b = world.spawn((Hp(2),));
-        world.despawn(b); // despawn: entity мертва
+        world.despawn(b); // despawn: entity is dead
 
         let log = world.resource::<HookLog>();
         assert_eq!(log.removed, vec![a, b]);
@@ -4446,13 +4507,13 @@ mod hooks_and_added_tests {
         let child = world.spawn((Hp(1),));
         world.add_relation(child, crate::relations::ChildOf, parent);
 
-        world.despawn(parent); // каскад сносит child
+        world.despawn(parent); // the cascade removes child
         assert!(!world.is_alive(child));
         assert_eq!(world.resource::<HookLog>().removed, vec![child]);
     }
 
     #[test]
-    #[should_panic(expected = "уже зарегистрирован")]
+    #[should_panic(expected = "is already registered")]
     fn double_on_add_registration_panics() {
         let mut world = World::new();
         world.on_add::<Hp>(|_, _| {});
@@ -4476,7 +4537,7 @@ mod hooks_and_added_tests {
         world.add_relation(owner, crate::relations::Owns, item);
         world.remove_relation(owner, crate::relations::Owns, item);
 
-        // Повторная связь — вычистка через despawn target'а.
+        // The relation again — cleanup via despawn of the target.
         world.add_relation(owner, crate::relations::Owns, item);
         world.despawn(item);
 
@@ -4485,7 +4546,7 @@ mod hooks_and_added_tests {
         assert_eq!(
             log.rel_removed,
             vec![(owner, item), (owner, item)],
-            "explicit remove + despawn-вычистка"
+            "explicit remove + despawn cleanup"
         );
     }
 
@@ -4520,21 +4581,21 @@ mod hooks_and_added_tests {
         #[require(LocalTf, GlobalTf)]
         struct Renderer;
 
-        let mut world = World::new(); // derive-регистраторы через linkme
+        let mut world = World::new(); // derive registrars via linkme
         let e = world.spawn((Renderer,));
         assert_eq!(
             world.get::<LocalTf>(e),
             Some(&LocalTf(0)),
-            "недостающий required дотянут дефолтом"
+            "the missing required was pulled in via default"
         );
         assert_eq!(world.get::<GlobalTf>(e), Some(&GlobalTf(0)));
 
-        // Явно заданное значение выигрывает у дефолта.
+        // An explicitly given value wins over the default.
         let e2 = world.spawn((Renderer, LocalTf(7)));
         assert_eq!(world.get::<LocalTf>(e2), Some(&LocalTf(7)));
         assert_eq!(world.get::<GlobalTf>(e2), Some(&GlobalTf(0)));
 
-        // insert-путь тоже дотягивает.
+        // The insert path also pulls it in.
         let e3 = world.spawn((Hp(1),));
         world.insert(e3, Renderer);
         assert_eq!(world.get::<GlobalTf>(e3), Some(&GlobalTf(0)));
@@ -4542,8 +4603,8 @@ mod hooks_and_added_tests {
 
     #[test]
     fn required_components_transitive_and_manual_api() {
-        // C требует B, B требует A — ручной API (для типов с ручным
-        // impl Component, как в движке).
+        // C requires B, B requires A — the manual API (for types with a manual
+        // impl Component, as in the engine).
         #[derive(Default, Debug, PartialEq)]
         struct A(u8);
         impl Component for A {}
@@ -4558,8 +4619,8 @@ mod hooks_and_added_tests {
         world.require_component::<B, A>();
 
         let e = world.spawn((C,));
-        assert_eq!(world.get::<B>(e), Some(&B(0)), "прямое требование");
-        assert_eq!(world.get::<A>(e), Some(&A(0)), "транзитивное через очередь");
+        assert_eq!(world.get::<B>(e), Some(&B(0)), "direct requirement");
+        assert_eq!(world.get::<A>(e), Some(&A(0)), "transitive via the queue");
     }
 
     #[test]
@@ -4572,11 +4633,11 @@ mod hooks_and_added_tests {
 
         let mut world = log_world();
         world.require_component::<C, R>();
-        // on_add владельца вызывается ПОСЛЕ дотяжки requires.
+        // The owner's on_add is called AFTER the requires are pulled in.
         world.on_add::<C>(|w, e| {
             assert!(
                 w.has_component::<R>(e),
-                "требуемый компонент уже на месте при вызове on_add"
+                "the required component is already present at the on_add call"
             );
             w.resource_mut::<HookLog>().added.push(e);
         });
@@ -4584,7 +4645,7 @@ mod hooks_and_added_tests {
         assert_eq!(world.resource::<HookLog>().added, vec![e]);
     }
 
-    // ── W3-5: память в archetype_stats ─────────────────────────
+    // ── W3-5: memory in archetype_stats ────────────────────────
 
     #[test]
     fn archetype_stats_reports_memory() {
@@ -4605,7 +4666,7 @@ mod hooks_and_added_tests {
         let mut world = World::new();
         world.track_removals::<Hp>();
         let e = world.spawn((Armor(1),));
-        world.despawn(e); // Armor не трекается
+        world.despawn(e); // Armor is not tracked
 
         world.flush_all_events();
         let mut reader = world.event_reader::<crate::events::Removed<Hp>>();

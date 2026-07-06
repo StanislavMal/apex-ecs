@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-/// Resources — глобальные синглтоны мира.
+/// Resources — the world's global singletons.
 use std::any::{Any, TypeId};
 use std::cell::UnsafeCell;
 
@@ -132,14 +132,13 @@ impl Resources {
         cell.0.get_mut().downcast_mut::<T>()
     }
 
-    /// Получить raw mutable pointer на ресурс.
+    /// Get a raw mutable pointer to a resource.
     ///
-    /// Используется `SystemContext::resource_mut` для параллельного доступа.
+    /// Used by `SystemContext::resource_mut` for parallel access.
     ///
     /// # Safety
-    /// Вызывающий код должен гарантировать что только одна система
-    /// в данный момент держит мутабельный доступ к T.
-    /// Планировщик обеспечивает это через `AccessDescriptor`.
+    /// The calling code must guarantee that only one system holds mutable access
+    /// to T at any given time. The scheduler ensures this via `AccessDescriptor`.
     pub(crate) fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut T> {
         let cell = self.data.get(&TypeId::of::<T>())?;
         // SAFETY: the `*mut` provenance is the UnsafeCell interior (via `get()`),
@@ -216,7 +215,7 @@ mod tests {
         let mut map = Resources::new();
         map.insert(Score(10));
         let ptr = map.get_raw_ptr::<Score>().unwrap();
-        // SAFETY: тест — единственный владелец
+        // SAFETY: the test is the sole owner
         unsafe {
             (*ptr).0 = 99;
         }

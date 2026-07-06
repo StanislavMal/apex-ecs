@@ -1,18 +1,18 @@
-//! Плотная (chunk) итерация уровня Legion (W2-0.5).
+//! Legion-level dense (chunk) iteration (W2-0.5).
 //!
-//! Хранение и так archetype-SoA — этот модуль лишь выдаёт колонки СЛАЙСАМИ,
-//! убирая per-row `fetch_item`/`Mut`-обвязку с горячего пути. Доступно только
-//! НЕ-фильтрующим формам: `Read`/`Write`/`&T`/`&mut T`/`Maybe`/`MaybeWrite`/
-//! `With`/`Without` и кортежам из них. `Changed<T>` и `Added<T>` НЕ реализуют
-//! [`DenseQuery`] — построчные фильтры несовместимы со слайсовой выдачей,
-//! такой запрос не компилируется (используйте `for_each`).
+//! Storage is already archetype-SoA — this module merely hands out columns as
+//! SLICES, removing the per-row `fetch_item`/`Mut` wrapping from the hot path.
+//! Available only to NON-filtering forms: `Read`/`Write`/`&T`/`&mut T`/`Maybe`/
+//! `MaybeWrite`/`With`/`Without` and tuples of them. `Changed<T>` and `Added<T>`
+//! do NOT implement [`DenseQuery`] — per-row filters are incompatible with slice
+//! output, so such a query does not compile (use `for_each`).
 //!
-//! Контракт change-detection: write-слайс стампит change-tick ВСЕМУ
-//! выданному диапазону в момент выдачи (`Column::stamp_range`,
-//! векторизуемый fill) — «взял слайс на запись = весь диапазон changed».
-//! Обычный `for_each` с точечным стампингом через `Mut<T>` не тронут.
+//! Change-detection contract: a write slice stamps the change-tick over the
+//! ENTIRE handed-out range at the moment it is handed out (`Column::stamp_range`,
+//! a vectorizable fill) — "took a slice for writing = whole range is changed".
+//! Plain `for_each` with pointwise stamping via `Mut<T>` is left untouched.
 //!
-//! Потребители: `Query::for_each_chunk` / `par_for_each_chunk`,
+//! Consumers: `Query::for_each_chunk` / `par_for_each_chunk`,
 //! `CachedQuery::for_each_chunk` / `par_for_each_chunk`.
 
 use crate::{
@@ -22,21 +22,21 @@ use crate::{
 };
 use crate::component::Component;
 
-/// Слайсовая выдача формы запроса для одного архетипа.
+/// Slice output of a query shape for a single archetype.
 ///
-/// # Safety-контракт `fetch_slices`
-/// - `arch` матчит форму (`matches_archetype` == true);
-/// - `ids` — сегмент, выровненный по `component_count` (как в `fetch_state`);
+/// # Safety contract of `fetch_slices`
+/// - `arch` matches the shape (`matches_archetype` == true);
+/// - `ids` — a segment aligned to `component_count` (as in `fetch_state`);
 /// - `start + len <= arch.len()`;
-/// - эксклюзивность write-доступа гарантирует вызывающий (планировщик /
-///   единоличный `&mut World`).
+/// - write-access exclusivity is guaranteed by the caller (the scheduler /
+///   a sole `&mut World`).
 pub trait DenseQuery: WorldQuery {
-    /// Что получает колбэк для одного chunk'а: `&[T]` / `&mut [T]` /
-    /// `Option<&[T]>` / `()` / кортежи из них.
+    /// What the callback receives for one chunk: `&[T]` / `&mut [T]` /
+    /// `Option<&[T]>` / `()` / tuples of them.
     type Slices<'w>;
 
-    /// Выдать слайсы колонок диапазона `[start, start+len)` архетипа.
-    /// Write-формы стампят change-tick диапазону ЗДЕСЬ.
+    /// Hand out the column slices for the range `[start, start+len)` of the
+    /// archetype. Write forms stamp the change-tick over the range HERE.
     ///
     /// # Safety
     /// `arch` must have matched this query and `ids` be its component-id list;
@@ -65,7 +65,7 @@ impl<T: Component> DenseQuery for Read<T> {
         _: Tick,
     ) -> &'w [T] {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
-        // get_ptr корректен и для ZST (выровненный ненулевой указатель).
+        // get_ptr is correct for ZSTs too (an aligned non-null pointer).
         let ptr = arch.columns[col_idx].get_ptr(start) as *const T;
         std::slice::from_raw_parts(ptr, len)
     }
@@ -101,7 +101,7 @@ impl<T: Component> DenseQuery for Write<T> {
     ) -> &'w mut [T] {
         let col_idx = arch.column_index(ids[0]).unwrap_unchecked();
         let col = &arch.columns[col_idx];
-        // Контракт dense-write: весь выданный диапазон считается изменённым.
+        // Dense-write contract: the whole handed-out range is treated as changed.
         col.stamp_range(start, start + len, this_run);
         let ptr = col.get_ptr(start) as *mut T;
         std::slice::from_raw_parts_mut(ptr, len)
@@ -123,12 +123,12 @@ impl<T: Component> DenseQuery for &mut T {
     }
 }
 
-// ── With / Without — фильтры уровня архетипа, слайсов не дают ──
+// ── With / Without — archetype-level filters, produce no slices ──
 
 impl<T: Component> DenseQuery for With<T> {
     type Slices<'w> = ();
 
-    // Лайфтайм обязан совпадать с декларацией трейта (E0195), хоть и не нужен.
+    // The lifetime must match the trait declaration (E0195), even though unused.
     #[allow(clippy::needless_lifetimes)]
     #[inline]
     unsafe fn fetch_slices<'w>(_: &'w Archetype, _: &[ComponentId], _: usize, _: usize, _: Tick) {}
@@ -142,7 +142,7 @@ impl<T: Component> DenseQuery for Without<T> {
     unsafe fn fetch_slices<'w>(_: &'w Archetype, _: &[ComponentId], _: usize, _: usize, _: Tick) {}
 }
 
-// ── Maybe / MaybeWrite — Option-слайсы ─────────────────────────
+// ── Maybe / MaybeWrite — Option slices ─────────────────────────
 
 impl<T: Component> DenseQuery for Maybe<T> {
     type Slices<'w> = Option<&'w [T]>;
@@ -186,7 +186,7 @@ impl<T: Component> DenseQuery for MaybeWrite<T> {
     }
 }
 
-// ── Кортежи ────────────────────────────────────────────────────
+// ── Tuples ─────────────────────────────────────────────────────
 
 macro_rules! impl_dense_query_tuple {
     ( $( $Q:ident ),+ ) => {
@@ -263,7 +263,7 @@ mod tests {
         });
         assert_eq!(total, 150);
 
-        // Проверяем фактическую запись: P увеличился на V.
+        // Verify the actual write: P was incremented by V.
         let mut sum = 0.0;
         Query::<Read<P>>::new(&world).for_each(|_, p| sum += p.0);
         let expected: f32 = (0..100).map(|i| i as f32 + 1.0).sum::<f32>()
@@ -281,14 +281,14 @@ mod tests {
         let last_run = world.current_tick();
         world.tick();
 
-        // Берём слайс на запись, но НИЧЕГО не пишем — по контракту dense-write
-        // весь диапазон всё равно становится changed.
+        // Take a slice for writing but write NOTHING — by the dense-write
+        // contract the whole range still becomes changed.
         Query::<Write<P>>::new_mut(&mut world).for_each_chunk_mut(|_, _p| {});
 
         let changed = Query::<Changed<P>>::new_with_tick(&world, last_run)
             .iter()
             .count();
-        assert_eq!(changed, 10, "dense-write стампит весь диапазон");
+        assert_eq!(changed, 10, "dense-write stamps the whole range");
     }
 
     #[test]

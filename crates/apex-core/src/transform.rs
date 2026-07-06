@@ -1,32 +1,32 @@
-//! TransformPropagation — иерархические трансформации.
+//! TransformPropagation — hierarchical transforms.
 //!
-//! # Архитектура
+//! # Architecture
 //!
-//! - [`LocalTransform`] — position/rotation/scale entity (локальное пространство)
-//! - [`GlobalTransform`] — итоговая мировая матрица (пересчитывается из иерархии)
-//! - [`propagate_transforms`] — эксклюзивная система, выполняющая иерархический пересчёт
+//! - [`LocalTransform`] — entity position/rotation/scale (local space)
+//! - [`GlobalTransform`] — resulting world matrix (recomputed from the hierarchy)
+//! - [`propagate_transforms`] — exclusive system performing the hierarchical recompute
 //!
-//! # DX (после C1/C2)
+//! # DX (after C1/C2)
 //!
-//! Ручной `TransformDirty` **удалён**: dirty-детекция идёт через
-//! `Changed<LocalTransform>` — достоверно для мутаций и через `Query<Write>`, и
-//! через `World::get_mut` (C1). Достаточно изменить `LocalTransform` — пересчёт
-//! произойдёт автоматически, каскадируясь на потомков. Достаточно заспавнить
-//! entity с одним `LocalTransform` — `GlobalTransform` создаётся **системой
-//! `propagate_transforms` при первом проходе** (не в момент спавна; до этого
-//! `get::<GlobalTransform>` вернёт `None`). См. doc у [`GlobalTransform`].
+//! Manual `TransformDirty` is **removed**: dirty-detection goes through
+//! `Changed<LocalTransform>` — reliable for mutations both via `Query<Write>` and
+//! via `World::get_mut` (C1). Just change `LocalTransform` and the recompute
+//! happens automatically, cascading to descendants. Just spawn an
+//! entity with a single `LocalTransform` — `GlobalTransform` is created by the
+//! **`propagate_transforms` system on its first pass** (not at spawn time; until then
+//! `get::<GlobalTransform>` returns `None`). See the doc on [`GlobalTransform`].
 //!
-//! # Алгоритм
+//! # Algorithm
 //!
-//! 1. Собрать entity с `Changed<LocalTransform>` (с прошлого запуска).
-//! 2. Оставить «dirty-корни» — изменённые entity без изменённого предка
-//!    (остальные лежат внутри их поддеревьев и будут пересчитаны спуском).
-//! 3. Для каждого dirty-корня спуститься по всему поддереву (DFS), передавая
-//!    мировую матрицу родителя по значению: `Global = parent_global * Local`.
-//!    Каждый узел посещается ровно один раз; stale-чтений родителя нет по
-//!    построению (родитель всегда вычислен до ребёнка).
+//! 1. Collect entities with `Changed<LocalTransform>` (since the previous run).
+//! 2. Keep the "dirty-roots" — changed entities without a changed ancestor
+//!    (the rest lie inside their subtrees and will be recomputed by the descent).
+//! 3. For each dirty-root, descend the whole subtree (DFS), passing the
+//!    parent world matrix by value: `Global = parent_global * Local`.
+//!    Each node is visited exactly once; there are no stale parent reads by
+//!    construction (the parent is always computed before the child).
 //!
-//! # Использование в Scheduler
+//! # Usage in the Scheduler
 //!
 //! ```ignore
 //! use apex_core::transform::{LocalTransform, GlobalTransform, TransformPlugin};
@@ -45,14 +45,14 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 
 use crate::{component::Tick, entity::Entity, relations::ChildOf, world::World};
 
-/// Генерационная «карта посещений» по `entity.index`: O(1) mark/contains без
-/// хэширования и без пер-кадровой очистки (сравнение поколений; на wrap'е — сброс).
-/// 21k hash-вставок FxHashSet на кадр стоили дороже всего остального propagate.
+/// Generational "visit map" keyed by `entity.index`: O(1) mark/contains without
+/// hashing and without per-frame clearing (generation comparison; reset on wrap).
+/// 21k FxHashSet hash-inserts per frame cost more than the rest of propagate combined.
 ///
-/// Публичная утилита (CR-M4) для паттерна «множество entity на кадр» — замена
-/// `FxHashSet<Entity>`-на-кадр в потребителях (extract движка: shadow_markers,
-/// skins active-set). Ключ — `entity.index()`; generation entity не участвует,
-/// поэтому корректна только для короткоживущих (кадровых) множеств.
+/// Public utility (CR-M4) for the "set of entities per frame" pattern — a replacement
+/// for per-frame `FxHashSet<Entity>` in consumers (engine extract: shadow_markers,
+/// skins active-set). The key is `entity.index()`; the entity generation is not involved,
+/// so it is correct only for short-lived (per-frame) sets.
 #[derive(Default)]
 pub struct IndexStamp {
     stamps: Vec<u32>,
@@ -60,18 +60,18 @@ pub struct IndexStamp {
 }
 
 impl IndexStamp {
-    /// Начать новое поколение (прежние отметки мгновенно «забываются»).
+    /// Start a new generation (previous marks are instantly "forgotten").
     pub fn next_generation(&mut self) {
         let (g, wrapped) = self.generation.overflowing_add(1);
         self.generation = g;
         if wrapped || g == 0 {
-            // Раз в 2^32 кадров: нулевое поколение совпадает с дефолтом ячеек — чистим.
+            // Once every 2^32 frames: generation zero collides with the cells' default — clear them.
             self.stamps.iter_mut().for_each(|s| *s = u32::MAX);
             self.generation = 1;
         }
     }
 
-    /// Отметить индекс в текущем поколении.
+    /// Mark the index in the current generation.
     #[inline]
     pub fn mark(&mut self, index: u32) {
         let i = index as usize;
@@ -81,18 +81,18 @@ impl IndexStamp {
         self.stamps[i] = self.generation;
     }
 
-    /// Отмечен ли индекс в текущем поколении.
+    /// Whether the index is marked in the current generation.
     #[inline]
     pub fn contains(&self, index: u32) -> bool {
         self.stamps.get(index as usize) == Some(&self.generation)
     }
 }
 
-// ── Компоненты трансформаций ─────────────────────────────────────
+// ── Transform components ─────────────────────────────────────
 
-/// Локальная трансформация entity (относительно родителя).
+/// Local transform of an entity (relative to the parent).
 ///
-/// Если entity не имеет родителя (no ChildOf) — это мировая трансформация.
+/// If the entity has no parent (no ChildOf) — this is its world transform.
 #[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
 pub struct LocalTransform {
     pub translation: Vec3,
@@ -101,7 +101,7 @@ pub struct LocalTransform {
 }
 
 impl LocalTransform {
-    /// Единичная трансформация (zero translation, identity rotation, unit scale).
+    /// Identity transform (zero translation, identity rotation, unit scale).
     pub const IDENTITY: Self = Self {
         translation: Vec3::ZERO,
         rotation: Quat::IDENTITY,
@@ -115,7 +115,7 @@ impl LocalTransform {
         }
     }
 
-    /// Трансформация из координат (самый частотный конструктор, 1:1 Bevy
+    /// Transform from coordinates (the most frequent constructor, 1:1 Bevy
     /// `Transform::from_xyz`).
     #[inline]
     pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
@@ -138,7 +138,7 @@ impl LocalTransform {
 
     // ── Builders (1:1 Bevy Transform) ────────────────────────────
 
-    /// Заменить translation (builder).
+    /// Replace translation (builder).
     #[inline]
     #[must_use]
     pub fn with_translation(mut self, translation: Vec3) -> Self {
@@ -146,7 +146,7 @@ impl LocalTransform {
         self
     }
 
-    /// Заменить rotation (builder).
+    /// Replace rotation (builder).
     #[inline]
     #[must_use]
     pub fn with_rotation(mut self, rotation: Quat) -> Self {
@@ -154,7 +154,7 @@ impl LocalTransform {
         self
     }
 
-    /// Заменить scale (builder).
+    /// Replace scale (builder).
     #[inline]
     #[must_use]
     pub fn with_scale(mut self, scale: Vec3) -> Self {
@@ -162,20 +162,20 @@ impl LocalTransform {
         self
     }
 
-    /// Повернуть так, чтобы локальный forward (−Z) смотрел на `target`,
-    /// а локальный +Y был выровнен к `up` без крена (1:1 Bevy
+    /// Rotate so the local forward (−Z) points at `target`,
+    /// and the local +Y is aligned to `up` without roll (1:1 Bevy
     /// `Transform::looking_at`).
     ///
-    /// ⚠ Это НЕ `Quat::from_rotation_arc` — тот оставляет произвольный roll
-    /// (горизонт заваливается).
+    /// ⚠ This is NOT `Quat::from_rotation_arc` — that leaves an arbitrary roll
+    /// (the horizon tilts).
     #[inline]
     #[must_use]
     pub fn looking_at(self, target: Vec3, up: Vec3) -> Self {
         self.looking_to(target - self.translation, up)
     }
 
-    /// Повернуть так, чтобы локальный forward (−Z) смотрел вдоль `direction`
-    /// (1:1 Bevy `Transform::looking_to`). См. [`Self::looking_at`].
+    /// Rotate so the local forward (−Z) points along `direction`
+    /// (1:1 Bevy `Transform::looking_to`). See [`Self::looking_at`].
     #[inline]
     #[must_use]
     pub fn looking_to(mut self, direction: Vec3, up: Vec3) -> Self {
@@ -183,55 +183,55 @@ impl LocalTransform {
         self
     }
 
-    // ── Направления (мировые оси локального базиса) ──────────────
+    // ── Directions (world axes of the local basis) ──────────────
 
-    /// Локальный forward: −Z в мировых координатах.
+    /// Local forward: −Z in world coordinates.
     #[inline]
     pub fn forward(&self) -> Vec3 {
         self.rotation * Vec3::NEG_Z
     }
 
-    /// Локальный back: +Z в мировых координатах.
+    /// Local back: +Z in world coordinates.
     #[inline]
     pub fn back(&self) -> Vec3 {
         self.rotation * Vec3::Z
     }
 
-    /// Локальный right: +X в мировых координатах.
+    /// Local right: +X in world coordinates.
     #[inline]
     pub fn right(&self) -> Vec3 {
         self.rotation * Vec3::X
     }
 
-    /// Локальный left: −X в мировых координатах.
+    /// Local left: −X in world coordinates.
     #[inline]
     pub fn left(&self) -> Vec3 {
         self.rotation * Vec3::NEG_X
     }
 
-    /// Локальный up: +Y в мировых координатах.
+    /// Local up: +Y in world coordinates.
     #[inline]
     pub fn up(&self) -> Vec3 {
         self.rotation * Vec3::Y
     }
 
-    /// Локальный down: −Y в мировых координатах.
+    /// Local down: −Y in world coordinates.
     #[inline]
     pub fn down(&self) -> Vec3 {
         self.rotation * Vec3::NEG_Y
     }
 
-    /// Преобразовать в аффинную матрицу 4x4.
+    /// Convert into a 4x4 affine matrix.
     #[inline]
     pub fn to_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
     }
 }
 
-/// Кватернион «смотреть вдоль `direction` с `up` без крена» — канонический
+/// Quaternion "look along `direction` with `up` without roll" — the canonical
 /// look-rotation (1:1 Bevy `Transform::looking_to`): back = −direction,
-/// right = up × back, up' = back × right. Вырожденные входы (нулевой/NaN
-/// direction, up ∥ direction) безопасно фоллбэчатся как у Bevy
+/// right = up × back, up' = back × right. Degenerate inputs (zero/NaN
+/// direction, up ∥ direction) fall back safely as in Bevy
 /// (`any_orthonormal_vector`).
 fn look_to_rotation(direction: Vec3, up: Vec3) -> Quat {
     let back = -direction.try_normalize().unwrap_or(Vec3::NEG_Z);
@@ -250,42 +250,42 @@ impl Default for LocalTransform {
     }
 }
 
-/// Глобальная (мировая) трансформация entity.
+/// Global (world) transform of an entity.
 ///
-/// # Когда появляется (важно!)
+/// # When it appears (important!)
 ///
-/// `GlobalTransform` **НЕ добавляется в момент спавна** — достаточно заспавнить
-/// entity с одним [`LocalTransform`]. Компонент создаётся **автоматически** системой
-/// [`propagate_transforms`] при её **первом проходе** после спавна (для entity, у
-/// которых есть `LocalTransform`, но ещё нет `GlobalTransform`).
+/// `GlobalTransform` is **NOT added at spawn time** — just spawn an
+/// entity with a single [`LocalTransform`]. The component is created **automatically** by the
+/// [`propagate_transforms`] system on its **first pass** after the spawn (for entities that
+/// have a `LocalTransform` but not yet a `GlobalTransform`).
 ///
-/// Практически: между `world.spawn((LocalTransform...,))` и первым запуском
-/// `propagate_transforms` (PostUpdate) `world.get::<GlobalTransform>(e)` вернёт
-/// `None`. После первого прохода — `Some(..)` с корректной матрицей. Рендер и
-/// прочие потребители читают `GlobalTransform` уже после propagate в том же кадре.
+/// In practice: between `world.spawn((LocalTransform...,))` and the first run of
+/// `propagate_transforms` (PostUpdate), `world.get::<GlobalTransform>(e)` returns
+/// `None`. After the first pass — `Some(..)` with a correct matrix. Rendering and
+/// other consumers read `GlobalTransform` after propagate within the same frame.
 ///
-/// Если `GlobalTransform` нужен **немедленно** при спавне — добавьте его в bundle
-/// явно: `world.spawn((LocalTransform::from_translation(t), GlobalTransform::IDENTITY))`
-/// (его значение всё равно будет пересчитано propagate).
+/// If `GlobalTransform` is needed **immediately** at spawn — add it to the bundle
+/// explicitly: `world.spawn((LocalTransform::from_translation(t), GlobalTransform::IDENTITY))`
+/// (its value will be recomputed by propagate anyway).
 ///
-/// Пересчитывается в PostUpdate системой `propagate_transforms`.
-/// Не сериализуется — восстанавливается из иерархии + LocalTransform.
+/// Recomputed in PostUpdate by the `propagate_transforms` system.
+/// Not serialized — reconstructed from the hierarchy + LocalTransform.
 #[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
 pub struct GlobalTransform(pub Mat4);
 
 impl GlobalTransform {
     pub const IDENTITY: Self = Self(Mat4::IDENTITY);
 
-    /// Мировая трансформация из координат (для спавна корневых entity,
-    /// которым матрица нужна немедленно — до первого propagate).
+    /// World transform from coordinates (for spawning root entities
+    /// that need the matrix immediately — before the first propagate).
     #[inline]
     pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
         Self(Mat4::from_translation(Vec3::new(x, y, z)))
     }
 
-    /// Мировая трансформация «из `eye`, смотреть на `target`» (тот же
-    /// look-rotation без крена, что [`LocalTransform::looking_at`]).
-    /// Типичный кейс — спавн света/камеры матрицей.
+    /// World transform "from `eye`, looking at `target`" (the same
+    /// roll-free look-rotation as [`LocalTransform::looking_at`]).
+    /// Typical case — spawning a light/camera by matrix.
     #[inline]
     pub fn looking_at(eye: Vec3, target: Vec3, up: Vec3) -> Self {
         Self(Mat4::from_rotation_translation(
@@ -299,59 +299,59 @@ impl GlobalTransform {
         &self.0
     }
 
-    /// Мировой forward (−Z), 1:1 Bevy `GlobalTransform::forward`. См. [`TransformDirections`].
+    /// World forward (−Z), 1:1 Bevy `GlobalTransform::forward`. See [`TransformDirections`].
     #[inline]
     pub fn forward(&self) -> Vec3 {
         self.0.forward()
     }
-    /// Мировой back (+Z), 1:1 Bevy `GlobalTransform::back`. См. [`TransformDirections`].
+    /// World back (+Z), 1:1 Bevy `GlobalTransform::back`. See [`TransformDirections`].
     #[inline]
     pub fn back(&self) -> Vec3 {
         self.0.back()
     }
-    /// Мировой right (+X), 1:1 Bevy `GlobalTransform::right`.
+    /// World right (+X), 1:1 Bevy `GlobalTransform::right`.
     #[inline]
     pub fn right(&self) -> Vec3 {
         self.0.right()
     }
-    /// Мировой left (−X), 1:1 Bevy `GlobalTransform::left`.
+    /// World left (−X), 1:1 Bevy `GlobalTransform::left`.
     #[inline]
     pub fn left(&self) -> Vec3 {
         self.0.left()
     }
-    /// Мировой up (+Y), 1:1 Bevy `GlobalTransform::up`.
+    /// World up (+Y), 1:1 Bevy `GlobalTransform::up`.
     #[inline]
     pub fn up(&self) -> Vec3 {
         self.0.up()
     }
-    /// Мировой down (−Y), 1:1 Bevy `GlobalTransform::down`.
+    /// World down (−Y), 1:1 Bevy `GlobalTransform::down`.
     #[inline]
     pub fn down(&self) -> Vec3 {
         self.0.down()
     }
 }
 
-/// Семантические аксессоры мировых направлений для матрицы трансформации (local→world),
-/// 1:1 Bevy `Transform`/`GlobalTransform`: **forward = локальный −Z**, back = +Z, right = +X,
-/// left = −X, up = +Y, down = −Y (каждый нормирован).
+/// Semantic accessors for world directions of a transform matrix (local→world),
+/// 1:1 Bevy `Transform`/`GlobalTransform`: **forward = local −Z**, back = +Z, right = +X,
+/// left = −X, up = +Y, down = −Y (each normalized).
 ///
-/// **Использовать вместо «сырых» `±matrix.z_axis`/`x_axis`/`y_axis`.** Сырой доступ к колонкам
-/// легко перепутать по знаку: например, базис view-матрицы spot-света должен строиться из
-/// `back()` (+Z), а не из forward (−Z) — путаница знака зеркалила теневую карту прожектора
-/// (он самозатенял свой объёмный конус). Именованные направления делают знак невозможным
-/// перепутать (см. `apex-engine/plans/TECH_DEBT.md`, fix 2026-06-15).
+/// **Use these instead of "raw" `±matrix.z_axis`/`x_axis`/`y_axis`.** Raw column access
+/// is easy to get sign-wrong: for example, the view-matrix basis of a spot-light must be built from
+/// `back()` (+Z), not from forward (−Z) — a sign mix-up mirrored the spotlight's shadow map
+/// (it self-shadowed its own volumetric cone). Named directions make the sign impossible
+/// to confuse (see `apex-engine/plans/TECH_DEBT.md`, fix 2026-06-15).
 pub trait TransformDirections {
-    /// Локальный −Z в мире (куда «смотрит» объект).
+    /// Local −Z in world space (where the object "looks").
     fn forward(&self) -> Vec3;
-    /// Локальный +Z в мире.
+    /// Local +Z in world space.
     fn back(&self) -> Vec3;
-    /// Локальный +X в мире.
+    /// Local +X in world space.
     fn right(&self) -> Vec3;
-    /// Локальный −X в мире.
+    /// Local −X in world space.
     fn left(&self) -> Vec3;
-    /// Локальный +Y в мире.
+    /// Local +Y in world space.
     fn up(&self) -> Vec3;
-    /// Локальный −Y в мире.
+    /// Local −Y in world space.
     fn down(&self) -> Vec3;
 }
 
@@ -383,7 +383,7 @@ impl TransformDirections for Mat4 {
 }
 
 impl From<&LocalTransform> for GlobalTransform {
-    /// Мировая матрица корневой entity == её локальная TRS (без родителя).
+    /// World matrix of a root entity == its local TRS (no parent).
     #[inline]
     fn from(local: &LocalTransform) -> Self {
         Self(local.to_matrix())
@@ -396,58 +396,58 @@ impl Default for GlobalTransform {
     }
 }
 
-// ── Система Propagation ─────────────────────────────────────────
+// ── Propagation system ─────────────────────────────────────────
 
-/// Scratch-буферы + состояние change-detection для [`propagate_transforms`].
-/// Переиспользуются каждый кадр, избегая Vec-аллокаций в горячем пути.
+/// Scratch buffers + change-detection state for [`propagate_transforms`].
+/// Reused every frame, avoiding Vec allocations on the hot path.
 #[derive(Default)]
 pub struct TransformScratch {
-    /// Тик предыдущего запуска propagate — база для `Changed<LocalTransform>`.
+    /// Tick of the previous propagate run — base for `Changed<LocalTransform>`.
     pub(crate) last_run: Tick,
-    /// Список dirty entity из query (шаг 1)
+    /// List of dirty entities from the query (step 1)
     pub(crate) dirty_entities: Vec<Entity>,
-    /// O(1)-проверка dirty по entity.index (генерационный stamp вместо hash-set)
+    /// O(1) dirty check by entity.index (generational stamp instead of a hash-set)
     pub(crate) dirty: IndexStamp,
-    /// DFS-стек спуска по поддеревьям: (entity, мировая матрица РОДИТЕЛЯ).
+    /// DFS descent stack over subtrees: (entity, PARENT world matrix).
     pub(crate) stack: Vec<(Entity, Mat4)>,
 }
 
-/// Эксклюзивная система: пересчитывает `GlobalTransform` для всех entity,
-/// чей `LocalTransform` **изменился** с прошлого запуска (`Changed<LocalTransform>`),
-/// и всех их потомков. Ручной `TransformDirty` больше не нужен — после C1
-/// `Changed<LocalTransform>` достоверен на всех путях мутации (`Query<Write>` и
-/// `World::get_mut`). Выполняется в PostUpdate.
+/// Exclusive system: recomputes `GlobalTransform` for every entity
+/// whose `LocalTransform` **changed** since the previous run (`Changed<LocalTransform>`),
+/// and all of their descendants. Manual `TransformDirty` is no longer needed — after C1,
+/// `Changed<LocalTransform>` is reliable on all mutation paths (`Query<Write>` and
+/// `World::get_mut`). Runs in PostUpdate.
 ///
-/// # Алгоритм (поддеревья от dirty-корней)
+/// # Algorithm (subtrees from dirty-roots)
 ///
-/// 1. Собрать entity с `Changed<LocalTransform>` (с прошлого `last_run`).
-/// 2. Оставить **dirty-корни** — изменённые entity, у которых НЕТ изменённого
-///    предка (остальные внутри их поддеревьев). Подъём прекращается на первом
-///    dirty-предке, поэтому в типичных сценах это 1–2 lookup'а на entity.
-/// 3. От каждого dirty-корня — итеративный DFS по всему поддереву с передачей
-///    мировой матрицы родителя **по значению**: `Global = parent_global * Local`;
-///    если `GlobalTransform` ещё нет — авто-инициализировать (DX: спавн с одним
-///    `LocalTransform` достаточно). Каждый узел посещается ровно один раз и
-///    строго после родителя — stale-чтений родительской матрицы нет по построению
-///    (прежняя версия пересчитывала dirty-узлы под чистым промежуточным предком
-///    дважды: сперва со старой матрицей, затем повторно каскадом).
+/// 1. Collect entities with `Changed<LocalTransform>` (since the previous `last_run`).
+/// 2. Keep the **dirty-roots** — changed entities that have NO changed
+///    ancestor (the rest are inside their subtrees). The walk-up stops at the first
+///    dirty ancestor, so in typical scenes this is 1–2 lookups per entity.
+/// 3. From each dirty-root — an iterative DFS over the whole subtree, passing the
+///    parent world matrix **by value**: `Global = parent_global * Local`;
+///    if a `GlobalTransform` does not exist yet — auto-initialize it (DX: spawn with a single
+///    `LocalTransform` is enough). Each node is visited exactly once and
+///    strictly after its parent — there are no stale reads of the parent matrix by construction
+///    (the previous version recomputed dirty nodes under a clean intermediate ancestor
+///    twice: first with the old matrix, then again by cascade).
 ///
-/// Стоимость — O(|объединение dirty-поддеревьев|): статичная сцена с одним
-/// мувером посещает только его поддерево, полностью анимированная — каждый узел
-/// один раз. Иерархия `ChildOf` предполагается ацикличной (как и всюду в ядре).
+/// Cost — O(|union of dirty subtrees|): a static scene with a single
+/// mover visits only its subtree; a fully animated one — every node
+/// once. The `ChildOf` hierarchy is assumed acyclic (as everywhere in the core).
 ///
 /// # Change-detection
 ///
-/// База — `scratch.last_run`; в конце пишется `world.current_tick()`. Требует
-/// покадрового продвижения тика (`world.tick()` перед `run()`; авто — в C7).
+/// The base is `scratch.last_run`; at the end `world.current_tick()` is written. Requires
+/// per-frame tick advancement (`world.tick()` before `run()`; automatic in C7).
 ///
-/// # Диагностика
+/// # Diagnostics
 ///
-/// `APEX_PROP_TRACE=1` — лог фаз (changed-query / спуск, число dirty/посещений).
+/// `APEX_PROP_TRACE=1` — logs the phases (changed-query / descent, number of dirty/visits).
 ///
-/// # Ресурсы
+/// # Resources
 ///
-/// Использует [`TransformScratch`] для переиспользования буферов между кадрами.
+/// Uses [`TransformScratch`] to reuse buffers between frames.
 ///
 /// Defensive bound on the ChildOf ancestor walk. `add_relation` rejects
 /// cycle-forming edges, so a real hierarchy never approaches this; it only stops
@@ -455,10 +455,10 @@ pub struct TransformScratch {
 const MAX_PROPAGATE_DEPTH: usize = 1 << 20;
 
 pub fn propagate_transforms(world: &mut World) {
-    // Извлекаем scratch-буфер из ресурсов (или создаём новый при первом вызове)
-    // remove_resource перемещает значение в локальную переменную, освобождая
-    // заимствование world — это позволяет вызывать world.get()/world.insert()
-    // без конфликта borrow checker.
+    // Take the scratch buffer out of the resources (or create a new one on the first call).
+    // remove_resource moves the value into a local variable, releasing
+    // the borrow of world — this lets us call world.get()/world.insert()
+    // without a borrow-checker conflict.
     let mut scratch = world
         .remove_resource::<TransformScratch>()
         .unwrap_or_default();
@@ -466,7 +466,7 @@ pub fn propagate_transforms(world: &mut World) {
     let last_run = scratch.last_run;
     let this_run = world.current_tick();
 
-    // Очищаем все буферы (емкость сохраняется — аллокации переиспользуются)
+    // Clear all buffers (capacity is preserved — allocations are reused)
     scratch.dirty_entities.clear();
     scratch.dirty.next_generation();
     scratch.stack.clear();
@@ -475,11 +475,11 @@ pub fn propagate_transforms(world: &mut World) {
     let trace = *TRACE.get_or_init(|| std::env::var("APEX_PROP_TRACE").is_ok_and(|v| v == "1"));
     let t0 = std::time::Instant::now();
 
-    // 1. Собираем entity с изменённым LocalTransform (с прошлого запуска) и метим их в
-    //    stamp-карте. Семантика — ровно `Query<Changed<LocalTransform>>` (тот же
-    //    `is_newer_than`), но прямым линейным сканом тик-колонок архетипов: генерик-
-    //    итерация запроса стоила ~35нс/строку (косвенность fetch_item + клоужер),
-    //    тут — узкий цикл по `Vec<Tick>` (паритет закреплён тестом
+    // 1. Collect entities with a changed LocalTransform (since the previous run) and mark them in
+    //    the stamp map. The semantics are exactly `Query<Changed<LocalTransform>>` (the same
+    //    `is_newer_than`), but via a direct linear scan of the archetypes' tick columns: generic
+    //    query iteration cost ~35ns/row (fetch_item indirection + closure),
+    //    here — a tight loop over `Vec<Tick>` (parity pinned by the test
     //    `direct_tick_scan_matches_changed_query`).
     {
         let TransformScratch {
@@ -505,16 +505,16 @@ pub fn propagate_transforms(world: &mut World) {
     let t1 = std::time::Instant::now();
 
     if scratch.dirty_entities.is_empty() {
-        // Ничего не изменилось — фиксируем тик и выходим.
+        // Nothing changed — commit the tick and return.
         scratch.last_run = this_run;
         world.insert_resource(scratch);
         return;
     }
 
-    // 2. Сеем стек dirty-корнями: dirty entity без dirty-предка. Подъём по предкам
-    //    останавливается на первом dirty (тогда entity внутри его поддерева и будет
-    //    пересчитана спуском — сеять её отдельно нельзя, иначе double-process).
-    //    Фаза только читает мир → при большом dirty-set распараллеливается.
+    // 2. Seed the stack with dirty-roots: dirty entities without a dirty ancestor. The walk-up over
+    //    ancestors stops at the first dirty one (then the entity is inside its subtree and will be
+    //    recomputed by the descent — it must not be seeded separately, otherwise double-process).
+    //    This phase only reads the world → it parallelizes for a large dirty-set.
     {
         let TransformScratch {
             dirty_entities,
@@ -529,7 +529,7 @@ pub fn propagate_transforms(world: &mut World) {
             let mut depth = 0usize;
             while let Some(p) = ancestor {
                 if dirty.contains(p.index) {
-                    return None; // покрыта dirty-предком — пересчитается его спуском
+                    return None; // covered by a dirty ancestor — recomputed by its descent
                 }
                 ancestor = world.target_of(p, ChildOf);
                 depth += 1;
@@ -544,8 +544,8 @@ pub fn propagate_transforms(world: &mut World) {
                     break;
                 }
             }
-            // Родитель чист (или отсутствует) — его мировая матрица валидна с прошлых
-            // кадров; отсутствие GlobalTransform трактуем как identity (прежняя семантика).
+            // The parent is clean (or absent) — its world matrix is valid from previous
+            // frames; a missing GlobalTransform is treated as identity (previous semantics).
             let parent_global = parent
                 .and_then(|p| world.get::<GlobalTransform>(p))
                 .map(|g| g.0)
@@ -572,31 +572,31 @@ pub fn propagate_transforms(world: &mut World) {
     let seeds = scratch.stack.len();
     let t2 = std::time::Instant::now();
 
-    // 3. Спуск. Два режима с одинаковой семантикой:
-    //    — мало корней / мелкие поддеревья → последовательный DFS на месте;
-    //    — много независимых корней (типично: толпа анимированных персонажей) →
-    //      фаза A: параллельное вычисление матриц по дизъюнктным поддеревьям
-    //      (только чтение &World — Sync, как в параллельных запросах), фаза B:
-    //      последовательная запись (get_mut/insert требуют &mut World).
-    //      Поддеревья дизъюнктны по построению (у entity один родитель, корни не
-    //      вложены друг в друга), поэтому записи не конфликтуют и порядок фазы B
-    //      не важен.
-    //    Стратегия: **widen-then-descend**. Параллельность по КОРНЯМ эффективна (thread-local стек,
-    //    без материализации уровней), но проседает, когда корней мало, а поддеревья огромные (кольцо
-    //    → 10k лис → 260k узлов: 56 корней). Поэтому СНАЧАЛА расширяем фронтир корней дешёвыми
-    //    последовательными уровнями, пока он не станет широким (56 → 10000 лис — обрабатываем лишь
-    //    56 узлов), ПОТОМ — параллельный спуск по независимым поддеревьям широкого фронтира. Если
-    //    фронтир уже широк (10000 анимированных персонажей-корней) — расширение пропускается; если
-    //    дерево узкое и не ширится (цепочка) — выходим и спускаемся как есть.
+    // 3. Descent. Two modes with identical semantics:
+    //    — few roots / small subtrees → sequential in-place DFS;
+    //    — many independent roots (typical: a crowd of animated characters) →
+    //      phase A: parallel matrix computation over disjoint subtrees
+    //      (read-only &World — Sync, as in parallel queries), phase B:
+    //      sequential writes (get_mut/insert require &mut World).
+    //      The subtrees are disjoint by construction (an entity has one parent, roots are not
+    //      nested within each other), so the writes do not conflict and the order of phase B
+    //      does not matter.
+    //    Strategy: **widen-then-descend**. Parallelism over ROOTS is efficient (thread-local stack,
+    //    no materialization of levels), but degrades when there are few roots and the subtrees are
+    //    huge (ring → 10k foxes → 260k nodes: 56 roots). So FIRST we widen the frontier of roots with
+    //    cheap sequential levels until it becomes wide (56 → 10000 foxes — we process only
+    //    56 nodes), THEN — a parallel descent over the independent subtrees of the wide frontier. If
+    //    the frontier is already wide (10000 animated character-roots) — the widening is skipped; if
+    //    the tree is narrow and does not widen (a chain) — we bail out and descend as is.
     let mut visits = 0usize;
     let gt_id = world.registry.get_id::<GlobalTransform>();
-    // Авто-создание GlobalTransform (entity с одним LocalTransform): в горячем пути пусто (required
-    // components); структурный insert — в конце, не во время параллельного спуска.
+    // Auto-creation of GlobalTransform (entity with a single LocalTransform): empty on the hot path
+    // (required components); the structural insert happens at the end, not during the parallel descent.
     let mut missing: Vec<(Entity, Mat4)> = Vec::new();
     let mut frontier: Vec<(Entity, Mat4)> = scratch.stack.drain(..).collect();
 
-    // ── Фаза widen: последовательно обрабатываем верхние (узкие) уровни, пока фронтир не станет
-    //    достаточно широким для хорошей параллельности по поддеревьям. ──
+    // ── Widen phase: sequentially process the top (narrow) levels until the frontier becomes
+    //    wide enough for good parallelism over subtrees. ──
     const WIDE_ENOUGH: usize = 1024;
     loop {
         if frontier.len() >= WIDE_ENOUGH || frontier.is_empty() {
@@ -608,7 +608,7 @@ pub fn propagate_transforms(world: &mut World) {
             if !world.is_alive(entity) {
                 continue;
             }
-            // Entity без LocalTransform останавливает спуск (каскад идёт только через узлы с трансформом).
+            // An entity without a LocalTransform stops the descent (the cascade goes only through nodes with a transform).
             let local = match world.get::<LocalTransform>(entity) {
                 Some(l) => *l,
                 None => continue,
@@ -627,19 +627,19 @@ pub fn propagate_transforms(world: &mut World) {
         let grew = next.len() > prev_len;
         frontier = next;
         if !grew {
-            // Уровень не расширяется (узкое/цепочечное дерево) — дальше расширять смысла нет.
+            // The level does not widen (a narrow/chained tree) — no point in widening further.
             break;
         }
     }
 
-    // ── Фаза descend: параллельный спуск по независимым поддеревьям широкого фронтира. ──
+    // ── Descend phase: parallel descent over the independent subtrees of the wide frontier. ──
     const PAR_MIN_ROOTS: usize = 64;
     if frontier.len() >= PAR_MIN_ROOTS {
         use rayon::prelude::*;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // Записи ПРЯМО из параллельного спуска по (archetype, row)-указателям — тот же контракт, что
-        // у параллельных Write-запросов (строка пишется ровно одним потоком): поддеревья дизъюнктны,
-        // entity посещается один раз; структурных изменений в фазе нет (missing откладываем).
+        // Writes go DIRECTLY from the parallel descent via (archetype, row) pointers — the same
+        // contract as parallel Write-queries (a row is written by exactly one thread): subtrees are
+        // disjoint, an entity is visited once; there are no structural changes in this phase (missing is deferred).
         let roots = frontier;
         let missing_par: std::sync::Mutex<Vec<(Entity, Mat4)>> = std::sync::Mutex::new(Vec::new());
         let visited = AtomicUsize::new(0);
@@ -676,7 +676,7 @@ pub fn propagate_transforms(world: &mut World) {
         visits += visited.load(Ordering::Relaxed);
         missing.extend(missing_par.into_inner().unwrap());
     } else {
-        // Последовательный DFS остатка (узкий фронтир): каждый узел ровно один раз, после родителя.
+        // Sequential DFS of the remainder (narrow frontier): each node exactly once, after its parent.
         let mut stack = frontier;
         while let Some((entity, parent_global)) = stack.pop() {
             if !world.is_alive(entity) {
@@ -699,7 +699,7 @@ pub fn propagate_transforms(world: &mut World) {
         }
     }
 
-    // Авто-инициализация отсутствующих GlobalTransform (entity посещается ровно один раз).
+    // Auto-initialize missing GlobalTransforms (each entity is visited exactly once).
     for (entity, global) in missing {
         world.insert(entity, GlobalTransform(global));
     }
@@ -718,18 +718,18 @@ pub fn propagate_transforms(world: &mut World) {
         );
     }
 
-    // Фиксируем тик этого запуска и возвращаем scratch для переиспользования.
+    // Commit this run's tick and return the scratch for reuse.
     scratch.last_run = this_run;
     world.insert_resource(scratch);
 }
 
-/// Прямая запись `GlobalTransform` по (archetype, row) из параллельного спуска.
-/// Возвращает `false`, если у entity ещё НЕТ компонента (нужен отложенный insert);
-/// мёртвые/невалидные строки молча игнорируются (`true`) — как is_alive-фильтр.
+/// Direct write of `GlobalTransform` via (archetype, row) from the parallel descent.
+/// Returns `false` if the entity does NOT have the component yet (a deferred insert is needed);
+/// dead/invalid rows are silently ignored (`true`) — like an is_alive filter.
 ///
-/// Контракт безопасности (тот же, что у параллельных Write-запросов): вызывающий
-/// гарантирует, что (а) каждая entity пишется не более чем одним потоком и
-/// (б) во время фазы нет структурных изменений мира (spawn/despawn/insert/remove).
+/// Safety contract (the same as parallel Write-queries): the caller
+/// guarantees that (a) each entity is written by at most one thread and
+/// (b) there are no structural changes to the world during the phase (spawn/despawn/insert/remove).
 fn write_global_parallel(
     world: &World,
     gt_id: Option<crate::component::ComponentId>,
@@ -738,7 +738,7 @@ fn write_global_parallel(
     tick: Tick,
 ) -> bool {
     let Some(cid) = gt_id else {
-        // Компонент ещё не зарегистрирован (самый первый кадр) → отложенный insert.
+        // The component is not registered yet (the very first frame) → deferred insert.
         return false;
     };
     let Some(loc) = world.entities.get_location(entity) else {
@@ -753,8 +753,8 @@ fn write_global_parallel(
     if row >= col.len {
         return true;
     }
-    // SAFETY: строка валидна (row < len); эксклюзив на строку и отсутствие структурных
-    // изменений — контракт вызывающего (см. doc). GlobalTransform: Copy, без Drop.
+    // SAFETY: the row is valid (row < len); exclusive access to the row and the absence of structural
+    // changes are the caller's contract (see doc). GlobalTransform: Copy, no Drop.
     unsafe {
         *(col.get_ptr(row) as *mut GlobalTransform) = GlobalTransform(global);
         col.set_change_tick(row, tick);
@@ -764,13 +764,13 @@ fn write_global_parallel(
 
 // ── Plugin ───────────────────────────────────────────────────────
 
-/// Plugin для регистрации Transform компонентов.
+/// Plugin for registering Transform components.
 ///
-/// Регистрирует [`LocalTransform`], [`GlobalTransform`] и [`TransformDirty`].
+/// Registers [`LocalTransform`], [`GlobalTransform`] and [`TransformDirty`].
 ///
-/// # Добавление системы
+/// # Adding the system
 ///
-/// Система `propagate_transforms` добавляется в Scheduler вручную:
+/// The `propagate_transforms` system is added to the Scheduler manually:
 ///
 /// ```ignore
 /// use apex_scheduler::stage::StageLabel;
@@ -784,13 +784,13 @@ fn write_global_parallel(
 pub struct TransformPlugin;
 
 impl TransformPlugin {
-    /// (Опционально) пред-инициализировать состояние Transform в World.
+    /// (Optionally) pre-initialize the Transform state in the World.
     ///
-    /// **Регистрация компонентов больше не нужна** — `LocalTransform`/`GlobalTransform`
-    /// помечены `#[derive(Component)]` и авто-регистрируются при `World::new()`
-    /// (linkme). `TransformDirty` и write-hook удалены (dirty-детекция — через
-    /// `Changed<LocalTransform>`, C1). Эта функция лишь пред-создаёт scratch-буфер
-    /// `propagate_transforms` (он также создаётся лениво при первом запуске).
+    /// **Component registration is no longer needed** — `LocalTransform`/`GlobalTransform`
+    /// are marked `#[derive(Component)]` and auto-register on `World::new()`
+    /// (linkme). `TransformDirty` and the write-hook are removed (dirty-detection — via
+    /// `Changed<LocalTransform>`, C1). This function only pre-creates the `propagate_transforms`
+    /// scratch buffer (which is also created lazily on the first run).
     pub fn register_components(world: &mut World) {
         world.insert_resource(TransformScratch::default());
     }
@@ -816,19 +816,19 @@ mod tests {
         let target = Vec3::new(0.0, 1.0, 0.0);
         let t = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
 
-        // forward (−Z) смотрит точно на target
+        // forward (−Z) points exactly at target
         let expected = (target - eye).normalize();
         assert!((t.forward() - expected).length() < 1e-6);
-        // без крена: right горизонтален (⊥ мировому Y)
+        // no roll: right is horizontal (⊥ to world Y)
         assert!(t.right().dot(Vec3::Y).abs() < 1e-6);
-        // ортонормальность базиса
+        // orthonormality of the basis
         assert!((t.up().dot(t.forward())).abs() < 1e-6);
         assert!((t.rotation.length() - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn looking_at_degenerate_inputs_do_not_produce_nan() {
-        // direction == 0 (target == eye) и up ∥ direction — не должны дать NaN.
+        // direction == 0 (target == eye) and up ∥ direction — must not produce NaN.
         let t = LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::new(1.0, 2.0, 3.0), Vec3::Y);
         assert!(t.rotation.is_finite());
         let t = LocalTransform::IDENTITY.looking_to(Vec3::Y, Vec3::Y);
@@ -843,7 +843,7 @@ mod tests {
         let local = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
         let global = GlobalTransform::looking_at(eye, target, Vec3::Y);
         let from_local: GlobalTransform = (&local).into();
-        // Матрицы совпадают (scale=1 у обоих путей).
+        // The matrices match (scale=1 in both paths).
         let (sa, ra, ta) = global.0.to_scale_rotation_translation();
         let (sb, rb, tb) = from_local.0.to_scale_rotation_translation();
         assert!((sa - sb).length() < 1e-6);
@@ -858,7 +858,7 @@ mod tests {
     #[test]
     fn direction_accessors_match_rotation() {
         let t = LocalTransform::from_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
-        // Поворот на +90° вокруг Y: forward (−Z) → −X.
+        // Rotation of +90° around Y: forward (−Z) → −X.
         assert!((t.forward() - Vec3::NEG_X).length() < 1e-6);
         assert!((t.back() + t.forward()).length() < 1e-6);
         assert!((t.left() + t.right()).length() < 1e-6);
@@ -869,7 +869,7 @@ mod tests {
     fn local_transform_to_matrix() {
         let lt = LocalTransform::from_translation(Vec3::new(1.0, 2.0, 3.0));
         let m = lt.to_matrix();
-        // Проверяем что матрица 4x4 переводит начало координат в translation
+        // Verify that the 4x4 matrix maps the origin to the translation
         let origin = Vec3::ZERO;
         let transformed = m.transform_point3(origin);
         assert_eq!(transformed, Vec3::new(1.0, 2.0, 3.0));
@@ -881,42 +881,42 @@ mod tests {
         assert_eq!(*gt.to_matrix(), Mat4::IDENTITY);
     }
 
-    /// C6: `LocalTransform`/`GlobalTransform` авто-регистрируются при `World::new()`
-    /// через `#[derive(Component)]` (linkme) — без ручного `register_component`.
+    /// C6: `LocalTransform`/`GlobalTransform` auto-register on `World::new()`
+    /// via `#[derive(Component)]` (linkme) — without a manual `register_component`.
     ///
-    /// Под Miri (и wasm32) `linkme::distributed_slice` отключён — компоненты
-    /// регистрируются лениво на spawn/insert (см. `component.rs`, TD-25), поэтому
-    /// авто-регистрация при пустом `World::new()` не выполняется. Тест проверяет
-    /// именно linkme-путь → скипаем в этих конфигурациях.
+    /// Under Miri (and wasm32) `linkme::distributed_slice` is disabled — components
+    /// register lazily on spawn/insert (see `component.rs`, TD-25), so
+    /// auto-registration on an empty `World::new()` does not happen. This test checks
+    /// exactly the linkme path → we skip it in these configurations.
     #[cfg_attr(any(miri, target_arch = "wasm32"), ignore)]
     #[test]
     fn transform_components_auto_registered() {
         let world = World::new();
         assert!(
             world.registry().get_id::<LocalTransform>().is_some(),
-            "LocalTransform должен авто-регистрироваться через derive(Component)"
+            "LocalTransform must auto-register via derive(Component)"
         );
         assert!(
             world.registry().get_id::<GlobalTransform>().is_some(),
-            "GlobalTransform должен авто-регистрироваться через derive(Component)"
+            "GlobalTransform must auto-register via derive(Component)"
         );
     }
 
     #[test]
     fn propagate_single_entity_auto_init_global() {
-        // БЕЗ register_components: derive авто-регистрирует компоненты,
-        // scratch создаётся лениво в propagate.
+        // WITHOUT register_components: derive auto-registers the components,
+        // scratch is created lazily in propagate.
         let mut world = World::new();
 
-        // Спавн с ОДНИМ LocalTransform — без GlobalTransform, без TransformDirty.
+        // Spawn with a SINGLE LocalTransform — no GlobalTransform, no TransformDirty.
         let entity = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
 
-        // GlobalTransform ещё не существует.
+        // GlobalTransform does not exist yet.
         assert!(world.get::<GlobalTransform>(entity).is_none());
 
         propagate_transforms(&mut world);
 
-        // propagate авто-инициализировал GlobalTransform = LocalTransform.
+        // propagate auto-initialized GlobalTransform = LocalTransform.
         let gt = world.get::<GlobalTransform>(entity).unwrap();
         assert_eq!(gt.0.transform_point3(Vec3::ZERO), Vec3::new(10.0, 0.0, 0.0));
     }
@@ -926,19 +926,19 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        // Иерархия parent → child, оба с одним LocalTransform (GlobalTransform авто).
+        // Hierarchy parent → child, both with a single LocalTransform (GlobalTransform auto).
         let parent = world.spawn((LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),));
         let child = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
         world.add_relation(child, ChildOf, parent);
 
         propagate_transforms(&mut world);
 
-        // child.Global = parent.Global * child.Local = (100 + 10) = 110 по X.
+        // child.Global = parent.Global * child.Local = (100 + 10) = 110 on X.
         let child_gt = world.get::<GlobalTransform>(child).unwrap();
         assert_eq!(
             child_gt.0.transform_point3(Vec3::ZERO),
             Vec3::new(110.0, 0.0, 0.0),
-            "Child должен быть на 110.0 по X (100 parent + 10 local)"
+            "Child must be at 110.0 on X (100 parent + 10 local)"
         );
         let parent_gt = world.get::<GlobalTransform>(parent).unwrap();
         assert_eq!(parent_gt.0.transform_point3(Vec3::ZERO), Vec3::new(100.0, 0.0, 0.0));
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(
             parent_gt.0.transform_point3(Vec3::ZERO),
             Vec3::new(80.0, 0.0, 0.0),
-            "Parent должен быть на 80.0"
+            "Parent must be at 80.0"
         );
 
         // child = 80 + 20 = 100
@@ -976,12 +976,12 @@ mod tests {
         assert_eq!(
             child_gt.0.transform_point3(Vec3::ZERO),
             Vec3::new(100.0, 0.0, 0.0),
-            "Child должен быть на 100.0"
+            "Child must be at 100.0"
         );
     }
 
-    /// Ключевой C1+C2: мутация `LocalTransform` через `Query<Write<_>>` (без
-    /// ручного `TransformDirty`) триггерит пересчёт `GlobalTransform`.
+    /// Key C1+C2: mutating `LocalTransform` via `Query<Write<_>>` (without
+    /// a manual `TransformDirty`) triggers a recompute of `GlobalTransform`.
     #[test]
     fn changed_local_via_write_query_triggers_recompute() {
         use crate::query::Write;
@@ -991,15 +991,15 @@ mod tests {
 
         let e = world.spawn((LocalTransform::from_translation(Vec3::new(1.0, 0.0, 0.0)),));
 
-        // Первый проход: авто-init GlobalTransform = (1,0,0).
+        // First pass: auto-init GlobalTransform = (1,0,0).
         propagate_transforms(&mut world);
         assert_eq!(
             world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
             Vec3::new(1.0, 0.0, 0.0)
         );
 
-        // Продвигаем тик (как делает кадр) и мутируем через Query<Write> — без
-        // какого-либо ручного маркера.
+        // Advance the tick (as a frame does) and mutate via Query<Write> — without
+        // any manual marker.
         world.tick();
         {
             let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
@@ -1010,18 +1010,18 @@ mod tests {
 
         propagate_transforms(&mut world);
 
-        // GlobalTransform пересчитан без TransformDirty.
+        // GlobalTransform recomputed without TransformDirty.
         assert_eq!(
             world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
             Vec3::new(42.0, 0.0, 0.0),
-            "Changed<LocalTransform> через Query<Write> должен триггерить пересчёт"
+            "Changed<LocalTransform> via Query<Write> must trigger a recompute"
         );
     }
 
-    /// Dirty-узел под ЧИСТЫМ промежуточным родителем при dirty-прародителе: спуск
-    /// от dirty-корня обязан пересчитать его ровно один раз и СТРОГО после
-    /// прародителя (прежний топосорт упорядочивал его до пересчёта предка и
-    /// чинил результат повторным каскадным проходом).
+    /// A dirty node under a CLEAN intermediate parent with a dirty grandparent: the descent
+    /// from the dirty-root must recompute it exactly once and STRICTLY after
+    /// the grandparent (the former toposort ordered it before the ancestor's recompute and
+    /// fixed the result with a second cascade pass).
     #[test]
     fn dirty_leaf_under_clean_intermediate_uses_fresh_ancestor_global() {
         let mut world = World::new();
@@ -1039,27 +1039,27 @@ mod tests {
             Vec3::new(111.0, 0.0, 0.0)
         );
 
-        // Меняем прародителя и лист; промежуточный узел остаётся чистым.
+        // Change the grandparent and the leaf; the intermediate node stays clean.
         world.tick();
         world.get_mut::<LocalTransform>(gp).unwrap().translation = Vec3::new(2.0, 0.0, 0.0);
         world.get_mut::<LocalTransform>(leaf).unwrap().translation = Vec3::new(200.0, 0.0, 0.0);
         propagate_transforms(&mut world);
 
-        // 2 (gp) + 10 (mid, чистый) + 200 (leaf) = 212.
+        // 2 (gp) + 10 (mid, clean) + 200 (leaf) = 212.
         assert_eq!(
             world.get::<GlobalTransform>(leaf).unwrap().0.transform_point3(Vec3::ZERO),
             Vec3::new(212.0, 0.0, 0.0),
-            "лист обязан считаться от СВЕЖЕЙ матрицы прародителя через чистый промежуточный узел"
+            "the leaf must be computed from the FRESH grandparent matrix through the clean intermediate node"
         );
-        // Чистый промежуточный узел тоже пересчитан (он в поддереве dirty-корня).
+        // The clean intermediate node is also recomputed (it is in the dirty-root's subtree).
         assert_eq!(
             world.get::<GlobalTransform>(mid).unwrap().0.transform_point3(Vec3::ZERO),
             Vec3::new(12.0, 0.0, 0.0)
         );
     }
 
-    /// Прямой скан тик-колонок (фаза 1) обязан давать ровно тот же dirty-набор, что
-    /// эталонный `Query<Changed<LocalTransform>>` с той же базы.
+    /// The direct scan of tick columns (phase 1) must yield exactly the same dirty-set as
+    /// the reference `Query<Changed<LocalTransform>>` from the same base.
     #[test]
     fn direct_tick_scan_matches_changed_query() {
         let mut world = World::new();
@@ -1070,7 +1070,7 @@ mod tests {
                 i as f32, 0.0, 0.0,
             )),)));
         }
-        // Половина сущностей — с другим составом (другой архетип в скане).
+        // Half of the entities — with a different composition (a different archetype in the scan).
         for (i, &e) in all.iter().enumerate() {
             if i % 2 == 0 {
                 world.insert(e, GlobalTransform::IDENTITY);
@@ -1086,7 +1086,7 @@ mod tests {
             }
         }
 
-        // Эталон — генерик-запрос с той же базы.
+        // Reference — a generic query from the same base.
         let mut expected: Vec<Entity> = Vec::new();
         {
             let q = Query::<Changed<LocalTransform>>::new_with_tick(&world, last_run);
@@ -1098,11 +1098,11 @@ mod tests {
         expected.sort_by_key(|e| e.index);
         actual.sort_by_key(|e| e.index);
         assert!(!expected.is_empty());
-        assert_eq!(actual, expected, "прямой скан тиков должен совпадать с Changed-запросом");
+        assert_eq!(actual, expected, "the direct tick scan must match the Changed query");
     }
 
-    /// Параллельная ветка спуска (≥64 независимых dirty-корней): результат идентичен
-    /// последовательному — у каждого ребёнка global = parent.local * child.local.
+    /// The parallel descent branch (≥64 independent dirty-roots): the result is identical
+    /// to the sequential one — each child's global = parent.local * child.local.
     #[test]
     fn many_dirty_roots_take_parallel_descent_and_stay_correct() {
         use crate::query::Write;
@@ -1122,7 +1122,7 @@ mod tests {
         }
         propagate_transforms(&mut world);
 
-        // Все родители dirty одновременно → n независимых поддеревьев → parallel-ветка.
+        // All parents are dirty at once → n independent subtrees → the parallel branch.
         world.tick();
         {
             let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
@@ -1142,15 +1142,15 @@ mod tests {
             assert_eq!(
                 world.get::<GlobalTransform>(*child).unwrap().0.transform_point3(Vec3::ZERO),
                 Vec3::new(1000.0 + i as f32, 1.0, 0.0),
-                "child {i} должен пересчитаться от свежего родителя в параллельной ветке"
+                "child {i} must be recomputed from the fresh parent in the parallel branch"
             );
         }
     }
 
-    /// Глубокая/широкая иерархия с НЕМНОГИМИ корнями (кейс ring-parent many_foxes): параллелизм
-    /// должен идти по ШИРИНЕ уровня, а не по числу корней. 1 корень → 300 детей (широкий уровень >
-    /// PAR_MIN_LEVEL → параллельная ветка) → у каждого внук. Сдвиг ТОЛЬКО корня каскадирует на 600
-    /// потомков; родитель уровня передаётся детям по значению через барьер уровня.
+    /// A deep/wide hierarchy with FEW roots (the ring-parent many_foxes case): parallelism
+    /// must go by the WIDTH of a level, not by the number of roots. 1 root → 300 children (a wide level >
+    /// PAR_MIN_LEVEL → the parallel branch) → each with a grandchild. Moving ONLY the root cascades to 600
+    /// descendants; the level's parent is passed to children by value across the level barrier.
     #[test]
     fn deep_wide_hierarchy_few_roots_propagates_in_parallel_levels() {
         use crate::query::Write;
@@ -1170,7 +1170,7 @@ mod tests {
         }
         propagate_transforms(&mut world);
 
-        // Сдвигаем ТОЛЬКО корень → пересчёт каскадирует на 600 потомков через широкие уровни.
+        // Move ONLY the root → the recompute cascades to 600 descendants through wide levels.
         world.tick();
         {
             let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
@@ -1182,17 +1182,17 @@ mod tests {
         }
         propagate_transforms(&mut world);
 
-        // Внук i: root(1000,0,0) + child(0,i,0) + gk(0,0,1) = (1000, i, 1).
+        // Grandchild i: root(1000,0,0) + child(0,i,0) + gk(0,0,1) = (1000, i, 1).
         for (i, gk) in grandkids {
             assert_eq!(
                 world.get::<GlobalTransform>(gk).unwrap().0.transform_point3(Vec3::ZERO),
                 Vec3::new(1000.0, i as f32, 1.0),
-                "внук {i} пересчитан от свежего корня через параллельный уровень"
+                "grandchild {i} recomputed from the fresh root through the parallel level"
             );
         }
     }
 
-    /// Изменение только родителя каскадирует пересчёт на детей.
+    /// Changing only the parent cascades the recompute to the children.
     #[test]
     fn parent_change_cascades_to_children() {
         use crate::query::Write;
@@ -1210,7 +1210,7 @@ mod tests {
             Vec3::new(5.0, 0.0, 0.0)
         );
 
-        // Двигаем ТОЛЬКО родителя.
+        // Move ONLY the parent.
         world.tick();
         {
             let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
@@ -1222,11 +1222,11 @@ mod tests {
         }
         propagate_transforms(&mut world);
 
-        // Ребёнок пересчитан каскадно: 100 (parent) + 5 (local) = 105.
+        // The child is recomputed by cascade: 100 (parent) + 5 (local) = 105.
         assert_eq!(
             world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO),
             Vec3::new(105.0, 0.0, 0.0),
-            "изменение родителя должно каскадно пересчитать ребёнка"
+            "changing the parent must cascade a recompute to the child"
         );
     }
 

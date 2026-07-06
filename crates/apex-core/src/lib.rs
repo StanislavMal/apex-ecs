@@ -1,19 +1,20 @@
-// ── Политика clippy ────────────────────────────────────────────
-// Ядро — низкоуровневый высокопроизводительный код с большим объёмом
-// внутреннего `unsafe` (storage/archetype/query). Следующие линты намеренно
-// смягчены: их «исправление» либо ухудшает перф/читаемость, либо относится к
-// внутренним примитивам, чьи safety-контракты документированы на уровне типов.
-// Корректность важнее: `unsafe`-инварианты покрыты тестами и debug_assert.
+// ── clippy policy ──────────────────────────────────────────────
+// The core is low-level high-performance code with a large amount of internal
+// `unsafe` (storage/archetype/query). The following lints are deliberately
+// relaxed: "fixing" them either hurts perf/readability, or concerns internal
+// primitives whose safety contracts are documented at the type level.
+// Correctness comes first: the `unsafe` invariants are covered by tests and
+// debug_assert.
 #![allow(
-    clippy::needless_range_loop,   // индексные циклы в горячих путях — намеренно
-    clippy::nonminimal_bool,       // явные булевы выражения ради читаемости
-    clippy::question_mark,         // явный if-let ради ясности control-flow
-    clippy::type_complexity,       // сложные типы в API запросов/планировщика
-    clippy::too_many_arguments,    // низкоуровневые fn хранилища
+    clippy::needless_range_loop,   // indexed loops in hot paths — intentional
+    clippy::nonminimal_bool,       // explicit boolean expressions for readability
+    clippy::question_mark,         // explicit if-let for control-flow clarity
+    clippy::type_complexity,       // complex types in the query/scheduler API
+    clippy::too_many_arguments,    // low-level storage fns
 )]
 
-// Позволяет `#[derive(Component)]` (эмитит пути `::apex_core::…`) работать на
-// типах ВНУТРИ самого apex-core (transform и пр.).
+// Lets `#[derive(Component)]` (which emits `::apex_core::…` paths) work on
+// types INSIDE apex-core itself (transform, etc.).
 extern crate self as apex_core;
 
 /// Emit a `log::warn!` at most once per call site (§0.2a "loud, not silent").
@@ -129,8 +130,8 @@ pub use transform::IndexStamp;
 pub use unsafe_world_cell::UnsafeWorldCell;
 pub use world::{ArchetypeStats, Bundle, ParallelWorld, QueryState, SystemContext, World};
 
-/// Шорткат `Default::default()` для struct-update-литералов (Bevy-идиома):
-/// `PbrMaterial { roughness: 0.5, ..default() }` вместо `..Default::default()`.
+/// Shortcut for `Default::default()` in struct-update literals (Bevy idiom):
+/// `PbrMaterial { roughness: 0.5, ..default() }` instead of `..Default::default()`.
 #[inline]
 pub fn default<T: Default>() -> T {
     T::default()

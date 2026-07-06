@@ -1,6 +1,6 @@
-/// Создаёт параллельную систему с автоматическим выводом AccessDescriptor.
+/// Creates a parallel system with automatic AccessDescriptor inference.
 ///
-/// # Вариант А — без состояния
+/// # Variant A — stateless
 ///
 /// ```ignore
 /// system! {
@@ -16,10 +16,10 @@
 ///         }
 ///     }
 /// }
-/// // Регистрация: app.add_system(Update, movement_system);
+/// // Registration: app.add_system(Update, movement_system);
 /// ```
 ///
-/// # Вариант Б — с состоянием
+/// # Variant B — stateful
 ///
 /// ```ignore
 /// system! {
@@ -34,22 +34,22 @@
 ///         }
 ///     }
 /// }
-/// // Регистрация: app.add_system(Update, Spawner::default());
+/// // Registration: app.add_system(Update, Spawner::default());
 /// ```
 ///
-/// # Параметры
+/// # Parameters
 ///
-/// | Параметр | Тип доступа | Описание |
+/// | Parameter | Access type | Description |
 /// |----------|------------|----------|
-/// | `q: (Read<A>, Write<B>)` | Query (кортеж) | Итерация по компонентам |
-/// | `q: Read<A>` | Query (одиночный) | Итерация по одному компоненту |
-/// | `name: Res<T>` | ResRead\<T\> | Иммутабельный ресурс (П2; `&T` — compile-ошибка: у Bevy `&T` = компонент) |
-/// | `name: ResMut<T>` | ResWrite\<T\> | Мутабельный ресурс (П2; `&mut T` — compile-ошибка) |
-/// | `name: &[E]` / `EventReader<E>` | Listen\<E\> | Чтение событий |
-/// | `name: &mut Vec<E>` / `EventWriter<E>` | Emit\<E\> | Отправка событий (`.send()`) |
-/// | `name: Cmd` | Commands | Отложенные структурные изменения |
-/// | `name: Ctx` | SystemContext | Прямой доступ к контексту |
-/// | `__whole: WholeWorld` | NEEDS_WHOLE_WORLD | Глобальный доступ ко всем entity |
+/// | `q: (Read<A>, Write<B>)` | Query (tuple) | Iterate over components |
+/// | `q: Read<A>` | Query (single) | Iterate over a single component |
+/// | `name: Res<T>` | ResRead\<T\> | Immutable resource (P2; `&T` — compile error: in Bevy `&T` = component) |
+/// | `name: ResMut<T>` | ResWrite\<T\> | Mutable resource (P2; `&mut T` — compile error) |
+/// | `name: &[E]` / `EventReader<E>` | Listen\<E\> | Read events |
+/// | `name: &mut Vec<E>` / `EventWriter<E>` | Emit\<E\> | Send events (`.send()`) |
+/// | `name: Cmd` | Commands | Deferred structural changes |
+/// | `name: Ctx` | SystemContext | Direct access to the context |
+/// | `__whole: WholeWorld` | NEEDS_WHOLE_WORLD | Global access to all entities |
 ///
 /// # Only one Query parameter (F6)
 ///
@@ -73,7 +73,7 @@
 #[macro_export]
 macro_rules! system {
     // ═══════════════════════════════════════════════════════════════
-    //  Эксклюзивные системы: `world: &mut World` ⇒ FULL access ⇒ alone
+    //  Exclusive systems: `world: &mut World` ⇒ FULL access ⇒ alone
     // ═══════════════════════════════════════════════════════════════
 
     // ── Exclusive A: stateless `fn name(world: &mut World) { … }` ──
@@ -90,20 +90,20 @@ macro_rules! system {
         }
     };
 
-    // ── Guard: `world` + другие параметры → понятная ошибка (U.1) ──
+    // ── Guard: `world` + other parameters → clear error (U.1) ──
     {
         fn $fn_name:ident( $world:ident : &mut World , $($rest:tt)+ ) {
             $($body:tt)*
         }
     } => {
         compile_error!(concat!(
-            "`", stringify!($world), ": &mut World` — это эксклюзивная система с FULL access;\n",
-            "её нельзя комбинировать с другими параметрами (она и так даёт полный доступ ко всему миру).\n",
-            "Внутри тела используй world.resource(), world.query::<_>(), world.spawn(...) напрямую."
+            "`", stringify!($world), ": &mut World` is an exclusive system with FULL access;\n",
+            "it cannot be combined with other parameters (it already grants full access to the whole world).\n",
+            "Inside the body, use world.resource(), world.query::<_>(), world.spawn(...) directly."
         ));
     };
 
-    // ── Exclusive B: stateful с дефолтами ──
+    // ── Exclusive B: stateful with defaults ──
     {
         struct $struct_name:ident {
             $( $field:ident : $fty:ty = $default:expr ),+ $(,)?
@@ -125,7 +125,7 @@ macro_rules! system {
         }
     };
 
-    // ── Exclusive B': stateful без дефолтов (U.5 — поля pub, без Default) ──
+    // ── Exclusive B': stateful without defaults (U.5 — fields pub, no Default) ──
     {
         struct $struct_name:ident {
             $( $field:ident : $fty:ty ),+ $(,)?
@@ -145,7 +145,7 @@ macro_rules! system {
     };
 
     // ═══════════════════════════════════════════════════════════════
-    //  Параллельные системы: доступ выведен из параметров
+    //  Parallel systems: access inferred from parameters
     // ═══════════════════════════════════════════════════════════════
 
     // ── Parallel A: stateless ──
@@ -168,7 +168,7 @@ macro_rules! system {
         }
     };
 
-    // ── Parallel B: with state (с дефолтами — генерируется Default) ──
+    // ── Parallel B: with state (with defaults — Default is generated) ──
     {
         struct $struct_name:ident {
             $( $field:ident : $fty:ty = $default:expr ),+ $(,)?
@@ -198,7 +198,7 @@ macro_rules! system {
         }
     };
 
-    // ── Parallel B': with state без дефолтов (U.5 — поля pub, без Default) ──
+    // ── Parallel B': with state without defaults (U.5 — fields pub, no Default) ──
     {
         struct $struct_name:ident {
             $( $field:ident : $fty:ty ),+ $(,)?
@@ -396,10 +396,10 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // Resource write — Res/ResMut-семантика (П2): та же грамматика, что в
-    // plain-fn системах. Bare `&T`/`&mut T` как ресурс БОЛЬШЕ НЕ принимаются
-    // (compile-ошибка ниже) — у Bevy `&T` означает компонент запроса,
-    // двойная семантика была ловушкой мигранта.
+    // Resource write — Res/ResMut semantics (P2): same grammar as in
+    // plain-fn systems. Bare `&T`/`&mut T` as a resource is NO LONGER accepted
+    // (compile error below) — in Bevy `&T` denotes a query component,
+    // the dual semantics was a migrant trap.
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -427,7 +427,7 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // EventReader<E> — Bevy-имя для чтения событий (эквивалент `&[E]`)
+    // EventReader<E> — Bevy name for reading events (equivalent to `&[E]`)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -441,7 +441,7 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // EventWriter<E> — Bevy-имя для записи событий (эквивалент `&mut Vec<E>`)
+    // EventWriter<E> — Bevy name for writing events (equivalent to `&mut Vec<E>`)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -455,8 +455,8 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // ── П2: bare `&T`/`&mut T` как ресурс — БОЛЬШЕ НЕ ПОДДЕРЖИВАЕТСЯ ──
-    // (двойная семантика с Bevy-компонентами была ловушкой №1 мигранта)
+    // ── P2: bare `&T`/`&mut T` as a resource — NO LONGER SUPPORTED ──
+    // (the dual semantics with Bevy components was the migrant's trap #1)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -465,9 +465,9 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
-        "` — `&mut T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
-         Используйте `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
-         Запись событий — `имя: &mut Vec<E>` или `имя: EventWriter<E>`."
+        "` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
+         Use `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
+         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`."
     )); };
 
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
@@ -478,10 +478,10 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &", stringify!($ty),
-        "` — `&T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
-         Используйте `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
-         Чтение событий — `имя: &[E]` или `имя: EventReader<E>`;\n\
-         компоненты — внутри запроса: `q: (Read<", stringify!($ty), ">, …)`."
+        "` — `&T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
+         Use `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
+         Event reading — `name: &[E]` or `name: EventReader<E>`;\n\
+         components — inside a query: `q: (Read<", stringify!($ty), ">, …)`."
     )); };
 
     // Commands
@@ -584,7 +584,7 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // Resource write (last) — ResMut<T> (П2)
+    // Resource write (last) — ResMut<T> (P2)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -598,7 +598,7 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // Resource read (last) — Res<T> (П2)
+    // Resource read (last) — Res<T> (P2)
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -640,7 +640,7 @@ macro_rules! __system_impl {
         @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
-    // ── П2: bare `&T`/`&mut T` как ресурс (last) — compile-ошибка ──
+    // ── P2: bare `&T`/`&mut T` as a resource (last) — compile error ──
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
@@ -649,9 +649,9 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
-        "` — `&mut T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
-         Используйте `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
-         Запись событий — `имя: &mut Vec<E>` или `имя: EventWriter<E>`."
+        "` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
+         Use `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
+         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`."
     )); };
 
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
@@ -662,10 +662,10 @@ macro_rules! __system_impl {
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &", stringify!($ty),
-        "` — `&T` больше не означает ресурс (ловушка Bevy-семантики, П2).\n\
-         Используйте `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
-         Чтение событий — `имя: &[E]` или `имя: EventReader<E>`;\n\
-         компоненты — внутри запроса: `q: (Read<", stringify!($ty), ">, …)`."
+        "` — `&T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
+         Use `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
+         Event reading — `name: &[E]` or `name: EventReader<E>`;\n\
+         components — inside a query: `q: (Read<", stringify!($ty), ">, …)`."
     )); };
 
     // Commands (last)

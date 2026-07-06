@@ -1,4 +1,4 @@
-//! Plain-fn системы (D2-1): обычная функция как система — Bevy-стиль 1:1.
+//! Plain-fn systems (D2-1): an ordinary function as a system — Bevy style 1:1.
 //!
 //! ```ignore
 //! fn movement(time: Res<Time>, mut q: Query<(&Velocity, &mut Transform)>) {
@@ -10,33 +10,33 @@
 //! sched.add_systems(StageLabel::Update, (movement, other_fn));
 //! ```
 //!
-//! Параметры — пользовательские типы с Bevy-семантикой (см. impl'ы
-//! `SystemParam` в [`system_param`](crate::system_param)): `Res<T>` /
-//! `ResMut<T>` / `Query<Q>` / `CachedQuery<Q>` / `EventReader<E>` /
-//! `EventWriter<E>` / `&mut Commands`. ⚠ В отличие от `system!`, здесь
-//! `Res<T>` — ресурс, а `&T`-компоненты живут ВНУТРИ `Query<…>` — ловушка
-//! «`&T` = ресурс» макроса в plain-fn пути отсутствует.
+//! Parameters are user types with Bevy semantics (see the `SystemParam` impls
+//! in [`system_param`](crate::system_param)): `Res<T>` / `ResMut<T>` /
+//! `Query<Q>` / `CachedQuery<Q>` / `EventReader<E>` / `EventWriter<E>` /
+//! `&mut Commands`. ⚠ Unlike `system!`, here `Res<T>` is a resource, and
+//! `&T` components live INSIDE `Query<…>` — the macro's "`&T` = resource" trap
+//! is absent on the plain-fn path.
 //!
-//! Access выводится статически (merge access'ов параметров), имя системы —
-//! из имени функции. `system!` остаётся диалектом (системы со state там
-//! удобнее Bevy `Local<T>`).
+//! Access is inferred statically (merging the parameters' accesses), and the
+//! system name comes from the function name. `system!` remains a dialect
+//! (stateful systems are more convenient there with Bevy's `Local<T>`).
 //!
-//! Реализация — классический Bevy-паттерн «двойного Fn-баунда»: функция
-//! обязана быть вызываемой и с декларированными типами параметров, и с их
-//! `Item<'w>` для любого `'w` (для fn-item'ов это одно и то же благодаря
-//! лайфтайм-генерализации элизии).
+//! The implementation is the classic Bevy "double Fn-bound" pattern: the
+//! function must be callable both with the declared parameter types and with
+//! their `Item<'w>` for any `'w` (for fn-items these are the same thanks to
+//! elision's lifetime generalization).
 
 use crate::system_param::SystemParam;
 
-/// Функция, чьи параметры — [`SystemParam`]. Реализуется автоматически для
-/// `fn`/замыканий с 1..=12 параметрами; `Marker` — тип-дизамбигуатор
-/// (`fn(P1, …)`), позволяющий одному типу функции матчить ровно один impl.
+/// A function whose parameters are [`SystemParam`]. Implemented automatically
+/// for `fn`s/closures with 1..=12 parameters; `Marker` is a disambiguator type
+/// (`fn(P1, …)`) that lets one function type match exactly one impl.
 pub trait SystemParamFunction<Marker>: Send + Sync + 'static {
-    /// Кортеж параметров (даже для одного параметра — `(P1,)`).
+    /// The parameter tuple (even for a single parameter — `(P1,)`).
     type Param: SystemParam;
 
-    /// Лайфтайм ресивера связан с лайфтаймом item — это позволяет HRTB-баунду
-    /// `for<'w> &'w mut Func: FnMut(Item<'w>…)` резолвиться по диагонали.
+    /// The receiver's lifetime is tied to the item's lifetime — this lets the
+    /// HRTB bound `for<'w> &'w mut Func: FnMut(Item<'w>…)` resolve diagonally.
     fn run<'w>(&'w mut self, item: <Self::Param as SystemParam>::Item<'w>);
 }
 
@@ -53,9 +53,9 @@ macro_rules! impl_system_param_function {
 
             #[inline]
             fn run<'w>(&'w mut self, item: <Self::Param as SystemParam>::Item<'w>) {
-                // Вызов через мономорфизированный шим: связывает HRTB-баунд
-                // с конкретными Item-типами этого вызова (Bevy-паттерн —
-                // напрямую `(self)(…)` компилятор по HRTB не резолвит).
+                // Call through a monomorphized shim: it binds the HRTB bound
+                // to this call's concrete Item types (Bevy pattern — the
+                // compiler cannot resolve `(self)(…)` directly via HRTB).
                 #[allow(non_snake_case, clippy::too_many_arguments)]
                 fn call_inner<$($P),+>(
                     mut f: impl FnMut($($P),+),
@@ -146,11 +146,11 @@ impl_system_param_function!(
     (P12, p12)
 );
 
-/// Короткое имя системы из типа функции: `my_game::systems::movement` →
-/// `movement` (отбрасывает путь модулей; generic-скобки сохраняются).
+/// Short system name from a function type: `my_game::systems::movement` →
+/// `movement` (drops the module path; generic brackets are kept).
 pub fn short_system_name<F: ?Sized>() -> &'static str {
     let full = std::any::type_name::<F>();
-    // Срез до последнего `::` ВНЕ угловых скобок.
+    // Slice up to the last `::` OUTSIDE angle brackets.
     let mut depth = 0usize;
     let bytes = full.as_bytes();
     let mut cut = 0usize;

@@ -1,38 +1,38 @@
-//! Система событий с per-reader курсорами и автоматической очисткой.
+//! Event system with per-reader cursors and automatic cleanup.
 //!
-//! # Концепция
+//! # Concept
 //!
-//! - [`Events<T>`] — основной тип. Содержит два буфера:
-//!   `pending` (куда пишут в текущем тике) и `events` (доступно для чтения).
-//! - [`EventCursor`] — лёгкий дескриптор читателя. Каждый читатель
-//!   регистрирует свой курсор и двигает его по мере чтения.
-//! - После вызова [`update()`](Events::update) буферы меняются местами:
-//!   `pending` → `events`, а старые события из `events`
-//!   удаляются (если все читатели их прочитали).
-//! - `update()` вызывается Scheduler'ом после каждого Stage
-//!   или вручную через [`World::flush_all_events`].
-//! - [`EntityEvent<T>`] — событие, адресованное конкретной сущности.
-//! - [`DelayedQueue<T>`] — отложенная доставка событий через N тиков.
-//!   Реализована через `BinaryHeap` для O(log N) вставки и O(K log N) flush.
+//! - [`Events<T>`] — the core type. Holds two buffers:
+//!   `pending` (written to in the current tick) and `events` (available for reading).
+//! - [`EventCursor`] — a lightweight reader handle. Each reader
+//!   registers its own cursor and advances it as it reads.
+//! - After calling [`update()`](Events::update) the buffers are swapped:
+//!   `pending` → `events`, and the old events from `events`
+//!   are dropped (if every reader has read them).
+//! - `update()` is called by the Scheduler after each Stage
+//!   or manually via [`World::flush_all_events`].
+//! - [`EntityEvent<T>`] — an event addressed to a specific entity.
+//! - [`DelayedQueue<T>`] — deferred delivery of events after N ticks.
+//!   Implemented via `BinaryHeap` for O(log N) insertion and O(K log N) flush.
 //!
-//! # Семантика `EventReadGuard`
+//! # `EventReadGuard` semantics
 //!
-//! `EventReadGuard` — RAII-обёртка. При **дропе** автоматически продвигает
-//! курсор читателя до конца буфера, независимо от того, сколько событий
-//! было реально прочитано через `iter()` или `as_slice()`.
+//! `EventReadGuard` is an RAII wrapper. On **drop** it automatically advances
+//! the reader cursor to the end of the buffer, regardless of how many events
+//! were actually read via `iter()` or `as_slice()`.
 //!
-//! Это означает: если вы вызвали `guard.iter()` и прочитали только часть
-//! событий, остальные будут пропущены при следующем чтении. Чтобы прочитать
-//! только часть событий и сохранить курсор, используйте [`Events::read_partial`].
+//! This means: if you called `guard.iter()` and read only part of the
+//! events, the rest are skipped on the next read. To read only part of the
+//! events and preserve the cursor, use [`Events::read_partial`].
 //!
-//! Для "посмотреть без продвижения" используйте [`EventReadGuard::peek`].
+//! For "peek without advancing" use [`EventReadGuard::peek`].
 //!
 //! # Thread-safety
 //!
-//! `Events<T>` не является `Sync`. Для отправки событий из параллельных
-//! систем используйте [`Events::send_sync`], который защищён внутренним
-//! `Mutex<Vec<T>>`. Содержимое `sync_pending` сливается в `pending`
-//! при вызове [`Events::update`] или [`Events::flush_sync`].
+//! `Events<T>` is not `Sync`. To send events from parallel
+//! systems use [`Events::send_sync`], which is guarded by an internal
+//! `Mutex<Vec<T>>`. The contents of `sync_pending` are merged into `pending`
+//! on a call to [`Events::update`] or [`Events::flush_sync`].
 
 use rustc_hash::FxHashMap;
 use std::any::{Any, TypeId};
@@ -45,42 +45,42 @@ use crate::entity::Entity;
 
 // ── Events ──────────────────────────────────────────────────────
 
-/// Очередь событий с per-reader отслеживанием прогресса чтения.
+/// Event queue with per-reader tracking of read progress.
 ///
-/// # Как это работает
+/// # How it works
 ///
-/// 1. Системы-отправители пишут события в `pending` (через `send()`).
-/// 2. В конце тика `update()` меняет местами `pending` и `events`.
-/// 3. Системы-читатели вызывают `reader.iter(queue)` — получают только
-///    непрочитанные события из буфера `events`.
-/// 4. После прочтения курсор читателя устанавливается на `events.len()`.
-/// 5. Garbage collection: если все активные читатели прочитали все события,
-///    буфер `events` очищается.
+/// 1. Sender systems write events into `pending` (via `send()`).
+/// 2. At the end of the tick `update()` swaps `pending` and `events`.
+/// 3. Reader systems call `reader.iter(queue)` — receiving only the
+///    unread events from the `events` buffer.
+/// 4. After reading, the reader cursor is set to `events.len()`.
+/// 5. Garbage collection: if every active reader has read all events,
+///    the `events` buffer is cleared.
 ///
-/// # Thread-safety и `send_sync`
+/// # Thread-safety and `send_sync`
 ///
-/// Базовые методы `send()` / `send_batch()` требуют `&mut self` и не `Sync`.
-/// Для параллельных систем — `send_sync(&self, event)` пишет в `sync_pending`
-/// (внутренний `Mutex<Vec<T>>`). Содержимое сливается в `pending` при
-/// [`update()`] или явном [`flush_sync()`].
+/// The base methods `send()` / `send_batch()` require `&mut self` and are not `Sync`.
+/// For parallel systems — `send_sync(&self, event)` writes into `sync_pending`
+/// (an internal `Mutex<Vec<T>>`). The contents are merged into `pending` on
+/// [`update()`] or an explicit [`flush_sync()`].
 pub struct Events<T> {
-    /// Буфер, доступный для чтения (предыдущий тик).
+    /// Buffer available for reading (previous tick).
     events: Vec<T>,
-    /// Буфер, куда пишутся новые события (текущий тик).
+    /// Buffer new events are written into (current tick).
     pending: Vec<T>,
-    /// Thread-safe буфер для параллельных систем (4.4).
-    /// Ленивая инициализация через `OnceLock` — нулевой overhead
-    /// для однопоточных пользователей.
+    /// Thread-safe buffer for parallel systems (4.4).
+    /// Lazily initialized via `OnceLock` — zero overhead
+    /// for single-threaded users.
     sync_pending: OnceLock<Mutex<Vec<T>>>,
-    /// Состояние читателей: `None` = читатель удалён, `Some(pos)` = текущая позиция.
+    /// Reader state: `None` = reader removed, `Some(pos)` = current position.
     cursors: Vec<Option<u32>>,
-    /// Счётчик для генерации ID новых читателей.
+    /// Counter for generating IDs of new readers.
     next_cursor_id: u32,
-    /// Список освобождённых EventCursor ID для O(1) переиспользования.
+    /// List of freed EventCursor IDs for O(1) reuse.
     free_list: Vec<EventCursor>,
-    /// Число активных читателей, у которых позиция курсора < events.len().
-    /// Инвариант: lagging_count == cursors.iter().flatten().filter(|&&p| p < events.len()).count()
-    /// Используется для O(1) проверки в `all_readers_caught_up()`.
+    /// Number of active readers whose cursor position < events.len().
+    /// Invariant: lagging_count == cursors.iter().flatten().filter(|&&p| p < events.len()).count()
+    /// Used for the O(1) check in `all_readers_caught_up()`.
     lagging_count: u32,
 }
 
@@ -97,33 +97,33 @@ impl<T> Events<T> {
         }
     }
 
-    /// Отправить событие в текущий тик.
+    /// Send an event into the current tick.
     #[inline]
     pub fn send(&mut self, event: T) {
         self.pending.push(event);
     }
 
-    /// Отправить пачку событий.
+    /// Send a batch of events.
     pub fn send_batch(&mut self, events: impl IntoIterator<Item = T>) {
         self.pending.extend(events);
     }
 
-    /// Отправить событие из параллельного контекста (thread-safe).
+    /// Send an event from a parallel context (thread-safe).
     ///
-    /// Пишет в внутренний `Mutex<Vec<T>>`. Содержимое сливается в основной
-    /// `pending`-буфер при следующем вызове [`update()`] или [`flush_sync()`].
+    /// Writes into the internal `Mutex<Vec<T>>`. The contents are merged into the
+    /// main `pending` buffer on the next call to [`update()`] or [`flush_sync()`].
     ///
-    /// # Пример
+    /// # Example
     ///
     /// ```ignore
-    /// // В параллельной системе:
+    /// // In a parallel system:
     /// events.send_sync(DamageEvent { amount: 10 });
     /// ```
     ///
-    /// # Примечание по производительности
+    /// # Performance note
     ///
-    /// Каждый вызов берёт `Mutex::lock`. При массовой отправке предпочтите
-    /// собирать события в локальный `Vec`, а затем вызывать `send_batch_sync`.
+    /// Each call takes `Mutex::lock`. For bulk sending, prefer to
+    /// collect events into a local `Vec` and then call `send_batch_sync`.
     ///
     /// Advanced escape hatch: golden path is the declared `EventWriter<T>`
     /// system parameter (the scheduler serializes writers), not `&Events<T>`.
@@ -133,19 +133,19 @@ impl<T> Events<T> {
         sync.lock().unwrap().push(event);
     }
 
-    /// Отправить пачку событий из параллельного контекста (thread-safe).
+    /// Send a batch of events from a parallel context (thread-safe).
     ///
-    /// Берёт lock один раз для всего пакета — эффективнее многократных `send_sync`.
+    /// Takes the lock once for the whole batch — more efficient than repeated `send_sync`.
     #[doc(hidden)] // advanced escape hatch — see `send_sync`
     pub fn send_batch_sync(&self, events: impl IntoIterator<Item = T>) {
         let sync = self.get_or_init_sync();
         sync.lock().unwrap().extend(events);
     }
 
-    /// Слить `sync_pending` в основной `pending`.
+    /// Merge `sync_pending` into the main `pending`.
     ///
-    /// Вызывается автоматически из [`update()`]. Можно вызвать вручную
-    /// если нужно сделать события доступными до следующего тика.
+    /// Called automatically from [`update()`]. Can be called manually
+    /// if you need to make events available before the next tick.
     #[doc(hidden)] // advanced — pairs with `send_sync`; no-op without it
     pub fn flush_sync(&mut self) {
         if let Some(sync) = self.sync_pending.get() {
@@ -156,16 +156,16 @@ impl<T> Events<T> {
         }
     }
 
-    /// Ленивая инициализация `sync_pending` — нулевой overhead для
-    /// однопоточных пользователей, которые никогда не вызывают `send_sync`.
+    /// Lazily initialize `sync_pending` — zero overhead for
+    /// single-threaded users who never call `send_sync`.
     fn get_or_init_sync(&self) -> &Mutex<Vec<T>> {
         self.sync_pending.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    /// Зарегистрировать нового читателя.
+    /// Register a new reader.
     ///
-    /// Возвращает [`EventCursor`], который нужно хранить и передавать
-    /// при каждом вызове [`iter()`](Events::iter).
+    /// Returns an [`EventCursor`] that must be stored and passed
+    /// on every call to [`iter()`](Events::iter).
     pub fn add_reader(&mut self) -> EventCursor {
         if let Some(cursor) = self.free_list.pop() {
             let idx = cursor.0 as usize;
@@ -189,10 +189,10 @@ impl<T> Events<T> {
         EventCursor(id)
     }
 
-    /// Удалить читателя.
+    /// Remove a reader.
     ///
-    /// После удаления курсор перестаёт учитываться при GC,
-    /// что может позволить очистить буфер `events`.
+    /// After removal the cursor stops being counted during GC,
+    /// which may allow the `events` buffer to be cleared.
     pub fn remove_reader(&mut self, reader_id: EventCursor) {
         let idx = reader_id.0 as usize;
         if idx < self.cursors.len() {
@@ -218,34 +218,34 @@ impl<T> Events<T> {
         self.assert_lagging_invariant();
     }
 
-    /// Количество активных читателей.
+    /// Number of active readers.
     pub fn reader_count(&self) -> usize {
         self.cursors.iter().filter(|c| c.is_some()).count()
     }
 
-    /// Предварительно выделить capacity для pending-буфера.
+    /// Pre-allocate capacity for the pending buffer.
     ///
-    /// Позволяет избежать многократных реаллокаций при массовой отправке событий.
-    /// Вызывать из системы перед `event_writer::send()` в цикле.
+    /// Lets you avoid repeated reallocations during bulk event sending.
+    /// Call from a system before `event_writer::send()` in a loop.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.pending.reserve(additional);
     }
 
-    /// Обновить буферы: переместить `pending` в `events`.
+    /// Update the buffers: move `pending` into `events`.
     ///
-    /// Вызывается Scheduler'ом после каждого Stage или вручную через [`World::flush_all_events`].
-    /// Если все читатели прочитали предыдущие события, буфер `events`
-    /// очищается перед загрузкой нового. Если не все читатели догнали —
-    /// старые события дописываются в конец нового буфера, чтобы
-    /// отстающие читатели могли их догнать.
+    /// Called by the Scheduler after each Stage or manually via [`World::flush_all_events`].
+    /// If every reader has read the previous events, the `events` buffer
+    /// is cleared before loading the new one. If not all readers caught up —
+    /// the old events are appended to the end of the new buffer so that
+    /// lagging readers can catch up on them.
     ///
-    /// Также сливает `sync_pending` (из `send_sync`) в `pending`.
+    /// Also merges `sync_pending` (from `send_sync`) into `pending`.
     pub fn update(&mut self) {
-        // Сливаем sync_pending в pending перед swap
+        // Merge sync_pending into pending before the swap
         self.flush_sync();
 
-        // Ранний выход: если оба буфера пусты — нечего свопать
+        // Early out: if both buffers are empty — nothing to swap
         if self.events.is_empty() && self.pending.is_empty() {
             self.assert_lagging_invariant();
             return;
@@ -279,7 +279,7 @@ impl<T> Events<T> {
             self.pending.reserve(pending_cap.min(256));
         }
 
-        // Пересчитываем lagging_count для нового состояния событий
+        // Recompute lagging_count for the new event state
         let new_event_len = self.events.len() as u32;
         self.lagging_count = self
             .cursors
@@ -291,10 +291,10 @@ impl<T> Events<T> {
         self.assert_lagging_invariant();
     }
 
-    /// Итерация по непрочитанным событиям из буфера `events`.
+    /// Iterate over the unread events in the `events` buffer.
     ///
-    /// Возвращает срез — не продвигает курсор. Для продвижения вызовите
-    /// [`advance_reader_mut`] или используйте [`read`] (с авто-advance при дропе).
+    /// Returns a slice — does not advance the cursor. To advance, call
+    /// [`advance_reader_mut`] or use [`read`] (auto-advance on drop).
     #[inline]
     pub fn iter(&self, reader_id: &EventCursor) -> &[T] {
         let idx = reader_id.0 as usize;
@@ -305,7 +305,7 @@ impl<T> Events<T> {
         }
     }
 
-    /// Мутабельная версия продвижения курсора до конца буфера.
+    /// Mutable version that advances the cursor to the end of the buffer.
     ///
     /// ⚠ INVARIANT (F5): this must mutate ONLY cursor state (`cursors`,
     /// `lagging_count`) and never the `events` buffer. `EventIterator::Drop`
@@ -326,10 +326,10 @@ impl<T> Events<T> {
         }
     }
 
-    /// Продвинуть курсор на заданное число событий.
+    /// Advance the cursor by a given number of events.
     ///
-    /// Используется внутри [`EventReadGuard`] при `read_partial()`.
-    /// Курсор не выйдет за пределы буфера.
+    /// Used inside [`EventReadGuard`] during `read_partial()`.
+    /// The cursor will not go past the end of the buffer.
     #[inline]
     pub fn advance_reader_by(&mut self, reader_id: &EventCursor, count: usize) {
         let idx = reader_id.0 as usize;
@@ -346,21 +346,21 @@ impl<T> Events<T> {
         }
     }
 
-    /// Прочитать непрочитанные события с автоматическим продвижением курсора
-    /// **до конца буфера** при дропе guard.
+    /// Read the unread events with automatic cursor advance
+    /// **to the end of the buffer** when the guard is dropped.
     ///
-    /// # Семантика
+    /// # Semantics
     ///
-    /// При дропе [`EventReadGuard`] курсор **всегда** прыгает в конец буфера,
-    /// независимо от того, сколько событий реально было прочитано через
-    /// `iter()` / `as_slice()`. Это означает: частичное чтение приводит
-    /// к пропуску оставшихся событий.
+    /// On dropping [`EventReadGuard`] the cursor **always** jumps to the end of
+    /// the buffer, regardless of how many events were actually read via
+    /// `iter()` / `as_slice()`. This means: a partial read leads to
+    /// skipping the remaining events.
     ///
-    /// Если вы хотите прочитать ровно N событий и оставить остальные —
-    /// используйте [`read_partial`](Events::read_partial).
+    /// If you want to read exactly N events and leave the rest —
+    /// use [`read_partial`](Events::read_partial).
     ///
-    /// Если вы хотите посмотреть события без продвижения курсора —
-    /// используйте [`EventReadGuard::peek`].
+    /// If you want to peek at events without advancing the cursor —
+    /// use [`EventReadGuard::peek`].
     #[inline]
     pub fn read(&mut self, reader_id: &EventCursor) -> EventReadGuard<'_, T> {
         let idx = reader_id.0 as usize;
@@ -378,23 +378,23 @@ impl<T> Events<T> {
         }
     }
 
-    /// Прочитать не более `max_count` событий с продвижением курсора
-    /// ровно на количество реально возвращённых событий.
+    /// Read at most `max_count` events, advancing the cursor
+    /// by exactly the number of events actually returned.
     ///
-    /// # Отличие от `read()`
+    /// # Difference from `read()`
     ///
-    /// `read()` при дропе продвигает курсор до конца буфера.
-    /// `read_partial(n)` при дропе продвигает курсор ровно на `n` событий
-    /// (или меньше, если в буфере меньше непрочитанных).
+    /// `read()` advances the cursor to the end of the buffer on drop.
+    /// `read_partial(n)` advances the cursor by exactly `n` events on drop
+    /// (or fewer, if there are fewer unread events in the buffer).
     ///
-    /// Используйте когда нужно обработать события пакетами:
+    /// Use it when you need to process events in batches:
     ///
     /// ```ignore
-    /// // Обрабатываем по 32 события за тик, не теряя остальные
+    /// // Process 32 events per tick, without losing the rest
     /// while let guard = events.read_partial(&cursor, 32) {
     ///     if guard.is_empty() { break; }
     ///     for ev in guard.iter() { process(ev); }
-    ///     // При дропе — курсор продвинется ровно на guard.len()
+    ///     // On drop — the cursor advances by exactly guard.len()
     /// }
     /// ```
     #[inline]
@@ -421,19 +421,19 @@ impl<T> Events<T> {
         }
     }
 
-    /// Количество событий в обоих буферах.
+    /// Number of events across both buffers.
     #[inline]
     pub fn len(&self) -> usize {
         self.events.len() + self.pending.len()
     }
 
-    /// Количество событий в буфере чтения (доступных для текущего тика).
+    /// Number of events in the read buffer (available for the current tick).
     #[inline]
     pub fn len_readable(&self) -> usize {
         self.events.len()
     }
 
-    /// Количество событий в буфере записи.
+    /// Number of events in the write buffer.
     #[inline]
     pub fn len_pending(&self) -> usize {
         self.pending.len()
@@ -444,7 +444,7 @@ impl<T> Events<T> {
         self.events.is_empty() && self.pending.is_empty()
     }
 
-    /// Очистить оба буфера и сбросить все курсоры.
+    /// Clear both buffers and reset all cursors.
     pub fn clear(&mut self) {
         self.events.clear();
         self.pending.clear();
@@ -458,7 +458,7 @@ impl<T> Events<T> {
         self.lagging_count = 0;
     }
 
-    /// Debug-assertion: проверяет инвариант lagging_count.
+    /// Debug assertion: checks the lagging_count invariant.
     #[cfg(debug_assertions)]
     fn assert_lagging_invariant(&self) {
         let event_len = self.events.len() as u32;
@@ -491,18 +491,18 @@ impl<T> Default for Events<T> {
 
 // ── EventReadGuard ──────────────────────────────────────────────
 
-/// RAII-обёртка: при дропе автоматически продвигает курсор **до конца** буфера.
+/// RAII wrapper: on drop it automatically advances the cursor **to the end** of the buffer.
 ///
-/// Создаётся через [`Events::read`].
+/// Created via [`Events::read`].
 ///
-/// # Семантика дропа
+/// # Drop semantics
 ///
-/// При дропе курсор читателя устанавливается в конец буфера `events`,
-/// независимо от того, сколько событий было реально прочитано через
-/// `iter()` / `as_slice()`. Если это нежелательно:
+/// On drop the reader cursor is set to the end of the `events` buffer,
+/// regardless of how many events were actually read via
+/// `iter()` / `as_slice()`. If that is undesirable:
 ///
-/// - Используйте [`EventReadGuard::peek`] чтобы посмотреть без продвижения.
-/// - Используйте [`Events::read_partial`] чтобы продвинуть ровно на N.
+/// - Use [`EventReadGuard::peek`] to peek without advancing.
+/// - Use [`Events::read_partial`] to advance by exactly N.
 #[must_use = "EventReadGuard advances cursor to end on drop; \
               bind to variable to read events, \
               or use Events::read_partial() to advance by count"]
@@ -513,28 +513,28 @@ pub struct EventReadGuard<'q, T> {
 }
 
 impl<'q, T> EventReadGuard<'q, T> {
-    /// Срез непрочитанных событий.
+    /// Slice of the unread events.
     #[inline]
     pub fn as_slice(&self) -> &[T] {
         &self.queue.events[self.start..]
     }
 
-    /// Итерация без потребления guard.
+    /// Iterate without consuming the guard.
     #[inline]
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.as_slice().iter()
     }
 
-    /// Отказаться от автоматического продвижения курсора.
-    /// Курсор останется на текущей позиции после дропа guard.
+    /// Opt out of the automatic cursor advance.
+    /// The cursor stays at its current position after the guard is dropped.
     pub fn peek(self) -> PeekGuard<'q, T> {
         let start = self.start;
         let queue_ptr: *const Events<T> = &*self.queue;
-        // Предотвращаем вызов EventReadGuard::drop (который продвинул бы курсор)
+        // Prevent EventReadGuard::drop from running (which would advance the cursor)
         std::mem::forget(self);
         PeekGuard {
-            // SAFETY: queue_ptr получен из &'q mut Events<T>, валиден для 'q.
-            // self забыт (drop не вызван), но Events<T> живёт дольше.
+            // SAFETY: queue_ptr is derived from &'q mut Events<T>, valid for 'q.
+            // self is forgotten (drop not run), but Events<T> outlives it.
             queue: unsafe { &*queue_ptr },
             start,
         }
@@ -551,17 +551,18 @@ impl<T> std::ops::Deref for EventReadGuard<'_, T> {
 
 impl<T> Drop for EventReadGuard<'_, T> {
     fn drop(&mut self) {
-        // Продвигаем курсор до конца буфера.
-        // Семантика: дроп guard = "я прочитал всё до конца буфера".
-        // Для частичного чтения используйте Events::read_partial().
+        // Advance the cursor to the end of the buffer.
+        // Semantics: dropping the guard = "I read everything to the end of the buffer".
+        // For partial reads use Events::read_partial().
         self.queue.advance_reader_mut(&self.reader_id);
     }
 }
 
-/// `for e in reader.read() { ... }` — главная событийная идиома Bevy (TD-24
-/// движка). Guard конвертируется во владеющий [`EventIterator`]; advance
-/// курсора до конца буфера происходит при дропе итератора (т.е. и при `break`
-/// — частичная итерация пропускает остаток, как и у самого guard'а).
+/// `for e in reader.read() { ... }` — the main event idiom of Bevy (engine
+/// TD-24). The guard converts into an owning [`EventIterator`]; the cursor
+/// advance to the end of the buffer happens when the iterator is dropped (i.e.
+/// also on `break` — partial iteration skips the remainder, just like the guard
+/// itself).
 impl<'q, T> IntoIterator for EventReadGuard<'q, T> {
     type Item = &'q T;
     type IntoIter = EventIterator<'q, T>;
@@ -570,14 +571,15 @@ impl<'q, T> IntoIterator for EventReadGuard<'q, T> {
         let reader_id = self.reader_id;
         let start = self.start;
         let queue: *mut Events<T> = &mut *self.queue;
-        // Предотвращаем вызов EventReadGuard::drop — advance переезжает
-        // в Drop итератора.
+        // Prevent EventReadGuard::drop from running — the advance moves
+        // into the iterator's Drop.
         std::mem::forget(self);
-        // SAFETY: queue получен из &'q mut Events<T> guard'а (guard забыт,
-        // его Drop не вызовется — мы единственный владелец заёма). Буфер
-        // `events` не мутируется, пока жив итератор: Drop итератора лишь
-        // продвигает курсор (поля cursors/lagging_count), сам буфер не
-        // трогает — тот же приём, что в `EventReadGuard::peek`.
+        // SAFETY: queue is derived from the guard's &'q mut Events<T> (the guard
+        // is forgotten, its Drop will not run — we are the sole owner of the
+        // borrow). The `events` buffer is not mutated while the iterator is
+        // live: the iterator's Drop only advances the cursor (the
+        // cursors/lagging_count fields), never touching the buffer itself — the
+        // same technique as in `EventReadGuard::peek`.
         let items = unsafe {
             let events: &[T] = &(*queue).events;
             events[start.min(events.len())..].iter()
@@ -591,7 +593,7 @@ impl<'q, T> IntoIterator for EventReadGuard<'q, T> {
     }
 }
 
-/// Итерация по ссылке — без потребления guard'а (`for e in &guard`).
+/// Iterate by reference — without consuming the guard (`for e in &guard`).
 impl<'a, T> IntoIterator for &'a EventReadGuard<'_, T> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
@@ -604,12 +606,13 @@ impl<'a, T> IntoIterator for &'a EventReadGuard<'_, T> {
 
 // ── EventIterator ───────────────────────────────────────────────
 
-/// Владеющий итератор по непрочитанным событиям (Bevy `EventIterator`-стиль):
-/// отдаёт `&T` с лайфтаймом исходного заёма `Events`, при дропе продвигает
-/// курсор читателя **до конца буфера** (семантика [`EventReadGuard`]
-/// сохранена: `break` посреди цикла пропускает оставшиеся события).
+/// Owning iterator over the unread events (Bevy `EventIterator` style):
+/// yields `&T` with the lifetime of the original `Events` borrow; on drop it
+/// advances the reader cursor **to the end of the buffer** (the
+/// [`EventReadGuard`] semantics are preserved: `break` mid-loop skips the
+/// remaining events).
 ///
-/// Создаётся через `IntoIterator` у [`EventReadGuard`]:
+/// Created via `IntoIterator` on [`EventReadGuard`]:
 /// `for e in reader.read() { ... }`.
 pub struct EventIterator<'q, T> {
     items: std::slice::Iter<'q, T>,
@@ -663,17 +666,17 @@ impl<T> Drop for EventIterator<'_, T> {
 
 // ── PartialReadGuard ────────────────────────────────────────────
 
-/// RAII-обёртка: при дропе продвигает курсор ровно на `count` событий.
+/// RAII wrapper: on drop it advances the cursor by exactly `count` events.
 ///
-/// Создаётся через [`Events::read_partial`].
+/// Created via [`Events::read_partial`].
 ///
-/// Позволяет читать события пакетами, не теряя непрочитанные:
+/// Lets you read events in batches without losing the unread ones:
 ///
 /// ```ignore
-/// // Обрабатываем не более 64 событий за тик
+/// // Process at most 64 events per tick
 /// let guard = events.read_partial(&cursor, 64);
 /// for ev in guard.iter() { process(ev); }
-/// // При дропе курсор продвинется только на guard.len() (≤64)
+/// // On drop the cursor advances only by guard.len() (≤64)
 /// ```
 #[must_use = "PartialReadGuard advances cursor by count on drop; bind to variable to read events"]
 pub struct PartialReadGuard<'q, T> {
@@ -684,25 +687,25 @@ pub struct PartialReadGuard<'q, T> {
 }
 
 impl<'q, T> PartialReadGuard<'q, T> {
-    /// Срез событий (не более `max_count`, переданного в `read_partial`).
+    /// Slice of events (at most `max_count`, as passed to `read_partial`).
     #[inline]
     pub fn as_slice(&self) -> &[T] {
         &self.queue.events[self.start..self.start + self.count]
     }
 
-    /// Итерация без потребления guard.
+    /// Iterate without consuming the guard.
     #[inline]
     pub fn iter(&self) -> std::slice::Iter<'_, T> {
         self.as_slice().iter()
     }
 
-    /// Количество событий в этом guard.
+    /// Number of events in this guard.
     #[inline]
     pub fn len(&self) -> usize {
         self.count
     }
 
-    /// Нет ли событий.
+    /// Whether there are no events.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
@@ -719,18 +722,18 @@ impl<T> std::ops::Deref for PartialReadGuard<'_, T> {
 
 impl<T> Drop for PartialReadGuard<'_, T> {
     fn drop(&mut self) {
-        // Продвигаем курсор ровно на count — только прочитанные события.
+        // Advance the cursor by exactly count — only the read events.
         self.queue.advance_reader_by(&self.reader_id, self.count);
     }
 }
 
 // ── PeekGuard ──────────────────────────────────────────────────
 
-/// Обёртка для "посмотреть без продвижения".
+/// Wrapper for "peek without advancing".
 ///
-/// Создаётся через [`EventReadGuard::peek`].
-/// При дропе курсор НЕ продвигается — в отличие от [`EventReadGuard`],
-/// который при дропе всегда ставит курсор в конец буфера.
+/// Created via [`EventReadGuard::peek`].
+/// On drop the cursor is NOT advanced — unlike [`EventReadGuard`],
+/// which on drop always sets the cursor to the end of the buffer.
 #[must_use = "PeekGuard prevents cursor advance; bind to variable to prevent accidental advance"]
 pub struct PeekGuard<'q, T> {
     queue: &'q Events<T>,
@@ -759,21 +762,21 @@ impl<T> std::ops::Deref for PeekGuard<'_, T> {
 
 // ── EventCursor ─────────────────────────────────────────────────
 
-/// Легковесный дескриптор читателя событий.
+/// Lightweight event-reader handle.
 ///
-/// Создаётся через [`Events::add_reader`].
-/// Хранится в [`EventReader`](crate::system_param::EventReader).
+/// Created via [`Events::add_reader`].
+/// Stored in [`EventReader`](crate::system_param::EventReader).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EventCursor(pub u32);
 
 // ── EntityEvent ─────────────────────────────────────────────────
 
-/// Событие, адресованное конкретной сущности.
+/// An event addressed to a specific entity.
 ///
-/// Позволяет отправить событие и прочитать его только тем системам,
-/// которые запрашивают события для конкретной entity.
+/// Lets you send an event and have it read only by the systems
+/// that request events for a specific entity.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// writer.send(EntityEvent::new(entity, Damage { amount: 10 }));
@@ -784,9 +787,9 @@ pub struct EventCursor(pub u32);
 /// ```
 #[derive(Debug, Clone)]
 pub struct EntityEvent<T> {
-    /// Целевая сущность.
+    /// Target entity.
     pub target: Entity,
-    /// Данные события.
+    /// Event data.
     pub data: T,
 }
 
@@ -798,52 +801,52 @@ impl<T> EntityEvent<T> {
 
 // ── DelayedQueue ────────────────────────────────────────────────
 
-/// Очередь отложенных событий с O(log N) вставкой.
+/// Deferred-event queue with O(log N) insertion.
 ///
-/// # Алгоритм
+/// # Algorithm
 ///
-/// Внутри — `BinaryHeap<(Reverse<deliver_at>, sequence, T)>`:
-/// - `Reverse<deliver_at>` — min-heap по тику доставки.
-/// - `sequence` — монотонный счётчик для стабильного порядка событий
-///   с одинаковым `deliver_at` (FIFO внутри одного тика).
+/// Internally — `BinaryHeap<(Reverse<deliver_at>, sequence, T)>`:
+/// - `Reverse<deliver_at>` — a min-heap by delivery tick.
+/// - `sequence` — a monotonic counter for stable ordering of events
+///   with the same `deliver_at` (FIFO within a single tick).
 ///
-/// # Сложность
+/// # Complexity
 ///
-/// | Операция | Старая реализация | Новая реализация |
+/// | Operation | Old implementation | New implementation |
 /// |----------|-------------------|------------------|
 /// | `send_delayed` | O(1) (push) | O(log N) (heap push) |
-/// | `flush_delayed` | O(N) (full scan) | O(K log N), K = кол-во готовых |
-/// | Память | Vec | BinaryHeap (Vec внутри) |
+/// | `flush_delayed` | O(N) (full scan) | O(K log N), K = number ready |
+/// | Memory | Vec | BinaryHeap (Vec inside) |
 ///
-/// При типичном использовании (редкие отложенные события, N < 1000)
-/// разница незначительна. При тысячах отложенных событий — flush_delayed
-/// ускоряется примерно в N/K раз.
+/// For typical usage (rare deferred events, N < 1000)
+/// the difference is negligible. With thousands of deferred events, flush_delayed
+/// speeds up by roughly N/K times.
 ///
-/// # Как это работает
+/// # How it works
 ///
-/// 1. `send_delayed(event, delay_ticks)` — событие сохраняется с меткой
+/// 1. `send_delayed(event, delay_ticks)` — the event is stored with the label
 ///    `deliver_at = current_tick + delay_ticks`.
-/// 2. Каждый вызов `flush_delayed(current_tick)` извлекает все события,
-///    у которых `deliver_at <= current_tick`, в `pending`-буфер основной очереди.
-/// 3. Вызывается автоматически из `World::tick()` перед `update()`.
+/// 2. Each call to `flush_delayed(current_tick)` moves all events
+///    with `deliver_at <= current_tick` into the `pending` buffer of the main queue.
+/// 3. Called automatically from `World::tick()` before `update()`.
 pub struct DelayedQueue<T> {
-    /// Min-heap по (deliver_at, sequence) — готовые события на вершине.
+    /// Min-heap by (deliver_at, sequence) — ready events at the top.
     heap: BinaryHeap<DelayedEvent<T>>,
-    /// Монотонный счётчик для стабильного порядка событий с одинаковым deliver_at.
+    /// Monotonic counter for stable ordering of events with the same deliver_at.
     sequence: u64,
 }
 
-/// Внутренняя запись отложенного события с поддержкой BinaryHeap.
+/// Internal deferred-event record with BinaryHeap support.
 struct DelayedEvent<T> {
-    /// Тик доставки (обёрнут в Reverse для min-heap).
+    /// Delivery tick (wrapped in Reverse for the min-heap).
     deliver_at: Reverse<u32>,
-    /// Порядковый номер для стабильного FIFO-порядка событий с одинаковым deliver_at.
+    /// Sequence number for stable FIFO ordering of events with the same deliver_at.
     sequence: Reverse<u64>,
     event: T,
 }
 
-// Ручная реализация PartialOrd/Ord для сравнения только по (deliver_at, sequence).
-// T не обязан реализовывать Ord.
+// Manual PartialOrd/Ord implementation, comparing only by (deliver_at, sequence).
+// T is not required to implement Ord.
 impl<T> PartialEq for DelayedEvent<T> {
     fn eq(&self, other: &Self) -> bool {
         self.deliver_at == other.deliver_at && self.sequence == other.sequence
@@ -859,8 +862,8 @@ impl<T> PartialOrd for DelayedEvent<T> {
 
 impl<T> Ord for DelayedEvent<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap — max-heap. Reverse<u32> даёт min по deliver_at.
-        // При равном deliver_at — Reverse<u64> даёт FIFO (меньший sequence = старее = выше).
+        // BinaryHeap is a max-heap. Reverse<u32> gives min by deliver_at.
+        // On equal deliver_at, Reverse<u64> gives FIFO (smaller sequence = older = higher).
         self.deliver_at
             .cmp(&other.deliver_at)
             .then(self.sequence.cmp(&other.sequence))
@@ -875,12 +878,12 @@ impl<T> DelayedQueue<T> {
         }
     }
 
-    /// Отправить событие с задержкой в тиках.
+    /// Send an event with a delay in ticks.
     ///
-    /// `delay` — количество тиков, через которые событие станет доступно.
-    /// `current_tick` — текущий тик мира (для расчёта `deliver_at`).
+    /// `delay` — the number of ticks after which the event becomes available.
+    /// `current_tick` — the world's current tick (used to compute `deliver_at`).
     ///
-    /// Сложность: O(log N).
+    /// Complexity: O(log N).
     pub fn send_delayed(&mut self, event: T, delay: u32, current_tick: u32) {
         let deliver_at = current_tick.wrapping_add(delay);
         let seq = self.sequence;
@@ -892,29 +895,29 @@ impl<T> DelayedQueue<T> {
         });
     }
 
-    /// Переместить все события, готовые к доставке, в `target_queue`.
+    /// Move all events ready for delivery into `target_queue`.
     ///
-    /// Извлекает события с `deliver_at <= current_tick` из min-heap.
-    /// Останавливается как только вершина heap не готова — O(K log N),
-    /// где K — количество готовых событий.
+    /// Extracts events with `deliver_at <= current_tick` from the min-heap.
+    /// Stops as soon as the heap top is not ready — O(K log N),
+    /// where K is the number of ready events.
     ///
-    /// События с одинаковым `deliver_at` доставляются в порядке вставки (FIFO).
+    /// Events with the same `deliver_at` are delivered in insertion order (FIFO).
     pub fn flush_delayed(&mut self, current_tick: u32, target_queue: &mut Events<T>) {
-        // BinaryHeap — max-heap с Reverse<u32>, поэтому вершина — min deliver_at.
-        // Извлекаем пока вершина "готова" (deliver_at <= current_tick).
+        // BinaryHeap is a max-heap with Reverse<u32>, so the top is the min deliver_at.
+        // Extract while the top is "ready" (deliver_at <= current_tick).
         while let Some(top) = self.heap.peek() {
             if top.deliver_at.0 <= current_tick {
-                // SAFETY: мы только что проверили peak, pop всегда Some
+                // SAFETY: we just checked peek, so pop is always Some
                 let ev = self.heap.pop().unwrap();
                 target_queue.send(ev.event);
             } else {
-                // Вершина ещё не готова — остальные тем более
+                // The top is not ready yet — the rest even less so
                 break;
             }
         }
     }
 
-    /// Количество отложенных событий (ещё не доставленных).
+    /// Number of deferred events (not yet delivered).
     #[inline]
     pub fn len(&self) -> usize {
         self.heap.len()
@@ -930,7 +933,7 @@ impl<T> DelayedQueue<T> {
         self.sequence = 0;
     }
 
-    /// Зарезервировать capacity для будущих событий.
+    /// Reserve capacity for future events.
     pub fn reserve(&mut self, additional: usize) {
         self.heap.reserve(additional);
     }
@@ -944,7 +947,7 @@ impl<T> Default for DelayedQueue<T> {
 
 // ── AnyEventQueue (trait object) ─────────────────────────────────
 
-/// Trait-object для хранения очередей разных типов в EventRegistry.
+/// Trait object for storing queues of different types in the EventRegistry.
 pub trait AnyEventQueue: Any + Send + Sync {
     fn update(&mut self);
     fn as_any(&self) -> &dyn Any;
@@ -953,13 +956,13 @@ pub trait AnyEventQueue: Any + Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Raw mutable pointer для EventWriter в SystemContext.
+    /// Raw mutable pointer for EventWriter in SystemContext.
     fn as_ptr_mut(&mut self) -> *mut u8;
-    /// Зарегистрировать читателя — возвращает EventCursor (как u32).
+    /// Register a reader — returns an EventCursor (as u32).
     fn add_reader(&mut self) -> u32;
-    /// Удалить читателя.
+    /// Remove a reader.
     fn remove_reader(&mut self, reader_id: u32);
-    /// Предварительно выделить capacity для pending-буфера.
+    /// Pre-allocate capacity for the pending buffer.
     fn reserve(&mut self, additional: usize);
 }
 
@@ -997,17 +1000,17 @@ impl<T: Send + Sync + 'static> AnyEventQueue for Events<T> {
     }
 }
 
-// ── Removed<T> — событие удаления компонента (W3-1) ────────────
+// ── Removed<T> — component-removal event (W3-1) ────────────
 
-/// Событие «у entity удалён компонент `T`» — аналог Bevy `RemovedComponents`.
+/// The event "entity had its component `T` removed" — analogous to Bevy `RemovedComponents`.
 ///
-/// Эмитится ядром для типов, включённых через
-/// [`World::track_removals::<T>()`](crate::World::track_removals), на ВСЕХ
-/// путях потери компонента: `remove`/`remove_raw` и `despawn` (в этом случае
-/// entity уже мертва). Читается как обычное событие — `&[Removed<T>]` в
-/// `system!`, `world.event_reader::<Removed<T>>()` — с per-reader курсорами
-/// (без дублей и пропусков) и обычной дисциплиной флаша (per-stage в
-/// планировщике / `advance_frame()` без него).
+/// Emitted by the core for types enabled via
+/// [`World::track_removals::<T>()`](crate::World::track_removals), on ALL
+/// component-loss paths: `remove`/`remove_raw` and `despawn` (in the latter case
+/// the entity is already dead). Read like a regular event — `&[Removed<T>]` in
+/// `system!`, `world.event_reader::<Removed<T>>()` — with per-reader cursors
+/// (no duplicates and no gaps) and the usual flush discipline (per-stage in the
+/// scheduler / `advance_frame()` without it).
 pub struct Removed<T: crate::component::Component> {
     pub entity: crate::entity::Entity,
     _marker: std::marker::PhantomData<fn() -> T>,
@@ -1071,14 +1074,14 @@ impl EventRegistry {
         }
     }
 
-    /// Зарегистрировать тип события.
+    /// Register an event type.
     pub fn register<T: Send + Sync + 'static>(&mut self) {
         self.queues
             .entry(TypeId::of::<T>())
             .or_insert_with(|| EventQueueCell(UnsafeCell::new(Box::new(Events::<T>::new()))));
     }
 
-    /// Получить очередь событий по типу (паникует если не зарегистрирована).
+    /// Get the event queue by type (panics if not registered).
     #[track_caller]
     pub fn get<T: Send + Sync + 'static>(&self) -> &Events<T> {
         self.queues
@@ -1094,7 +1097,7 @@ impl EventRegistry {
             })
     }
 
-    /// Мутабельный доступ к очереди (паникует если не зарегистрирована).
+    /// Mutable access to the queue (panics if not registered).
     #[track_caller]
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
         self.queues
@@ -1109,7 +1112,7 @@ impl EventRegistry {
             })
     }
 
-    /// Получить мутабельный доступ к очереди, автоматически регистрируя тип.
+    /// Get mutable access to the queue, automatically registering the type.
     pub fn get_or_register_mut<T: Send + Sync + 'static>(&mut self) -> &mut Events<T> {
         if !self.queues.contains_key(&TypeId::of::<T>()) {
             self.register::<T>();
@@ -1120,11 +1123,11 @@ impl EventRegistry {
             .unwrap()
     }
 
-    /// Raw pointer для EventWriter.
+    /// Raw pointer for EventWriter.
     ///
     /// # Safety
-    /// Вызывающий гарантирует уникальный доступ. Данные на куче (Box)
-    /// не перемещаются при реаллокации HashMap.
+    /// The caller guarantees unique access. The heap data (Box)
+    /// is not moved on HashMap reallocation.
     pub fn get_raw_ptr<T: Send + Sync + 'static>(&self) -> Option<*mut Events<T>> {
         let cell = self.queues.get(&TypeId::of::<T>())?;
         // SAFETY: the `*mut` provenance is the `UnsafeCell` interior (via
@@ -1136,22 +1139,22 @@ impl EventRegistry {
         Some(events as *mut Events<T>)
     }
 
-    /// Предварительно выделить capacity для очереди событий по TypeId.
+    /// Pre-allocate capacity for the event queue identified by TypeId.
     pub fn reserve_by_type(&mut self, type_id: TypeId, capacity: usize) {
         if let Some(cell) = self.queues.get_mut(&type_id) {
             cell.0.get_mut().reserve(capacity);
         }
     }
 
-    /// Обновить все очереди (вызывается в конце тика).
+    /// Update all queues (called at the end of the tick).
     pub fn update_all(&mut self) {
         for cell in self.queues.values_mut() {
             cell.0.get_mut().update();
         }
     }
 
-    /// Flush конкретных типов событий (по TypeId).
-    /// Используется Scheduler для per-Stage flush.
+    /// Flush specific event types (by TypeId).
+    /// Used by the Scheduler for per-Stage flush.
     pub fn flush_by_type_id(&mut self, type_ids: &[TypeId]) {
         for tid in type_ids {
             if let Some(cell) = self.queues.get_mut(tid) {
@@ -1160,8 +1163,8 @@ impl EventRegistry {
         }
     }
 
-    /// Flush всех очередей событий.
-    /// Используется при работе без Scheduler.
+    /// Flush all event queues.
+    /// Used when operating without a Scheduler.
     pub fn flush_all(&mut self) {
         self.update_all();
     }
@@ -1174,7 +1177,7 @@ impl Default for EventRegistry {
     }
 }
 
-// ── Тесты ─────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1194,13 +1197,13 @@ mod tests {
         assert_eq!(events[0], 42);
         assert_eq!(events[1], 43);
 
-        // Продвигаем курсор
+        // Advance the cursor
         queue.advance_reader_mut(&reader);
         let events = queue.iter(&reader);
-        assert_eq!(events.len(), 0, "после advance курсор должен быть в конце");
+        assert_eq!(events.len(), 0, "after advance the cursor should be at the end");
     }
 
-    // ── EventIterator (TD-24 движка): for e in read() ──────────
+    // ── EventIterator (engine TD-24): for e in read() ──────────
 
     #[test]
     fn read_guard_into_iterator_yields_and_advances() {
@@ -1212,14 +1215,14 @@ mod tests {
         queue.send(3);
         queue.update();
 
-        // Главная Bevy-идиома: прямая итерация по read() без .iter().
+        // The main Bevy idiom: direct iteration over read() without .iter().
         let mut got = Vec::new();
         for e in queue.read(&reader) {
             got.push(*e);
         }
         assert_eq!(got, vec![1, 2, 3]);
 
-        // Дроп итератора продвинул курсор до конца буфера.
+        // Dropping the iterator advanced the cursor to the end of the buffer.
         assert_eq!(queue.iter(&reader).len(), 0);
     }
 
@@ -1234,14 +1237,14 @@ mod tests {
 
         for e in queue.read(&reader) {
             if *e == 10 {
-                break; // частичная итерация
+                break; // partial iteration
             }
         }
-        // Семантика guard'а сохранена: break = пропуск остатка.
+        // The guard's semantics are preserved: break = skip the remainder.
         assert_eq!(
             queue.iter(&reader).len(),
             0,
-            "дроп итератора (в т.ч. на break) продвигает курсор до конца"
+            "dropping the iterator (including on break) advances the cursor to the end"
         );
     }
 
@@ -1260,7 +1263,7 @@ mod tests {
         queue.send(8);
         queue.update();
 
-        // Ссылки переживают сам итератор (лайфтайм исходного заёма Events).
+        // The references outlive the iterator itself (lifetime of the original Events borrow).
         let collected: Vec<&i32> = queue.read(&reader).into_iter().collect();
         // Read the still-live references AFTER the iterator has dropped (its
         // Drop ran when `into_iter().collect()` consumed it).
@@ -1279,14 +1282,14 @@ mod tests {
         queue.update();
 
         {
-            // len()/is_empty() доступны на guard'е через Deref<[T]>.
+            // len()/is_empty() are available on the guard via Deref<[T]>.
             let guard = queue.read(&reader);
             assert_eq!(guard.len(), 2);
             assert!(!guard.is_empty());
-            // Итерация по ссылке не потребляет guard.
+            // Iterating by reference does not consume the guard.
             let doubled: Vec<i32> = (&guard).into_iter().map(|e| e * 2).collect();
             assert_eq!(doubled, vec![10, 12]);
-            // ExactSizeIterator у владеющего итератора.
+            // ExactSizeIterator on the owning iterator.
             let it = guard.into_iter();
             assert_eq!(it.len(), 2);
         }
@@ -1303,26 +1306,26 @@ mod tests {
         queue.send(2);
         queue.update();
 
-        // Reader A читает одно событие
+        // Reader A reads one event
         {
             let events = queue.iter(&reader_a);
             assert_eq!(events.len(), 2);
         }
         queue.advance_reader_mut(&reader_a);
 
-        // Reader B ничего не читал — всё ещё может прочитать оба
+        // Reader B read nothing — it can still read both
         {
             let events = queue.iter(&reader_b);
             assert_eq!(events.len(), 2);
         }
         queue.advance_reader_mut(&reader_b);
 
-        // Оба прочитали — следующее update может очистить
+        // Both have read — the next update may clear
         queue.update();
         queue.send(3);
         queue.update();
 
-        // Новые события
+        // New events
         let events = queue.iter(&reader_a);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], 3);
@@ -1382,8 +1385,8 @@ mod tests {
         queue.update();
         queue.remove_reader(reader);
 
-        // После удаления читателя, очередь не должна паниковать
-        // и должна работать нормально для других читателей
+        // After removing a reader, the queue must not panic
+        // and must work normally for other readers
         let _reader2 = queue.add_reader();
         queue.send(20);
         queue.update();
@@ -1407,7 +1410,7 @@ mod tests {
         assert_eq!(events[0].data, 100);
     }
 
-    // ── DelayedQueue тесты ─────────────────────────────────────
+    // ── DelayedQueue tests ─────────────────────────────────────
 
     #[test]
     fn delayed_event_delivery() {
@@ -1415,24 +1418,24 @@ mod tests {
         let reader = queue.add_reader();
         let mut delayed = DelayedQueue::new();
 
-        // Отправляем событие с задержкой 3 тика
+        // Send an event with a 3-tick delay
         delayed.send_delayed(99, 3, 0);
         assert_eq!(delayed.len(), 1);
 
-        // Тик 1: ничего не должно доставиться
+        // Tick 1: nothing should be delivered
         delayed.flush_delayed(1, &mut queue);
         assert_eq!(queue.len_pending(), 0);
 
-        // Тик 2: ничего
+        // Tick 2: nothing
         delayed.flush_delayed(2, &mut queue);
         assert_eq!(queue.len_pending(), 0);
 
-        // Тик 3: должно доставиться
+        // Tick 3: should be delivered
         delayed.flush_delayed(3, &mut queue);
         assert_eq!(queue.len_pending(), 1);
         assert!(delayed.is_empty());
 
-        // После update() событие доступно для чтения
+        // After update() the event is available for reading
         queue.update();
         let events = queue.iter(&reader);
         assert_eq!(events.len(), 1);
@@ -1441,7 +1444,7 @@ mod tests {
 
     #[test]
     fn delayed_event_fifo_same_tick() {
-        // События с одинаковым deliver_at должны доставляться в порядке вставки (FIFO)
+        // Events with the same deliver_at must be delivered in insertion order (FIFO)
         let mut queue = Events::new();
         let reader = queue.add_reader();
         let mut delayed = DelayedQueue::new();
@@ -1457,7 +1460,7 @@ mod tests {
         queue.update();
         let events = queue.iter(&reader);
         assert_eq!(events.len(), 3);
-        // FIFO: порядок вставки должен сохраняться
+        // FIFO: the insertion order must be preserved
         assert_eq!(events[0], 10);
         assert_eq!(events[1], 20);
         assert_eq!(events[2], 30);
@@ -1473,7 +1476,7 @@ mod tests {
         delayed.send_delayed(20, 2, 0);
         delayed.send_delayed(30, 1, 0);
 
-        // Тик 1: два события с задержкой 1
+        // Tick 1: two events with delay 1
         delayed.flush_delayed(1, &mut queue);
         assert_eq!(queue.len_pending(), 2);
 
@@ -1484,7 +1487,7 @@ mod tests {
         assert_eq!(events[1], 30);
         queue.advance_reader_mut(&reader);
 
-        // Тик 2: одно событие с задержкой 2
+        // Tick 2: one event with delay 2
         delayed.flush_delayed(2, &mut queue);
         assert_eq!(queue.len_pending(), 1);
         assert!(delayed.is_empty());
@@ -1497,7 +1500,7 @@ mod tests {
 
     #[test]
     fn delayed_heap_early_stop() {
-        // flush_delayed должен останавливаться как только вершина heap "не готова"
+        // flush_delayed must stop as soon as the heap top is "not ready"
         let mut queue = Events::new();
         let mut delayed = DelayedQueue::new();
 
@@ -1505,21 +1508,21 @@ mod tests {
         delayed.send_delayed(2, 10, 0); // deliver_at=10
         delayed.send_delayed(3, 20, 0); // deliver_at=20
 
-        // flush на тике 10 — должны доставиться события с deliver_at <= 10
+        // flush at tick 10 — events with deliver_at <= 10 should be delivered
         delayed.flush_delayed(10, &mut queue);
         assert_eq!(queue.len_pending(), 2);
-        assert_eq!(delayed.len(), 1, "событие с deliver_at=20 должно остаться");
+        assert_eq!(delayed.len(), 1, "the event with deliver_at=20 should remain");
 
-        // flush на тике 15 — ничего нового
+        // flush at tick 15 — nothing new
         delayed.flush_delayed(15, &mut queue);
         assert_eq!(delayed.len(), 1);
 
-        // flush на тике 20 — последнее событие
+        // flush at tick 20 — the last event
         delayed.flush_delayed(20, &mut queue);
         assert_eq!(delayed.len(), 0);
     }
 
-    // ── read_partial тесты ─────────────────────────────────────
+    // ── read_partial tests ─────────────────────────────────────
 
     #[test]
     fn read_partial_advances_by_count() {
@@ -1531,27 +1534,27 @@ mod tests {
         }
         queue.update();
 
-        // Читаем первые 3 события
+        // Read the first 3 events
         {
             let guard = queue.read_partial(&reader, 3);
             assert_eq!(guard.len(), 3);
             assert_eq!(guard.as_slice(), &[0, 1, 2]);
-        } // Drop: курсор продвинется на 3
+        } // Drop: the cursor advances by 3
 
-        // Читаем следующие 3
+        // Read the next 3
         {
             let guard = queue.read_partial(&reader, 3);
             assert_eq!(guard.len(), 3);
             assert_eq!(guard.as_slice(), &[3, 4, 5]);
         }
 
-        // Читаем больше чем осталось
+        // Read more than remains
         {
             let guard = queue.read_partial(&reader, 100);
-            assert_eq!(guard.len(), 4); // остались 6,7,8,9
+            assert_eq!(guard.len(), 4); // 6,7,8,9 remain
         }
 
-        // Ничего не осталось
+        // Nothing remains
         {
             let guard = queue.read_partial(&reader, 10);
             assert_eq!(guard.len(), 0);
@@ -1568,37 +1571,37 @@ mod tests {
         queue.send(3);
         queue.update();
 
-        // read() должен продвинуть до конца при дропе
+        // read() must advance to the end on drop
         {
             let _guard = queue.read(&reader);
-            // читаем только первый
-            // _guard.iter().next(); — не важно, при дропе всё равно до конца
+            // read only the first one
+            // _guard.iter().next(); — does not matter, on drop it goes to the end anyway
         }
 
-        // Курсор должен быть в конце — новых событий нет
+        // The cursor must be at the end — there are no new events
         let remaining = queue.iter(&reader);
         assert_eq!(
             remaining.len(),
             0,
-            "read() должен продвинуть до конца буфера"
+            "read() must advance to the end of the buffer"
         );
     }
 
-    // ── send_sync тесты ────────────────────────────────────────
+    // ── send_sync tests ────────────────────────────────────────
 
     #[test]
     fn send_sync_visible_after_flush() {
         let mut queue = Events::<i32>::new();
         let reader = queue.add_reader();
 
-        // send_sync через shared reference
+        // send_sync via a shared reference
         queue.send_sync(42);
         queue.send_sync(43);
 
-        // До flush_sync — в pending ещё нет
+        // Before flush_sync — not yet in pending
         assert_eq!(queue.len_pending(), 0);
 
-        // flush_sync переносит из sync_pending в pending
+        // flush_sync moves from sync_pending into pending
         queue.flush_sync();
         assert_eq!(queue.len_pending(), 2);
 
@@ -1615,9 +1618,9 @@ mod tests {
         let reader = queue.add_reader();
 
         queue.send_sync(100);
-        queue.send(200); // в основной pending
+        queue.send(200); // into the main pending
 
-        // update() должен слить sync_pending + pending и сделать swap
+        // update() must merge sync_pending + pending and perform the swap
         queue.update();
         let events = queue.iter(&reader);
         assert_eq!(events.len(), 2);
@@ -1646,13 +1649,13 @@ mod tests {
         let mut queue = Events::new();
         let reader = queue.add_reader();
 
-        // Тик 1
+        // Tick 1
         queue.send(1);
         queue.update();
         assert_eq!(queue.iter(&reader).len(), 1);
         queue.advance_reader_mut(&reader);
 
-        // Тик 2
+        // Tick 2
         queue.send(2);
         queue.update();
         assert_eq!(queue.iter(&reader).len(), 1);
@@ -1664,7 +1667,7 @@ mod tests {
         use crate::world::World;
 
         let mut world = World::new();
-        // Не вызываем add_event::<String>()
+        // We do not call add_event::<String>()
         world.send_event("auto-registered".to_string());
 
         world.tick();
@@ -1673,12 +1676,13 @@ mod tests {
         assert_eq!(
             queue.len_readable(),
             1,
-            "Событие должно быть доступно после tick()"
+            "The event should be available after tick()"
         );
     }
 
-    /// C7: `advance_frame()` самодостаточен — флашит события (становятся читаемы
-    /// на следующем кадре) И продвигает change-tick. Без ручной пары tick+flush.
+    /// C7: `advance_frame()` is self-contained — it flushes events (they become
+    /// readable on the next frame) AND advances the change-tick. Without a manual
+    /// tick+flush pair.
     #[test]
     fn advance_frame_flushes_events_and_ticks() {
         use crate::world::World;
@@ -1687,16 +1691,16 @@ mod tests {
         let t0 = world.current_tick();
 
         world.send_event(7u32);
-        // До конца кадра событие ещё не во «readable»-буфере.
+        // Until the end of the frame the event is not yet in the "readable" buffer.
         assert_eq!(world.events::<u32>().len_readable(), 0);
 
-        world.advance_frame(); // флаш + tick
+        world.advance_frame(); // flush + tick
 
         assert_eq!(
             world.events::<u32>().len_readable(),
             1,
-            "advance_frame должен сделать событие читаемым"
+            "advance_frame must make the event readable"
         );
-        assert_ne!(world.current_tick(), t0, "advance_frame должен продвинуть change-tick");
+        assert_ne!(world.current_tick(), t0, "advance_frame must advance the change-tick");
     }
 }

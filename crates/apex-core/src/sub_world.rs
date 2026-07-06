@@ -3,43 +3,44 @@ use crate::{
     World,
 };
 
-/// Представление на подмножество архетипов World'а.
+/// A view over a subset of a World's archetypes.
 ///
-/// Содержит индексы архетипов, которые соответствуют AccessDescriptor системы.
-/// Не владеет данными — только ссылается на них через World.
+/// Holds the archetype indices matching a system's AccessDescriptor.
+/// Does not own the data — it only references it through the World.
 ///
 /// # Row-level splits (5.7)
 ///
-/// Если поле `row_ranges` не пусто, итерация ограничивается указанными
-/// диапазонами строк `(arch_idx, start, end)`. Это позволяет нескольким
-/// системам с одинаковым ArchetypeMask параллельно обрабатывать разные
-/// строки одного архетипа.
+/// If the `row_ranges` field is non-empty, iteration is restricted to the given
+/// row ranges `(arch_idx, start, end)`. This lets multiple systems with the same
+/// ArchetypeMask process different rows of the same archetype in parallel.
 ///
-/// # Безопасность
-/// - SubWorld не владеет данными — World должен быть жив всё время использования.
-/// - Разные SubWorld для разных систем в одном Stage не пересекаются по архетипам
-///   (проверено compile() через AccessDescriptor).
-/// - Structural changes запрещены во время выполнения систем.
+/// # Safety
+/// - SubWorld does not own the data — the World must stay alive for the entire
+///   duration of use.
+/// - Different SubWorlds for different systems in the same Stage do not overlap
+///   by archetype (verified by compile() via AccessDescriptor).
+/// - Structural changes are forbidden while systems are running.
 ///
 /// # Storage
-/// `world`, `archetype_indices` и `row_ranges` хранятся как сырые указатели,
-/// чтобы избежать UB продления lifetime и исключить конфликт `&World`/`&mut World`
-/// при параллельном выполнении.
+/// `world`, `archetype_indices` and `row_ranges` are stored as raw pointers, to
+/// avoid the UB of extending a lifetime and to eliminate the `&World`/`&mut World`
+/// conflict under parallel execution.
 pub struct SubWorld<'w> {
-    /// Сырой указатель на World. Всегда валиден пока SubWorld существует.
+    /// Raw pointer to the World. Always valid while the SubWorld exists.
     world: *const World,
-    /// Индексы архетипов, которые входят в этот SubWorld (сырой fat-указатель)
+    /// Indices of the archetypes belonging to this SubWorld (raw fat pointer)
     archetype_indices: *const [usize],
-    /// Опциональные ограничения строк для row-level splits.
+    /// Optional row constraints for row-level splits.
     row_ranges: *const [(usize, usize, usize)],
     #[allow(dead_code)]
     _phantom: std::marker::PhantomData<&'w ()>,
 }
 
 impl<'w> SubWorld<'w> {
-    /// Все входные ссылки привязаны к `'w`: сырые указатели внутри не могут
-    /// пережить заимствованные данные (иначе можно было бы получить
-    /// `SubWorld<'static>` из временных ссылок и разыменовать висячий указатель).
+    /// All input references are tied to `'w`: the raw pointers inside cannot
+    /// outlive the borrowed data (otherwise one could obtain a
+    /// `SubWorld<'static>` from temporary references and dereference a dangling
+    /// pointer).
     ///
     /// # Safety
     /// A `SubWorld` vends mutable views (`resource_mut`, `event_writer`, write
@@ -60,9 +61,9 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// Создать SubWorld с row-level range ограничениями. Все входные ссылки
-    /// привязаны к `'w` (лайфтаймы гарантируют, что сырые указатели не
-    /// переживут данные).
+    /// Create a SubWorld with row-level range constraints. All input references
+    /// are tied to `'w` (the lifetimes guarantee the raw pointers cannot outlive
+    /// the data).
     ///
     /// # Safety
     /// Same contract as [`new`](Self::new).
@@ -80,16 +81,16 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// Собрать SubWorld из ссылок, лайфтаймы которых НЕ привязаны к `'w`.
+    /// Build a SubWorld from references whose lifetimes are NOT tied to `'w`.
     ///
     /// # Safety
-    /// Вызывающий гарантирует, что `world` и `archetype_indices` живут не меньше
-    /// возвращённого SubWorld, и что во время его использования нет активного
-    /// `&mut World`, алиасящего покрытые архетипы. Предназначено для планировщика,
-    /// который держит `*mut World` под дисциплиной «во время исполнения систем
-    /// структурных изменений нет» и чередует `&World`/`&mut World` вручную —
-    /// поэтому не может пройти через безопасный [`new`](Self::new) (заём `&World`
-    /// конфликтовал бы с последующим `&mut World`).
+    /// The caller guarantees that `world` and `archetype_indices` live at least
+    /// as long as the returned SubWorld, and that while it is in use there is no
+    /// live `&mut World` aliasing the covered archetypes. Intended for the
+    /// scheduler, which holds a `*mut World` under the discipline "no structural
+    /// changes while systems run" and interleaves `&World`/`&mut World` by hand —
+    /// so it cannot go through the safe [`new`](Self::new) (a `&World` borrow
+    /// would conflict with the subsequent `&mut World`).
     #[inline]
     pub unsafe fn from_raw(world: &World, archetype_indices: &[usize]) -> Self {
         Self {
@@ -103,11 +104,11 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// [`from_raw`](Self::from_raw) с row-level range ограничениями.
+    /// [`from_raw`](Self::from_raw) with row-level range constraints.
     ///
     /// # Safety
-    /// См. [`from_raw`](Self::from_raw); дополнительно `row_ranges` должен жить
-    /// не меньше SubWorld.
+    /// See [`from_raw`](Self::from_raw); additionally `row_ranges` must live at
+    /// least as long as the SubWorld.
     #[inline]
     pub unsafe fn from_raw_with_ranges(
         world: &World,
@@ -122,13 +123,13 @@ impl<'w> SubWorld<'w> {
         }
     }
 
-    /// Получить ссылку на World.
+    /// Get a reference to the World.
     #[inline]
     fn world_ref(&self) -> &World {
         unsafe { &*self.world }
     }
 
-    /// Вернуть срез индексов архетипов.
+    /// Return the slice of archetype indices.
     #[inline]
     fn archetype_indices_slice(&self) -> &[usize] {
         if self.archetype_indices.is_null() {
@@ -137,7 +138,7 @@ impl<'w> SubWorld<'w> {
         unsafe { &*self.archetype_indices }
     }
 
-    /// Вернуть срез row_ranges.
+    /// Return the row_ranges slice.
     #[inline]
     fn row_ranges_slice(&self) -> &[(usize, usize, usize)] {
         if self.row_ranges.is_null() {
@@ -167,13 +168,13 @@ impl<'w> SubWorld<'w> {
         self.row_ranges_slice()
     }
 
-    /// Количество архетипов в этом SubWorld.
+    /// Number of archetypes in this SubWorld.
     #[inline]
     pub fn archetype_count(&self) -> usize {
         self.archetype_indices_slice().len()
     }
 
-    /// Общее количество entity во всех архетипах этого SubWorld.
+    /// Total number of entities across all archetypes of this SubWorld.
     pub fn entity_count(&self) -> usize {
         let w = self.world_ref();
         self.archetype_indices_slice()

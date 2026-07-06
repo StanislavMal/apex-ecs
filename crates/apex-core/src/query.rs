@@ -12,35 +12,36 @@ use crate::{
 
 // ── WorldQuery ─────────────────────────────────────────────────
 
-/// Inline-буфер ComponentId формы запроса: до 8 компонентов БЕЗ heap-аллокации
-/// (W2-0 — `fill_ids` на горячем пути `ctx.query` каждый вызов).
+/// Inline buffer of ComponentId for a query shape: up to 8 components with NO
+/// heap allocation (W2-0 — `fill_ids` on the hot path `ctx.query`, every call).
 pub type IdBuf = smallvec::SmallVec<[ComponentId; 8]>;
 
-/// Роли компонентов в ключе кэша запросов (старшие биты поверх ComponentId).
+/// Component roles in the query cache key (high bits above ComponentId).
 pub const KEY_ROLE_WITHOUT: u64 = 1 << 32;
 pub const KEY_ROLE_OPTIONAL: u64 = 2 << 32;
-/// Структурные маркеры `Or<>`-группы в ключе кэша (W2-5). Не несут ComponentId
-/// и ПРОПУСКАЮТСЯ при восстановлении ids из ключа (см. [`KEY_MARKER_BIT`]):
-/// `(Or<(With<A>,)>, With<B>)` и `Or<(With<A>, With<B>)>` обязаны давать
-/// разные записи кэша — у них разная матч-семантика при одинаковых ids.
+/// Structural markers for an `Or<>` group in the cache key (W2-5). They carry no
+/// ComponentId and are SKIPPED when reconstructing ids from the key (see
+/// [`KEY_MARKER_BIT`]): `(Or<(With<A>,)>, With<B>)` and `Or<(With<A>, With<B>)>`
+/// must produce different cache entries — they have different match semantics
+/// for the same ids.
 pub const KEY_OR_OPEN: u64 = 4 << 32;
 pub const KEY_OR_CLOSE: u64 = 5 << 32;
-/// Бит «запись ключа — структурный маркер, а не компонент».
+/// Bit "the key entry is a structural marker, not a component".
 pub const KEY_MARKER_BIT: u64 = 4 << 32;
 
 /// # Safety
 ///
-/// Реализация — часть unsafe-контракта итерации (safe-код в `for_each`/`iter`
-/// полагается на него без проверок):
-/// - `fetch_state`/`fetch_item` вызываются только для архетипа, прошедшего
-///   `matches_archetype`, и `row < arch.len()`; возвращаемые `Item` не должны
-///   алиасить чужие строки.
-/// - Если `has_row_filter()` возвращает `false`, то `fetch_item` ОБЯЗАН вернуть
-///   `Some` для КАЖДОЙ строки совпавшего непустого архетипа — иначе
-///   `fetch_item_unchecked` (её `unwrap_unchecked`) — UB. Форма, которая может
-///   отфильтровать строку, обязана вернуть `has_row_filter() == true`.
-/// - `component_count()` = число записей, которые `fill_ids`/`fill_cache_key`
-///   кладут, и совпадает с числом сегментов, которые ждёт `fetch_state`.
+/// The implementation is part of the unsafe iteration contract (safe code in
+/// `for_each`/`iter` relies on it without checks):
+/// - `fetch_state`/`fetch_item` are called only for an archetype that passed
+///   `matches_archetype`, with `row < arch.len()`; the returned `Item`s must not
+///   alias other rows.
+/// - If `has_row_filter()` returns `false`, then `fetch_item` MUST return `Some`
+///   for EVERY row of a matched non-empty archetype — otherwise
+///   `fetch_item_unchecked` (its `unwrap_unchecked`) is UB. A shape that may
+///   filter out a row must return `has_row_filter() == true`.
+/// - `component_count()` = the number of entries that `fill_ids`/`fill_cache_key`
+///   push, and equals the number of segments `fetch_state` expects.
 pub unsafe trait WorldQuery: Sized {
     type Item<'w>;
     type State: Copy;
@@ -55,38 +56,38 @@ pub unsafe trait WorldQuery: Sized {
 
     fn component_count() -> usize;
 
-    /// Заполняет ComponentId формы. ИНВАРИАНТ (W2): каждая форма кладёт РОВНО
-    /// `component_count()` записей — незарегистрированный компонент кодируется
-    /// сентинелом [`ComponentId::INVALID`]. Это гарантирует выравнивание
-    /// сегментов ids в кортежах/`Or` при любой комбинации регистраций;
-    /// «пустой запрос для незарегистрированного обязательного компонента»
-    /// получается естественно: `has_component(INVALID)` не матчится нигде.
+    /// Fills the ComponentId of the shape. INVARIANT (W2): every shape pushes
+    /// EXACTLY `component_count()` entries — an unregistered component is encoded
+    /// with the [`ComponentId::INVALID`] sentinel. This guarantees the alignment
+    /// of id segments in tuples/`Or` for any combination of registrations; an
+    /// "empty query for an unregistered required component" falls out naturally:
+    /// `has_component(INVALID)` matches nowhere.
     fn fill_ids(world: &World, ids: &mut IdBuf);
 
-    /// Заполняет только "positive" (не-Without) component IDs.
-    /// По умолчанию — то же что fill_ids.
+    /// Fills only the "positive" (non-Without) component IDs.
+    /// By default — the same as fill_ids.
     fn fill_positive_ids(world: &World, ids: &mut IdBuf) {
         Self::fill_ids(world, ids);
     }
 
-    /// Заполняет только ОБЯЗАТЕЛЬНЫЕ component IDs — те, без которых архетип
-    /// заведомо не матчится (Read/Write/Ref/With/Changed). В отличие от
-    /// `fill_positive_ids` НЕ включает optional (`Maybe`/`MaybeWrite`).
-    /// Используется `Query::new` для выбора архетипов-кандидатов из
-    /// `component_arch_index` (кандидаты = архетипы самого редкого
-    /// обязательного компонента).
+    /// Fills only the REQUIRED component IDs — those without which an archetype
+    /// definitely cannot match (Read/Write/Ref/With/Changed). Unlike
+    /// `fill_positive_ids` it does NOT include optionals (`Maybe`/`MaybeWrite`).
+    /// Used by `Query::new` to pick candidate archetypes from
+    /// `component_arch_index` (candidates = archetypes of the rarest required
+    /// component).
     fn fill_required_ids(world: &World, ids: &mut IdBuf) {
         Self::fill_positive_ids(world, ids);
     }
 
-    /// Ключ кэша запросов (CR-M2b): по одному `u64` на компонент — ComponentId
-    /// в нижних 32 битах, роль в верхних ([`KEY_ROLE_WITHOUT`]/[`KEY_ROLE_OPTIONAL`];
-    /// обязательные — 0). Однозначно кодирует матч-семантику формы запроса
+    /// Query cache key (CR-M2b): one `u64` per component — ComponentId in the low
+    /// 32 bits, the role in the high bits ([`KEY_ROLE_WITHOUT`]/[`KEY_ROLE_OPTIONAL`];
+    /// required — 0). Unambiguously encodes the match semantics of the query shape
     /// ((Read<A>, Read<B>) ≠ (Read<A>, Without<B>) ≠ (Read<A>, Maybe<B>)).
     ///
-    /// ВАЖНО: последовательность нижних 32 бит обязана совпадать с `fill_ids`
-    /// (CachedQuery восстанавливает ids из ключа без второго прохода реестра).
-    /// Один проход, без heap-аллокаций до 8 компонентов.
+    /// IMPORTANT: the sequence of low 32 bits must match `fill_ids` (CachedQuery
+    /// reconstructs the ids from the key without a second registry pass). A single
+    /// pass, no heap allocations up to 8 components.
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>);
 
     /// Reports this form's DATA borrows for the runtime self-alias check (C2):
@@ -103,11 +104,11 @@ pub unsafe trait WorldQuery: Sized {
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool;
 
-    /// Захватывает per-archetype состояние для итерации.
+    /// Captures per-archetype state for iteration.
     ///
-    /// `last_run` — тик предыдущего запуска (для `Changed<T>`-фильтрации).
-    /// `this_run` — текущий тик мира; `Write<T>`/`MaybeWrite<T>` стампят его в
-    /// change-tick строки при `DerefMut` через возвращаемый `Mut<T>`.
+    /// `last_run` — the tick of the previous run (for `Changed<T>` filtering).
+    /// `this_run` — the current world tick; `Write<T>`/`MaybeWrite<T>` stamp it
+    /// into the row's change-tick on `DerefMut` through the returned `Mut<T>`.
     ///
     /// # Safety
     /// `arch` must have matched this query (`matches_archetype`), and `ids` must
@@ -126,30 +127,31 @@ pub unsafe trait WorldQuery: Sized {
     /// must be accessed exclusively (no aliasing across parallel chunks).
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
 
-    /// `true`, если `fetch_item` может вернуть `None` на НЕКОТОРЫХ строках уже
-    /// совпавшего архетипа — т.е. форма несёт **построчный** фильтр
-    /// (`Changed`/`Added`/`Or`/кортеж с такими). `false` ⇒ для совпавшего
-    /// архетипа `fetch_item` ВСЕГДА `Some`, поэтому итерация вправе пропустить
-    /// per-row Option-проверку и идти плотным циклом через
-    /// [`fetch_item_unchecked`](Self::fetch_item_unchecked) (Bevy
-    /// «archetype-level filter» fast-path; перф-кампания §3.1A). Это **чисто
-    /// перф-флаг**: семантика не меняется (`Mut<T>` по-прежнему стампит
-    /// change-tick на `DerefMut`, ленивая entity для row-фильтров сохранена).
+    /// `true` if `fetch_item` may return `None` on SOME rows of an
+    /// already-matched archetype — i.e. the shape carries a **per-row** filter
+    /// (`Changed`/`Added`/`Or`/a tuple with such). `false` ⇒ for a matched
+    /// archetype `fetch_item` is ALWAYS `Some`, so iteration may skip the per-row
+    /// Option check and run a dense loop through
+    /// [`fetch_item_unchecked`](Self::fetch_item_unchecked) (Bevy's
+    /// "archetype-level filter" fast-path; perf campaign §3.1A). This is a **pure
+    /// perf flag**: the semantics do not change (`Mut<T>` still stamps the
+    /// change-tick on `DerefMut`, and lazy entity loading for row filters is
+    /// preserved).
     ///
-    /// Дефолт `false` — большинство форм (`Read`/`Write`/`With`/`Without`/
-    /// `Maybe`/`Entity`/`()`) инфаллибельны. Переопределяют ровно построчные
-    /// фильтры и комбинаторы над ними.
+    /// Default `false` — most shapes (`Read`/`Write`/`With`/`Without`/
+    /// `Maybe`/`Entity`/`()`) are infallible. Only per-row filters and the
+    /// combinators over them override it.
     #[inline(always)]
     fn has_row_filter() -> bool {
         false
     }
 
-    /// Инфаллибл-вариант [`fetch_item`](Self::fetch_item) для архетип-уровневых
-    /// форм. Вызывать ТОЛЬКО когда [`has_row_filter`](Self::has_row_filter)
-    /// ложно — иначе UB (`unwrap_unchecked` на построчно-отфильтрованной
-    /// строке). Дефолт делегирует в `fetch_item().unwrap_unchecked()`: для
-    /// инфаллибельных форм оптимизатор инлайнит конструкцию `Some(..)` и
-    /// устраняет Option целиком.
+    /// Infallible variant of [`fetch_item`](Self::fetch_item) for
+    /// archetype-level shapes. Call ONLY when [`has_row_filter`](Self::has_row_filter)
+    /// is false — otherwise UB (`unwrap_unchecked` on a per-row-filtered row).
+    /// The default delegates to `fetch_item().unwrap_unchecked()`: for infallible
+    /// shapes the optimizer inlines the `Some(..)` construction and eliminates
+    /// the Option entirely.
     ///
     /// # Safety
     /// Same contract as [`fetch_item`](Self::fetch_item), AND
@@ -163,38 +165,38 @@ pub unsafe trait WorldQuery: Sized {
     fn is_filter() -> bool {
         false
     }
-    /// Возвращает true для компонентов, которые ДОЛЖНЫ присутствовать.
-    /// Для Without<T> возвращает false.
+    /// Returns true for components that MUST be present.
+    /// For Without<T> returns false.
     fn is_positive() -> bool {
         true
     }
 }
 
-// ── Mut<T> — smart-pointer для Write<T> (change detection) ──────
+// ── Mut<T> — smart-pointer for Write<T> (change detection) ──────
 
-/// Мутабельный доступ к компоненту с автоматическим change-detection.
+/// Mutable access to a component with automatic change-detection.
 ///
-/// Возвращается из `Query<Write<T>>`. На `DerefMut` стампит текущий тик мира в
-/// change-tick строки → `Changed<T>` достоверно срабатывает на ВСЕХ путях
-/// мутации (а не только `World::get_mut`). Семантика как у Bevy `Mut<T>`:
-/// любое мутабельное заимствование помечает компонент изменённым, даже если
-/// фактически только читали — это приемлемый и стандартный компромисс.
+/// Returned from `Query<Write<T>>`. On `DerefMut` it stamps the current world
+/// tick into the row's change-tick → `Changed<T>` reliably fires on ALL mutation
+/// paths (not only `World::get_mut`). Semantics as in Bevy `Mut<T>`: any mutable
+/// borrow marks the component changed, even if it was in fact only read — an
+/// acceptable and standard trade-off.
 pub struct Mut<'w, T: 'static> {
     pub(crate) value: &'w mut T,
-    /// Указатель на change-tick этой строки (внутри `Column::change_ticks`).
+    /// Pointer to this row's change-tick (inside `Column::change_ticks`).
     pub(crate) change_tick: *mut Tick,
-    /// Текущий тик мира — стампится при `DerefMut`.
+    /// Current world tick — stamped on `DerefMut`.
     pub(crate) this_run: Tick,
 }
 
 impl<T: 'static> Mut<'_, T> {
-    /// Явно пометить компонент изменённым без мутации значения.
+    /// Explicitly mark the component changed without mutating the value.
     #[inline]
     pub fn set_changed(&mut self) {
         unsafe { *self.change_tick = self.this_run };
     }
 
-    /// Получить `&mut T` без пометки изменения (escape-hatch).
+    /// Get `&mut T` without marking a change (escape-hatch).
     #[inline]
     pub fn bypass_change_detection(&mut self) -> &mut T {
         self.value
@@ -223,8 +225,8 @@ impl<T: std::fmt::Debug + 'static> std::fmt::Debug for Mut<'_, T> {
     }
 }
 
-/// Per-archetype состояние `Write<T>`: базовый указатель данных + указатель на
-/// массив change-ticks + текущий тик мира.
+/// Per-archetype state of `Write<T>`: base data pointer + pointer to the
+/// change-ticks array + current world tick.
 pub struct WriteState<T> {
     data: *mut T,
     ticks: *mut Tick,
@@ -259,7 +261,7 @@ unsafe impl<T: Component> WorldQuery for Read<T> {
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
-        key.push(id.0 as u64); // роль REQUIRED = 0
+        key.push(id.0 as u64); // role REQUIRED = 0
     }
 
     fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
@@ -310,7 +312,7 @@ unsafe impl<T: Component> WorldQuery for Write<T> {
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
-        key.push(id.0 as u64); // роль REQUIRED = 0
+        key.push(id.0 as u64); // role REQUIRED = 0
     }
 
     fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
@@ -382,8 +384,8 @@ unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
 unsafe impl<T: Component> ReadOnlyWorldQuery for Added<T> {}
 unsafe impl ReadOnlyWorldQuery for () {}
 
-/// `&T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в [`Read<T>`],
-/// выдаёт `&T`.
+/// `&T` as a query specifier (1:1 port from Bevy). Delegates to [`Read<T>`],
+/// yields `&T`.
 unsafe impl<'a, T: Component> WorldQuery for &'a T {
     type Item<'w> = &'w T;
     type State = <Read<T> as WorldQuery>::State;
@@ -421,8 +423,8 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &T {
     }
 }
 
-/// `&mut T` как спецификатор запроса (1:1 перенос с Bevy). Делегирует в
-/// [`Write<T>`], выдаёт [`Mut<T>`] (со стампом change-tick на `DerefMut`).
+/// `&mut T` as a query specifier (1:1 port from Bevy). Delegates to
+/// [`Write<T>`], yields [`Mut<T>`] (stamping the change-tick on `DerefMut`).
 unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
     type Item<'w> = Mut<'w, T>;
     type State = <Write<T> as WorldQuery>::State;
@@ -460,15 +462,17 @@ impl<T: Component + 'static> WorldQuerySystemAccess for &mut T {
     }
 }
 
-// ── Entity как форма запроса (П1/TD-8, Bevy-паритет) ───────────
+// ── Entity as a query shape (P1/TD-8, Bevy parity) ─────────────
 
-/// `Entity` — обычная форма запроса: `Query<(Entity, &Pos)>` выдаёт id
-/// сущности в составе item. После П1 `iter()`/for-цикл выдают ТОЛЬКО item —
-/// entity больше не навязана; нужна — запросите явно (как в Bevy).
+/// `Entity` — an ordinary query shape: `Query<(Entity, &Pos)>` yields the
+/// entity id as part of the item. After P1, `iter()`/the for-loop yield ONLY the
+/// item — entity is no longer forced; if you need it, request it explicitly (as
+/// in Bevy).
 unsafe impl WorldQuery for Entity {
     type Item<'w> = Entity;
-    /// Указатель на массив `Archetype::entities` (живёт, пока жив мир и нет
-    /// структурных изменений — стандартный инвариант итерации).
+    /// Pointer to the `Archetype::entities` array (valid as long as the world is
+    /// alive and there is no structural change — the standard iteration
+    /// invariant).
     type State = *const Entity;
     type ReadOnly = Entity;
 
@@ -525,7 +529,7 @@ unsafe impl<T: Component> WorldQuery for With<T> {
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
-        key.push(id.0 as u64); // роль REQUIRED = 0
+        key.push(id.0 as u64); // role REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -542,7 +546,7 @@ unsafe impl<T: Component> WorldQuery for With<T> {
 
 impl<T: Component + 'static> WorldQuerySystemAccess for With<T> {
     fn system_access() -> AccessDescriptor {
-        // With<T> только проверяет наличие — read semantics
+        // With<T> only checks presence — read semantics
         AccessDescriptor::new().read::<T>()
     }
 }
@@ -594,25 +598,25 @@ unsafe impl<T: Component> WorldQuery for Without<T> {
 
 impl<T: Component + 'static> WorldQuerySystemAccess for Without<T> {
     fn system_access() -> AccessDescriptor {
-        // Without не читает данные T — нет доступа к T вообще
+        // Without does not read T's data — no access to T at all
         AccessDescriptor::new()
     }
 }
 
-// ── Maybe<T> — опциональное чтение (Optional <T>) ──────────────
+// ── Maybe<T> — optional read (Optional <T>) ────────────────────
 
-/// Опциональный компонент — аналог `Option<&T>`.
+/// Optional component — the analogue of `Option<&T>`.
 ///
-/// В отличие от `Read<T>`, не требует обязательного наличия компонента.
-/// Всегда итерирует все entity: если компонент отсутствует — возвращает `None`.
+/// Unlike `Read<T>`, it does not require the component to be present.
+/// Always iterates every entity: if the component is absent — returns `None`.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// Query::<(Read<A>, Maybe<B>)>::new(&world)
 ///     .for_each(|entity, (a, b)| {
-///         // a: &A — всегда есть
-///         // b: Option<&B> — может быть None
+///         // a: &A — always present
+///         // b: Option<&B> — may be None
 ///     });
 /// ```
 pub struct Maybe<T: Component>(std::marker::PhantomData<T>);
@@ -647,14 +651,14 @@ unsafe impl<T: Component> WorldQuery for Maybe<T> {
         1
     }
 
-    /// Optional ВСЕГДА вносит запись (сентинел [`ComponentId::INVALID`] для
-    /// незарегистрированного T) — иначе компоненты ПОСЛЕ него в кортеже
-    /// читали бы чужие id (выравнивание по `component_count`).
+    /// Optional ALWAYS pushes an entry (the [`ComponentId::INVALID`] sentinel for
+    /// an unregistered T) — otherwise components AFTER it in the tuple would read
+    /// the wrong ids (alignment by `component_count`).
     fn fill_ids(world: &World, ids: &mut IdBuf) {
         ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
-    /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
+    /// Optional component: presence is NOT required — does not narrow candidates.
     fn fill_required_ids(_: &World, _: &mut IdBuf) {}
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
@@ -680,7 +684,7 @@ unsafe impl<T: Component> WorldQuery for Maybe<T> {
         _: Tick,
         _: Tick,
     ) -> Self::State {
-        // INVALID-сентинел не матчится has_component'ом ни в одном архетипе.
+        // The INVALID sentinel is not matched by has_component in any archetype.
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeState::absent();
         }
@@ -697,7 +701,7 @@ unsafe impl<T: Component> WorldQuery for Maybe<T> {
     unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
         if state.present {
             if state.item_size == 0 {
-                // ZST — колонка не аллоцирует память, используем dangling
+                // ZST — the column allocates no memory, use a dangling pointer
                 Some(Some(&*(std::ptr::NonNull::<T>::dangling().as_ptr())))
             } else {
                 Some(Some(&*(state.data.add(row * state.item_size) as *const T)))
@@ -714,11 +718,11 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Maybe<T> {
     }
 }
 
-// ── MaybeWrite<T> — опциональная запись (Optional <&mut T>) ────
+// ── MaybeWrite<T> — optional write (Optional <&mut T>) ─────────
 
-/// Опциональный мутабельный компонент — аналог `Option<&mut T>`.
+/// Optional mutable component — the analogue of `Option<&mut T>`.
 ///
-/// Всегда итерирует все entity: если компонент отсутствует — возвращает `None`.
+/// Always iterates every entity: if the component is absent — returns `None`.
 pub struct MaybeWrite<T: Component>(std::marker::PhantomData<T>);
 
 #[derive(Clone, Copy)]
@@ -755,13 +759,13 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
         1
     }
 
-    /// Optional ВСЕГДА вносит запись (сентинел [`ComponentId::INVALID`] для
-    /// незарегистрированного T) — выравнивание ids по `component_count`.
+    /// Optional ALWAYS pushes an entry (the [`ComponentId::INVALID`] sentinel for
+    /// an unregistered T) — id alignment by `component_count`.
     fn fill_ids(world: &World, ids: &mut IdBuf) {
         ids.push(world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID));
     }
 
-    /// Optional-компонент: присутствие НЕ обязательно — кандидатов не сужает.
+    /// Optional component: presence is NOT required — does not narrow candidates.
     fn fill_required_ids(_: &World, _: &mut IdBuf) {}
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
@@ -786,7 +790,7 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
         _: Tick,
         this_run: Tick,
     ) -> Self::State {
-        // INVALID-сентинел не матчится has_component'ом ни в одном архетипе.
+        // The INVALID sentinel is not matched by has_component in any archetype.
         if ids.is_empty() || !arch.has_component(ids[0]) {
             return MaybeMutState::absent();
         }
@@ -863,7 +867,7 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
-        key.push(id.0 as u64); // роль REQUIRED = 0
+        key.push(id.0 as u64); // role REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -903,15 +907,15 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Changed<T> {
 
 // ── Added<T> ───────────────────────────────────────────────────
 
-/// Фильтр «компонент `T` ДОБАВЛЕН entity после `last_run`» (W3-1, паритет
-/// Bevy `Added<T>`).
+/// Filter "component `T` was ADDED to the entity after `last_run`" (W3-1, parity
+/// with Bevy `Added<T>`).
 ///
-/// Семантика added-тика: ставится при ПОЯВЛЕНИИ компонента у entity
-/// (spawn / insert нового), переживает archetype move (insert/remove соседних
-/// компонентов) и НЕ обновляется ни мутацией (`Changed`), ни `insert` поверх
-/// существующего компонента (replace = Changed, не Added — как в Bevy).
-/// Построчный фильтр: с плотной итерацией ([`DenseQuery`](crate::dense::DenseQuery))
-/// не компилируется, как и `Changed<T>`.
+/// Added-tick semantics: set when the component APPEARS on the entity
+/// (spawn / insert of a new one), survives an archetype move (insert/remove of
+/// neighboring components), and is NOT updated by mutation (`Changed`) nor by an
+/// `insert` over an existing component (replace = Changed, not Added — as in
+/// Bevy). A per-row filter: like `Changed<T>`, it does not compile with dense
+/// iteration ([`DenseQuery`](crate::dense::DenseQuery)).
 pub struct Added<T: Component>(std::marker::PhantomData<T>);
 
 #[derive(Clone, Copy)]
@@ -947,7 +951,7 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
 
     fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
         let id = world.registry.get_id::<T>().unwrap_or(ComponentId::INVALID);
-        key.push(id.0 as u64); // роль REQUIRED = 0
+        key.push(id.0 as u64); // role REQUIRED = 0
     }
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
@@ -985,35 +989,35 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Added<T> {
     }
 }
 
-// ── Or<> — дизъюнкция фильтров (W2-5) ──────────────────────────
+// ── Or<> — disjunction of filters (W2-5) ───────────────────────
 
-/// Дизъюнкция фильтров уровня Bevy: строка проходит, если проходит ХОТЯ БЫ
-/// ОДНА ветка. Главный потребитель — `Or<(Changed<A>, Changed<B>)>` вместо
-/// двух запросов + dedup-set (паттерн extract-систем движка).
+/// Bevy-level disjunction of filters: a row passes if AT LEAST ONE branch
+/// passes. The main consumer is `Or<(Changed<A>, Changed<B>)>` instead of two
+/// queries + a dedup-set (the pattern of the engine's extract systems).
 ///
 /// ```ignore
 /// Query::<(Read<A>, Read<B>, Or<(Changed<A>, Changed<B>)>)>::new(&world)
-///     .for_each(|e, (a, b, _)| { /* A ИЛИ B изменился */ });
+///     .for_each(|e, (a, b, _)| { /* A OR B changed */ });
 /// ```
 ///
-/// Семантика:
-/// - архетип матчится, если матчится хотя бы одна ветка;
-/// - ветка с незарегистрированным компонентом просто не матчится
-///   (остальные работают);
-/// - ветки — фильтры (`With`/`Without`/`Changed`/вложенный `Or`/кортежи-
-///   конъюнкции из них); item ветки игнорируется, поэтому data-формы
-///   (`Read` и пр.) внутри `Or` допускаются, но бессмысленны;
-/// - `Or` не сужает кандидатов запроса (`fill_required_ids` пуст): строка
-///   может пройти по любой ветке.
+/// Semantics:
+/// - an archetype matches if at least one branch matches;
+/// - a branch with an unregistered component simply does not match
+///   (the others still work);
+/// - branches are filters (`With`/`Without`/`Changed`/a nested `Or`/conjunction
+///   tuples of them); a branch's item is ignored, so data shapes (`Read` etc.)
+///   inside `Or` are allowed but pointless;
+/// - `Or` does not narrow the query's candidates (`fill_required_ids` is empty):
+///   a row may pass via any branch.
 pub struct Or<T>(std::marker::PhantomData<T>);
 
 macro_rules! impl_or_query {
     ( $( ($F:ident, $idx:tt) ),+ ) => {
         unsafe impl< $($F: WorldQuery),+ > WorldQuery for Or<( $($F,)+ )> {
             type Item<'w> = ();
-            /// Per-arch состояние ветки: `Some(state)` — ветка матчит этот
-            /// архетип, `None` — ветка мертва (state НЕ фетчится, иначе UB
-            /// на отсутствующей колонке).
+            /// Per-arch state of a branch: `Some(state)` — the branch matches
+            /// this archetype, `None` — the branch is dead (state is NOT fetched,
+            /// otherwise UB on a missing column).
             type State = ( $(Option<$F::State>,)+ );
             type ReadOnly = Or<( $(<$F as WorldQuery>::ReadOnly,)+ )>;
 
@@ -1021,15 +1025,16 @@ macro_rules! impl_or_query {
             fn component_count() -> usize { 0 $( + $F::component_count() )+ }
             #[inline]
             fn is_filter() -> bool { true }
-            /// Дизъюнкция построчна, если построчна ХОТЯ БЫ одна ветка: ветка-
-            /// row-фильтр (`Changed`/`Added`) может занулить строку даже в
-            /// совпавшем архетипе (когда совпала только она). Консервативно-
-            /// корректно: при `false` все ветки инфаллибельны ⇒ `Or` инфаллибелен.
+            /// The disjunction is per-row if AT LEAST ONE branch is per-row: a
+            /// row-filter branch (`Changed`/`Added`) may null out a row even in a
+            /// matched archetype (when only it matched). Conservatively correct:
+            /// at `false` every branch is infallible ⇒ `Or` is infallible.
             #[inline(always)]
             fn has_row_filter() -> bool { false $( || $F::has_row_filter() )+ }
 
-            /// Ветка с незарегистрированным компонентом несёт INVALID-сентинел
-            /// (инвариант `fill_ids`) — мёртвая ветка не опустошает запрос.
+            /// A branch with an unregistered component carries the INVALID
+            /// sentinel (the `fill_ids` invariant) — a dead branch does not empty
+            /// the query.
             fn fill_ids(world: &World, ids: &mut IdBuf) {
                 $( $F::fill_ids(world, ids); )+
             }
@@ -1038,8 +1043,8 @@ macro_rules! impl_or_query {
                 Self::fill_ids(world, ids);
             }
 
-            /// Дизъюнкция не сужает кандидатов: строка может пройти по любой
-            /// ветке, поэтому НИ ОДИН компонент Or не «обязателен».
+            /// The disjunction does not narrow candidates: a row may pass via any
+            /// branch, so NO component of Or is "required".
             fn fill_required_ids(_: &World, _: &mut IdBuf) {}
 
             fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
@@ -1134,8 +1139,8 @@ macro_rules! impl_world_query_tuple {
 
             #[inline]
             fn component_count() -> usize { 0 $( + $Q::component_count() )+ }
-            /// Кортеж построчен, если построчен ХОТЯ БЫ один элемент: `fetch_item`
-            /// кортежа возвращает `None`, как только любой элемент дал `None`.
+            /// A tuple is per-row if AT LEAST ONE element is per-row: the tuple's
+            /// `fetch_item` returns `None` as soon as any element yields `None`.
             #[inline(always)]
             fn has_row_filter() -> bool { false $( || $Q::has_row_filter() )+ }
 
@@ -1193,17 +1198,17 @@ macro_rules! impl_world_query_tuple {
                 }, )+ ))
             }
 
-            /// Плотный fetch без Option: каждый элемент инфаллибелен (вызывать
-            /// только при `has_row_filter() == false`), поэтому строим кортеж
-            /// напрямую через `fetch_item_unchecked` элементов — ни одной
-            /// per-элементной Option-проверки.
+            /// Dense fetch without Option: every element is infallible (call only
+            /// when `has_row_filter() == false`), so build the tuple directly via
+            /// the elements' `fetch_item_unchecked` — not a single per-element
+            /// Option check.
             #[inline(always)]
             unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
                 ( $( $Q::fetch_item_unchecked(state.$idx, row), )+ )
             }
         }
 
-        // WorldQuerySystemAccess для кортежей
+        // WorldQuerySystemAccess for tuples
         impl< $($Q: WorldQuery + WorldQuerySystemAccess + 'static),+ >
             WorldQuerySystemAccess for ( $($Q,)+ )
         {
@@ -1218,7 +1223,7 @@ macro_rules! impl_world_query_tuple {
     };
 }
 
-// ── () — пустой запрос (для AutoSystem без компонентного доступа) ─
+// ── () — empty query (for AutoSystem without component access) ─
 
 unsafe impl WorldQuery for () {
     type Item<'w> = ();
@@ -1276,10 +1281,10 @@ impl_world_query_tuple!(
 
 // ── ArchetypeFilter (D2-2) ─────────────────────────────────────
 
-/// Маркер «фильтр целиком архетипного уровня» — не смотрит на строки.
-/// Реализован для `()`, `With<T>`, `Without<T>` и их кортежей. Требуется
-/// плотной итерацией (`for_each_chunk`): построчные фильтры (`Changed`/
-/// `Added`/`Or` с ними) со слайсовой выдачей несовместимы.
+/// Marker "the filter is entirely archetype-level" — it does not look at rows.
+/// Implemented for `()`, `With<T>`, `Without<T>` and their tuples. Required by
+/// dense iteration (`for_each_chunk`): per-row filters (`Changed`/`Added`/`Or`
+/// with them) are incompatible with slice-based yielding.
 pub trait ArchetypeFilter: WorldQuery {}
 
 impl ArchetypeFilter for () {}
@@ -3145,15 +3150,15 @@ mod query_filter_tests {
     struct Boss;
     impl Component for Boss {}
 
-    /// Bevy-форма `Query<Data, Filter>`: фильтр не попадает в выдачу.
+    /// Bevy form `Query<Data, Filter>`: the filter is not yielded.
     #[test]
     fn query_data_filter_form() {
         let mut world = World::new();
         let boss = world.spawn((Hp(100), Mana(50), Boss));
         let _mob = world.spawn((Hp(10), Mana(5)));
 
-        // С фильтром (With<Boss>,): item — только данные; entity — явной
-        // формой запроса (П1).
+        // With a filter (With<Boss>,): the item is data only; entity — via an
+        // explicit query shape (P1).
         let q = Query::<(Entity, Read<Hp>, Read<Mana>), (With<Boss>,)>::new(&world);
         let got: Vec<(Entity, &Hp, &Mana)> = q.iter().collect();
         assert_eq!(got.len(), 1);
@@ -3161,11 +3166,11 @@ mod query_filter_tests {
         assert_eq!(*got[0].1, Hp(100));
         drop(q);
 
-        // Одиночный фильтр без кортежа тоже работает.
+        // A single filter without a tuple works too.
         let n = Query::<Read<Hp>, With<Boss>>::new(&world).iter().count();
         assert_eq!(n, 1);
 
-        // Changed в фильтре: после advance — пусто, после мутации — снова 1.
+        // Changed in the filter: after advance — empty, after mutation — 1 again.
         world.advance_change_tick();
         let lr = world.last_run_tick();
         let n = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
@@ -3179,8 +3184,8 @@ mod query_filter_tests {
         assert_eq!(n, 1);
     }
 
-    /// `for item in &q` / `&mut q` — IntoIterator поверх iter() (D2-2/П1):
-    /// item без навязанной entity (Bevy 1:1); entity — формой запроса.
+    /// `for item in &q` / `&mut q` — IntoIterator over iter() (D2-2/P1): the item
+    /// without a forced entity (Bevy 1:1); entity — via the query shape.
     #[test]
     fn query_for_loop_iteration() {
         let mut world = World::new();
@@ -3201,7 +3206,7 @@ mod query_filter_tests {
         let total: u32 = Query::<Read<Hp>>::new(&world).iter().map(|hp| hp.0).sum();
         assert_eq!(total, 30);
 
-        // Entity — явной формой, как в Bevy:
+        // Entity — via an explicit shape, as in Bevy:
         let q = Query::<(Entity, Read<Hp>)>::new(&world);
         let pairs: Vec<(Entity, &Hp)> = q.iter().collect();
         assert_eq!(pairs.len(), 2);
@@ -3340,7 +3345,7 @@ mod query_filter_tests {
         assert_eq!(Query::<Read<Hp>>::new(&world).len(), 2);
     }
 
-    /// `single()` — Bevy-паритет: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
+    /// `single()` — Bevy parity: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
     #[test]
     fn query_single() {
         let mut world = World::new();
@@ -3350,13 +3355,13 @@ mod query_filter_tests {
         );
 
         let e = world.spawn((Hp(42),));
-        // Entity при необходимости — формой запроса (П1).
+        // Entity when needed — via the query shape (P1).
         let q = Query::<(Entity, Read<Hp>)>::new(&world);
         let (got_e, hp) = q.single().unwrap();
         assert_eq!((got_e, hp.0), (e, 42));
         drop(q);
 
-        // single_mut: мутация через Mut<T>.
+        // single_mut: mutation through Mut<T>.
         let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         let mut hp = q.single_mut().unwrap();
         hp.0 = 7;
@@ -3370,8 +3375,8 @@ mod query_filter_tests {
         );
     }
 
-    /// `get(entity)` — random-access внутри запроса (П3, Bevy-паритет):
-    /// O(1) по location, фильтры (арх- и построчные) применяются.
+    /// `get(entity)` — random access within a query (P3, Bevy parity):
+    /// O(1) by location, filters (archetype- and per-row) are applied.
     #[test]
     fn query_get_by_entity() {
         let mut world = World::new();
@@ -3380,27 +3385,27 @@ mod query_filter_tests {
 
         let q = Query::<Read<Hp>, With<Boss>>::new(&world);
         assert_eq!(q.get(boss), Some(&Hp(100)));
-        assert_eq!(q.get(mob), None, "не матчит фильтр With<Boss>");
+        assert_eq!(q.get(mob), None, "does not match the With<Boss> filter");
         drop(q);
 
-        // Построчный фильтр: Changed применяется и в get().
+        // Per-row filter: Changed is applied in get() too.
         world.advance_change_tick();
         let lr = world.last_run_tick();
         world.get_mut::<Hp>(mob).unwrap().0 += 1;
         let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
         assert_eq!(q.get(mob), Some(&Hp(11)));
-        assert_eq!(q.get(boss), None, "boss не менялся");
+        assert_eq!(q.get(boss), None, "boss did not change");
         drop(q);
 
-        // get_mut: мутация через Mut<T>.
+        // get_mut: mutation through Mut<T>.
         let mut q = Query::<Write<Hp>>::new_mut(&mut world);
         q.get_mut(boss).unwrap().0 = 1;
         drop(q);
         assert_eq!(world.get::<Hp>(boss), Some(&Hp(1)));
     }
 
-    /// Архетипный фильтр совместим с плотной итерацией; данные приходят
-    /// только из отфильтрованных архетипов.
+    /// An archetype filter is compatible with dense iteration; data comes only
+    /// from the filtered archetypes.
     #[test]
     fn query_filter_with_chunks() {
         let mut world = World::new();
@@ -3411,7 +3416,7 @@ mod query_filter_tests {
         Query::<Read<Hp>, With<Boss>>::new(&world).for_each_chunk(|_, hp| {
             sum += hp.iter().map(|h| h.0).sum::<u32>();
         });
-        assert_eq!(sum, 1, "for_each_chunk уважает архетипный фильтр");
+        assert_eq!(sum, 1, "for_each_chunk respects the archetype filter");
     }
 }
 
@@ -3431,41 +3436,41 @@ mod tests {
     fn without_exclude_mask_works() {
         let mut world = World::new();
 
-        // Создаём сущность только с A
+        // Spawn an entity with only A
         let e1 = world.spawn((A,));
-        // Создаём сущность с A и B
+        // Spawn an entity with A and B
         let _e2 = world.spawn((A, B));
-        // Создаём сущность только с B
+        // Spawn an entity with only B
         let e3 = world.spawn((B,));
 
-        // Query<Read<A>, Without<B>> должен вернуть только e1
+        // Query<Read<A>, Without<B>> must return only e1
         let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
             vec![e1],
-            "Without<B> должен исключить сущности с B"
+            "Without<B> must exclude entities with B"
         );
 
-        // Query<Read<B>, Without<A>> должен вернуть только e3
+        // Query<Read<B>, Without<A>> must return only e3
         let query: Query<'_, '_, (Entity, Read<B>, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
             vec![e3],
-            "Without<A> должен исключить сущности с A"
+            "Without<A> must exclude entities with A"
         );
 
-        // Query<Without<A>, Without<B>> — пустой результат (все имеют хотя бы один компонент)
+        // Query<Without<A>, Without<B>> — empty result (all have at least one component)
         let query: Query<'_, '_, (Without<A>, Without<B>)> = Query::new(&world);
-        assert!(query.is_empty(), "Без A и B ничего не должно остаться");
+        assert!(query.is_empty(), "Without A and B nothing should remain");
     }
 
     #[test]
     fn without_with_large_world() {
         let mut world = World::new();
 
-        // Создаём много сущностей с (A) и много с (A, B)
+        // Spawn many entities with (A) and many with (A, B)
         let mut only_a = Vec::new();
         let mut with_b = Vec::new();
 
@@ -3476,14 +3481,14 @@ mod tests {
             with_b.push(world.spawn((A, B)));
         }
 
-        // Query<Read<A>, Without<B>> — должны получить только entities с A без B
+        // Query<Read<A>, Without<B>> — must get only entities with A and without B
         let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
 
-        assert_eq!(results.len(), 50, "Должно быть 50 сущностей с A без B");
+        assert_eq!(results.len(), 50, "There must be 50 entities with A and without B");
         for e in &results {
-            assert!(only_a.contains(e), "Сущность должна быть из only_a");
-            assert!(!with_b.contains(e), "Сущность не должна быть из with_b");
+            assert!(only_a.contains(e), "The entity must be from only_a");
+            assert!(!with_b.contains(e), "The entity must not be from with_b");
         }
     }
 
@@ -3493,20 +3498,20 @@ mod tests {
     }
     impl Component for Pos {}
 
-    /// C1: мутация через `Query<Write<T>>` должна делать `Changed<T>`
-    /// достоверным (раньше change-tick ставился только в `World::get_mut`).
+    /// C1: mutation through `Query<Write<T>>` must make `Changed<T>` reliable
+    /// (previously the change-tick was set only in `World::get_mut`).
     #[test]
     fn write_query_marks_changed() {
         let mut world = World::new();
         let target = world.spawn((Pos { x: 0.0 },));
         let _other = world.spawn((Pos { x: 100.0 },));
 
-        // Базовая линия: тик, относительно которого считаем "изменения".
+        // Baseline: the tick against which we measure "changes".
         world.tick();
         let last_run = world.current_tick();
         world.tick();
 
-        // Мутируем ТОЛЬКО target через Query<Write<Pos>>.
+        // Mutate ONLY target through Query<Write<Pos>>.
         {
             let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
             q.for_each_mut(|e, mut p| {
@@ -3516,7 +3521,7 @@ mod tests {
             });
         }
 
-        // Changed<Pos> относительно last_run должен вернуть ровно target.
+        // Changed<Pos> relative to last_run must return exactly target.
         let changed: Vec<_> =
             Query::<(Entity, crate::query::Changed<Pos>, Read<Pos>)>::new_with_tick(&world, last_run)
                 .iter()
@@ -3525,17 +3530,17 @@ mod tests {
         assert_eq!(
             changed,
             vec![target],
-            "мутация через Query<Write<T>> должна помечать Changed<T>"
+            "mutation through Query<Write<T>> must mark Changed<T>"
         );
     }
 
-    /// C3: Bevy-подобный синтаксис `&T` / `&mut T` в запросах.
+    /// C3: Bevy-like `&T` / `&mut T` syntax in queries.
     #[test]
     fn bevy_ref_syntax_query() {
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0 },));
 
-        // Чтение через &Pos, мутация через &mut Pos — как в Bevy.
+        // Read through &Pos, mutate through &mut Pos — as in Bevy.
         Query::<(&Pos,)>::new(&world).for_each(|_, (p,)| {
             assert_eq!(p.x, 1.0);
         });
@@ -3544,7 +3549,7 @@ mod tests {
         });
         assert_eq!(world.get::<Pos>(e).unwrap().x, 11.0);
 
-        // &mut стампит change-tick (как Write) — Changed достоверен.
+        // &mut stamps the change-tick (like Write) — Changed is reliable.
         world.tick();
         let lr = world.current_tick();
         world.tick();
@@ -3554,11 +3559,11 @@ mod tests {
         let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
             .iter()
             .count();
-        assert_eq!(changed, 1, "&mut T должен помечать Changed как Write<T>");
+        assert_eq!(changed, 1, "&mut T must mark Changed like Write<T>");
     }
 
-    /// Чистое чтение через `Write<T>` без `DerefMut` НЕ должно помечать изменённым
-    /// (стамп происходит только при мутабельном разыменовании).
+    /// A pure read through `Write<T>` without `DerefMut` must NOT mark it changed
+    /// (the stamp happens only on a mutable dereference).
     #[test]
     fn write_query_read_only_no_change() {
         let mut world = World::new();
@@ -3572,7 +3577,7 @@ mod tests {
             let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
             let mut sink = 0.0;
             q.for_each_mut(|_, p| {
-                // Только Deref (чтение) — без DerefMut.
+                // Only Deref (read) — no DerefMut.
                 sink += p.x;
             });
             std::hint::black_box(sink);
@@ -3581,7 +3586,7 @@ mod tests {
         let changed_count = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, last_run)
             .iter()
             .count();
-        assert_eq!(changed_count, 0, "чтение через Write<T> не должно помечать Changed");
+        assert_eq!(changed_count, 0, "reading through Write<T> must not mark Changed");
     }
 
     #[test]
@@ -3592,32 +3597,32 @@ mod tests {
         let e2 = world.spawn((B,));
         let _e3 = world.spawn((A, B));
 
-        // Чистый Without<A> — все сущности без A
+        // Pure Without<A> — all entities without A
         let query: Query<'_, '_, (Entity, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _)| e).collect();
         assert_eq!(
             results,
             vec![e2],
-            "Without<A> должен вернуть сущности без A"
+            "Without<A> must return entities without A"
         );
     }
 
     #[test]
     fn maybe_optional_component_simple() {
         let mut world = World::new();
-        // Все entity имеют и A и B — один архетип
+        // Every entity has both A and B — a single archetype
         world.spawn((A, B));
         world.spawn((A, B));
 
         let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
         let count = query.iter().count();
-        assert_eq!(count, 2, "Должно быть 2 entity с A");
+        assert_eq!(count, 2, "There must be 2 entities with A");
     }
 
     #[test]
     fn maybe_optional_component_mixed_archetypes() {
         let mut world = World::new();
-        // Два архетипа: [A,B] и [A]
+        // Two archetypes: [A,B] and [A]
         world.spawn((A, B));
         world.spawn((A,));
         world.spawn((B,));
@@ -3625,10 +3630,10 @@ mod tests {
         let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(_, b)| b.is_some()).collect();
 
-        assert_eq!(results.len(), 2, "Должно быть 2 сущности с A");
-        // e1 имеет A+B → b.is_some() == true
-        // e2 имеет A → b.is_some() == false
-        assert!(results[0] != results[1], "Одна должна иметь B, другая нет");
+        assert_eq!(results.len(), 2, "There must be 2 entities with A");
+        // e1 has A+B → b.is_some() == true
+        // e2 has A → b.is_some() == false
+        assert!(results[0] != results[1], "One must have B, the other not");
     }
 
     #[test]
@@ -3638,7 +3643,7 @@ mod tests {
         world.spawn((A, B));
         world.spawn((A,));
 
-        // Опциональная запись: у кого есть B — удваиваем
+        // Optional write: those that have B — double them
         let mut query: Query<'_, '_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
             .iter_mut()
@@ -3647,26 +3652,26 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         let has_b_count = results.iter().filter(|b| **b).count();
-        assert_eq!(has_b_count, 1, "Только одна сущность имеет B");
+        assert_eq!(has_b_count, 1, "Only one entity has B");
     }
 
     #[test]
     fn maybe_with_unregistered_component() {
         let mut world = World::new();
-        // Регистрируем только A — B не используется
+        // Register only A — B is not used
         world.spawn((A,));
 
-        // Query<Maybe<B>> — B никогда не регистрировался
+        // Query<Maybe<B>> — B was never registered
         let query: Query<'_, '_, Maybe<B>> = Query::new(&world);
-        // Должен вернуть entity, но B будет None
+        // Must return the entity, but B will be None
         let results: Vec<_> = query.iter().collect();
-        assert_eq!(results.len(), 1, "Должна вернуться entity без B");
-        assert!(results[0].is_none(), "B должен быть None");
+        assert_eq!(results.len(), 1, "The entity without B must be returned");
+        assert!(results[0].is_none(), "B must be None");
     }
 
-    /// Регрессия W2: (Maybe<X>, Read<A>) с НЕзарегистрированным X раньше
-    /// смещал ids — Read<A> читал чужой сегмент и запрос был ложно пуст.
-    /// INVALID-сентинел сохраняет выравнивание.
+    /// W2 regression: (Maybe<X>, Read<A>) with an UNregistered X used to shift
+    /// the ids — Read<A> read the wrong segment and the query was falsely empty.
+    /// The INVALID sentinel preserves the alignment.
     #[test]
     fn maybe_unregistered_does_not_misalign_following_ids() {
         struct NeverRegistered;
@@ -3680,7 +3685,7 @@ mod tests {
         assert_eq!(
             query.iter().count(),
             2,
-            "незарегистрированный Maybe не должен опустошать запрос"
+            "an unregistered Maybe must not empty the query"
         );
     }
 
@@ -3702,7 +3707,7 @@ mod tests {
         let last_run = world.current_tick();
         world.tick();
 
-        // Мутируем Pos у ea и Marker2 у em — ловим Or<(Changed<Pos>, Changed<Marker2>)>.
+        // Mutate Pos on ea and Marker2 on em — catch Or<(Changed<Pos>, Changed<Marker2>)>.
         if let Some(mut p) = world.get_mut::<Pos>(ea) {
             p.x = 1.0;
         }
@@ -3719,9 +3724,9 @@ mod tests {
         .map(|(e, _, _)| e)
         .collect();
 
-        assert!(hits.contains(&ea), "ветка Changed<Pos>");
-        assert!(hits.contains(&em), "ветка Changed<Marker2>");
-        assert!(!hits.contains(&eb), "B не менялся");
+        assert!(hits.contains(&ea), "the Changed<Pos> branch");
+        assert!(hits.contains(&em), "the Changed<Marker2> branch");
+        assert!(!hits.contains(&eb), "B did not change");
         assert_eq!(hits.len(), 2);
     }
 
@@ -3780,8 +3785,9 @@ mod tests {
         assert!(!hits.contains(&none));
     }
 
-    /// Ветка Or с незарегистрированным компонентом мертва, но НЕ опустошает
-    /// запрос — другая ветка работает (и не падает на fetch_state).
+    /// An Or branch with an unregistered component is dead, but does NOT empty
+    /// the query — the other branch still works (and does not crash on
+    /// fetch_state).
     #[test]
     fn or_with_unregistered_branch_is_dead_not_fatal() {
         struct NeverRegistered;
@@ -3799,16 +3805,16 @@ mod tests {
         assert_eq!(hits, vec![ea]);
     }
 
-    /// Or в CachedQuery: `(Or<(With<A>,)>, With<B>)` и `Or<(With<A>, With<B>)>`
-    /// имеют одинаковые ids, но разную семантику — маркеры группы в ключе
-    /// кэша обязаны разводить их по разным записям.
+    /// Or in CachedQuery: `(Or<(With<A>,)>, With<B>)` and `Or<(With<A>, With<B>)>`
+    /// have the same ids but different semantics — the group markers in the cache
+    /// key must separate them into different entries.
     #[test]
     fn or_cache_key_distinguishes_grouping() {
         let mut world = World::new();
         let _only_a = world.spawn((A,));
         let both = world.spawn((A, B));
 
-        // (Or<(With<A>,)>, With<B>) ≡ With<A> AND With<B> → только both
+        // (Or<(With<A>,)>, With<B>) ≡ With<A> AND With<B> → only both
         let strict: Vec<_> = world
             .query::<(Entity, Or<(With<A>,)>, With<B>)>()
             .iter()
@@ -3816,7 +3822,7 @@ mod tests {
             .collect();
         assert_eq!(strict, vec![both]);
 
-        // Or<(With<A>, With<B>)> → обе entity
+        // Or<(With<A>, With<B>)> → both entities
         let union_count = world.query::<Or<(With<A>, With<B>)>>().iter().count();
         assert_eq!(union_count, 2);
     }
@@ -3835,14 +3841,14 @@ mod tests {
         let _e1 = world.spawn((A, C(1)));
         let _e2 = world.spawn((B, D(2)));
 
-        // (Maybe<A>, Maybe<C>) — все entity
+        // (Maybe<A>, Maybe<C>) — every entity
         let query: Query<'_, '_, (Maybe<A>, Maybe<C>)> = Query::new(&world);
         let results: Vec<_> = query
             .iter()
             .map(|(a, c)| (a.is_some(), c.is_some()))
             .collect();
 
-        // Должно быть 2 entity
+        // There must be 2 entities
         assert_eq!(results.len(), 2);
         // e1: A=Some, C=Some
         assert!(results[0].0 && results[0].1);

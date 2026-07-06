@@ -1,10 +1,10 @@
-//! EntityTemplate — программные шаблоны сущностей.
+//! EntityTemplate — programmatic entity templates.
 //!
-//! Позволяет регистрировать именованные шаблоны в [`World`] и создавать
-//! entity с предопределённым набором компонентов, поддерживая переопределение
-//! полей через [`TemplateParams`].
+//! Lets you register named templates in a [`World`] and spawn an
+//! entity with a predefined set of components, supporting field overrides
+//! via [`TemplateParams`].
 //!
-//! # Пример
+//! # Example
 //!
 //! ```ignore
 //! use apex_core::template::*;
@@ -55,15 +55,15 @@ use std::sync::Arc;
 
 // ── TemplateParam trait ──────────────────────────────────────────
 
-/// Маркерный трейт для типизированных параметров шаблонов.
+/// Marker trait for typed template parameters.
 ///
-/// Каждый параметр идентифицируется типом-маркером, реализующим `TemplateParam`.
-/// Это позволяет использовать `TypeId` в качестве ключа вместо строк.
+/// Each parameter is identified by a marker type implementing `TemplateParam`.
+/// This lets us use `TypeId` as the key instead of strings.
 ///
-/// Чтобы параметр автоматически преобразовывался в overrides для PrefabManifest,
-/// переопределите [`component_type_name()`](TemplateParam::component_type_name).
+/// To have a parameter automatically converted into overrides for PrefabManifest,
+/// override [`component_type_name()`](TemplateParam::component_type_name).
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// struct SpawnX;
@@ -74,15 +74,15 @@ use std::sync::Arc;
 /// let val = params.get::<SpawnX>().copied().unwrap_or(10.0);
 /// ```
 pub trait TemplateParam: Send + Sync + 'static {
-    /// Тип значения параметра.
+    /// The parameter's value type.
     type Value: Send + Sync + 'static + Serialize;
 
-    /// Полное имя типа компонента, которым управляет этот параметр.
+    /// The fully qualified name of the component type this parameter drives.
     ///
-    /// Переопределите этот метод чтобы включить автоматическое преобразование
-    /// параметров в overrides при спавне через `PrefabManifest`.
+    /// Override this method to enable automatic conversion of parameters
+    /// into overrides when spawning via `PrefabManifest`.
     ///
-    /// # Пример
+    /// # Example
     /// ```ignore
     /// struct MonsterHealth;
     /// impl TemplateParam for MonsterHealth {
@@ -97,21 +97,21 @@ pub trait TemplateParam: Send + Sync + 'static {
 
 // ── TemplateParams ───────────────────────────────────────────────
 
-/// Параметры шаблона — значения для переопределения полей при спавне.
+/// Template parameters — values for overriding fields at spawn time.
 ///
-/// Хранит `HashMap<TypeId, Box<dyn Any + Send + Sync>>`. Доступ через
-/// [`set::<P>()`](TemplateParams::set) и [`get::<P>()`](TemplateParams::get)
-/// по типу-маркеру `P: TemplateParam`.
+/// Stores `HashMap<TypeId, Box<dyn Any + Send + Sync>>`. Accessed via
+/// [`set::<P>()`](TemplateParams::set) and [`get::<P>()`](TemplateParams::get)
+/// by the marker type `P: TemplateParam`.
 ///
-/// Также хранит обратный маппинг TypeId → имя типа компонента
-/// и предсериализованные JSON-значения для автоматического
-/// преобразования в overrides при спавне через `PrefabManifest`.
+/// Also stores the reverse mapping TypeId → component type name
+/// and pre-serialized JSON values for automatic
+/// conversion into overrides when spawning via `PrefabManifest`.
 #[derive(Default)]
 pub struct TemplateParams {
     params: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
-    /// TypeId → имя типа компонента (для PrefabManifest overrides)
+    /// TypeId → component type name (for PrefabManifest overrides)
     type_names: HashMap<TypeId, String>,
-    /// TypeId → предсериализованное JSON-значение
+    /// TypeId → pre-serialized JSON value
     json_overrides: HashMap<TypeId, serde_json::Value>,
 }
 
@@ -124,13 +124,13 @@ impl TemplateParams {
         }
     }
 
-    /// Установить параметр по типу-маркеру.
+    /// Set a parameter by its marker type.
     ///
-    /// Если [`TemplateParam::component_type_name()`] переопределён,
-    /// значение сериализуется в JSON и сохраняется для автоматического
-    /// преобразования в overrides при спавне через `PrefabManifest`.
+    /// If [`TemplateParam::component_type_name()`] is overridden,
+    /// the value is serialized to JSON and stored for automatic
+    /// conversion into overrides when spawning via `PrefabManifest`.
     ///
-    /// # Пример
+    /// # Example
     /// ```ignore
     /// struct HealthParam;
     /// impl TemplateParam for HealthParam { type Value = f32; }
@@ -161,22 +161,22 @@ impl TemplateParams {
         self
     }
 
-    /// Получить значение параметра по типу-маркеру.
+    /// Get a parameter's value by its marker type.
     pub fn get<P: TemplateParam>(&self) -> Option<&P::Value> {
         self.params
             .get(&TypeId::of::<P>())
             .and_then(|b| b.downcast_ref::<P::Value>())
     }
 
-    /// Есть ли переопределения?
+    /// Are there any overrides?
     pub fn is_empty(&self) -> bool {
         self.params.is_empty()
     }
 
-    /// Итератор по всем парам (component_type_name, JSON-значение) для override-ов.
+    /// Iterator over all (component_type_name, JSON value) pairs for overrides.
     ///
-    /// Используется `PrefabManifest::spawn()` для автоматического
-    /// преобразования параметров в overrides компонентов.
+    /// Used by `PrefabManifest::spawn()` for automatic
+    /// conversion of parameters into component overrides.
     pub fn json_overrides_iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.type_names.iter().filter_map(|(tid, name)| {
             self.json_overrides
@@ -185,7 +185,7 @@ impl TemplateParams {
         })
     }
 
-    /// Есть ли хотя бы один override с именем типа компонента?
+    /// Is there at least one override with a component type name?
     pub fn has_json_overrides(&self) -> bool {
         !self.json_overrides.is_empty()
     }
@@ -193,32 +193,32 @@ impl TemplateParams {
 
 // ── EntityTemplate trait ─────────────────────────────────────────
 
-/// Трейт для шаблонов сущностей.
+/// Trait for entity templates.
 ///
-/// Позволяет создавать entity с предопределённым набором компонентов,
-/// поддерживая переопределение полей через [`TemplateParams`].
+/// Lets you spawn an entity with a predefined set of components,
+/// supporting field overrides via [`TemplateParams`].
 ///
-/// # Реализация
+/// # Implementation
 ///
-/// 1. Реализовать `EntityTemplate` для вашей структуры
-/// 2. Зарегистрировать через [`World::register_template`]
-/// 3. Создавать entity через [`World::spawn_from_template`]
+/// 1. Implement `EntityTemplate` for your struct
+/// 2. Register it via [`World::register_template`]
+/// 3. Spawn entities via [`World::spawn_from_template`]
 ///
-/// `Send + Sync` требуется для хранения в `TemplateRegistry`
-/// (доступ из параллельных систем).
+/// `Send + Sync` is required for storage in `TemplateRegistry`
+/// (access from parallel systems).
 pub trait EntityTemplate: Send + Sync {
-    /// Создать entity в указанном мире с параметрами.
+    /// Spawn an entity in the given world with the given parameters.
     ///
-    /// `params` содержит переопределения полей, заданные пользователем
-    /// при вызове `spawn_from_template`. Если поле не переопределено —
-    /// использовать значения по умолчанию из шаблона.
+    /// `params` holds the field overrides supplied by the user
+    /// when calling `spawn_from_template`. If a field is not overridden,
+    /// use the template's default values.
     fn spawn(&self, world: &mut World, params: &TemplateParams) -> Entity;
 
-    /// Опциональный родитель для создаваемой entity.
+    /// Optional parent for the spawned entity.
     ///
-    /// Если вернуть `Some(parent_entity)`, то после спавна будет
-    /// автоматически установлено отношение `ChildOf(parent)`.
-    /// По умолчанию возвращает `None` (без родителя).
+    /// If this returns `Some(parent_entity)`, a `ChildOf(parent)` relation
+    /// is automatically established after spawning.
+    /// Returns `None` by default (no parent).
     fn parent(&self) -> Option<Entity> {
         None
     }
@@ -226,13 +226,13 @@ pub trait EntityTemplate: Send + Sync {
 
 // ── TemplateRegistry ─────────────────────────────────────────────
 
-/// Реестр именованных шаблонов.
+/// Registry of named templates.
 ///
-/// Хранит `HashMap<String, Arc<dyn EntityTemplate>>`. `Arc` (а не `Box`)
-/// позволяет клонировать хэндл шаблона и отпустить заём реестра ДО вызова
-/// `spawn` — иначе шаблон, перерегистрирующий себя из своего же `spawn`,
-/// освободил бы `Box` под живым указателем (UAF, B4).
-/// Каждый шаблон можно вызвать по имени через [`World::spawn_from_template`].
+/// Stores `HashMap<String, Arc<dyn EntityTemplate>>`. `Arc` (not `Box`)
+/// lets us clone the template handle and release the registry borrow BEFORE
+/// calling `spawn` — otherwise a template that re-registers itself from its own
+/// `spawn` would free the `Box` out from under a live pointer (UAF, B4).
+/// Each template can be invoked by name via [`World::spawn_from_template`].
 pub struct TemplateRegistry {
     templates: HashMap<String, Arc<dyn EntityTemplate>>,
 }
@@ -244,15 +244,15 @@ impl TemplateRegistry {
         }
     }
 
-    /// Зарегистрировать именованный шаблон.
+    /// Register a named template.
     pub fn register(&mut self, name: &str, template: impl EntityTemplate + 'static) {
         self.templates.insert(name.to_string(), Arc::new(template));
     }
 
-    /// Создать entity из зарегистрированного шаблона.
+    /// Spawn an entity from a registered template.
     ///
-    /// Если шаблон возвращает `Some(parent)` из [`EntityTemplate::parent()`],
-    /// то после спавна автоматически устанавливается `ChildOf(parent)`.
+    /// If the template returns `Some(parent)` from [`EntityTemplate::parent()`],
+    /// a `ChildOf(parent)` relation is automatically established after spawning.
     pub fn spawn_from_template(
         &self,
         world: &mut World,
@@ -268,19 +268,19 @@ impl TemplateRegistry {
         })
     }
 
-    /// Клонировать хэндл шаблона по имени. Клон `Arc` отвязывает шаблон от
-    /// заёма реестра, поэтому вызывающий может держать `&mut World` во время
-    /// `spawn` без риска UAF, даже если шаблон перерегистрирует сам себя (B4).
+    /// Clone the template handle by name. The `Arc` clone detaches the template
+    /// from the registry borrow, so the caller can hold `&mut World` during
+    /// `spawn` without risk of UAF, even if the template re-registers itself (B4).
     pub(crate) fn get_arc(&self, name: &str) -> Option<Arc<dyn EntityTemplate>> {
         self.templates.get(name).cloned()
     }
 
-    /// Проверить, зарегистрирован ли шаблон.
+    /// Check whether a template is registered.
     pub fn has(&self, name: &str) -> bool {
         self.templates.contains_key(name)
     }
 
-    /// Количество зарегистрированных шаблонов.
+    /// The number of registered templates.
     pub fn len(&self) -> usize {
         self.templates.len()
     }
@@ -298,9 +298,9 @@ impl Default for TemplateRegistry {
 
 // ── Pre-exported macro ───────────────────────────────────────────
 
-/// Макрос для удобной имплементации `EntityTemplate` с замыканием.
+/// Macro for conveniently implementing `EntityTemplate` with a closure.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// use apex_core::template::*;
@@ -358,7 +358,7 @@ mod tests {
     struct Label(String);
     impl Component for Label {}
 
-    // ── Marker-типы для типизированных параметров ────────────────
+    // ── Marker types for typed parameters ────────────────────────
 
     struct ParamX;
     impl TemplateParam for ParamX {
@@ -553,7 +553,7 @@ mod tests {
         commands.spawn_template("test");
         commands.apply(&mut world);
 
-        // Должна быть ровно одна entity с Position
+        // There should be exactly one entity with Position
         let query = world.query::<Read<Position>>();
         let mut count = 0;
         query.for_each(|_, _| count += 1);
@@ -572,8 +572,8 @@ mod tests {
                 world.spawn((Position { x: 1.0, y: 2.0 },))
             }
             fn parent(&self) -> Option<Entity> {
-                // Будет установлен внешним кодом через замыкание или хранение parent в структуре.
-                // В этом тесте мы проверяем механизм через регистрацию.
+                // Will be set by external code via a closure or by storing the parent in the struct.
+                // In this test we exercise the mechanism through registration.
                 None
             }
         }
@@ -601,7 +601,7 @@ mod tests {
 
         let child = world.spawn_template("child").unwrap();
 
-        // Проверяем, что child имеет отношение ChildOf(parent)
+        // Verify that child has the ChildOf(parent) relation
         assert!(world.has_relation(child, ChildOf, parent));
     }
 }

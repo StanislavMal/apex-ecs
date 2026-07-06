@@ -1,11 +1,11 @@
-//! SystemParam — типобезопасные обёртки для параметров систем.
+//! SystemParam — type-safe wrappers for system parameters.
 //!
-//! # Иерархия API (от простого к гибкому)
+//! # API hierarchy (from simple to flexible)
 //!
-//! ## 1. AutoSystem — рекомендуемый способ (автовывод access)
+//! ## 1. AutoSystem — the recommended approach (automatic access inference)
 //!
-//! Access выводится статически из `type Query`, `type Resources` и `type Events`.
-//! Невозможно случайно забыть компонент, ресурс или событие.
+//! Access is inferred statically from `type Query`, `type Resources` and `type Events`.
+//! It is impossible to accidentally forget a component, resource or event.
 //!
 //! ```ignore
 //! struct MovementSystem;
@@ -40,7 +40,7 @@
 //! }
 //! ```
 //!
-//! ## 2. FnParSystem — замыкание с явным access
+//! ## 2. FnParSystem — a closure with explicit access
 //!
 //! ```ignore
 //! sched.add_fn_par_system("ai", |ctx| { ... },
@@ -48,7 +48,7 @@
 //! );
 //! ```
 //!
-//! ## 3. Sequential — полный &mut World
+//! ## 3. Sequential — full &mut World
 //!
 //! ```ignore
 //! sched.add_system("commands", |world: &mut World| { ... });
@@ -63,22 +63,23 @@ use std::marker::PhantomData;
 
 // ── Res / ResMut ───────────────────────────────────────────────
 
-/// Иммутабельный доступ к ресурсу.
+/// Immutable access to a resource.
 ///
-/// Поле скрыто (D2-1): публичный `.0` ПЕРЕКРЫВАЛ Deref — `res.0` на ресурсе-
-/// кортеже выдавал `&T` вместо поля ресурса (футган для Bevy-мигранта).
-/// Доступ — через Deref (`*res`, `res.field`) или [`into_inner`](Self::into_inner).
+/// The field is hidden (D2-1): a public `.0` SHADOWED Deref — `res.0` on a
+/// tuple resource yielded `&T` instead of a resource field (a footgun for the
+/// Bevy migrant). Access is via Deref (`*res`, `res.field`) or
+/// [`into_inner`](Self::into_inner).
 #[derive(Clone, Copy)]
 pub struct Res<'w, T: Send + Sync + 'static>(pub(crate) &'w T);
 
 impl<'w, T: Send + Sync + 'static> Res<'w, T> {
-    /// Сконструировать из ссылки (низкоуровневый API планировщика/мостов).
+    /// Construct from a reference (low-level scheduler/bridge API).
     #[inline]
     pub fn new(value: &'w T) -> Self {
         Self(value)
     }
 
-    /// Извлечь `&T` с полным лайфтаймом мира.
+    /// Extract `&T` with the full world lifetime.
     #[inline]
     pub fn into_inner(self) -> &'w T {
         self.0
@@ -99,7 +100,7 @@ impl<T: Send + Sync + 'static + std::fmt::Debug> std::fmt::Debug for Res<'_, T> 
     }
 }
 
-/// Мутабельный доступ к ресурсу.
+/// Mutable access to a resource.
 pub struct ResMut<'w, T: Send + Sync + 'static> {
     ptr: *mut T,
     _marker: PhantomData<&'w mut T>,
@@ -136,9 +137,9 @@ unsafe impl<T: Send + Sync + 'static> Sync for ResMut<'_, T> {}
 
 // ── EventReader / EventWriter ──────────────────────────────────
 
-/// Читатель событий — использует per-reader курсор.
+/// Event reader — uses a per-reader cursor.
 pub struct EventReader<'w, T: Send + Sync + 'static> {
-    /// Сырой указатель для возможности мутабельного доступа через `read()`.
+    /// Raw pointer to allow mutable access via `read()`.
     ptr: *const Events<T>,
     cursor: EventCursor,
     /// `false` (default) — this reader OWNS its cursor and frees it on drop
@@ -150,9 +151,9 @@ pub struct EventReader<'w, T: Send + Sync + 'static> {
 }
 
 impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
-    /// Создать читателя с новым курсором (владеет им — освобождает на drop).
+    /// Create a reader with a fresh cursor (owns it — frees it on drop).
     /// # Panics
-    /// Паникует если события типа T не зарегистрированы.
+    /// Panics if events of type T are not registered.
     pub fn new(events: &'w mut Events<T>) -> Self {
         let cursor = events.add_reader();
         Self {
@@ -176,13 +177,13 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
         }
     }
 
-    /// Итерация по непрочитанным событиям.
+    /// Iterate over unread events.
     #[inline]
     pub fn iter(&self) -> &[T] {
         unsafe { (*self.ptr).iter(&self.cursor) }
     }
 
-    /// Прочитать и автоматически продвинуть курсор (RAII).
+    /// Read and automatically advance the cursor (RAII).
     #[inline]
     pub fn read(&mut self) -> EventReadGuard<'_, T> {
         unsafe {
@@ -193,7 +194,7 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
         }
     }
 
-    /// Количество непрочитанных событий.
+    /// Number of unread events.
     #[inline]
     pub fn len(&self) -> usize {
         self.iter().len()
@@ -219,7 +220,7 @@ impl<T: Send + Sync + 'static> Drop for EventReader<'_, T> {
     }
 }
 
-/// Отправитель событий — мутабельный доступ к Events.
+/// Event writer — mutable access to Events.
 pub struct EventWriter<'w, T: Send + Sync + 'static> {
     ptr: *mut Events<T>,
     _marker: PhantomData<&'w mut Events<T>>,
@@ -248,8 +249,8 @@ impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
         }
     }
 
-    /// Предварительно выделить capacity для отправляемых событий.
-    /// Позволяет избежать реаллокаций при массовой отправке.
+    /// Pre-reserve capacity for the events to be sent.
+    /// Avoids reallocations during bulk sends.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         unsafe {
@@ -261,12 +262,12 @@ impl<'w, T: Send + Sync + 'static> EventWriter<'w, T> {
 unsafe impl<T: Send + Sync + 'static> Send for EventWriter<'_, T> {}
 unsafe impl<T: Send + Sync + 'static> Sync for EventWriter<'_, T> {}
 
-/// Bevy-совместимое имя для чтения удалений компонента `T` (D2-3):
-/// обычный [`EventReader`] событий [`Removed<T>`](crate::events::Removed).
+/// Bevy-compatible name for reading removals of component `T` (D2-3):
+/// an ordinary [`EventReader`] of [`Removed<T>`](crate::events::Removed) events.
 ///
-/// Требует включённого трекинга — `world.track_removals::<T>()` при setup'е
-/// (в отличие от Bevy, где удаления пишутся для всех компонентов всегда,
-/// у нас это opt-in с нулевой стоимостью по умолчанию).
+/// Requires tracking to be enabled — `world.track_removals::<T>()` at setup
+/// (unlike Bevy, where removals are always written for all components, here it
+/// is opt-in with zero cost by default).
 ///
 /// ```ignore
 /// fn cleanup(mut removed: RemovedComponents<PhysicsBody>, mut phys: ResMut<Physics>) {
@@ -275,38 +276,38 @@ unsafe impl<T: Send + Sync + 'static> Sync for EventWriter<'_, T> {}
 /// ```
 pub type RemovedComponents<'w, T> = EventReader<'w, crate::events::Removed<T>>;
 
-// ── Маркеры для ResourceAccessList ────────────────────────────
+// ── Markers for ResourceAccessList ────────────────────────────
 
-/// Маркер: read-доступ к ресурсу T в `AutoSystem::Resources`.
+/// Marker: read access to resource T in `AutoSystem::Resources`.
 ///
-/// Не путать с runtime-обёрткой `Res<'w, T>` — это только статическое
-/// описание доступа для планировщика.
+/// Not to be confused with the runtime wrapper `Res<'w, T>` — this is only a
+/// static access declaration for the scheduler.
 pub struct ResRead<T: Send + Sync + 'static>(PhantomData<T>);
 
-/// Маркер: write-доступ к ресурсу T в `AutoSystem::Resources`.
+/// Marker: write access to resource T in `AutoSystem::Resources`.
 pub struct ResWrite<T: Send + Sync + 'static>(PhantomData<T>);
 
-// ── Маркеры для EventAccessList ────────────────────────────────
+// ── Markers for EventAccessList ────────────────────────────────
 
-/// Маркер: подписка на события типа E в `AutoSystem::Events`.
+/// Marker: subscription to events of type E in `AutoSystem::Events`.
 ///
-/// Соответствует `ctx.event_reader::<E>()` внутри `run()`.
+/// Corresponds to `ctx.event_reader::<E>()` inside `run()`.
 pub struct Listen<E: Send + Sync + 'static>(PhantomData<E>);
 
-/// Маркер: публикация событий типа E в `AutoSystem::Events`.
+/// Marker: publishing events of type E in `AutoSystem::Events`.
 ///
-/// Соответствует `ctx.event_writer_unchecked::<E>()` внутри `run()`.
+/// Corresponds to `ctx.event_writer_unchecked::<E>()` inside `run()`.
 pub struct Emit<E: Send + Sync + 'static>(PhantomData<E>);
 
 // ── ResourceAccessList ─────────────────────────────────────────
 
-/// Статическое описание доступа к ресурсам — используется в `AutoSystem::Resources`.
+/// Static resource access declaration — used in `AutoSystem::Resources`.
 ///
-/// Реализован для:
-/// - `()` — нет доступа к ресурсам (дефолт)
-/// - `ResRead<T>` — read-доступ к ресурсу T
-/// - `ResWrite<T>` — write-доступ к ресурсу T
-/// - кортежи из вышеперечисленных (до 8 элементов)
+/// Implemented for:
+/// - `()` — no resource access (default)
+/// - `ResRead<T>` — read access to resource T
+/// - `ResWrite<T>` — write access to resource T
+/// - tuples of the above (up to 8 elements)
 pub trait ResourceAccessList {
     fn resource_accesses() -> crate::access::AccessDescriptor;
 }
@@ -325,7 +326,7 @@ impl<T: Send + Sync + 'static> ResourceAccessList for ResRead<T> {
     }
 }
 
-// NB: write-доступ к ресурсу ставит `resource_write()` (гейт ASD, TD-37).
+// NB: write access to a resource sets `resource_write()` (the ASD gate, TD-37).
 impl<T: Send + Sync + 'static> ResourceAccessList for ResWrite<T> {
     #[inline]
     fn resource_accesses() -> crate::access::AccessDescriptor {
@@ -355,13 +356,13 @@ impl_resource_access_list_tuple!(A, B, C, D, E, F, G, H);
 
 // ── EventAccessList ────────────────────────────────────────────
 
-/// Статическое описание доступа к событиям — используется в `AutoSystem::Events`.
+/// Static event access declaration — used in `AutoSystem::Events`.
 ///
-/// Реализован для:
-/// - `()` — нет доступа к событиям (дефолт)
-/// - `Listen<E>` — подписка на события E (read_event)
-/// - `Emit<E>`   — публикация событий E  (write_event)
-/// - кортежи из вышеперечисленных (до 8 элементов)
+/// Implemented for:
+/// - `()` — no event access (default)
+/// - `Listen<E>` — subscription to events E (read_event)
+/// - `Emit<E>`   — publishing events E  (write_event)
+/// - tuples of the above (up to 8 elements)
 pub trait EventAccessList {
     fn event_accesses() -> crate::access::AccessDescriptor;
 }
@@ -409,48 +410,48 @@ impl_event_access_list_tuple!(A, B, C, D, E, F, G, H);
 
 // ── SystemParam ────────────────────────────────────────────────
 
-/// Типобезопасное извлечение параметров системы из `SystemContext`.
+/// Type-safe extraction of system parameters from `SystemContext`.
 ///
-/// Аналог Bevy `SystemParam`, но БЕЗ разделения State/Fetch,
-/// БЕЗ proc-макросов, БЕЗ изменения существующих макросов `system!`/`sequential_system!`.
+/// The analogue of Bevy `SystemParam`, but WITHOUT the State/Fetch split,
+/// WITHOUT proc macros, WITHOUT changing the existing `system!`/`sequential_system!` macros.
 ///
-/// # Примеры
+/// # Examples
 ///
 /// ```ignore
-/// // Один ресурс
+/// // A single resource
 /// type MyParam = ResRead<DeltaTime>;
 /// let dt = MyParam::fetch(&ctx);
 ///
-/// // Кортеж: ресурс + запрос + события
+/// // A tuple: resource + query + events
 /// type MyParam = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>, Listen<CollisionEvent>);
 /// let (dt, q, events) = MyParam::fetch(&ctx);
 /// ```
 ///
-/// # Зачем
+/// # Why
 ///
-/// Упрощает портирование Bevy-рендера (где `RenderCommand::Param: SystemParam`)
-/// и устраняет бойлерплейт в sequential системах.
+/// Simplifies porting the Bevy renderer (where `RenderCommand::Param: SystemParam`)
+/// and removes boilerplate in sequential systems.
 pub trait SystemParam {
-    /// Что возвращается при [`fetch`](SystemParam::fetch) (с лайфтаймом `'w`).
+    /// What is returned by [`fetch`](SystemParam::fetch) (with lifetime `'w`).
     type Item<'w>;
 
-    /// Per-system persistent state (В3, wave 6b). Lives in the `fn_sys` closure
+    /// Per-system persistent state (V3, wave 6b). Lives in the `fn_sys` closure
     /// across frames — the home for `Query`/`CachedQuery`/`Single` arch-index caches
     /// (and, later, event cursors). Stateless params use the default `()`.
     /// `Send + Sync` so the boxed system fn keeps its existing bounds (no ripple);
     /// `'static` because it outlives every call and owns no borrows.
     type State: Send + Sync + Default + 'static;
 
-    /// Статическая декларация доступа для планировщика.
+    /// Static access declaration for the scheduler.
     fn access() -> AccessDescriptor;
 
-    /// Извлечь значение из контекста системы.
+    /// Extract the value from the system context.
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> Self::Item<'w>;
 
-    /// Stateful fetch (В3): извлечь значение, используя per-system `state`. Дефолт —
-    /// игнорирует `state` и зовёт [`fetch`](Self::fetch) (для stateless-параметров:
-    /// `Res`/`ResMut`/`EventReader`/`EventWriter`/`Commands`). Кэширующие параметры
-    /// (`Query`-семейство) переопределяют, чтобы переиспользовать резолв между кадрами.
+    /// Stateful fetch (V3): extract the value using the per-system `state`. The default
+    /// ignores `state` and calls [`fetch`](Self::fetch) (for stateless params:
+    /// `Res`/`ResMut`/`EventReader`/`EventWriter`/`Commands`). Caching params
+    /// (the `Query` family) override this to reuse the resolve across frames.
     fn get_param<'w>(
         ctx: &'w crate::world::SystemContext<'w>,
         _state: &'w mut Self::State,
@@ -458,21 +459,21 @@ pub trait SystemParam {
         Self::fetch(ctx)
     }
 
-    /// Параметр использует отложенные команды (`Commands`) — планировщик
-    /// вставляет auto-apply sync-точку после системы (D2-1).
+    /// The param uses deferred commands (`Commands`) — the scheduler inserts an
+    /// auto-apply sync point after the system (D2-1).
     fn has_deferred() -> bool {
         false
     }
 
-    /// Валидация перед запуском системы (Э5): `false` ⇒ система ПРОПУСКАЕТСЯ
-    /// в этом кадре (skip-семантика `Single<Q>`; Bevy `validate_param`).
-    /// Вызывается планировщиком непосредственно перед [`fetch`](Self::fetch).
+    /// Validation before running the system (E5): `false` ⇒ the system is SKIPPED
+    /// this frame (the skip semantics of `Single<Q>`; Bevy `validate_param`).
+    /// Called by the scheduler immediately before [`fetch`](Self::fetch).
     fn validate(_ctx: &crate::world::SystemContext<'_>) -> bool {
         true
     }
 }
 
-// ── impl SystemParam для маркеров ресурсов ────────────────────
+// ── impl SystemParam for resource markers ────────────────────
 
 impl<T: Send + Sync + 'static> SystemParam for ResRead<T> {
     type Item<'w> = Res<'w, T>;
@@ -496,7 +497,7 @@ impl<T: Send + Sync + 'static> SystemParam for ResWrite<T> {
     }
 }
 
-// ── impl SystemParam для маркеров событий ─────────────────────
+// ── impl SystemParam for event markers ─────────────────────
 
 impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
     type Item<'w> = EventReader<'w, E>;
@@ -520,9 +521,9 @@ impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
     }
 }
 
-// ── Маркер QueryParam ──────────────────────────────────────────
+// ── QueryParam marker ──────────────────────────────────────────
 
-/// Маркер: параметр-запрос компонентов через [`SystemParam`].
+/// Marker: a component-query param via [`SystemParam`].
 ///
 /// ```ignore
 /// type MyParams = QueryParam<(Read<Position>, Write<Velocity>)>;
@@ -545,9 +546,9 @@ impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
     }
 }
 
-// ── Маркер CommandsParam ───────────────────────────────────────
+// ── CommandsParam marker ───────────────────────────────────────
 
-/// Маркер: параметр-доступ к [`Commands`](crate::commands::Commands).
+/// Marker: an access param for [`Commands`](crate::commands::Commands).
 ///
 /// ```ignore
 /// type MyParams = CommandsParam;
@@ -560,7 +561,7 @@ impl SystemParam for CommandsParam {
     type Item<'w> = &'w mut crate::commands::Commands;
     type State = ();
     fn access() -> AccessDescriptor {
-        // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
+        // `commands_used` gates ASD: non-entity-local commands would be duplicated across chunks.
         AccessDescriptor::new().commands_used()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
@@ -571,14 +572,14 @@ impl SystemParam for CommandsParam {
     }
 }
 
-// ── Bevy-style параметры plain-fn систем (D2-1) ────────────────
+// ── Bevy-style params of plain-fn systems (D2-1) ────────────────
 //
-// В plain-fn пути (см. [`SystemParamFunction`](crate::fn_system::SystemParamFunction))
-// параметром служит САМ пользовательский тип: `Res<T>`, `ResMut<T>`,
-// `Query<Q>`, `EventReader<E>`, `EventWriter<E>`, `&mut Commands` — семантика
-// Bevy 1:1 (в отличие от `system!`, где `&T` означает ресурс).
-// Item обязан быть тем же конструктором типа, что и параметр (двойной
-// Fn-баунд SystemParamFunction связывает обе формы).
+// In the plain-fn path (see [`SystemParamFunction`](crate::fn_system::SystemParamFunction))
+// the parameter is the user type ITSELF: `Res<T>`, `ResMut<T>`,
+// `Query<Q>`, `EventReader<E>`, `EventWriter<E>`, `&mut Commands` — Bevy
+// semantics 1:1 (unlike `system!`, where `&T` means a resource).
+// Item must be the same type constructor as the parameter (the double
+// Fn-bound SystemParamFunction ties both forms together).
 
 impl<'a, T: Send + Sync + 'static> SystemParam for Res<'a, T> {
     type Item<'w> = Res<'w, T>;
@@ -595,9 +596,9 @@ impl<'a, T: Send + Sync + 'static> SystemParam for ResMut<'a, T> {
     type Item<'w> = ResMut<'w, T>;
     type State = ();
     fn access() -> AccessDescriptor {
-        // `write::<T>()` — для конфликт-анализа (две `ResMut<T>` не параллелятся);
-        // `resource_write()` — гейт ASD: систему с мутацией ресурса нельзя дробить на чанки
-        // (тело выполнялось бы раз на чанк ⇒ мутация × число чанков). См. TD-37.
+        // `write::<T>()` — for conflict analysis (two `ResMut<T>` do not parallelize);
+        // `resource_write()` — the ASD gate: a system that mutates a resource cannot be split into chunks
+        // (the body would run once per chunk ⇒ mutation × number of chunks). See TD-37.
         AccessDescriptor::new().write::<T>().resource_write()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> ResMut<'w, T> {
@@ -616,8 +617,8 @@ where
         Q::system_access().merge(&F::system_access())
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q, F> {
-        // База Changed/Added — last_run_tick мира (граница прошлого кадра),
-        // как у ctx.query() (TD-9).
+        // The Changed/Added baseline is the world's last_run_tick (the previous
+        // frame's boundary), same as ctx.query() (TD-9).
         let sub = &ctx.sub_worlds[0];
         let last_run = sub.world().last_run_tick();
         // SAFETY: `ctx` (and its SubWorlds) is vended by the scheduler for a
@@ -627,7 +628,7 @@ where
     }
 }
 
-/// `Single<Q, F>` — ровно один матч; система пропускается при 0 или >1 (Э5).
+/// `Single<Q, F>` — exactly one match; the system is skipped on 0 or >1 (E5).
 impl<'a, Q, F> SystemParam for crate::query::Single<'a, Q, F>
 where
     Q: WorldQuery + WorldQuerySystemAccess,
@@ -653,17 +654,17 @@ where
                 item,
                 _filter: std::marker::PhantomData,
             },
-            // Недостижимо после validate (планировщик зовёт validate→fetch
-            // атомарно в рамках слота системы); паника — для ручных вызовов
-            // fetch без validate.
+            // Unreachable after validate (the scheduler calls validate→fetch
+            // atomically within the system's slot); the panic is for manual
+            // fetch calls without validate.
             Err(e) => panic!(
-                "Single<…>: запрос дал не ровно один матч ({e:?});                  системы с Single пропускаются планировщиком"
+                "Single<…>: query yielded not exactly one match ({e:?});                  systems with Single are skipped by the scheduler"
             ),
         }
     }
 }
 
-/// `Option<Single<Q, F>>` — `None` при нуле матчей; пропуск только при >1 (Э5).
+/// `Option<Single<Q, F>>` — `None` on zero matches; skip only on >1 (E5).
 impl<'a, Q, F> SystemParam for Option<crate::query::Single<'a, Q, F>>
 where
     Q: WorldQuery + WorldQuerySystemAccess,
@@ -689,7 +690,7 @@ where
             }),
             Err(crate::query::QuerySingleError::NoEntities) => None,
             Err(e) => panic!(
-                "Option<Single<…>>: больше одного матча ({e:?});                  системы пропускаются планировщиком"
+                "Option<Single<…>>: more than one match ({e:?});                  systems are skipped by the scheduler"
             ),
         }
     }
@@ -745,7 +746,7 @@ impl SystemParam for &mut crate::commands::Commands {
     type Item<'w> = &'w mut crate::commands::Commands;
     type State = ();
     fn access() -> AccessDescriptor {
-        // `commands_used` гейтит ASD: не-entity-локальные команды дублировались бы по чанкам.
+        // `commands_used` gates ASD: non-entity-local commands would be duplicated across chunks.
         AccessDescriptor::new().commands_used()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> &'w mut crate::commands::Commands {
@@ -756,7 +757,7 @@ impl SystemParam for &mut crate::commands::Commands {
     }
 }
 
-// ── impl SystemParam для () (нет параметров) ──────────────────
+// ── impl SystemParam for () (no parameters) ──────────────────
 
 impl SystemParam for () {
     type Item<'w> = ();
@@ -767,7 +768,7 @@ impl SystemParam for () {
     fn fetch<'w>(_ctx: &crate::world::SystemContext<'w>) {}
 }
 
-// ── Кортежи SystemParam (1..12) ───────────────────────────────
+// ── SystemParam tuples (1..12) ───────────────────────────────
 
 macro_rules! impl_system_param_tuple {
     ( $($P:ident),+ ) => {
@@ -786,7 +787,7 @@ macro_rules! impl_system_param_tuple {
                 ctx: &'w crate::world::SystemContext<'w>,
                 state: &'w mut Self::State,
             ) -> Self::Item<'w> {
-                // Thread each param's own state slot (В3). Names reuse $P as the slot binding.
+                // Thread each param's own state slot (V3). Names reuse $P as the slot binding.
                 let ( $($P,)+ ) = state;
                 ( $($P::get_param(ctx, $P),)+ )
             }
@@ -815,49 +816,49 @@ impl_system_param_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 // ── WorldQuerySystemAccess ─────────────────────────────────────
 
-/// Расширение WorldQuery — статическое описание R/W доступа для планировщика.
+/// An extension of WorldQuery — a static R/W access declaration for the scheduler.
 ///
-/// Реализовано для Read<T>, Write<T>, With<T>, Without<T>, Changed<T>
-/// и кортежей из них в query.rs.
+/// Implemented for Read<T>, Write<T>, With<T>, Without<T>, Changed<T>
+/// and tuples of them in query.rs.
 ///
-/// Является основой для `AutoSystem::access()` — позволяет планировщику
-/// получить `AccessDescriptor` без ручного перечисления компонентов.
+/// It is the basis for `AutoSystem::access()` — it lets the scheduler
+/// obtain an `AccessDescriptor` without manually enumerating components.
 pub trait WorldQuerySystemAccess: WorldQuery {
     fn system_access() -> AccessDescriptor;
 }
 
 // ── AutoSystem ─────────────────────────────────────────────────
 
-/// Параллельная система с автоматическим выводом AccessDescriptor.
+/// A parallel system with automatic AccessDescriptor inference.
 ///
-/// # Мотивация
+/// # Motivation
 ///
-/// При использовании `ParSystem` с явным `AccessDescriptor` есть риск
-/// забыть задекларировать компонент:
+/// When using `ParSystem` with an explicit `AccessDescriptor` there is a risk
+/// of forgetting to declare a component:
 ///
 /// ```ignore
-/// // БАГИ: Write<Position> не указан — планировщик не видит конфликт
+/// // BUG: Write<Position> is not listed — the scheduler does not see the conflict
 /// fn access() -> AccessDescriptor {
-///     AccessDescriptor::new().read::<Velocity>() // забыли write::<Position>()
+///     AccessDescriptor::new().read::<Velocity>() // forgot write::<Position>()
 /// }
 /// fn run(&mut self, ctx: SystemContext<'_>) {
 ///     ctx.for_each::<(Read<Velocity>, Write<Position>), _>(...)
-///     //                                        ^^^^^^^^^^^^^^^ пишем, но не декларировали
+///     //                                        ^^^^^^^^^^^^^^^ we write, but did not declare it
 /// }
 /// ```
 ///
-/// `AutoSystem` устраняет этот класс багов: access выводится из `type Query`
-/// статически во время компиляции.
+/// `AutoSystem` eliminates this class of bugs: access is inferred from `type Query`
+/// statically at compile time.
 ///
-/// # Ресурсы и события
+/// # Resources and events
 ///
-/// Если системе нужен доступ к ресурсам или событиям, укажи их в
-/// ассоциированных типах `Resources` и `Events`:
+/// If a system needs access to resources or events, specify them in the
+/// associated types `Resources` and `Events`:
 ///
-/// # Примеры
+/// # Examples
 ///
 /// ```ignore
-/// // Только компоненты
+/// // Components only
 /// struct MovementSystem;
 /// impl AutoSystem for MovementSystem {
 ///     type Query = (Read<Velocity>, Write<Position>);
@@ -868,7 +869,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 ///     }
 /// }
 ///
-/// // Компоненты + ресурсы + события
+/// // Components + resources + events
 /// struct PhysicsSystem;
 /// impl AutoSystem for PhysicsSystem {
 ///     type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
@@ -883,23 +884,23 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 ///
 /// ```
 pub trait AutoSystem: Send + Sync {
-    /// Компонентный запрос — из него выводится часть `AccessDescriptor`.
+    /// A component query — part of the `AccessDescriptor` is inferred from it.
     type Query: WorldQuery + WorldQuerySystemAccess;
 
-    /// Ресурсы, которые нужны системе.
+    /// The resources the system needs.
     type Resources: ResourceAccessList;
 
-    /// События, которые система читает или пишет.
+    /// The events the system reads or writes.
     type Events: EventAccessList;
 
-    /// Системе нужны ВСЕ entity (глобальный доступ).
-    /// ASD-чанкование запрещено, система всегда получает полный SubWorld.
-    /// По умолчанию `false`.
+    /// The system needs ALL entities (global access).
+    /// ASD chunking is forbidden; the system always receives the full SubWorld.
+    /// Defaults to `false`.
     const NEEDS_WHOLE_WORLD: bool = false;
 
-    /// Система использует Commands (отложенные операции).
-    /// Устанавливается `system!` макросом автоматически при обнаружении `cmd: Cmd`.
-    /// Позволяет `compile()` вставлять auto-apply sync points.
+    /// The system uses Commands (deferred operations).
+    /// Set by the `system!` macro automatically when it detects `cmd: Cmd`.
+    /// Lets `compile()` insert auto-apply sync points.
     const HAS_DEFERRED: bool = false;
 
     fn run(&mut self, ctx: crate::world::SystemContext<'_>);
@@ -912,16 +913,16 @@ pub trait AutoSystem: Send + Sync {
     }
 }
 
-/// Эксклюзивная система — получает полный `&mut World`.
+/// An exclusive system — receives the full `&mut World`.
 ///
-/// Генерируется тем же макросом [`system!`](crate::system), когда среди
-/// параметров есть `world: &mut World`. Такая система объявляет **FULL access**
-/// (конфликтует со всем) и исполняется планировщиком в одиночку (sync-точка),
-/// между параллельными батчами. `world: &mut World` нельзя комбинировать с
-/// другими data-параметрами — макрос проверяет это и даёт compile-ошибку.
+/// Generated by the same [`system!`](crate::system) macro when the parameters
+/// include `world: &mut World`. Such a system declares **FULL access**
+/// (conflicts with everything) and is run by the scheduler alone (a sync point),
+/// between parallel batches. `world: &mut World` cannot be combined with
+/// other data parameters — the macro checks this and emits a compile error.
 ///
-/// Это замена удалённого `sequential_system!`: один макрос `system!` для
-/// параллельных и эксклюзивных систем, режим выбирается по наличию `&mut World`.
+/// This replaces the removed `sequential_system!`: a single `system!` macro for
+/// parallel and exclusive systems, the mode chosen by the presence of `&mut World`.
 pub trait ExclusiveSystem: Send + 'static {
     fn run(&mut self, world: &mut crate::world::World);
 
@@ -930,13 +931,13 @@ pub trait ExclusiveSystem: Send + 'static {
     }
 }
 
-/// Любое замыкание/функция `FnMut(&mut World)` — это эксклюзивная система.
+/// Any closure/function `FnMut(&mut World)` is an exclusive system.
 ///
-/// Унифицирует регистрацию: `add_exclusive_system` / `add_systems` принимают как
-/// struct-маркеры из `system!`, так и обычные `fn(&mut World)` (например,
-/// `propagate_transforms`) и инлайн-замыкания — единый профессиональный путь.
-/// Конфликта с ручными `impl ExclusiveSystem` из макроса нет: struct-маркеры не
-/// реализуют `FnMut`.
+/// Unifies registration: `add_exclusive_system` / `add_systems` accept both
+/// struct markers from `system!` and plain `fn(&mut World)` (for example,
+/// `propagate_transforms`) and inline closures — a single professional path.
+/// There is no conflict with hand-written `impl ExclusiveSystem` from the macro:
+/// struct markers do not implement `FnMut`.
 impl<F> ExclusiveSystem for F
 where
     F: FnMut(&mut crate::world::World) + Send + 'static,
@@ -947,15 +948,15 @@ where
     }
 }
 
-// ── Extract<P> — Bevy-совместимый SystemParam для extract-систем ──
+// ── Extract<P> — a Bevy-compatible SystemParam for extract systems ──
 
-/// Bevy-совместимый параметр extract-систем — читает из [`MainWorld`].
+/// A Bevy-compatible parameter of extract systems — reads from [`MainWorld`].
 ///
-/// Во время extract-стадии render-мир содержит временный ресурс `MainWorld`.
-/// `Extract<P>` прозрачно применяет внутренний `SystemParam P` к этому миру,
-/// а не к render-миру.
+/// During the extract stage the render world holds a temporary `MainWorld` resource.
+/// `Extract<P>` transparently applies the inner `SystemParam P` to that world,
+/// not to the render world.
 ///
-/// # Пример
+/// # Example
 ///
 /// ```ignore
 /// system! {
@@ -970,12 +971,12 @@ where
 /// }
 /// ```
 ///
-/// После extract-стадии `MainWorld` удаляется из render-мира и возвращается main-потоку.
+/// After the extract stage `MainWorld` is removed from the render world and returned to the main thread.
 pub struct Extract<P>(PhantomData<P>);
 
-// Extract<QueryParam<Q>> — читает компоненты из MainWorld. Форма обязана
-// быть read-only: extract по контракту НЕ пишет в main-мир (write-форма
-// теперь и не скомпилируется — ReadOnlyWorldQuery).
+// Extract<QueryParam<Q>> — reads components from MainWorld. The shape must be
+// read-only: by contract extract does NOT write to the main world (a write shape
+// now will not even compile — ReadOnlyWorldQuery).
 impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> SystemParam
     for Extract<QueryParam<Q>>
 {
@@ -993,7 +994,7 @@ impl<Q: WorldQuery + WorldQuerySystemAccess + crate::query::ReadOnlyWorldQuery> 
     }
 }
 
-// Extract<ResRead<T>> — читает ресурс из MainWorld
+// Extract<ResRead<T>> — reads a resource from MainWorld
 impl<T: Send + Sync + 'static> SystemParam for Extract<ResRead<T>> {
     type Item<'w> = Res<'w, T>;
     type State = ();
@@ -1009,7 +1010,7 @@ impl<T: Send + Sync + 'static> SystemParam for Extract<ResRead<T>> {
     }
 }
 
-// Extract<Listen<E>> — читает события из MainWorld
+// Extract<Listen<E>> — reads events from MainWorld
 impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
     type Item<'w> = EventReader<'w, E>;
     type State = ();

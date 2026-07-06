@@ -1,15 +1,15 @@
 use crate::world::{adaptive_chunk_size, ChunkConfig};
 use smallvec::SmallVec;
 
-/// Вычислить список чанков `(arch_idx, start, end)` для параллельной итерации.
+/// Compute the list of chunks `(arch_idx, start, end)` for parallel iteration.
 ///
-/// Принимает итератор пар `(arch_idx, len)` — индекс архетипа и количество entity в нём.
-/// Возвращает `SmallVec<[(usize, usize, usize); 64]>` где каждый элемент — `(arch_idx, start, end)`.
-/// Использует SmallVec с inline-буфером на 64 элемента, чтобы избежать heap-аллокации
-/// для типичных сценариев (20–30 архетипов, 1–4 чанка на архетип).
+/// Takes an iterator of `(arch_idx, len)` pairs — the archetype index and its entity count.
+/// Returns `SmallVec<[(usize, usize, usize); 64]>` where each element is `(arch_idx, start, end)`.
+/// Uses a SmallVec with a 64-element inline buffer to avoid heap allocation
+/// for typical scenarios (20–30 archetypes, 1–4 chunks per archetype).
 ///
-/// Использует [`adaptive_chunk_size`] для вычисления оптимального размера чанка.
-/// Эта функция является общей для `Query::par_for_each*` и `CachedQuery::par_for_each*`.
+/// Uses [`adaptive_chunk_size`] to compute the optimal chunk size.
+/// This function is shared by `Query::par_for_each*` and `CachedQuery::par_for_each*`.
 pub(crate) fn compute_par_chunks<I>(
     archetype_lens: I,
     num_threads: usize,

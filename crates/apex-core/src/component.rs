@@ -3,24 +3,24 @@ use linkme::distributed_slice;
 use rustc_hash::FxHashMap;
 use std::any::TypeId;
 
-/// Тип функции-регистратора: принимает мутабельный реестр, регистрирует компонент.
+/// Registrar function type: takes a mutable registry, registers a component.
 pub type ComponentRegistrarFn = fn(&mut ComponentRegistry);
 
-/// Глобальный список всех авторегистраторов компонентов.
-/// Заполняется линкером из всех крейтов, использующих #[derive(Component)].
+/// Global list of all component auto-registrars.
+/// Populated by the linker from every crate that uses #[derive(Component)].
 #[cfg(all(not(target_arch = "wasm32"), not(miri)))]
 #[distributed_slice]
 pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn] = [..];
 
-/// На wasm32 (и под Miri) `linkme::distributed_slice` недоступно —
-/// авторегистрация на `World::new()` не выполняется, компоненты регистрируются
-/// лениво (`get_or_register` на spawn/insert). Miri: linkme's distributed-slice
+/// On wasm32 (and under Miri) `linkme::distributed_slice` is unavailable —
+/// auto-registration on `World::new()` does not run, components are registered
+/// lazily (`get_or_register` on spawn/insert). Miri: linkme's distributed-slice
 /// address arithmetic overflows under Miri, so the same lazy path is used —
 /// components still register on first use (only `#[require]` pre-application is
-/// skipped, like wasm). ⚠ Следствие: `#[require(...)]` на wasm пока НЕ
-/// применяется (регистраторы derive не запускаются) — TD-25 в
-/// `apex-engine/plans/TECH_DEBT.md`, закрыть до первого wasm-рантайма (план:
-/// ленивый require через trait-метод Component).
+/// skipped, like wasm). ⚠ Consequence: `#[require(...)]` on wasm is not yet
+/// applied (derive registrars do not run) — TD-25 in
+/// `apex-engine/plans/TECH_DEBT.md`, to be closed before the first wasm runtime (plan:
+/// lazy require via a Component trait method).
 #[cfg(any(target_arch = "wasm32", miri))]
 pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn; 0] = [];
 
@@ -28,11 +28,11 @@ pub static COMPONENT_REGISTRARS: [ComponentRegistrarFn; 0] = [];
 pub struct ComponentId(pub u32);
 
 impl ComponentId {
-    /// Сентинел «компонент не зарегистрирован» — используется optional-формами
-    /// запросов (`Maybe`/`MaybeWrite`) и ветками `Or<>`, чтобы СОХРАНИТЬ
-    /// ВЫРАВНИВАНИЕ списка ids по `component_count()` (иначе компоненты после
-    /// незарегистрированного читали бы чужие id — латентный баг до W2).
-    /// Ни один реальный компонент этого id не получает (`next_id` растёт от 0).
+    /// Sentinel meaning "component not registered" — used by optional query
+    /// forms (`Maybe`/`MaybeWrite`) and `Or<>` branches to PRESERVE the
+    /// ALIGNMENT of the ids list against `component_count()` (otherwise components after
+    /// an unregistered one would read someone else's id — a latent bug until W2).
+    /// No real component ever gets this id (`next_id` grows from 0).
     pub const INVALID: Self = Self(u32::MAX);
 }
 
@@ -42,13 +42,13 @@ pub struct Tick(pub u32);
 impl Tick {
     pub const ZERO: Self = Self(0);
 
-    /// Максимальный «возраст» change-тика относительно текущего тика мира.
+    /// Maximum "age" of a change tick relative to the world's current tick.
     ///
-    /// `is_newer_than` — wrapping-сравнение, корректное при разнице < 2³¹.
-    /// Строка, не менявшаяся дольше, «перевернулась» бы в ложно-Changed
-    /// (~99 дней аптайма @250Hz). Периодический кламп
+    /// `is_newer_than` is a wrapping comparison, correct when the difference < 2³¹.
+    /// A row unchanged for longer would "wrap around" into a false Changed
+    /// (~99 days of uptime @250Hz). A periodic clamp
     /// ([`World::check_change_ticks`](crate::World::check_change_ticks))
-    /// подтягивает старые тики к этому возрасту, сохраняя инвариант (W2-3).
+    /// pulls old ticks up to this age, preserving the invariant (W2-3).
     pub const MAX_CHANGE_AGE: u32 = 1 << 30;
 
     #[inline]
@@ -56,8 +56,8 @@ impl Tick {
         self.0.wrapping_sub(last_run.0) as i32 > 0
     }
 
-    /// Подтянуть тик к окну `MAX_CHANGE_AGE` от `current`, если он старше.
-    /// Возвращает `true`, если кламп произошёл.
+    /// Pull the tick up to the `MAX_CHANGE_AGE` window from `current` if it is older.
+    /// Returns `true` if the clamp happened.
     #[inline]
     pub fn check_against(&mut self, current: Tick) -> bool {
         if current.0.wrapping_sub(self.0) > Self::MAX_CHANGE_AGE {
@@ -69,9 +69,9 @@ impl Tick {
     }
 }
 
-// ── Сериализация компонентов ───────────────────────────────────
+// ── Component serialization ────────────────────────────────────
 
-/// Результат сериализации одного компонента — байты в выбранном формате.
+/// Result of serializing a single component — bytes in the chosen format.
 pub type SerializeResult = Result<Vec<u8>, ComponentSerdeError>;
 pub type DeserializeResult = Result<Vec<u8>, ComponentSerdeError>;
 
@@ -94,30 +94,30 @@ impl std::fmt::Display for ComponentSerdeError {
     }
 }
 
-/// Таблица функций сериализации, хранящаяся в `ComponentInfo`.
+/// Table of serialization functions stored in `ComponentInfo`.
 ///
-/// Разделена на отдельную структуру чтобы `ComponentInfo` оставалась `Copy`-friendly
-/// там где это нужно, а сами fn-pointer'ы доступны опционально.
+/// Split into a separate struct so that `ComponentInfo` stays `Copy`-friendly
+/// where needed, while the fn-pointers themselves are available optionally.
 ///
 /// # Safety
-/// Обе функции работают с raw байтами компонента:
-/// - `serialize_fn(src_ptr)` — читает T из `src_ptr`, возвращает байты (JSON/bincode/RON)
-/// - `deserialize_fn(bytes)`  — принимает байты, возвращает выровненные байты T
-///   пригодные для записи в Column через `write_component`.
+/// Both functions operate on the component's raw bytes:
+/// - `serialize_fn(src_ptr)` — reads T from `src_ptr`, returns bytes (JSON/bincode/RON)
+/// - `deserialize_fn(bytes)`  — takes bytes, returns aligned bytes of T
+///   suitable for writing into a Column via `write_component`.
 ///
-/// Вызывающий обязан гарантировать что `src_ptr` указывает на живой T правильного типа.
-/// Непрозрачный **контекст (де)сериализации**, прокидываемый в [`ComponentSerdeFns`] (TD-44). Ядро НЕ
-/// знает его содержимого — потребитель (движок/редактор) реализует свой тип и **даункастит** через
-/// [`as_any_mut`](SerdeContext::as_any_mut). Так компонент с внешней ссылкой (Handle ассета,
-/// Entity-референс при ремапе) резолвит её при (де)сериализации, а apex-ecs остаётся **самостоятельным**
-/// — НИ ОДНОГО движкового/ассетного типа в сигнатурах ядра. Обычные компоненты контекст игнорируют.
+/// The caller must guarantee that `src_ptr` points to a live T of the correct type.
+/// An opaque **(de)serialization context**, threaded into [`ComponentSerdeFns`] (TD-44). The core does
+/// NOT know its contents — the consumer (engine/editor) implements its own type and **downcasts** via
+/// [`as_any_mut`](SerdeContext::as_any_mut). This way a component holding an external reference (an asset
+/// Handle, an Entity reference during remap) resolves it during (de)serialization, while apex-ecs stays
+/// **self-contained** — NOT A SINGLE engine/asset type in the core signatures. Ordinary components ignore the context.
 pub trait SerdeContext: std::any::Any {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
-/// Пустой контекст по умолчанию — для обычной (де)сериализации без резолва внешних ссылок. Старые
-/// `WorldSerializer::snapshot/restore` используют его, поэтому существующие компоненты не затрагиваются.
+/// The default empty context — for ordinary (de)serialization without resolving external references. The old
+/// `WorldSerializer::snapshot/restore` use it, so existing components are unaffected.
 pub struct NoContext;
 impl SerdeContext for NoContext {
     #[inline]
@@ -132,28 +132,28 @@ impl SerdeContext for NoContext {
 
 #[derive(Clone)]
 pub struct ComponentSerdeFns {
-    /// Сериализовать компонент по raw-указателю в байты. `ctx` — опциональный резолвер внешних ссылок
-    /// (обычные компоненты его игнорируют; контекст-зависимые даункастят, см. [`SerdeContext`]).
+    /// Serialize the component from a raw pointer into bytes. `ctx` is an optional external-reference resolver
+    /// (ordinary components ignore it; context-dependent ones downcast, see [`SerdeContext`]).
     pub serialize_fn: unsafe fn(*const u8, &mut dyn SerdeContext) -> SerializeResult,
-    /// Десериализовать байты обратно в выровненный буфер с данными T (с тем же `ctx`).
+    /// Deserialize bytes back into an aligned buffer holding T's data (with the same `ctx`).
     pub deserialize_fn: fn(&[u8], &mut dyn SerdeContext) -> DeserializeResult,
-    /// Человекочитаемое имя формата: "json", "bincode", "ron".
+    /// Human-readable format name: "json", "bincode", "ron".
     pub format: &'static str,
 }
 
-/// Ремап `Entity`-ссылок ВНУТРИ компонента (E6, MapEntities-аналог Bevy). После
-/// `restore` snapshot все старые `Entity` пересоздаются с НОВЫМИ id; компонент,
-/// хранящий `Entity` (напр. `Target(Entity)`), обязан обновить свои ссылки, иначе
-/// они указывают в пустоту. Вызывается ВТОРЫМ проходом restore, когда карта
-/// old→new полна (в т.ч. forward-ссылки).
+/// Remap of `Entity` references INSIDE a component (E6, Bevy's MapEntities analog). After
+/// a snapshot `restore` all old `Entity`s are recreated with NEW ids; a component
+/// holding an `Entity` (e.g. `Target(Entity)`) must update its references, otherwise
+/// they point into the void. Called by the SECOND restore pass, when the
+/// old→new map is complete (including forward references).
 ///
 /// # Safety
-/// `ptr` — валидный `*mut T` живого компонента этого типа; `f` применяется к
-/// каждой `Entity`-ссылке и возвращает её новый id.
+/// `ptr` is a valid `*mut T` of a live component of this type; `f` is applied to
+/// each `Entity` reference and returns its new id.
 pub type MapEntitiesFn = unsafe fn(*mut u8, f: &mut dyn FnMut(crate::Entity) -> crate::Entity);
 
-/// Компонент, хранящий `Entity`-ссылки, которые нужно ремапить при restore
-/// snapshot (E6). Регистрируется через
+/// A component holding `Entity` references that must be remapped on snapshot
+/// restore (E6). Registered via
 /// [`World::register_map_entities`](crate::World::register_map_entities).
 ///
 /// ```ignore
@@ -168,36 +168,36 @@ pub trait MapEntities {
     fn map_entities(&mut self, f: &mut dyn FnMut(crate::Entity) -> crate::Entity);
 }
 
-// ── Хуки компонентов (W3-1) ────────────────────────────────────
+// ── Component hooks (W3-1) ─────────────────────────────────────
 
-/// Хук состава: вызывается ПОСЛЕ завершения структурной операции, когда мир
-/// консистентен (`on_add` — компонент уже у entity; `on_remove` — компонента
-/// уже нет; при `despawn` entity уже мертва — `is_alive` вернёт `false`).
+/// Composition hook: called AFTER a structural operation completes, when the world
+/// is consistent (`on_add` — the component is already on the entity; `on_remove` — the
+/// component is already gone; on `despawn` the entity is already dead — `is_alive` returns `false`).
 ///
-/// Хук получает `&mut World` и может делать любые операции, включая
-/// структурные — вложенные хуки ставятся в ту же очередь и обрабатываются
-/// тем же диспетчером (без рекурсии). Только не-захватывающие функции
-/// (fn-pointer): состояние подписчика живёт в ресурсах/компонентах.
-/// Один хук на компонент на вид события; для нескольких подписчиков
-/// используйте события ([`World::track_removals`](crate::World::track_removals)).
+/// The hook receives `&mut World` and may perform any operation, including
+/// structural ones — nested hooks are enqueued into the same queue and processed
+/// by the same dispatcher (no recursion). Only non-capturing functions
+/// (fn-pointers): the subscriber's state lives in resources/components.
+/// One hook per component per event kind; for multiple subscribers
+/// use events ([`World::track_removals`](crate::World::track_removals)).
 pub type ComponentHookFn = fn(&mut crate::World, crate::Entity);
 
-/// Эмиттер события `Removed<T>` — мономорфизированный fn-pointer,
-/// ставится `World::track_removals::<T>()`.
+/// Emitter of the `Removed<T>` event — a monomorphized fn-pointer,
+/// installed by `World::track_removals::<T>()`.
 pub(crate) type EmitRemovedFn = fn(&mut crate::events::EventRegistry, crate::Entity);
 
-/// Биты `ComponentRegistry::flags` — быстрый «есть ли подписчики» без
-/// hashmap-lookup'а на горячих структурных путях.
+/// `ComponentRegistry::flags` bits — a fast "are there any subscribers" check without
+/// a hashmap lookup on hot structural paths.
 pub(crate) const FLAG_ON_ADD: u8 = 1;
 pub(crate) const FLAG_ON_REMOVE: u8 = 2;
 pub(crate) const FLAG_TRACK_REMOVED: u8 = 4;
-/// У компонента есть required-компоненты (D2-4, `#[require(...)]`).
+/// The component has required components (D2-4, `#[require(...)]`).
 pub(crate) const FLAG_REQUIRES: u8 = 8;
-/// Маска «появление компонента кого-то интересует» (requires + on_add).
+/// Mask "the appearance of the component is of interest to someone" (requires + on_add).
 pub(crate) const ADDED_NOTIFY_MASK: u8 = FLAG_ON_ADD | FLAG_REQUIRES;
 
-/// Вставка недостающего required-компонента (D2-4): no-op, если `R` уже есть
-/// у entity (явное значение из спавна/бандла ВСЕГДА выигрывает у дефолта).
+/// Insertion of a missing required component (D2-4): a no-op if `R` is already on
+/// the entity (an explicit value from spawn/bundle ALWAYS wins over the default).
 pub(crate) type RequiredInsertFn = fn(&mut crate::World, crate::Entity);
 
 #[derive(Default, Clone, Copy)]
@@ -216,42 +216,42 @@ pub struct ComponentInfo {
     pub size: usize,
     pub align: usize,
     pub drop_fn: unsafe fn(*mut u8),
-    /// Функции сериализации — `None` если компонент не помечен как Serializable.
-    /// Заполняется при вызове `register_component_serde::<T>()`.
+    /// Serialization functions — `None` if the component is not marked as Serializable.
+    /// Populated by a call to `register_component_serde::<T>()`.
     pub serde: Option<ComponentSerdeFns>,
-    /// Ремап Entity-ссылок при restore (E6) — `None`, если компонент их не
-    /// хранит. Заполняется `register_map_entities::<T>()`.
+    /// Remap of Entity references on restore (E6) — `None` if the component does not
+    /// hold any. Populated by `register_map_entities::<T>()`.
     pub map_entities: Option<MapEntitiesFn>,
 }
 
 // ── Component trait ────────────────────────────────────────────
 
 pub trait Component: Send + Sync + 'static {
-    /// Регистрация **required-компонентов** (`#[require(...)]`, D2-4). Дефолт — требований нет;
-    /// `#[derive(Component)]` переопределяет его, вызывая `register_required::<Self, R>()` для каждого
-    /// `R`. Вызывается из [`ComponentRegistry::register`] РОВНО ОДИН РАЗ при первой регистрации типа —
-    /// поэтому `#[require]` работает на **ВСЕХ** платформах (включая wasm) через ленивую регистрацию,
-    /// **без** `linkme`/linker-магии: на нативе требования регистрирует distributed-slice-регистратор
-    /// (через `register`), на wasm — первое использование компонента (тоже через `register`). TD-25.
+    /// Registration of **required components** (`#[require(...)]`, D2-4). The default is no requirements;
+    /// `#[derive(Component)]` overrides it, calling `register_required::<Self, R>()` for each
+    /// `R`. Called from [`ComponentRegistry::register`] EXACTLY ONCE on the type's first registration —
+    /// therefore `#[require]` works on **ALL** platforms (including wasm) via lazy registration,
+    /// **without** `linkme`/linker magic: natively the requirements are registered by the distributed-slice registrar
+    /// (via `register`), on wasm by the component's first use (also via `register`). TD-25.
     fn register_requires(_registry: &mut ComponentRegistry) {}
 }
 
 #[cfg(feature = "cgmath")]
 impl Component for cgmath::Matrix4<f32> {}
 
-/// Маркер: компонент можно сериализовать/десериализовать.
+/// Marker: the component can be serialized/deserialized.
 ///
-/// # Пример
+/// # Example
 /// ```ignore
 /// #[derive(Serialize, Deserialize)]
 /// struct Position { x: f32, y: f32 }
 ///
-/// // Регистрация:
+/// // Registration:
 /// world.register_component_serde::<Position>();
 /// ```
 ///
-/// Компоненты без этого маркера (PhysicsHandle, RenderMesh, …) пропускаются
-/// при снэпшоте — это нормально, они должны пересоздаваться из сериализованного state.
+/// Components without this marker (PhysicsHandle, RenderMesh, …) are skipped
+/// during a snapshot — that is fine, they are meant to be recreated from the serialized state.
 pub trait Serializable: Component + serde::Serialize + for<'de> serde::Deserialize<'de> {}
 impl<T> Serializable for T where T: Component + serde::Serialize + for<'de> serde::Deserialize<'de> {}
 
@@ -261,16 +261,16 @@ pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
     ptr.cast::<T>().drop_in_place();
 }
 
-// ── Реализация serde fn для конкретного T ─────────────────────
+// ── serde fn implementation for a concrete T ──────────────────
 
-/// Создаёт `ComponentSerdeFns` для типа T реализующего `Serializable`.
+/// Creates `ComponentSerdeFns` for a type T implementing `Serializable`.
 ///
-/// Внутри использует `bincode` как компактный бинарный формат.
-/// Формат можно сменить — достаточно поменять реализацию двух замыканий.
+/// Internally uses `bincode` as a compact binary format.
+/// The format can be changed — it is enough to swap the implementation of the two closures.
 pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
         serialize_fn: |ptr, _ctx| {
-            // SAFETY: вызывающий гарантирует валидность ptr как *const T
+            // SAFETY: the caller guarantees the validity of ptr as *const T
             let val = unsafe { &*(ptr as *const T) };
             bincode::serialize(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
@@ -278,11 +278,11 @@ pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
         deserialize_fn: |bytes, _ctx| {
             let val: T = bincode::deserialize(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
-            // Упаковываем T в выровненный байтовый буфер для записи в Column.
+            // Pack T into an aligned byte buffer for writing into a Column.
             let size = std::mem::size_of::<T>();
             let mut buf = vec![0u8; size];
             if size > 0 {
-                // SAFETY: buf достаточного размера, T: Copy-compatible через serde
+                // SAFETY: buf is large enough, T: Copy-compatible via serde
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         &val as *const T as *const u8,
@@ -298,8 +298,8 @@ pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
     }
 }
 
-/// Создаёт `ComponentSerdeFns` для типа T реализующего `Serializable`
-/// с использованием `serde_json` (текстовый формат для отладки/логов).
+/// Creates `ComponentSerdeFns` for a type T implementing `Serializable`
+/// using `serde_json` (a text format for debugging/logs).
 pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
         serialize_fn: |ptr, _ctx| {
@@ -332,21 +332,21 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
 
 pub struct ComponentRegistry {
     type_to_id: FxHashMap<TypeId, ComponentId>,
-    /// HashMap вместо Vec — историческое решение (произвольные ID relations
-    /// до CR-M1); ids сейчас плотные от 0.
+    /// HashMap instead of Vec — a historical decision (arbitrary relation IDs
+    /// before CR-M1); ids are now dense from 0.
     by_id: FxHashMap<u32, ComponentInfo>,
     next_id: u32,
-    /// Биты подписок per-ComponentId ([`FLAG_ON_ADD`]/[`FLAG_ON_REMOVE`]/
-    /// [`FLAG_TRACK_REMOVED`]) — индекс = `ComponentId.0` (ids плотные).
-    /// Горячие структурные пути сначала смотрят [`any_flags`](Self::any_flags)
-    /// (один bool), потом бит — hashmap-lookup'ов нет.
+    /// Subscription bits per-ComponentId ([`FLAG_ON_ADD`]/[`FLAG_ON_REMOVE`]/
+    /// [`FLAG_TRACK_REMOVED`]) — index = `ComponentId.0` (ids are dense).
+    /// Hot structural paths first check [`any_flags`](Self::any_flags)
+    /// (a single bool), then the bit — no hashmap lookups.
     flags: Vec<u8>,
-    /// Сами хуки — только для компонентов с ненулевыми flags.
+    /// The hooks themselves — only for components with non-zero flags.
     hooks: FxHashMap<u32, ComponentHooks>,
-    /// Required-компоненты per cid (D2-4): вставляются дефолтом, если
-    /// отсутствуют, ПОСЛЕ появления компонента-владельца (через очередь
-    /// хуков, до пользовательского on_add; транзитивность — естественно
-    /// через ту же очередь).
+    /// Required components per cid (D2-4): inserted by default if
+    /// absent, AFTER the owning component appears (via the hook
+    /// queue, before the user's on_add; transitivity comes naturally
+    /// through the same queue).
     requires: FxHashMap<u32, Vec<RequiredInsertFn>>,
     any_flags: bool,
 }
@@ -364,10 +364,10 @@ impl ComponentRegistry {
         }
     }
 
-    /// Объявить: компонент `C` требует `R` (D2-4, аналог Bevy
-    /// `#[require(...)]`). При ПОЯВЛЕНИИ `C` у entity недостающий `R`
-    /// вставляется `R::default()` (явно заданное значение всегда выигрывает).
-    /// Вызывается registrar'ом derive-макроса или вручную
+    /// Declare: component `C` requires `R` (D2-4, Bevy's
+    /// `#[require(...)]` analog). When `C` APPEARS on an entity, a missing `R`
+    /// is inserted as `R::default()` (an explicitly set value always wins).
+    /// Called by the derive-macro registrar or manually
     /// ([`World::require_component`](crate::World::require_component)).
     pub fn register_required<C: Component, R: Component + Default>(&mut self) {
         let cid = self.register::<C>();
@@ -383,21 +383,21 @@ impl ComponentRegistry {
         self.set_flag(cid, FLAG_REQUIRES);
     }
 
-    /// Required-вставки компонента (D2-4); `None` — требований нет.
+    /// The component's required inserts (D2-4); `None` — no requirements.
     #[inline]
     pub(crate) fn requires(&self, cid: ComponentId) -> Option<&[RequiredInsertFn]> {
         self.requires.get(&cid.0).map(|v| v.as_slice())
     }
 
-    // ── Хуки (W3-1) ────────────────────────────────────────────
+    // ── Hooks (W3-1) ───────────────────────────────────────────
 
-    /// Есть ли в мире хоть один подписчик на состав (fast-path гейт).
+    /// Whether the world has at least one composition subscriber (fast-path gate).
     #[inline]
     pub(crate) fn any_flags(&self) -> bool {
         self.any_flags
     }
 
-    /// Биты подписок компонента (0 — подписчиков нет).
+    /// The component's subscription bits (0 — no subscribers).
     #[inline]
     pub(crate) fn flags(&self, cid: ComponentId) -> u8 {
         self.flags.get(cid.0 as usize).copied().unwrap_or(0)
@@ -421,18 +421,18 @@ impl ComponentRegistry {
         self.hooks.entry(cid.0).or_default()
     }
 
-    /// Регистрирует все компоненты, объявленные через `#[derive(Component)]`.
-    /// Вызывается один раз при создании World.
+    /// Registers all components declared via `#[derive(Component)]`.
+    /// Called once at World creation.
     ///
-    /// Работает через `linkme::distributed_slice` — линкер собирает
-    /// статические регистраторы из всех крейтов, использующих макрос.
+    /// Works via `linkme::distributed_slice` — the linker collects
+    /// the static registrars from every crate that uses the macro.
     pub fn register_all_auto(&mut self) {
         for registrar in COMPONENT_REGISTRARS {
             registrar(self);
         }
     }
 
-    /// Зарегистрировать компонент без сериализации.
+    /// Register a component without serialization.
     pub fn register<T: Component>(&mut self) -> ComponentId {
         let type_id = TypeId::of::<T>();
         if let Some(&id) = self.type_to_id.get(&type_id) {
@@ -454,17 +454,17 @@ impl ComponentRegistry {
             },
         );
         self.type_to_id.insert(type_id, id);
-        // Зарегистрировать required-компоненты (`#[require]`) РОВНО ОДИН РАЗ — здесь, на первой
-        // регистрации типа (re-entrant `register::<T>` из `register_required` выйдет рано, т.к. T уже
-        // в `type_to_id`). Платформо-независимо: работает и без distributed-slice (wasm — TD-25).
+        // Register the required components (`#[require]`) EXACTLY ONCE — here, on the type's first
+        // registration (a re-entrant `register::<T>` from `register_required` returns early, since T is already
+        // in `type_to_id`). Platform-independent: works even without a distributed-slice (wasm — TD-25).
         T::register_requires(self);
         id
     }
 
-    /// Зарегистрировать компонент с поддержкой сериализации.
+    /// Register a component with serialization support.
     ///
-    /// Если компонент уже зарегистрирован — только добавляет serde-функции,
-    /// ID и layout не меняются.
+    /// If the component is already registered — only adds the serde functions,
+    /// the ID and layout do not change.
     pub fn register_serde<T: Serializable>(&mut self) -> ComponentId {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(&id.0) {
@@ -475,11 +475,11 @@ impl ComponentRegistry {
         id
     }
 
-    /// Зарегистрировать компонент с **контекст-зависимыми** serde-функциями (TD-44): компонент с
-    /// внешней ссылкой (Handle ассета, Entity-референс) (де)сериализуется через [`SerdeContext`],
-    /// который даёт `WorldSerializer::*_with` / `PrefabLoader`. В отличие от [`register_serde`], **всегда
-    /// заменяет** serde-функции (контекст-зависимые важнее дефолтных bincode/json). Сам резолвер живёт в
-    /// движке/редакторе — ядро остаётся ассет-агностичным.
+    /// Register a component with **context-dependent** serde functions (TD-44): a component with
+    /// an external reference (an asset Handle, an Entity reference) is (de)serialized via [`SerdeContext`],
+    /// which is provided by `WorldSerializer::*_with` / `PrefabLoader`. Unlike [`register_serde`], it **always
+    /// replaces** the serde functions (context-dependent ones take priority over the default bincode/json). The resolver itself lives in
+    /// the engine/editor — the core stays asset-agnostic.
     pub fn register_serde_with<T: Component>(&mut self, fns: ComponentSerdeFns) -> ComponentId {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(&id.0) {
@@ -488,18 +488,18 @@ impl ComponentRegistry {
         id
     }
 
-    /// Установить [`MapEntitiesFn`] компонента (E6). Компонент должен быть уже
-    /// зарегистрирован (`id` из `get_or_register`).
+    /// Set the component's [`MapEntitiesFn`] (E6). The component must already be
+    /// registered (`id` from `get_or_register`).
     pub(crate) fn set_map_entities(&mut self, id: ComponentId, f: MapEntitiesFn) {
         if let Some(info) = self.by_id.get_mut(&id.0) {
             info.map_entities = Some(f);
         }
     }
 
-    /// Зарегистрировать компонент с поддержкой сериализации (JSON-формат).
+    /// Register a component with serialization support (JSON format).
     ///
-    /// Если компонент уже зарегистрирован — только добавляет serde-функции,
-    /// ID и layout не меняются.
+    /// If the component is already registered — only adds the serde functions,
+    /// the ID and layout do not change.
     pub fn register_serde_json<T: Serializable>(&mut self) -> ComponentId {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(&id.0) {
@@ -514,7 +514,7 @@ impl ComponentRegistry {
         self.type_to_id.get(&TypeId::of::<T>()).copied()
     }
 
-    /// Получить ComponentId по TypeId (для динамических запросов).
+    /// Get a ComponentId by TypeId (for dynamic queries).
     pub fn get_id_by_type(&self, type_id: &TypeId) -> Option<ComponentId> {
         self.type_to_id.get(type_id).copied()
     }
@@ -527,12 +527,12 @@ impl ComponentRegistry {
         self.by_id.get(&id.0)
     }
 
-    /// Итерация по всем зарегистрированным компонентам.
+    /// Iterate over all registered components.
     pub fn iter(&self) -> impl Iterator<Item = &ComponentInfo> {
         self.by_id.values()
     }
 
-    /// Только компоненты у которых есть serde-функции.
+    /// Only components that have serde functions.
     pub fn iter_serializable(&self) -> impl Iterator<Item = &ComponentInfo> {
         self.by_id.values().filter(|info| info.serde.is_some())
     }

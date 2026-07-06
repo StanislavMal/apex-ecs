@@ -59,7 +59,7 @@ pub struct ArchetypeId(pub(crate) u32);
 impl ArchetypeId {
     pub const EMPTY: Self = Self(0);
 
-    /// Получить внутренний индекс (для доступа к `world.archetypes()`).
+    /// Get the internal index (for access to `world.archetypes()`).
     pub fn as_usize(self) -> usize {
         self.0 as usize
     }
@@ -73,24 +73,25 @@ pub struct Column {
     drop_fn: unsafe fn(*mut u8),
     pub(crate) len: usize,
     pub(crate) capacity: usize,
-    /// Per-row тик последнего изменения (для change detection).
+    /// Per-row tick of the last change (for change detection).
     /// `TickCell` so the change-detection hot path may write through a shared
     /// `&Column` soundly (A2).
     pub(crate) change_ticks: Vec<TickCell>,
-    /// Per-row тик ДОБАВЛЕНИЯ компонента entity (W3-1, фильтр `Added<T>`).
+    /// Per-row tick of the component's ADDITION to the entity (W3-1, `Added<T>`
+    /// filter).
     ///
-    /// Семантика: ставится при появлении компонента у entity (spawn/insert
-    /// нового) и ПЕРЕЖИВАЕТ archetype move (insert/remove соседних компонентов
-    /// entity её не «обновляют»). Замена значения через `insert` поверх
-    /// существующего компонента обновляет ТОЛЬКО change-tick (как Bevy:
-    /// re-insert не перезапускает `Added<T>`).
+    /// Semantics: set when a component first appears on an entity (spawn/insert
+    /// of a new one) and SURVIVES an archetype move (insert/remove of the
+    /// entity's neighboring components does not "refresh" it). Replacing a value
+    /// via `insert` over an existing component updates ONLY the change-tick (like
+    /// Bevy: a re-insert does not restart `Added<T>`).
     pub(crate) added_ticks: Vec<TickCell>,
 }
 
 unsafe impl Send for Column {}
 unsafe impl Sync for Column {}
 
-/// Публичное представление колонки для внешних крейтов.
+/// Public view of a column for external crates.
 pub struct ColumnView<'a> {
     col: &'a Column,
 }
@@ -123,7 +124,7 @@ impl Column {
         }
     }
 
-    /// Публичный accessor для component_id колонки.
+    /// Public accessor for the column's component_id.
     #[inline]
     pub fn id(&self) -> ComponentId {
         self.component_id
@@ -153,14 +154,14 @@ impl Column {
         *ptr.add(row) = tick;
     }
 
-    /// Проставить change-tick ДИАПАЗОНУ строк `[start, end)` (W2-0.5).
+    /// Stamp the change-tick over a RANGE of rows `[start, end)` (W2-0.5).
     ///
-    /// Используется плотной итерацией ([`DenseQuery`](crate::query::DenseQuery)):
-    /// контракт «слайс на запись = весь диапазон changed». Простой цикл
-    /// векторизуется компилятором в fill.
+    /// Used by dense iteration ([`DenseQuery`](crate::query::DenseQuery)): the
+    /// contract is "a write slice = the whole range changed". The plain loop is
+    /// vectorized by the compiler into a fill.
     ///
     /// # Safety
-    /// `end <= self.len`; никакая другая ссылка на тики этих строк не существует.
+    /// `end <= self.len`; no other reference to these rows' ticks exists.
     #[inline]
     pub unsafe fn stamp_range(&self, start: usize, end: usize, tick: Tick) {
         debug_assert!(end <= self.len);
@@ -207,11 +208,11 @@ impl Column {
         &mut *(self.get_ptr(row) as *mut T)
     }
 
-    /// Записать новый элемент в конец, проставить тики изменения и добавления.
+    /// Append a new element at the end, stamping the change and added ticks.
     ///
-    /// `push` — путь СВЕЖЕГО значения (spawn / insert нового компонента):
-    /// added-tick == change-tick == `tick`. Для переноса строки между
-    /// архетипами с сохранением тиков см. [`push_moved`](Self::push_moved).
+    /// `push` is the FRESH-value path (spawn / insert of a new component):
+    /// added-tick == change-tick == `tick`. To move a row between archetypes
+    /// while preserving ticks see [`push_moved`](Self::push_moved).
     ///
     /// # Safety
     /// `src` must point to an initialized value of the column's component type
@@ -230,12 +231,13 @@ impl Column {
         self.len += 1;
     }
 
-    /// Дозаписать тики ПЕРЕНЕСЁННОЙ строки (archetype move): данные уже
-    /// скопированы вызывающим, оба тика сохраняются как были — перенос
-    /// entity между архетипами не «обновляет» ни `Changed<T>`, ни `Added<T>`.
+    /// Append the ticks of a MOVED row (archetype move): the data has already
+    /// been copied by the caller, both ticks are preserved as-is — moving an
+    /// entity between archetypes does not "refresh" either `Changed<T>` or
+    /// `Added<T>`.
     ///
     /// # Safety
-    /// Данные строки `len` уже записаны; вызывается ровно один раз на строку.
+    /// The data for row `len` is already written; called exactly once per row.
     #[inline]
     pub(crate) unsafe fn push_moved_ticks(&mut self, changed: Tick, added: Tick) {
         self.change_ticks.push(TickCell::new(changed));
@@ -243,14 +245,14 @@ impl Column {
         self.len += 1;
     }
 
-    /// Записать типизированное значение в колонку по заданной строке и инкрементировать `len`.
+    /// Write a typed value into the column at the given row and increment `len`.
     ///
-    /// Используется derive-макросом [`#[derive(Bundle)]`](apex_macros::Bundle) для записи
-    /// компонентов в архетип.
+    /// Used by the [`#[derive(Bundle)]`](apex_macros::Bundle) derive macro to
+    /// write components into an archetype.
     ///
     /// # Safety
-    /// Вызывающий гарантирует что `T` соответствует `self.component_id`,
-    /// а `row == self.len` (запись всегда в конец колонки).
+    /// The caller guarantees that `T` matches `self.component_id`, and that
+    /// `row == self.len` (writes are always at the end of the column).
     #[inline]
     pub unsafe fn write_typed_at<T>(&mut self, value: T, row: usize, tick: Tick) {
         debug_assert!(
@@ -263,11 +265,11 @@ impl Column {
         std::mem::forget(value);
     }
 
-    /// Записать элемент в уже существующую строку, обновить тик.
+    /// Write an element into an already existing row and update the tick.
     ///
-    /// НЕ дропает прежнее значение — для строк, чьё содержимое уже вынесено
-    /// (move) либо тривиально. Для перезаписи ЖИВОГО значения используйте
-    /// [`replace_at`](Self::replace_at), иначе Drop-типы текут.
+    /// Does NOT drop the previous value — for rows whose contents were already
+    /// moved out (move) or are trivial. To overwrite a LIVE value use
+    /// [`replace_at`](Self::replace_at), otherwise Drop types leak.
     ///
     /// # Safety
     /// `row < self.len`; `src` points to an initialized value of the column's
@@ -283,10 +285,10 @@ impl Column {
         }
     }
 
-    /// Заменить ЖИВОЕ значение строки: дропнуть старое, записать новое, тик.
+    /// Replace a row's LIVE value: drop the old, write the new, stamp the tick.
     ///
-    /// Закрывает утечку `insert` поверх существующего компонента (W2-1):
-    /// старое значение Drop-типа (String, Vec, Arc…) раньше молча терялось.
+    /// Closes the leak of `insert` over an existing component (W2-1): the old
+    /// value of a Drop type (String, Vec, Arc…) was previously silently lost.
     ///
     /// # Safety
     /// `row < self.len`; the row currently holds a live, initialized value of
@@ -298,7 +300,7 @@ impl Column {
         self.write_at(row, src, tick);
     }
 
-    /// Кламп старых change/added-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3).
+    /// Clamp old change/added ticks to the `Tick::MAX_CHANGE_AGE` window (W2-3).
     pub(crate) fn check_change_ticks(&mut self, current: Tick) {
         for t in &mut self.change_ticks {
             t.get_mut().check_against(current);
@@ -354,13 +356,13 @@ impl Column {
 
     pub(crate) fn grow(&mut self) {
         let new_cap = if self.capacity == 0 {
-            // Целевой размер первого выделения: ~256 байт минимум, но не более 64 элементов.
-            // Для крупных компонентов (Mat4=64B, Transform=~48B) — 4 элемента.
-            // Для мелких (f32=4B, u8=1B) — 64 элемента.
+            // Target size of the first allocation: ~256 bytes minimum, but no more
+            // than 64 elements. For large components (Mat4=64B, Transform=~48B) — 4
+            // elements. For small ones (f32=4B, u8=1B) — 64 elements.
             if self.item_size == 0 {
                 64
             } else {
-                // 256 байт / item_size, зажатые в [4, 64]
+                // 256 bytes / item_size, clamped to [4, 64]
                 (256 / self.item_size.max(1)).clamp(4, 64)
             }
         } else {
@@ -371,7 +373,7 @@ impl Column {
             return;
         }
         if self.capacity == 0 {
-            // Первое выделение — через alloc (realloc с null ptr — UB)
+            // First allocation — via alloc (realloc with a null ptr is UB)
             let new_layout = self.layout_for(new_cap);
             self.data = unsafe {
                 let ptr = alloc(new_layout);
@@ -379,9 +381,10 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
-            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
-            // (A11: соседний путь раньше умножал без проверки переполнения).
+            // Reallocation — realloc: one syscall instead of alloc+copy+dealloc.
+            // `new_size` via `layout_for` — the same checked_mul as in the alloc
+            // branch (A11: the neighboring path previously multiplied without an
+            // overflow check).
             let old_layout = self.layout_for(self.capacity);
             let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
@@ -393,8 +396,8 @@ impl Column {
         self.capacity = new_cap;
     }
 
-    /// Предварительное выделение памяти под `additional` элементов.
-    /// Позволяет избежать множественных grow() при массовых spawn'ах.
+    /// Pre-allocate memory for `additional` elements.
+    /// Avoids multiple grow() calls during bulk spawns.
     pub(crate) fn reserve(&mut self, additional: usize) {
         let needed = self.len + additional;
         if needed <= self.capacity {
@@ -410,7 +413,7 @@ impl Column {
             return;
         }
         if self.capacity == 0 {
-            // Первое выделение — через alloc
+            // First allocation — via alloc
             let new_layout = self.layout_for(new_cap);
             self.data = unsafe {
                 let ptr = alloc(new_layout);
@@ -418,9 +421,10 @@ impl Column {
                 ptr
             };
         } else {
-            // Перевыделение — realloc: один syscall вместо alloc+copy+dealloc.
-            // `new_size` через `layout_for` — тот же checked_mul, что в alloc-ветке
-            // (A11: соседний путь раньше умножал без проверки переполнения).
+            // Reallocation — realloc: one syscall instead of alloc+copy+dealloc.
+            // `new_size` via `layout_for` — the same checked_mul as in the alloc
+            // branch (A11: the neighboring path previously multiplied without an
+            // overflow check).
             let old_layout = self.layout_for(self.capacity);
             let new_size = self.layout_for(new_cap).size();
             self.data = unsafe {
@@ -434,7 +438,7 @@ impl Column {
         self.added_ticks.reserve(additional);
     }
 
-    /// Тик изменения для строки row
+    /// Change tick for row `row`
     #[inline]
     pub fn get_tick(&self, row: usize) -> Tick {
         self.change_ticks
@@ -443,7 +447,7 @@ impl Column {
             .unwrap_or(Tick::ZERO)
     }
 
-    /// Тик добавления компонента для строки row (W3-1, `Added<T>`).
+    /// Component-added tick for row `row` (W3-1, `Added<T>`).
     #[inline]
     pub fn get_added_tick(&self, row: usize) -> Tick {
         self.added_ticks
@@ -452,7 +456,7 @@ impl Column {
             .unwrap_or(Tick::ZERO)
     }
 
-    /// Указатель на массив тиков — для zero-cost Changed<T> query.
+    /// Pointer to the tick array — for zero-cost Changed<T> query.
     /// `TickCell` is `#[repr(transparent)]` over `Tick`, so the base pointer is
     /// a valid `*const Tick` over the whole buffer.
     #[inline]
@@ -460,19 +464,19 @@ impl Column {
         self.change_ticks.as_ptr() as *const Tick
     }
 
-    /// Указатель на массив added-тиков — для zero-cost `Added<T>` query
+    /// Pointer to the added-ticks array — for zero-cost `Added<T>` query
     #[inline]
     pub fn added_ticks_ptr(&self) -> *const Tick {
         self.added_ticks.as_ptr() as *const Tick
     }
 
-    /// Сырой указатель на данные — для chunk-level параллелизма
+    /// Raw pointer to the data — for chunk-level parallelism
     #[inline]
     pub fn data_ptr(&self) -> *mut u8 {
         self.data
     }
 
-    /// Аллоцированная память колонки: (байты данных, байты тиков) — для
+    /// Allocated memory of the column: (data bytes, tick bytes) — for
     /// [`World::archetype_stats`](crate::World::archetype_stats) (W3-5).
     pub(crate) fn allocated_bytes(&self) -> (usize, usize) {
         let data = if self.item_size == 0 {
@@ -543,14 +547,15 @@ impl Archetype {
         self.entities.is_empty()
     }
 
-    /// Порог линейного поиска колонки: на ≤8 компонентах скан inline-SmallVec
-    /// быстрее FxHashMap-lookup'а (CR-M3; критерий — frag_world random get_mut).
+    /// Column linear-search threshold: at ≤8 components, scanning the inline
+    /// SmallVec is faster than an FxHashMap lookup (CR-M3; benchmark — frag_world
+    /// random get_mut).
     const COLUMN_LINEAR_MAX: usize = 8;
 
     #[inline]
     pub fn column_index(&self, component_id: ComponentId) -> Option<usize> {
-        // Инвариант: columns построены в порядке component_ids, поэтому
-        // позиция в component_ids == значение в column_map.
+        // Invariant: columns are built in the order of component_ids, so the
+        // position in component_ids == the value in column_map.
         if self.component_ids.len() <= Self::COLUMN_LINEAR_MAX {
             self.component_ids.iter().position(|&c| c == component_id)
         } else {
@@ -589,14 +594,14 @@ impl Archetype {
         Some(self.columns[col_idx].get_mut::<T>(row))
     }
 
-    /// Обновить change tick для компонента в указанной строке.
+    /// Update the change tick for a component in the given row.
     ///
-    /// Использует сырые указатели для interior mutation через `&self`,
-    /// что позволяет обновлять tick без `&mut self`.
+    /// Uses raw pointers for interior mutation through `&self`, which allows
+    /// updating the tick without `&mut self`.
     ///
     /// # Safety
-    /// - `row` должен быть < len колонки
-    /// - Никакая другая mutable ссылка на колонку не должна существовать
+    /// - `row` must be < the column's len
+    /// - No other mutable reference to the column may exist
     pub unsafe fn set_change_tick(&self, row: usize, component_id: ComponentId, tick: Tick) {
         if let Some(col_idx) = self.column_index(component_id) {
             self.columns[col_idx].set_change_tick(row, tick);
@@ -638,8 +643,8 @@ impl Archetype {
         }
     }
 
-    /// Записать компонент: в новую строку — push, поверх живого значения —
-    /// replace (с дропом старого). Используется групповым `insert_parts` (W2-1).
+    /// Write a component: into a new row — push, over a live value — replace
+    /// (dropping the old one). Used by the batched `insert_parts` (W2-1).
     ///
     /// # Safety
     /// `src` points to an initialized value of the component type registered
@@ -684,19 +689,19 @@ impl Archetype {
         }
     }
 
-    /// Публичный итератор колонок через ColumnView (безопасный, без raw).
+    /// Public column iterator via ColumnView (safe, no raw).
     pub fn columns(&self) -> impl Iterator<Item = ColumnView<'_>> {
         self.columns.iter().map(|col| ColumnView { col })
     }
 
-    /// Сырой срез колонок — для apex-scripting query-итератора.
+    /// Raw column slice — for the apex-scripting query iterator.
     ///
     /// # Safety
-    /// Вызывающий должен гарантировать что:
-    /// - Нет concurrent structural changes во время итерации
-    /// - Индексы row не выходят за пределы col.len
+    /// The caller must guarantee that:
+    /// - There are no concurrent structural changes during iteration
+    /// - Row indices do not exceed col.len
     ///
-    /// Используется только `RhaiQueryIter` в однопоточном контексте.
+    /// Used only by `RhaiQueryIter` in a single-threaded context.
     #[inline]
     pub fn columns_raw(&self) -> &[Column] {
         &self.columns
@@ -707,23 +712,23 @@ impl Archetype {
     }
 }
 
-/// Описание одного чанка архетипа для chunk-level параллелизма.
+/// Description of a single archetype chunk for chunk-level parallelism.
 ///
-/// Содержит сырые указатели на срезы данных [start, start+len).
-/// SAFETY: используется только внутри Rayon scope пока архетип жив
-/// и не происходит structural changes.
+/// Holds raw pointers to data slices [start, start+len).
+/// SAFETY: used only inside a Rayon scope while the archetype is alive
+/// and no structural changes occur.
 pub struct ArchetypeChunk<'a> {
     pub entities: &'a [Entity],
     pub arch_id: ArchetypeId,
-    /// Индекс строки start внутри архетипа (для column_index lookup)
+    /// Index of the start row within the archetype (for column_index lookup)
     pub start_row: usize,
     pub len: usize,
 }
 
-/// Разбить архетип на чанки фиксированного размера.
+/// Split an archetype into fixed-size chunks.
 ///
-/// Возвращает срезы `entities` длиной `chunk_size` (последний может быть меньше).
-/// Используется `par_for_each` для параллельной итерации внутри одного архетипа.
+/// Returns `entities` slices of length `chunk_size` (the last may be smaller).
+/// Used by `par_for_each` for parallel iteration within a single archetype.
 pub fn archetype_chunks(
     arch: &Archetype,
     chunk_size: usize,
@@ -938,7 +943,7 @@ mod tests {
             col.swap_remove_no_drop(1);
         }
         assert_eq!(col.len, 4);
-        // Последний элемент (4.0) перемещён на место удалённого (1)
+        // The last element (4.0) is moved into the removed slot (1)
         unsafe {
             assert_eq!(*col.get::<f32>(0), 0.0);
             assert_eq!(*col.get::<f32>(1), 4.0);
@@ -1081,7 +1086,7 @@ mod tests {
 
         let swapped = unsafe { arch.remove_row(0) };
         assert_eq!(arch.len(), 1);
-        assert_eq!(swapped, Some(e2)); // последний переехал на место 0
+        assert_eq!(swapped, Some(e2)); // the last one moved into slot 0
     }
 
     #[test]

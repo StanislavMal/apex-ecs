@@ -1,29 +1,31 @@
-//! Relations — связи между entity.
+//! Relations — links between entities.
 //!
-//! # Модель (CR-M1, 2026-06-11)
+//! # Model (CR-M1, 2026-06-11)
 //!
-//! Пара `(kind, target)` НЕ является компонентом и не входит в идентичность
-//! архетипа. Истина о связях живёт в двух индексах мира:
+//! The `(kind, target)` pair is NOT a component and does not participate in
+//! archetype identity. The truth about relations lives in two world indexes:
 //!
-//! - [`SubjectIndex`]: `entity.index` → набор [`RelationPair`] (kind + target
-//!   **целиком**, с generation) — отвечает за `has_relation`,
-//!   `target_of`, сериализацию;
-//! - [`TargetIndex`]: `(kind, target.index)` → subjects — отвечает за
-//!   `targets_of` (O(детей)), `query_relation`/`query_wildcard` и
-//!   **cascade delete при `despawn(target)`**.
+//! - [`SubjectIndex`]: `entity.index` → set of [`RelationPair`] (kind + target
+//!   **in full**, with generation) — backs `has_relation`,
+//!   `target_of`, serialization;
+//! - [`TargetIndex`]: `(kind, target.index)` → subjects — backs
+//!   `targets_of` (O(children)), `query_relation`/`query_wildcard` and
+//!   **cascade delete on `despawn(target)`**.
 //!
-//! Следствия:
-//! - `add_relation` = две индекс-вставки, БЕЗ структурного изменения
-//!   (нет archetype move, нет нового архетипа, нет инвалидации QueryCache);
-//! - `despawn(target)` вычищает все связи, где entity — target; для kind'ов с
-//!   `cascade_delete_on_target_despawn()` subjects деспавнятся каскадом;
-//! - generation-честность: в индексах хранится `Entity` целиком, поэтому
-//!   переиспользование `entity.index` новым поколением не возвращает чужие
-//!   связи; лимитов кодирования (2^20 на index, 2^11 на kind) больше нет.
+//! Consequences:
+//! - `add_relation` = two index insertions, WITHOUT any structural change
+//!   (no archetype move, no new archetype, no QueryCache invalidation);
+//! - `despawn(target)` clears every relation where the entity is the target; for
+//!   kinds with `cascade_delete_on_target_despawn()` the subjects are despawned
+//!   cascadingly;
+//! - generation-correctness: the indexes store the whole `Entity`, so
+//!   reusing `entity.index` for a new generation does not return foreign
+//!   relations; the encoding limits (2^20 for index, 2^11 for kind) are gone.
 //!
-//! Историческая модель «пара кодируется в ComponentId и входит в состав
-//! архетипа» фрагментировала мир на архетип-на-родителя (many_foxes @1000 —
-//! 22k архетипов) и удалена; см. apex-engine/plans/CORE_REFACTORING.md (C-1..C-3).
+//! The historical model where "the pair is encoded into a ComponentId and forms
+//! part of the archetype" fragmented the world into an archetype-per-parent
+//! (many_foxes @1000 — 22k archetypes) and has been removed; see
+//! apex-engine/plans/CORE_REFACTORING.md (C-1..C-3).
 
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -38,7 +40,7 @@ use crate::{
 
 // ── RelationPair ───────────────────────────────────────────────
 
-/// Одна связь субъекта: вид + target целиком (index + generation).
+/// A single relation of a subject: kind + target in full (index + generation).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RelationPair {
     pub kind_idx: u32,
@@ -64,9 +66,9 @@ impl Ord for RelationPair {
     }
 }
 
-/// Порог переключения от Sparse к Dense хранению отношений.
-/// При количестве отношений > DENSE_THRESHOLD на сущность,
-/// хранилище переключается на HashSet для O(1) операций.
+/// Threshold for switching from Sparse to Dense relation storage.
+/// When the number of relations per entity exceeds DENSE_THRESHOLD,
+/// the storage switches to a HashSet for O(1) operations.
 const DENSE_THRESHOLD: usize = 8;
 
 /// Upper bound on the ancestor walk used for cycle detection in `add_relation`.
@@ -75,12 +77,12 @@ const DENSE_THRESHOLD: usize = 8;
 /// pathological chain while never limiting any real scene graph.
 const MAX_ANCESTOR_WALK: usize = 1 << 20;
 
-/// Хранилище отношений для одной сущности.
+/// Relation storage for a single entity.
 ///
-/// - `Sparse`: отсортированный SmallVec для малого числа отношений (≤8).
-///   Использует binary_search — O(log n).
-/// - `Dense`: FxHashSet для большого числа отношений (>8).
-///   Все операции O(1) amortized.
+/// - `Sparse`: a sorted SmallVec for a small number of relations (≤8).
+///   Uses binary_search — O(log n).
+/// - `Dense`: FxHashSet for a large number of relations (>8).
+///   All operations O(1) amortized.
 enum PairStorage {
     Sparse(SmallVec<[RelationPair; 4]>),
     Dense(rustc_hash::FxHashSet<RelationPair>),
@@ -93,17 +95,17 @@ impl Default for PairStorage {
 }
 
 impl PairStorage {
-    /// true, если пары не было (вставлена впервые).
+    /// true if the pair was absent (inserted for the first time).
     #[inline]
     fn insert(&mut self, pair: RelationPair) -> bool {
         match self {
             Self::Sparse(sv) => {
                 let pos = match sv.binary_search(&pair) {
-                    Ok(_) => return false, // уже существует
+                    Ok(_) => return false, // already exists
                     Err(pos) => pos,
                 };
                 sv.insert(pos, pair);
-                // Auto-upgrade: при превышении порога переключаемся на Dense
+                // Auto-upgrade: switch to Dense once the threshold is exceeded
                 if sv.len() > DENSE_THRESHOLD {
                     let set: rustc_hash::FxHashSet<RelationPair> = sv.drain(..).collect();
                     *self = Self::Dense(set);
@@ -145,7 +147,7 @@ impl PairStorage {
         }
     }
 
-    /// Первая пара заданного вида (для Sparse — с минимальным target).
+    /// First pair of the given kind (for Sparse — with the smallest target).
     #[inline]
     fn first_with_kind(&self, kind_idx: u32) -> Option<RelationPair> {
         match self {
@@ -168,7 +170,7 @@ impl PairStorage {
         }
     }
 
-    /// Забрать все пары, оставив хранилище пустым (без аллокаций при Sparse≤4).
+    /// Take all pairs, leaving the storage empty (no allocations for Sparse≤4).
     fn take_all(&mut self) -> SmallVec<[RelationPair; 4]> {
         match self {
             Self::Sparse(sv) => std::mem::take(sv),
@@ -185,9 +187,9 @@ impl PairStorage {
 
 #[derive(Default)]
 struct SubjectEntry {
-    /// Битовая маска: бит k установлен ↔ есть relation с kind_idx = k.
+    /// Bitmask: bit k is set ↔ there is a relation with kind_idx = k.
     kind_mask: u64,
-    /// Хранилище пар (Sparse для ≤8, Dense для >8).
+    /// Pair storage (Sparse for ≤8, Dense for >8).
     storage: PairStorage,
 }
 
@@ -213,7 +215,7 @@ impl SubjectEntry {
     fn remove(&mut self, pair: RelationPair) -> bool {
         let existed = self.storage.remove(pair);
         if existed && pair.kind_idx < 64 {
-            // Проверяем, остались ли ещё отношения этого вида
+            // Check whether any relations of this kind remain
             if !self.storage.contains_kind(pair.kind_idx) {
                 self.kind_mask &= !(1u64 << pair.kind_idx);
             }
@@ -249,7 +251,7 @@ impl SubjectIndex {
         }
     }
 
-    /// true, если пары не было (вставлена впервые).
+    /// true if the pair was absent (inserted for the first time).
     #[inline]
     pub fn insert(&mut self, entity_index: u32, pair: RelationPair) -> bool {
         let idx = entity_index as usize;
@@ -283,7 +285,7 @@ impl SubjectIndex {
         entry.storage.first_with_kind(kind_idx)
     }
 
-    /// Забрать все пары entity (для despawn).
+    /// Take all pairs of an entity (for despawn).
     #[inline]
     pub fn take_all(&mut self, entity_index: u32) -> SmallVec<[RelationPair; 4]> {
         let idx = entity_index as usize;
@@ -295,7 +297,7 @@ impl SubjectIndex {
         }
     }
 
-    /// Итерация всех (subject_index, pair) — для сериализации.
+    /// Iterate all (subject_index, pair) — for serialization.
     pub fn iter_all(&self) -> impl Iterator<Item = (u32, RelationPair)> + '_ {
         self.entries
             .iter()
@@ -313,15 +315,15 @@ impl Default for SubjectIndex {
 
 // ── TargetIndex ────────────────────────────────────────────────
 
-/// Обратный индекс: `(kind, target.index)` → subjects.
+/// Reverse index: `(kind, target.index)` → subjects.
 ///
-/// Ключ — голый `target.index`: записи вычищаются при despawn target'а,
-/// поэтому живая запись всегда принадлежит ТЕКУЩЕМУ поколению индекса
-/// (generation-честность обеспечивается чисткой, subjects хранятся целиком).
+/// The key is the bare `target.index`: entries are cleared on the target's
+/// despawn, so a live entry always belongs to the CURRENT generation of the index
+/// (generation-correctness is ensured by the cleanup, subjects are stored in full).
 pub(crate) struct TargetIndex {
-    /// kind_idx → (target.index → subjects в порядке вставки).
+    /// kind_idx → (target.index → subjects in insertion order).
     by_kind: Vec<FxHashMap<u32, SmallVec<[Entity; 4]>>>,
-    /// Число пар, где `entity.index` — target (fast-skip в despawn).
+    /// Number of pairs where `entity.index` is the target (fast-skip in despawn).
     target_counts: Vec<u32>,
 }
 
@@ -387,7 +389,7 @@ impl TargetIndex {
         true
     }
 
-    /// Забрать всех subjects записи `(kind, target.index)` (для despawn).
+    /// Take all subjects of the entry `(kind, target.index)` (for despawn).
     #[inline]
     pub fn take_subjects(
         &mut self,
@@ -409,7 +411,7 @@ impl TargetIndex {
             .unwrap_or(&[])
     }
 
-    /// Все subjects вида (wildcard) — по одному вхождению на пару.
+    /// All subjects of a kind (wildcard) — one occurrence per pair.
     pub fn all_subjects(&self, kind_idx: u32) -> impl Iterator<Item = Entity> + '_ {
         self.by_kind
             .get(kind_idx as usize)
@@ -417,7 +419,7 @@ impl TargetIndex {
             .flat_map(|m| m.values().flat_map(|sv| sv.iter().copied()))
     }
 
-    /// Есть ли хоть одна связь, где данный index — target.
+    /// Whether there is any relation where the given index is the target.
     #[inline]
     pub fn has_target(&self, entity_index: u32) -> bool {
         self.target_counts
@@ -436,9 +438,9 @@ impl Default for TargetIndex {
 // ── RelationKind ───────────────────────────────────────────────
 
 pub trait RelationKind: Copy + Send + Sync + 'static {
-    /// При `despawn(target)` subjects этого вида деспавнятся каскадом.
-    /// Для остальных видов связь просто вычищается из индексов
-    /// (ни одна связь не переживает свой target).
+    /// On `despawn(target)` subjects of this kind are despawned cascadingly.
+    /// For other kinds the relation is simply cleared from the indexes
+    /// (no relation outlives its target).
     fn cascade_delete_on_target_despawn() -> bool {
         false
     }
@@ -453,22 +455,22 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
 
 // ── RelationRegistry ───────────────────────────────────────────
 
-/// Хук связи (W3-1): `fn(&mut World, subject, target)` — вызывается после
-/// завершения операции на консистентном мире (despawn-вычистка: entity могут
-/// быть уже мертвы). Только fn-pointer; один хук на вид на событие.
+/// Relation hook (W3-1): `fn(&mut World, subject, target)` — called after the
+/// operation completes on a consistent world (despawn cleanup: entities may
+/// already be dead). fn-pointer only; one hook per kind per event.
 pub type RelationHookFn = fn(&mut crate::world::World, Entity, Entity);
 
 pub struct RelationRegistry {
     type_to_idx: FxHashMap<TypeId, u32>,
     cascade_flags: Vec<bool>,
     exclusive_flags: Vec<bool>,
-    /// kind_idx → type_name строка (для сериализации).
-    /// Инвариант: `idx_to_name[kind_idx]` заполняется в `get_or_register`.
+    /// kind_idx → type_name string (for serialization).
+    /// Invariant: `idx_to_name[kind_idx]` is filled in `get_or_register`.
     idx_to_name: Vec<String>,
-    /// type_name → kind_idx (для десериализации).
+    /// type_name → kind_idx (for deserialization).
     name_to_idx: FxHashMap<String, u32>,
     next_idx: u32,
-    /// Хуки per kind_idx (W3-1); `any_hooks` — fast-path гейт горячих путей.
+    /// Hooks per kind_idx (W3-1); `any_hooks` — fast-path gate for hot paths.
     on_add_hooks: Vec<Option<RelationHookFn>>,
     on_remove_hooks: Vec<Option<RelationHookFn>>,
     any_hooks: bool,
@@ -503,7 +505,7 @@ impl RelationRegistry {
         self.on_add_hooks.push(None);
         self.on_remove_hooks.push(None);
 
-        // Регистрируем name для сериализации
+        // Register the name for serialization
         let name = std::any::type_name::<R>().to_string();
         self.idx_to_name.push(name.clone());
         self.name_to_idx.insert(name, idx);
@@ -511,13 +513,13 @@ impl RelationRegistry {
         idx
     }
 
-    // ── Хуки связей (W3-1) ─────────────────────────────────────
+    // ── Relation hooks (W3-1) ──────────────────────────────────
 
     pub(crate) fn set_on_add(&mut self, kind_idx: u32, hook: RelationHookFn) {
         let slot = &mut self.on_add_hooks[kind_idx as usize];
         assert!(
             slot.is_none(),
-            "on_relation_add-хук для вида {} уже зарегистрирован (один хук на вид)",
+            "on_relation_add hook for kind {} is already registered (one hook per kind)",
             self.idx_to_name[kind_idx as usize]
         );
         *slot = Some(hook);
@@ -528,7 +530,7 @@ impl RelationRegistry {
         let slot = &mut self.on_remove_hooks[kind_idx as usize];
         assert!(
             slot.is_none(),
-            "on_relation_remove-хук для вида {} уже зарегистрирован (один хук на вид)",
+            "on_relation_remove hook for kind {} is already registered (one hook per kind)",
             self.idx_to_name[kind_idx as usize]
         );
         *slot = Some(hook);
@@ -554,7 +556,7 @@ impl RelationRegistry {
             .flatten()
     }
 
-    /// Быстрая проверка «у вида есть on_remove-хук» (despawn-вычистка).
+    /// Fast check "the kind has an on_remove hook" (despawn cleanup).
     #[inline]
     pub(crate) fn has_remove_hook(&self, kind_idx: u32) -> bool {
         self.on_remove_hook(kind_idx).is_some()
@@ -580,28 +582,28 @@ impl RelationRegistry {
             .unwrap_or(false)
     }
 
-    // ── Методы для сериализации ────────────────────────────────
+    // ── Serialization methods ──────────────────────────────────
 
-    /// Получить type_name строку по kind_idx.
+    /// Get the type_name string by kind_idx.
     ///
-    /// Используется `WorldSerializer::snapshot` для записи human-readable
-    /// имени relation в снэпшот.
+    /// Used by `WorldSerializer::snapshot` to write the human-readable
+    /// relation name into the snapshot.
     #[inline]
     pub fn get_name(&self, kind_idx: u32) -> Option<&str> {
         self.idx_to_name.get(kind_idx as usize).map(|s| s.as_str())
     }
 
-    /// Получить kind_idx по type_name строке.
+    /// Get the kind_idx by type_name string.
     ///
-    /// Используется `WorldSerializer::restore` при восстановлении relations.
-    /// Возвращает `None` если RelationKind не зарегистрирован в текущем мире
-    /// (например, был удалён из кода после сохранения).
+    /// Used by `WorldSerializer::restore` when restoring relations.
+    /// Returns `None` if the RelationKind is not registered in the current world
+    /// (for example, it was removed from the code after saving).
     #[inline]
     pub fn get_idx_by_name(&self, name: &str) -> Option<u32> {
         self.name_to_idx.get(name).copied()
     }
 
-    /// Количество зарегистрированных видов relations.
+    /// Number of registered relation kinds.
     pub fn kind_count(&self) -> usize {
         self.next_idx as usize
     }
@@ -616,14 +618,14 @@ impl Default for RelationRegistry {
 // ── World extension ────────────────────────────────────────────
 
 impl World {
-    /// Добавить связь `(kind, target)` субъекту.
+    /// Add a relation `(kind, target)` to a subject.
     ///
-    /// Две индекс-вставки, БЕЗ структурного изменения мира (не создаёт
-    /// архетипов, не двигает entity, не инвалидирует кэш запросов).
+    /// Two index insertions, WITHOUT any structural change to the world (creates
+    /// no archetypes, does not move entities, does not invalidate the query cache).
     ///
-    /// Мёртвые subject/target игнорируются (с warn в лог): связь с мёртвым
-    /// target никогда не была бы вычищена и при переиспользовании индекса
-    /// указала бы на чужую entity.
+    /// Dead subject/target are ignored (with a warn in the log): a relation to a
+    /// dead target would never be cleared and, on index reuse, would point at a
+    /// foreign entity.
     ///
     /// # Re-parenting and transforms (C5)
     ///
@@ -640,8 +642,8 @@ impl World {
         self.add_relation_by_kind_idx(subject, kind_idx, target);
     }
 
-    /// Низкоуровневый вариант `add_relation` по уже известному kind_idx
-    /// (горячие циклы, restore в apex-serialization).
+    /// Low-level variant of `add_relation` by an already-known kind_idx
+    /// (hot loops, restore in apex-serialization).
     pub fn add_relation_by_kind_idx(&mut self, subject: Entity, kind_idx: u32, target: Entity) {
         debug_assert!(
             (kind_idx as usize) < self.relations.kind_count(),
@@ -748,7 +750,7 @@ impl World {
         }
     }
 
-    /// O(1) проверка через SubjectIndex: kind_mask check + binary_search.
+    /// O(1) check via SubjectIndex: kind_mask check + binary_search.
     #[inline]
     pub fn has_relation<R: RelationKind>(&self, subject: Entity, _kind: R, target: Entity) -> bool {
         if !self.entities.is_alive(subject) {
@@ -794,10 +796,10 @@ impl World {
         }
     }
 
-    /// Subjects связи `(kind, target)` с данными компонентов `Q`.
+    /// Subjects of the relation `(kind, target)` with component data `Q`.
     ///
-    /// План исполнения: subjects из TargetIndex → группировка по архетипам →
-    /// `fetch_state` на архетип + точечные строки. O(детей), не O(архетипов).
+    /// Execution plan: subjects from TargetIndex → grouping by archetypes →
+    /// `fetch_state` per archetype + pinpoint rows. O(children), not O(archetypes).
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -814,8 +816,8 @@ impl World {
         self.relation_iter_for_subjects(subjects.iter().copied())
     }
 
-    /// Все subjects, имеющие связь вида `R` (wildcard `(R, *)`).
-    /// Subject с несколькими target'ами одного вида выдаётся по разу на пару.
+    /// All subjects that have a relation of kind `R` (wildcard `(R, *)`).
+    /// A subject with several targets of one kind is yielded once per pair.
     pub fn query_wildcard<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -835,7 +837,7 @@ impl World {
         let mut data_ids = crate::query::IdBuf::new();
         Q::fill_ids(self, &mut data_ids);
 
-        // Локации subjects, сгруппированные по архетипу (sort по arch, row).
+        // Subject locations, grouped by archetype (sorted by arch, row).
         let mut locs: Vec<(u32, u32)> = subjects
             .filter_map(|s| {
                 self.entities
@@ -907,20 +909,21 @@ impl World {
             .map(|p| p.target)
     }
 
-    /// Рекурсивный despawn поддерева по виду связи.
+    /// Recursive despawn of a subtree by relation kind.
     ///
-    /// Для kind'ов с `cascade_delete_on_target_despawn()` обычный `despawn`
-    /// корня делает то же самое автоматически.
+    /// For kinds with `cascade_delete_on_target_despawn()` a plain `despawn` of
+    /// the root does the same thing automatically.
     pub fn despawn_recursive<R: RelationKind + Copy>(&mut self, _kind: R, entity: Entity) {
-        // Каскадный kind (напр. ChildOf): обычный `despawn` УЖЕ сносит всё поддерево эффективно —
-        // его внутренний стек делает `take_subjects` (забирает ВЕСЬ список детей разом, O(поддерева)).
-        // Ручная же рекурсия ниже снесла бы детей ПЕРВЫМИ, удаляя каждого из target-списка ещё
-        // живого родителя через linear search+remove ⇒ O(n²) (на 1000 детей было 2.4× медленнее Bevy).
+        // Cascading kind (e.g. ChildOf): a plain `despawn` ALREADY tears down the whole subtree
+        // efficiently — its internal stack uses `take_subjects` (grabs the ENTIRE child list at once,
+        // O(subtree)). The manual recursion below would tear down children FIRST, removing each from
+        // the still-alive parent's target list via linear search+remove ⇒ O(n²) (for 1000 children it
+        // was 2.4× slower than Bevy).
         if R::cascade_delete_on_target_despawn() {
             self.despawn(entity);
             return;
         }
-        // Не-каскадный kind: связь не сносит subjects автоматически — обходим вручную.
+        // Non-cascading kind: the relation does not tear down subjects automatically — walk manually.
         let children: Vec<Entity> = self.targets_of(_kind, entity).collect();
         for child in children {
             self.despawn_recursive(_kind, child);
@@ -928,7 +931,7 @@ impl World {
         self.despawn(entity);
     }
 
-    /// Все связи мира: `(subject.index, kind_idx, target)` — для сериализации.
+    /// All relations of the world: `(subject.index, kind_idx, target)` — for serialization.
     pub fn iter_relations(&self) -> impl Iterator<Item = (u32, u32, Entity)> + '_ {
         self.subject_index
             .iter_all()
@@ -946,7 +949,7 @@ pub(crate) struct RelationArchState<S> {
 pub struct RelationIter<'w, Q: WorldQuery> {
     world: &'w World,
     groups: Vec<RelationArchState<Q::State>>,
-    /// (индекс группы, row) на каждого subject.
+    /// (group index, row) per subject.
     rows: Vec<(u32, u32)>,
     cursor: usize,
 }
@@ -979,7 +982,7 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
     }
 }
 
-// ── Встроенные relation kinds ──────────────────────────────────
+// ── Built-in relation kinds ────────────────────────────────────
 
 #[derive(Clone, Copy)]
 pub struct ChildOf;
@@ -1001,7 +1004,7 @@ impl RelationKind for Owns {}
 pub struct Likes;
 impl RelationKind for Likes {}
 
-// ── Тесты ─────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1052,7 +1055,7 @@ mod tests {
         assert_eq!(
             world.archetype_count(),
             arch_count,
-            "add_relation не должен создавать архетипов"
+            "add_relation must not create archetypes"
         );
     }
 
@@ -1083,11 +1086,11 @@ mod tests {
         let mut reg = RelationRegistry::new();
         let idx = reg.get_or_register::<ChildOf>();
 
-        // Проверяем что имя сохраняется
+        // Verify the name is stored
         let name = reg.get_name(idx).unwrap();
         assert!(name.contains("ChildOf"));
 
-        // Проверяем обратный поиск
+        // Verify the reverse lookup
         let found_idx = reg.get_idx_by_name(name).unwrap();
         assert_eq!(found_idx, idx);
     }
@@ -1119,9 +1122,9 @@ mod tests {
         assert_eq!(world.target_of(child, ChildOf), Some(parent));
     }
 
-    // ── Новые гарантии CR-M1 ───────────────────────────────────
+    // ── New CR-M1 guarantees ───────────────────────────────────
 
-    /// C-2: cascade-вид (ChildOf) деспавнит детей при despawn родителя.
+    /// C-2: a cascade kind (ChildOf) despawns children on the parent's despawn.
     #[test]
     fn despawn_target_cascades() {
         let mut world = World::new();
@@ -1134,10 +1137,10 @@ mod tests {
         world.add_relation(leaf, ChildOf, child);
 
         world.despawn(root);
-        assert_eq!(world.entity_count(), 0, "ChildOf — cascade: дети умирают с родителем");
+        assert_eq!(world.entity_count(), 0, "ChildOf — cascade: children die with the parent");
     }
 
-    /// C-2: не-cascade вид — subjects живут, но связь вычищается.
+    /// C-2: a non-cascade kind — subjects survive, but the relation is cleared.
     #[test]
     fn despawn_target_clears_non_cascade() {
         let mut world = World::new();
@@ -1153,11 +1156,11 @@ mod tests {
         assert_eq!(
             world.target_of(item, Owns),
             None,
-            "связь не должна переживать свой target"
+            "a relation must not outlive its target"
         );
     }
 
-    /// C-2/C-3: переиспользованный index не возвращает чужие связи.
+    /// C-2/C-3: a reused index does not return foreign relations.
     #[test]
     fn reused_index_does_not_leak_relations() {
         let mut world = World::new();
@@ -1166,18 +1169,18 @@ mod tests {
         let child = world.spawn((Position { x: 1.0, y: 0.0 },));
         world.add_relation(child, ChildOf, parent);
 
-        world.despawn(parent); // cascade: child тоже умер
+        world.despawn(parent); // cascade: the child died too
 
-        // Новые entity переиспользуют оба освободившихся индекса
+        // New entities reuse both freed indexes
         let n1 = world.spawn((Position { x: 9.0, y: 9.0 },));
         let n2 = world.spawn((Position { x: 8.0, y: 8.0 },));
         let newcomer = [n1, n2]
             .into_iter()
             .find(|e| e.index() == parent.index())
-            .expect("тест требует переиспользования index родителя");
+            .expect("the test requires reuse of the parent's index");
 
         assert_eq!(world.targets_of(ChildOf, newcomer).count(), 0);
-        // Стейл-хэндл старого родителя тоже ничего не возвращает
+        // A stale handle of the old parent also returns nothing
         assert_eq!(world.targets_of(ChildOf, parent).count(), 0);
     }
 
@@ -1324,7 +1327,7 @@ mod tests {
         for &t in &targets {
             assert!(world.has_relation(hub, Likes, t));
         }
-        // Удаление одного target'а вычищает ровно его
+        // Removing one target clears exactly that one
         world.despawn(targets[7]);
         assert!(!world.has_relation(hub, Likes, targets[7]));
         let alive = targets.iter().filter(|&&t| world.has_relation(hub, Likes, t)).count();
