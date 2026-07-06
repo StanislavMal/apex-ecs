@@ -252,7 +252,13 @@ Bevy-модель идиоматически верна (не мимикрия).
 (в) `executor_parity.rs` расширить change-detection-сценарием (seq ↔ hybrid — одинаковые
 наблюдаемые change-сеты).
 
-### 1.3 Run-to-run детерминизм-гейт (постоянный, не разовый спайк)
+### 1.3 Run-to-run детерминизм-гейт (постоянный, не разовый спайк) ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `apex-scheduler/tests/determinism.rs` — 5 гейтов: concurrent_spawn (3 системы
+> гоняются), spawn_despawn_churn (25 кадров reuse), conditional_spawn (run_until-гейт), event_driven
+> (события→спавн), escrow_spike (спайк в пределах эскроу, валидирует 1.1). Каждый — id-ЧУВСТВИТЕЛЬНЫЙ
+> снапшот дважды в одном процессе с `set_deterministic_spawn(true)`, ассерт байт-идентичности
+> (сильнее parity-гейта D9: тот только семантика seq↔par). Дешёвый CI-гейт против дрейфа детерминизма.
 
 **Как:** новый тест-таргет `apex-scheduler/tests/determinism.rs`:
 - Репрезентативные schedule'ы (переиспользовать матрицу `executor_parity.rs`: spawn+move,
