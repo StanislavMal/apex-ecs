@@ -1,12 +1,13 @@
-# APEX ECS — Entity Component System Engine
+# ApexForge_ECS — Entity Component System Engine
 ### Руководство пользователя
-> **Версия 0.3.0** | Rust Edition 2021
+> **Версия 0.1.0** | Rust Edition 2021
 
 ---
 
 ## Содержание
 
 1. [Введение](#1-введение)
+   - [1.4 Быстрый старт — рабочий мир за 20 строк](#14-быстрый-старт--рабочий-мир-за-20-строк)
 2. [Основные концепции](#2-основные-концепции)
    - [2.4 Миграция с Bevy — таблица соответствий](#24-миграция-с-bevy--таблица-соответствий-d2-8)
 3. [Архетипы и хранилище](#3-архетипы-и-хранилище)
@@ -34,23 +35,29 @@
 
 ## 1. Введение
 
-**Apex ECS** — это высокопроизводительный движок Entity Component System (ECS), написанный на Rust. Он разработан для применения в игровых движках и симуляциях, где требуется обработка сотен тысяч объектов с минимальными накладными расходами.
+**ApexForge_ECS** — это высокопроизводительный движок Entity Component System (ECS), написанный на Rust. Он разработан для применения в игровых движках и симуляциях, где требуется обработка сотен тысяч объектов с минимальными накладными расходами.
+
+> **О продукте.** Продуктовое имя движка — **ApexForge_ECS**. Крейты называются `apex-core`,
+> `apex-scheduler`, `apex-serialization` и т.д. (импорты `use apex_core::prelude::*;`) — имена крейтов
+> не меняются. В тексте руководства «ApexForge_ECS» и «движок» — синонимы.
 
 ### 1.1 Ключевые возможности
 
 - **Архетипное хранилище компонентов (SoA layout)** — данные одного типа хранятся рядом в памяти, что максимизирует использование CPU-кеша
-- **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon с адаптивным отключением для малых миров
-- **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>` работают без overhead
+- **Параллельное выполнение систем** — планировщик автоматически находит системы без конфликтов и запускает их параллельно через Rayon; решение SEQ/PAR принимает cost-model по замеренной работе стадии (не по числу entity)
+- **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>`/`Added<T>` работают без overhead
 - **Композиция Bundle** — вложенные `#[derive(Bundle)]`, кортежи Bundle до 12 элементов, одиночные компоненты напрямую в `spawn()`
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи в выделенных индексах мира (O(1) добавление, без влияния на архетипы; cascade delete при despawn target)
-- **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode
-- **Hot Reload конфигураций** — файловый watcher перезагружает JSON-конфиги без перезапуска
+- **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode; инкрементальный diff; префабы
+- **Hot Reload** — файловый watcher перезагружает JSON-конфиги, Lua-скрипты и префабы без перезапуска
 - **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
-- **Batch API** — `spawn_many` создаёт тысячи entity за один проход
-- **Run Conditions** — условное выполнение систем: `.run_if(cond)` для closures, `.run_if_cond(typed_cond)` для typed-доступа (планировщик знает что читает условие), AND/OR-комбинация, scope conditions, common conditions из коробки
-- **Apply Deferred** — применение Commands: ручное `apply_deferred()` для sequential систем, авто-apply через `system!` + `cmd: Cmd` + `chain()` (HAS_DEFERRED auto-detect, compile-time split)
+- **Детерминированный спавн** — опциональный record/replay-детерминизм присвоения entity-id run-to-run
+- **Run Conditions** — условное выполнение систем: `.run_if(closure)` для простых проверок и `.run_if_cond(typed)` для условий, чей доступ виден планировщику (авто-порядок); AND/OR-комбинация, scope conditions, готовые условия из модуля `conditions`
 - **Event Pipeline** — конвейерная обработка событий (Producer → Transformer → Consumer) с порядком по именам
-> **Версия 0.3.0** — крейты пока не опубликованы на crates.io. Для использования добавляйте зависимость через `path = "..."` или `git = "..."` (см. раздел 1.3).
+- **Изолированные миры** — `IsolatedWorld` + `WorldBridge`: полноценный 2-поточный параллелизм между независимыми мирами
+
+> **Крейты пока не опубликованы на crates.io.** Добавляйте зависимость через `path = "..."` или
+> `git = "..."` (см. §1.3).
 ### 1.2 Структура крейтов
 
 | Крейт | Назначение |
@@ -99,10 +106,54 @@ apex-isolated      = { git = "https://github.com/StanislavMal/apex-ecs", rev = "
 ```
 
 > **Минимальная версия Rust:** 2021 Edition. Rayon всегда скомпилирован — параллелизм доступен
-> без feature-флагов. Решение SEQ/PAR принимает **cost-model** (замеренная работа стадии, EMA), а не
+> без feature-флагов. Решение SEQ/PAR принимает **cost-model** (замеренная работа стадии), а не
 > число entity: тривиальные стадии не платят rayon-оверхед, тяжёлые — параллелятся даже при малом
-> числе entity (см. §13.1.3). Для жёсткого sequential:
-> `scheduler.set_parallel_min_entities(usize::MAX)`.
+> числе entity (см. §13).
+
+### 1.4 Быстрый старт — рабочий мир за 20 строк
+
+Минимальная программа: объявить компоненты, создать мир, заспавнить entity, прогнать систему.
+
+```rust
+use apex_core::prelude::*;
+use apex_scheduler::prelude::*;
+
+#[derive(Component, Clone, Copy)]
+struct Position { x: f32, y: f32 }
+
+#[derive(Component, Clone, Copy)]
+struct Velocity { x: f32, y: f32 }
+
+// Система — обычная функция с типизированными параметрами (Bevy-стиль).
+// Планировщик выводит доступ из типов параметров и распараллеливает бесконфликтные системы.
+fn movement(mut q: Query<(&Velocity, &mut Position)>) {
+    q.for_each_mut(|_, (vel, mut pos)| {
+        pos.x += vel.x;
+        pos.y += vel.y;
+    });
+}
+
+fn main() {
+    let mut world = World::new();
+
+    // #[derive(Component)] регистрирует тип автоматически.
+    world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 0.0 }));
+
+    let mut sched = Scheduler::new();
+    sched.add_systems(StageLabel::Update, movement);
+    sched.compile().unwrap();
+
+    for _ in 0..60 {
+        sched.run(&mut world);   // флашит события и продвигает change-tick сам
+    }
+
+    println!("entities: {}", world.entity_count());
+}
+```
+
+Дальше в руководстве — концепции (§2–3), затем золотой путь по задачам (запросы §4, ресурсы и события
+§5, системы §6, команды §7), козыри движка (relations §8, шаблоны §9, сериализация §10, изолированные
+миры §12) и справочник (§16).
 
 ---
 
@@ -285,8 +336,9 @@ world.spawn((
 ));
 // Поддерживается до 12 элементов в кортеже
 
-// Добавление компонента после создания через EntityRef:
-world.entity(player).insert(Armor { value: 10.0 });
+// Добавление компонента после создания — через EntityWorldMut (полный мутабельный доступ).
+// `entity(e)` даёт read-only EntityRef; для мутаций берём `entity_mut(e)`:
+world.entity_mut(player).insert(Armor { value: 10.0 });
 
 // Batch-спавн одинаковых бандлов (самый быстрый способ):
 let entities = world.spawn_many(1000, |i| (
@@ -322,51 +374,42 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 }
 ```
 
-### 2.4 Миграция с Bevy — таблица соответствий (D2-8)
+### 2.4 Миграция с Bevy — таблица соответствий
 
-Цель D-волны: типичная Bevy-система компилируется после **механической замены имён**.
-Идиомы Bevy работают 1:1, наши преимущества — сверху. В движке начинайте с
-`use apex_engine::prelude::*;` (umbrella-крейт) — он покрывает всё из таблицы.
+Типичная Bevy-**ECS**-система компилируется после механической замены имён: идиомы Bevy работают
+1:1, наши преимущества — сверху. Ниже — только ECS-соответствия; движковые типы (`Transform`,
+`Camera`, `Color`, `Handle`, `Input` и т.п.) описаны в руководстве движка.
 
 #### Что переносится 1:1 (только импорты)
 
-| Bevy | Apex | Примечание |
+| Bevy | ApexForge_ECS | Примечание |
 |---|---|---|
-| `fn sys(time: Res<Time>, q: Query<(&A, &mut B)>)` | то же | plain-fn системы (D2-1); `ResMut<T>`, `&mut Commands`, `EventReader<E>`/`EventWriter<E>` — те же параметры |
-| `Query<(&A, &mut B), (With<C>, Changed<A>)>` | то же | двухпараметрическая форма (D2-2); `Added`/`Changed`/`With`/`Without`/`Or<>` — те же фильтры |
-| `for (a, mut b) in &mut q { … }` | то же | итерация выдаёт item без навязанной entity (П1); `Query<(Entity, &A)>` — entity явной формой |
+| `fn sys(time: Res<Time>, q: Query<(&A, &mut B)>)` | то же | plain-fn системы; `ResMut<T>`, `&mut Commands`, `EventReader<E>`/`EventWriter<E>` — те же параметры |
+| `Query<(&A, &mut B), (With<C>, Changed<A>)>` | то же | двухпараметрическая форма; `Added`/`Changed`/`With`/`Without`/`Or<>` — те же фильтры |
+| `for (a, mut b) in &mut q { … }` | то же | итерация выдаёт item без навязанной entity; `Query<(Entity, &A)>` — entity явной формой |
 | `q.single()` / `q.single_mut()` | то же | `Result<_, QuerySingleError>` (Bevy 0.15+) |
-| `q.get(entity)` / `q.get_mut(entity)` | то же | random-access O(1), фильтры применяются (П3) |
-| `app.add_systems(Update, (a, b))` | то же | bare-метки стадий в prelude; `movement.run_if(in_state(...))` работает на bare-fn (П4) |
-| `#[derive(Component)]` `#[require(A, B)]` | то же | required components (D2-4); плюс у нас derive **авто-регистрирует** компонент (linkme) — `register_component` не нужен |
-| `App::new().add_plugins((DefaultPlugins, MyPlugin))` | то же | группы плагинов и кортежи, включая вложенные (D2-7) |
+| `q.get(entity)` / `q.get_mut(entity)` | то же | random-access O(1), фильтры применяются |
+| `app.add_systems(Update, (a, b))` | то же | bare-метки стадий в prelude; `movement.run_if(in_state(...))` работает на bare-fn |
+| `#[derive(Component)]` `#[require(A, B)]` | то же | required components; плюс наш derive **авто-регистрирует** компонент (linkme) — `register_component` не нужен |
+| `App::new().add_plugins((DefaultPlugins, MyPlugin))` | то же | группы плагинов и кортежи, включая вложенные |
 | `commands.spawn(bundle)` / `despawn` / `insert` | то же | `Commands` — bump-arena (без per-command Box) |
-| `EventReader::read()`, `EventWriter::send()` | то же | итерация 1:1 Bevy: `for e in r.read()` (guard конвертируется во владеющий `EventIterator`, advance курсора на drop); регистрация типов событий не нужна (авто) |
-| `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — condition'ы, а не отдельные schedule (D2-6) |
-| `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` (D2-5) |
+| `EventReader::read()`, `EventWriter::send()` | то же | итерация 1:1 Bevy: `for e in r.read()`; регистрация типов событий не нужна (авто) |
+| `State<S>` / `NextState<S>` / `in_state(...)` | то же | `app.add_state(initial)`; `on_enter`/`on_exit` — условия, а не отдельные schedule |
+| `FixedUpdate` | то же | стадия с аккумулятором `FixedTime` |
 | `RemovedComponents<T>` | то же | трекинг **opt-in**: `world.track_removals::<T>()` — нулевая стоимость по умолчанию |
-| `Single<Q>` / `Option<Single<Q>>` | то же | skip-семантика (система пропускается при ≠1 матче), как Bevy `validate_param` (Э5) |
-| `Transform::from_xyz(…).looking_at(…)` | `LocalTransform::…` — то же | builders `from_xyz`/`looking_at`/`looking_to`/`with_*` + направления `forward()/right()/up()` (Э1) |
+| `Single<Q>` / `Option<Single<Q>>` | то же | skip-семантика (система пропускается при ≠1 матче), как Bevy `validate_param` |
 | `commands.insert_resource(r)` | то же | отложенная вставка ресурса в sync-точке |
-| `Srgba::hex("28221B")` | `Color::hex("28221B")` | 3/4/6/8-значные формы, с `#` и без (Э4) |
-| `color.with_alpha(a)` / `.alpha()` | то же | работает для всех вариантов `Color` (Э4) |
-| `..default()` | то же | шорткат в prelude (Э6) |
-| `keys.any_pressed([..])` | то же | + `any_just_pressed` (Э6) |
 
 #### Что называется иначе (и почему)
 
-| Bevy | Apex | Почему |
+| Bevy | ApexForge_ECS | Почему |
 |---|---|---|
-| `Transform` | `LocalTransform` | имя честно говорит о паре local/global; `GlobalTransform` — как в Bevy |
-| `time.delta_secs()` | `time.delta_seconds` | поле, не метод |
-| `Msaa` на камере-компоненте | `Camera.msaa` | поле камеры, не отдельный компонент |
-| `Handle<T>` (Arc-клоны) | `Handle<T>` — **Copy** | дешевле и эргономичнее; авто-unload через `remove_unused` |
 | стадии `PreUpdate`/`Update`/`PostUpdate`/… | те же имена | у нас это `StageLabel`-стадии планировщика, а не вложенные schedule |
 | `mut commands: Commands` | `cmd: &mut Commands` | параметр берётся по `&mut` (bump-arena живёт в контексте системы) |
-| `ButtonInput<KeyCode>` | `Input<KeyCode>` | имя до Bevy 0.13; алиасов не заводим — одна сущность, одно имя |
-| `KeyCode::Digit1` / `KeyA` | `KeyCode::Key1` / `A` | короткие имена; compile-ошибка мигранта очевидна |
-| `time.elapsed_secs()` | `time.seconds_since_startup` | поле, не метод |
-| `Mesh3d(h)` + `MeshMaterial3d(h)` | `MeshRenderer { mesh, material }` | один компонент вместо двух обёрток — осознанное решение (см. ниже) |
+
+Ключевая семантическая разница внутри `system!`: там `&T` означает **ресурс** (не компонент запроса,
+как в Bevy) — ловушка мигранта; компоненты в `system!` пишутся `Read<T>`/`Write<T>`. В plain-fn
+системах этой ловушки нет: `&T`/`&mut T` внутри `Query` — компоненты, как в Bevy (см. §6).
 
 #### `Local<T>` — НЕ переносим (намеренно)
 
@@ -430,10 +473,9 @@ Archetype [Position, Velocity, Health]
 На больших мирах (>128 архетипов) `Query::new` берёт кандидатов из индекса по самому
 редкому обязательному компоненту, но архетип-на-горстку-строк всё равно дороже плотного
 хранения. Фрагментацию создаёт только РАЗНООБРАЗИЕ СОСТАВОВ компонентов — следите за
-ним на реальных сценах через `world.archetype_stats()` (или строку
-`MAIN PROF мир: archetypes=…` при `APEX_MAIN_PROF=1`). **Relations фрагментацию НЕ
-создают**: с CR-M1 пара `(kind, target)` не входит в идентичность архетипа — иерархия
-из 27k уникальных родителей живёт в считанных архетипах (см. §8 и §14.7).
+ним на реальных сценах через `world.archetype_stats()`. **Relations фрагментацию НЕ
+создают**: пара `(kind, target)` не входит в идентичность архетипа — иерархия
+из десятков тысяч уникальных родителей живёт в считанных архетипах (см. §8 и §14).
 
 ### 3.2 Граф переходов архетипов
 
@@ -483,64 +525,69 @@ Query — основной способ итерации по компонент
 
 ### 4.1 Параметры запроса
 
-| Параметр | Алиас (Bevy-стиль) | Выдаёт | Описание |
+| Параметр | Bevy-эквивалент | Выдаёт | Описание |
 |---|---|---|---|
-| `Entity` | — | `Entity` | Id сущности в составе item (П1; iter/for-цикл больше НЕ выдают entity сами) |
-| `Read<T>` | `Ref<T>` / `&T` | `&T` | Чтение компонента |
+| `Entity` | — | `Entity` | Id сущности в составе item (iter/for-цикл больше НЕ выдают entity сами) |
+| `Read<T>` | `&T` | `&T` | Чтение компонента |
 | `Write<T>` | `&mut T` | **`Mut<T>`** | Запись (smart-pointer, стампит change-tick) |
 | `With<T>` | — | `()` | Фильтр: entity должен иметь T |
 | `Without<T>` | — | `()` | Фильтр: entity не должен иметь T |
 | `Changed<T>` | — | `()` | Фильтр: изменённые с прошлого запуска; комбинируется с `Read<T>` |
-| `Added<T>` | — | `()` | Фильтр: компонент ДОБАВЛЕН entity с прошлого запуска (W3-1, §4.3.4) |
-| `Maybe<T>` | — | `Option<&T>` | Чтение, если компонент есть |
-| `MaybeWrite<T>` | — | `Option<Mut<T>>` | Запись, если компонент есть |
-| `Or<(F1, F2, …)>` | — | `()` | Дизъюнкция фильтров: строка проходит, если проходит хотя бы одна ветка (§4.3) |
+| `Added<T>` | — | `()` | Фильтр: компонент ДОБАВЛЕН entity с прошлого запуска (§4.3.4) |
+| `Maybe<T>` | `Option<&T>` | `Option<&T>` | Чтение, если компонент есть |
+| `MaybeWrite<T>` | `Option<&mut T>` | `Option<Mut<T>>` | Запись, если компонент есть |
+| `Or<(F1, F2, …)>` | `Or<…>` | `()` | Дизъюнкция фильтров: строка проходит, если проходит хотя бы одна ветка (§4.3) |
+
+> **Два словаря данных.** Компоненты в запросе можно писать двумя эквивалентными способами: маркерами
+> `Read<T>`/`Write<T>` **или** ссылками `&T`/`&mut T` — обе формы дают идентичный Item. `&T`/`&mut T` —
+> идиома plain-fn систем (1:1 Bevy); `Read<T>`/`Write<T>` — идиома `system!` (там `&T` занят под
+> ресурсы). Прежний алиас `Ref<T>` **удалён** (в Bevy `Ref` = read + change-detection — другая
+> семантика; чтобы не путать, у нас его нет).
 
 > **`Mut<T>` и `mut`-биндинг (важно!).** `Write<T>`/`&mut T` выдают smart-pointer **`Mut<T>`** (как в
 > Bevy): на `DerefMut` он автоматически стампит change-tick строки → `Changed<T>` достоверен на всех
-> путях мутации (через Query и через `World::get_mut`). Поэтому связка в `for_each` требует `mut`:
-> `q.for_each(|_, (vel, mut pos)| pos.x += vel.x)` — как `for mut x in &mut query` в Bevy. Чистое
-> чтение через `Write<T>` без мутации **не** помечает изменённым (стамп — только на `DerefMut`).
+> путях мутации (через Query и через `World::get_mut`). Поэтому связка требует `mut`:
+> `q.for_each_mut(|_, (vel, mut pos)| pos.x += vel.x)`. Чистое чтение через `Write<T>` без мутации
+> **не** помечает изменённым (стамп — только на `DerefMut`).
+
+> **Read/write split (borrow-модель, как Bevy).** Итерация делится по типу заёма:
+> - **read-only аксессоры** (`for_each`/`iter`/`par_for_each`/`for_each_chunk`) берут `&self` и требуют
+>   `Q: ReadOnlyWorldQuery` (только `Read`/`&T`/`With`/`Without`/`Maybe`/фильтры);
+> - **write-аксессоры** (`for_each_mut`/`iter_mut`/`par_for_each_mut`/`for_each_chunk_mut`) берут
+>   `&mut self` и работают с любой формой, включая `Write`/`&mut T`.
 >
-> **Bevy-синтаксис `&T`/`&mut T`** работает в прямых `Query::<…>::new(world)`:
-> `Query::<(&Velocity, &mut Position)>::new_mut(&mut world)`. Внутри `system!` для запросов используйте
-> `Read<T>`/`Write<T>` (П2: `&T`-ресурсы в `system!` удалены — ресурсы пишутся `Res<T>`/`ResMut<T>`, как в plain-fn).
+> Прямые конструкторы: `Query::new(&world)` — только read-only-формы; `Query::new_mut(&mut world)` —
+> любая форма (эксклюзивный заём ⇒ выдаваемые `&mut` заведомо не алиасят). Аналогично
+> `world.query::<Q>()` (read-only) / `world.query_mut::<Q>()` (любая форма) и `QueryState::query` /
+> `query_mut`. Внутри систем `Query`-параметр выдаёт планировщик, уже проверивший доступы на конфликты.
 
-> **Борроу-модель (В1в, как Bevy):** прямые конструкторы write-форм требуют
-> эксклюзивный заём — `Query::new_mut(&mut world)` / `new_mut_with_tick`;
-> `Query::new(&world)` доступен только read-only-формам (`ReadOnlyWorldQuery`).
-> Внутри систем ничего не меняется: `Query`-параметр и `ctx.query` выдаёт
-> планировщик, который уже проверил доступы систем на конфликты. Аналогично
-> `world.query::<Q>()` (read-only) / `world.query_mut::<Q>()` (любая форма) и
-> `QueryState::query` / `query_mut`.
-
-### 4.1.1 Bevy-форма `Query<Data, Filter>`, for-итерация и `single()` (D2-2)
+### 4.1.1 Bevy-форма `Query<Data, Filter>`, for-итерация и `single()`
 
 Второй параметр `Query` — фильтр (по умолчанию `()`); item фильтра не попадает в выдачу.
-После П1 (TD-8) `iter()`/for-цикл/`single()` выдают **только item** — Bevy 1:1; `Entity`
-при необходимости включается в запрос явной формой:
+`iter()`/for-цикл/`single()` выдают **только item** — Bevy 1:1; `Entity` при необходимости
+включается в запрос явной формой:
 
 ```rust
 // Данные и фильтрация разнесены (1:1 перенос с Bevy):
-let q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_mut_with_tick(&mut world, last_run);
-for (hp, mut pos) in &q { /* … */ }              // item без entity — как в Bevy
+let mut q = Query::<(&Hp, &mut Pos), (With<Boss>, Changed<Hp>)>::new_mut_with_tick(&mut world, last_run);
+for (hp, mut pos) in &mut q { /* … */ }          // write-форма → итерируем по `&mut q`
 
-// Entity — явной формой запроса:
+// Read-only форма — по `&q`:
 let q = Query::<(Entity, &Hp)>::new(&world);
-for (e, hp) in &q { /* … */ }
+for (e, hp) in &q { /* … */ }                    // Entity — явной формой запроса
 
 // Ровно одна entity (Result, как Bevy 0.15+):
-let hp = q.single()?;                            // NoEntities / MultipleEntities
+let hp = q.single()?;                            // NoMatches / MultipleMatches
 
-// Random-access внутри запроса (П3): O(1), фильтры применяются:
+// Random-access внутри запроса: O(1), фильтры применяются:
 if let Some(hp) = q.get(boss_entity) { /* … */ }
 let mut q = Query::<&mut Hp>::new_mut(&mut world);
 q.get_mut(boss_entity).unwrap().0 -= 10;
 ```
 
-> `for_each(|entity, item|)` — НАШ диалект (горячий путь, entity всегда передаётся);
-> это не Bevy-API, поэтому конфликта ожиданий нет. Bevy-идиомы (`iter`, for-цикл,
-> `single`, `get`) ведут себя ровно как в Bevy.
+> `for_each(|entity, item|)` / `for_each_mut(...)` — НАШ диалект (горячий путь, entity всегда
+> передаётся первым аргументом); это не Bevy-API, поэтому конфликта ожиданий нет. Bevy-идиомы
+> (`iter`, for-цикл, `single`, `get`) ведут себя ровно как в Bevy.
 
 Единый кортеж остаётся как вторая форма: `Query<(&Hp, With<Boss>)>` эквивалентен.
 Плотная итерация (`for_each_chunk`) требует **архетипного** фильтра
@@ -558,9 +605,10 @@ Query::<Read<Position>>::new(&world)
         println!("pos: ({}, {})", pos.x, pos.y);
     });
 
-// Запрос с Entity + мутацией (Write<Position> → Mut<Position> → `mut pos`):
+// Запрос с Entity + мутацией (Write<Position> → Mut<Position> → `mut pos`).
+// Write-форма ⇒ new_mut + for_each_mut (эксклюзивный заём):
 Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
-    .for_each(|entity, (vel, mut pos)| {
+    .for_each_mut(|entity, (vel, mut pos)| {
         pos.x += vel.x * 0.016;   // DerefMut → стампит change-tick
         pos.y += vel.y * 0.016;
         println!("entity {:?} moved", entity);
@@ -568,7 +616,7 @@ Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
 
 // То же в Bevy-синтаксисе (&T / &mut T) — для прямых Query:
 Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
-    .for_each(|_, (vel, mut pos)| { pos.x += vel.x * 0.016; });
+    .for_each_mut(|_, (vel, mut pos)| { pos.x += vel.x * 0.016; });
 
 // Фильтрация по маркерному компоненту:
 Query::<(Read<Health>, With<Player>)>::new(&world)
@@ -601,7 +649,9 @@ let count = Query::<Read<Health>>::new(&world)
     .count();
 ```
 
-> **Примечание:** `Query::new()` собирает список подходящих архетипов при создании. Для горячих путей используйте `CachedQuery`, который переиспользует этот список.
+> **Примечание:** `Query::new()` собирает список подходящих архетипов при создании. `world.query::<Q>()`
+> использует **кэш архетипов мира** (переиспользует список между вызовами), а для долгоживущих горячих
+> запросов есть инкрементальный `QueryState<Q>` (§4.3.2).
 > 
 > **`Maybe<T>`** — опциональный компонент: возвращает `None` если компонент отсутствует, без фильтрации entity:
 > ```rust
@@ -614,29 +664,30 @@ let count = Query::<Read<Health>>::new(&world)
 >         }
 >     });
 > 
-> // MaybeWrite<T> — опциональная мутация:
+> // MaybeWrite<T> — опциональная мутация (write-форма → new_mut + for_each_mut):
 > Query::<(Read<Position>, MaybeWrite<Speed>)>::new_mut(&mut world)
->     .for_each(|_, (pos, speed)| {
+>     .for_each_mut(|_, (pos, speed)| {
 >         if let Some(mut speed) = speed {   // Option<Mut<Speed>>
 >             speed.0 *= 0.9;  // замедлить, если есть Speed
 >         }
 >     });
 > ```
 
-`CachedQuery` кеширует список архетипов и инвалидируется только при изменении состава архетипов мира.
+`world.query::<Q>()` возвращает `Query`, кэширующий список архетипов мира; кэш инвалидируется только при
+изменении состава архетипов. Для read-only-формы — `query`, для write-формы — `query_mut`.
 
 ```rust
-// CachedQuery — переиспользует список архетипов (Bevy: world.query::<Q>()):
+// Read-only запрос через кэш мира (Bevy: world.query::<Q>()):
 world.query::<Read<Position>>()
     .for_each(|_, pos| { /* ... */ });
 
-// С change detection (Changed<T> как фильтр):
-world.query_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
-    .for_each(|entity, (vel, mut pos)| {
+// С мутацией и change detection — query_mut_changed (write-форма) + for_each_mut:
+world.query_mut_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
+    .for_each_mut(|entity, (vel, mut pos)| {
         // Обрабатываются только entity с изменённым Position или Velocity
     });
 
-// Changed<T> как фильтр в Query (возвращает (), не данные):
+// Changed<T> как фильтр (read-only: данных Write нет → query_changed):
 world.query_changed::<(Read<Velocity>, Changed<Position>)>(last_tick)
     .for_each(|_, (vel, ())| {
         // vel только для изменившегося Position
@@ -655,9 +706,15 @@ world.query::<Read<Position>>()
     });
 ```
 
-> **Внутри систем (через `SystemContext`)** `ctx.query::<Q>()` использует `CachedQuery::from_sub_world` — ленивый `fetch_state` (вызывается в `for_each`, не при создании); индексы архетипов **заимствуются** у per-system SubWorld (предвычислены планировщиком, дополняются инкрементально) — вызов не делает ни аллокаций, ни локов (W2-0). Подробнее — в [разделе 6.6](#66-systemcontext).
+> **Внутри систем** запросы декларируются параметром `q: Query<…>` (плановщик выдаёт `Query` над
+> per-system SubWorld — индексы архетипов предвычислены, вызов не делает ни аллокаций, ни локов).
+> Read-only-доступ есть и через `ctx.query::<Q>()` (`Q: ReadOnlyWorldQuery`); для мутаций объявляйте
+> `Query<Write<T>>`-параметр, а не тянитесь за `ctx` (см. §6).
 >
-> **Незарегистрированные компоненты (W2).** Каждая форма запроса вносит в список ids ровно своё число записей; не зарегистрированный ещё компонент кодируется сентинелом `ComponentId::INVALID`. Следствия: обязательная форма (`Read`/`Write`/`With`/`Changed`) с незарегистрированным T даёт честно пустой запрос; `Maybe<T>` выдаёт `None`; `Without<T>` пропускает всех; позиция формы в кортеже больше НЕ влияет на корректность (до W2 компоненты после незарегистрированного читали чужие id — класс багов «мусорного чтения чужого типа» закрыт).
+> **Незарегистрированные компоненты.** Каждая форма запроса вносит в список ids ровно своё число записей;
+> не зарегистрированный ещё компонент кодируется сентинелом `ComponentId::INVALID`. Следствия: обязательная
+> форма (`Read`/`Write`/`With`/`Changed`) с незарегистрированным T даёт честно пустой запрос; `Maybe<T>`
+> выдаёт `None`; `Without<T>` пропускает всех; позиция формы в кортеже не влияет на корректность.
 
 ### 4.3 `Or<>` — дизъюнкция фильтров (W2-5)
 
@@ -687,15 +744,15 @@ Query::<(Read<Position>, Or<(With<Player>, With<Npc>)>)>::new(&world)
 дружелюбно к автовекторизации (скорость уровня Legion, но с change-тиками):
 
 ```rust
-// |entities, (vel: &[Velocity], pos: &mut [Position])|
+// |entities, (vel: &[Velocity], pos: &mut [Position])|  — write-форма → for_each_chunk_mut
 Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
-    .for_each_chunk(|_entities, (vel, pos)| {
+    .for_each_chunk_mut(|_entities, (vel, pos)| {
         for (p, v) in pos.iter_mut().zip(vel) { p.x += v.x * 0.016; }
     });
 
-// Параллельно — те же диапазоны, что у par_for_each:
+// Параллельно — те же диапазоны, что у par_for_each_mut:
 world.query_mut::<(Read<Velocity>, Write<Position>)>()
-    .par_for_each_chunk(|_, (vel, pos)| { /* ... */ });
+    .par_for_each_chunk_mut(|_, (vel, pos)| { /* ... */ });
 ```
 
 Правила:
@@ -1050,9 +1107,9 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 |-------|----------|
 | `send(event)` | Отправить одно событие в текущий тик |
 | `send_batch(events)` | Отправить пачку событий (любой `IntoIterator`) |
-| `send_sync(event)` | Thread-safe отправка из параллельных систем (через `&self`) |
-| `send_batch_sync(events)` | Thread-safe пакетная отправка (один lock на пачку) |
-| `flush_sync()` | Слить thread-safe буфер (`sync_pending`) в основной `pending` |
+| `send_sync(event)` | *advanced* (`#[doc(hidden)]`): thread-safe отправка через `&self`. Золотой путь — декларировать `EventWriter<T>`-параметр |
+| `send_batch_sync(events)` | *advanced*: thread-safe пакетная отправка (один lock на пачку) |
+| `flush_sync()` | *advanced*: слить thread-safe буфер (`sync_pending`) в основной `pending` |
 | `reserve(n)` | Предаллоцировать `pending` буфер для N событий (избежать реаллокаций) |
 | `add_reader() -> EventCursor` | Зарегистрировать нового читателя |
 | `remove_reader(reader_id)` | Удалить читателя |
@@ -1121,7 +1178,7 @@ sched.add_systems(StageLabel::Update, par_access(
 [`DelayedQueue<T>`](crates/apex-core/src/events.rs:636) — отдельная очередь для событий, которые должны быть доставлены с задержкой в N тиков. Внутри — `BinaryHeap` для O(log N) вставки и O(K log N) извлечения готовых. События с одинаковым `deliver_at` доставляются в порядке вставки (FIFO).
 
 ```rust
-use apex_core::prelude::*;
+use apex_core::DelayedQueue;   // advanced — не в prelude
 
 let mut delayed = DelayedQueue::new();
 
@@ -1144,9 +1201,13 @@ delayed.flush_delayed(world.current_tick().0, world.events_mut::<&str>());
 | `clear()` | Очистить очередь и сбросить sequence |
 | `reserve(n)` | Предаллоцировать память под N будущих событий |
 
-#### 5.2.9 Thread-safe отправка (`send_sync` / `send_batch_sync`)
+#### 5.2.9 Thread-safe отправка (`send_sync` / `send_batch_sync`) — *advanced*
 
-Для отправки событий из параллельных систем (где доступен только `&Events<T>`, а не `&mut Events<T>`) используйте методы `send_sync` и `send_batch_sync`. Они пишут во внутренний `Mutex<Vec<T>>`, который лениво инициализируется через `OnceLock` (нулевой overhead для однопоточных сценариев).
+> **Золотой путь — декларировать `EventWriter<T>`-параметр системы** (планировщик валидирует доступ и
+> сериализует писателей). Методы ниже (`#[doc(hidden)]`) — низкоуровневый escape для случаев, когда
+> доступен только `&Events<T>`.
+
+Методы `send_sync` и `send_batch_sync` пишут во внутренний `Mutex<Vec<T>>`, который лениво инициализируется через `OnceLock` (нулевой overhead для однопоточных сценариев).
 
 Содержимое `sync_pending` автоматически сливается в основной `pending` при вызове `update()` (т.е. при каждом `world.tick()`), либо вручную через `flush_sync()`.
 
@@ -1311,13 +1372,14 @@ Apex ECS предоставляет **единый макрос** `system!` дл
 use apex_scheduler::{Scheduler, StageLabel};
 
 // Plain-fn система — Bevy-стиль 1:1, БЕЗ макроса. Параметры:
-// Res<T> / ResMut<T> / Query<Q> / CachedQuery<Q> / EventReader<E> /
-// EventWriter<E> / &mut Commands / Single<Q> / Option<Single<Q>>.
+// Res<T> / ResMut<T> / Query<Q> / EventReader<E> / EventWriter<E> /
+// &mut Commands / Single<Q> / Option<Single<Q>>.
 // Access выведен, имя — из имени функции. Single — ровно один матч:
-// система ПРОПУСКАЕТСЯ в кадрах с 0 или >1 матчами (Э5, Bevy 1:1);
+// система ПРОПУСКАЕТСЯ в кадрах с 0 или >1 матчами (Bevy 1:1);
 // Option<Single> — None при нуле, пропуск только при >1.
-fn movement(dt: Res<DeltaTime>, q: Query<(&Velocity, &mut Position)>) {
-    q.for_each(|_, (vel, mut pos)| pos.x += vel.x * dt.step);
+// Write-форма запроса ⇒ параметр `mut q` + for_each_mut:
+fn movement(dt: Res<DeltaTime>, mut q: Query<(&Velocity, &mut Position)>) {
+    q.for_each_mut(|_, (vel, mut pos)| pos.x += vel.x * dt.0);
 }
 
 let mut sched = Scheduler::new();
@@ -1347,8 +1409,10 @@ sched.add_systems(StageLabel::Update, (
     sys("ai", ai_system).run_if(|w| !is_paused(w)),       // с условием
     seq("cleanup", |world: &mut World| { /* ... */ }),    // sequential замыкание
     par("log", |_: SystemContext| println!("tick")),      // closure без доступа (advanced)
+    // par_access — advanced: доступ объявлен в access_desc!, поэтому write-запрос берётся через
+    // ctx.query_unchecked (escape для закрытых-по-декларации замыканий):
     par_access("physics", access_desc!(read<Vel>, write<Pos>),
-        |ctx| ctx.query::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, mut p)| p.x += v.x)),
+        |ctx| ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>().for_each_mut(|_, (v, mut p)| p.x += v.x)),
 ));
 ```
 
@@ -1600,9 +1664,9 @@ system! {
         q: (Read<Velocity>, Write<Position>),
         keys: Res<Input<KeyCode>>,
     ) {
-        // ВАЖНО: Write<T> выдаёт smart-pointer Mut<T> → связка требует `mut`
-        // (как `for mut x` в Bevy); на DerefMut стампится change-tick.
-        q.for_each(|_, (vel, mut pos)| {
+        // ВАЖНО: Write<T> выдаёт smart-pointer Mut<T> → нужен for_each_mut и `mut pos`
+        // (как `for mut x in &mut q` в Bevy); на DerefMut стампится change-tick.
+        q.for_each_mut(|_, (vel, mut pos)| {
             if keys.pressed(KeyCode::A) { pos.x -= vel.x; }
         });
     }
