@@ -35,8 +35,19 @@ impl Scheduler {
             scratch_skipped: FxHashSet::default(),
             deterministic_spawn: false,
             system_spawn_history: FxHashMap::default(),
+            deterministic_overflow_count: 0,
             parallel_policy: ParallelPolicy::default(),
         }
+    }
+
+    /// D8b overflow frontier: how many times a stage-system's spawn spike exhausted its
+    /// id block + escrow and fell to the shared, non-deterministic allocator path
+    /// (§0.2a — the same event that fires a throttled `warn_once!`). Steady-state is 0;
+    /// a non-zero count means those frames' overflow entity ids were not run-to-run
+    /// deterministic. Exposed for tests/diagnostics.
+    #[inline]
+    pub fn deterministic_overflow_count(&self) -> u64 {
+        self.deterministic_overflow_count
     }
 
     /// Sh2/ADR-003: select the SEQ-vs-PAR dispatch policy.
@@ -91,6 +102,27 @@ impl Scheduler {
         }
     }
 
+    /// D8b overflow frontier: the id-block actually SEEDED per system = the adaptive
+    /// [`block_size_for`] PLUS an escrow margin. The escrow is a rank-deterministic,
+    /// contention-free private tail: a spike that exceeds the adaptive block still
+    /// draws DETERMINISTIC ids from the escrow instead of falling to the shared,
+    /// non-deterministic path — extending the single-binary determinism guarantee
+    /// (ADR-001) from "steady-state only" to "steady-state + spikes within the escrow".
+    /// The unused escrow tail is reclaimed each stage ([`commit_spawn_history`]), so the
+    /// id-space stays bounded. Beyond block+escrow, the reserve falls through LOUDLY
+    /// (telemetry). Escrow = half the block (a modest margin — the block is already
+    /// 2× the observed peak, so this covers a ~3× peak spike; kept modest so the extra
+    /// reclaim churn stays small on this opt-in path). Returns 0 iff the block is 0.
+    pub(crate) fn seed_size_for(&self, sys_id: SystemId) -> u32 {
+        const ESCROW_FLOOR: u32 = 8;
+        let block = self.block_size_for(sys_id);
+        if block == 0 {
+            return 0;
+        }
+        let escrow = (block / 2).max(ESCROW_FLOOR);
+        block.saturating_add(escrow)
+    }
+
     /// D8b: after a stage applies (`flush` grew records), for each seeded system:
     /// (1) fold its observed spawn count (block size − remaining) into the adaptive-
     /// sizing history — `reserver` shares the block cursor with the one handed to the
@@ -105,6 +137,20 @@ impl Scheduler {
         world: &mut World,
     ) {
         for (sys_id, size, reserver) in seeded.drain(..) {
+            // D8b overflow telemetry (§0.2a — loud, not silent): the system exhausted
+            // its block AND its escrow and fell to the shared, non-deterministic path.
+            // Its overflow ids this frame are NOT run-to-run deterministic. Count every
+            // occurrence (diagnostics) and warn once per process (throttled).
+            if reserver.block_overflowed() {
+                self.deterministic_overflow_count =
+                    self.deterministic_overflow_count.saturating_add(1);
+                apex_core::warn_once!(
+                    "deterministic_spawn: a system exhausted its id block + escrow and \
+                     fell back to the shared allocator — this frame's overflow entity ids \
+                     are NOT run-to-run deterministic. The block grows next frame; if this \
+                     recurs, the spawn spike exceeds the adaptive block + escrow margin."
+                );
+            }
             let used = size - reserver.block_remaining().unwrap_or(0);
             self.system_spawn_history.insert(sys_id, used);
             world.reclaim_entity_block_tail(&reserver.unused_block_ids());

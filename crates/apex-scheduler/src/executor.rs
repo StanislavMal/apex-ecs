@@ -777,7 +777,11 @@ impl Scheduler {
                         })
                         .unwrap_or(false);
                     if uses_cmds {
-                        let size = self.block_size_for(sys_id);
+                        // Seed block + escrow (overflow frontier): a spike beyond the
+                        // adaptive block still draws deterministic ids from the escrow
+                        // tail. `size` tracked here is the SEEDED size, so
+                        // `commit_spawn_history` measures actual usage as size−remaining.
+                        let size = self.seed_size_for(sys_id);
                         if size > 0 {
                             let reserver = unsafe { &*const_ptr }.reserve_entity_block(size);
                             stage_cmds[slot].set_reserver(reserver.clone());

@@ -150,6 +150,81 @@ fn non_deterministic_mode_still_spawns_correctly() {
     assert_eq!(content, expected, "all spawns land regardless of determinism mode");
 }
 
+// ── Overflow frontier (1.1): escrow keeps spikes deterministic; loud beyond it ──
+
+/// One fresh run with `n` seeds (⇒ each of the 3 systems spawns `n` children). On a
+/// fresh scheduler (frame 1) the seeded block = INITIAL 256 + escrow 128 = 384. Returns
+/// the sorted `(index, sys, seed)` snapshot and the scheduler's overflow count.
+fn run_spike(n: u32) -> (Vec<(u32, u32, u32)>, u64) {
+    let mut world = World::new();
+    for i in 0..n {
+        world.spawn((Seed(i),));
+    }
+    let mut sched = Scheduler::new();
+    sched.set_deterministic_spawn(true);
+    world.set_chunk_config(apex_core::world::ChunkConfig {
+        auto_disable_stage_parallel: false,
+        stage_parallel_min_entities: 0,
+        ..Default::default()
+    });
+    sched.add_systems(StageLabel::Update, (spawn_a, spawn_b, spawn_c));
+    sched.compile_with_world(&world).unwrap();
+    sched.run(&mut world);
+
+    let mut out = Vec::new();
+    Query::<Read<Made>>::new(&world).for_each(|e, m| out.push((e.index(), m.sys, m.seed)));
+    out.sort_unstable();
+    (out, sched.deterministic_overflow_count())
+}
+
+/// 1.1: a spawn spike that EXCEEDS the adaptive block (256) but fits within block +
+/// escrow (384) stays run-to-run DETERMINISTIC. Without the escrow, the 3 spawners would
+/// each overflow the 256-block and RACE on the shared reserver for the 44 overflow ids
+/// (non-deterministic). No loud fall-through fires. This is the frontier ADR-001
+/// deferred, now closed for spikes within the escrow margin.
+#[test]
+fn escrow_keeps_spike_within_margin_deterministic() {
+    const SPIKE: u32 = 300; // 256 (block) < 300 <= 384 (block + escrow)
+    let (baseline, overflow) = run_spike(SPIKE);
+    assert_eq!(baseline.len() as u32, SPIKE * 3, "each system spawns SPIKE children");
+    assert_eq!(overflow, 0, "within block+escrow: no fall-through to the shared path");
+
+    for run in 1..20 {
+        let (snap, of) = run_spike(SPIKE);
+        assert_eq!(
+            snap, baseline,
+            "run {run} diverged — the escrow overflow segment is not deterministic"
+        );
+        assert_eq!(of, 0, "run {run} unexpectedly fell through block+escrow");
+    }
+
+    // Every id unique — the escrow segment never collides with the block or another
+    // system's block/escrow.
+    let ids: BTreeSet<u32> = baseline.iter().map(|&(i, _, _)| i).collect();
+    assert_eq!(ids.len(), baseline.len(), "ids unique across block + escrow");
+}
+
+/// 1.1: a spike BEYOND block + escrow (384) still falls through to the shared path — the
+/// overflow ids that frame are not deterministic, but the fall-through is now LOUD
+/// (§0.2a): the overflow counter increments (and a `warn_once!` fires). Correctness is
+/// preserved — every spawn lands.
+#[test]
+fn overflow_beyond_escrow_is_loud_and_still_correct() {
+    const SPIKE: u32 = 500; // > 384 (block + escrow) ⇒ shared fall-through
+    let (snap, overflow) = run_spike(SPIKE);
+
+    // Correctness: every spawn lands regardless of determinism.
+    assert_eq!(snap.len() as u32, SPIKE * 3, "all spawns land even past the escrow");
+    let content: BTreeSet<(u32, u32)> = snap.iter().map(|&(_, s, sd)| (s, sd)).collect();
+    assert_eq!(content.len() as u32, SPIKE * 3, "content set complete");
+
+    // Loud: the fall-through past block+escrow was counted (all 3 systems overflow).
+    assert!(
+        overflow > 0,
+        "overflow past block+escrow must be counted loudly (§0.2a); got {overflow}"
+    );
+}
+
 // ── Churn capstone: deterministic reuse of freed slots under despawn+respawn ──
 
 #[derive(Component, Clone, Copy)]

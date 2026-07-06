@@ -200,9 +200,21 @@ goldens `visual_tests` 649/0/9 БАЙТ-ИДЕНТИЧНЫ** (B6-паника и
 > оговорку «steady-state» и закрыть D6-полное (change-окна), плюс поставить детерминизм под
 > постоянный тест-гейт.
 
-### 1.1 D8b-overflow — rank-ordered детерминированный overflow блока
+### 1.1 D8b-overflow — rank-ordered детерминированный overflow блока ✅ 2026-07-06
 
-**Дизайн (спайк-first, как D8b):**
+> **✅ ЗАКРЫТО (упрощение дизайна vs план — к лучшему).** Реализация: эскроу — НЕ отдельный
+> сегмент/резерв, а **margin на сеемый блок** (`seed_size_for` = `block_size_for` peak×2 + половина
+> блока). Механизм тот же, что у блока (доказан контентон-фри и rank-детерминированным), поэтому
+> отдельный «эскроу-пул» не нужен — overflow в margin автоматически тянет приватные детерминированные
+> id. За пределами блок+эскроу: `BlockCursor.overflowed`-флаг → `warn_once!` + счётчик
+> `deterministic_overflow_count` (имя `deterministic_overflow_fallbacks` из плана → короче). Реклейм
+> эскроу-хвоста = существующий `reclaim_block_tail` (не дублируется). Спайк-first подтверждён
+> тестами: `escrow_keeps_spike_within_margin_deterministic` (спайк 300 > блок 256, ≤ seed 384 →
+> детерминирован; без эскроу 3 системы гоняли бы 44 overflow-id на общем reserve) +
+> `overflow_beyond_escrow_is_loud_and_still_correct` (500 > 384 → счётчик > 0). Miri чист (20
+> entity), 101 scheduler + все d8b, clippy net-neutral. Addendum ADR-001 + руководство §6.6a.
+
+**Дизайн (спайк-first, как D8b) — исходный план (реализация упростила эскроу до block-margin):**
 - **Эскроу-пул:** при посеве блоков стадии (`World::reserve_entity_block`, main-поток,
   rank-порядок) планировщик дополнительно выделяет **rank-упорядоченный эскроу-резерв**
   (доля от суммы блоков, адаптивная по `system_spawn_history`, как сами блоки). Overflow

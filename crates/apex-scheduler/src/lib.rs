@@ -870,6 +870,12 @@ pub struct Scheduler {
     /// frames. `SystemId`/`u32` are `Send`, so this is safe as a field (unlike a
     /// `Vec<Commands>`, which would make `Scheduler: !Send`).
     system_spawn_history: FxHashMap<SystemId, u32>,
+    /// D8b overflow frontier: count of stage-system overflows past block + escrow to
+    /// the shared (non-deterministic) allocator path. Steady-state stays 0; a non-zero
+    /// value means a spawn spike exceeded the adaptive block + escrow and that frame's
+    /// overflow ids were not run-to-run deterministic. Diagnostics only (a `warn_once!`
+    /// also fires); see `deterministic_overflow_count`.
+    deterministic_overflow_count: u64,
 
     // ── Sh2: SEQ/PAR dispatch policy (ADR-003) ──────────────────────────────────
     /// Governs how each parallel-eligible stage picks SEQ vs PAR above the explicit

@@ -81,7 +81,7 @@ impl EntityRecord {
     }
 }
 
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 /// Lease of free slots for reservation: a snapshot of `free_list` (index + generation), moved out of
@@ -154,6 +154,11 @@ fn reserve_from(lease: &ReserveLease, high_water: &AtomicU32) -> Entity {
 struct BlockCursor {
     ids: Box<[Entity]>,
     next: AtomicU32,
+    /// D8b overflow frontier (escrow): set when a reserve falls THROUGH this block
+    /// (block + escrow tail exhausted) to the shared, NON-deterministic path. Read on
+    /// the main thread post-apply for loud overflow telemetry (§0.2a). Written only on
+    /// the rare overflow path — the common in-block reserve never touches it.
+    overflowed: AtomicBool,
 }
 
 /// B5: shared channel for reservation indices abandoned WITHOUT `apply` (a
@@ -196,9 +201,11 @@ impl EntityReserver {
             if (i as usize) < block.ids.len() {
                 return block.ids[i as usize];
             }
-            // Block exhausted — fall through to the shared reserver (non-deterministic
-            // that frame). Adaptive sizing makes overflow a warmup/spike-only event; the
-            // rank-ordered deterministic overflow claim is a follow-up (§4.1).
+            // Block + escrow exhausted — fall through to the shared reserver
+            // (non-deterministic that frame). Adaptive sizing + the escrow margin make
+            // this a rare spike-only event; the fall-through is now flagged for LOUD
+            // post-apply telemetry (§0.2a) rather than silent.
+            block.overflowed.store(true, Ordering::Relaxed);
         }
         let lease = read_lease(&self.lease);
         reserve_from(&lease, &self.high_water)
@@ -215,9 +222,22 @@ impl EntityReserver {
             block: Some(Arc::new(BlockCursor {
                 ids,
                 next: AtomicU32::new(0),
+                overflowed: AtomicBool::new(false),
             })),
             abandoned: Arc::clone(&self.abandoned),
         }
+    }
+
+    /// D8b overflow telemetry: did any reserve fall THROUGH this reserver's block
+    /// (block + escrow) to the shared, non-deterministic path? Read on the main thread
+    /// after the stage applies. `false` for a reserver without a block. When `true`,
+    /// this stage's overflow ids are NOT run-to-run deterministic — the scheduler warns
+    /// loudly and grows the block (§0.2a).
+    pub fn block_overflowed(&self) -> bool {
+        self.block
+            .as_ref()
+            .map(|b| b.overflowed.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// B5: return reserved-but-un-applied `Entity`s to the owning allocator's
@@ -292,6 +312,9 @@ impl EntityReserver {
                 block.next.store((cur + n) as u32, Ordering::Relaxed);
                 return block.ids[cur..cur + n].to_vec();
             }
+            // Not enough contiguous block+escrow ids for this batch — fall through to
+            // the shared (non-deterministic) path and flag for loud telemetry.
+            block.overflowed.store(true, Ordering::Relaxed);
         }
         let lease = read_lease(&self.lease);
         let old = lease.cursor.fetch_sub(n as i64, Ordering::Relaxed);
