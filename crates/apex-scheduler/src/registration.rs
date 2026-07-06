@@ -35,7 +35,27 @@ impl Scheduler {
             scratch_skipped: FxHashSet::default(),
             deterministic_spawn: false,
             system_spawn_history: FxHashMap::default(),
+            parallel_policy: ParallelPolicy::default(),
         }
+    }
+
+    /// Sh2/ADR-003: select the SEQ-vs-PAR dispatch policy.
+    ///
+    /// [`ParallelPolicy::CostModel`] (default) lets the measured dispatch-time EMA
+    /// decide once warm. [`ParallelPolicy::Fixed`] opts out of the EMA gates and
+    /// decides purely from entity counts — deterministic frame-to-frame, for
+    /// pathological-EMA stages or when a reproducible dispatch decision is required.
+    /// The explicit floor (`ChunkConfig::stage_parallel_min_entities`) applies under
+    /// both.
+    pub fn set_parallel_policy(&mut self, policy: ParallelPolicy) -> &mut Self {
+        self.parallel_policy = policy;
+        self
+    }
+
+    /// Sh2/ADR-003: the active SEQ-vs-PAR dispatch policy.
+    #[inline]
+    pub fn parallel_policy(&self) -> ParallelPolicy {
+        self.parallel_policy
     }
 
     /// D8b: enable/disable deterministic parallel-spawn entity-id assignment.

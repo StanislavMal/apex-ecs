@@ -134,12 +134,15 @@
   процесс-глобальный фолбэк (частичная мимикрия Bevy-глобала — против нашей per-world модели §0.9).
   Осознанный фокусный охват, не полумера: golden-path мутаций покрыт; хвост — по спросу.
 
-- **ParallelPolicy 🟡 → CORE_POLISH волна 0.2 — обещан планом, не реализован; комментарий в коде лжёт.** План PARALLELISM §3.1
-  обещал тип-политику (`ParallelPolicy`) с `Fixed`-фолбэком для отключения cost-model при патологии
-  EMA. Не реализовано: пороги — захардкоженные `const`, ручки нет (только `parallel_min_entities` как
-  пол). Комментарий `apex-scheduler/src/lib.rs:451-452` утверждает «`ParallelPolicy::Fixed` remains
-  available» — **ложь в коде** (§0.2a). *Минимум:* исправить комментарий (не обещать несуществующее)
-  + записать, что cost-model всегда on после прогрева. *Полно:* реализовать `Fixed`-откат. См. ADR-003.
+- **ParallelPolicy ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.2) — реализован `Fixed`-откат.**
+  Был: тип-политика обещана планом PARALLELISM §3.1, не реализована (пороги — захардкоженные `const`),
+  комментарий `lib.rs` обещал несуществующий `ParallelPolicy::Fixed` — ложь в коде (§0.2a).
+  **Сделано (§0.2b — полный откат, не правка комментария):** `pub enum ParallelPolicy { CostModel, Fixed }`
+  + `Scheduler::set_parallel_policy`/`parallel_policy`. `Fixed` — SEQ/PAR из entity-порогов, EMA не
+  читается (детерминированный, измерение-независимый путь для патологии EMA); явный пол — жёсткий гейт
+  под обеими политиками. Развилка вынесена в чистую `Scheduler::stage_prefers_seq`; юнит-тест
+  `parallel_policy_fixed_vs_cost_model`; комментарий исправлен; addendum к ADR-003.
+  Гейты: 101 scheduler-тест зелёный, clippy net-neutral.
 - **guide-broken ✅ ЗАКРЫТ (2026-07-06, волна 5 API_GOLDEN_PATH).** Руководство
   `Apex_ECS_Руководство_пользователя.md` переписано под финальный API (ecs `5ab4096`..`5323d34`). Все
   классы §2.1 починены: (1) для_each-write→`for_each_mut`, ctx-write→`*_unchecked`; (2) §6.7+§16

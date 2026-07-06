@@ -40,6 +40,74 @@
         assert!(!s.cost_model_prefers_seq(1));
     }
 
+    // ── Sh2/ADR-003: ParallelPolicy — Fixed opts out of the EMA gates ─────────
+    #[test]
+    fn parallel_policy_fixed_vs_cost_model() {
+        use std::time::Duration;
+        // Two systems → entity crossover = min_entities_for_parallelism(2) = 25_000,
+        // compared against per-system = stage_entity_count / 2.
+        const SYS: usize = 2;
+
+        // --- CostModel (default): the warm EMA fully decides. ---
+        let mut cm = Scheduler::new();
+        assert_eq!(cm.parallel_policy(), ParallelPolicy::CostModel);
+        // Cheap EMA on stage 0 (10µs, below the band) → the cost model prefers SEQ.
+        cm.record_stage_cost(0, Duration::from_micros(10), false);
+        // Even at 60k entities (the entity heuristic alone would say PAR), CostModel
+        // honors the cheap measurement → SEQ.
+        assert!(
+            cm.stage_prefers_seq(0, 60_000, SYS, 0, false),
+            "CostModel: cheap warm EMA → SEQ regardless of high entity count"
+        );
+        // Expensive EMA on stage 1 (200µs) → PAR even at a low entity count — the
+        // whole point of the model (heavy-low-entity work is parallelized).
+        for _ in 0..20 {
+            cm.record_stage_cost(1, Duration::from_micros(200), false);
+        }
+        assert!(
+            !cm.stage_prefers_seq(1, 10_000, SYS, 0, false),
+            "CostModel: expensive warm EMA → PAR regardless of low entity count"
+        );
+
+        // --- Fixed: entity counts only; the EMA is NEVER consulted. ---
+        let mut fx = Scheduler::new();
+        fx.set_parallel_policy(ParallelPolicy::Fixed);
+        assert_eq!(fx.parallel_policy(), ParallelPolicy::Fixed);
+        // Record the SAME cheap EMA on stage 0. Fixed ignores it: 60k entities
+        // (per-system 30_000 ≥ 25_000) → PAR — the OPPOSITE verdict CostModel gave
+        // on identical input, proving Fixed bypasses the EMA.
+        fx.record_stage_cost(0, Duration::from_micros(10), false);
+        assert!(
+            !fx.stage_prefers_seq(0, 60_000, SYS, 0, false),
+            "Fixed: high entity count → PAR even with a cheap EMA recorded"
+        );
+        // Low entity count (per-system 5_000 < 25_000) → SEQ, again ignoring the EMA.
+        assert!(
+            fx.stage_prefers_seq(0, 10_000, SYS, 0, false),
+            "Fixed: low entity count → SEQ"
+        );
+
+        // --- The explicit floor is a hard gate under BOTH policies. ---
+        assert!(
+            cm.stage_prefers_seq(2, 100, SYS, 5_000, false),
+            "CostModel: below the explicit floor → SEQ"
+        );
+        assert!(
+            fx.stage_prefers_seq(2, 100, SYS, 5_000, false),
+            "Fixed: below the explicit floor → SEQ"
+        );
+
+        // --- CostModel cold start (stage 7 has no EMA history). ---
+        assert!(
+            !cm.stage_prefers_seq(7, 10_000, SYS, 0, false),
+            "CostModel cold start, auto_disable off → PAR"
+        );
+        assert!(
+            cm.stage_prefers_seq(7, 10_000, SYS, 0, true),
+            "CostModel cold start, auto_disable on, low entities → SEQ"
+        );
+    }
+
     #[derive(Component, Clone, Copy)]
     struct Pos {
         x: f32,

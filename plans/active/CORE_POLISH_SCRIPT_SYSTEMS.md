@@ -61,7 +61,12 @@
 эту кампанию: S3/S4 → волна 2 здесь, B5/B6 → волна 0 здесь, §10.8/S7/S8 → волна 3 здесь.
 **Гейт:** ноль ссылок из TECH_DEBT на несуществующие дома.
 
-### 0.2 ParallelPolicy — реализовать `Fixed` (сейчас комментарий в коде лжёт, §0.2a)
+### 0.2 ParallelPolicy — реализовать `Fixed` (сейчас комментарий в коде лжёт, §0.2a) ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `pub enum ParallelPolicy { CostModel, Fixed }` + `set_parallel_policy`/`parallel_policy`;
+> `Fixed` минует EMA (entity-пороги + явный пол); развилка вынесена в чистую `stage_prefers_seq`
+> (юнит-тест `parallel_policy_fixed_vs_cost_model`); лживый комментарий исправлен; addendum ADR-003.
+> Гейты: 101 scheduler-тест, clippy net-neutral.
 
 **Проблема:** `apex-scheduler/src/lib.rs:475-476` — комментарий обещает
 «`ParallelPolicy::Fixed` … remains available as a fallback», типа `ParallelPolicy` в коде НЕТ;

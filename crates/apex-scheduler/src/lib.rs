@@ -89,6 +89,7 @@ pub mod prelude {
         in_state, init_state, on_enter, on_exit, NextState, State, StateTransitions, States,
     };
     pub use crate::Scheduler;
+    pub use crate::ParallelPolicy;
 }
 
 mod config;
@@ -467,13 +468,15 @@ struct SysInfo {
 
 // ── Sh2: cost-model thresholds ──────────────────────────────────
 //
-// The scheduler decides SEQ vs PAR from MEASURED work (µs), not entity count
-// (D1/D2): entity thresholds cannot tell light work (1 ns/entity) from heavy
-// (500 ns/entity), so they mis-fire both ways. A stage whose dispatch-time EMA
-// is below `T_STAGE_SEQ_NS` runs sequentially — below it, rayon scope + per-task
-// overhead exceeds the parallel speedup ("valley of death", parallel_diagnostics).
-// Defaults are tuned on a 12-thread machine; `ParallelPolicy::Fixed` (entity
-// heuristic only) remains available as a fallback.
+// Under the default `ParallelPolicy::CostModel`, the scheduler decides SEQ vs PAR
+// from MEASURED work (µs), not entity count (D1/D2): entity thresholds cannot tell
+// light work (1 ns/entity) from heavy (500 ns/entity), so they mis-fire both ways.
+// A stage whose dispatch-time EMA is below `T_STAGE_SEQ_NS` runs sequentially —
+// below it, rayon scope + per-task overhead exceeds the parallel speedup ("valley
+// of death", parallel_diagnostics). Defaults are tuned on a 12-thread machine.
+// `ParallelPolicy::Fixed` opts OUT of the EMA gates and decides purely from entity
+// counts — a deterministic, measurement-free fallback for pathological EMA (e.g.
+// a stage whose per-frame cost swings wildly, defeating the smoothing).
 
 /// Below this measured stage EMA (ns), run the stage sequentially.
 const T_STAGE_SEQ_NS: f64 = 40_000.0; // 40µs
@@ -481,6 +484,26 @@ const T_STAGE_SEQ_NS: f64 = 40_000.0; // 40µs
 const STAGE_HYSTERESIS: f64 = 0.2;
 /// EMA smoothing factor (higher = faster adaptation, noisier).
 const STAGE_EMA_ALPHA: f64 = 0.2;
+
+/// How a stage's SEQ-vs-PAR dispatch is decided (ADR-003).
+///
+/// The explicit user floor (`ChunkConfig::stage_parallel_min_entities`) always
+/// wins under both policies — it is a hard "never parallelize below N" gate.
+/// The policy governs what happens ABOVE that floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParallelPolicy {
+    /// Default. Once a stage's measured dispatch-time EMA is warm, it fully decides
+    /// SEQ vs PAR (measured work supersedes entity count). Cold start falls back to
+    /// the entity heuristic. This is the calibrated, adaptive path — see ADR-003.
+    #[default]
+    CostModel,
+    /// Measurement-free fallback: decide SEQ vs PAR purely from entity counts
+    /// (per-system `min_entities_for_parallelism` heuristic + the explicit floor),
+    /// NEVER consulting the cost-model EMA. Deterministic frame-to-frame; use when
+    /// the EMA misbehaves (pathological per-frame cost variance) or when a fixed,
+    /// reproducible dispatch decision is required.
+    Fixed,
+}
 
 // ── ParSystem trait ────────────────────────────────────────────
 
@@ -847,6 +870,12 @@ pub struct Scheduler {
     /// frames. `SystemId`/`u32` are `Send`, so this is safe as a field (unlike a
     /// `Vec<Commands>`, which would make `Scheduler: !Send`).
     system_spawn_history: FxHashMap<SystemId, u32>,
+
+    // ── Sh2: SEQ/PAR dispatch policy (ADR-003) ──────────────────────────────────
+    /// Governs how each parallel-eligible stage picks SEQ vs PAR above the explicit
+    /// entity floor. Default `CostModel` (measured-EMA adaptive); `Fixed` opts out of
+    /// the EMA gates for a deterministic, measurement-free entity heuristic.
+    parallel_policy: ParallelPolicy,
 }
 
 

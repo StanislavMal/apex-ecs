@@ -61,11 +61,16 @@
 - ✅ **ASD row-split защищён:** на реальной CPU-нагрузке 4.4–4.8× (> Bevy-потолок «1 система = 1
   таск»); cost-model меняет ТОЛЬКО «SEQ/PAR и размер листа», не сам балансировщик
   `par_split_run_ranges` и не гейты корректности (has_events/stateful/uses_par_for_each).
-- ⚠ **`ParallelPolicy` НЕ реализован** (честно, §0.2a). План §3.1 обещал тип-политику с
-  `ParallelPolicy::Fixed`-фолбэком для отключения cost-model при патологии EMA — сейчас пороги
-  захардкожены как `const`, ручки нет (только `parallel_min_entities` как жёсткий пол). Отложено в
-  `plans/TECH_DEBT.md` (ParallelPolicy). До реализации отката: комментарий в коде, обещающий Fixed,
-  должен быть исправлен (не обещать несуществующее).
+- ✅ **`ParallelPolicy` РЕАЛИЗОВАН** (addendum 2026-07-06, кампания CORE_POLISH волна 0.2). План §3.1
+  обещал тип-политику с `Fixed`-фолбэком для отключения cost-model при патологии EMA; до 2026-07-06
+  её не было (пороги — захардкоженные `const`), а комментарий в коде обещал несуществующий
+  `ParallelPolicy::Fixed` — ложь в коде (§0.2a). Теперь: `pub enum ParallelPolicy { CostModel, Fixed }`
+  + `Scheduler::set_parallel_policy`/`parallel_policy`. `CostModel` (дефолт) — поведение этого ADR без
+  изменений. `Fixed` — детерминированный, измерение-независимый путь: SEQ/PAR из entity-порогов
+  (`min_entities_for_parallelism` + явный пол `stage_parallel_min_entities`), EMA НЕ читается вовсе —
+  для патологической дисперсии по-кадровой стоимости или когда нужна воспроизводимость диспатча. Явный
+  пол — жёсткий гейт под обеими политиками. Развилка вынесена в чистую `Scheduler::stage_prefers_seq`
+  (юнит-тест `parallel_policy_fixed_vs_cost_model`). Комментарий в коде исправлен.
 - **Открытые follow-up спайки** (ROI-gated, не полумеры — §0.2b; детали в TECH_DEBT): **Ş5**
   dense-by-default для infallible-запросов (goldens-рискован: семантика change-стампинга per-deref
   vs range), **Ş6** heavy_compute leaf-sizing (0.83× vs Bevy — малый/pow-of-2-дисбаланс),

@@ -45,6 +45,53 @@ impl Scheduler {
         ema < threshold
     }
 
+    /// Sh2/ADR-003: the SEQ-vs-PAR verdict for a parallel-eligible stage — a pure
+    /// function of the policy, the explicit floor, and the measured/heuristic inputs,
+    /// extracted from `run_hybrid_parallel` so it is unit-testable in isolation.
+    /// `true` = run the stage SEQ (fall back off the ASD path).
+    ///
+    /// Priority:
+    ///   1. explicit floor (`stage_par_min`) — a hard "never parallelize below N"
+    ///      gate under BOTH policies;
+    ///   2. `ParallelPolicy::Fixed` — the entity heuristic only, NEVER the cost-model
+    ///      EMA (deterministic, measurement-free);
+    ///   3. `ParallelPolicy::CostModel` (default) — the warm EMA fully decides; on
+    ///      cold start fall back to the entity heuristic when `auto_disable` is set,
+    ///      else parallelize.
+    pub(crate) fn stage_prefers_seq(
+        &self,
+        stage_idx: usize,
+        stage_entity_count: usize,
+        sys_count: usize,
+        stage_par_min: usize,
+        auto_disable: bool,
+    ) -> bool {
+        // 1. Explicit floor wins under both policies.
+        if stage_par_min > 0 && stage_entity_count < stage_par_min {
+            return true;
+        }
+        // Pure entity heuristic (no EMA): SEQ when per-system work is below the
+        // valley-of-death crossover. Shared by Fixed and cost-model cold-start.
+        let entity_heuristic_prefers_seq = || {
+            let per_system = stage_entity_count / sys_count.max(1);
+            per_system < Self::min_entities_for_parallelism(sys_count)
+        };
+        match self.parallel_policy {
+            ParallelPolicy::Fixed => entity_heuristic_prefers_seq(),
+            ParallelPolicy::CostModel => {
+                let has_cost_history =
+                    self.stage_cost_ema_ns.get(stage_idx).copied().unwrap_or(0.0) > 0.0;
+                if has_cost_history {
+                    self.cost_model_prefers_seq(stage_idx)
+                } else if auto_disable {
+                    entity_heuristic_prefers_seq()
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Sh2: fold a measured stage dispatch time into the per-stage EMA and record the
     /// mode that produced it (for hysteresis). Lazily grows the buffers.
     pub(crate) fn record_stage_cost(&mut self, stage_idx: usize, elapsed: std::time::Duration, ran_seq: bool) {
@@ -793,17 +840,14 @@ impl Scheduler {
                 continue;
             }
 
-            // Sh2: SEQ/PAR decision. Priority:
-            //   1. explicit user floor (`parallel_min_entities`) always wins;
-            //   2. else, once the cost-model has measured this stage (EMA>0), it
-            //      FULLY decides — measured work supersedes entity count. This is the
-            //      point of the model: it parallelizes heavy-low-entity stages the
-            //      entity heuristic would serialize, and serializes light-high-entity
-            //      stages it would parallelize (D1/D2);
-            //   3. else (cold start, no history yet) fall back to the entity heuristic.
-            let stage_entity_count: usize = if stage_par_min > 0
+            // Sh2: SEQ/PAR decision (verdict extracted into `stage_prefers_seq`).
+            // `stage_entity_count` is only needed when a path consults it: an explicit
+            // floor, the auto-disable heuristic, or ParallelPolicy::Fixed. Otherwise
+            // (CostModel with no floor) it is not read, so skip the O(archetypes) sum.
+            let needs_entity_count = stage_par_min > 0
                 || auto_disable_stage
-            {
+                || self.parallel_policy == ParallelPolicy::Fixed;
+            let stage_entity_count: usize = if needs_entity_count {
                 let total_entities: usize = arch_lengths.iter().sum();
                 stage_ids
                     .iter()
@@ -821,21 +865,13 @@ impl Scheduler {
             } else {
                 0
             };
-            let below_hard_limit = stage_par_min > 0
-                && stage_entity_count < stage_par_min;
-            let has_cost_history =
-                self.stage_cost_ema_ns.get(stage_idx).copied().unwrap_or(0.0) > 0.0;
-            let should_fallback = if below_hard_limit {
-                true
-            } else if has_cost_history {
-                self.cost_model_prefers_seq(stage_idx)
-            } else if auto_disable_stage {
-                let sys_count = stage_ids.len();
-                let per_system = stage_entity_count / sys_count.max(1);
-                per_system < Self::min_entities_for_parallelism(sys_count)
-            } else {
-                false
-            };
+            let should_fallback = self.stage_prefers_seq(
+                stage_idx,
+                stage_entity_count,
+                stage_ids.len(),
+                stage_par_min,
+                auto_disable_stage,
+            );
             let stage_t0 = std::time::Instant::now();
 
             if should_fallback {
