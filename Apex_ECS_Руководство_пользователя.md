@@ -3646,7 +3646,7 @@ wall-time диспетча стадии и сравнивает с порого�
 замеренной стоимостью не управляются.
 
 **Иерархия решения (в порядке приоритета):**
-1. **Жёсткий пол** `set_parallel_min_entities(n)` — стадия с < `n` total entity **всегда** sequential
+1. **Жёсткий пол** `stage_parallel_min_entities` — стадия с < `n` total entity **всегда** sequential
    (пользовательский оверрайд, суперсидит всё).
 2. **Cost-model (основной механизм, steady-state).** После первого прогона стадии (есть история EMA)
    решает **замеренная работа**: тяжёлая стадия параллелится даже при малом числе entity; тривиальная
@@ -3654,18 +3654,32 @@ wall-time диспетча стадии и сравнивает с порого�
    entity-count.
 3. **Cold-start эвристика (первый кадр, истории нет).** Пока EMA не накоплена, работает старая
    entity-эвристика (порог зависит от числа систем: 15 000 / 25 000 / 80 000 entity/system).
-   Управляется `set_parallel_auto_disable(bool)` (по умолчанию `true`). Худший случай первого кадра =
+   Управляется `auto_disable_stage_parallel` (по умолчанию `true`). Худший случай первого кадра =
    прежнее поведение; со второго кадра решает cost-model.
 
-| Метод | По умолчанию | Описание |
-|-------|-------------|----------|
-| `set_parallel_min_entities(n)` | `0` (без ограничений) | Жёсткий пол: < `n` total entity в Stage → всегда sequential. `usize::MAX` = полностью sequential |
-| `set_parallel_auto_disable(bool)` | **`true`** | Cold-start entity-эвристика (только первый прогон стадии, до накопления EMA). После прогрева решает cost-model |
-| `set_par_chunk_size(n)` | `65536` | Максимальный размер чанка (через env `APEX_PAR_CHUNK_SIZE`) |
+**Единая точка настройки — `ChunkConfig` на World** (`world.set_chunk_config(...)`); планировщик читает
+из `world.chunk_config()`. Прежние глобальный atomic `set_par_chunk_size` и методы Scheduler
+`set_parallel_min_entities`/`set_parallel_auto_disable` **сняты** — все ручки теперь поля `ChunkConfig`:
 
-> **Единой ручки-политики (`ParallelPolicy`) пока нет** — пороги cost-model (`T_STAGE_SEQ_NS`, α,
-> гистерезис) захардкожены как константы; настраиваемая политика/принудительный Fixed-режим — в
-> `plans/TECH_DEBT.md` (пункт ParallelPolicy). Дизайн решения — `decisions/ADR-003`.
+```rust
+world.set_chunk_config(ChunkConfig {
+    stage_parallel_min_entities: 10_000, // жёсткий пол PAR; usize::MAX = полностью sequential
+    auto_disable_stage_parallel: true,   // cold-start entity-эвристика (по умолчанию)
+    max_chunk_size: 65536,               // потолок размера чанка (env APEX_PAR_CHUNK_SIZE)
+    ..Default::default()
+});
+// Один env-вход для всех оверрайдов из окружения:
+world.set_chunk_config(ChunkConfig::from_env());
+```
+
+| Поле `ChunkConfig` | По умолчанию | Описание |
+|-------|-------------|----------|
+| `stage_parallel_min_entities` | `0` (без пола) | Жёсткий пол: < `n` total entity в Stage → всегда sequential. `usize::MAX` = полностью sequential |
+| `auto_disable_stage_parallel` | **`true`** | Cold-start entity-эвристика (только первый прогон стадии). После прогрева решает cost-model |
+| `max_chunk_size` | `65536` | Максимальный размер чанка (env `APEX_PAR_CHUNK_SIZE`) |
+
+> **Единой ручки-политики (`ParallelPolicy`) пока нет** — пороги cost-model захардкожены как константы;
+> настраиваемая политика/принудительный Fixed-режим — в `plans/TECH_DEBT.md`. Дизайн — `decisions/ADR-003`.
 
 #### 13.1.4 Правила параллелизма
 
@@ -3721,7 +3735,7 @@ system! {
     fn physics_system(
         q: (Read<Mass>, Write<Velocity>, Write<Position>),
     ) {
-        q.par_for_each(|_, (mass, mut vel, mut pos)| {
+        q.par_for_each_mut(|_, (mass, mut vel, mut pos)| {   // write-форма → par_for_each_mut
             vel.y -= 9.8 * mass.0 * 0.016;
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
@@ -3729,7 +3743,7 @@ system! {
     }
 }
 
-// par_for_each — то же с Entity:
+// par_for_each — read-only с Entity:
 ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
     /* обрабатывается параллельно */
 });
@@ -3739,49 +3753,22 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 > ```rust
 > sched.add_systems(StageLabel::Update, par_access("heavy_sys",
 >     access_desc!(read<A>, write<B>).par_for_each_used(),
->     |ctx| { ctx.query::<(Read<A>, Write<B>)>().par_for_each(|_, (a, mut b)| { ... }); },
+>     |ctx| { ctx.query_unchecked::<(Read<A>, Write<B>)>().par_for_each_mut(|_, (a, mut b)| { /* … */ }); },
 > ));
 > ```
-> Для типизированных систем — по имени после регистрации:
+> Для типизированных систем — декларативно, `.par_for_each_used()` на конфиге:
 > ```rust
-> sched.add_systems(StageLabel::Update, sys("heavy_sys", MyAutoSys));
-> sched.par_for_each_used_by_name("heavy_sys").unwrap();
+> sched.add_systems(StageLabel::Update, sys("heavy_sys", MyAutoSys).par_for_each_used());
 > ```
 > Планировщик не будет дополнительно чанковать такую систему через ASD, избегая oversubscribe rayon thread pool.
 
-> **Настройка `MAX_CHUNK_SIZE`:** По умолчанию 65536. Можно изменить через `set_par_chunk_size(n)` или env `APEX_PAR_CHUNK_SIZE=n`. Увеличение уменьшает число задач для больших миров (меньше overhead), уменьшение — более равномерная загрузка ядер.
+> **Настройка `max_chunk_size`:** По умолчанию 65536. Меняется полем `ChunkConfig` (`world.set_chunk_config`)
+> или env `APEX_PAR_CHUNK_SIZE=n` (через `ChunkConfig::from_env()`). Увеличение уменьшает число задач для
+> больших миров (меньше overhead), уменьшение — более равномерная загрузка ядер.
 
 > **Примечание:** Выигрыш от `par_for_each` достигается когда вычисления CPU-bound (не memory-bandwidth bound), а overhead Rayon оправдан сложностью расчётов. Для маленьких датасетов (entity_count < 100) chunk-size = 128, что минимизирует overhead.
 
-### 13.3 Row-level параллельный SubWorld
-
-Начиная с v0.1.0, [`SubWorld`](crates/apex-core/src/sub_world.rs:94) поддерживает row-level итерацию — параллельную обработку entity внутри одного архетипа.
-
-```rust
-// Последовательная итерация по entity в SubWorld:
-sub_world.for_each_entity(|entity| {
-    println!("entity: {:?}", entity);
-});
-
-// Последовательная итерация по строкам (без Entity, чуть быстрее):
-sub_world.for_each_row(|_row| {
-    // доступ к компонентам через SubWorld
-});
-
-// Параллельная итерация (rayon всегда доступен):
-sub_world.par_for_each_entity(|entity| {
-    /* выполняется на нескольких потоках */
-});
-
-// Параллельная итерация по строкам:
-sub_world.par_for_each_row(|_row| {
-    /* выполняется на нескольких потоках */
-});
-```
-
-> **Примечание:** `par_for_each_entity` и `par_for_each_row` используют [`compute_par_chunks`](crates/apex-core/src/par_utils.rs:14) — размер чанка вычисляется динамически через [`adaptive_chunk_size`](crates/apex-core/src/world.rs:798) (см. [раздел 13.2](#132-параллельная-итерация-внутри-системы)).
-
-### 13.4 Ограничения параллелизма
+### 13.3 Ограничения параллелизма
 
 #### Nested `par_for_each`
 
@@ -3843,9 +3830,9 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 
 ### 14.2 Query
 
-- `CachedQuery` (`world.query::<Q>()`) переиспользует список архетипов — дешевле `Query::new()` в hot path
+- `world.query::<Q>()` переиспользует список архетипов мира — дешевле `Query::new()` в hot path
 - Для ДОЛГОЖИВУЩИХ горячих запросов (системы, extract) — `QueryState<Q>` (§4.3.2): инкрементальный стейт у владельца, ноль локов/аллокаций на вызов (~9ns конструктор против ~32ns у `world.query::<Q>()`)
-- Массовые не-фильтрующие проходы — `for_each_chunk` (§4.3.1): слайсы колонок, автовекторизация, ~1.4× быстрее per-row `for_each` (W2-0.5)
+- Массовые не-фильтрующие проходы — `for_each_chunk` (§4.3.1): слайсы колонок, автовекторизация, ~1.4× быстрее per-row `for_each`
 - «Изменился любой из» — `Or<(Changed<A>, Changed<B>)>` вместо двух запросов + dedup-set (§4.3)
 - Используйте `With<T>`/`Without<T>` для фильтрации вместо `if` внутри closure
 - `for_each(|_, ...)` — единый метод; если entity не нужна, используйте `_` (компилятор оптимизирует загрузку entity)
@@ -3867,7 +3854,7 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 
 ### 14.5 Intra-system Parallelism
 
-`par_for_each` на `Query`/`CachedQuery` даёт реальный прирост только когда:
+`par_for_each` на `Query` даёт реальный прирост только когда:
 - **Размер чанка** — вычисляется динамически `adaptive_chunk_size`: по умолчанию создаётся `2×threads` задач (work-stealing Rayon). Нижний лимит `dynamic_min_chunk=64` entity, верхний `max_chunk_size=65536`. Настраивается через `ChunkConfig`:
   ```rust
   world.set_chunk_config(ChunkConfig {
@@ -3878,12 +3865,12 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
   });
   ```
 - **Вычисления CPU-bound** (atan2, физика, AI) — memory-bound задачи упираются в шину памяти
-- **Флаг `.par_for_each_used()`** — для `par_access` через `access_desc!(...).par_for_each_used()`, для типизированных систем — `sched.par_for_each_used_by_name("имя")` после регистрации.
+- **Флаг `.par_for_each_used()`** — для `par_access` через `access_desc!(...).par_for_each_used()`, для типизированных систем — `sys("имя", S).par_for_each_used()` при регистрации.
 
 ```rust
-// Хорошо: CPU-bound, много entity
-ctx.query::<(Read<Mass>, Write<Velocity>)>()
-    .par_for_each(|_, (mass, mut vel)| {
+// Хорошо: CPU-bound, много entity (write-форма через declared-access escape + par_for_each_mut)
+ctx.query_unchecked::<(Read<Mass>, Write<Velocity>)>()
+    .par_for_each_mut(|_, (mass, mut vel)| {
         vel.y -= 9.8 * mass.0 * 0.016; // CPU-bound
     });
 
@@ -3928,7 +3915,7 @@ cargo run --release
 | `spawn_many_silent` (4 comp) | 29.2 | **34.3 M ops/s** | 🟢 O(N) |
 | `allocate_batch` (ZST) | 11.6 | **86.5 M ops/s** | 🟢 O(N) |
 | `Query::for_each` | 9.2 | **109 M ops/s** | 🟢 O(N) |
-| `CachedQuery::for_each` | 9.0 | **111 M ops/s** | 🟢 O(N) |
+| `world.query` `for_each` (кэш) | 9.0 | **111 M ops/s** | 🟢 O(N) |
 | `Query<(Read<Vel>, Write<Pos>)>` | 9.2 | **109 M ops/s** | 🟢 O(N) |
 | `Query<With<_>>` 0 результатов | 8.3 | **121 M ops/s** | 🟢 O(N) |
 | insert component (archetype-move) | 78.0 | **12.8 M ops/s** | 🟢 O(N) |
@@ -4034,37 +4021,7 @@ cargo run --release
 > Бенч-страж: `cargo run --release -p apex-bench --bin frag_world` — падение >20% на нём
 > блокирует мерж.
 
-### 14.8 Применённые оптимизации
-
-В версии 0.1.0 применён ряд оптимизаций внутренних структур данных:
-
-| Оптимизация | Суть | Эффект |
-|------------|------|--------|
-| **QueryCache zero-copy key** (`SmallVec<[ComponentId; 8]>`) | Ключ кэша хранится на стеке, heap-аллокация только при >8 компонентах | Ускорение cache-hit (горячий путь) |
-| **Column::grow начальная ёмкость 16** (было 64) | Меньше начального overshoot для небольших архетипов | Экономия памяти на старте |
-| **ArchetypeMask::iter_ones — bit manipulation** | Замена `filter_map` на `trailing_zeros()` | Ускорение итерации по маскам архетипов |
-| **Bundle::component_ids — SmallVec** | `SmallVec<[ComponentId; 8]>` вместо `Vec` | Без heap-аллокации для типичных бандлов |
-| **SparseSet adaptive backend** | Auto-switch: Dense (Vec) для плотных индексов, Sparse (HashMap) для разреженных | Переключение при `entity_index > dense.len() * 4 && entity_index > 1024` |
-| **EntityAllocator — pack EntityLocation в u64** | `encoded_location: u64` с битовой упаковкой (нижние 32 бита — row, верхние — archetype_id); `u64::MAX` как sentinel для None | Уменьшение размера EntityRecord и количества кеш-миссов |
-| **propagate_transforms HashSet** | Сбор dirty entity в HashSet вместо повторных world-запросов | Ускорение propagation при большом числе иерархий |
-| **EventReadGuard RAII** | Guard автоматически продвигает курсор при Drop, исключая ручное управление курсором | Упрощение кода, устранение забытых `advance_reader_mut()` |
-| **bincode по умолчанию** | `make_serde_fns` и Prefab-десериализация используют bincode вместо JSON | Ускорение runtime-сериализации в ~1.5-2x |
-| **Graph::bfs/dfs buffer reuse** | Переиспользование `visit_order`, `stack`, `visited` между вызовами | Устранение повторных аллокаций в планировщике |
-
-**Оптимизации перф-кампании 2026-06-16** (бенч-кампания против Bevy 0.18 / Legion 0.4, см. §14.9):
-
-| Оптимизация | Суть | Эффект |
-|------------|------|--------|
-| **`Command` enum ≤48 байт** | `TemplateParams` (3×HashMap, ~144 байта) вынесен в `Box` — раньше раздувал ВЕСЬ enum до ~168 байт (Vec<Command> однороден по наибольшему варианту); compile-time страж размера | Запись любой команды в очередь дешевле → **commands_spawn −53%, обогнал Bevy** |
-| **Commands bulk-apply спавнов** | Подряд идущие `spawn` одного типа `B` применяются ОДНИМ резолвом архетипа (`spawn_bundles_bulk`) вместо per-spawn `spawn_at` | commands_spawn в 4.6×→ближе к прямому пути |
-| **Lazy entity-load в `for_each`** | `entity` грузится только для строк, прошедших фильтр (`Changed`/`Added`), а не по каждой | **changed_iter −36%, обогнал Bevy** (фильтрованные запросы extract'а) |
-| **`CachedQuery.match_verified`** | Пропуск повторного `matches_archetype` для УЖЕ отфильтрованных путей (`QueryState`/`new`); `from_sub_world` оставлен с проверкой | Дешевле итерация по многим архетипам (extract/cull) |
-| **`despawn_recursive` O(n²)→O(поддерева)** | Для cascade-видов делегирует в `despawn` (его `take_subjects` забирает список детей разом); ручная рекурсия удаляла каждого ребёнка из target-списка живого родителя | **×2.6 быстрее Bevy** (было ×2.4 медленнее) |
-| **`allocate_batch` батчинг атомиков** | Один `fetch_add`/`resize` на пачку вместо per-entity 2 атомиков + resize | устранил регресс TD-39 |
-| **`spawn_many` корректность + перф (col_indices)** | **БАГ-ФИКС:** `col_indices` строится в порядке ОБХОДА бандла (`push_component_ids`), НЕ из отсортированных id (иначе компонент в чужую колонку — UB); per-entity данные через `write_data_into_batch` (data-only) с **поколоночной заливкой тиков** (`resize` вместо `count×ncols` push'ей) | корректные per-entity данные + competitive perf |
-| **archetype-level filter fast-path** (`has_row_filter`, 2026-06-17) | `WorldQuery::has_row_filter()` (compile-time: `true` только у `Changed`/`Added`/`Or` с ними) + `fetch_item_unchecked`: для НЕ-фильтрующих форм (`Read`/`Write`/`With`/`Without`/кортежи) итерация идёт плотным циклом без per-row Option-ветки (1:1 Bevy «archetype-level filter»). Чисто перф, семантика не тронута (`Mut` стампит на `DerefMut`) | убирает мёртвую ветку из всех `for_each` (extract/propagate); golden-safe |
-
-### 14.9 Сравнение с Bevy 0.18 и Legion 0.4
+### 14.8 Сравнение с Bevy 0.18 и Legion 0.4
 
 Микро-бенчи `apex-bench` (criterion) против **современных** движков: `bevy_ecs 0.18.1`
 (фича `multi_threaded`) и `legion 0.4.0`. Запуск:
@@ -4086,62 +4043,38 @@ ergonomic-путь с кэширующим Bevy); фильтрованные/с�
 
 | Бенч | apex | bevy 0.18 | legion 0.4 | Итог |
 |------|:----:|:---------:|:----------:|------|
-| simple_insert (10k×4 comp) | 340 µs | **303** | **206** | 🟡 ≈ Bevy³ (−12%) |
+| simple_insert (10k×4 comp) | 340 µs | **303** | **206** | 🟡 ≈ Bevy (−12%) |
 | simple_iter (10k) | 9.22 µs · dense **6.70** | 9.24 | 6.32 | ≈ паритет (dense ≈ legion) |
-| fragmented_iter (26 арх) | 167 ns | **144** | 187 | 🔴 < Bevy² (но > legion) |
-| schedule (3 sys / 40k) | 44 µs | 39 | **36** | 🔴 < Bevy¹ |
-| heavy_compute (par) | 587 µs | 579 | **488** | ≈ паритет³ |
+| fragmented_iter (26 арх) | 167 ns | **144** | 187 | 🔴 < Bevy (но > legion) |
+| schedule (3 sys / 40k) | 44 µs | 39 | **36** | 🔴 < Bevy |
+| heavy_compute (par) | 587 µs | 579 | **488** | ≈ паритет |
 | add_remove (10k) | **521 µs** | 867 | 2720 | 🟢 ×1.7 (vs legion ×5.2) |
 | commands_spawn (10k) | **378 µs** | 479 | — | 🟢 ×1.3 > Bevy |
 | despawn (10k) | **252 µs** | 305 | 488 | 🟢 > обоих |
 | despawn_recursive (поддерево 1k) | **21.3 µs** | 56 | — | 🟢 **×2.6** |
 | get_component (random ×10k) | **34 µs** | 37 | 55 | 🟢 > обоих |
-| changed_iter (Changed, 10% dirty) | 7.59 µs | 7.61 | — | ≈ паритет⁴ |
+| changed_iter (Changed, 10% dirty) | 7.59 µs | 7.61 | — | ≈ паритет |
 | events (send+read 10k) | **13.2 µs** | 22.5 | — | 🟢 **×1.7** |
-| relations (build+iter 10k ChildOf) | 678 µs | 678 | — | ≈ паритет⁴ |
+| relations (build+iter 10k ChildOf) | 678 µs | 678 | — | ≈ паритет |
 | wide_iter (5 comp: 4R+1W) | 3.77 µs | 3.74 | **2.26** | ≈ паритет |
-| commands_insert (10k) | 534 µs | **490** | — | 🟡 < Bevy (−9%)⁵ |
+| commands_insert (10k) | 534 µs | **490** | — | 🟡 < Bevy (−9%) |
 
 **Итог: ~6 побед / 5 паритетов / 4 отставания** против современного Bevy (+ `propagate` — apex-фокус
 без прямого аналога: bevy propagate — отдельный crate). Наши уникальные возможности (events ×1.7,
 relations, despawn_recursive-каскад ×2.6, add_remove ×1.7) — **заметно быстрее Bevy**. Отставания — НЕ
-баги (см. сноски): trade-off параллелизма + микро-тюнинг codegen Bevy. Где Legion впереди
+баги (см. ниже): trade-off параллелизма + микро-тюнинг codegen Bevy. Где Legion впереди
 (simple_insert/simple_iter/wide_iter/heavy_compute) — у него **нет change detection** (мы платим за
 `Changed<T>`/`Added<T>`; Bevy платит ту же цену и ≈равен нам), а iter-выигрыш Legion apex **уже берёт**
 своим dense-путём (`for_each_chunk`: simple_iter dense 6.70 ≈ legion 6.32). На СТРУКТУРНЫХ операциях
 apex рушит Legion (add_remove ×5.2, despawn ×1.9, get_component ×1.6) — цена его cross-archetype packed
 storage.
 
-> ¹ **schedule** — прогон 2026-06-17 показывал ~13% отставание: ASD дробит каждую систему на чанки
-> по воркерам (тонкая балансировка), что на ТРИВИАЛЬНОЙ работе (swap) было дороже Bevy-модели
-> «1 система = 1 таск». **Диагноз закрыт cost-model (Ş2, 2026-07-04):** тривиальные стадии теперь идут
-> sequential (rayon-оверхед не платится), а тяжёлая неравномерная нагрузка по-прежнему параллелится
-> (parallel §14.7 до ×5). Итог — `schedule` **обгоняет оба эталона** (1.45× / 1.12×). Подробнее §13.1.3.
->
-> ² **fragmented_iter** — диффузный per-table codegen Bevy (~1.3 ns/таблица; niche-оптимизированные
-> типы строк, годы LLVM-тюнинга), НЕ структурный дефект: алгоритм обхода тот же, и apex **обгоняет
-> legion**. Два независимых расследования рычага не нашли. На реальной нагрузке (мало архетипов / много
-> сущностей) — паритет; dense-путь (`for_each_chunk`) бьёт всех, но row-фильтры (`Or`/`Changed`) с ним
-> несовместимы.
->
-> ³ **Коррекция честности (2026-06-16).** Прежние «heavy_compute ×2.4» и «simple_insert 293µs > Bevy»
-> были АРТЕФАКТОМ латентного UB-бага: `spawn_many` для КОРТЕЖЕЙ строил `col_indices` из ОТСОРТИРОВАННЫХ
-> id, а write писал в порядке ОБЪЯВЛЕНИЯ ⇒ при «объявление ≠ порядок id» компонент уходил в чужую
-> колонку (запись 64B в 12B-колонку), а bulk-copy «строка 0 во все» терял per-entity данные. Матрицы
-> heavy_compute вырождались (det=0) → мгновенная инверсия → фиктивные 225µs. **Исправлено** (col_indices
-> в порядке ОБХОДА бандла через `push_component_ids` + per-entity `write_data_into_batch` с поколоночными
-> тиками): данные корректны, числа честны — heavy_compute ПАРИТЕТ, simple_insert чуть позади (цена
-> корректной per-entity записи). 191 core + 310 render/golden + регресс-тест целы.
->
-> ⁴ **changed_iter / relations — сползли «победа → паритет», это НЕ регресс apex.** Числа apex
-> стабильны между прогонами (relations 691→678, changed_iter 7.3→7.59 µs); Bevy в прогоне 2026-06-17
-> измерился чуть быстрее (relations 736→678, changed_iter 7.7→7.61), т.е. прежнее преимущество apex
-> было неблагоприятным шумом Bevy, а не реальной победой. Честно — паритет (coin-flip).
->
-> ⁵ **commands_insert** — bound на archetype-move (перемещение из РАЗБРОСАННЫХ строк source + удаление),
-> диффузный отрыв ~9%. Гипотезу «bulk-insert» (перенос приёма `spawn_bundles_bulk` на insert)
-> реализовали и замерили — дала **регресс +35%** (spawn пишет НОВЫЕ строки непрерывным memcpy без
-> source-removal; insert так не умеет — иная структура стоимости). Откачено; рычага нет.
+**Природа отставаний (не баги):**
+- **schedule** — после перехода на cost-model планировщик обгоняет оба эталона (тривиальные стадии не платят rayon-оверхед, тяжёлая неравномерная нагрузка параллелится); таблица выше снята ДО cost-model.
+- **fragmented_iter / simple_insert / wide_iter / heavy_compute** — микро-тюнинг codegen Bevy и отсутствие change detection у Legion (мы платим за `Changed<T>`/`Added<T>`; наш dense-путь `for_each_chunk` берёт iter-выигрыш Legion назад). Алгоритмически обход тот же.
+- **commands_insert** — bound на archetype-move из разбросанных строк; ~9% диффузный отрыв, рычага нет.
+
+> Полная история бенч-кампаний и «коррекции честности» — в архивах планов (`plans/archive/`).
 
 ---
 
