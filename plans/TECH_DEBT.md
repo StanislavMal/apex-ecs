@@ -47,29 +47,33 @@
   clippy net-neutral; движок `check --all-targets` чист; goldens **649/0/9 byte-identical**; Miri TB чист на
   split + chunk-mut + write-путях. (Смежное:
   `SubWorld::resource_mut/event_*(&self)` недостижимо из safe → волна 3/4 dead-code, не S1.)
-- **A5 ✅ ЧАСТИЧНО (pub-ПОЛЯ закрыты 2026-07-05, commit b2a1ff5) — сырая pub-поверхность хранилища.**
+- **A5 ✅ ЗАКРЫТ ЦЕЛИКОМ (pub-ПОЛЯ 2026-07-05 commit b2a1ff5; raw-остаток верифицирован закрытым
+  2026-07-06, кампания CORE_POLISH волна 0.1) — сырая pub-поверхность хранилища.**
   `World.archetypes`/`World.resources` были **pub-ПОЛЯ** (`world.rs:198/213`): `world.archetypes.clear()`
   из safe-кода ломал инварианты. **→ pub(crate)**; потребители (scripting/isolated/hot-reload/
   serialization/examples) переведены на `World::try_resource`/`insert_resource`; +`World::
-  snapshot_resources_serde`/`restore_resource_serde` для сериализатора. **ОСТАТОК → волна 3 (харденинг
-  поверхности, НЕ UB-из-safe):** raw-МЕТОДЫ `run_sequential(*mut World)`→`&mut World` (тривиально,
-  исходно-совместимо — все вызовы уже `&mut world`, движком не используется), `Resources::get_raw_ptr`,
-  `World::event_queue_ptr`, `compute_archetype_indices`/`populate_type_names` (фазы compile). Для плохого
-  `*mut` нужен явный unsound-каст → футган, не прямой UB-из-safe.
+  snapshot_resources_serde`/`restore_resource_serde` для сериализатора. **ОСТАТОК (харденинг поверхности)
+  — верификация по коду 2026-07-06 показала, что ВСЕ 5 пунктов уже удовлетворены** (реестр отставал):
+  `run_sequential(&mut World)` (`apex-scheduler/src/executor.rs:98`), `Resources::get_raw_ptr` `pub(crate)`
+  (`resources.rs:142`), `World::event_queue_ptr` `pub(crate)` (`world.rs:967`), `compute_archetype_indices`
+  `pub(crate)` (`apex-scheduler/src/compile.rs:184`), `populate_type_names` `pub(crate)`
+  (`apex-scheduler/src/registration.rs:978`). Долг закрыт: сырых `*mut World`-методов и pub raw-поверхности
+  из safe нет.
 - **S2 ✅ ЗАКРЫТ (2026-07-05) — `SystemContext::fetch::<P>()` safe-обход F3/ADR-002.** `ctx.fetch::<P>()`
   фетчил ЛЮБОЙ SystemParam без сверки декларации → недекларированный live-write. **→ `fetch_unchecked`
   + `#[doc(hidden)]`** (ADR-002-консистентно с `query_unchecked`/`resource_mut_unchecked`); единственный
   потребитель — пример `system_param.rs` — мигрирован. Полное устранение (params-as-args, `fetch` не
   нужен) — Р-1/волна 3.
-- **S3 🟡 → ВОЛНА 4 — `World::event_writer/event_reader(&self)` = гонка из safe-кода.** `world.rs:~913-933`
-  мутируют event-очереди через `&World`; `World: Sync` → два потока с `&World` в safe. **Реализуемо лишь
-  при явном меж-поточном шеринге `&World`** (планировщик использует UnsafeWorldCell, не `&World`) →
-  футган-класс. Чистый фикс = per-system курсоры (F4) → **волна 4** (rename-only был бы полумерой §0.2b;
-  используется примером basic.rs И EventReader-SystemParam).
-- **S4 🟡 → ВОЛНА 4 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне conflict-детекции.**
-  `ctx.event_reader` (`world.rs:2427`) благословлён как «read», но `EventReader::new`→`add_reader`
-  пишет в реестр курсоров (push/realloc, `events.rs:163-178`). Для ДЕКЛАРИРОВАННЫХ читателей гонку
-  закрывает F2 (`SharedEventReaders`), но недекларированный ctx-путь планировщик не видит. Связан с F4.
+- **S3 🟡 → CORE_POLISH волна 2.1 — `World::event_writer/event_reader(&self)` = гонка из safe-кода.**
+  `world.rs:977/990` мутируют event-очереди через `&World`; `World: Sync` → два потока с `&World` в safe.
+  **Реализуемо лишь при явном меж-поточном шеринге `&World`** (планировщик использует UnsafeWorldCell, не
+  `&World`) → футган-класс. Чистый фикс = `&mut self`+`_unchecked` по канону ADR-002 → **CORE_POLISH
+  волна 2.1** (rename-only был бы полумерой §0.2b; используется примером basic.rs И EventReader-SystemParam).
+- **S4 🟡 → CORE_POLISH волна 2.2 — недекларированный `ctx.event_reader` мутирует реестр курсоров вне
+  conflict-детекции.** `ctx.event_reader` (`world.rs:2531`) благословлён как «read», но
+  `EventReader::new`→`add_reader` пишет в реестр курсоров (push/realloc, `events.rs:163-178`). Для
+  ДЕКЛАРИРОВАННЫХ читателей гонку закрывает F2 (`SharedEventReaders`), но недекларированный ctx-путь
+  планировщик не видит. Связан с F4.
 
 ---
 
@@ -87,30 +91,33 @@
   события). Цена no-loss — сериализация читателей одного события (`SharedEventReaders`) — оставлена
   осознанно. Гейты: workspace + clippy net-neutral + движок check + Miri TB (F4-тест + 23 event) +
   goldens byte-identical. Регресс-тест `persistent_event_reader_no_duplicate_reads`.
-- **F4b 🟢 (edge, низкий приоритет) — AutoSystem/`system!`-путь чтения событий НЕ персистентен.**
+- **F4b 🟢 → CORE_POLISH волна 2.3 — AutoSystem/`system!`-путь чтения событий НЕ персистентен.**
   `ctx.event_reader::<E>()` внутри `AutoSystem::run` / `system!`-тела даёт свежий курсор (не через
   `SystemParam::State`) → тот же FixedUpdate-дубль для AutoSystem-читателей. AutoSystem — второй уровень
   (Р-1: plain-fn = golden path). Фикс потребовал бы хранить курсоры в AutoSystem-инстансе (macro-хирургия
   `system!`). Golden-path (plain-fn) закрыт F4; это — хвост. **Смежно: S3/S4** (footgun-гонки `&self`
   event-мутации) F4 НЕ закрывает (по-прежнему registry + `ctx.event_reader` для standalone).
-- **D6-полное 🟡 — per-system `last_run` (Bevy-паритет change-окон).** Окно по-прежнему
+- **D6-полное 🟡 → CORE_POLISH волна 1.2 — per-system `last_run` (Bevy-паритет change-окон).** Окно по-прежнему
   per-execution-stage (`stage_last_run: Vec<Tick>`, `apex-scheduler/src/lib.rs:~740-747, 2449-2454`);
   волна 2 закрыла только run_if-кейс. Значился в исходном scope волны 6б, исчез при формировании плана.
-- **B5 🟡 — утечка Entity-резерваций при drop/clear Commands без apply.** `Commands::drop`
+- **B5 🟡 → CORE_POLISH волна 0.3 — утечка Entity-резерваций при drop/clear Commands без apply.** `Commands::drop`
   (`commands.rs:~925`) и `clear()` (`commands.rs:~761-786`) дропают payload арены, но не варнят о
   непотреблённых резервациях и не возвращают слоты (тест-свидетель
   `len_counts_only_located_ignoring_orphaned_reservations`, `entity.rs:742`). TD-40 починил счётчик,
   не утечку id-пространства. Решение §3 («warn при drop/clear + честный возврат») не исполнено.
-- **B6 🟡 — standalone Commands (PLACEHOLDER) молча теряет chained insert/with_children.**
+- **B6 🟡 → CORE_POLISH волна 0.4 — standalone Commands (PLACEHOLDER) молча теряет chained insert/with_children.**
   `EntityCommands::insert` ставит `Insert{entity: PLACEHOLDER}` (`commands.rs:~809-813, 338`).
   Смягчено косвенно (spawn аллоцирует id на apply; insert-на-PLACEHOLDER попадает в A9-warn), но
   данные chained-insert теряются. Принятое решение §3 («паника в EntityCommands при PLACEHOLDER»)
   не исполнено и не пересмотрено письменно.
-- **В4 🟡 — IsolatedWorld не дотянут до дифференциатора.** Решение §10.6 = ДА (Entity-ремаппинг между
+- **В4 🟡 — IsolatedWorld не дотянут до дифференциатора (осознанно ОТЛОЖЕН за scope CORE_POLISH —
+  кандидат на следующую кампанию-дифференциатор).** Решение §10.6 = ДА (Entity-ремаппинг между
   мирами, bounded-каналы с телеметрией, кросс-поточные тесты). Сделано: только громкость дропа (E12,
-  волна 4). Каналы моста unbounded, ремаппинга нет. Тестовая часть — в scope волны 7; ремаппинг/
-  bounded-каналы бездомны. Прямое требование §0.9 (козырь-прототип хуже отсутствия козыря).
-- **§10.8 🟡 — Lua-путь не пересажен на общий DynQuery.** Решение (волна 6 п.4): скриптинг «обязан
+  волна 4) + кросс-поточные тесты (волна 7, `apex-isolated/tests/cross_thread.rs`). Каналы моста
+  unbounded, ремаппинга нет — эти два пункта бездомны намеренно: это отдельный дифференциатор (§0.9),
+  не хвост полиша; берётся отдельной кампанией, не CORE_POLISH. Прямое требование §0.9 (козырь-прототип
+  хуже отсутствия козыря).
+- **§10.8 🟡 → CORE_POLISH волна 3 (фаза A) — Lua-путь не пересажен на общий DynQuery.** Решение (волна 6 п.4): скриптинг «обязан
   встать на общий, валидируемый ядром механизм». Факт: `apex-scripting/src` — ноль `DynQuery`;
   `iterators.rs` — прежний собственный unsafe-путь через `_meta` (`:~301, 426`; E1-валидация есть,
   но доступ свой). DynQuery (волна 6) сделан и назвал скриптинг консумером, но миграция не выполнена.
@@ -127,7 +134,7 @@
   процесс-глобальный фолбэк (частичная мимикрия Bevy-глобала — против нашей per-world модели §0.9).
   Осознанный фокусный охват, не полумера: golden-path мутаций покрыт; хвост — по спросу.
 
-- **ParallelPolicy 🟡 — обещан планом, не реализован; комментарий в коде лжёт.** План PARALLELISM §3.1
+- **ParallelPolicy 🟡 → CORE_POLISH волна 0.2 — обещан планом, не реализован; комментарий в коде лжёт.** План PARALLELISM §3.1
   обещал тип-политику (`ParallelPolicy`) с `Fixed`-фолбэком для отключения cost-model при патологии
   EMA. Не реализовано: пороги — захардкоженные `const`, ручки нет (только `parallel_min_entities` как
   пол). Комментарий `apex-scheduler/src/lib.rs:451-452` утверждает «`ParallelPolicy::Fixed` remains
@@ -143,7 +150,7 @@
   внутренние шифры; брендинг ApexForge_ECS. Гейт: grep снятых имён = только migration-заметки; сниппеты
   золотого пути компилируются. **Уточнение:** §2.1-класс F3.1 (`ctx.query::<…Write>`) оказался не
   «~10 битых» — `run_if_cond`/`conditions` НЕ сняты (снят тест-`SystemBuilder`), §6.0a был корректен.
-- **string-table снапшота 🟢 — `type_name` per-instance.** `serializer.rs:142` пишет
+- **string-table снапшота 🟢 → CORE_POLISH волна 0.6 — `type_name` per-instance.** `serializer.rs:142` пишет
   `info.name.to_string()` на каждый инстанс компонента (E7-формат v2 string-table не включил).
   Выигрыш — только в РАЗМЕРЕ сейва (редкий путь), отдельный focused-заход.
 - **D9 ✅ ЗАКРЫТ (2026-07-06) — РЕШЕНИЕ: не фолд, а дифференциальный parity-гейт.** Прежняя рамка
@@ -166,11 +173,11 @@
   `apex-scheduler/tests/executor_parity.rs` (5 тестов, incl. форс-параллельный ASD-путь через
   `set_chunk_config`). Co-location из волны 7 (всё в `executor.rs`) сохранена. `run_stage_parallel` —
   по-прежнему ASD-под-хелпер hybrid'а (не top-level копия).
-- **§1.4-хвосты 🟢 — гигиена, не сделана волной 4.** `EventCursor(pub u32)` — всё ещё pub
+- **§1.4-хвосты 🟢 → CORE_POLISH волна 0.5 — гигиена, не сделана волной 4.** `EventCursor(pub u32)` — всё ещё pub
   (`events.rs:761`); `by_id` — FxHashMap, не Vec (`component.rs:337`); `MainWorld unsafe impl
   Send+Sync` — «проверить необходимость» не журналировано (`world.rs:~2112-2113`); `TargetIndex::remove`
   O(N)-скан без обещанного коммента-компромисса (`relations.rs:~372-388`).
-- **DynQueryMut item-гейт 🟢 (S7/S8).** `DynItemMut::get_mut/get_mut_ptr` (`query.rs:~2711,2725`) не
+- **DynQueryMut item-гейт 🟢 (S7/S8) → CORE_POLISH волна 3 (фаза A).** `DynItemMut::get_mut/get_mut_ptr` (`query.rs:~2711,2725`) не
   проверяют вхождение id в декларированные `writes` — декларация влияет только на матчинг архетипов,
   `AliasedWrite`-проверка при lending декоративна; для agent-IPC/скриптинга политику «что можно
   писать» придётся enforcить слоем выше (S7). Нет Changed/Added-термов у динамического билдера —
@@ -200,7 +207,7 @@
   A/B-гардом). **В2** packed/SoA storage (fragmented_iter/relations структурно; ROI-гейт =
   many_foxes-доказательство, НЕ микробенч — ставит под удар структурные победы add_remove/despawn/get).
   Детали: ADR-003, архив PARALLELISM §4.5/4.6/§8.В2.
-- **D8b-overflow 🟢 — детерминированный overflow блока (фронтир).** При overflow блока в кадре
+- **D8b-overflow 🟢 → CORE_POLISH волна 1.1 — детерминированный overflow блока (фронтир).** При overflow блока в кадре
   система падает в недетерминированный путь тот кадр, затем блок растёт. Rank-ordered
   детерминированный overflow — по спросу (после прогрева не наступает). Детали: ADR-001, entity.rs:183-185.
 - **Волна 7 🔶 ЧАСТИЧНО (2026-07-06) — EN-миграция ✅ + декомпозиция ✅ + тест-кампании ⏳.**
