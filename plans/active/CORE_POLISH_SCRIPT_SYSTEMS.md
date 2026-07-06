@@ -1,9 +1,11 @@
 # Кампания CORE_POLISH + SCRIPT_SYSTEMS — хвосты TECH_DEBT, безусловный детерминизм, скриптинг на золотом пути
 
-> **Статус: 🚧 в работе (старт 2026-07-06). Волны 0 и 1 ✅ ЗАКРЫТЫ.** Волна 0: 0.1–0.5 сделаны,
+> **Статус: 🚧 в работе (старт 2026-07-06). Волны 0, 1 и 2 ✅ ЗАКРЫТЫ.** Волна 0: 0.1–0.5 сделаны,
 > 0.6 string-table переоценён §0.2b (отдельный заход, 🟢 открыт). Волна 1: 1.1 D8b-overflow (эскроу),
-> 1.2 D6-полное (per-system change-окна), 1.3 детерминизм-гейт — сделаны; goldens 649/0/9
-> байт-идентичны на обеих волнах. Далее — волна 2 (event-модель). Источник истины
+> 1.2 D6-полное (per-system change-окна), 1.3 детерминизм-гейт. Волна 2 (event-модель): 2.1 S3
+> (`World::event_*`→`&mut self`+`_unchecked`), 2.2 S4 (`ctx.event_reader`→`_unchecked`, blessed=param),
+> 2.3 F4b (⚠ переоценка §0.2b — macro-персистентность неисполнима чисто, golden path=plain-fn). Goldens
+> 649/0/9 байт-идентичны на всех трёх волнах. Далее — волна 3 (скриптинг/DynQuery). Источник истины
 > кампании. Статусы пунктов — ЗДЕСЬ; `plans/TECH_DEBT.md` держит указатель сюда для взятых в
 > работу пунктов. Ветка: `core-polish-script-systems` (заведена 2026-07-06 от HEAD
 > `api-golden-path`, НЕ от main — main отстаёт на 71 коммит и не содержит фундамента волны 7,
@@ -371,10 +373,17 @@ event-теста зелёные.
 state в AutoSystem-инстансе.
 **Тест:** зеркало `persistent_event_reader_no_duplicate_reads` для `system!`-пути.
 
-### Гейт волны 2
+### Гейт волны 2 ✅ ПРОЙДЕН (2026-07-06)
 
-Полные гейты; Miri по event-тестам; TECH_DEBT: S3/S4/F4b закрываются. Руководство: §-секции
-событий отражают финальную поверхность (advanced `_unchecked` — по формату guide-волны 5).
+Полные гейты шапки + Miri TB по event-путям (core events 22, persistent-reader, multi-thread
+`events_lag_threads` 3 — ноль UB/гонок). **Итог:** apex-core 260 lib + весь workspace (scheduler 102 +
+integration, scripting 8 E2E) зелёный; clippy `--all-targets` net-neutral (4 pre-existing в
+serialization/bench); **движок `check --all-targets` ✅, goldens `visual_tests` 649/0/9 БАЙТ-ИДЕНТИЧНЫ**
+(S3/S4 рендер не трогают, apex-input rename семантически тождествен). TECH_DEBT: S3 ✅ (2.1), S4 ✅ (2.2),
+F4b ✅ переоценкой (2.3). Руководство §5.2.1/§6.7 + таблицы World/ctx отражают финальную поверхность.
+Коммиты: core `5150970`/`a70abf2`/`095dcd7` + engine `ced2f31` (ветка api-golden-path). НЕ запушено.
+
+**Волна 2 ✅ ЗАКРЫТА.** Далее — волна 3 (скриптинг: фаза A DynQuery/S7/S8, фаза B Lua-системы).
 
 ---
 
