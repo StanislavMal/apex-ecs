@@ -9,7 +9,11 @@
 9d376a5b94e6e76995e5e037c08390f9cedbd462
 83cfa59f4e20350d3957f2907ed1f4d631a5eb30
 e44828e74986847909e9eaefacc8e1a57573a3ae
+01a56ad1cf137161e79b8c8e8d201fc06c0e2f30
+bc496b22ec9eb39d2710f0444f46e7fbfd1945fa
+e76726c73f56ee88e0480ba1b5fafa45470c9ab9
 
 # Wave 7 — scheduler/lib.rs decomposition: pure code moves (extract module
 # to sibling file, split impl blocks). Byte-preserving, no behavior change.
 ccb050dd9dcd53a6f6c55e06eb4c6fdcdfbeecdf
+8c4ab2161ea0602f4900ec704b5af23d1e4bb21f
