@@ -1861,7 +1861,7 @@ system! {
     fn movement_system(
         q: (Read<Velocity>, Write<Position>),
     ) {
-        q.for_each(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
+        q.for_each_mut(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -1883,9 +1883,11 @@ impl AutoSystem for PhysicsSystem {
     type Events    = Emit<CollisionEvent>;
     const HAS_DEFERRED: bool = false;  // не использует Commands
     fn run(&mut self, ctx: SystemContext<'_>) {
+        // Ручная реализация — advanced: доступ объявлен в associated-типах, поэтому
+        // write-запрос/writer берутся через *_unchecked (declared-access escape).
         let cfg = ctx.resource::<PhysicsConfig>();
-        let mut writer = ctx.event_writer::<CollisionEvent>();
-        ctx.query::<Self::Query>().for_each(|entity, (mass, mut vel, pos)| {
+        let mut writer = ctx.event_writer_unchecked::<CollisionEvent>();
+        ctx.query_unchecked::<Self::Query>().for_each_mut(|entity, (mass, mut vel, pos)| {
             vel.y -= cfg.gravity * mass.0 * cfg.dt;   // Write<Velocity> → Mut → mut
             if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
         });
@@ -1899,7 +1901,7 @@ system! {
         cfg: Res<PhysicsConfig>,
         writer: &mut Vec<CollisionEvent>,
     ) {
-        q.for_each(|entity, (mass, mut vel, pos)| {
+        q.for_each_mut(|entity, (mass, mut vel, pos)| {
             vel.y -= cfg.gravity * mass.0 * cfg.dt;
             if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
         });
@@ -1931,13 +1933,14 @@ system! {
         q: (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>),
         __whole: WholeWorld,
     ) {
-        // Фаза 1: собираем глобальные данные (все entity)
+        // Фаза 1: собираем глобальные данные (все entity). Запрос содержит Write<Velocity>
+        // ⇒ итерируем через for_each_mut (даже когда фаза только читает):
         let mut bodies: Vec<(Entity, Position, f32)> = Vec::new();
-        q.for_each(|entity, (pos, _, mass, _)| {
+        q.for_each_mut(|entity, (pos, _, mass, _)| {
             bodies.push((entity, *pos, mass.0));
         });
         // Фаза 2: применяем гравитацию
-        q.for_each(|_, (pos, vel, mass, orbits)| {
+        q.for_each_mut(|_, (pos, vel, mass, orbits)| {
             // ... расчёт сил через bodies ...
         });
     }
@@ -1987,8 +1990,9 @@ sched.add_systems(StageLabel::Update, par_access(
     "enemy_ai",
     access_desc!(read<Enemy>, write<Velocity>),
     |ctx| {
-        ctx.query::<(Read<Enemy>, Write<Velocity>)>()
-            .for_each(|_, (_, mut vel)| {   // Write<T> → Mut<T> → `mut`
+        // доступ объявлен в access_desc! ⇒ write-запрос через ctx.query_unchecked + for_each_mut
+        ctx.query_unchecked::<(Read<Enemy>, Write<Velocity>)>()
+            .for_each_mut(|_, (_, mut vel)| {   // Write<T> → Mut<T> → `mut`
                 vel.x *= 0.99;
                 vel.y *= 0.99;
             });
@@ -2005,14 +2009,13 @@ sched.add_systems(StageLabel::Update, par_access(
     "heavy_physics",
     access_desc!(write<Pos>, read<Vel>).par_for_each_used(),
     |ctx| {
-        ctx.query::<(Read<Vel>, Write<Pos>)>()
-            .par_for_each(|_, (v, mut p)| { /* CPU-bound расчёты */ });
+        ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+            .par_for_each_mut(|_, (v, mut p)| { /* CPU-bound расчёты */ });
     },
 ));
 
-// Для типизированных систем — по имени после регистрации:
-sched.add_systems(StageLabel::Update, sys("heavy_physics", HeavyPhysSys));
-sched.par_for_each_used_by_name("heavy_physics").unwrap();
+// Для типизированных систем — декларативно, методом .par_for_each_used() на конфиге:
+sched.add_systems(StageLabel::Update, sys("heavy_physics", HeavyPhysSys).par_for_each_used());
 ```
 
 > **`access_desc!(read<T>, write<T>, read_event<T>, write_event<T>)`** — макрос,
@@ -2279,58 +2282,54 @@ sched.set_deterministic_spawn(true);
 
 По умолчанию опция **выключена** — обычные проекты платят ноль (путь резерва не меняется).
 
-### 6.7 `SystemContext`
+### 6.7 `SystemContext` — *advanced*
 
-`SystemContext` — read-only view на мир, доступный внутри системы. Предоставляет доступ к Query, ресурсам и событиям.
+> **Золотой путь — типизированные параметры системы** (`Query`, `Res`/`ResMut`, `EventReader`/
+> `EventWriter`, `&mut Commands` — см. §6.0–6.1). `SystemContext` нужен только в ручной реализации
+> `AutoSystem` и в `par`/`par_access`-замыканиях. Мутабельный доступ через `ctx` **не декларируется**
+> планировщику, поэтому идёт через `#[doc(hidden)]`-методы `*_unchecked` — их можно звать ТОЛЬКО когда
+> доступ уже объявлен (типами `AutoSystem` или `access_desc!`), иначе это недекларированная гонка.
+
+`SystemContext` даёт read-only доступ к Query, ресурсам и событиям; write-доступ — через
+declared-access escape (`*_unchecked`).
 
 ```rust
 fn run(&mut self, ctx: SystemContext<'_>) {
-    // Query — использует CachedQuery с ленивым fetch_state
-    // (вызывается в for_each, не при создании):
-    ctx.query::<(Read<Velocity>, Write<Position>)>()
-        .for_each(|entity, (vel, mut pos)| { /* ... */ });
+    // Read-only Query (Q: ReadOnlyWorldQuery):
+    ctx.query::<Read<Velocity>>()
+        .for_each(|entity, vel| { /* ... */ });
 
-    // Единый API — entity всегда доступна (используйте `_` если не нужна):
-    ctx.query::<(Read<Vel>, Write<Pos>)>()
-        .for_each(|_, (v, mut p)| { /* ... */ });
+    // Write-запрос — только через declared-access escape (доступ объявлен в type Query):
+    ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+        .for_each_mut(|_, (v, mut p)| { /* ... */ });
 
-    // Ресурсы:
-    let cfg   = ctx.resource::<PhysicsConfig>();        // Res<T> — паникует если нет
-    let mut s = ctx.resource_mut::<FrameStats>();       // ResMut<T> — паникует если нет
-
-    // Безопасный доступ (без паники):
-    if let Some(stats) = ctx.try_resource::<FrameStats>() {
+    // Ресурсы (чтение — обычный API):
+    let cfg = ctx.resource::<PhysicsConfig>();          // Res<T> — паникует если нет
+    if let Some(stats) = ctx.try_resource::<FrameStats>() {  // Option<Res<T>>
         println!("frame: {}", stats.frame);
     }
-    if let Some(mut stats) = ctx.try_resource_mut::<FrameStats>() {
-        stats.frame += 1;
-    }
+    // Запись ресурса — declared-access escape:
+    let mut s = ctx.resource_mut_unchecked::<FrameStats>();  // ResMut<T>
+    s.frame += 1;
 
-    // События:
-    let reader     = ctx.event_reader::<DamageEvent>(); // EventReader<T>
-    let mut writer = ctx.event_writer::<DeathEvent>();  // EventWriter<T>
+    // События (чтение — обычный API; запись — escape):
+    let reader     = ctx.event_reader::<DamageEvent>();          // EventReader<T>
+    let mut writer = ctx.event_writer_unchecked::<DeathEvent>(); // EventWriter<T>
     writer.send(DeathEvent { entity });
 
-    // Количество entity:
-    ctx.entity_count() // -> usize
+    ctx.entity_count(); // -> usize
 
-    // Параллельная итерация (rayon всегда доступен):
-    ctx.query::<(Read<Vel>, Write<Pos>)>()
-        .par_for_each(|_, (v, mut p)| {
-            /* выполняется на нескольких потоках */
-        });
-    // Для типизированных систем: sched.par_for_each_used_by_name("имя")
-    // Для par_access-замыканий: access_desc!(...).par_for_each_used()
-
-    // Thread-local Commands (начиная с v0.1.0):
+    // Thread-local Commands:
     ctx.commands().despawn(entity);
     ctx.commands().insert(entity, NewComponent { value: 42 });
 }
 ```
 
-> **`ctx.commands()` (начиная с v0.1.0):** Возвращает `&mut Commands` для текущего потока. В параллельных системах каждая система получает собственный экземпляр `Commands` — это безопасно, т.к. `Commands` не `Sync`. В последовательном режиме используется локальный экземпляр, хранящийся внутри `SystemContext`. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
+> **`ctx.commands()`** возвращает `&mut Commands` для текущего потока. В параллельных системах каждая
+> система получает собственный экземпляр `Commands` (безопасно — `Commands` не `Sync`); команды применяет
+> планировщик после Stage. Метод устраняет необходимость вручную создавать `Commands` внутри `par_for_each`.
 
-### 6.7 `EventPipelineBuilder`
+### 6.9 `EventPipelineBuilder`
 
 `EventPipelineBuilder` — строитель конвейера событий. Создаётся через `Scheduler::event_pipeline::<E>()`, применяется через `.build()`.
 
@@ -2338,9 +2337,9 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 
 | Метод | Описание |
 |-------|----------|
-| `produced_by(id, name)` | Добавить систему-производитель (требует `Emit<E>`) |
-| `transformed_by(id, name)` | Добавить систему-трансформер (требует `Listen<E>` + `Emit<E>`) |
-| `consumed_by(id, name)` | Добавить систему-потребитель (требует `Listen<E>`) |
+| `produced_by(name)` | Добавить систему-производитель по имени (требует `Emit<E>`) |
+| `transformed_by(name)` | Добавить систему-трансформер (требует `Listen<E>` + `Emit<E>`) |
+| `consumed_by(name)` | Добавить систему-потребитель (требует `Listen<E>`) |
 | `build(sched)` | Применить зависимости к планировщику |
 | `build_validated(sched) -> Result<(), Vec<PipelineValidationError>>` | Применить с проверкой ролей |
 
@@ -2356,51 +2355,45 @@ fn run(&mut self, ctx: SystemContext<'_>) {
 
 ### 6.8 `SystemParam` — типобезопасные параметры систем
 
-`SystemParam` — трейт для **типобезопасного извлечения параметров** из `SystemContext`. Позволяет объявить, какие ресурсы/запросы/события нужны системе, **без ручного вызова** `ctx.resource::<T>()`, `ctx.query::<Q>()`, `ctx.event_reader::<E>()`.
-
-**Зачем:** устраняет бойлерплейт в sequential системах и упрощает портирование Bevy-рендера (где `RenderCommand::Param: SystemParam`).
+`SystemParam` — трейт, стоящий **за** типизированными параметрами систем: именно он превращает
+`Res<T>`/`Query<Q>`/`EventReader<E>`-параметры plain-fn и `system!` в доступ к миру. Его можно
+использовать и напрямую — объявить набор параметров типом-кортежем и извлечь одним вызовом. Это
+**advanced**-механизм (полезен для портирования Bevy-рендера, где `RenderCommand::Param: SystemParam`);
+в обычных системах пишите параметры напрямую.
 
 #### Базовое использование
 
 ```rust
 use apex_core::prelude::*;
 
-// Ручной стиль (было):
-fn old_style(ctx: &SystemContext<'_>) {
-    let dt = ctx.resource::<DeltaTime>();
-    let q = ctx.query::<(Read<Vel>, Write<Pos>)>();
-    let events = ctx.event_reader::<CollisionEvent>();
-    // ... используем dt, q, events
-}
-
-// SystemParam-стиль (стало):
+// Набор параметров как тип-кортеж из маркеров:
 type MyParams = (
     ResRead<DeltaTime>,                            // → Res<'_, DeltaTime>
-    QueryParam<(Read<Vel>, Write<Pos>)>,           // → CachedQuery<'_, (Read<Vel>, Write<Pos>)>
+    QueryParam<(Read<Vel>, Write<Pos>)>,           // → Query<'_, '_, (Read<Vel>, Write<Pos>)>
     Listen<CollisionEvent>,                        // → EventReader<'_, CollisionEvent>
 );
 
-fn new_style(ctx: &SystemContext<'_>) {
-    let (dt, q, events) = MyParams::fetch(ctx);
-    // или через convenience-метод:
-    let (dt, q, events) = ctx.fetch::<MyParams>();
+fn my_system(ctx: &SystemContext<'_>) {
+    // fetch_unchecked — declared-access escape (#[doc(hidden)]): сверки декларации нет,
+    // вызывать только когда доступ объявлен (тип MyParams и есть декларация).
+    let (dt, mut q, events) = ctx.fetch_unchecked::<MyParams>();
     // ... используем dt, q, events
 }
 ```
 
 #### Маркеры параметров
 
-| Маркер | Что возвращает `fetch()` | Аналог |
+| Маркер | Что возвращает `fetch_unchecked()` | Соответствует |
 |--------|--------------------------|--------|
-| `ResRead<T>` | `Res<'w, T>` (иммутабельная ссылка) | `ctx.resource::<T>()` |
-| `ResWrite<T>` | `ResMut<'w, T>` (мутабельная ссылка) | `ctx.resource_mut::<T>()` |
-| `Listen<E>` | `EventReader<'w, E>` (чтение событий) | `ctx.event_reader::<E>()` |
-| `Emit<E>` | `EventWriter<'w, E>` (отправка событий) | `ctx.event_writer::<E>()` |
-| `QueryParam<Q>` | `CachedQuery<'w, Q>` (запрос компонентов) | `ctx.query::<Q>()` |
-| `CommandsParam` | `&'w mut Commands` (структурные изменения) | `ctx.commands()` |
-| `Extract<QueryParam<Q>>` | `CachedQuery<'w, Q>` (из MainWorld) | `ctx.resource::<MainWorld>().0.query::<Q>()` |
-| `Extract<ResRead<T>>` | `Res<'w, T>` (из MainWorld) | `ctx.resource::<MainWorld>().0.resource::<T>()` |
-| `Extract<Listen<E>>` | `EventReader<'w, E>` (из MainWorld) | `ctx.resource::<MainWorld>().0.event_reader::<E>()` |
+| `ResRead<T>` | `Res<'w, T>` (иммутабельная ссылка) | `Res<T>`-параметр |
+| `ResWrite<T>` | `ResMut<'w, T>` (мутабельная ссылка) | `ResMut<T>`-параметр |
+| `Listen<E>` | `EventReader<'w, E>` (чтение событий) | `EventReader<E>`-параметр |
+| `Emit<E>` | `EventWriter<'w, E>` (отправка событий) | `EventWriter<E>`-параметр |
+| `QueryParam<Q>` | `Query<'w, '_, Q>` (запрос компонентов) | `Query<Q>`-параметр |
+| `CommandsParam` | `&'w mut Commands` (структурные изменения) | `&mut Commands`-параметр |
+| `Extract<QueryParam<Q>>` | `Query<'w, '_, Q>` (read-only, из MainWorld) | доступ к MainWorld (§12.1.1) |
+| `Extract<ResRead<T>>` | `Res<'w, T>` (из MainWorld) | доступ к MainWorld |
+| `Extract<Listen<E>>` | `EventReader<'w, E>` (из MainWorld) | доступ к MainWorld |
 
 #### Кортежи
 
@@ -2426,10 +2419,10 @@ type P0 = ();
 
 // Использование:
 fn my_system(ctx: &SystemContext<'_>) {
-    let (dt, stats, q, mut writer) = ctx.fetch::<P4>();
+    let (dt, stats, mut q, mut writer) = ctx.fetch_unchecked::<P4>();
     // dt: Res<'_, DeltaTime>
     // stats: ResMut<'_, FrameStats>
-    // q: CachedQuery<'_, (Read<Vel>, Write<Pos>)>
+    // q: Query<'_, '_, (Read<Vel>, Write<Pos>)>
     // writer: EventWriter<'_, CollisionEvent>
 }
 ```
@@ -2463,50 +2456,40 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
 
 #### Отличия от Bevy SystemParam
 
-| Bevy | Apex |
+| Bevy | ApexForge_ECS |
 |------|------|
-| `SystemParam` с разделением `State`/`Fetch` | Без разделения — `fetch()` напрямую |
+| `SystemParam` с разделением `State`/`Fetch` | `fetch_unchecked(ctx)` напрямую (declared-access escape) |
 | `#[derive(SystemParam)]` proc-макрос | Типы-маркеры + кортежи (без макроса) |
 | `Query<&T, &mut U>` через SystemParam | `QueryParam<(Read<T>, Write<U>)>` |
 | Интегрирован в планировщик | Ортогонален: `system!` (параллельный/эксклюзивный) работает независимо |
 
 #### `Extract<P>` — Bevy-совместимый доступ к MainWorld
 
-`Extract<P>` позволяет extract-системам **прозрачно читать данные из другого мира** (MainWorld), временно вставленного как ресурс. Это точный порт Bevy `Extract<T>` SystemParam.
+`Extract<P>` позволяет extract-системам **прозрачно читать данные из другого мира** (MainWorld),
+временно вставленного как ресурс (§12.1.1). Это порт Bevy `Extract<T>` SystemParam; извлекается тем же
+`ctx.fetch_unchecked`. Доступ read-only.
 
 ```rust
 use apex_core::prelude::*;
 
-// Extract-система: читает камеры из MainWorld, пишет результат в текущий мир
-fn extract_cameras(
-    q: Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,
-    out: ResWrite<ExtractedCamera>,
-) {
-    for (cam, transform) in q.iter() {   // iter() выдаёт item (П1)
-        *out = ExtractedCamera::new(cam, transform);
-    }
-}
+// Extract-система: читает камеры и ресурс из MainWorld, пишет результат в текущий мир.
+type ExtractCams = (
+    Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,  // → Query из MainWorld
+    Extract<ResRead<ShadowQuality>>,                             // → Res из MainWorld
+);
 
-// Extract-система: читает ресурс из MainWorld
-fn extract_shadow_quality(
-    sq: Extract<ResRead<ShadowQuality>>,
-    out: ResWrite<ShadowQuality>,
-) {
-    *out = *sq;
-}
-
-// Extract-система: читает события из MainWorld
-fn extract_input_events(
-    events: Extract<Listen<InputEvent>>,
-    writer: Emit<InputEvent>,
-) {
-    for ev in events.iter() {
-        writer.send(*ev);
+fn extract_cameras(ctx: &SystemContext<'_>) {
+    let (q, shadow) = ctx.fetch_unchecked::<ExtractCams>();
+    let mut out = ctx.resource_mut_unchecked::<ExtractedCamera>();
+    for (_, (cam, transform)) in q.iter() {   // iter() выдаёт item
+        *out = ExtractedCamera::new(cam, transform, *shadow);
     }
 }
 ```
 
-**Как это работает:** во время extract-стадии render-мир содержит временный ресурс `MainWorld(pub World)`. `Extract<P>` через `fetch(ctx)` читает `Res<MainWorld>` из текущего мира и применяет внутренний `SystemParam P` к main-миру — прозрачно для вызывающего кода.
+**Как это работает:** во время extract-стадии render-мир содержит временный ресурс `MainWorld` (§12.1.1).
+`Extract<P>` читает `Res<MainWorld>` из текущего мира и применяет внутренний `SystemParam P` к main-миру —
+прозрачно для вызывающего кода.
 
 **Доступные комбинации `Extract<P>`:**
 
@@ -2635,7 +2618,7 @@ target-индекс (`(kind, target) → subjects`). Следствия:
 
 - `add_relation`/`remove_relation` — O(1)-вставки в индексы, БЕЗ архетипного перехода
   и без влияния на кэш запросов; иерархия любого размера не плодит архетипов;
-- `children_of(kind, parent)` — O(числа детей);
+- `targets_of(kind, parent)` — O(числа детей);
 - **связь никогда не переживает свой target**: `despawn(target)` вычищает все пары,
   где entity — target, а generation в индексах гарантирует, что переиспользованный
   `entity.index` не вернёт чужие связи;
@@ -2658,10 +2641,10 @@ world.add_relation(player, Owns, sword);
 world.has_relation(child, ChildOf, parent) // -> bool
 
 // Получение target:
-let parent_entity = world.get_relation_target(child, ChildOf); // -> Option<Entity>
+let parent_entity = world.target_of(child, ChildOf); // -> Option<Entity>
 
 // Итерация по дочерним entity:
-for child in world.children_of(ChildOf, parent) {
+for child in world.targets_of(ChildOf, parent) {
     println!("child: {:?}", child);
 }
 
@@ -2679,7 +2662,7 @@ world.despawn_recursive(ChildOf, root); // удаляет root + всех пот
 **Семантика despawn(target):** для видов с
 `cascade_delete_on_target_despawn() == true` (например, `ChildOf`) subjects
 уничтожаются вместе с target; для остальных видов (например, `Owns`) subjects
-живут дальше, но связь вычищается из индексов — `get_relation_target` вернёт `None`.
+живут дальше, но связь вычищается из индексов — `target_of` вернёт `None`.
 
 ### 8.1.1 Массовое добавление Relations
 
@@ -2734,7 +2717,7 @@ system! {
         q: (Write<Position>,),
     ) {
         // Чтение:
-        for child in ctx.children_of(ChildOf, root) {
+        for child in ctx.targets_of(ChildOf, root) {
             if ctx.has_relation(child, Owns, root) {
                 cmd.remove_relation(child, Owns, root);
             }
@@ -2754,7 +2737,7 @@ system! {
 ```rust
 system! {
     fn cleanup_orphans(world: &mut World) {
-        let orphans: Vec<_> = world.children_of(ChildOf, root)
+        let orphans: Vec<_> = world.targets_of(ChildOf, root)
             .filter(|&child| !world.has_relation(child, Owns, root))
             .collect();
         for child in orphans {
@@ -2772,9 +2755,9 @@ system! {
 |-------|-----------|----------|
 | `query_relation<R, Q>(kind, target)` | `RelationIter<Q>` | Entity с relation R к target + компоненты Q |
 | `query_wildcard<R, Q>(kind)` | `RelationIter<Q>` | Entity с любым relation R + компоненты Q |
-| `children_of<R>(kind, parent)` | `impl Iterator<Item = Entity>` | Все субъекты relation R к parent |
+| `targets_of<R>(kind, parent)` | `impl Iterator<Item = Entity>` | Все субъекты relation R к parent |
 | `has_relation<R>(subject, kind, target)` | `bool` | Проверка наличия связи |
-| `get_relation_target<R>(subject, kind)` | `Option<Entity>` | Найти target для subject |
+| `target_of<R>(subject, kind)` | `Option<Entity>` | Найти target для subject |
 
 ### 8.6 Запись Relations через Commands
 
@@ -2867,7 +2850,7 @@ let params = TemplateParams::new()
     .set::<HpParam>(150.0);
 
 // Спавн из шаблона:
-let boss = world.spawn_from_template("Monster", &params)
+let boss = world.spawn_template_with("Monster", &params)
     .expect("template not found");
 ```
 
@@ -2889,7 +2872,7 @@ let params = TemplateParams::new()
     .set::<MonsterHealth>(200.0f32);
 
 // PrefabManifest::spawn() применит overrides:
-world.spawn_from_template("MonsterPrefab", &params);
+world.spawn_template_with("MonsterPrefab", &params);
 ```
 
 Значение сериализуется в JSON в момент `set::<P>()` и хранится в `TemplateParams` до спавна. Параметры без `component_type_name()` (по умолчанию `""`) игнорируются для overrides, но по-прежнему доступны через `get::<P>()`.
@@ -2903,7 +2886,7 @@ world.spawn_from_template("MonsterPrefab", &params);
 ```rust
 let mut cmds = Commands::new();
 cmds.spawn_template("Monster");
-cmds.spawn_from_template("Monster", params.clone());
+cmds.spawn_template_with("Monster", params.clone());
 cmds.apply(&mut world);
 ```
 
@@ -2927,7 +2910,7 @@ impl EntityTemplate for ChildTemplate {
 }
 
 // При спавне child сразу получает ChildOf к parent:
-let child = world.spawn_from_template("Child", &TemplateParams::new());
+let child = world.spawn_template_with("Child", &TemplateParams::new());
 ```
 
 ### 9.6 Макрос `impl_entity_template!`
@@ -2991,12 +2974,12 @@ println!("relations: {}", snapshot.relations.len());
 
 ```rust
 // Сериализовать в bincode:
-let binary = snapshot.to_binary().expect("bincode failed");
+let binary = snapshot.to_bincode().expect("bincode failed");
 std::fs::write("savegame.bin", &binary).unwrap();
 
 // Загрузить из bincode:
 let data = std::fs::read("savegame.bin").unwrap();
-let restored = WorldSnapshot::from_binary(&data).expect("invalid binary save");
+let restored = WorldSnapshot::from_bincode(&data).expect("invalid binary save");
 ```
 
 Также доступен универсальный метод `WorldSerializer::write_to_file()`, который определяет формат по расширению:
@@ -3021,7 +3004,7 @@ let snapshot = WorldSnapshot::from_json(&json).unwrap();
 
 // Или из bincode:
 let binary = std::fs::read("savegame.bin").unwrap();
-let snapshot = WorldSnapshot::from_binary(&binary).unwrap();
+let snapshot = WorldSnapshot::from_bincode(&binary).unwrap();
 
 // Подготовить новый мир (зарегистрировать те же типы):
 let mut world = World::new();
@@ -3044,15 +3027,15 @@ let new_player_entity = entity_map[&old_player_index];
 `WorldDiff` — структура, представляющая разницу между двумя состояниями мира. Используется для инкрементальных сохранений — вместо полного snapshot сохраняются только изменённые компоненты.
 
 ```rust
-use apex_serialization::snapshot::{WorldDiff, diff_snapshots};
+use apex_serialization::{WorldSerializer, snapshot::WorldDiff};
 
 // Создать два snapshot:
 let snap1 = WorldSerializer::snapshot(&world).unwrap();
 // ... изменения в мире ...
 let snap2 = WorldSerializer::snapshot(&world).unwrap();
 
-// Вычислить diff (byte-level сравнение компонентов):
-let diff = diff_snapshots(&snap1, &snap2).unwrap();
+// Вычислить diff (byte-level сравнение компонентов) — ассоциированный метод хаба:
+let diff = WorldSerializer::diff_snapshots(&snap1, &snap2).unwrap();
 
 // diff.modified_components — только изменённые данные
 // Неизменённые компоненты исключены из диффа
@@ -3110,6 +3093,46 @@ let diff = WorldSerializer::diff_with(&old_snapshot, &world, &mut ctx)?;
 // Префабы (сериализация и инстанцирование):
 let manifest = WorldSerializer::entity_to_prefab_with(&world, entity, &mut ctx)?;       // + hierarchy_to_prefab_with
 loader.instantiate_with(&mut world, &manifest, &[], None, None, &mut ctx)?;
+```
+
+### 10.3.3 Версия формата, ресурсы и Entity-ссылки
+
+**Версия снапшота.** Формат `WorldSnapshot` версионирован: `WorldSnapshot::CURRENT_VERSION` (сейчас `2`)
+пишется в поле `version`. При загрузке старого снапшота вызывайте `migrate()` — он поднимает данные до
+текущей версии (v1→v2 — no-op, поле `resources` добавляется пустым); `is_version_compatible()` проверяет
+совместимость до восстановления:
+
+```rust
+let mut snapshot = WorldSnapshot::from_json(&json)?;
+if !snapshot.is_version_compatible() {
+    snapshot.migrate().expect("несовместимая версия снапшота");
+}
+WorldSerializer::restore(&mut world, &snapshot)?;
+```
+
+**Ресурсы в снапшоте (v2).** Ресурсы сериализуются отдельно от компонентов — зарегистрируйте их через
+`register_resource_serde::<R>()` (`R: Serialize + DeserializeOwned`). Тогда `snapshot`/`restore`
+сохраняют и восстанавливают их вместе с миром.
+
+```rust
+world.register_resource_serde::<GameConfig>();   // → ресурс попадает в снапшот
+```
+
+**Entity-ссылки внутри компонентов.** Компонент, хранящий `Entity` другого объекта, после `restore`
+получил бы устаревший id (restore перенумеровывает entity). Реализуйте `MapEntities` и зарегистрируйте
+через `register_map_entities::<T>()` — restore автоматически перепишет ссылки на новые id:
+
+```rust
+#[derive(Component, Serialize, Deserialize)]
+struct Target(Entity);
+
+impl MapEntities for Target {
+    fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+        self.0 = f(self.0);
+    }
+}
+
+world.register_map_entities::<Target>();   // ссылки чинятся при restore
 ```
 
 ### 10.4 Prefabs (файловые префабы)
@@ -3179,7 +3202,7 @@ let orc = loader.instantiate(&mut world, &manifest, &[], None, None)
 
 ```rust
 world.register_template("Orc", manifest);
-world.spawn_from_template("Orc", &TemplateParams::new());
+world.spawn_template_with("Orc", &TemplateParams::new());
 ```
 
 #### 10.4.4 Экспорт entity в префаб
@@ -3194,14 +3217,14 @@ let prefab = WorldSerializer::entity_to_prefab(&world, entity).unwrap();
 let hierarchy = WorldSerializer::hierarchy_to_prefab(&world, root).unwrap();
 ```
 
-`hierarchy_to_prefab` встраивает всех детей как **inline**-манифесты, поэтому полученный префаб **самодостаточен**: его можно сохранить в один `.prefab`-файл и инстанцировать через `PrefabLoader` **без предзагрузки** под-префабов:
+`hierarchy_to_prefab` встраивает всех детей как **inline**-манифесты, поэтому полученный префаб **самодостаточен**: его можно сохранить в один `.prefab.json`-файл и инстанцировать через `PrefabLoader` **без предзагрузки** под-префабов:
 
 ```rust
 let loader = PrefabLoader::new();            // пустой кэш — под-префабы не нужны
 let root = loader.instantiate(&mut world, &hierarchy, &[], None, None).unwrap();
 ```
 
-Сохраните полученный `PrefabManifest` в файл с расширением `.prefab` для последующей загрузки через `PrefabLoader`. (Обходится только `ChildOf`; ZST-компоненты-маркеры `entity_to_prefab` пропускает.)
+Сохраните полученный `PrefabManifest` в файл `<имя>.prefab.json` для последующей загрузки через `PrefabLoader`/`PrefabPlugin` (watcher берёт только `*.prefab.json`). (Обходится только `ChildOf`; ZST-компоненты-маркеры `entity_to_prefab` пропускает.)
 
 ---
 
@@ -3322,7 +3345,7 @@ loop {
 
 ### 11.3 Hot Reload префабов (PrefabPlugin)
 
-`PrefabPlugin` из крейта `apex-hot-reload` отслеживает изменения `.prefab`-файлов и автоматически пересоздаёт entity при изменении.
+`PrefabPlugin` из крейта `apex-hot-reload` отслеживает изменения `*.prefab.json`-файлов и автоматически пересоздаёт entity при изменении.
 
 #### 11.3.1 Инициализация
 
@@ -3333,9 +3356,8 @@ use apex_hot_reload::asset_registry::AssetRegistry;
 let mut registry = AssetRegistry::new();
 let mut prefab_plugin = PrefabPlugin::new();
 
-// Загрузить все .prefab файлы из директории:
-let mut loader = PrefabLoader::new();
-prefab_plugin.load_directory("assets/prefabs/", &mut registry, &mut loader);
+// Загрузить все `*.prefab.json`-файлы из директории (берутся только они):
+prefab_plugin.load_directory(Path::new("assets/prefabs/"), &mut registry)?;
 
 // Трекинг entity: после спавна префаба привяжите entity к AssetId
 prefab_plugin.track_entity(asset_id, entity);
@@ -3995,8 +4017,8 @@ cargo run --release
 | `Query::new` (Read, With) (1k) | 222 µs | **~0.17 µs** | ~1300× |
 | `Query::new` редкий комп. (8 строк) | 173 µs | **~0.12 µs** | ~1400× |
 | `Query::new` Changed (with_tick) | 974 µs | **~0.13 µs** | ~7000× |
-| `children_of` ×27k родителей | 264 µs (9.8 ns/вызов) | **~190 µs (7 ns)** | 1.4× |
-| `get_relation_target` ×27k | 1.64 ms (61 ns/вызов) | **80 µs (3 ns)** | 20× |
+| `targets_of` ×27k родителей | 264 µs (9.8 ns/вызов) | **~190 µs (7 ns)** | 1.4× |
+| `target_of` ×27k | 1.64 ms (61 ns/вызов) | **80 µs (3 ns)** | 20× |
 | random `get_mut` ×28k (shuffle) | 3.25 ms (116 ns/вызов) | **195 µs (7 ns)** | 16× |
 | random `get_mut_by_id` ×28k (CR-M3) | — | **172 µs (6.1 ns)** | 19× от ДО-get_mut |
 | `has_component` ×28k | 425 µs (15 ns/вызов) | **120 µs (4.3 ns)** | 3.5× |
@@ -4348,8 +4370,8 @@ fn main() {
 | `add_relation(s, kind, t)` | Создать связь subject→target (O(1), без структурных изменений; мёртвые s/t — no-op+warn) |
 | `add_relation_batch(&subjects, kind, target)` | Массовое добавление relation (bulk-вставка в индексы) |
 | `has_relation(s, kind, t)` | Проверить наличие связи |
-| `get_relation_target(s, kind)` | Получить target связи → `Option<Entity>` (generation-честно) |
-| `children_of(kind, parent)` | Итерация по дочерним entity — O(числа детей) |
+| `target_of(s, kind)` | Получить target связи → `Option<Entity>` (generation-честно) |
+| `targets_of(kind, parent)` | Итерация по дочерним entity — O(числа детей) |
 | `despawn_recursive(kind, e)` | Удалить entity + потомков (для cascade-видов хватает обычного `despawn`) |
 | `iter_relations()` | Все связи мира `(subject_index, kind_idx, target)` — сериализация |
 | `add_relation_by_kind_idx(s, kind_idx, t)` | Низкоуровневое добавление по kind_idx (restore/горячие циклы) |
@@ -4372,7 +4394,7 @@ fn main() {
 | `advance_change_tick()` | Продвинуть change-tick на границе кадра (база `Changed<T>`); делает планировщик |
 | `last_run_tick()` | База change-detection для систем → `Tick` |
 | `register_template(name, tmpl)` | Зарегистрировать EntityTemplate по имени |
-| `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
+| `spawn_template_with(name, params)` | Создать entity из шаблона с параметрами |
 | `has_template(name)` | Проверить наличие шаблона → `bool` |
 | `id()` | Уникальный id мира в процессе (привязка `QueryState`; W2-0) |
 | `check_change_ticks()` | Кламп старых change-тиков к окну `Tick::MAX_CHANGE_AGE` (W2-3); автозапуск из `tick()`/`advance_change_tick()` раз в ~67M тиков — вручную нужен только при собственном цикле без них |
@@ -4521,9 +4543,9 @@ generation entity не участвует — НЕ использовать дл
 | **`commands()`** | Thread-local Commands (v0.1.0) |
 | `query_relation::<R, Q>(kind, target)` | Query по relation R к target + компоненты Q |
 | `query_wildcard::<R, Q>(kind)` | Query по relation R (любой target) + компоненты Q |
-| `children_of::<R>(kind, parent)` | Итератор по дочерним entity |
+| `targets_of::<R>(kind, parent)` | Итератор по дочерним entity |
 | `has_relation::<R>(subject, kind, target)` | Проверить наличие связи |
-| `get_relation_target::<R>(subject, kind)` | Получить target связи → `Option<Entity>` |
+| `target_of::<R>(subject, kind)` | Получить target связи → `Option<Entity>` |
 
 ### Commands API
 
@@ -4539,7 +4561,7 @@ generation entity не участвует — НЕ использовать дл
 | `insert_raw(entity, component_id, value)` | Добавить компонент по динамическому ComponentId |
 | `add(fn)` | Произвольная команда `\|world: &mut World\|` |
 | `spawn_template(name)` | Создать entity из шаблона (без параметров) |
-| `spawn_from_template(name, params)` | Создать entity из шаблона с параметрами |
+| `spawn_template_with(name, params)` | Создать entity из шаблона с параметрами |
 | `add_relation(subject, kind, target)` | Добавить relation (отложенно, без аллокации) |
 | `remove_relation(subject, kind, target)` | Удалить relation (отложенно, без аллокации) |
 | `add_relation_batch(subjects, kind, target)` | Массовое добавление relation |
