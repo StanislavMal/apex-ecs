@@ -100,11 +100,18 @@
 - **D6-полное 🟡 → CORE_POLISH волна 1.2 — per-system `last_run` (Bevy-паритет change-окон).** Окно по-прежнему
   per-execution-stage (`stage_last_run: Vec<Tick>`, `apex-scheduler/src/lib.rs:~740-747, 2449-2454`);
   волна 2 закрыла только run_if-кейс. Значился в исходном scope волны 6б, исчез при формировании плана.
-- **B5 🟡 → CORE_POLISH волна 0.3 — утечка Entity-резерваций при drop/clear Commands без apply.** `Commands::drop`
-  (`commands.rs:~925`) и `clear()` (`commands.rs:~761-786`) дропают payload арены, но не варнят о
-  непотреблённых резервациях и не возвращают слоты (тест-свидетель
-  `len_counts_only_located_ignoring_orphaned_reservations`, `entity.rs:742`). TD-40 починил счётчик,
-  не утечку id-пространства. Решение §3 («warn при drop/clear + честный возврат») не исполнено.
+- **B5 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.3) — утечка Entity-резерваций при drop/clear
+  Commands.** Было: `Commands::drop`/`clear()` дропали payload, но непотреблённые `spawn().id()`-
+  резервации (продвинули high-water / съели lease-слоты) не возвращались → утечка id-пространства
+  (TD-40 починил только счётчик). **Сделано (честный возврат, §0.2b):** общий канал `AbandonQueue`
+  (Arc, разделён аллокатором и всеми резерверами) с atomic-флагом `pending` — `EntityReserver::abandon`
+  кладёт индексы (rare drop/clear-путь), `EntityAllocator::flush` дренит их в free-list ПОСЛЕ роста
+  records, БЕЗ gen-инкремента (никогда не были живы — та же логика, что `reclaim_block_tail`).
+  Флаг держит горячий fast-path flush lock-free. `Commands::abandon_queued_reservations` собирает
+  `Command::Spawn`-резервации (не PLACEHOLDER) на drop/clear + `warn_once!` (нет World в scope →
+  не ErrorHandler). Тесты: `abandoned_reservations_are_reclaimed_on_flush` (entity),
+  `dropped_/cleared_commands_reservations_are_reclaimed` (commands). Гейты: 256 core-тестов, clippy
+  net-neutral, Miri чист (19 reserv + 28 commands тестов, ноль UB/гонок).
 - **B6 🟡 → CORE_POLISH волна 0.4 — standalone Commands (PLACEHOLDER) молча теряет chained insert/with_children.**
   `EntityCommands::insert` ставит `Insert{entity: PLACEHOLDER}` (`commands.rs:~809-813, 338`).
   Смягчено косвенно (spawn аллоцирует id на apply; insert-на-PLACEHOLDER попадает в A9-warn), но

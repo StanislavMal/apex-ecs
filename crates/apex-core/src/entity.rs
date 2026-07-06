@@ -82,7 +82,7 @@ impl EntityRecord {
 }
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Lease of free slots for reservation: a snapshot of `free_list` (index + generation), moved out of
 /// `free_list` for the span between flushes, plus a decrementing cursor. **Lease slots are disjoint from
@@ -156,6 +156,18 @@ struct BlockCursor {
     next: AtomicU32,
 }
 
+/// B5: shared channel for reservation indices abandoned WITHOUT `apply` (a
+/// reserver-bound `Commands` dropped/cleared with un-applied `spawn().id()`s). The
+/// `pending` flag lets [`EntityAllocator::flush`] skip the lock on the hot path (the
+/// overwhelmingly common case is nothing abandoned), so the fast path stays
+/// lock-free; the `Mutex` is taken only when something was actually abandoned (a rare
+/// drop/clear) or drained.
+#[derive(Default)]
+struct AbandonQueue {
+    pending: std::sync::atomic::AtomicBool,
+    indices: Mutex<Vec<u32>>,
+}
+
 #[derive(Clone)]
 pub struct EntityReserver {
     high_water: Arc<AtomicU32>,
@@ -164,6 +176,10 @@ pub struct EntityReserver {
     /// private block (deterministic, contention-free) until exhausted, then falls
     /// back to the shared high-water/lease.
     block: Option<Arc<BlockCursor>>,
+    /// B5: shared channel for reservations abandoned without `apply` (see
+    /// [`abandon`](Self::abandon) and [`EntityAllocator::flush`]). Same `Arc` the
+    /// owning allocator drains.
+    abandoned: Arc<AbandonQueue>,
 }
 
 impl EntityReserver {
@@ -200,6 +216,39 @@ impl EntityReserver {
                 ids,
                 next: AtomicU32::new(0),
             })),
+            abandoned: Arc::clone(&self.abandoned),
+        }
+    }
+
+    /// B5: return reserved-but-un-applied `Entity`s to the owning allocator's
+    /// abandoned queue so their id-space is reclaimed. Called by [`Commands`] when it
+    /// is dropped or cleared with un-applied `spawn().id()` reservations still queued
+    /// — those ids advanced the shared high-water / consumed lease slots but were
+    /// never materialized, so without this they leak the id-space (TD-40 fixed only
+    /// the count). `PLACEHOLDER`s (standalone `Commands` with no reserver) carry no
+    /// reservation and are skipped. The allocator drains the queue in [`flush`] AFTER
+    /// growing `records`, pushing the indices back to `free_list` WITHOUT a generation
+    /// bump (they were never alive — same rationale as
+    /// [`reclaim_block_tail`](EntityAllocator::reclaim_block_tail)).
+    pub fn abandon(&self, entities: &[Entity]) {
+        let mut guard = self
+            .abandoned
+            .indices
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let before = guard.len();
+        guard.extend(
+            entities
+                .iter()
+                .filter(|e| **e != Entity::PLACEHOLDER)
+                .map(|e| e.index),
+        );
+        if guard.len() != before {
+            // Publish AFTER the push (release) so a flush that observes the flag also
+            // sees the queued indices.
+            self.abandoned
+                .pending
+                .store(true, Ordering::Release);
         }
     }
 
@@ -280,6 +329,14 @@ pub struct EntityAllocator {
     /// location-less records (for example orphaned when `Commands` is dropped without `apply`) are NOT counted
     /// here (previously they inflated the count — TD-40).
     live: u32,
+    /// B5: shared channel of reservation indices abandoned WITHOUT `apply` (a
+    /// reserver-bound `Commands` dropped/cleared with un-applied `spawn().id()`s).
+    /// Pushed from [`EntityReserver::abandon`] (rare drop/clear path — never the hot
+    /// reserve loop), drained into `free_list` by [`flush`](Self::flush) so the
+    /// id-space stays bounded (TD-40 fixed the count; this stops the id-space leak).
+    /// Shared via `Arc` with every reserver handle; the `pending` flag keeps `flush`
+    /// lock-free when nothing was abandoned.
+    abandoned: Arc<AbandonQueue>,
 }
 
 impl EntityAllocator {
@@ -293,6 +350,7 @@ impl EntityAllocator {
             records: Vec::new(),
             free_list: Vec::new(),
             live: 0,
+            abandoned: Arc::new(AbandonQueue::default()),
         }
     }
 
@@ -305,6 +363,7 @@ impl EntityAllocator {
             // Clone of the Arc onto the SAME cell — the reserver sees all future re-leases.
             lease: Arc::clone(&self.lease),
             block: None,
+            abandoned: Arc::clone(&self.abandoned),
         }
     }
 
@@ -387,10 +446,35 @@ impl EntityAllocator {
                 encoded_location: NO_LOCATION,
             });
         }
+        // B5: reclaim indices abandoned by a dropped/cleared reserver-bound `Commands`.
+        // `records` now covers them (step 2 grew to high-water), so pushing to free_list
+        // is safe (refresh_lease reads their generation). No generation bump — they were
+        // never alive (same rationale as `reclaim_block_tail`). The `pending` flag keeps
+        // this lock-free on the hot path (nothing abandoned → no lock); drained before
+        // the fast-path check so a non-empty free_list re-leases the returned slots.
+        if self.abandoned.pending.swap(false, Ordering::Acquire) {
+            let drained: Vec<u32> = {
+                let mut guard = self
+                    .abandoned
+                    .indices
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            for index in drained {
+                debug_assert!(
+                    (index as usize) < self.records.len(),
+                    "abandoned reservation index {} beyond records (flush grows to high-water first)",
+                    index
+                );
+                self.free_list.push(index);
+            }
+        }
         // Read the current lease from the cell (a clone — the read-lock is released immediately, before
         // the write-lock in refresh_lease, otherwise self-deadlock).
         let lease = read_lease(&self.lease);
         // Fast path (typical: spawns only, no despawns): nothing to return/re-lease.
+        // A non-empty `free_list` here (e.g. just-drained abandoned indices) skips it.
         if self.free_list.is_empty() && lease.free.is_empty() {
             return;
         }
@@ -763,6 +847,42 @@ mod tests {
         assert!(alloc.free(a));
         assert_eq!(alloc.len(), 1, "len is consistent with is_alive after despawn");
         assert!(!alloc.is_alive(a) && alloc.is_alive(b));
+    }
+
+    /// B5: reservations abandoned WITHOUT `apply` (as a dropped/cleared reserver-bound
+    /// `Commands` produces) are returned to the pool on `flush`, so the id-space stays
+    /// bounded instead of leaking one index per abandoned reservation.
+    #[test]
+    fn abandoned_reservations_are_reclaimed_on_flush() {
+        let mut alloc = EntityAllocator::new();
+        let r = alloc.reserver();
+        // Reserve three fresh ids (indices 0,1,2) — this advances the shared high-water.
+        let a = r.reserve();
+        let b = r.reserve();
+        let c = r.reserve();
+        assert_eq!([a.index, b.index, c.index], [0, 1, 2]);
+
+        // Abandon them (as a dropped reserver-bound Commands would) + flush.
+        r.abandon(&[a, b, c]);
+        alloc.flush();
+
+        // The next reservations REUSE the abandoned indices rather than growing the
+        // id-space to 3,4,5 — the leak is gone.
+        let reused: std::collections::HashSet<u32> =
+            [r.reserve().index, r.reserve().index, r.reserve().index]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            reused,
+            [0, 1, 2].into_iter().collect(),
+            "abandoned indices are reused — id-space stays bounded"
+        );
+
+        // PLACEHOLDER carries no reservation → skipped (no panic, no bogus index).
+        r.abandon(&[Entity::PLACEHOLDER]);
+        alloc.flush();
+        // Still only indices 0,1,2 ever handed out (no phantom index from PLACEHOLDER).
+        assert_eq!(alloc.high_water.load(Ordering::Relaxed), 3);
     }
 
     #[test]

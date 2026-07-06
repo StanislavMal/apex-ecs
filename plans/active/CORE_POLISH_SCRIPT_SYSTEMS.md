@@ -85,7 +85,15 @@ cost-model нельзя отключить при патологии EMA (пла
   параллель при N ≥ порога и в seq при N < порога; под `CostModel` поведение неизменно
   (существующие тесты диспатча зелёные без правок).
 
-### 0.3 B5 — утечка Entity-резерваций при drop/clear `Commands` без apply
+### 0.3 B5 — утечка Entity-резерваций при drop/clear `Commands` без apply ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** Общий `AbandonQueue` (Arc: аллокатор + резерверы) с atomic-флагом `pending`
+> (fast-path flush остаётся lock-free); `EntityReserver::abandon` кладёт индексы на drop/clear,
+> `EntityAllocator::flush` дренит в free-list без gen-инкремента (как `reclaim_block_tail`);
+> `Commands::abandon_queued_reservations` + `warn_once!`. Тесты entity+commands; Miri чист
+> (19+28); 256 core-тестов; clippy net-neutral. Уточнение к дизайну: `reclaim_block_tail`
+> напрямую переиспользовать нельзя (Drop не имеет `&mut World`) — тот же ПРИНЦИП (возврат без
+> gen-bump), но через общий канал drop→flush.
 
 **Проблема:** `Commands::drop` (`apex-core/src/commands.rs:~925`) и `clear()` (`:~761-786`)
 дропают payload, но молча теряют непотреблённые id-резервации (слоты не возвращаются,

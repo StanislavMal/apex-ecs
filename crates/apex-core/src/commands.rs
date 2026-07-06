@@ -766,6 +766,8 @@ impl Commands {
 
     /// Clear without applying — correctly drops the typed data in the arena
     pub fn clear(&mut self) {
+        // B5: reclaim reservations from `spawn().id()` that will never be applied.
+        self.abandon_queued_reservations();
         for cmd in self.queue.drain(..) {
             match cmd {
                 Command::Spawn { offset, drop, .. } => unsafe {
@@ -784,6 +786,37 @@ impl Commands {
             }
         }
         self.arena.reset();
+    }
+
+    /// B5: return reservations from un-applied `spawn().id()` calls to the allocator.
+    ///
+    /// A reserver-bound `Commands` (the system path) that is dropped or cleared with
+    /// queued `Spawn`s never materializes those ids — they advanced the shared
+    /// high-water / consumed lease slots. Without returning them the id-space leaks
+    /// (TD-40 fixed only the *count*, not the leak). We hand the reserved indices to
+    /// the reserver's abandoned queue; the allocator reclaims them on the next
+    /// [`flush`](crate::entity::EntityAllocator::flush). A no-op without a reserver
+    /// (standalone `Commands` reserve `PLACEHOLDER`, which owns no id) or with no
+    /// queued spawns (the common post-`apply` case: `apply` empties the queue).
+    fn abandon_queued_reservations(&self) {
+        let Some(reserver) = &self.reserver else { return };
+        let reserved: Vec<Entity> = self
+            .queue
+            .iter()
+            .filter_map(|cmd| match cmd {
+                Command::Spawn { entity, .. } if *entity != Entity::PLACEHOLDER => Some(*entity),
+                _ => None,
+            })
+            .collect();
+        if reserved.is_empty() {
+            return;
+        }
+        crate::warn_once!(
+            "Commands dropped/cleared with {} un-applied spawn() reservation(s); \
+             returning their ids to the allocator (apply the Commands to avoid this)",
+            reserved.len()
+        );
+        reserver.abandon(&reserved);
     }
 }
 
@@ -932,6 +965,8 @@ impl ChildSpawner<'_> {
 
 impl Drop for Commands {
     fn drop(&mut self) {
+        // B5: reclaim reservations from `spawn().id()` that were never applied.
+        self.abandon_queued_reservations();
         // Drop the typed data in the arena before deallocating the buffer
         for cmd in self.queue.drain(..) {
             match cmd {
@@ -1013,6 +1048,55 @@ mod tests {
         cmds.apply(&mut world);
         assert!(world.is_alive(e), "entity is alive after apply");
         assert_eq!(world.get::<Pos>(e).unwrap().0, 7.0);
+    }
+
+    /// B5: a reserver-bound `Commands` dropped WITHOUT `apply` returns its
+    /// `spawn().id()` reservations to the allocator, so the id-space stays bounded — a
+    /// fresh `Commands` reuses those indices instead of growing past them.
+    #[test]
+    fn dropped_commands_reservations_are_reclaimed() {
+        let mut world = World::new();
+        {
+            let mut cmds = Commands::new();
+            cmds.set_reserver(world.entity_reserver());
+            let a = cmds.spawn((Pos(1.0),)).id();
+            let b = cmds.spawn((Pos(2.0),)).id();
+            let c = cmds.spawn((Pos(3.0),)).id();
+            assert_eq!([a.index, b.index, c.index], [0, 1, 2]);
+            // `cmds` dropped here without apply → abandons indices 0,1,2.
+        }
+        world.flush_reserved();
+
+        // A fresh Commands reuses the abandoned indices rather than growing to 3,4,5.
+        let mut cmds2 = Commands::new();
+        cmds2.set_reserver(world.entity_reserver());
+        let reused: std::collections::HashSet<u32> = (0..3)
+            .map(|i| cmds2.spawn((Pos(i as f32),)).id().index)
+            .collect();
+        assert_eq!(
+            reused,
+            [0, 1, 2].into_iter().collect(),
+            "dropped reservations returned to the pool — id-space bounded"
+        );
+        cmds2.apply(&mut world);
+        assert_eq!(world.entity_count(), 3, "only the applied entities are alive");
+    }
+
+    /// B5: `clear()` reclaims reservations too (same path as drop).
+    #[test]
+    fn cleared_commands_reservations_are_reclaimed() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+        let a = cmds.spawn((Pos(1.0),)).id();
+        let b = cmds.spawn((Pos(2.0),)).id();
+        assert_eq!([a.index, b.index], [0, 1]);
+        cmds.clear();
+        world.flush_reserved();
+
+        // Reuse after clear.
+        let c = cmds.spawn((Pos(9.0),)).id();
+        assert!(c.index < 2, "cleared reservation index reused (bounded id-space)");
     }
 
     #[test]
