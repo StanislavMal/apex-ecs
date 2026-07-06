@@ -91,15 +91,15 @@ impl Scheduler {
         }
     }
 
-    // ── Регистрация ────────────────────────────────────────────
+    // ── Registration ────────────────────────────────────────────
     //
-    // ЕДИНСТВЕННЫЙ публичный вход — `add_systems(label, …)` (+ конструкторы
-    // `sys`/`seq`/`par`/`par_access` и bare-идентификаторы). Методы ниже —
-    // внутренние строительные блоки и опора внутренних тестов; публичный
-    // зоопарк из 15 add_*-вариантов удалён ревизией API 2026-06-12.
+    // The ONLY public entry point is `add_systems(label, …)` (+ the constructors
+    // `sys`/`seq`/`par`/`par_access` and bare identifiers). The methods below are
+    // internal building blocks and the backbone of the internal tests; the public
+    // zoo of 15 add_* variants was removed by the API revision of 2026-06-12.
 
-    /// Регистрировать Sequential систему (полный &mut World).
-    /// Этап — `default_stage_label` (по умолчанию `Update`).
+    /// Register a Sequential system (full &mut World).
+    /// Stage is `default_stage_label` (`Update` by default).
     #[cfg(test)]
     pub(crate) fn add_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
@@ -108,7 +108,7 @@ impl Scheduler {
         self.add_system_to_stage(name, func, self.default_stage_label.clone())
     }
 
-    /// Регистрировать Sequential систему в указанном этапе.
+    /// Register a Sequential system in the given stage.
     /// Test-only builder helper — production code uses `add_systems` + `seq()`.
     #[cfg(test)]
     pub(crate) fn add_system_to_stage<F>(
@@ -145,7 +145,7 @@ impl Scheduler {
         }
     }
 
-    /// Регистрировать Sequential систему в Startup этапе (запускается один раз).
+    /// Register a Sequential system in the Startup stage (runs once).
     #[cfg(test)]
     pub(crate) fn add_startup_system<F>(&mut self, name: impl Into<String>, func: F) -> SystemBuilder<'_>
     where
@@ -161,8 +161,8 @@ impl Scheduler {
         self.add_system_to_stage(name_str, func, StageLabel::Startup)
     }
 
-    /// Регистрировать AutoSystem.
-    /// Этап — `default_stage_label` (по умолчанию `Update`).
+    /// Register an AutoSystem.
+    /// Stage is `default_stage_label` (`Update` by default).
     #[cfg(test)]
     pub(crate) fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
@@ -171,7 +171,7 @@ impl Scheduler {
         self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
     }
 
-    /// Регистрировать AutoSystem в указанном этапе.
+    /// Register an AutoSystem in the given stage.
     #[cfg(test)]
     pub(crate) fn add_auto_system_to_stage<S>(
         &mut self,
@@ -191,8 +191,8 @@ impl Scheduler {
         if S::NEEDS_WHOLE_WORLD {
             access.needs_whole_world = true;
         }
-        // W3-4: система с состоянием не делится ASD row-split'ом — несколько
-        // задач звали бы run(&mut self) одного экземпляра конкурентно.
+        // W3-4: a stateful system is not split by ASD row-split — multiple
+        // tasks would call run(&mut self) on one instance concurrently.
         if std::mem::size_of::<S>() > 0 {
             access.stateful = true;
         }
@@ -222,7 +222,7 @@ impl Scheduler {
         }
     }
 
-    /// Регистрировать AutoSystem в Startup этапе.
+    /// Register an AutoSystem in the Startup stage.
     #[cfg(test)]
     pub(crate) fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
     where
@@ -238,8 +238,8 @@ impl Scheduler {
         self.add_auto_system_to_stage(name_str, system, StageLabel::Startup)
     }
 
-    /// Регистрировать ParSystem.
-    /// Этап — `default_stage_label` (по умолчанию `Update`).
+    /// Register a ParSystem.
+    /// Stage is `default_stage_label` (`Update` by default).
     #[allow(dead_code)]
     pub(crate) fn add_par_system<S: ParSystem + 'static>(
         &mut self,
@@ -249,7 +249,7 @@ impl Scheduler {
         self.add_par_system_to_stage(name, system, self.default_stage_label.clone())
     }
 
-    /// Регистрировать ParSystem в указанном этапе.
+    /// Register a ParSystem in the given stage.
     #[allow(dead_code)]
     pub(crate) fn add_par_system_to_stage<S: ParSystem + 'static>(
         &mut self,
@@ -261,7 +261,7 @@ impl Scheduler {
         self.next_id += 1;
         self.last_added_system_id = Some(id);
         let mut access = S::access();
-        // W3-4: система с состоянием → без ASD row-split.
+        // W3-4: a stateful system → no ASD row-split.
         if std::mem::size_of::<S>() > 0 {
             access.stateful = true;
         }
@@ -287,7 +287,7 @@ impl Scheduler {
         id
     }
 
-    /// Регистрировать ParSystem в Startup этапе.
+    /// Register a ParSystem in the Startup stage.
     #[allow(dead_code)]
     pub(crate) fn add_startup_par_system<S: ParSystem + 'static>(
         &mut self,
@@ -298,12 +298,12 @@ impl Scheduler {
     }
 
 
-    /// Регистрировать параллельную систему-замыкание с явным доступом.
+    /// Register a parallel closure system with explicit access.
     ///
-    /// `access` описывает, какие компоненты/ресурсы/события система читает
-    /// и пишет — планировщик использует это для разрешения конфликтов.
+    /// `access` describes which components/resources/events the system reads
+    /// and writes — the scheduler uses this to resolve conflicts.
     ///
-    /// Этап — `default_stage_label` (по умолчанию `Update`).
+    /// Stage is `default_stage_label` (`Update` by default).
     ///
     /// ```
     /// # use apex_core::prelude::*;
@@ -335,8 +335,8 @@ impl Scheduler {
         self.add_par_access_to_stage(name, access, func, self.default_stage_label.clone())
     }
 
-    /// Регистрировать параллельную систему-замыкание с явным доступом
-    /// в указанном этапе.
+    /// Register a parallel closure system with explicit access
+    /// in the given stage.
     #[cfg(test)]
     fn add_par_access_to_stage<F>(
         &mut self,
@@ -352,7 +352,7 @@ impl Scheduler {
         self.next_id += 1;
         self.last_added_system_id = Some(id);
         let mut access = access;
-        // W3-4: замыкание с захватами = состояние → без ASD row-split.
+        // W3-4: a capturing closure = state → no ASD row-split.
         if std::mem::size_of::<F>() > 0 {
             access.stateful = true;
         }
@@ -392,30 +392,30 @@ impl Scheduler {
     // config object for all parallelism tuning. (Former setters
     // `set_parallel_min_entities` / `set_parallel_auto_disable` removed.)
 
-    /// Эвристика: минимальное количество entity на одну систему для окупаемости
-    /// параллелизма (rayon overhead < выигрыш).
+    /// Heuristic: the minimum entity count per system for parallelism to pay
+    /// off (rayon overhead < gain).
     ///
-    /// Пороги определены эмпирически через `parallel_diagnostics` scaling benchmark
-    /// (12 ядер, release). «Valley of death» (PAR медленнее SEQ в 2-3x) находится
-    /// в диапазоне 5,000-10,000 entity для multi-system и до 50,000 для single-system.
+    /// Thresholds were found empirically via the `parallel_diagnostics` scaling benchmark
+    /// (12 cores, release). The "valley of death" (PAR 2-3x slower than SEQ) sits
+    /// in the 5,000-10,000 entity range for multi-system and up to 50,000 for single-system.
     pub(crate) fn min_entities_for_parallelism(num_systems: usize) -> usize {
         if num_systems >= 3 {
-            15_000 // 3+ систем — амортизация rayon overhead на 25K+ entity
+            15_000 // 3+ systems — amortizes rayon overhead at 25K+ entities
         } else if num_systems >= 2 {
-            25_000 // 2 системы — пересечение PAR/SEQ около 25K
+            25_000 // 2 systems — PAR/SEQ crossover around 25K
         } else {
-            80_000 // 1 система — только row-level chunking, пересечение ~100K
+            80_000 // 1 system — row-level chunking only, crossover ~100K
         }
     }
 
-    /// Зарегистрировать системы в указанном этапе через замыкание.
+    /// Register systems in the given stage via a closure.
     ///
-    /// Внутри замыкания `default_stage_label` временно подменяется на `label`,
-    /// поэтому все `add_*_system` (без `_to_stage`) внутри попадают в этот этап.
+    /// Inside the closure `default_stage_label` is temporarily set to `label`,
+    /// so every `add_*_system` (without `_to_stage`) inside lands in that stage.
     ///
-    /// После замыкания предыдущий этап восстанавливается.
+    /// After the closure the previous stage is restored.
     ///
-    /// Удобно для группировки систем плагина:
+    /// Handy for grouping a plugin's systems:
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel};
     /// # use apex_core::world::SystemContext;
@@ -442,18 +442,18 @@ impl Scheduler {
         let saved_condition = self.scope_condition.clone();
         f(self);
         self.default_stage_label = previous;
-        // Скоуп-условие действует только ВНУТРИ блока (раньше «прилипало» ко
-        // всем последующим регистрациям — латентный баг, найден аудитом
+        // The scope condition applies only INSIDE the block (it used to "stick" to
+        // all subsequent registrations — a latent bug found by the audit
         // 2026-06-12).
         self.scope_condition = saved_condition;
         self
     }
 
-    /// Скоуп условий: все системы, зарегистрированные внутри замыкания —
-    /// включая через [`add_systems`](Self::add_systems) — получают условия,
-    /// заданные [`run_condition`](Self::run_condition) (AND с их собственными).
-    /// Скоупы вкладываются (условия комбинируются по AND); по выходе из блока
-    /// прежний скоуп восстанавливается.
+    /// Condition scope: every system registered inside the closure —
+    /// including via [`add_systems`](Self::add_systems) — gets the conditions
+    /// set by [`run_condition`](Self::run_condition) (AND-ed with their own).
+    /// Scopes nest (conditions combine with AND); on leaving the block
+    /// the previous scope is restored.
     ///
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel, seq};
@@ -464,7 +464,7 @@ impl Scheduler {
     ///         seq("movement", |_w: &mut apex_core::world::World| {}),
     ///         seq("ai", |_w: &mut apex_core::world::World| {}),
     ///     ));
-    ///     // обе системы наследуют условие паузы
+    ///     // both systems inherit the pause condition
     /// });
     /// ```
     pub fn scoped<F>(&mut self, f: F) -> &mut Self
@@ -477,12 +477,12 @@ impl Scheduler {
         self
     }
 
-    /// Установить scope condition — все системы, зарегистрированные внутри
-    /// текущего [`scoped`](Self::scoped)-блока, автоматически получат это
-    /// условие (AND с их собственными condition'ами). Повторные вызовы внутри
-    /// блока комбинируются по AND.
+    /// Set a scope condition — every system registered inside
+    /// the current [`scoped`](Self::scoped) block automatically gets this
+    /// condition (AND-ed with their own). Repeated calls inside
+    /// the block combine with AND.
     ///
-    /// # Пример
+    /// # Example
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel, seq};
     /// # let mut sched = Scheduler::new();
@@ -492,7 +492,7 @@ impl Scheduler {
     ///         seq("movement", |_w: &mut apex_core::world::World| {}),
     ///         seq("ai", |_w: &mut apex_core::world::World| {}),
     ///     ));
-    ///     // обе системы наследуют условие паузы
+    ///     // both systems inherit the pause condition
     /// });
     /// ```
     pub fn run_condition<F>(&mut self, condition: F) -> &mut Self
@@ -526,7 +526,7 @@ impl Scheduler {
         }
     }
 
-    /// Добавить явную зависимость: `system` выполняется после `after_id`.
+    /// Add an explicit dependency: `system` runs after `after_id`.
     pub(crate) fn add_dependency(&mut self, system: SystemId, after_id: SystemId) {
         if let Some(s) = self.systems.iter_mut().find(|s| s.id == system) {
             if !s.after.contains(&after_id) {
@@ -562,13 +562,13 @@ impl Scheduler {
         }
     }
 
-    /// `a` выполняется до `b`. Эквивалентно `add_dependency(b, a)`.
+    /// `a` runs before `b`. Equivalent to `add_dependency(b, a)`.
     ///
-    /// Явный порядок имеет приоритет над автоматически обнаруженными конфликтами
-    /// чтения-записи: если планировщик видит `BidirectionalWriteRead` между `a` и `b`,
-    /// ребро, противоречащее явному порядку, будет подавлено (цикла не будет).
+    /// An explicit order takes precedence over automatically detected read-write
+    /// conflicts: if the scheduler sees `BidirectionalWriteRead` between `a` and `b`,
+    /// the edge contradicting the explicit order is suppressed (no cycle).
     ///
-    /// Системы указываются по именам, переданным в `add_auto_system` / `add_system`.
+    /// Systems are named as passed to `add_auto_system` / `add_system`.
     pub fn before(&mut self, a_name: &str, b_name: &str) -> Result<(), SchedulerError> {
         let a_id = self.find_id_by_name(a_name)?;
         let b_id = self.find_id_by_name(b_name)?;
@@ -576,13 +576,13 @@ impl Scheduler {
         Ok(())
     }
 
-    /// `a` выполняется после `b`. Эквивалентно `add_dependency(a, b)`.
+    /// `a` runs after `b`. Equivalent to `add_dependency(a, b)`.
     ///
-    /// Явный порядок имеет приоритет над автоматически обнаруженными конфликтами
-    /// чтения-записи: если планировщик видит `BidirectionalWriteRead` между `a` и `b`,
-    /// ребро, противоречащее явному порядку, будет подавлено (цикла не будет).
+    /// An explicit order takes precedence over automatically detected read-write
+    /// conflicts: if the scheduler sees `BidirectionalWriteRead` between `a` and `b`,
+    /// the edge contradicting the explicit order is suppressed (no cycle).
     ///
-    /// Системы указываются по именам, переданным в `add_auto_system` / `add_system`.
+    /// Systems are named as passed to `add_auto_system` / `add_system`.
     pub fn after(&mut self, a_name: &str, b_name: &str) -> Result<(), SchedulerError> {
         let a_id = self.find_id_by_name(a_name)?;
         let b_id = self.find_id_by_name(b_name)?;
@@ -610,11 +610,11 @@ impl Scheduler {
         Err(SchedulerError::SystemNotFound(name.to_string()))
     }
 
-    /// Цепочка систем: каждая запускается после предыдущей.
+    /// A chain of systems: each runs after the previous one.
     ///
-    /// `sched.chain(&["grav", "phys"])` — эквивалент `sched.before("grav", "phys")`.
+    /// `sched.chain(&["grav", "phys"])` is equivalent to `sched.before("grav", "phys")`.
     ///
-    /// Для N имён создаёт N-1 зависимостей:
+    /// For N names it creates N-1 dependencies:
     /// `names[0] → names[1] → ... → names[N-1]`.
     pub fn chain(&mut self, names: &[&str]) -> Result<(), SchedulerError> {
         for w in names.windows(2) {
@@ -623,27 +623,27 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Объявить системы взаимно **порядко-независимыми**: при `BidirectionalWriteRead` между ними
-    /// планировщик НЕ роняет компиляцию (`CircularDependency`), а сериализует их в
-    /// **детерминированном порядке регистрации** (порядок воспроизводим между сборками).
+    /// Declare systems mutually **order-independent**: on `BidirectionalWriteRead` between them
+    /// the scheduler does NOT fail compilation (`CircularDependency`) but serializes them in
+    /// **deterministic registration order** (reproducible across builds).
     ///
-    /// Когда применять: две системы имеют перекрёстный конфликт чтения-записи (A пишет T, читаемый
-    /// B; B пишет U, читаемый A), но порядок их выполнения для логики **не важен** — и не хочется
-    /// выдумывать искусственный `before`/`after`. Конфликт по данным всё равно исключает
-    /// параллельный запуск (гонок нет) — `independent` лишь снимает требование *явно выбрать*
-    /// направление, фиксируя его детерминированно (порядок добавления систем).
+    /// When to use: two systems have a cross read-write conflict (A writes T read by
+    /// B; B writes U read by A), but their execution order **does not matter** for the logic — and you
+    /// don't want to invent an artificial `before`/`after`. The data conflict still prevents
+    /// parallel execution (no races) — `independent` only drops the requirement to *explicitly pick*
+    /// a direction, fixing it deterministically (system registration order).
     ///
-    /// Отличие от Bevy `ambiguous_with`: тот допускает ПРОИЗВОЛЬНЫЙ порядок (недетерминизм); мы
-    /// сохраняем детерминизм (важно для replay/netcode — см. руководство §6.3).
+    /// Difference from Bevy `ambiguous_with`: that allows an ARBITRARY order (non-determinism); we
+    /// keep determinism (important for replay/netcode — see the guide §6.3).
     ///
-    /// Для N имён покрывает все пары. Системы указываются по именам (как в `before`/`after`/`chain`).
+    /// For N names it covers all pairs. Systems are named (as in `before`/`after`/`chain`).
     pub fn independent(&mut self, names: &[&str]) -> Result<(), SchedulerError> {
         let mut ids = Vec::with_capacity(names.len());
         for n in names {
             ids.push(self.find_id_by_name(n)?);
         }
-        // Для каждой пары — ребро в порядке РЕГИСТРАЦИИ (позиция в `self.systems`); собираем пары
-        // заранее, чтобы не держать иммутабельный борроу `self.systems` во время `add_dependency`.
+        // For each pair — an edge in REGISTRATION order (position in `self.systems`); collect the pairs
+        // up front, so we don't hold an immutable borrow of `self.systems` during `add_dependency`.
         let mut ordered: Vec<(SystemId, SystemId)> = Vec::new();
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
@@ -658,18 +658,18 @@ impl Scheduler {
             }
         }
         for (first, second) in ordered {
-            // `first` → `second`: explicit ordering подавляет встречное ребро BidirectionalWriteRead.
+            // `first` → `second`: explicit ordering suppresses the opposing BidirectionalWriteRead edge.
             self.add_dependency(second, first);
         }
         Ok(())
     }
 
-    /// Установить пользовательский порядок StageLabel для compile().
+    /// Set a custom StageLabel order for compile().
     ///
-    /// По умолчанию стадии упорядочиваются по приоритету:
+    /// By default stages are ordered by priority:
     /// `Startup(0) → First(1) → PreUpdate(2) → Update(3) → PostUpdate(4) → Last(5) → Custom(6)`.
     ///
-    /// Если нужно изменить порядок (например, `First` после `Update`), используй этот метод:
+    /// To change the order (e.g. `First` after `Update`), use this method:
     ///
     /// ```ignore
     /// # use apex_scheduler::stage::StageLabel::*;
@@ -677,7 +677,7 @@ impl Scheduler {
     /// scheduler.configure_stages(vec![Startup, Update, First, PreUpdate, PostUpdate, Last]);
     /// ```
     ///
-    /// Стадии, не указанные в `order`, добавляются в конец в порядке возрастания приоритета.
+    /// Stages not listed in `order` are appended at the end in ascending priority order.
     pub fn configure_stages(&mut self, order: Vec<StageLabel>) {
         self.stage_order = Some(order);
         self.invalidate_plan();
@@ -685,7 +685,7 @@ impl Scheduler {
 
     // ── Run Conditions ─────────────────────────────────────────
 
-    /// Прикрепить run condition к системе по имени (AND-композиция).
+    /// Attach a run condition to a system by name (AND composition).
     #[cfg(test)]
     pub(crate) fn set_run_if<F>(&mut self, name: &str, condition: F) -> Result<(), SchedulerError>
     where
@@ -737,18 +737,18 @@ impl Scheduler {
 
     // ── Apply Deferred ─────────────────────────────────────────
 
-    /// Вставить точку синхронизации после последней зарегистрированной системы.
+    /// Insert a sync point after the last registered system.
     ///
-    /// При `compile()` Stage будет разбит на под-Stage, и между ними будут
-    /// применены все накопленные `Commands` и сброшены события.
+    /// At `compile()` the stage is split into sub-stages, and between them all
+    /// accumulated `Commands` are applied and events are flushed.
     ///
-    /// Типичное использование — между `add_systems`-вызовами:
+    /// Typical use — between `add_systems` calls:
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel, seq};
     /// # let mut sched = Scheduler::new();
     /// let combat = StageLabel::tag("combat");
     /// sched.add_systems(combat.clone(), seq("spawner", |_w: &mut apex_core::world::World| {}));
-    /// sched.apply_deferred(); // ← команды spawner'а применены до следующих систем
+    /// sched.apply_deferred(); // ← spawner commands applied before the next systems
     /// sched.add_systems(combat, seq("camera", |_w: &mut apex_core::world::World| {}));
     /// ```
     pub fn apply_deferred(&mut self) -> &mut Self {
@@ -760,14 +760,14 @@ impl Scheduler {
         self
     }
 
-    // ── add_systems — кортежный API (профессиональный) ──────────
+    // ── add_systems — tuple API (the professional way) ──────────
 
-    /// Зарегистрировать несколько систем одновременно через кортежный API.
+    /// Register several systems at once via the tuple API.
     ///
-    /// Это рекомендованный способ регистрации. Системы конфигурируются
-    /// с условиями ДО регистрации, что исключает double-borrow conflict.
+    /// This is the recommended way to register. Systems are configured
+    /// with conditions BEFORE registration, which avoids a double-borrow conflict.
     ///
-    /// # Пример
+    /// # Example
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel, sys, seq, IntoScheduleConfigs};
     /// # let mut sched = Scheduler::new();
@@ -782,11 +782,11 @@ impl Scheduler {
     /// # }
     /// ```
     ///
-    /// # Порядок (золотой путь)
+    /// # Ordering (the golden path)
     ///
-    /// Зависимости объявляются прямо на конфигах через `.before()`/`.after()`
-    /// (по имени системы) и `.chain()` (позиционно, по порядку в кортеже). Имена
-    /// резолвятся при `compile()`, поэтому forward-ссылки допустимы:
+    /// Dependencies are declared right on the configs via `.before()`/`.after()`
+    /// (by system name) and `.chain()` (positionally, by tuple order). Names
+    /// are resolved at `compile()`, so forward references are allowed:
     /// ```
     /// # use apex_scheduler::{Scheduler, StageLabel, seq, IntoScheduleConfigs};
     /// # let mut sched = Scheduler::new();
@@ -798,8 +798,8 @@ impl Scheduler {
     /// ));
     /// sched.compile().unwrap();
     /// ```
-    /// Для ДИНАМИЧЕСКОГО порядка (по строке-имени, из редактора/скриптов)
-    /// остаётся `Scheduler::before`/`after`/`chain`.
+    /// For DYNAMIC ordering (by string name, from the editor/scripts)
+    /// use `Scheduler::before`/`after`/`chain`.
     pub fn add_systems<M>(
         &mut self,
         stage_label: StageLabel,
@@ -836,11 +836,11 @@ impl Scheduler {
         self
     }
 
-    /// Внутренняя регистрация одной SystemConfig.
+    /// Internal registration of one SystemConfig.
     fn register_system_config(&mut self, cfg: SystemConfig, stage_label: StageLabel) -> SystemId {
         if stage_label == StageLabel::Startup && self.startup_completed {
             log::warn!(
-                "add_systems(Startup, …): `{}` добавлена после завершения Startup — не выполнится",
+                "add_systems(Startup, …): `{}` added after Startup finished — it will not run",
                 cfg.name
             );
         }
@@ -903,16 +903,16 @@ impl Scheduler {
         }
 
         self.system_indices.insert(id, index);
-        // Scope-условия (scoped/run_condition) применяются и к add_systems-пути
-        // (раньше — только к внутренним методам регистрации: документированный
-        // паттерн «scoped + add_systems» молча терял условие — латентный баг,
-        // найден аудитом 2026-06-12).
+        // Scope conditions (scoped/run_condition) apply to the add_systems path too
+        // (previously only to the internal registration methods: the documented
+        // "scoped + add_systems" pattern silently dropped the condition — a latent bug
+        // found by the audit of 2026-06-12).
         self.merge_scope_condition(id);
         self.invalidate_plan();
         id
     }
 
-    /// Получить `&mut SystemDescriptor` по `SystemId` (O(1)).
+    /// Get `&mut SystemDescriptor` by `SystemId` (O(1)).
     pub(crate) fn system_by_id_mut(&mut self, id: SystemId) -> Option<&mut SystemDescriptor> {
         self.system_indices
             .get(&id)
@@ -920,29 +920,29 @@ impl Scheduler {
     }
 
     fn invalidate_plan(&mut self) {
-        // ВНИМАНИЕ: НЕ сбрасываем stage_order — он должен сохраняться
-        // между перекомпиляциями (см. тест configure_stages_persists_across_compiles).
+        // NOTE: do NOT reset stage_order — it must persist
+        // across recompiles (see the configure_stages_persists_across_compiles test).
         self.execution_plan = None;
         self.graph_dirty = true;
     }
 
-    /// Управлять автоматическим упорядочиванием по событиям.
+    /// Control automatic event-based ordering.
     ///
-    /// При `true` (по умолчанию): все системы с `Emit<E>` гарантированно
-    /// выполняются до систем с `Listen<E>` в пределах одного кадра.
+    /// When `true` (the default): every system with `Emit<E>` is guaranteed to
+    /// run before systems with `Listen<E>` within a single frame.
     ///
-    /// При `false`: порядок Emit/Listen не определён планировщиком.
-    /// Используйте только для совместимости со старым кодом или если
-    /// порядок не важен и вы хотите максимизировать параллелизм.
+    /// When `false`: the Emit/Listen order is not defined by the scheduler.
+    /// Use only for backward compatibility or if
+    /// the order does not matter and you want to maximize parallelism.
     pub fn enable_event_ordering(&mut self, enabled: bool) -> &mut Self {
         self.event_ordering_enabled = enabled;
         self.invalidate_plan();
         self
     }
 
-    /// Создать конвейер событий для типа E.
+    /// Create an event pipeline for type E.
     ///
-    /// # Пример
+    /// # Example
     /// ```ignore
     /// let physics_id = sched.add_auto_system("physics", PhysicsSystem);
     /// let armor_id   = sched.add_auto_system("armor",   ArmorSystem);
@@ -958,26 +958,26 @@ impl Scheduler {
         EventPipelineBuilder::new()
     }
 
-    /// Получить AccessDescriptor системы по её SystemId.
+    /// Get a system's AccessDescriptor by its SystemId.
     ///
-    /// Возвращает `None` если система не найдена или это sequential система.
+    /// Returns `None` if the system is not found or is a sequential system.
     pub(crate) fn system_access(&self, id: SystemId) -> Option<&AccessDescriptor> {
         self.system_indices
             .get(&id)
             .and_then(|&idx| self.systems.get(idx)?.kind.access())
     }
 
-    /// Заполнить `type_names` из ComponentRegistry World'а.
+    /// Populate `type_names` from the World's ComponentRegistry.
     ///
-    /// После вызова этой функции `component_type_name()` будет возвращать
-    /// реальные имена компонентов вместо `"<component>"`.
+    /// After calling this, `component_type_name()` returns
+    /// real component names instead of `"<component>"`.
     ///
-    /// Вызывается автоматически в `run()` / `run_sequential()`.
-    /// Можно вызвать вручную перед `compile()`, если нужны реальные имена
-    /// в `debug_plan_verbose()`.
+    /// Called automatically in `run()` / `run_sequential()`.
+    /// Can be called manually before `compile()` if you need real names
+    /// in `debug_plan_verbose()`.
     pub(crate) fn populate_type_names(&mut self, registry: &ComponentRegistry) {
         if !self.type_names.is_empty() {
-            return; // Уже заполнены — все миры имеют одинаковые компоненты
+            return; // Already populated — all worlds have the same components
         }
         for info in registry.iter() {
             self.type_names.insert(info.type_id, info.name);

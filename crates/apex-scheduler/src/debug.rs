@@ -1,7 +1,7 @@
 use super::*;
 
 impl Scheduler {
-    // ── Инспекция ──────────────────────────────────────────────
+    // ── Inspection ─────────────────────────────────────────────
 
     pub fn system_count(&self) -> usize {
         self.systems.len()
@@ -11,7 +11,7 @@ impl Scheduler {
         self.execution_plan.as_ref().map(|p| p.stages.as_slice())
     }
 
-    /// Краткий план выполнения.
+    /// Compact execution plan.
     pub fn debug_plan(&self) -> String {
         let Some(plan) = &self.execution_plan else {
             return "(not compiled — call compile() first)".to_string();
@@ -45,13 +45,13 @@ impl Scheduler {
         out
     }
 
-    /// Подробный план с причинами разделения Stage.
+    /// Detailed plan with the reasons stages were split.
     ///
-    /// Показывает какой конфликт компонентов привёл к тому что
-    /// системы оказались в разных Stage. Полезно при отладке
-    /// расписания и оптимизации параллелизма.
+    /// Shows which component conflict caused systems to end up in
+    /// different stages. Useful when debugging the schedule and
+    /// tuning parallelism.
     ///
-    /// # Пример вывода
+    /// # Example output
     /// ```text
     /// Stage 0 [PARALLEL]:
     ///   - physics    [par | R:1 W:2]  (reads: Mass; writes: Velocity, Position)
@@ -72,7 +72,7 @@ impl Scheduler {
 
         let mut out = String::new();
 
-        // ── Стадии ────────────────────────────────────────────
+        // ── Stages ────────────────────────────────────────────
         for (i, stage) in plan.stages.iter().enumerate() {
             let mode = if stage.is_parallelizable() {
                 "PARALLEL"
@@ -117,7 +117,7 @@ impl Scheduler {
                             out.push_str(&format!("  - {} [seq | full &mut World]\n", s.name));
                         }
                     }
-                    // Показать условия
+                    // Show conditions
                     let cond_str = format_condition(&s.run_condition);
                     if !cond_str.is_empty() {
                         out.push_str(&format!("      run_if: {}\n", cond_str));
@@ -126,7 +126,7 @@ impl Scheduler {
             }
         }
 
-        // ── SubWorld маппинг (архетипы для каждой системы) ────
+        // ── SubWorld mapping (archetypes per system) ──────────
         if !self.system_archetype_indices.is_empty() {
             out.push_str("\n  ── SubWorld archetype mapping ──\n");
             for sys_id in plan.flat_order.iter() {
@@ -186,7 +186,7 @@ impl Scheduler {
             }
         }
 
-        // ── Параллелизм summary ───────────────────────────────
+        // ── Parallelism summary ───────────────────────────────
         let par_stages = plan.stages.iter().filter(|s| s.is_parallelizable()).count();
         let seq_stages = plan.stages.iter().filter(|s| !s.all_parallel).count();
         let max_par = plan
@@ -206,7 +206,7 @@ impl Scheduler {
         out
     }
 
-    /// Получить причины конфликта между двумя конкретными системами.
+    /// Get the conflict reasons between two specific systems.
     pub fn conflicts_between(&self, a: SystemId, b: SystemId) -> Vec<&ConflictKind> {
         self.edge_info
             .iter()

@@ -1,57 +1,57 @@
 use super::*;
 
 impl Scheduler {
-    // ── Компиляция ─────────────────────────────────────────────
+    // ── Compilation ─────────────────────────────────────────────
 
-    /// Скомпилировать расписание.
+    /// Compile the schedule.
     ///
-    /// Строит/обновляет граф зависимостей, находит параллельные Stage.
-    /// Если граф не изменился с прошлого compile — только пересчитывает
-    /// топосорт (добавленные узлы уже в графе).
+    /// Builds/updates the dependency graph and finds parallel stages.
+    /// If the graph is unchanged since the last compile, only the topo
+    /// sort is recomputed (added nodes are already in the graph).
     ///
-    /// Также вычисляет для каждой системы индексы архетипов, которые ей нужны
-    /// (для создания SubWorld в run_hybrid_parallel).
+    /// Also computes, per system, the archetype indices it needs
+    /// (for building the SubWorld in run_hybrid_parallel).
     pub fn compile(&mut self) -> Result<(), SchedulerError> {
-        // Ранний выход: если граф не менялся и план уже построен
+        // Early out: graph unchanged and the plan is already built
         if !self.graph_dirty && self.execution_plan.is_some() {
             return Ok(());
         }
 
-        // План (а значит и индексы execution-стадий) перестраивается — сбрасываем per-stage базы
-        // change-detection (TD-52). Одно лишнее «всё изменилось» на следующем кадре — безопасно.
+        // The plan (and thus execution-stage indices) is rebuilt — reset the per-stage
+        // change-detection baselines (TD-52). One extra "everything changed" next frame is safe.
         self.stage_last_run.clear();
-        // Ш2: stage indices changed — drop the cost-model history (it re-learns in a
+        // Sh2: stage indices changed — drop the cost-model history (it re-learns in a
         // couple of frames; a stale index would mis-classify a different stage).
         self.stage_cost_ema_ns.clear();
         self.stage_ran_seq.clear();
 
         if self.type_names.is_empty() {
             log::debug!(
-                "Scheduler::compile: type_names пуст. \
-                 Вызовите populate_type_names(&world.registry()) или \
-                 compile_with_world(&world) для отображения имён компонентов \
-                 в debug_plan_verbose()"
+                "Scheduler::compile: type_names is empty. \
+                 Call populate_type_names(&world.registry()) or \
+                 compile_with_world(&world) to show component names \
+                 in debug_plan_verbose()"
             );
         }
 
         if self.graph_dirty {
-            // Резолвим config-объявленный порядок (`.before/.after/.chain`) в
-            // id-рёбра ДО построения графа — теперь все имена известны
-            // (forward-ссылки разрешены). Ошибка «имя не найдено» — громко (§0.2a).
+            // Resolve the config-declared order (`.before/.after/.chain`) into
+            // id edges BEFORE building the graph — all names are now known
+            // (forward references allowed). A "name not found" error is loud (§0.2a).
             self.resolve_pending_orderings()?;
-            // Инкрементальное обновление: добавляем только новые узлы и рёбра
+            // Incremental update: add only new nodes and edges
             self.add_new_nodes_and_edges()?;
             self.graph_dirty = false;
         }
 
-        // Топологическая сортировка всех систем → уровни параллелизма
+        // Topological sort of all systems → parallelism levels
         let levels = self.dependency_graph.parallel_levels().map_err(|_| {
             let cycle_info = self.find_cycle_description();
             SchedulerError::CircularDependency { cycle_info }
         })?;
 
-        // Для каждого уровня топосорта разделяем system_ids по stage_label.
-        // Затем объединяем результаты по label в порядке приоритета.
+        // For each topo-sort level, split system_ids by stage_label.
+        // Then merge the results per label in priority order.
         use rustc_hash::FxHashMap;
         use std::collections::BTreeMap;
         let mut label_stages: BTreeMap<u8, Vec<Stage>> = BTreeMap::new();
@@ -60,7 +60,7 @@ impl Scheduler {
             let mut level_by_label: FxHashMap<StageLabel, Vec<SystemId>> = FxHashMap::default();
             for &node in level {
                 if let Some(&sys_id) = self.dependency_graph.node_data(node) {
-                    // O(1) lookup через system_indices вместо O(N) find()
+                    // O(1) lookup via system_indices instead of O(N) find()
                     if let Some(system) = self
                         .system_indices
                         .get(&sys_id)
@@ -82,7 +82,7 @@ impl Scheduler {
             labeled.sort_by(|a, b| a.0.cmp(&b.0));
             for (label, ids) in labeled {
                 let prio = label.priority();
-                // Разбиваем на под-Stage'и по маркерам apply_deferred_after
+                // Split into sub-stages at apply_deferred_after markers
                 let sub_groups = split_at_apply_boundaries(&ids, &self.systems, &self.explicit_orderings);
                 for group_ids in sub_groups {
                     let all_parallel = group_ids.iter().all(|sid| {
@@ -100,11 +100,11 @@ impl Scheduler {
             }
         }
 
-        // Собираем все Stage в порядке priority или пользовательском порядке
+        // Collect all stages in priority order or the user-defined order
         let mut stages: Vec<Stage> = Vec::new();
 
         if let Some(order) = &self.stage_order {
-            // Пользовательский порядок стадий
+            // User-defined stage order
             let mut stage_map: FxHashMap<StageLabel, Vec<Stage>> = FxHashMap::default();
             for (_prio, mut s_stages) in label_stages {
                 for stage in s_stages.drain(..) {
@@ -119,13 +119,13 @@ impl Scheduler {
                     stages.append(&mut s_stages);
                 }
             }
-            // Стадии не указанные в порядке — добавляем в конец, детерминированно
-            // (D8: по label, иначе FxHashMap-порядок непредсказуем).
+            // Stages not listed in the order — append them, deterministically
+            // (D8: by label, otherwise FxHashMap order is unpredictable).
             let mut remaining: Vec<Stage> = stage_map.into_values().flatten().collect();
             remaining.sort_by(|a, b| a.label.cmp(&b.label));
             stages.append(&mut remaining);
         } else {
-            // Стандартный порядок по priority (Startup → First → ... → Last → Custom)
+            // Standard priority order (Startup → First → ... → Last → Custom)
             for (_prio, mut s_stages) in label_stages {
                 stages.append(&mut s_stages);
             }
@@ -136,7 +136,7 @@ impl Scheduler {
             .flat_map(|s| s.system_ids.iter().copied())
             .collect();
 
-        // Собираем event_writes для per-Stage flush
+        // Collect event_writes for the per-stage flush
         for stage in &mut stages {
             let mut emit_types: FxHashSet<TypeId> = FxHashSet::default();
             for &sys_id in &stage.system_ids {
@@ -159,41 +159,41 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Скомпилировать расписание, предварительно заполнив имена компонентов.
+    /// Compile the schedule, first populating component names.
     ///
-    /// Эквивалентно вызову `populate_type_names(world.registry())` затем `compile()`.
-    /// После этого `debug_plan_verbose()` будет показывать реальные имена компонентов.
+    /// Equivalent to calling `populate_type_names(world.registry())` then `compile()`.
+    /// After this, `debug_plan_verbose()` shows real component names.
     ///
-    /// # Пример
+    /// # Example
     ///
     /// ```ignore
     /// let mut sched = Scheduler::new();
-    /// // ... добавляем системы ...
+    /// // ... add systems ...
     /// sched.compile_with_world(&world).expect("schedule error");
-    /// println!("{}", sched.debug_plan_verbose()); // с именами компонентов!
+    /// println!("{}", sched.debug_plan_verbose()); // with component names!
     /// ```
     pub fn compile_with_world(&mut self, world: &World) -> Result<(), SchedulerError> {
         self.populate_type_names(world.registry());
         self.compile()
     }
 
-    /// Вычислить для каждой системы индексы архетипов, которые ей нужны.
+    /// Compute, per system, the archetype indices it needs.
     ///
-    /// Вызывается после compile() перед run(), когда World уже создан.
-    /// Использует AccessDescriptor.reads/writes (TypeId) для фильтрации.
+    /// Called after compile() before run(), once the World exists.
+    /// Uses AccessDescriptor.reads/writes (TypeId) to filter.
     pub(crate) fn compute_archetype_indices(&mut self, world: &apex_core::World) {
         let archetypes = world.archetypes();
         let arch_count = archetypes.len();
 
-        // Кеш: если количество архетипов не изменилось — пропускаем пересчёт
+        // Cache: if the archetype count is unchanged, skip the recompute
         if arch_count == self.cached_archetype_count && !self.system_archetype_indices.is_empty() {
             return;
         }
 
-        // Архетипы append-only: при росте мира существующие списки ДОПОЛНЯЮТСЯ
-        // только хвостом archetypes[prev_count..] — полный пересчёт O(systems ×
-        // archetypes) был квадратичным на спавн-бёрстах (C-8). Полный скан —
-        // только при первом вызове и для систем без записи (новые после compile).
+        // Archetypes are append-only: as the world grows, existing lists are EXTENDED
+        // only by the tail archetypes[prev_count..] — a full recompute O(systems ×
+        // archetypes) was quadratic on spawn bursts (C-8). A full scan runs
+        // only on the first call and for write-less systems (new after compile).
         let prev_count = if self.system_archetype_indices.is_empty() {
             0
         } else {
@@ -207,44 +207,44 @@ impl Scheduler {
 
         let registry = world.registry();
 
-        // Для каждой системы находим подходящие архетипы.
-        // Используем критерий `any()`: архетип подходит, если содержит
-        // хотя бы один компонент из системы. Это правильно для SubWorld —
-        // Query потом сам отфильтрует неподходящие архетипы через matches_archetype.
+        // For each system, find the matching archetypes.
+        // Use the `any()` criterion: an archetype matches if it contains
+        // at least one component from the system. This is correct for SubWorld —
+        // the Query itself later filters out non-matching archetypes via matches_archetype.
         for system in &self.systems {
             let access = match system.kind.access() {
                 Some(a) => a,
-                None => continue, // Sequential — не использует SubWorld
+                None => continue, // Sequential — does not use SubWorld
             };
 
-            // Только компонентные TypeId определяют, какие архетипы нужны системе.
-            // reads_event / writes_event — виртуальные доступы для планировщика,
-            // они не соответствуют реальным данным в архетипах.
+            // Only component TypeIds determine which archetypes a system needs.
+            // reads_event / writes_event are virtual accesses for the scheduler,
+            // they do not correspond to real data in archetypes.
             let mut system_type_ids: Vec<std::any::TypeId> = Vec::new();
             system_type_ids.extend(access.reads.iter().copied());
             system_type_ids.extend(access.writes.iter().copied());
 
             if system_type_ids.is_empty() {
-                // Система без компонентов (только ресурсы/события) — маркер
-                // «без ограничений» вместо материализованного Vec всех индексов.
+                // A system with no components (resources/events only) — the marker
+                // "unrestricted" instead of a materialized Vec of all indices.
                 self.system_archetype_indices
                     .insert(system.id, SystemArchetypes::All);
                 continue;
             }
 
-            // ComponentId резолвим один раз на систему, не на архетип.
-            // (Незарезолвленный TypeId безвреден: архетип с компонентом не может
-            // существовать раньше регистрации компонента.)
+            // Resolve the ComponentId once per system, not per archetype.
+            // (An unresolved TypeId is harmless: an archetype with the component cannot
+            // exist before the component is registered.)
             let cids: Vec<apex_core::ComponentId> = system_type_ids
                 .iter()
                 .filter_map(|tid| registry.get_id_by_type(tid))
                 .collect();
 
-            // Существующий список дополняем с prev_count; новый (система,
-            // появившаяся после прошлого вызова) сканируем с нуля.
+            // Extend an existing list from prev_count; a new one (a system that
+            // appeared since the last call) is scanned from scratch.
             let start = match self.system_archetype_indices.get(&system.id) {
                 Some(SystemArchetypes::Filtered(_)) => prev_count,
-                Some(SystemArchetypes::All) => continue, // состав доступа статичен
+                Some(SystemArchetypes::All) => continue, // access set is static
                 None => {
                     self.system_archetype_indices
                         .insert(system.id, SystemArchetypes::Filtered(Vec::new()));
@@ -254,7 +254,7 @@ impl Scheduler {
             let Some(SystemArchetypes::Filtered(indices)) =
                 self.system_archetype_indices.get_mut(&system.id)
             else {
-                unreachable!("ветки выше гарантируют Filtered");
+                unreachable!("the branches above guarantee Filtered");
             };
 
             for (offset, arch) in archetypes[start..].iter().enumerate() {
@@ -267,26 +267,26 @@ impl Scheduler {
         self.cached_archetype_count = arch_count;
     }
 
-    /// Проверяет, существует ли ребро между двумя узлами.
+    /// Checks whether an edge exists between two nodes.
     fn has_edge_between(&self, from: Index, to: Index) -> bool {
-        // O(1) проверка через edge_set вместо O(N) successors()
+        // O(1) check via edge_set instead of O(N) successors()
         self.edge_set.contains(&(from, to))
     }
 
-    /// Инкрементальное добавление новых узлов и рёбер в граф.
+    /// Incrementally add new nodes and edges to the graph.
     ///
-    /// Добавляет только системы, которых ещё нет в `graph_nodes`,
-    /// и рёбра для новых/изменённых систем.
+    /// Adds only systems not yet in `graph_nodes`,
+    /// and edges for new/changed systems.
     ///
-    /// ## Оптимизация
-    /// - При первом compile (граф пуст) — проверки `has_path()` не нужны,
-    ///   т.к. циклов в пустом графе быть не может. Это убирает O(N²) BFS-ов.
-    /// - `has_path()` использует переиспользуемые буферы Graph.bfs_visited/bfs_queue
-    ///   вместо аллокации на каждый вызов.
+    /// ## Optimization
+    /// - On the first compile (empty graph), `has_path()` checks are unnecessary,
+    ///   since an empty graph cannot have cycles. This removes O(N²) BFS runs.
+    /// - `has_path()` uses the reusable Graph.bfs_visited/bfs_queue buffers
+    ///   instead of allocating on every call.
     fn add_new_nodes_and_edges(&mut self) -> Result<(), SchedulerError> {
         let n = self.systems.len();
 
-        // ── 1. Добавляем новые узлы (системы) ──────────────────
+        // ── 1. Add new nodes (systems) ──────────────────
         let mut new_system_indices = Vec::new();
         for (idx, system) in self.systems.iter().enumerate() {
             if !self.graph_nodes.contains_key(&system.id) {
@@ -296,31 +296,31 @@ impl Scheduler {
             }
         }
 
-        // Если нет новых систем, но граф помечен как dirty (например, изменились зависимости)
-        // нужно пересчитать рёбра для существующих систем
+        // If there are no new systems but the graph is marked dirty (e.g. dependencies changed)
+        // we must recompute edges for existing systems
         let systems_to_process = if new_system_indices.is_empty() {
-            // Обрабатываем все системы (зависимости могли измениться)
+            // Process all systems (dependencies may have changed)
             (0..n).collect::<Vec<_>>()
         } else {
-            // Обрабатываем только новые системы и их связи с существующими
+            // Process only new systems and their links to existing ones
             new_system_indices
         };
 
-        // Оптимизация 🅱️: при первом compile() граф ещё пуст — has_path() всегда false.
-        // Пропускаем O(N²) BFS-ов, т.к. циклов в пустом графе быть не может.
+        // Optimization: on the first compile() the graph is still empty — has_path() is always false.
+        // Skip the O(N²) BFS runs, since an empty graph cannot have cycles.
         let has_existing_edges = !self.edge_set.is_empty();
 
-        // ── 2. Явные зависимости для новых/изменённых систем ──
+        // ── 2. Explicit dependencies for new/changed systems ──
         for &idx in &systems_to_process {
             let system = &self.systems[idx];
 
-            // После кого выполняется
+            // Runs after
             for &after_id in &system.after {
                 if let (Some(&from), Some(&to)) = (
                     self.graph_nodes.get(&after_id),
                     self.graph_nodes.get(&system.id),
                 ) {
-                    // Проверяем, нет ли уже такого ребра
+                    // Check the edge does not already exist
                     if !self.has_edge_between(from, to) {
                         self.dependency_graph
                             .add_edge(from, to, ConflictKind::Explicit);
@@ -334,7 +334,7 @@ impl Scheduler {
                 }
             }
 
-            // Перед кем выполняется
+            // Runs before
             for &before_id in &system.before {
                 if let (Some(&from), Some(&to)) = (
                     self.graph_nodes.get(&system.id),
@@ -354,15 +354,15 @@ impl Scheduler {
             }
         }
 
-        // ── 3. Sequential барьеры ──
-        // Используем один dummy barrier-узел вместо O(N×M) рёбер:
+        // ── 3. Sequential barriers ──
+        // Use one dummy barrier node instead of O(N×M) edges:
         //   all parallel → barrier → all sequential
-        // Результат: N+M рёбер вместо N×M.
+        // Result: N+M edges instead of N×M.
         const BARRIER_ID: u32 = u32::MAX;
         let barrier_sys_id = SystemId(BARRIER_ID);
 
         if !self.seq_system_indices.is_empty() && !self.par_system_indices.is_empty() {
-            // Удаляем старый барьерный узел, если он был
+            // Remove the old barrier node, if any
             if let Some(old_barrier) = self.graph_nodes.remove(&barrier_sys_id) {
                 self.dependency_graph.remove_node(old_barrier);
                 self.edge_set
@@ -370,11 +370,11 @@ impl Scheduler {
                 self.edge_info
                     .retain(|e| e.from_id != barrier_sys_id && e.to_id != barrier_sys_id);
             }
-            // Добавляем новый барьерный узел
+            // Add a new barrier node
             let barrier_node = self.dependency_graph.add_node(barrier_sys_id);
             self.graph_nodes.insert(barrier_sys_id, barrier_node);
 
-            // Все parallel → barrier
+            // All parallel → barrier
             for &par_idx in &self.par_system_indices {
                 let par_id = self.systems[par_idx].id;
                 if let Some(&par_node) = self.graph_nodes.get(&par_id) {
@@ -398,7 +398,7 @@ impl Scheduler {
                 }
             }
 
-            // Barrier → все sequential
+            // Barrier → all sequential
             for &seq_idx in &self.seq_system_indices {
                 let seq_id = self.systems[seq_idx].id;
                 if let Some(&seq_node) = self.graph_nodes.get(&seq_id) {
@@ -423,7 +423,7 @@ impl Scheduler {
             }
         }
 
-        // ── 4. Write/Read конфликты для новых/изменённых систем ─
+        // ── 4. Write/Read conflicts for new/changed systems ─
         for &idx in &systems_to_process {
             let system_i = &self.systems[idx];
             let ai = match system_i.kind.access() {
@@ -431,9 +431,9 @@ impl Scheduler {
                 None => continue,
             };
 
-            // Проверяем конфликты со всеми другими системами
-            // Для Write+Write конфликтов добавляем ребро только если idx < j
-            // чтобы избежать дублирования
+            // Check conflicts against all other systems
+            // For Write+Write conflicts, add an edge only if idx < j
+            // to avoid duplication
             for j in 0..n {
                 if j == idx {
                     continue;
@@ -511,7 +511,7 @@ impl Scheduler {
                         continue;
                     }
 
-                    // direction = true означает i→j, direction = false означает j→i
+                    // direction = true means i→j, direction = false means j→i
                     let (from_idx, to_idx, from_id, to_id) = if direction {
                         (idx, j, system_i.id, system_j.id)
                     } else {
@@ -564,9 +564,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Попытка найти описание цикла для сообщения об ошибке.
+    /// Try to find a cycle description for the error message.
     fn find_cycle_description(&self) -> String {
-        // Простой поиск: находим пары систем с взаимными зависимостями
+        // Simple search: find pairs of systems with mutual dependencies
         let mut pairs = Vec::new();
         for edge in &self.edge_info {
             let reverse = self
