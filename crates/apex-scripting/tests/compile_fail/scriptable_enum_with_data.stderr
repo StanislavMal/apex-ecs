@@ -1,0 +1,5 @@
+error: #[derive(Scriptable)] for an enum supports only data-less variants (a C-like enum). For an enum with data, implement ScriptableRegistrar manually.
+  --> tests/compile_fail/scriptable_enum_with_data.rs:10:5
+   |
+10 |     Tuple(u32),
+   |     ^^^^^

@@ -1,0 +1,12 @@
+error: system!: `res: &u32` — `&T` no longer denotes a resource (Bevy-semantics trap, P2).
+       Use `res: Res<u32>`.
+       Event reading — `name: &[E]` or `name: EventReader<E>`;
+       components — inside a query: `q: (Read<u32>, …)`.
+ --> tests/compile_fail/system_ref_resource.rs:4:1
+  |
+4 | / apex_core::system! {
+5 | |     fn takes_ref(res: &u32) {}
+6 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `$crate::__system_impl` which comes from the expansion of the macro `apex_core::system` (in Nightly builds, run with -Z macro-backtrace for more info)

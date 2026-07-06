@@ -1,0 +1,20 @@
+error: unsupported parameter in system! macro: "mut"
+
+       Expected one of:
+         - q: (Read<A>, Write<B>) — query (tuple)
+         - q: Read<A>             — query (single)
+         - name: Res<T>           — resource read
+         - name: ResMut<T>        — resource write
+         - name: &[E]             — event reader
+         - name: &mut Vec<E>      — event writer (use .send())
+         - cmd: Cmd               — commands
+         - ctx: Ctx               — SystemContext access
+         - __whole: WholeWorld    — NEEDS_WHOLE_WORLD flag
+ --> tests/compile_fail/system_unsupported_param.rs:4:1
+  |
+4 | / apex_core::system! {
+5 | |     fn bad(mut weird: u32) {}
+6 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `$crate::__sys_compile_error` which comes from the expansion of the macro `apex_core::system` (in Nightly builds, run with -Z macro-backtrace for more info)

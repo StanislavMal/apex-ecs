@@ -1,0 +1,9 @@
+error: system! supports only one Query parameter — combine components into a single tuple query, e.g. `q: (Read<A>, Write<B>)`
+ --> tests/compile_fail/system_two_queries.rs:5:1
+  |
+5 | / apex_core::system! {
+6 | |     fn two_queries(q1: (Foo,), q2: (Bar,)) {}
+7 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `$crate::__system_impl` which comes from the expansion of the macro `apex_core::system` (in Nightly builds, run with -Z macro-backtrace for more info)

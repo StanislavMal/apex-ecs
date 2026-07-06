@@ -61,6 +61,9 @@ cgmath = "0.18"
 # Авторегистрация компонентов через distributed slice
 linkme = "0.3"
 
+# Compile-fail тесты макросов (derive/system!) — trybuild
+trybuild = "1.0"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

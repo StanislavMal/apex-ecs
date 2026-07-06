@@ -1,0 +1,11 @@
+error: system!: `res: &mut u32` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).
+       Use `res: ResMut<u32>`.
+       Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`.
+ --> tests/compile_fail/system_ref_mut_resource.rs:4:1
+  |
+4 | / apex_core::system! {
+5 | |     fn takes_ref_mut(res: &mut u32) {}
+6 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `$crate::__system_impl` which comes from the expansion of the macro `apex_core::system` (in Nightly builds, run with -Z macro-backtrace for more info)

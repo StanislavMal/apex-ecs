@@ -1,0 +1,5 @@
+error: #[derive(Bundle)] supports only structs
+ --> tests/compile_fail/bundle_on_union.rs:8:7
+  |
+8 | union NotAStruct {
+  |       ^^^^^^^^^^

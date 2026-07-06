@@ -30,3 +30,7 @@ bincode    = { workspace = true }
 # Математика для трансформаций
 glam = { workspace = true }
 cgmath = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Compile-fail tests for derive/`system!` migrant traps
+trybuild = { workspace = true }

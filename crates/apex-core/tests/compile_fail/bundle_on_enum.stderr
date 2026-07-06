@@ -1,0 +1,5 @@
+error: #[derive(Bundle)] supports only structs
+ --> tests/compile_fail/bundle_on_enum.rs:8:6
+  |
+8 | enum NotAStruct {
+  |      ^^^^^^^^^^

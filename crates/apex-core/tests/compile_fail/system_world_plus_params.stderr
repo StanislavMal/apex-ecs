@@ -1,0 +1,11 @@
+error: `world: &mut World` is an exclusive system with FULL access;
+       it cannot be combined with other parameters (it already grants full access to the whole world).
+       Inside the body, use world.resource(), world.query::<_>(), world.spawn(...) directly.
+ --> tests/compile_fail/system_world_plus_params.rs:4:1
+  |
+4 | / apex_core::system! {
+5 | |     fn bad(world: &mut World, extra: u32) {}
+6 | | }
+  | |_^
+  |
+  = note: this error originates in the macro `apex_core::system` (in Nightly builds, run with -Z macro-backtrace for more info)

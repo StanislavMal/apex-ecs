@@ -1,0 +1,5 @@
+error: #[derive(Scriptable)] does not support a tuple struct without fields
+ --> tests/compile_fail/scriptable_empty_tuple_struct.rs:9:8
+  |
+9 | struct Gravity();
+  |        ^^^^^^^

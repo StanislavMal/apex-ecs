@@ -1,0 +1,5 @@
+error: #[derive(Scriptable)] does not support union
+ --> tests/compile_fail/scriptable_union.rs:7:7
+  |
+7 | union U {
+  |       ^

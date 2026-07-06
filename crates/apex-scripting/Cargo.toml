@@ -12,3 +12,7 @@ log.workspace     = true
 rustc-hash.workspace = true
 thiserror.workspace  = true
 notify = "6.1"
+
+[dev-dependencies]
+# Compile-fail tests for the `#[derive(Scriptable)]` migrant traps
+trybuild = { workspace = true }
