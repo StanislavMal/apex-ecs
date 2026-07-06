@@ -27,6 +27,17 @@
 > `World`/`SystemContext`-поверхности остались лазейками. Заявка «soundness в типах» до конца НЕ
 > выполнена. Приоритет — первым заходом.
 
+- **MIRI-CD 🔴 НОВОЕ (обнаружено 2026-07-06, CORE_POLISH волна 1.2 — PRE-EXISTING, НЕ регрессия) —
+  Miri UB в change-detection query-пути под планировщиком.** `apex-scheduler/tests/unified_system.rs`
+  `changed_in_system_detects_only_mutated` (система `detect_changed` с `(Changed<C>, Read<C>)` через
+  `system!`) даёт **реальный UB И под Stacked, И под Tree Borrows** (`reborrow ... forbidden` / `retag
+  ... tag does not exist`). **Подтверждено pre-existing:** идентичный фейл на pre-1.2 (commit b48ffd0),
+  до любых правок волны 1.2. Почему не замечено: аудит гонял Miri TB на apex-**core** lib-тестах, а
+  этот путь — в apex-**scheduler** integration-тесте (query-fetch через SubWorld+system! в scheduler-
+  контексте). §0.2a — записан громко. **Вне scope CORE_POLISH** (независимый pre-existing soundness-баг
+  query-слоя, не детерминизм/скриптинг); заведена отдельная задача. Приоритет 🔴 (UB в горячем
+  read-пути), но требует изолированного захода с локализацией retag'а.
+
 - **S1 ✅ ЗАКРЫТ ЦЕЛИКОМ — ЧАСТЬ 1 (2026-07-05, commit e79ad1e) + ЧАСТЬ 2 (2026-07-05) — read/write-аксессоры.**
   **Часть 1 ✅ (документированный PoC закрыт):** `Query::get`/`single` возвращали ОДИН дублируемый item;
   `new_mut::<Write<T>>().get(e)` дважды → два `Mut<T>` на одну строку (aliasing из safe). → `get`/`single`
