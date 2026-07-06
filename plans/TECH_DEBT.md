@@ -272,7 +272,7 @@
   extract держать последовательным); (4) `TargetIndex::remove` O(N)-скан — коммент-компромисс
   (O(N) в fan-in target'а; малый для типичных relations; SmallVec inline бьёт вторичный индекс;
   деградация только на патологическом huge-fan-in). Гейты: 260 core-тестов, clippy net-neutral.
-- **DynQueryMut item-гейт: S7 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 3 фаза A) / S8 🟢 → волна 3 фаза A.**
+- **DynQueryMut item-гейт: S7 ✅ + S8 ✅ ЗАКРЫТЫ (2026-07-06, CORE_POLISH волна 3 фаза A).**
   **S7 ✅:** `DynItemMut::get_mut/get_mut_ptr` теперь ГЕЙТЯТ по декларированным `writes` — id не в
   `writes` → `None` + `anomaly!` (`refuse_undeclared_write`, Severity::Warn, World в scope через новое
   поле `DynItemMut.world`). Декларация write больше не декоративна: скриптинг/agent-IPC/редактор поверх
@@ -281,9 +281,16 @@
   (`for_each_mut`/`get_mut`) прокидывают их. Тест `dyn_write_gate_refuses_undeclared_write` (write:Hp +
   read:Mana → get_mut::<Mana>/get_mut_ptr(mana) = None, Mana не тронута; get::<Mana> работает). Гейты:
   260 core + workspace зелёные, clippy net-neutral, Miri TB чист (dyn_write 9). Нулевой blast radius
-  (движок DynItemMut не потребляет). **S8 🟢 (открыт):** нет Changed/Added-термов у динамического
-  билдера — инспектору для change-polling остаются полные сканы. Синтаксис дескриптора
-  `"Changed:Position"`/`"Added:Position"` (симметрично With/Without) — следующий пункт фазы A.
+  (движок DynItemMut не потребляет). **S8 ✅:** динамический билдер получил Changed/Added-термы —
+  `changed[_id/_name]::<T>()` / `added[_id/_name]::<T>()` + `since(last_run)`-baseline (дефолт
+  `world.last_run_tick()`) на ОБОИХ билдерах (Query/QueryBuilderMut). Реализованы как per-row
+  post-фильтр (`DynTerms::row_passes_change` через `col.get_tick`/`get_added_tick` +
+  `is_newer_than`), симметрично relation-фильтру; терм добавляет id в `withs` (компонент обязан
+  присутствовать). Заврайрено в `DynIter::next`/`DynQuery::get`/`count`/`is_empty` +
+  `DynQueryMut::for_each_mut`/`get_mut`/`count`. Инспектору редактора теперь доступен change-polling
+  без полных сканов; скриптингу — реактивные запросы. Тесты `dyn_changed_filter_matches_typed`
+  (== типизированный `Changed<T>`) + `dyn_added_filter` (added-tick, не мутация). Гейты: 263 core +
+  workspace зелёные, clippy net-neutral, Miri TB чист (dyn 21).
 
 ---
 

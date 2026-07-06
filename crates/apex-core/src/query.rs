@@ -2321,6 +2321,19 @@ struct RelationFilter {
     negate: bool,
 }
 
+/// S8: a per-row change-detection term — component `id` must have been changed
+/// (or added) since the query's `last_run` baseline. The component's presence is
+/// also required (the id is added to `withs`), so this is a filter over the
+/// archetype-matched set, applied per row like [`RelationFilter`]. Mirrors the
+/// typed `Changed<T>`/`Added<T>` filters at runtime, for the dynamic path
+/// (editor change-polling, reactive scripting) a typed query cannot express.
+#[derive(Clone, Copy)]
+struct ChangeTerm {
+    id: ComponentId,
+    /// `false` = changed (change tick); `true` = added (added tick).
+    added: bool,
+}
+
 /// Resolved terms of a dynamic query — shared by the read and write builders.
 #[derive(Default)]
 struct DynTerms {
@@ -2337,6 +2350,11 @@ struct DynTerms {
     /// any entity ⇒ the whole query is empty. Set at builder time; makes
     /// [`matching_archetype_ids`](DynTerms::matching_archetype_ids) return none.
     relation_impossible: bool,
+    /// S8: per-row change-detection terms (Changed/Added).
+    change_terms: Vec<ChangeTerm>,
+    /// S8: the change-detection baseline. `None` ⇒ default to the world's
+    /// `last_run_tick()` at build time ("changed since the previous run").
+    since: Option<Tick>,
 }
 
 impl DynTerms {
@@ -2384,6 +2402,31 @@ impl DynTerms {
         relations.iter().all(|t| {
             world.subject_has_relation_idx(entity, t.kind_idx, t.target) != t.negate
         })
+    }
+
+    /// S8: whether row `row` of `arch` satisfies every change-detection term
+    /// (per-row post-filter). Empty term list ⇒ trivially true (no per-row cost).
+    /// A term's component missing from `arch` fails the term (the row was matched
+    /// on other terms) — but `push_change` adds the id to `withs`, so a matched
+    /// archetype always has it; the `column_index` guard is defensive.
+    #[inline]
+    fn row_passes_change(terms: &[ChangeTerm], last_run: Tick, arch: &Archetype, row: usize) -> bool {
+        terms.iter().all(|t| {
+            let Some(col_idx) = arch.column_index(t.id) else {
+                return false;
+            };
+            let col = &arch.columns[col_idx];
+            let tick = if t.added { col.get_added_tick(row) } else { col.get_tick(row) };
+            tick.is_newer_than(last_run)
+        })
+    }
+
+    /// Record a change-detection term (Changed/Added) and require the component
+    /// present (added to `withs`). An unregistered id collapses to `INVALID`
+    /// (matches nothing) — the same convention as the typed path.
+    fn push_change(&mut self, id: ComponentId, added: bool) {
+        self.withs.push(id);
+        self.change_terms.push(ChangeTerm { id, added });
     }
 
     /// Record a relation term, resolving the kind read-only. An unregistered
@@ -2544,6 +2587,56 @@ impl<'w> QueryBuilder<'w> {
         self
     }
 
+    /// S8: change filter — the entity's `T` must have CHANGED since the baseline
+    /// ([`since`](Self::since), default the previous run). Requires `T` present.
+    pub fn changed<T: Component>(mut self) -> Self {
+        self.terms.push_change(DynTerms::id_of::<T>(self.world), false);
+        self
+    }
+
+    /// S8: change filter by runtime id.
+    pub fn changed_id(mut self, id: ComponentId) -> Self {
+        self.terms.push_change(id, false);
+        self
+    }
+
+    /// S8: change filter by full type name (unknown name is loud at build).
+    pub fn changed_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.push_change(id, false);
+        }
+        self
+    }
+
+    /// S8: added filter — `T` must have been ADDED (added tick) since the
+    /// baseline. Requires `T` present.
+    pub fn added<T: Component>(mut self) -> Self {
+        self.terms.push_change(DynTerms::id_of::<T>(self.world), true);
+        self
+    }
+
+    /// S8: added filter by runtime id.
+    pub fn added_id(mut self, id: ComponentId) -> Self {
+        self.terms.push_change(id, true);
+        self
+    }
+
+    /// S8: added filter by full type name (unknown name is loud at build).
+    pub fn added_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.push_change(id, true);
+        }
+        self
+    }
+
+    /// S8: set the change-detection baseline. Changed/Added terms match a
+    /// component whose tick is newer than `last_run`. Defaults to the world's
+    /// `last_run_tick()` (changed since the previous run) when unset.
+    pub fn since(mut self, last_run: Tick) -> Self {
+        self.terms.since = Some(last_run);
+        self
+    }
+
     /// Indices into `world.archetypes()` of the archetypes matching the
     /// builder's COMPONENT terms. Relation terms (a per-entity post-filter) are
     /// NOT applied here — iterate the built query for the full result. If a name
@@ -2565,11 +2658,14 @@ impl<'w> QueryBuilder<'w> {
             return Err(DynQueryError::WriteNotSupported);
         }
         let arch_ids = self.terms.matching_archetype_ids(self.world);
+        let last_run = self.terms.since.unwrap_or_else(|| self.world.last_run_tick());
         Ok(DynQuery {
             world: self.world,
             reads: self.terms.reads,
             arch_ids,
             relations: self.terms.relations,
+            change_terms: self.terms.change_terms,
+            change_since: last_run,
         })
     }
 }
@@ -2693,6 +2789,53 @@ impl<'w> QueryBuilderMut<'w> {
         self
     }
 
+    /// S8: change filter — the entity's `T` must have CHANGED since the baseline
+    /// ([`since`](Self::since)). Requires `T` present. See [`QueryBuilder::changed`].
+    pub fn changed<T: Component>(mut self) -> Self {
+        self.terms.push_change(DynTerms::id_of::<T>(self.world), false);
+        self
+    }
+
+    /// S8: change filter by runtime id.
+    pub fn changed_id(mut self, id: ComponentId) -> Self {
+        self.terms.push_change(id, false);
+        self
+    }
+
+    /// S8: change filter by full type name (unknown name is loud at build).
+    pub fn changed_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.push_change(id, false);
+        }
+        self
+    }
+
+    /// S8: added filter — `T` must have been ADDED (added tick) since the baseline.
+    pub fn added<T: Component>(mut self) -> Self {
+        self.terms.push_change(DynTerms::id_of::<T>(self.world), true);
+        self
+    }
+
+    /// S8: added filter by runtime id.
+    pub fn added_id(mut self, id: ComponentId) -> Self {
+        self.terms.push_change(id, true);
+        self
+    }
+
+    /// S8: added filter by full type name (unknown name is loud at build).
+    pub fn added_name(mut self, name: &str) -> Self {
+        if let Some(id) = self.terms.resolve_name(self.world, name) {
+            self.terms.push_change(id, true);
+        }
+        self
+    }
+
+    /// S8: set the change-detection baseline (default the world's `last_run_tick()`).
+    pub fn since(mut self, last_run: Tick) -> Self {
+        self.terms.since = Some(last_run);
+        self
+    }
+
     /// Build the read/write dynamic query.
     ///
     /// Errors loudly on unresolved names and on a component written twice
@@ -2703,12 +2846,15 @@ impl<'w> QueryBuilderMut<'w> {
         }
         self.terms.check_write_alias()?;
         let arch_ids = self.terms.matching_archetype_ids(self.world);
+        let last_run = self.terms.since.unwrap_or_else(|| self.world.last_run_tick());
         Ok(DynQueryMut {
             world: self.world.as_unsafe_world_cell(),
             reads: self.terms.reads,
             writes: self.terms.writes,
             arch_ids,
             relations: self.terms.relations,
+            change_terms: self.terms.change_terms,
+            change_since: last_run,
         })
     }
 }
@@ -2722,6 +2868,10 @@ pub struct DynQuery<'w> {
     arch_ids: Vec<usize>,
     /// Relation terms (S8) — per-entity post-filter over the archetype set.
     relations: Vec<RelationFilter>,
+    /// S8: change-detection terms (Changed/Added) — per-row post-filter.
+    change_terms: Vec<ChangeTerm>,
+    /// S8: the change-detection baseline for `change_terms`.
+    change_since: Tick,
 }
 
 impl<'w> DynQuery<'w> {
@@ -2740,7 +2890,7 @@ impl<'w> DynQuery<'w> {
     /// matched archetype lengths (O(archetypes)); with relation terms it counts
     /// the post-filtered entities (O(candidates)).
     pub fn count(&self) -> usize {
-        if self.relations.is_empty() {
+        if self.relations.is_empty() && self.change_terms.is_empty() {
             let archs = self.world.archetypes();
             self.arch_ids.iter().map(|&i| archs[i].len()).sum()
         } else {
@@ -2749,26 +2899,29 @@ impl<'w> DynQuery<'w> {
     }
 
     pub fn is_empty(&self) -> bool {
-        if self.relations.is_empty() {
+        if self.relations.is_empty() && self.change_terms.is_empty() {
             self.arch_ids.iter().all(|&i| self.world.archetypes()[i].is_empty())
         } else {
             self.iter().next().is_none()
         }
     }
 
-    /// Iterate all matching entities (archetype terms + relation post-filter).
+    /// Iterate all matching entities (archetype terms + relation and
+    /// change-detection post-filters).
     pub fn iter(&self) -> DynIter<'_, 'w> {
         DynIter {
             world: self.world,
             arch_ids: &self.arch_ids,
             relations: &self.relations,
+            change_terms: &self.change_terms,
+            change_since: self.change_since,
             arch_cursor: 0,
             row: 0,
         }
     }
 
     /// Point lookup: the item for `entity`, or `None` if the entity is dead,
-    /// its archetype does not match, or it fails a relation term.
+    /// its archetype does not match, or it fails a relation / change term.
     pub fn get(&self, entity: Entity) -> Option<DynItem<'w>> {
         let loc = self.world.entity_allocator().get_location(entity)?;
         let arch_idx = loc.archetype_id.as_usize();
@@ -2777,10 +2930,15 @@ impl<'w> DynQuery<'w> {
         if !DynTerms::entity_passes_relations(&self.relations, self.world, entity) {
             return None;
         }
+        let arch = &self.world.archetypes()[arch_idx];
+        let row = loc.row as usize;
+        if !DynTerms::row_passes_change(&self.change_terms, self.change_since, arch, row) {
+            return None;
+        }
         Some(DynItem {
             entity,
-            arch: &self.world.archetypes()[arch_idx],
-            row: loc.row as usize,
+            arch,
+            row,
             registry: self.world.registry(),
         })
     }
@@ -2809,6 +2967,9 @@ pub struct DynIter<'q, 'w> {
     arch_ids: &'q [usize],
     /// Relation terms (S8) — entities failing them are skipped.
     relations: &'q [RelationFilter],
+    /// Change-detection terms (S8) — rows failing them are skipped.
+    change_terms: &'q [ChangeTerm],
+    change_since: Tick,
     arch_cursor: usize,
     row: usize,
 }
@@ -2826,6 +2987,10 @@ impl<'q, 'w> Iterator for DynIter<'q, 'w> {
                 let entity = arch.entities()[row];
                 // Relation post-filter (S8): skip entities that fail a term.
                 if !DynTerms::entity_passes_relations(self.relations, self.world, entity) {
+                    continue;
+                }
+                // Change-detection post-filter (S8): skip rows not changed/added.
+                if !DynTerms::row_passes_change(self.change_terms, self.change_since, arch, row) {
                     continue;
                 }
                 return Some(DynItem {
@@ -2927,6 +3092,10 @@ pub struct DynQueryMut<'w> {
     arch_ids: Vec<usize>,
     /// Relation terms (S8) — per-entity post-filter over the archetype set.
     relations: Vec<RelationFilter>,
+    /// S8: change-detection terms (Changed/Added) — per-row post-filter.
+    change_terms: Vec<ChangeTerm>,
+    /// S8: the change-detection baseline for `change_terms`.
+    change_since: Tick,
 }
 
 impl std::fmt::Debug for DynQueryMut<'_> {
@@ -2960,17 +3129,23 @@ impl<'w> DynQueryMut<'w> {
     pub fn count(&self) -> usize {
         // SAFETY: read-only metadata view; no mutable view is live here.
         let world = unsafe { self.world.world() };
-        if self.relations.is_empty() {
-            let archs = world.archetypes();
-            self.arch_ids.iter().map(|&i| archs[i].len()).sum()
-        } else {
-            let archs = world.archetypes();
-            self.arch_ids
-                .iter()
-                .flat_map(|&i| archs[i].entities().iter().copied())
-                .filter(|&e| DynTerms::entity_passes_relations(&self.relations, world, e))
-                .count()
+        let archs = world.archetypes();
+        if self.relations.is_empty() && self.change_terms.is_empty() {
+            return self.arch_ids.iter().map(|&i| archs[i].len()).sum();
         }
+        let mut n = 0;
+        for &i in &self.arch_ids {
+            let arch = &archs[i];
+            for row in 0..arch.len() {
+                let e = arch.entities()[row];
+                if DynTerms::entity_passes_relations(&self.relations, world, e)
+                    && DynTerms::row_passes_change(&self.change_terms, self.change_since, arch, row)
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2993,6 +3168,10 @@ impl<'w> DynQueryMut<'w> {
                 let entity = arch.entities()[row];
                 // Relation post-filter (S8): skip entities that fail a term.
                 if !DynTerms::entity_passes_relations(&self.relations, world, entity) {
+                    continue;
+                }
+                // Change-detection post-filter (S8): skip rows not changed/added.
+                if !DynTerms::row_passes_change(&self.change_terms, self.change_since, arch, row) {
                     continue;
                 }
                 f(DynItemMut {
@@ -3020,10 +3199,15 @@ impl<'w> DynQueryMut<'w> {
         if !DynTerms::entity_passes_relations(&self.relations, world, entity) {
             return None;
         }
+        let arch = &world.archetypes()[arch_idx];
+        let row = loc.row as usize;
+        if !DynTerms::row_passes_change(&self.change_terms, self.change_since, arch, row) {
+            return None;
+        }
         Some(DynItemMut {
             entity,
-            arch: &world.archetypes()[arch_idx],
-            row: loc.row as usize,
+            arch,
+            row,
             registry: world.registry(),
             this_run: world.current_tick(),
             writes: &self.writes,
@@ -4305,6 +4489,82 @@ mod dyn_query_tests {
             .collect();
         assert_eq!(changed, vec![e]);
         assert_eq!(world.get::<Hp>(e), Some(&Hp(42)));
+    }
+
+    /// S8: a dynamic `Changed` filter matches only rows whose component changed
+    /// since the baseline — parity with the typed `Changed<T>` filter, but
+    /// expressible at runtime (editor change-polling / reactive scripting).
+    #[test]
+    fn dyn_changed_filter_matches_typed() {
+        let mut world = World::new();
+        let a = world.spawn((Hp(1),));
+        let _b = world.spawn((Hp(2),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        world.advance_change_tick();
+
+        // Nothing changed since `lr`.
+        let q = world.query_builder().changed::<Hp>().since(lr).build().unwrap();
+        assert_eq!(q.count(), 0);
+
+        // Mutate `a` via the dynamic write path (stamps the change tick).
+        world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .build()
+            .unwrap()
+            .get_mut(a)
+            .unwrap()
+            .get_mut::<Hp>(hp_id)
+            .unwrap()
+            .0 = 99;
+
+        let q = world.query_builder().changed::<Hp>().since(lr).build().unwrap();
+        let hits: Vec<Entity> = q.iter().map(|it| it.entity()).collect();
+        assert_eq!(hits, vec![a], "only the changed entity matches");
+        assert_eq!(q.count(), 1);
+        // Same set as the typed filter.
+        let typed: Vec<Entity> =
+            Query::<Entity, Changed<Hp>>::new_with_tick(&world, lr).iter().collect();
+        assert_eq!(hits, typed, "dynamic Changed == typed Changed");
+    }
+
+    /// S8: a dynamic `Added` filter matches rows whose component was ADDED since
+    /// the baseline (added tick), not mere mutation.
+    #[test]
+    fn dyn_added_filter() {
+        let mut world = World::new();
+        let old = world.spawn((Hp(1),));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        world.advance_change_tick();
+        let lr = world.last_run_tick();
+        world.advance_change_tick();
+
+        // A freshly spawned entity has Hp ADDED after `lr`.
+        let fresh = world.spawn((Hp(2),));
+        let q = world.query_builder().added::<Hp>().since(lr).build().unwrap();
+        assert_eq!(q.iter().map(|it| it.entity()).collect::<Vec<_>>(), vec![fresh]);
+
+        // Mutating the OLD entity marks Changed, NOT Added — the filter ignores it.
+        world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .build()
+            .unwrap()
+            .get_mut(old)
+            .unwrap()
+            .get_mut::<Hp>(hp_id)
+            .unwrap()
+            .0 = 5;
+        let q = world.query_builder().added::<Hp>().since(lr).build().unwrap();
+        assert_eq!(
+            q.iter().map(|it| it.entity()).collect::<Vec<_>>(),
+            vec![fresh],
+            "mutation is not an add"
+        );
     }
 
     #[test]
