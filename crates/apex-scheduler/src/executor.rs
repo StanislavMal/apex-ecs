@@ -1,12 +1,12 @@
 use super::*;
 
 impl Scheduler {
-    // ── Выполнение ─────────────────────────────────────────────
+    // ── Execution ─────────────────────────────────────────────
 
-    /// Запустить одну итерацию планировщика.
-    /// Использует Rayon для параллельного выполнения.
+    /// Run one scheduler iteration.
+    /// Uses Rayon for parallel execution.
     ///
-    /// Startup этап выполняется только при первом вызове `run()`.
+    /// The Startup stage runs only on the first `run()` call.
     /// Open a stage's change-detection window (TD-52 cross-stage fix). Advances `current_tick` so this
     /// stage's writes get a fresh, higher tick, then sets the base (`last_run_tick`) to the tick at
     /// which this stage last ran. A `Changed<T>`/`Added<T>` reader in the stage therefore sees
@@ -25,7 +25,7 @@ impl Scheduler {
         self.stage_last_run[stage_idx] = this_run;
     }
 
-    /// Ш2: cost-model verdict — should this parallel-eligible stage run sequentially?
+    /// Sh2: cost-model verdict — should this parallel-eligible stage run sequentially?
     /// Uses the measured dispatch-time EMA with a ±hysteresis band around
     /// `T_STAGE_SEQ_NS` to avoid flapping. `None`-history (EMA 0) → `false` (let the
     /// caller's entity heuristic decide the first frames).
@@ -45,7 +45,7 @@ impl Scheduler {
         ema < threshold
     }
 
-    /// Ш2: fold a measured stage dispatch time into the per-stage EMA and record the
+    /// Sh2: fold a measured stage dispatch time into the per-stage EMA and record the
     /// mode that produced it (for hysteresis). Lazily grows the buffers.
     pub(crate) fn record_stage_cost(&mut self, stage_idx: usize, elapsed: std::time::Duration, ran_seq: bool) {
         let ns = elapsed.as_nanos() as f64;
@@ -68,22 +68,22 @@ impl Scheduler {
         if main_prof_enabled() {
             main_prof_world_stats(world);
         }
-        // Заполняем реестр имён компонентов для диагностики конфликтов
+        // Populate the component-name registry for conflict diagnostics
         self.populate_type_names(world.registry());
         if self.execution_plan.is_none() {
             self.compile().expect("Failed to compile schedule");
         }
 
-        // Вычисляем маппинг систем → архетипы для SubWorld.
+        // Compute the system → archetype mapping for the SubWorld.
         self.compute_archetype_indices(world);
 
         self.run_hybrid_parallel(world as *mut World);
 
-        // Граница кадра: продвигаем change-tick, чтобы `Changed<T>` в системах
-        // на следующем кадре детектировал только мутации этого кадра (TD-9).
+        // Frame boundary: advance the change-tick so `Changed<T>` in systems
+        // next frame detects only this frame's mutations (TD-9).
         world.advance_change_tick();
 
-        // После первого run() Startup больше не выполняется
+        // After the first run() Startup no longer runs
         self.startup_completed = true;
     }
 
@@ -121,8 +121,8 @@ impl Scheduler {
         let mut stage_cmds = Commands::new();
         let cmds_ptr = &mut stage_cmds as *mut Commands;
 
-        // (клонируем метаданные стадий — plan заимствует self, а stage_steps
-        // и системы ниже требуют &mut)
+        // (clone the stage metadata — the plan borrows self, while stage_steps
+        // and the systems below need &mut)
         let stages_meta: Vec<(StageLabel, Vec<SystemId>, Vec<TypeId>)> = plan
             .stages
             .iter()
@@ -212,52 +212,52 @@ impl Scheduler {
                     }
                 }
 
-                // Применяем отложенные команды после каждой стадии/шага (rank order —
+                // Apply deferred commands after each stage/step (rank order —
                 // systems appended to `stage_cmds` in execution order).
                 stage_cmds.apply(w);
 
-                // Per-stage flush — делает события доступными для следующего этапа
+                // Per-stage flush — makes events available to the next stage
                 if !emit_event_types.is_empty() {
                     w.flush_events_by_type(emit_event_types);
                 }
             }
         }
 
-        // Граница кадра: продвигаем change-tick (TD-9).
+        // Frame boundary: advance the change-tick (TD-9).
         w.advance_change_tick();
 
         self.startup_completed = true;
     }
 
-    /// Запустить stage через ASD (Adaptive Scope Distribution).
+    /// Run a stage via ASD (Adaptive Scope Distribution).
     ///
-    /// ASD динамически разбивает entity всех систем stage на чанки
-    /// адаптивного размера, сортирует их по archetype_id для cache locality
-    /// и распределяет по всем воркерам Rayon.
+    /// ASD dynamically splits the entities of all the stage's systems into
+    /// adaptively sized chunks, sorts them by archetype_id for cache locality,
+    /// and distributes them across all Rayon workers.
     ///
-    /// # Алгоритм
+    /// # Algorithm
     ///
-    /// 1. Вычисляется `total_entity_count` — сумма entity всех систем в stage.
+    /// 1. Compute `total_entity_count` — the sum of entities of all systems in the stage.
     /// 2. `target_chunk = max(total_entity_count / num_workers / 2, MIN_CHUNK)`.
-    /// 3. Для каждой системы:
-    ///    - Если entity_count <= target_chunk → 1 задача (весь архетип целиком).
-    ///    - Если entity_count > target_chunk → разбивка на чанки размером ~target_chunk.
-    /// 4. Все чанки собираются в Vec, сортируются по archetype_id.
-    /// 5. Чанки запускаются через `rayon::scope`.
+    /// 3. For each system:
+    ///    - If entity_count <= target_chunk → 1 task (the whole archetype).
+    ///    - If entity_count > target_chunk → split into chunks of ~target_chunk.
+    /// 4. All chunks are collected into a Vec and sorted by archetype_id.
+    /// 5. The chunks are run via `rayon::scope`.
     ///
-    /// # Адаптивность
+    /// # Adaptivity
     ///
-    /// - Мало entity → target_chunk мал → каждая система = 1 задача (per-system scope).
-    /// - Много entity → target_chunk велик → задачи равномерно заполняют всех воркеров.
-    /// - Без if/else — один механизм на все сценарии.
+    /// - Few entities → small target_chunk → each system = 1 task (per-system scope).
+    /// - Many entities → large target_chunk → tasks fill all workers evenly.
+    /// - No if/else — one mechanism for every scenario.
     ///
-    /// # Безопасность
+    /// # Safety
     ///
-    /// Каждая spawn-задача работает с РАЗНЫМ `SystemDescriptor`
-    /// (разные `AsdTask.ptr`), поэтому одновременный `&mut` доступ
-    /// к разным системам безопасен. SubWorld создаётся локально внутри spawn
-    /// с ограничением `(arch_idx, start, end)`, что гарантирует что
-    /// разные задачи НЕ пересекаются по данным одного архетипа.
+    /// Each spawned task works on a DIFFERENT `SystemDescriptor`
+    /// (different `AsdTask.ptr`), so concurrent `&mut` access
+    /// to different systems is safe. The SubWorld is created locally inside spawn
+    /// with the `(arch_idx, start, end)` restriction, which guarantees that
+    /// different tasks do NOT overlap in the data of a single archetype.
     /// `cmds_base` — raw pointer (as `usize`, Copy+Send) to the base of the
     /// stage's per-system `Commands` slots (`stage_cmds` in `run_hybrid_parallel`),
     /// one per system in rank order. `slot_of` maps a `SystemId` to its slot index.
@@ -278,7 +278,7 @@ impl Scheduler {
         //    (`enabled` set) — do NOT re-evaluate here, or a stateful condition
         //    (`run_until`/`every_n_frames`) would be double-counted. Systems absent
         //    from `enabled` are skipped.
-        //    Ш1: buffers pooled in Scheduler scratch fields (detached via mem::take
+        //    Sh1: buffers pooled in Scheduler scratch fields (detached via mem::take
         //    so `&mut self` method calls below don't alias them; restored at the end
         //    to retain capacity — zero steady-state allocation).
         let mut skipped_systems = std::mem::take(&mut self.scratch_skipped);
@@ -289,7 +289,7 @@ impl Scheduler {
             }
         }
 
-        // 1. Собираем per-system информацию (SysInfo — module-level, pooled).
+        // 1. Collect per-system info (SysInfo — module-level, pooled).
         let mut sys_infos = std::mem::take(&mut self.scratch_sys_infos);
         sys_infos.clear();
         let mut total_entity_count: usize = 0;
@@ -309,7 +309,7 @@ impl Scheduler {
                     self.system_archetype_indices.get(&sys_id),
                     Some(SystemArchetypes::Filtered(_))
                 );
-                // Ш1: entity_count without materializing an arch-index Vec — the
+                // Sh1: entity_count without materializing an arch-index Vec — the
                 // slice is fetched from `system_archetype_indices` at task-build time.
                 let entity_count: usize = match self.system_archetype_indices.get(&sys_id) {
                     Some(SystemArchetypes::Filtered(v)) => v
@@ -328,11 +328,11 @@ impl Scheduler {
                         .unwrap_or(false);
                     let uses_par_for_each = access.map(|a| a.uses_par_for_each).unwrap_or(false);
                     let needs_whole_world = access.map(|a| a.needs_whole_world).unwrap_or(false);
-                    // Нет access (динамическая система) — состояние неизвестно,
-                    // консервативно считаем stateful (без row-split).
+                    // No access (dynamic system) — state is unknown,
+                    // conservatively treat it as stateful (no row-split).
                     let stateful = access.map(|a| a.stateful).unwrap_or(true);
-                    // Мутация ресурса / Commands (TD-37): сайд-эффект, не локальный для партиции
-                    // запроса ⇒ row-split дублировал бы его. Нет access ⇒ консервативно true.
+                    // Resource mutation / Commands (TD-37): a side effect not local to the query
+                    // partition ⇒ row-split would duplicate it. No access ⇒ conservatively true.
                     // `has_deferred` covers `system!`-macro command systems (`Cmd` sets
                     // `HAS_DEFERRED` but NOT `access.uses_commands` — only the `Commands`
                     // SystemParam sets the latter); both must forbid row-split, else the
@@ -362,7 +362,7 @@ impl Scheduler {
                         non_query_side_effects,
                     });
                 } else {
-                    // Система без entity (только ресурсы/события) — запускаем сразу.
+                    // A system with no entities (resources/events only) — run it immediately.
                     let slot = slot_of[&sys_id];
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
@@ -389,8 +389,8 @@ impl Scheduler {
             return;
         }
 
-        // 2. Вычисляем target chunk size через adaptive_chunk_size
-        //    из apex-core (используется в Query::par_for_each и CachedQuery::par_for_each).
+        // 2. Compute the target chunk size via adaptive_chunk_size
+        //    from apex-core (used in Query::par_for_each).
         let per_system_entity = total_entity_count / sys_infos.len().max(1);
         let target_chunk = apex_core::world::adaptive_chunk_size(
             per_system_entity,
@@ -398,34 +398,34 @@ impl Scheduler {
             world.chunk_config(),
         );
 
-        // Выравниваем размер чанка до 8 entity, чтобы избежать false sharing
-        // кэш-линий между соседними чанками одного архетипа (8 × sizeof(Position) = 96 байт > 64).
+        // Align the chunk size to 8 entities to avoid false sharing of
+        // cache lines between adjacent chunks of one archetype (8 × sizeof(Position) = 96 bytes > 64).
         const CACHE_ALIGN_ENTITIES: usize = 8;
         let aligned_chunk = (target_chunk / CACHE_ALIGN_ENTITIES) * CACHE_ALIGN_ENTITIES;
         let effective_chunk = aligned_chunk.max(CACHE_ALIGN_ENTITIES);
 
-        // 3. Создаём чанки для всех систем (Ш1: pooled task buffer)
+        // 3. Create chunks for all systems (Sh1: pooled task buffer)
         let mut tasks = std::mem::take(&mut self.scratch_tasks);
         tasks.clear();
 
         for info in &sys_infos {
-            // Ш1: fetch the arch-index slice from the cached map (no per-system clone).
+            // Sh1: fetch the arch-index slice from the cached map (no per-system clone).
             let arch_slice: &[usize] = match self.system_archetype_indices.get(&info.sys_id) {
                 Some(SystemArchetypes::Filtered(v)) => v.as_slice(),
                 _ => &[],
             };
-            // Per-system scope (БЕЗ row-split — система выполняется ровно один раз) для:
-            //   a) Систем с малым entity_count
-            //   b) Систем с событиями (Emit/Listen)
-            //   c) Систем с par_for_each — избегаем oversubscribe rayon
-            //   d) Систем с needs_whole_world — глобальный доступ
-            //   e) Систем с состоянием (W3-4) — row-split звал бы
-            //      run(&mut self) одного экземпляра конкурентно
-            //   f) Систем с мутацией ресурса / Commands (TD-37) — тело plain-fn выполняется раз
-            //      на чанк, поэтому не-query-локальный сайд-эффект (ResMut-запись, Commands)
-            //      умножился бы на число чанков (+ гонка при параллельных чанках). Декомпозиция
-            //      допустима ТОЛЬКО когда эффекты системы ограничены её per-entity партицией
-            //      запроса (записи компонентов по непересекающимся диапазонам строк).
+            // Per-system scope (NO row-split — the system runs exactly once) for:
+            //   a) systems with a small entity_count
+            //   b) systems with events (Emit/Listen)
+            //   c) systems with par_for_each — to avoid oversubscribing rayon
+            //   d) systems with needs_whole_world — global access
+            //   e) stateful systems (W3-4) — row-split would call
+            //      run(&mut self) on one instance concurrently
+            //   f) systems mutating a resource / Commands (TD-37) — the plain-fn body runs once
+            //      per chunk, so a non-query-local side effect (a ResMut write, Commands)
+            //      would be multiplied by the chunk count (+ a race across parallel chunks). Decomposition
+            //      is allowed ONLY when a system's effects are confined to its per-entity query
+            //      partition (component writes over disjoint row ranges).
             if info.has_events
                 || info.uses_par_for_each
                 || info.needs_whole_world
@@ -433,17 +433,17 @@ impl Scheduler {
                 || info.non_query_side_effects
                 || info.entity_count <= effective_chunk
             {
-                // Per-system scope: одна задача, все entity целиком. D8b: single-task
+                // Per-system scope: one task, all entities at once. D8b: single-task
                 // → private per-system command slot (unique writer).
                 let slot = slot_of[&info.sys_id];
                 tasks.push(AsdTask {
                     ptr: info.ptr,
                     arch_indices: SmallVec::from_slice(arch_slice),
-                    chunk_ranges: SmallVec::new(), // пусто = весь SubWorld
+                    chunk_ranges: SmallVec::new(), // empty = the whole SubWorld
                     cmds: Some(SendPtr((cmds_base as *mut Commands).wrapping_add(slot))),
                 });
             } else {
-                // Multi-архетипная крупная система — ASD разбивка
+                // A large multi-archetype system — ASD split
                 let mut remaining = info.entity_count;
                 let mut arch_iter = arch_slice.iter().copied();
                 let mut current_arch = arch_iter.next();
@@ -451,7 +451,7 @@ impl Scheduler {
 
                 while remaining > 0 {
                     let mut chunk_ranges: SmallVec<[(usize, usize, usize); 4]> = SmallVec::new();
-                    // Множество archetype_id в этом чанке — для сужения arch_indices
+                    // The set of archetype_ids in this chunk — to narrow arch_indices
                     let mut chunk_arch_set: SmallVec<[usize; 8]> = SmallVec::new();
                     let mut chunk_remaining = effective_chunk.min(remaining);
 
@@ -475,7 +475,7 @@ impl Scheduler {
                         let take = chunk_remaining.min(available);
 
                         chunk_ranges.push((arch_idx, arch_offset, arch_offset + take));
-                        // Добавляем archetype_id в set если его там нет
+                        // Add archetype_id to the set if not already present
                         if !chunk_arch_set.contains(&arch_idx) {
                             chunk_arch_set.push(arch_idx);
                         }
@@ -503,31 +503,31 @@ impl Scheduler {
             }
         }
 
-        // 4. Сортируем чанки по archetype_id для cache locality
+        // 4. Sort chunks by archetype_id for cache locality
         tasks.sort_unstable_by_key(|t| t.chunk_ranges.first().map(|&(a, _, _)| a).unwrap_or(0));
 
-        // 5. Запускаем через rayon::scope. `task.cmds` (Option<SendPtr<Commands>>)
+        // 5. Run via rayon::scope. `task.cmds` (Option<SendPtr<Commands>>)
         //    is Copy+Send — each single-task system carries the pointer to its own
         //    per-system slot; row-split tasks carry `None`.
         rayon::scope(|s| {
             for task in &tasks {
                 s.spawn(move |_| {
-                    // SAFETY (W3-4 + D3): несколько задач одной системы существуют
-                    // ТОЛЬКО для систем без состояния (`stateful`/`has_events`/
-                    // `uses_par_for_each`/`needs_whole_world` получают единый
-                    // per-system scope). Для них `run(&mut self)` не читает и
-                    // не пишет байтов self (ZST/без захватов). `task.ptr` целит
-                    // ПРЯМО в `dyn ParSystem` (ZST-цель), поэтому конкурентные
-                    // `&mut *task.ptr.0` не алиасят реальных байт — в отличие от
-                    // прежнего `&mut SystemDescriptor` (владеет `String` name и
-                    // т.п.). Диапазоны строк задач дизъюнктны по построению.
+                    // SAFETY (W3-4 + D3): multiple tasks of one system exist
+                    // ONLY for stateless systems (`stateful`/`has_events`/
+                    // `uses_par_for_each`/`needs_whole_world` get a single
+                    // per-system scope). For them `run(&mut self)` neither reads
+                    // nor writes any bytes of self (ZST/no captures). `task.ptr` points
+                    // DIRECTLY at the `dyn ParSystem` (a ZST target), so concurrent
+                    // `&mut *task.ptr.0` do not alias any real bytes — unlike
+                    // the former `&mut SystemDescriptor` (owns a `String` name etc.).
+                    // Task row ranges are disjoint by construction.
                     unsafe {
                         let sys: &mut dyn ParSystem = &mut *task.ptr.0;
                         let sub = if task.chunk_ranges.is_empty() {
-                            // Полный SubWorld — все архетипы системы без ограничений
+                            // Full SubWorld — all of the system's archetypes, unrestricted
                             apex_core::SubWorld::from_raw(world, &task.arch_indices)
                         } else {
-                            // SubWorld с range-ограничениями и суженными arch_indices
+                            // SubWorld with range restrictions and narrowed arch_indices
                             apex_core::SubWorld::from_raw_with_ranges(
                                 world,
                                 &task.arch_indices,
@@ -551,7 +551,7 @@ impl Scheduler {
             }
         });
 
-        // Ш1: return pooled buffers to the Scheduler to retain capacity next frame.
+        // Sh1: return pooled buffers to the Scheduler to retain capacity next frame.
         // `sys_infos` holds raw `SendPtr`s into `self.systems`; they are cleared and
         // rebuilt each frame before any use, never dereferenced while stale.
         self.scratch_skipped = skipped_systems;
@@ -559,15 +559,15 @@ impl Scheduler {
         self.scratch_tasks = tasks;
     }
 
-    /// Параллельное выполнение через ASD (Adaptive Scope Distribution).
+    /// Parallel execution via ASD (Adaptive Scope Distribution).
     ///
-    /// Для stage с исключительно параллельными системами используется
-    /// [`run_stage_parallel`] (ASD). Stage с sequential системами или
-    /// смешанные выполняются последовательно, каждая система получает
-    /// полный `SubWorld` над всеми архетипами.
+    /// A stage with exclusively parallel systems uses
+    /// [`run_stage_parallel`] (ASD). A stage with sequential systems or
+    /// a mix runs sequentially, and each system gets
+    /// a full `SubWorld` over all archetypes.
     ///
     fn run_hybrid_parallel(&mut self, world_ptr: *mut World) {
-        // Ш1: move the plan OUT of `self` (mem::take) so its stages can be borrowed
+        // Sh1: move the plan OUT of `self` (mem::take) so its stages can be borrowed
         // while `&mut self` methods run in the loop — no per-frame clone of the stage
         // metadata (labels, `system_ids`, `emit_event_types`). Restored at the end.
         // If a system panics mid-run the plan is lost → recompiled on the next run
@@ -615,7 +615,7 @@ impl Scheduler {
         // update adaptive-sizing history. Empty unless `deterministic_spawn`.
         let mut seeded: Vec<(SystemId, u32, apex_core::entity::EntityReserver)> = Vec::new();
 
-        // Ш1: pooled arch-length snapshot (cleared + refilled, capacity retained).
+        // Sh1: pooled arch-length snapshot (cleared + refilled, capacity retained).
         let mut arch_lengths = std::mem::take(&mut self.scratch_arch_lengths);
         arch_lengths.clear();
         arch_lengths.extend(unsafe { &*const_ptr }.archetypes().iter().map(|a| a.len()));
@@ -793,13 +793,13 @@ impl Scheduler {
                 continue;
             }
 
-            // Ş2: SEQ/PAR decision. Priority:
+            // Sh2: SEQ/PAR decision. Priority:
             //   1. explicit user floor (`parallel_min_entities`) always wins;
             //   2. else, once the cost-model has measured this stage (EMA>0), it
             //      FULLY decides — measured work supersedes entity count. This is the
             //      point of the model: it parallelizes heavy-low-entity stages the
             //      entity heuristic would serialize, and serializes light-high-entity
-            //      stages it would parallelize (Д1/Д2);
+            //      stages it would parallelize (D1/D2);
             //   3. else (cold start, no history yet) fall back to the entity heuristic.
             let stage_entity_count: usize = if stage_par_min > 0
                 || auto_disable_stage
@@ -913,20 +913,20 @@ impl Scheduler {
             if !emit_event_types.is_empty() {
                 unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
             }
-            // Ш2: fold the measured stage time into the per-stage cost EMA (drives
+            // Sh2: fold the measured stage time into the per-stage cost EMA (drives
             // the SEQ/PAR decision next frame). `should_fallback` = the mode we ran.
             self.record_stage_cost(stage_idx, stage_t0.elapsed(), should_fallback);
         }
 
-        // Ш1: return the plan and pooled buffers to `self` (capacity retained).
+        // Sh1: return the plan and pooled buffers to `self` (capacity retained).
         self.execution_plan = Some(plan);
         self.scratch_arch_lengths = arch_lengths;
         self.scratch_schedule = schedule;
     }
 
-    /// Число исполнений стадии в этом кадре (D2-5): FixedUpdate — по
-    /// аккумулятору [`FixedTime`] (без ресурса — 1, обычная стадия);
-    /// остальные стадии — всегда 1.
+    /// The stage's execution count this frame (D2-5): FixedUpdate — from
+    /// the [`FixedTime`] accumulator (no resource — 1, a normal stage);
+    /// all other stages — always 1.
     fn stage_steps(world: &mut World, label: &StageLabel) -> usize {
         if *label != StageLabel::FixedUpdate {
             return 1;

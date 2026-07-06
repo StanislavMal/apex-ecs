@@ -1,8 +1,8 @@
-//! apex-scheduler — гибридный планировщик систем.
+//! apex-scheduler — a hybrid system scheduler.
 //!
-//! # Улучшения по сравнению с предыдущей версией
+//! # Improvements over the previous version
 //!
-//! ## 1. `add_auto_system` — регистрация AutoSystem без ручного access
+//! ## 1. `add_auto_system` — register an AutoSystem without a manual access
 //!
 //! ```ignore
 //! struct MovementSystem;
@@ -15,12 +15,12 @@
 //!     }
 //! }
 //! sched.add_auto_system("movement", MovementSystem);
-//! // AccessDescriptor выводится статически — нельзя забыть компонент
+//! // AccessDescriptor is derived statically — you cannot forget a component
 //! ```
 //!
-//! ## 2. `ConflictKind` в рёбрах графа — verbose диагностика
+//! ## 2. `ConflictKind` on graph edges — verbose diagnostics
 //!
-//! `debug_plan_verbose()` показывает ПОЧЕМУ системы в разных Stage:
+//! `debug_plan_verbose()` shows WHY systems are in different stages:
 //! ```text
 //! Stage 0 [PARALLEL]:
 //!   - physics    [par | R:1 W:2]
@@ -31,26 +31,26 @@
 //!   - commands   [seq | full &mut World]
 //! ```
 //!
-//! ## 3. Инкрементальный граф — добавление систем без полного пересчёта
+//! ## 3. Incremental graph — adding systems without a full recompute
 //!
-//! При `add_*_system` граф не пересчитывается сразу.
-//! Топосорт выполняется лениво при первом `run()` или явном `compile()`.
-//! При добавлении новой системы добавляются только новые узлы/рёбра.
+//! On `add_*_system` the graph is not recomputed immediately.
+//! The topo sort runs lazily on the first `run()` or an explicit `compile()`.
+//! Adding a new system adds only new nodes/edges.
 //!
-//! ## 4. `par_for_each` в SystemContext (в apex-core/world.rs)
+//! ## 4. `par_for_each` in SystemContext (in apex-core/world.rs)
 //!
-//! Параллелизм внутри одной системы по архетипам через Rayon.
+//! Intra-system parallelism across archetypes via Rayon.
 //!
-//! # Типы систем
+//! # System kinds
 //!
-//! | Тип | Access | Использование |
+//! | Kind | Access | Use |
 //! |-----|--------|---------------|
-//! | AutoSystem | автовывод из Query + Resources + Events | рекомендуется |
-//! | FnParSystem | явный + замыкание | быстрые прототипы |
-//! | Sequential | полный &mut World | structural changes |
+//! | AutoSystem | auto-derived from Query + Resources + Events | recommended |
+//! | FnParSystem | explicit + closure | quick prototypes |
+//! | Sequential | full &mut World | structural changes |
 
-// Планировщик — высокопроизводительный код с внутренним `unsafe` (ASD, SendPtr,
-// rayon::scope). Часть линтов смягчена намеренно (см. аналогичный блок в apex-core).
+// The scheduler is high-performance code with internal `unsafe` (ASD, SendPtr,
+// rayon::scope). Some lints are relaxed on purpose (see the similar block in apex-core).
 #![allow(
     clippy::missing_safety_doc,
     clippy::needless_range_loop,
@@ -113,11 +113,11 @@ use std::any::TypeId;
 use thiserror::Error;
 use thunderdome::Index;
 
-// ── Main-world per-system профайлер (`APEX_MAIN_PROF=1`) ────────────────────
+// ── Main-world per-system profiler (`APEX_MAIN_PROF=1`) ────────────────────
 //
-// Зеркало рендерного `APEX_PROF`: render-мир и extract давно имели разбивку, а
-// exclusive-системы main-мира мерились только ad-hoc обёртками в примерах.
-// Лог раз в ~2с: среднее ms/вызов по каждой системе, отсортировано по убыванию.
+// Mirror of the render `APEX_PROF`: the render world and extract have long had a breakdown,
+// while main-world exclusive systems were only measured by ad-hoc wrappers in examples.
+// Logs every ~2s: mean ms/call per system, sorted descending.
 
 fn main_prof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -152,7 +152,7 @@ fn main_prof_record(name: &str, elapsed: std::time::Duration) {
             .map(|(n, avg)| format!("{n} {avg:.2}"))
             .collect::<Vec<_>>()
             .join(" | ");
-        log::info!("MAIN PROF (ms/вызов, avg ~2s): {line}");
+        log::info!("MAIN PROF (ms/call, avg ~2s): {line}");
         for e in acc.iter_mut() {
             e.1 = 0.0;
             e.2 = 0;
@@ -160,8 +160,8 @@ fn main_prof_record(name: &str, elapsed: std::time::Duration) {
     }
 }
 
-/// Раз в ~2с — сводка по архетипам мира (CR-M4: счётчик живых строк в отчёте
-/// `APEX_MAIN_PROF`; рост empty/archetypes — сигнал фрагментации).
+/// Every ~2s — a summary of the world's archetypes (CR-M4: live-row counter in the
+/// `APEX_MAIN_PROF` report; growth in empty/archetypes signals fragmentation).
 fn main_prof_world_stats(world: &apex_core::World) {
     use std::sync::Mutex;
     use std::time::Instant;
@@ -171,7 +171,7 @@ fn main_prof_world_stats(world: &apex_core::World) {
         *last = Some(Instant::now());
         let s = world.archetype_stats();
         log::info!(
-            "MAIN PROF мир: archetypes={} (empty={}), rows={}, max_arch_rows={}, \
+            "MAIN PROF world: archetypes={} (empty={}), rows={}, max_arch_rows={}, \
              mem={:.2} MiB (data={:.2} ticks={:.2} entities={:.2})",
             s.archetypes,
             s.empty_archetypes,
@@ -195,34 +195,34 @@ pub use stage::{Stage, StageLabel};
 
 // ── ConflictKind ───────────────────────────────────────────────
 
-/// Причина зависимости между системами в графе.
+/// The reason for a dependency between two systems in the graph.
 ///
-/// Хранится в рёбрах `dependency_graph` для verbose диагностики.
-/// Позволяет `debug_plan_verbose()` объяснять ПОЧЕМУ системы
-/// оказались в разных Stage.
+/// Stored on `dependency_graph` edges for verbose diagnostics.
+/// Lets `debug_plan_verbose()` explain WHY systems
+/// ended up in different stages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConflictKind {
-    /// Явная зависимость через `add_dependency()`
+    /// Explicit dependency via `add_dependency()`
     Explicit,
-    /// Оба пишут в один компонент — Write+Write конфликт
+    /// Both write the same component — a Write+Write conflict
     WriteWrite { component_name: &'static str },
-    /// Один пишет, другой читает — Write+Read конфликт
+    /// One writes, the other reads — a Write+Read conflict
     WriteRead {
         component_name: &'static str,
         writer_id: u32,
         reader_id: u32,
     },
-    /// Sequential барьер — система с полным &mut World
+    /// Sequential barrier — a system with a full &mut World
     SequentialBarrier,
-    /// Два EventWriter одного типа событий
+    /// Two EventWriters of the same event type
     EventWriteWrite { event_name: &'static str },
-    /// EventWriter и EventReader одного типа событий
+    /// An EventWriter and an EventReader of the same event type
     EventWriteRead {
         event_name: &'static str,
         writer_id: u32,
         reader_id: u32,
     },
-    /// Обе системы пишут в компоненты, которые другая читает
+    /// Both systems write components that the other reads
     /// (A writes Pos that B reads, B writes Vel that A reads).
     BidirectionalWriteRead { a_name: String, b_name: String },
     /// Two systems read the SAME event type. They must be serialized because each
@@ -274,28 +274,28 @@ pub enum SchedulerError {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SystemId(pub u32);
 
-// ── ConditionTree — составные условия выполнения ────────────
+// ── ConditionTree — composite run conditions ────────────
 
-/// Дерево условий: определяет, должна ли система выполниться в этом кадре.
+/// Condition tree: decides whether a system should run this frame.
 ///
-/// Оценивается на главном потоке **до** выполнения stage'а.
-/// Поддерживает AND (все дочерние true) и OR (хотя бы одно true).
+/// Evaluated on the main thread **before** the stage runs.
+/// Supports AND (all children true) and OR (at least one true).
 ///
-/// # Композиция
+/// # Composition
 ///
 /// ```ignore
-/// // AND — несколько run_if подряд:
+/// // AND — several run_if in a row:
 /// s.run_if(cond_a).run_if(cond_b)        → And([Leaf(a), Leaf(b)])
 ///
-/// // OR — через or_else:
+/// // OR — via or_else:
 /// s.or_else(cond_a).or_else(cond_b)      → Or([Leaf(a), Leaf(b)])
 /// ```
 ///
-/// # Оценка
+/// # Evaluation
 ///
-/// AND использует шорт-циркут: как только одно условие false — остальные не проверяются.
-/// OR использует шорт-циркут: как только одно true — остальные не проверяются.
-/// Это безопасно, потому что условия Apex stateless (в отличие от Bevy).
+/// AND short-circuits: as soon as one condition is false, the rest are not checked.
+/// OR short-circuits: as soon as one is true, the rest are not checked.
+/// This is safe because Apex conditions are stateless (unlike Bevy).
 pub enum ConditionTree {
     Leaf(Box<dyn Fn(&World) -> bool + Send + Sync>),
     And(Vec<ConditionTree>),
@@ -303,7 +303,7 @@ pub enum ConditionTree {
 }
 
 impl ConditionTree {
-    /// Оценить дерево условий для данного мира.
+    /// Evaluate the condition tree for the given world.
     pub fn evaluate(&self, world: &World) -> bool {
         match self {
             ConditionTree::Leaf(f) => f(world),
@@ -312,7 +312,7 @@ impl ConditionTree {
         }
     }
 
-    /// Создать Leaf из замыкания.
+    /// Create a Leaf from a closure.
     pub fn leaf(f: impl Fn(&World) -> bool + Send + Sync + 'static) -> Self {
         ConditionTree::Leaf(Box::new(f))
     }
@@ -396,8 +396,8 @@ pub type SystemFn = Box<dyn FnMut(&mut World) + Send>;
 
 struct SendPtr<T: ?Sized>(*mut T);
 
-// SAFETY: использование строго ограничено run_hybrid_parallel где
-// уникальность ptr гарантирована — каждый ptr из уникального индекса.
+// SAFETY: usage is strictly limited to run_hybrid_parallel where
+// pointer uniqueness is guaranteed — each ptr comes from a unique index.
 unsafe impl<T: ?Sized> Send for SendPtr<T> {}
 unsafe impl<T: ?Sized> Sync for SendPtr<T> {}
 impl<T: ?Sized> Clone for SendPtr<T> {
@@ -411,14 +411,14 @@ impl<T: ?Sized> Copy for SendPtr<T> {}
 // the former `as_mut`/`as_ref` helpers were never called and were removed in the
 // wave-4 dead-code pass.
 
-/// Задача для ASD (Adaptive Scope Distribution).
+/// A task for ASD (Adaptive Scope Distribution).
 ///
-/// Содержит указатель на систему (`dyn ParSystem`), указатель на срез архетипов
-/// системы и диапазоны строк, которые эта задача должна обработать.
-/// Каждая задача обрабатывает subset entity системы.
+/// Holds a pointer to the system (`dyn ParSystem`), a pointer to the system's
+/// archetype slice, and the row ranges this task must process.
+/// Each task processes a subset of the system's entities.
 ///
-/// Если `chunk_ranges` пуст — задача обрабатывает все entity системы
-/// (весь SubWorld без ограничений).
+/// If `chunk_ranges` is empty, the task processes all of the system's entities
+/// (the whole SubWorld, unrestricted).
 #[allow(dead_code)]
 struct AsdTask {
     /// Pointer to the `dyn ParSystem` itself — NOT the enclosing
@@ -428,13 +428,13 @@ struct AsdTask {
     /// `&mut` non-aliasing over any real bytes, whereas `&mut SystemDescriptor`
     /// (which owns a `String` name, etc.) aliased UB-ly (D3).
     ptr: SendPtr<dyn ParSystem>,
-    /// Индексы архетипов для этой задачи.
-    /// Если `chunk_ranges` пусто — все архетипы системы.
-    /// Иначе — только те, что есть в `chunk_ranges` (сужение для 4-arch cases).
+    /// Archetype indices for this task.
+    /// If `chunk_ranges` is empty — all of the system's archetypes.
+    /// Otherwise only those present in `chunk_ranges` (narrowed for 4-arch cases).
     arch_indices: SmallVec<[usize; 8]>,
-    /// Диапазоны строк для ограничения SubWorld:
-    /// `(arch_idx, start, end)` — только эти строки указанных архетипов.
-    /// Если пусто — SubWorld без ограничений (все entity системы).
+    /// Row ranges that restrict the SubWorld:
+    /// `(arch_idx, start, end)` — only these rows of the given archetypes.
+    /// If empty — an unrestricted SubWorld (all of the system's entities).
     chunk_ranges: SmallVec<[(usize, usize, usize); 4]>,
     /// D8b: pointer to this system's private per-system `Commands` slot, set ONLY
     /// for single-task (per-system scope, `chunk_ranges` empty) tasks — a command-
@@ -447,7 +447,7 @@ struct AsdTask {
 unsafe impl Send for AsdTask {}
 unsafe impl Sync for AsdTask {}
 
-/// Per-system dispatch info collected once per parallel stage (Ш1: pooled in a
+/// Per-system dispatch info collected once per parallel stage (Sh1: pooled in a
 /// Scheduler scratch buffer, reused across frames). Holds the system's `sys_id`
 /// rather than a clone of its archetype-index list — the slice is fetched from
 /// `system_archetype_indices` at task-build time, so no per-system `Vec` is
@@ -465,10 +465,10 @@ struct SysInfo {
     non_query_side_effects: bool,
 }
 
-// ── Ш2: cost-model thresholds ──────────────────────────────────
+// ── Sh2: cost-model thresholds ──────────────────────────────────
 //
 // The scheduler decides SEQ vs PAR from MEASURED work (µs), not entity count
-// (Д1/Д2): entity thresholds cannot tell light work (1 ns/entity) from heavy
+// (D1/D2): entity thresholds cannot tell light work (1 ns/entity) from heavy
 // (500 ns/entity), so they mis-fire both ways. A stage whose dispatch-time EMA
 // is below `T_STAGE_SEQ_NS` runs sequentially — below it, rayon scope + per-task
 // overhead exceeds the parallel speedup ("valley of death", parallel_diagnostics).
@@ -484,9 +484,9 @@ const STAGE_EMA_ALPHA: f64 = 0.2;
 
 // ── ParSystem trait ────────────────────────────────────────────
 
-/// Параллельная система с явным AccessDescriptor.
+/// A parallel system with an explicit AccessDescriptor.
 ///
-/// Внутренний механизм — используйте `AutoSystem` для публичного API.
+/// Internal mechanism — use `AutoSystem` for the public API.
 pub(crate) trait ParSystem: Send + Sync {
     #[allow(dead_code)]
     fn access() -> AccessDescriptor
@@ -502,12 +502,12 @@ pub(crate) trait ParSystem: Send + Sync {
     }
 }
 
-// ── Адаптер AutoSystem → ParSystem ────────────────────────────
+// ── AutoSystem → ParSystem adapter ────────────────────────────
 
-/// Обёртка которая позволяет регистрировать AutoSystem как ParSystem.
+/// A wrapper that lets an AutoSystem be registered as a ParSystem.
 ///
-/// Access берётся из `S::Query::system_access()` — статически,
-/// без возможности ошибиться.
+/// Access comes from `S::Query::system_access()` — statically,
+/// with no room for error.
 struct AutoSystemAdapter<S: AutoSystem> {
     inner: S,
 }
@@ -585,16 +585,16 @@ struct SystemDescriptor {
     kind: SystemKind,
     after: Vec<SystemId>,
     before: Vec<SystemId>,
-    /// Этап выполнения (по умолчанию Update).
+    /// Execution stage (Update by default).
     stage_label: StageLabel,
-    /// Run condition: система запускается только если дерево условий возвращает true.
-    /// По умолчанию `ConditionTree::And(Vec::new())` — всегда true (пустой AND = true).
+    /// Run condition: the system runs only if the condition tree returns true.
+    /// Defaults to `ConditionTree::And(Vec::new())` — always true (an empty AND = true).
     run_condition: ConditionTree,
-    /// True = применить Commands после этой системы, разбив Stage на под-Stage.
-    /// Устанавливается через `sched.apply_deferred()`.
+    /// True = apply Commands after this system, splitting the stage into sub-stages.
+    /// Set via `sched.apply_deferred()`.
     apply_deferred_after: bool,
-    /// True = система использует отложенные операции (Commands).
-    /// Автоматически определяется при регистрации.
+    /// True = the system uses deferred operations (Commands).
+    /// Determined automatically at registration.
     has_deferred: bool,
 }
 
@@ -643,7 +643,7 @@ impl<'a> SystemBuilder<'a> {
         self
     }
 
-    /// Прикрепить run condition — closure.
+    /// Attach a run condition — closure.
     pub(crate) fn run_if<F>(self, condition: F) -> Self
     where
         F: Fn(&World) -> bool + Send + Sync + 'static,
@@ -662,7 +662,7 @@ struct ExecutionPlan {
 
 // ── GraphEdgeInfo ──────────────────────────────────────────────
 
-/// Метаданные ребра в dependency_graph для verbose диагностики.
+/// Edge metadata in dependency_graph for verbose diagnostics.
 #[derive(Clone, Debug)]
 struct GraphEdgeInfo {
     from_id: SystemId,
@@ -684,38 +684,38 @@ enum OrderEndpoint {
 
 // ── Scheduler ─────────────────────────────────────────────────
 
-/// Гибридный планировщик с граф-ориентированным компилятором.
+/// A hybrid scheduler with a graph-oriented compiler.
 ///
-/// # Жизненный цикл
+/// # Lifecycle
 ///
 /// ```text
-/// add_*_system()    →  systems Vec обновлён, план инвалидирован
-/// compile()         →  граф пересчитан, план готов
-/// run()             →  compile() лениво если нужно, затем выполнение
+/// add_*_system()    →  systems Vec updated, plan invalidated
+/// compile()         →  graph recomputed, plan ready
+/// run()             →  compile() lazily if needed, then execution
 /// ```
 ///
-/// # Инкрементальность
+/// # Incrementality
 ///
-/// Какие архетипы нужны системе (CR-M4).
+/// Which archetypes a system needs (CR-M4).
 ///
-/// Системы без компонентных доступов (только ресурсы/события) получают
-/// маркер `All` вместо материализованного `Vec` всех индексов — на больших
-/// мирах это убирало по Vec<usize> длиной в число архетипов на систему.
+/// Systems with no component accesses (resources/events only) get
+/// the `All` marker instead of a materialized `Vec` of all indices — on large
+/// worlds this removed a Vec<usize> the length of the archetype count per system.
 #[derive(Debug, Clone)]
 enum SystemArchetypes {
-    /// Без ограничений — системе подходят все архетипы.
+    /// Unrestricted — every archetype matches the system.
     All,
-    /// Архетипы, содержащие хотя бы один компонент системы
-    /// (критерий `any()`; Query сам дофильтрует через matches_archetype).
+    /// Archetypes containing at least one of the system's components
+    /// (the `any()` criterion; the Query itself filters further via matches_archetype).
     Filtered(Vec<usize>),
 }
 
-/// Граф зависимостей хранится между `compile()` вызовами.
-/// `dirty_systems` отслеживает системы добавленные после последнего compile —
-/// при следующем compile добавляются только новые узлы/рёбра.
+/// The dependency graph persists between `compile()` calls.
+/// `dirty_systems` tracks systems added since the last compile —
+/// on the next compile only new nodes/edges are added.
 pub struct Scheduler {
     systems: Vec<SystemDescriptor>,
-    /// Быстрый поиск системы по SystemId: O(1) вместо O(n)
+    /// Fast system lookup by SystemId: O(1) instead of O(n)
     system_indices: FxHashMap<SystemId, usize>,
     next_id: u32,
     execution_plan: Option<ExecutionPlan>,
@@ -729,9 +729,9 @@ pub struct Scheduler {
     /// `compile` (the plan — and thus indices — can change).
     stage_last_run: Vec<apex_core::Tick>,
 
-    // ── Ш2: cost-model telemetry (per-execution-stage), keyed like stage_last_run ──
+    // ── Sh2: cost-model telemetry (per-execution-stage), keyed like stage_last_run ──
     /// EMA of measured stage dispatch time (ns). Drives the cost-based SEQ/PAR
-    /// decision (Д1/Д2): a parallel-eligible stage whose EMA is below the threshold
+    /// decision (D1/D2): a parallel-eligible stage whose EMA is below the threshold
     /// is run sequentially, because rayon scope + per-task overhead exceeds the
     /// parallel win on light work (the "valley of death"). `0.0` = no history yet
     /// (first frames fall back to the entity-count heuristic). Lazily sized;
@@ -741,26 +741,26 @@ pub struct Scheduler {
     /// flapping at the threshold. Lazily sized; cleared on `compile`.
     stage_ran_seq: Vec<bool>,
 
-    // ── Конфигурация параллелизма ───────────────────────────────
+    // ── Parallelism configuration ───────────────────────────────
     // Stage-parallelism gating moved to `ChunkConfig` on the World (wave 3,
     // §1.7 single-config model): the scheduler reads
     // `world.chunk_config().stage_parallel_min_entities` /
     // `.auto_disable_stage_parallel` at stage-decision time.
 
-    // ── Инкрементальный граф ────────────────────────────────────
-    /// Граф зависимостей: узлы = SystemId, рёбра = ConflictKind.
-    /// Хранится между compile() для инкрементального обновления.
+    // ── Incremental graph ────────────────────────────────────
+    /// Dependency graph: nodes = SystemId, edges = ConflictKind.
+    /// Persisted between compile() calls for incremental updates.
     dependency_graph: Graph<SystemId, ConflictKind>,
-    /// Map SystemId → Index в dependency_graph (для быстрого lookup).
+    /// Maps SystemId → Index in dependency_graph (for fast lookup).
     graph_nodes: FxHashMap<SystemId, Index>,
-    /// O(1) lookup рёбер: (from, to) → exists. Синхронизирован с dependency_graph.
+    /// O(1) edge lookup: (from, to) → exists. Kept in sync with dependency_graph.
     edge_set: FxHashSet<(Index, Index)>,
-    /// Рёбра с полными метаданными — для verbose диагностики.
+    /// Edges with full metadata — for verbose diagnostics.
     edge_info: Vec<GraphEdgeInfo>,
-    /// True если после последнего compile() добавлялись системы/зависимости.
+    /// True if systems/dependencies were added since the last compile().
     graph_dirty: bool,
-    /// Пары систем с явным порядком (от add_dependency / .before / .after).
-    /// Edge направлен от «раньше» к «позже»: (a, b) означает a до b.
+    /// Pairs of systems with an explicit order (from add_dependency / .before / .after).
+    /// The edge points from "earlier" to "later": (a, b) means a before b.
     explicit_orderings: FxHashSet<(SystemId, SystemId)>,
     /// Config-declared ordering edges awaiting name resolution, drained at the
     /// start of `compile()`. Each pair is `(before, after)`: `before` runs
@@ -769,56 +769,56 @@ pub struct Scheduler {
     /// at compile so forward references work. Deterministic (insertion order).
     pending_orderings: Vec<(OrderEndpoint, OrderEndpoint)>,
 
-    // ── Seq/Par индексы для O(P) sequential-барьеров ────────────
-    /// Индексы sequential систем в self.systems.
+    // ── Seq/Par indices for O(P) sequential barriers ────────────
+    /// Indices of sequential systems in self.systems.
     seq_system_indices: Vec<usize>,
-    /// Индексы parallel систем в self.systems.
+    /// Indices of parallel systems in self.systems.
     par_system_indices: Vec<usize>,
 
-    // ── SubWorld маппинг ────────────────────────────────────────
-    /// Для каждой системы — индексы архетипов, которые ей нужны.
-    /// Заполняется в compile() и используется в run_hybrid_parallel().
+    // ── SubWorld mapping ────────────────────────────────────────
+    /// Per system — the archetype indices it needs.
+    /// Populated in compile() and used in run_hybrid_parallel().
     system_archetype_indices: FxHashMap<SystemId, SystemArchetypes>,
-    /// Количество архетипов в World на момент последнего compute_archetype_indices().
-    /// Используется для кеширования — пересчёт только при изменении.
+    /// The World's archetype count as of the last compute_archetype_indices().
+    /// Used for caching — recompute only on change.
     cached_archetype_count: usize,
 
-    /// Флаг: был ли уже выполнен Startup этап.
+    /// Flag: whether the Startup stage has already run.
     startup_completed: bool,
 
-    /// Пользовательский порядок StageLabel для compile().
-    /// Если Some — compile() использует этот порядок вместо hardcoded standard_order().
-    /// Если None — используется StageLabel::standard_order().
+    /// A custom StageLabel order for compile().
+    /// If Some — compile() uses this order instead of the hardcoded standard_order().
+    /// If None — StageLabel::standard_order() is used.
     stage_order: Option<Vec<StageLabel>>,
 
-    /// Этап по умолчанию для `add_system`, `add_auto_system`, `add_par`,
-    /// `add_par_access` (без суффикса `_to_stage`).
+    /// Default stage for `add_system`, `add_auto_system`, `add_par`,
+    /// `add_par_access` (without the `_to_stage` suffix).
     ///
-    /// По умолчанию — `StageLabel::Update`. Меняется через `set_default_stage()`
-    /// или временно подменяется внутри `staged()`.
+    /// Defaults to `StageLabel::Update`. Changed via `set_default_stage()`
+    /// or temporarily overridden inside `staged()`.
     default_stage_label: StageLabel,
 
-    /// Реестр имён компонентов TypeId → &'static str.
-    /// Заполняется из ComponentRegistry перед compile() в run()/run_sequential().
-    /// Используется `component_type_name()` для отображения реальных имён компонентов
-    /// в ConflictKind (вместо заглушки "<component>").
+    /// Registry of component names TypeId → &'static str.
+    /// Populated from the ComponentRegistry before compile() in run()/run_sequential().
+    /// Used by `component_type_name()` to show real component names
+    /// in ConflictKind (instead of the "<component>" placeholder).
     type_names: FxHashMap<TypeId, &'static str>,
 
-    /// Флаг: учитывать ли Emit<E>/Listen<E> при построении графа зависимостей.
+    /// Flag: whether to account for Emit<E>/Listen<E> when building the dependency graph.
     ///
-    /// По умолчанию `true` — событийный порядок гарантируется автоматически.
-    /// При `false` поведение соответствует состоянию до введения EventAccessList:
-    /// порядок Emit/Listen не определён (как в предыдущих версиях движка).
+    /// Defaults to `true` — event ordering is guaranteed automatically.
+    /// When `false`, behavior matches the state before EventAccessList was introduced:
+    /// the Emit/Listen order is undefined (as in earlier engine versions).
     event_ordering_enabled: bool,
 
-    /// Последняя зарегистрированная система — для `apply_deferred()`.
+    /// The last registered system — for `apply_deferred()`.
     last_added_system_id: Option<SystemId>,
 
-    /// Scope condition: все системы, зарегистрированные внутри `staged()` пока этот
-    /// condition активен, наследуют его (автоматически AND-ится с их условиями).
+    /// Scope condition: every system registered inside `staged()` while this
+    /// condition is active inherits it (auto AND-ed with their own conditions).
     scope_condition: Option<std::sync::Arc<dyn Fn(&World) -> bool + Send + Sync>>,
 
-    // ── Ш1: pooled per-frame scratch buffers (zero steady-state alloc) ──────────
+    // ── Sh1: pooled per-frame scratch buffers (zero steady-state alloc) ──────────
     // NOTE: per-worker `Vec<Commands>` is intentionally NOT pooled here — `Commands`
     // is `!Send`, and a `Vec<Commands>` field would make `Scheduler: !Send` (breaks
     // `ThreadPool::install`). Its outer-Vec alloc is negligible; it stays a local.
@@ -856,27 +856,27 @@ impl Default for Scheduler {
     }
 }
 
-// ── Вспомогательные функции ────────────────────────────────────
+// ── Helper functions ────────────────────────────────────
 
-/// Обнаружить конфликт между двумя системами.
+/// Detect a conflict between two systems.
 ///
-/// # Порядок проверок
-/// 1. Компонентные Write+Write
-/// 2. Компонентные Write+Read (оба направления)
-/// 3. Event Write+Write (два Emit одного события → конфликт)
-/// 4. Event Write+Read (Emit + Listen → Emit идёт раньше)
+/// # Check order
+/// 1. Component Write+Write
+/// 2. Component Write+Read (both directions)
+/// 3. Event Write+Write (two Emits of the same event → conflict)
+/// 4. Event Write+Read (Emit + Listen → Emit runs first)
 ///
-/// # Гарантия порядка событий
-/// Ребро Emit(E) → Listen(E) гарантирует, что все отправители события E
-/// будут выполнены до любого слушателя E в пределах одного кадра.
-/// Два Listen(E) конфликта не создают — могут выполняться параллельно.
+/// # Event-ordering guarantee
+/// The Emit(E) → Listen(E) edge guarantees that every sender of event E
+/// runs before any listener of E within a single frame.
+/// Two Listen(E) do not conflict — they may run in parallel.
 ///
-/// # Управление
-/// Если `event_ordering = false`, проверки событийных конфликтов (3, 4)
-/// пропускаются — порядок Emit/Listen не определён планировщиком.
+/// # Control
+/// If `event_ordering = false`, the event conflict checks (3, 4)
+/// are skipped — the Emit/Listen order is undefined for the scheduler.
 ///
-/// Возвращает (ConflictKind, направление) где направление true означает i→j.
-/// Если конфликтов нет — None.
+/// Returns (ConflictKind, direction) where direction true means i→j.
+/// If there are no conflicts — None.
 fn detect_conflict_kind(
     ai: &AccessDescriptor,
     aj: &AccessDescriptor,
@@ -911,9 +911,9 @@ fn detect_conflict_kind(
         }
     }
 
-    // ── Компонентные конфликты ──────────────────────────────────
+    // ── Component conflicts ──────────────────────────────────
 
-    // Write+Write: оба пишут в один компонент
+    // Write+Write: both write the same component
     for w in &ai.writes {
         if aj.writes.contains(w) {
             return Some((
@@ -924,20 +924,20 @@ fn detect_conflict_kind(
             )); // i→j
         }
     }
-    // Write(i)+Read(j): i пишет то что j читает
+    // Write(i)+Read(j): i writes what j reads
     let i_writes_j_reads = ai.writes.iter().any(|w| aj.reads.contains(w));
-    // Write(j)+Read(i): j пишет то что i читает
+    // Write(j)+Read(i): j writes what i reads
     let j_writes_i_reads = aj.writes.iter().any(|w| ai.reads.contains(w));
 
     if i_writes_j_reads && j_writes_i_reads {
-        // Bidirectional WriteRead: обе системы пишут в компоненты,
-        // которые читает другая. Это истинный циклический конфликт.
+        // Bidirectional WriteRead: both systems write components
+        // that the other reads. This is a true cyclic conflict.
         let a_name = format!("system_{}", id_i.0);
         let b_name = format!("system_{}", id_j.0);
         return Some((
             ConflictKind::BidirectionalWriteRead { a_name, b_name },
             true,
-        )); // беззначимо — используем i→j
+        )); // direction irrelevant — use i→j
     }
 
     if i_writes_j_reads {
@@ -951,7 +951,7 @@ fn detect_conflict_kind(
                 reader_id: id_j.0,
             },
             true,
-        )); // i→j (писатель → читатель)
+        )); // i→j (writer → reader)
     }
     if j_writes_i_reads {
         return Some((
@@ -967,18 +967,18 @@ fn detect_conflict_kind(
         )); // j→i
     }
 
-    // ── Event конфликты ─────────────────────────────────────────
-    // Активны только если `event_ordering = true` (по умолчанию).
+    // ── Event conflicts ─────────────────────────────────────────
+    // Active only if `event_ordering = true` (the default).
 
     if event_ordering {
-        // EventWriteWrite: оба пишут в один тип событий
+        // EventWriteWrite: both write the same event type
         for w in &ai.writes_event {
             if aj.writes_event.iter().any(|(id, _)| *id == w.0) {
                 return Some((ConflictKind::EventWriteWrite { event_name: w.1 }, true));
                 // i→j
             }
         }
-        // EventWrite(i)+EventRead(j): i пишет событие, j читает
+        // EventWrite(i)+EventRead(j): i writes the event, j reads it
         for w in &ai.writes_event {
             if aj.reads_event.iter().any(|(id, _)| *id == w.0) {
                 return Some((
@@ -988,10 +988,10 @@ fn detect_conflict_kind(
                         reader_id: id_j.0,
                     },
                     true,
-                )); // i→j (писатель → читатель)
+                )); // i→j (writer → reader)
             }
         }
-        // EventWrite(j)+EventRead(i): j пишет событие, i читает
+        // EventWrite(j)+EventRead(i): j writes the event, i reads it
         for w in &aj.writes_event {
             if ai.reads_event.iter().any(|(id, _)| *id == w.0) {
                 return Some((
@@ -1019,15 +1019,15 @@ fn detect_conflict_kind(
     None
 }
 
-/// Разбить список `system_ids` на под-списки по маркерам `apply_deferred_after`.
+/// Split the `system_ids` list into sub-lists at `apply_deferred_after` markers.
 ///
-/// Используется в `compile()` для создания под-Stage'ей между точками синхронизации.
+/// Used in `compile()` to create sub-stages between sync points.
 ///
-/// Правила:
-/// - Система с `apply_deferred_after = true` вызывает split ПОСЛЕ себя
-///   (кроме случая когда это последняя система в списке)
-/// - Несколько подряд идущих `apply_deferred_after` → все разделяют
-/// - Пустые под-Stage'и не создаются
+/// Rules:
+/// - A system with `apply_deferred_after = true` triggers a split AFTER itself
+///   (unless it is the last system in the list)
+/// - Several consecutive `apply_deferred_after` → each one splits
+/// - Empty sub-stages are not created
 fn split_at_apply_boundaries(
     ids: &[SystemId],
     systems: &[SystemDescriptor],
@@ -1047,8 +1047,8 @@ fn split_at_apply_boundaries(
         let sys = systems.iter().find(|s| s.id == id);
         let manual_split = sys.map(|s| s.apply_deferred_after).unwrap_or(false);
 
-        // Auto-split: если эта система использует Commands и следующая зависит
-        // от неё явно (explicit ordering), вставляем split-точку.
+        // Auto-split: if this system uses Commands and the next one depends
+        // on it explicitly (explicit ordering), insert a split point.
         let auto_split = if !is_last {
             let next_id = ids[i + 1];
             sys.map(|s| s.has_deferred).unwrap_or(false)
@@ -1069,10 +1069,10 @@ fn split_at_apply_boundaries(
     groups
 }
 
-/// Получить имя типа по TypeId.
+/// Get a type name by TypeId.
 ///
-/// Пытается найти имя в переданной `type_names` (заполняется из ComponentRegistry).
-/// Если не найдено — возвращает `"<component>"`.
+/// Looks the name up in the given `type_names` (populated from the ComponentRegistry).
+/// If not found — returns `"<component>"`.
 fn component_type_name(
     type_id: TypeId,
     type_names: &FxHashMap<TypeId, &'static str>,
@@ -1080,8 +1080,8 @@ fn component_type_name(
     type_names.get(&type_id).copied().unwrap_or("<component>")
 }
 
-/// Форматировать дерево условий для debug-вывода.
-/// Возвращает пустую строку если условий нет (default And([])).
+/// Format a condition tree for debug output.
+/// Returns an empty string if there are no conditions (default And([])).
 fn format_condition(tree: &ConditionTree) -> String {
     match tree {
         ConditionTree::Leaf(_) => "<condition>".to_string(),
@@ -1091,7 +1091,7 @@ fn format_condition(tree: &ConditionTree) -> String {
     }
 }
 
-// ── Тесты ─────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests;
