@@ -1,6 +1,8 @@
 # Кампания: API Golden Path — унификация публичного API + переписывание руководства (ApexForge_ECS)
 
-> **Статус: 🔜 план (2026-07-05, анализ выполнен).** Источник истины кампании; статусы пунктов — ЗДЕСЬ.
+> **Статус: ✅ ВСЕ ВОЛНЫ ЗАКРЫТЫ (2026-07-06).** Волны 0/1a/1b/2/3/4/6/P/5 сделаны; волна 5 (руководство) —
+> ФИНАЛ кампании (§5). Готова к ротации в `plans/archive/` + ADR Р-1..Р-5 (после ревизии руководства
+> пользователем; руководство = deliverable, контент оценивает пользователь). Источник истины кампании; статусы пунктов — ЗДЕСЬ.
 > Метод анализа: 4 параллельных агента (руководство целиком ×2, инвентаризация pub-поверхности по коду,
 > уроки API-дизайна по исходникам Bevy `C:\My\Projects\Rust_projects\bevy` — bevy_ecs **0.19.0-dev**).
 > Планка: `docs/CONVENTIONS.md` §0.2a/§0.2b/§0.9 (анти-mimicry: Bevy-паттерн перенимаем только где он
@@ -413,7 +415,31 @@ sys/seq/par-merge, prelude-диета, **ordering-on-configs Р-3**, **SystemBui
 > no-loss, оставлена. Т.е. «правильно/на совесть» здесь = НЕ копировать Bevy, а починить корректность на
 > нашей превосходящей модели. Параллельные-читатели-через-local-cursor — НЕ делать (потеряем no-loss).
 
-**Волна 5 — Руководство** (после стабилизации API): переписывание под целевую структуру §3 —
+**Волна 5 — Руководство. ✅ ЗАКРЫТА (2026-07-06) — ФИНАЛ КАМПАНИИ.** Руководство
+`Apex_ECS_Руководство_пользователя.md` переписано под финальный API 6 коммит-фазами (ecs
+`5ab4096`..`5323d34`). Сделано: брендинг **ApexForge_ECS** + версия 0.1.0 из Cargo; новый §1.4
+Quick start (рабочий мир за 20 строк, plain-fn `Query`+`for_each_mut`); read/write split
+(`for_each`→`for_each_mut`/`par_for_each_mut`/`*_chunk_mut` на всех write-формах, `query_mut`/
+`query_mut_changed`); снят тип `CachedQuery` (проза→`Query`/`world.query`); `SystemContext`→advanced
+(golden path = параметры; write-методы `*_unchecked`+`#[doc(hidden)]`); `SystemParam`/`ctx.fetch`→
+`ctx.fetch_unchecked`; ChunkConfig-модель параллелизма (снятые Scheduler-ручки + `use
+apex_core::world::ChunkConfig`); §10 дописан (v2/`migrate`, `register_resource_serde`, `MapEntities`/
+`register_map_entities`); §11 `load_directory` 2 арг + `*.prefab.json`; §17 Lua entity id =
+строка `"index:generation"`; App API → отсылка к руководству движка; удалена §13.3 (снятая SubWorld
+row-итерация) и §14.8 бенч-кухня; вычищены ВСЕ внутренние шифры (D2/W2/W3/CR-M/П/Э/U/F3/B1в/TD/§0.x)
+и version-noise. **Классы §2.1** починены (для_each-write, ctx-write, §15 `#[derive(Component)]`,
+`query_mut_changed`, Lua id, prefab load, `WaveSpawner`-литерал, irrefutable `while let`,
+`produced_by(name)`). **Уточнение по §2.1 (верификация по коду 2026-07-06):** `run_if_cond`/
+`or_else`/`conditions`/`SystemConfig::fn_sys` НЕ сняты (снят был только тест-`SystemBuilder`) — §6.0a
+уже был корректен; `spawn_many`/`Read`/`Write` живы (двойной словарь `Read`/`Write`+`&T`/`&mut T` —
+финальный, не битый).
+**Гейт волны 5 ✅:** grep руководства на снятые/переименованные имена = только migration-заметки
+(«X удалён, используйте Y», §0.2a-громкость), НИ ОДИН сниппет их не использует; сниппеты золотого
+пути (quick-start/query/events/relations/commands/ChunkConfig) компилируются (временный
+`apex-examples`-пример, `cargo check` зелёный, удалён после проверки); ядро `cargo build --workspace`
+зелёный (правки только в `.md`). Историческая формулировка задачи ниже.
+
+**[архив формулировки] Волна 5 — Руководство** (после стабилизации API): переписывание под целевую структуру §3 —
 quick start, перенумерация, справочник в конец (+полнота: query_mut-семейство, DynQuery, set_
 deterministic_spawn, register_resource_serde/map_entities, v2/migrate), вычистка 52 шифров и
 бенч-архива, починка ВСЕХ классов §2.1, §10-дописать (E6/E7/версии), §17-Lua под строковый id,

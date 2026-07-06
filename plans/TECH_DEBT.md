@@ -133,19 +133,16 @@
   пол). Комментарий `apex-scheduler/src/lib.rs:451-452` утверждает «`ParallelPolicy::Fixed` remains
   available» — **ложь в коде** (§0.2a). *Минимум:* исправить комментарий (не обещать несуществующее)
   + записать, что cost-model всегда on после прогрева. *Полно:* реализовать `Fixed`-откат. См. ADR-003.
-- **guide-broken 🟡 — ≥7 классов некомпилирующихся/ложных примеров руководства** (аудит руководства
-  2026-07-05; полный реестр со строками — `plans/active/API_GOLDEN_PATH.md` §2). Классы: (1) F3.1:
-  ~10 × `ctx.query::<...Write...>` (нужна развилка Р-1 плана: публичный `ctx.query_mut` vs
-  `system!`-only); (2) F3.2: §6.7+§16 учат снятым `ctx.resource_mut/try_resource_mut/event_writer`;
-  (3) §6.8: все 3 Extract-примера используют маркеры как plain-fn параметры; (4) §15 «Полный пример»
-  без `#[derive(Component)]`; (5) §4 `query_changed` с Write (а `query_mut_changed` не задокументирован
-  вовсе); (6) §17 Lua: entity id как integer (E10 отверг — id строка "index:generation");
-  (7) §11: `load_directory` 3 аргумента + миф про расширение `.prefab` (код берёт только
-  `*.prefab.json`). Плюс STALE-пласт: версия «0.3.0» vs 0.1.0, §13.2 формула чанка другой эпохи,
-  §10 молчит про v2/migrate/E6/E7, §16 прячет write-путь запросов и `set_deterministic_spawn`,
-  ~10 гнилых file:line-ссылок. *Фикс = волна 5 кампании API_GOLDEN_PATH* (переписывание руководства
-  ПОСЛЕ стабилизации API — иначе дважды). Cost-model-секции (§1/§13.1.1/§13.1.3/§14.4/§14.9-нота)
-  уже исправлены 2026-07-05.
+- **guide-broken ✅ ЗАКРЫТ (2026-07-06, волна 5 API_GOLDEN_PATH).** Руководство
+  `Apex_ECS_Руководство_пользователя.md` переписано под финальный API (ecs `5ab4096`..`5323d34`). Все
+  классы §2.1 починены: (1) для_each-write→`for_each_mut`, ctx-write→`*_unchecked`; (2) §6.7+§16
+  ctx.resource_mut/event_writer→advanced `*_unchecked`; (3) §6.8 Extract→`fetch_unchecked`; (4) §15
+  `#[derive(Component)]`; (5) `query_mut_changed` задокументирован; (6) §17 Lua id = строка
+  "index:generation"; (7) §11 `load_directory` 2 арг + `*.prefab.json`. STALE-пласт вычищен (версия
+  0.1.0, ChunkConfig-модель, §10 v2/migrate/resources/MapEntities, write-путь запросов). Вычищены ВСЕ
+  внутренние шифры; брендинг ApexForge_ECS. Гейт: grep снятых имён = только migration-заметки; сниппеты
+  золотого пути компилируются. **Уточнение:** §2.1-класс F3.1 (`ctx.query::<…Write>`) оказался не
+  «~10 битых» — `run_if_cond`/`conditions` НЕ сняты (снят тест-`SystemBuilder`), §6.0a был корректен.
 - **string-table снапшота 🟢 — `type_name` per-instance.** `serializer.rs:142` пишет
   `info.name.to_string()` на каждый инстанс компонента (E7-формат v2 string-table не включил).
   Выигрыш — только в РАЗМЕРЕ сейва (редкий путь), отдельный focused-заход.
