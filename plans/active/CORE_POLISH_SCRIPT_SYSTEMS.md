@@ -111,7 +111,14 @@ id-пространство растёт). Решение принято ран�
   `len_counts_only_located_ignoring_orphaned_reservations` (`entity.rs:742`) обновить под новую
   семантику (резервации больше не «orphaned»).
 
-### 0.4 B6 — standalone `Commands`: PLACEHOLDER молча теряет chained insert
+### 0.4 B6 — standalone `Commands`: PLACEHOLDER молча теряет chained insert ✅ 2026-07-06
+
+> **✅ ЗАКРЫТО.** `EntityCommands::assert_bound(op)` (`#[track_caller]`) — паника с actionable-текстом
+> на ВСЕХ цепочечных методах (insert/remove/add_relation/set_parent/add_child/add_children/
+> remove_parent/clear_children/with_children/despawn). Полнее плана: не только insert/with_children —
+> любой отложенный op на PLACEHOLDER. `cmd.entity(real)` и `spawn((full_bundle))` не затронуты;
+> `ChildSpawner` защищён транзитивно. Тесты should_panic + позитивные; 260 core-тестов, clippy
+> net-neutral.
 
 **Проблема:** `EntityCommands::insert` на standalone-Commands ставит
 `Insert{entity: PLACEHOLDER}` (`commands.rs:~809-813, 338`) — данные chained-insert теряются

@@ -846,30 +846,58 @@ impl EntityCommands<'_> {
         self.entity
     }
 
+    /// B6: panic if this builder wraps a `PLACEHOLDER` id — i.e. `spawn()` on a
+    /// standalone `Commands` with no reserver. Such a builder cannot chain deferred
+    /// ops (insert / relations / children): the real id is allocated only at apply
+    /// time, so the chained command would target `PLACEHOLDER` and be **silently
+    /// lost**. A loud panic (§0.2a) beats silent data loss. Fixes: use world-attached
+    /// Commands (`SystemContext::commands`, which binds a reserver so `spawn().id()`
+    /// is a real id), or pass the whole bundle to `spawn((..))` up front instead of
+    /// chaining. `cmd.entity(real)` is unaffected (its id is a real entity).
+    #[inline]
+    #[track_caller]
+    fn assert_bound(&self, op: &str) {
+        assert!(
+            self.entity != Entity::PLACEHOLDER,
+            "EntityCommands::{op} on a PLACEHOLDER id: a standalone Commands (no reserver) \
+             cannot chain deferred ops onto spawn() — the spawned id is unknown until apply, \
+             so the op would be silently lost. Use world-attached Commands \
+             (SystemContext::commands), or spawn the full bundle at once."
+        );
+    }
+
     /// Attach a component (deferred). 1:1 Bevy `EntityCommands::insert`.
     #[inline]
+    #[track_caller]
     pub fn insert<T: Component + Send + 'static>(self, component: T) -> Self {
+        self.assert_bound("insert");
         self.commands.insert(self.entity, component);
         self
     }
 
     /// Remove a component (deferred).
     #[inline]
+    #[track_caller]
     pub fn remove<T: Component + Send + 'static>(self) -> Self {
+        self.assert_bound("remove");
         self.commands.remove::<T>(self.entity);
         self
     }
 
     /// Add a relation `self —kind→ target` (deferred).
     #[inline]
+    #[track_caller]
     pub fn add_relation<R: RelationKind>(self, kind: R, target: Entity) -> Self {
+        self.assert_bound("add_relation");
         self.commands.add_relation(self.entity, kind, target);
         self
     }
 
     /// Make `self` a child of `parent` (the [`ChildOf`](crate::relations::ChildOf) relation).
     #[inline]
+    #[track_caller]
     pub fn set_parent(self, parent: Entity) -> Self {
+        self.assert_bound("set_parent");
         self.commands
             .add_relation(self.entity, crate::relations::ChildOf, parent);
         self
@@ -879,14 +907,18 @@ impl EntityCommands<'_> {
     /// [`with_children`](Self::with_children) (which spawns new ones), this binds an existing entity
     /// — needed by the editor/gameplay for reparenting. 1:1 Bevy `EntityCommands::add_child`.
     #[inline]
+    #[track_caller]
     pub fn add_child(self, child: Entity) -> Self {
+        self.assert_bound("add_child");
         self.commands
             .add_relation(child, crate::relations::ChildOf, self.entity);
         self
     }
 
     /// Adopt a set of existing entities (see [`add_child`](Self::add_child)).
+    #[track_caller]
     pub fn add_children(self, children: &[Entity]) -> Self {
+        self.assert_bound("add_children");
         for &child in children {
             self.commands
                 .add_relation(child, crate::relations::ChildOf, self.entity);
@@ -896,7 +928,9 @@ impl EntityCommands<'_> {
 
     /// Detach `self` from its parent (remove its `ChildOf` relation). The parent is resolved on
     /// apply (its id need not be known). 1:1 Bevy `EntityCommands::remove_parent`.
+    #[track_caller]
     pub fn remove_parent(self) -> Self {
+        self.assert_bound("remove_parent");
         let entity = self.entity;
         self.commands.add(move |world: &mut World| {
             if let Some(parent) = world.target_of(entity, crate::relations::ChildOf) {
@@ -908,7 +942,9 @@ impl EntityCommands<'_> {
 
     /// Detach ALL children of `self` (remove their `ChildOf` → self relations) without deleting
     /// them. The children are resolved on apply. 1:1 Bevy `EntityCommands::clear_children`.
+    #[track_caller]
     pub fn clear_children(self) -> Self {
+        self.assert_bound("clear_children");
         let parent = self.entity;
         self.commands.add(move |world: &mut World| {
             let kids: Vec<Entity> = world.targets_of(crate::relations::ChildOf, parent).collect();
@@ -922,7 +958,9 @@ impl EntityCommands<'_> {
     /// Spawn children of this entity declaratively (1:1 Bevy `with_children`). Each `c.spawn(...)`
     /// automatically gets a [`ChildOf`](crate::relations::ChildOf) → this entity relation. Nesting
     /// of arbitrary depth (a child also returns [`EntityCommands`] with its own `with_children`).
+    #[track_caller]
     pub fn with_children(self, f: impl FnOnce(&mut ChildSpawner)) -> Self {
+        self.assert_bound("with_children");
         let parent = self.entity;
         {
             let mut spawner = ChildSpawner {
@@ -936,7 +974,9 @@ impl EntityCommands<'_> {
 
     /// Destroy this entity (deferred).
     #[inline]
+    #[track_caller]
     pub fn despawn(self) {
+        self.assert_bound("despawn");
         self.commands.despawn(self.entity);
     }
 }
@@ -1080,6 +1120,58 @@ mod tests {
         );
         cmds2.apply(&mut world);
         assert_eq!(world.entity_count(), 3, "only the applied entities are alive");
+    }
+
+    /// B6: chaining a deferred op onto `spawn()` from a STANDALONE Commands (no
+    /// reserver → PLACEHOLDER id) panics loudly instead of silently losing the op.
+    #[test]
+    #[should_panic(expected = "PLACEHOLDER")]
+    fn standalone_spawn_chained_insert_panics() {
+        let mut cmds = Commands::new(); // no reserver
+        // `spawn(bundle)` alone is fine; chaining `.insert` onto the PLACEHOLDER id is the bug.
+        let _ = cmds.spawn((Pos(1.0),)).insert(Vel(2.0));
+    }
+
+    /// B6: `with_children` on a standalone spawn also panics (children would attach to
+    /// a PLACEHOLDER parent).
+    #[test]
+    #[should_panic(expected = "PLACEHOLDER")]
+    fn standalone_spawn_with_children_panics() {
+        let mut cmds = Commands::new();
+        let _ = cmds.spawn((Pos(1.0),)).with_children(|c| {
+            c.spawn((Vel(1.0),));
+        });
+    }
+
+    /// B6: the SAME chaining works when Commands is world-attached (a reserver makes
+    /// `spawn().id()` a real id) — the guard targets only the broken standalone path.
+    #[test]
+    fn world_attached_spawn_chained_insert_works() {
+        let mut world = World::new();
+        let mut cmds = Commands::new();
+        cmds.set_reserver(world.entity_reserver());
+        let e = cmds.spawn((Pos(1.0),)).insert(Vel(2.0)).id();
+        assert_ne!(e, Entity::PLACEHOLDER);
+        cmds.apply(&mut world);
+        assert_eq!(world.get::<Pos>(e).unwrap().0, 1.0);
+        assert_eq!(world.get::<Vel>(e).unwrap().0, 2.0, "chained insert applied to the real id");
+    }
+
+    /// B6: a bare `spawn((..))` with the full bundle (no chaining) still works
+    /// standalone — the guard does not fire on the non-chained path.
+    #[test]
+    fn standalone_spawn_full_bundle_still_works() {
+        let mut world = World::new();
+        let mut cmds = Commands::new(); // no reserver
+        cmds.spawn((Pos(3.0), Vel(4.0))); // full bundle up front — no chaining
+        cmds.apply(&mut world);
+        let mut count = 0;
+        crate::query::Query::<(crate::query::Read<Pos>, crate::query::Read<Vel>)>::new(&world)
+            .for_each(|_, (p, v)| {
+                count += 1;
+                assert_eq!((p.0, v.0), (3.0, 4.0));
+            });
+        assert_eq!(count, 1, "standalone full-bundle spawn materialized correctly");
     }
 
     /// B5: `clear()` reclaims reservations too (same path as drop).

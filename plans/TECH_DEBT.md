@@ -112,11 +112,17 @@
   не ErrorHandler). Тесты: `abandoned_reservations_are_reclaimed_on_flush` (entity),
   `dropped_/cleared_commands_reservations_are_reclaimed` (commands). Гейты: 256 core-тестов, clippy
   net-neutral, Miri чист (19 reserv + 28 commands тестов, ноль UB/гонок).
-- **B6 🟡 → CORE_POLISH волна 0.4 — standalone Commands (PLACEHOLDER) молча теряет chained insert/with_children.**
-  `EntityCommands::insert` ставит `Insert{entity: PLACEHOLDER}` (`commands.rs:~809-813, 338`).
-  Смягчено косвенно (spawn аллоцирует id на apply; insert-на-PLACEHOLDER попадает в A9-warn), но
-  данные chained-insert теряются. Принятое решение §3 («паника в EntityCommands при PLACEHOLDER»)
-  не исполнено и не пересмотрено письменно.
+- **B6 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 0.4) — standalone Commands (PLACEHOLDER) молча терял
+  chained insert/with_children.** Было: цепочка `standalone.spawn(x).insert(y)` (нет резервера → id =
+  PLACEHOLDER) молча теряла `y` (Insert на PLACEHOLDER). **Сделано (§0.2a — громко, не молча):**
+  `EntityCommands::assert_bound(op)` (`#[track_caller]`) — паника с actionable-сообщением на ВСЕХ
+  цепочечных методах, использующих отложенный id (insert/remove/add_relation/set_parent/add_child/
+  add_children/remove_parent/clear_children/with_children/despawn). `cmd.entity(real)` не затронут
+  (реальный id); `cmd.spawn((full,bundle))` без цепочки работает standalone (компоненты в самой
+  Spawn-команде); `ChildSpawner` защищён транзитивно (`with_children` уже проверил родителя →
+  резервер есть → дети реальны). Тесты: `standalone_spawn_chained_insert_panics`/`_with_children_panics`
+  (should_panic), `world_attached_spawn_chained_insert_works`, `standalone_spawn_full_bundle_still_works`.
+  Гейты: 260 core-тестов, clippy net-neutral.
 - **В4 🟡 — IsolatedWorld не дотянут до дифференциатора (осознанно ОТЛОЖЕН за scope CORE_POLISH —
   кандидат на следующую кампанию-дифференциатор).** Решение §10.6 = ДА (Entity-ремаппинг между
   мирами, bounded-каналы с телеметрией, кросс-поточные тесты). Сделано: только громкость дропа (E12,
