@@ -190,6 +190,7 @@ version = "0.1.0"
 dependencies = [
  "apex-core",
  "apex-macros",
+ "apex-scheduler",
  "log",
  "mlua",
  "notify",
