@@ -17,9 +17,10 @@ use apex_core::World;
 use apex_scheduler::Scheduler;
 
 pub mod exchange;
-pub mod registrar;
 
-pub use registrar::WorldRegistrar;
+// `WorldRegistrar` is a plain `World`-schema recipe and lives in `apex-core`; re-exported here because
+// `IsolatedWorld` (via [`IsolatedWorld::from_registrar`]) is one of its consumers.
+pub use apex_core::WorldRegistrar;
 
 // ---------------------------------------------------------------------------
 // BridgeEvent

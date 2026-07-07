@@ -1,16 +1,18 @@
-//! `WorldRegistrar` — a replayable world-schema recipe (В4 / B5).
+//! `WorldRegistrar` — a replayable world-schema recipe.
 //!
-//! Multiple worlds that exchange data (an [`crate::IsolatedWorld`] fork, a render
-//! world, an editor play-world) must agree on their **schema**: the same
-//! components registered for serde, the same event types, the same relation
-//! kinds. Before this, each consumer duplicated those registrations by hand —
-//! the renderer re-registers ~35 components into its render world line by line,
-//! the editor re-registers its vocabulary for every Play fork. A drift between
-//! two such lists is a silent data-loss bug (a component that serializes in one
-//! world and is unknown in the other).
+//! Multiple worlds that exchange data (an isolated-world fork, a render world, an
+//! editor play-world) must agree on their **schema**: the same components
+//! registered for serde, the same event types, the same relation kinds. Without a
+//! recipe, each consumer duplicates those registrations by hand — the renderer
+//! re-registers its components into its render world line by line, the editor
+//! re-registers its vocabulary for every Play fork. A drift between two such lists
+//! is a silent data-loss bug (a component that serializes in one world and is
+//! unknown in the other).
 //!
 //! A `WorldRegistrar` records the registration steps ONCE and replays them onto
-//! any world, so linked worlds share one source of truth for their schema.
+//! any world, so linked worlds share one source of truth for their schema. It is a
+//! plain `World` primitive (no isolation semantics of its own) — `apex-isolated`
+//! and the editor are consumers, not its owner.
 //!
 //! ```ignore
 //! let mut recipe = WorldRegistrar::new();
@@ -20,10 +22,10 @@
 //!     .add_event::<Damage>();
 //! let doc   = recipe.new_world();      // fresh world with the schema
 //! let mut fork = recipe.new_world();   // an identically-schema'd fork
-//! recipe.apply(iso.world_mut());       // or onto an existing world
+//! recipe.apply(&mut existing_world);   // or onto an existing world
 //! ```
 
-use apex_core::World;
+use crate::World;
 
 /// One replayable registration step.
 type Step = Box<dyn Fn(&mut World) + Send + Sync>;
@@ -47,7 +49,7 @@ impl WorldRegistrar {
     /// snapshot default). Chainable.
     pub fn register_component_serde_json<T>(&mut self) -> &mut Self
     where
-        T: apex_core::component::Serializable + 'static,
+        T: crate::component::Serializable + 'static,
     {
         self.steps.push(Box::new(|w: &mut World| {
             w.register_component_serde_json::<T>();
@@ -58,7 +60,7 @@ impl WorldRegistrar {
     /// Record `register_component_serde::<T>()` (binary serde). Chainable.
     pub fn register_component_serde<T>(&mut self) -> &mut Self
     where
-        T: apex_core::component::Serializable + 'static,
+        T: crate::component::Serializable + 'static,
     {
         self.steps.push(Box::new(|w: &mut World| {
             w.register_component_serde::<T>();
@@ -83,7 +85,7 @@ impl WorldRegistrar {
     /// its relations are dropped (only `ChildOf` is auto-registered). Chainable.
     pub fn register_relation_kind<R>(&mut self) -> &mut Self
     where
-        R: apex_core::relations::RelationKind + 'static,
+        R: crate::relations::RelationKind + 'static,
     {
         self.steps.push(Box::new(|w: &mut World| {
             w.relation_registry_mut().get_or_register::<R>();

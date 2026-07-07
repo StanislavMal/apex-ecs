@@ -83,6 +83,7 @@ pub mod events;
 pub mod fn_system;
 pub mod par_utils;
 pub mod query;
+pub mod registrar;
 pub mod relations;
 pub mod resources;
 pub mod sub_world;
@@ -117,6 +118,7 @@ pub use query::{
     DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QueryIter,
     QuerySingleError, Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
 };
+pub use registrar::WorldRegistrar;
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
 pub use resources::Resources;
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
