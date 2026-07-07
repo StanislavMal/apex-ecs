@@ -3122,6 +3122,29 @@ impl<'w> DynItem<'w> {
         // the storage alive and structurally unchanged for 'w.
         Some(unsafe { self.arch.columns_raw()[col_idx].get::<T>(self.row) })
     }
+
+    /// Whether ANY of this entity's components was mutated or newly added strictly
+    /// after `last_run` — the whole-entity change probe.
+    ///
+    /// Complements the per-component `changed`/`added` query terms (which select
+    /// entities by ONE named component's tick): this answers the component-agnostic
+    /// question "did anything on this entity change", which a reflection consumer —
+    /// e.g. an editor inspector gating value-tree re-serialization — needs across an
+    /// entity's whole (statically-unknown) component set. Because insertion stamps
+    /// both the change and added ticks (see `Column::push`), the change tick alone
+    /// covers additions as well as mutations. O(components on the entity).
+    ///
+    /// A structural change that only REMOVES a component leaves the survivors' ticks
+    /// untouched, so it is not observable here — a consumer that must react to
+    /// removals also compares the entity's archetype identity
+    /// (`World::entity_archetype_index`).
+    #[inline]
+    pub fn changed_since(&self, last_run: Tick) -> bool {
+        self.arch
+            .columns_raw()
+            .iter()
+            .any(|col| col.get_tick(self.row).is_newer_than(last_run))
+    }
 }
 
 /// A built read/write dynamic query (see [`QueryBuilderMut`]). Holds the
@@ -4654,6 +4677,50 @@ mod dyn_query_tests {
             vec![fresh],
             "mutation is not an add"
         );
+    }
+
+    /// S8: `DynItem::changed_since` is the whole-entity value probe (any component
+    /// mutated/added since a baseline), and `World::entity_archetype_index` is the
+    /// stable structural identity that catches the removals the tick probe cannot —
+    /// together the primitives an editor inspector uses to cache its value tree.
+    #[test]
+    fn dyn_item_changed_since_and_archetype_index() {
+        let mut world = World::new();
+        let e = world.spawn((Hp(1), Mana(10)));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+
+        world.advance_change_tick();
+        let base = world.current_tick(); // the reader's baseline
+        world.advance_change_tick();
+
+        // Nothing on the entity changed strictly after `base`.
+        let item = world.query_builder().build().unwrap().get(e).unwrap();
+        assert!(!item.changed_since(base), "no component changed since the baseline");
+
+        // Mutate one component through the dynamic write path (stamps its change tick).
+        world
+            .query_builder_mut()
+            .write_id(hp_id)
+            .build()
+            .unwrap()
+            .get_mut(e)
+            .unwrap()
+            .get_mut::<Hp>(hp_id)
+            .unwrap()
+            .0 = 99;
+        let item = world.query_builder().build().unwrap().get(e).unwrap();
+        assert!(item.changed_since(base), "the whole-entity probe sees the mutation");
+
+        // Removing a component is a structural move — a new (append-only) archetype index,
+        // which the value probe alone cannot observe (survivors keep their ticks).
+        let before = world.entity_archetype_index(e).unwrap();
+        assert!(world.remove::<Mana>(e));
+        let after = world.entity_archetype_index(e).unwrap();
+        assert_ne!(before, after, "losing a component moves the archetype");
+
+        // A dead entity has no archetype index.
+        assert!(world.despawn(e));
+        assert_eq!(world.entity_archetype_index(e), None);
     }
 
     #[test]

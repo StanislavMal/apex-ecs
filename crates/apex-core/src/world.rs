@@ -3665,6 +3665,17 @@ impl World {
         &self.entities
     }
 
+    /// The index (into `archetypes()`) of the archetype currently holding `entity`,
+    /// or `None` if the entity is dead. Archetypes are append-only and never
+    /// reindexed, so this index is a **stable structural identity**: it changes iff
+    /// the entity gains or loses a component (an archetype move). A reflection
+    /// consumer caching per-entity data pairs it with a change tick
+    /// (`DynItem::changed_since`) to detect both structural and value edits. O(1).
+    #[inline]
+    pub fn entity_archetype_index(&self, entity: Entity) -> Option<usize> {
+        self.entities.get_location(entity).map(|loc| loc.archetype_id.0 as usize)
+    }
+
     /// Get the ComponentId by the type's string name.
     ///
     /// Used by `apex-scripting` to resolve names from scripts. The search is
