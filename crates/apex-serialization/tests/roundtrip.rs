@@ -352,6 +352,42 @@ fn future_version_is_rejected_by_restore() {
     }
 }
 
+/// Apply-back / merge (В4): a snapshot entity resolved to an EXISTING entity
+/// updates it in place (component overwritten) instead of spawning a duplicate;
+/// an unresolved entity is spawned fresh. This is the primitive the editor's
+/// preview-transaction apply-back keys on `EditorId`.
+#[test]
+fn restore_merge_reuses_resolved_entity_and_spawns_the_rest() {
+    let mut src = World::new();
+    register_vocabulary(&mut src);
+    let e_keep = src.spawn((Position { x: 9.0, y: 9.0 },));
+    let e_new = src.spawn((Position { x: 1.0, y: 2.0 },));
+    let snap = WorldSerializer::snapshot(&src).unwrap();
+    let (keep_idx, new_idx) = (e_keep.index(), e_new.index());
+
+    let mut dst = World::new();
+    register_vocabulary(&mut dst);
+    let existing = dst.spawn((Position { x: 0.0, y: 0.0 },));
+    let before = dst.entity_count();
+
+    let map = WorldSerializer::restore_merge_with(
+        &mut dst,
+        &snap,
+        &mut apex_core::NoContext,
+        &mut |idx| if idx == keep_idx { Some(existing) } else { None },
+    )
+    .unwrap();
+
+    // The resolved entity was updated in place; only the unresolved one was spawned.
+    assert_eq!(dst.entity_count(), before + 1, "one fresh spawn, one merged in place");
+    assert_eq!(map[&keep_idx], existing, "resolved index maps to the existing entity");
+    assert_ne!(map[&new_idx], existing, "unresolved index got a fresh entity");
+    let pos = dst.get::<Position>(existing).unwrap();
+    assert_eq!((pos.x, pos.y), (9.0, 9.0), "existing entity's component overwritten by snapshot");
+    let fresh = dst.get::<Position>(map[&new_idx]).unwrap();
+    assert_eq!((fresh.x, fresh.y), (1.0, 2.0));
+}
+
 /// An OLDER-version snapshot restores by migrating internally — the golden-path
 /// fix for A2. This exercises the same path the editor uses (`restore` /
 /// `restore_with`, not `read_from_file`), which previously bypassed migration

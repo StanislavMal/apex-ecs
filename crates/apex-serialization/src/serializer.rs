@@ -221,10 +221,50 @@ impl WorldSerializer {
     /// version is rejected with [`SerializationError::VersionMismatch`]. Previously the check was a strict
     /// equality that rejected old versions too, and migration only ran in `read_from_file` — so the
     /// editor's `from_json` + `restore_with` byte path silently bypassed it.
+    ///
+    /// Every snapshot entity is created fresh; to instead REUSE existing entities
+    /// (apply-back / merge by an external key), see [`restore_merge_with`](Self::restore_merge_with).
     pub fn restore_with(
         world:    &mut World,
         snapshot: &WorldSnapshot,
         ctx:      &mut dyn apex_core::SerdeContext,
+    ) -> Result<RestoreEntityMap, SerializationError> {
+        // No resolver ⇒ every snapshot entity is spawned fresh (classic restore).
+        Self::restore_impl(world, snapshot, ctx, &mut |_| None)
+    }
+
+    /// Restore a snapshot into `world`, but **reuse existing entities** where the
+    /// caller's `resolve` maps a snapshot's `original_index` to an entity already
+    /// present in `world`; unresolved entities are spawned fresh. This is the
+    /// golden-path **apply-back / merge** primitive (В4): a subtree edited in a
+    /// forked world can be committed back onto the source world without
+    /// duplicating entities — the consumer keys `resolve` on its stable identity
+    /// (e.g. the editor's `EditorId`), so component values land on the SAME
+    /// entities rather than clones.
+    ///
+    /// Merge semantics: a resolved entity's components named in the snapshot are
+    /// overwritten (insert overwrites); components it has that are NOT in the
+    /// snapshot are left untouched (additive/update, not replace). Relations in
+    /// the snapshot are added as usual. Entity references inside components are
+    /// remapped through the resulting old→entity map, so cross-references land on
+    /// resolved-or-created targets consistently.
+    pub fn restore_merge_with(
+        world:    &mut World,
+        snapshot: &WorldSnapshot,
+        ctx:      &mut dyn apex_core::SerdeContext,
+        resolve:  &mut dyn FnMut(u32) -> Option<Entity>,
+    ) -> Result<RestoreEntityMap, SerializationError> {
+        Self::restore_impl(world, snapshot, ctx, resolve)
+    }
+
+    /// Shared restore worker: version-resolves the snapshot, then creates or
+    /// reuses each entity via `resolve`, inserts components, remaps Entity refs
+    /// (E6), and restores relations + resources.
+    fn restore_impl(
+        world:    &mut World,
+        snapshot: &WorldSnapshot,
+        ctx:      &mut dyn apex_core::SerdeContext,
+        resolve:  &mut dyn FnMut(u32) -> Option<Entity>,
     ) -> Result<RestoreEntityMap, SerializationError> {
         // Bring the snapshot to the current version (migrate old; reject future). The migrated copy is
         // only allocated when the version is actually behind; at the current version `snapshot` is used
@@ -263,7 +303,10 @@ impl WorldSerializer {
 
         // ── Step 1: Entity + components ───────────────────────
         for entity_snap in &snapshot.entities {
-            let new_entity = world.spawn(());
+            // Reuse an existing entity if the caller resolves this index (apply-back),
+            // otherwise spawn a fresh one (classic restore).
+            let new_entity = resolve(entity_snap.original_index)
+                .unwrap_or_else(|| world.spawn(()));
             entity_map.insert(entity_snap.original_index, new_entity);
 
             for comp_snap in &entity_snap.components {
