@@ -29,6 +29,7 @@
 pub mod prefab;
 pub mod snapshot;
 pub mod serializer;
+pub(crate) mod wire;
 
 pub use prefab::{PrefabManifest, PrefabComponent, PrefabChild, PrefabLoader, PrefabError};
 pub use snapshot::{WorldSnapshot, EntitySnapshot, ComponentSnapshot, RelationSnapshot, WorldDiff, SaveFormat};

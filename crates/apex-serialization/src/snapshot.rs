@@ -46,9 +46,19 @@ pub struct ResourceSnapshot {
 }
 
 /// A full world snapshot — everything needed to restore state.
+///
+/// This is the **in-memory** shape: component/relation/resource type names are
+/// stored inline. It is representation-agnostic — the on-disk wire form is
+/// chosen by the (de)serialization methods below. Since v3 those methods intern
+/// the repeated type names into a string table (see [`crate::wire`]); the struct
+/// itself is unchanged, so older inline files still parse directly into it.
+///
+/// The field layout must stay stable: legacy (v≤2) bincode is positional and
+/// parses straight into this struct, so reordering/removing a field would break
+/// old saves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldSnapshot {
-    /// Snapshot format version — for future migration.
+    /// Snapshot format version — the single wire-version scheme (see `migrate`).
     pub version:   u32,
     /// World tick at the moment of the snapshot.
     pub tick:      u32,
@@ -56,16 +66,16 @@ pub struct WorldSnapshot {
     pub entities:  Vec<EntitySnapshot>,
     /// Relations between entities.
     pub relations: Vec<RelationSnapshot>,
-    /// Registered resources (E7, format v2). `serde(default)` — v1 JSON
-    /// snapshots (without the field) read as an empty list. Bincode v1 is not
-    /// compatible with v2 (dev snapshots are ephemeral; the version is read and
-    /// migrated on the load path).
+    /// Registered resources (E7, added at v2). `serde(default)` — a v1 JSON
+    /// snapshot (without the field) reads as an empty list.
     #[serde(default)]
     pub resources: Vec<ResourceSnapshot>,
 }
 
 impl WorldSnapshot {
-    pub const CURRENT_VERSION: u32 = 2;
+    /// Current wire-format version. v3 introduced the string table
+    /// ([`crate::wire`]); v2 added resources; v1 was the original inline format.
+    pub const CURRENT_VERSION: u32 = 3;
 
     pub fn new(tick: u32) -> Self {
         Self {
@@ -79,30 +89,47 @@ impl WorldSnapshot {
 
     // ── JSON ─────────────────────────────────────────────────────
 
-    /// Serialize the snapshot into JSON bytes.
+    /// Serialize the snapshot into JSON bytes (current wire format = v3, interned).
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec_pretty(self)
+        serde_json::to_vec_pretty(&crate::wire::WireSnapshotV3::from_snapshot(self))
     }
 
     /// Deserialize the snapshot from JSON bytes.
+    ///
+    /// The leading `version` is peeked to dispatch: v3+ parses the interned wire
+    /// form and resolves the string table; an older (v≤2) file parses directly
+    /// into the inline struct. Migration to the current version happens at restore.
     pub fn from_json(data: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(data)
+        if crate::wire::peek_version_json(data)? >= crate::wire::WIRE_VERSION_V3 {
+            let wire: crate::wire::WireSnapshotV3 = serde_json::from_slice(data)?;
+            wire.into_snapshot().map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_slice(data)
+        }
     }
 
     // ── Bincode ──────────────────────────────────────────────────
 
-    /// Serialize the snapshot into the binary format (bincode).
+    /// Serialize the snapshot into the binary format (bincode; current wire
+    /// format = v3, interned).
     ///
     /// 5-10x smaller than JSON, 2-3x faster.
     pub fn to_bincode(&self) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
-        bincode::serialize(self)
+        bincode::serialize(&crate::wire::WireSnapshotV3::from_snapshot(self))
     }
 
     /// Deserialize the snapshot from the binary format (bincode).
     ///
-    /// Checks the snapshot version compatibility.
+    /// The leading `u32` version word dispatches: v3+ parses the interned wire
+    /// form, an older (v≤2) file parses directly into the inline struct.
     pub fn from_bincode(data: &[u8]) -> Result<Self, Box<bincode::ErrorKind>> {
-        bincode::deserialize(data)
+        if crate::wire::peek_version_bincode(data) >= crate::wire::WIRE_VERSION_V3 {
+            let wire: crate::wire::WireSnapshotV3 = bincode::deserialize(data)?;
+            wire.into_snapshot()
+                .map_err(|e| Box::new(bincode::ErrorKind::Custom(e)))
+        } else {
+            bincode::deserialize(data)
+        }
     }
 
     // ── Migration ────────────────────────────────────────────────
@@ -210,6 +237,10 @@ fn migration_for(version: u32) -> Option<MigrationFn> {
         0 => Some(|_data| Ok(())), // no-op: the data format did not change between v0 and v1
         // v1 → v2 (E7): `resources` was added; for v1 it is `serde(default)` empty.
         1 => Some(|_data| Ok(())),
+        // v2 → v3: the string table is a WIRE-only change (see `crate::wire`); the
+        // in-memory `WorldSnapshot` is representation-agnostic and unchanged, so
+        // there is nothing to migrate on the parsed struct — bump only.
+        2 => Some(|_data| Ok(())),
         _ => None,
     }
 }
@@ -441,5 +472,135 @@ mod tests {
     fn world_diff_version_tracks_snapshot_version() {
         // The diff wire version is the snapshot wire version — one source of truth.
         assert_eq!(WorldDiff::CURRENT_VERSION, WorldSnapshot::CURRENT_VERSION);
+    }
+
+    // ── v3 string table (wire format) ────────────────────────────
+
+    #[test]
+    fn v3_json_interns_repeated_type_names() {
+        // 100 entities, all carrying the same component type: the fully-qualified
+        // type name must appear in the serialized bytes EXACTLY ONCE (interned in
+        // the string table), not 100 times inline.
+        let mut snap = WorldSnapshot::new(0);
+        for i in 0..100 {
+            snap.entities.push(EntitySnapshot {
+                original_index: i,
+                components: vec![ComponentSnapshot::new_json(
+                    "my_crate::components::Position",
+                    br#"{"x":1.0,"y":2.0}"#.to_vec(),
+                )],
+            });
+        }
+        let json = String::from_utf8(snap.to_json().unwrap()).unwrap();
+        let occurrences = json.matches("my_crate::components::Position").count();
+        assert_eq!(occurrences, 1, "type name must be interned once, saw {occurrences}");
+
+        // And it round-trips back to the inline in-memory form intact.
+        let restored = WorldSnapshot::from_json(json.as_bytes()).unwrap();
+        assert_eq!(restored.entities.len(), 100);
+        assert_eq!(
+            restored.entities[42].components[0].type_name,
+            "my_crate::components::Position"
+        );
+        assert_eq!(restored.version, WorldSnapshot::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn v3_interning_shrinks_repeated_names_in_bincode() {
+        // A snapshot dominated by repeated type names is smaller interned than the
+        // pre-v3 inline shape would be (proxy: many identical names → the table
+        // stores one copy, records store a 4-byte index).
+        let mut snap = WorldSnapshot::new(0);
+        for i in 0..200 {
+            snap.entities.push(EntitySnapshot {
+                original_index: i,
+                components: vec![ComponentSnapshot::new_binary(
+                    "some_game_crate::gameplay::components::Transform",
+                    vec![0u8; 4],
+                )],
+            });
+        }
+        // Inline size = serialize the struct directly (the pre-v3 wire shape).
+        let inline = bincode::serialize(&snap).unwrap().len();
+        let interned = snap.to_bincode().unwrap().len();
+        assert!(
+            interned < inline,
+            "interned bincode ({interned}) must be smaller than inline ({inline})"
+        );
+    }
+
+    #[test]
+    fn reads_legacy_v2_inline_json_fixture() {
+        // A v2 file predates the string table: type names are inline and the
+        // envelope version is 2. `from_json` must peek version 2, take the legacy
+        // parse path, and yield the data intact (backward compatibility — the
+        // whole point of the versioned wire format). Migration to current happens
+        // at restore, so the parsed version stays 2 here.
+        let mut legacy = WorldSnapshot::new(7);
+        legacy.version = 2; // pretend it was written by the pre-v3 code
+        legacy.entities.push(EntitySnapshot {
+            original_index: 3,
+            components: vec![ComponentSnapshot::new_json(
+                "my_crate::Health",
+                br#"{"hp":50.0}"#.to_vec(),
+            )],
+        });
+        // Serialize the struct DIRECTLY (inline) to emulate a real v2 file — this
+        // is exactly the shape the old `to_json` produced (no string table).
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+        assert!(
+            String::from_utf8_lossy(&legacy_bytes).contains(r#""type_name":"my_crate::Health""#),
+            "fixture must carry the inline type_name"
+        );
+
+        let parsed = WorldSnapshot::from_json(&legacy_bytes).unwrap();
+        assert_eq!(parsed.version, 2, "legacy version preserved until restore migrates");
+        assert_eq!(parsed.tick, 7);
+        assert_eq!(parsed.entities.len(), 1);
+        assert_eq!(parsed.entities[0].original_index, 3);
+        assert_eq!(parsed.entities[0].components[0].type_name, "my_crate::Health");
+    }
+
+    #[test]
+    fn reads_legacy_v2_inline_bincode_fixture() {
+        // Same, for bincode: the leading u32 version word (2) routes to the legacy
+        // positional parse; the interned v3 parse is not attempted.
+        let mut legacy = WorldSnapshot::new(1);
+        legacy.version = 2;
+        legacy.relations.push(RelationSnapshot {
+            subject_index: 1,
+            target_index:  0,
+            kind_name:     "apex_core::relations::ChildOf".to_string(),
+        });
+        let legacy_bytes = bincode::serialize(&legacy).unwrap();
+        let parsed = WorldSnapshot::from_bincode(&legacy_bytes).unwrap();
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.relations.len(), 1);
+        assert_eq!(parsed.relations[0].kind_name, "apex_core::relations::ChildOf");
+    }
+
+    #[test]
+    fn v3_corrupt_string_table_index_is_rejected() {
+        // A record pointing past the string table is a corrupt file — restore must
+        // never fabricate a name; from_json/from_bincode surface an error.
+        let wire = crate::wire::WireSnapshotV3 {
+            version: WorldSnapshot::CURRENT_VERSION,
+            tick: 0,
+            string_table: vec!["only_one".to_string()],
+            entities: vec![crate::wire::WireEntity {
+                original_index: 0,
+                components: vec![crate::wire::WireComponent {
+                    name_idx: 5, // out of range
+                    data: Vec::new(),
+                    format: DataFormat::Json,
+                }],
+            }],
+            relations: vec![],
+            resources: vec![],
+        };
+        let json = serde_json::to_vec(&wire).unwrap();
+        assert!(WorldSnapshot::from_json(&json).is_err());
+        let bin = bincode::serialize(&wire).unwrap();
+        assert!(WorldSnapshot::from_bincode(&bin).is_err());
     }
 }
