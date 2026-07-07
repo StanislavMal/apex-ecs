@@ -69,8 +69,19 @@ pub enum PrefabChild {
 }
 
 /// Prefab manifest — a JSON file describing an entity and its children.
+///
+/// # Versioning
+/// `version` is the prefab wire-format version, mirroring [`WorldSnapshot`](crate::WorldSnapshot).
+/// It is `#[serde(default)]` = 0, so a pre-versioning file (no field) reads as version 0 and is
+/// migrated up to [`Self::CURRENT_VERSION`] on load ([`PrefabManifest::from_json_str`] /
+/// [`PrefabLoader::load_json`]). The field is meaningful at the **file root**; on a nested
+/// [`PrefabChild::Inline`] sub-tree it is inert (the whole file shares one version). Prefabs are
+/// JSON-only, so this is an additive, backward-compatible change (unlike positional bincode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefabManifest {
+    /// Prefab wire-format version (see type docs). Defaults to 0 for old, field-less files.
+    #[serde(default)]
+    pub version:    u32,
     /// Prefab name (for debugging and lookup).
     pub name:       String,
     /// Components of the root entity.
@@ -78,6 +89,40 @@ pub struct PrefabManifest {
     /// Child entities (recursive).
     #[serde(default)]
     pub children:   Vec<PrefabChild>,
+}
+
+impl PrefabManifest {
+    /// Current prefab wire-format version.
+    pub const CURRENT_VERSION: u32 = 1;
+
+    /// Parse a manifest from a JSON string, migrating an older version up to
+    /// [`Self::CURRENT_VERSION`]. This is the single load choke point — every
+    /// consumer (loader cache, asset loader, editor diff reads) should go through
+    /// it so no path skips migration (mirrors `WorldSerializer::restore` for snapshots).
+    pub fn from_json_str(json: &str) -> Result<Self, PrefabError> {
+        let mut manifest: PrefabManifest = serde_json::from_str(json)?;
+        manifest.migrate()?;
+        Ok(manifest)
+    }
+
+    /// Migrate an older-version manifest up to the current version.
+    ///
+    /// v0 → v1 is a no-op: v0 is the pre-versioning shape, structurally identical
+    /// to v1 (the `version` field was simply absent). Future format changes add a
+    /// step here. A newer, unmigratable version is left as-is (loaders may still
+    /// reject it); like snapshots, this only steps UP toward current.
+    pub fn migrate(&mut self) -> Result<(), PrefabError> {
+        while self.version < Self::CURRENT_VERSION {
+            match self.version {
+                0 => {} // no-op: v0 (field-less) is structurally v1
+                other => {
+                    return Err(PrefabError::UnmigratablePrefabVersion { version: other });
+                }
+            }
+            self.version += 1;
+        }
+        Ok(())
+    }
 }
 
 // ── Errors ────────────────────────────────────────────────────────
@@ -105,6 +150,9 @@ pub enum PrefabError {
     #[error("prefab nesting exceeds the depth limit ({limit})")]
     DepthLimitExceeded { limit: usize },
 
+    #[error("prefab version {version} is newer than supported and cannot be migrated")]
+    UnmigratablePrefabVersion { version: u32 },
+
     #[error("serialization error: {0}")]
     Serialization(#[from] SerializationError),
 }
@@ -130,9 +178,9 @@ impl PrefabLoader {
         Self { cache: FxHashMap::default() }
     }
 
-    /// Load a manifest from a JSON string.
+    /// Load a manifest from a JSON string (migrating an older version up to current).
     pub fn load_json(&mut self, json: &str) -> Result<&PrefabManifest, PrefabError> {
-        let manifest: PrefabManifest = serde_json::from_str(json)?;
+        let manifest = PrefabManifest::from_json_str(json)?;
         let name = manifest.name.clone();
         self.cache.insert(name.clone(), manifest);
         // Guaranteed to exist — just inserted it
@@ -420,6 +468,7 @@ mod tests {
     #[test]
     fn prefab_json_roundtrip() {
         let manifest = PrefabManifest {
+            version: PrefabManifest::CURRENT_VERSION,
             name: "Test".to_string(),
             components: vec![
                 PrefabComponent {
@@ -433,9 +482,24 @@ mod tests {
         let json = serde_json::to_string(&manifest).unwrap();
         let restored: PrefabManifest = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(restored.version, PrefabManifest::CURRENT_VERSION);
         assert_eq!(restored.name, "Test");
         assert_eq!(restored.components.len(), 1);
         assert_eq!(restored.components[0].type_name, "apex_core::Health");
+    }
+
+    /// A pre-versioning prefab file (no `version` field) reads as v0 and migrates
+    /// up to CURRENT via `from_json_str` — the golden-path load choke point (A4).
+    #[test]
+    fn old_prefab_without_version_migrates_on_load() {
+        let json = r#"{ "name": "Legacy", "components": [] }"#;
+        // Raw serde read: version defaults to 0 (field absent).
+        let raw: PrefabManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.version, 0);
+        // The load choke point migrates it to current.
+        let migrated = PrefabManifest::from_json_str(json).unwrap();
+        assert_eq!(migrated.version, PrefabManifest::CURRENT_VERSION);
+        assert_eq!(migrated.name, "Legacy");
     }
 
     /// §0.2a: `EntityTemplate::spawn` cannot return a Result, but a failed
@@ -807,6 +871,7 @@ mod tests {
         loader.cache.insert(
             "A".into(),
             PrefabManifest {
+                version: PrefabManifest::CURRENT_VERSION,
                 name: "A".into(),
                 components: vec![],
                 children: vec![PrefabChild::Ref {
@@ -818,6 +883,7 @@ mod tests {
         loader.cache.insert(
             "B".into(),
             PrefabManifest {
+                version: PrefabManifest::CURRENT_VERSION,
                 name: "B".into(),
                 components: vec![],
                 children: vec![PrefabChild::Ref {

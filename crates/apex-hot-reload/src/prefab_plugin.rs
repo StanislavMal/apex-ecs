@@ -145,11 +145,14 @@ impl PrefabPlugin {
             reason: e.to_string(),
         })?;
 
-        let manifest: PrefabManifest =
-            serde_json::from_str(&content).map_err(|e| HotReloadError::Deserialize {
+        // Route through the load choke point so an older-version prefab migrates
+        // up to current (mirrors the loader cache / editor read paths).
+        let manifest = PrefabManifest::from_json_str(&content).map_err(|e| {
+            HotReloadError::Deserialize {
                 path: path.display().to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         let prefab_name = manifest.name.clone();
 
@@ -204,8 +207,8 @@ impl PrefabPlugin {
                 reason: e.to_string(),
             })?;
 
-        // Update the manifest in assets
-        if let Ok(manifest) = serde_json::from_str::<PrefabManifest>(&content) {
+        // Update the manifest in assets (migrating an older version on the way in)
+        if let Ok(manifest) = PrefabManifest::from_json_str(&content) {
             let prefab_name = manifest.name.clone();
             if let Some(asset) = self.assets.get_mut(&change.id.0) {
                 asset.manifest = manifest;
