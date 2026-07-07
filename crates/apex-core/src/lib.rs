@@ -92,6 +92,7 @@ pub mod system_param;
 pub mod template;
 pub mod transform;
 pub mod unsafe_world_cell;
+pub mod visibility;
 pub mod world;
 
 pub use access::AccessDescriptor;
@@ -129,6 +130,7 @@ pub use system_param::{
     SystemParam, WorldQuerySystemAccess,
 };
 pub use transform::IndexStamp;
+pub use visibility::Visibility;
 pub use unsafe_world_cell::UnsafeWorldCell;
 pub use world::{
     ArchetypeStats, Bundle, EventCursors, ParallelWorld, QueryState, SystemContext, World,
