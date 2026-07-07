@@ -29,7 +29,7 @@ use apex_core::{
 };
 
 use crate::iterators::QueryDesc;
-use crate::registrar::{ResourceBinding, EventBinding};
+use crate::registrar::{DeferredWorldOp, ResourceBinding, EventBinding};
 
 // ── SpawnApplierFn ─────────────────────────────────────────────
 
@@ -189,27 +189,22 @@ impl ScriptContext {
 
     // ── Lifetime management ────────────────────────────────────
 
-    /// Set the world pointer before executing the script.
-    pub(crate) unsafe fn set_world_ptr(&mut self, world: &mut World) {
-        self.world_ptr         = Some(NonNull::new_unchecked(world as *mut World));
-        self.entity_count_cache = world.entity_count();
-        self.deferred_despawns.clear();
-        self.deferred_spawns.clear();
-        self.deferred_resource_writes.clear();
-        self.deferred_events.clear();
-    }
-
-    /// Set the world pointer from a SHARED `&World` — the phase-B script-system
-    /// runner path.
+    /// Set the world pointer from a SHARED `&World` before executing the script.
     ///
-    /// Unlike [`set_world_ptr`](Self::set_world_ptr) this stores a pointer derived
-    /// from `&World`, so it may ONLY be read back as `&World` (via
-    /// [`world_ref`](Self::world_ref) — used by the `query`/`commit` declared-cell
-    /// path). It must NEVER reach [`world_mut`](Self::world_mut): a `&mut World`
-    /// derived from a `&World` provenance is UB, and the stage that vends this
-    /// `&World` holds only shared access. Structural changes from a script system
-    /// go through the scheduler's per-system `Commands` slot instead (phase B4).
-    pub(crate) unsafe fn set_world_ptr_shared(&mut self, world: &World) {
+    /// Stored and only ever read back as `&World` (via
+    /// [`world_ref`](Self::world_ref) — the `query`/`commit` declared-cell path and
+    /// resource reads). A `&mut World` is NEVER derived from this pointer: every
+    /// deferred WRITE (component commit, spawn/despawn, resource, event) goes
+    /// through the declared-cell interior-mutable path or a `Commands` buffer, so
+    /// the same setter is sound for both the monolithic `run()` (exclusive access)
+    /// and a phase-B script system (the concurrent stage holds only `&World`, so a
+    /// `&mut World` from this provenance would be UB).
+    ///
+    /// # Safety
+    /// `world` must outlive every use of the pointer within this run (the ptr is
+    /// cleared via [`clear_world_ptr`](Self::clear_world_ptr) before the borrow
+    /// ends — see the module invariant).
+    pub(crate) unsafe fn set_world_ptr(&mut self, world: &World) {
         self.world_ptr = Some(NonNull::new_unchecked(world as *const World as *mut World));
         self.entity_count_cache = world.entity_count();
         self.deferred_despawns.clear();
@@ -259,39 +254,16 @@ impl ScriptContext {
         std::mem::take(&mut self.script_systems)
     }
 
-    /// Discard any deferred RESOURCE-WRITE / EVENT operations WITHOUT applying
-    /// them, freeing their Lua registry slots. A script SYSTEM cannot apply these
-    /// (they need a `&mut World` the concurrent stage does not grant, and unlike
-    /// spawns/despawns they are not entity-local `Commands` ops) — they belong in
-    /// a Rust system or the monolithic `run()`. Returns `true` if anything was
-    /// discarded, so the caller can warn loudly (§0.2a).
-    pub(crate) fn discard_deferred_globals(&mut self, lua: &mlua::Lua) -> bool {
-        let mut had = false;
-        for (_name, key) in std::mem::take(&mut self.deferred_resource_writes) {
-            had = true;
-            let _ = lua.remove_registry_value(key);
-        }
-        for (_name, key) in std::mem::take(&mut self.deferred_events) {
-            had = true;
-            let _ = lua.remove_registry_value(key);
-        }
-        had
-    }
 
-    /// Get `&World` — read-only (query iterators).
+    /// Get `&World` — read-only (query iterators, resource reads). This is the
+    /// ONLY way the stored pointer is dereferenced; no `&mut World` is ever
+    /// derived from it (see [`set_world_ptr`](Self::set_world_ptr)).
     pub(crate) fn world_ref(&self) -> &World {
         unsafe {
             self.world_ptr
                 .expect("ScriptContext::world_ref called outside run()")
                 .as_ref()
         }
-    }
-
-    /// Get `&mut World` — for applying deferred commands.
-    pub(crate) unsafe fn world_mut(&mut self) -> &mut World {
-        self.world_ptr
-            .expect("ScriptContext::world_mut called outside run()")
-            .as_mut()
     }
 
     // ── API for Lua functions ─────────────────────────────────
@@ -357,61 +329,44 @@ impl ScriptContext {
         }
     }
 
-    /// Apply deferred resource writes and event emissions.
-    pub(crate) fn apply_deferred_resources_and_events(
-        &mut self,
-        lua: &mlua::Lua,
-    ) {
+    /// Extract each buffered resource write / event emission into a deferred
+    /// world op (see [`DeferredWorldOp`]). The Lua values are read here (the
+    /// caller holds the VM) and their registry slots freed. Resource writes come
+    /// before events, in buffered order.
+    fn drain_global_ops(&mut self, lua: &mlua::Lua) -> Vec<DeferredWorldOp> {
         let writes = std::mem::take(&mut self.deferred_resource_writes);
         let events = std::mem::take(&mut self.deferred_events);
-
-        if writes.is_empty() && events.is_empty() {
-            return;
-        }
-
-        // Collect the bindings before borrowing world
-        type ApplyFn = fn(&mlua::Value, &mut World) -> bool;
-
-        let write_infos: Vec<(&'static str, ApplyFn)> = writes.iter()
-            .filter_map(|(name, _)| {
-                self.resource_bindings.get(name.as_str())
-                    .map(|b| (b.name, b.write))
-            })
-            .collect();
-
-        let emit_infos: Vec<(&'static str, ApplyFn)> = events.iter()
-            .filter_map(|(name, _)| {
-                self.event_bindings.get(name.as_str())
-                    .map(|b| (b.name, b.emit))
-            })
-            .collect();
-
-        let world = unsafe { self.world_mut() };
+        let mut ops: Vec<DeferredWorldOp> = Vec::with_capacity(writes.len() + events.len());
 
         for (type_name, key) in writes {
-            let val: mlua::Value = match lua.registry_value(&key) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for (name, write_fn) in &write_infos {
-                if *name == type_name.as_str() {
-                    write_fn(&val, world);
+            if let Ok(val) = lua.registry_value::<mlua::Value>(&key) {
+                if let Some(binding) = self.resource_bindings.get(type_name.as_str()) {
+                    if let Some(op) = (binding.defer_write)(&val) {
+                        ops.push(op);
+                    }
                 }
             }
             let _ = lua.remove_registry_value(key);
         }
-
         for (type_name, key) in events {
-            let val: mlua::Value = match lua.registry_value(&key) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for (name, emit_fn) in &emit_infos {
-                if *name == type_name.as_str() {
-                    emit_fn(&val, world);
+            if let Ok(val) = lua.registry_value::<mlua::Value>(&key) {
+                if let Some(binding) = self.event_bindings.get(type_name.as_str()) {
+                    if let Some(op) = (binding.defer_emit)(&val) {
+                        ops.push(op);
+                    }
                 }
             }
             let _ = lua.remove_registry_value(key);
+        }
+        ops
+    }
+
+    /// Queue deferred resource writes + event emissions on a `Commands` buffer via
+    /// `commands.add` — the script-SYSTEM path (no `&mut World` during the
+    /// concurrent stage; the scheduler applies the per-system slot afterwards).
+    pub(crate) fn apply_globals_to_commands(&mut self, lua: &mlua::Lua, commands: &mut Commands) {
+        for op in self.drain_global_ops(lua) {
+            commands.add(op);
         }
     }
 
@@ -502,11 +457,11 @@ mod tests {
     use super::*;
     use crate::registrar::{ResourceBinding, EventBinding};
 
-    fn dummy_resource_write(_v: &mlua::Value, _w: &mut World) -> bool { true }
+    fn dummy_resource_defer(_v: &mlua::Value) -> Option<DeferredWorldOp> { None }
     fn dummy_resource_read(_lua: &mlua::Lua, _w: &World) -> mlua::Result<mlua::Value> {
         Ok(mlua::Value::Nil)
     }
-    fn dummy_event_emit(_v: &mlua::Value, _w: &mut World) -> bool { true }
+    fn dummy_event_defer(_v: &mlua::Value) -> Option<DeferredWorldOp> { None }
 
     /// E3: `write_resource` must NOT leak memory per call. Previously each call
     /// did `Box::leak(name)`, so a script writing the same resource every frame
@@ -523,7 +478,7 @@ mod tests {
         ctx.add_resource_binding(ResourceBinding {
             name:  "Score",
             read:  dummy_resource_read,
-            write: dummy_resource_write,
+            defer_write: dummy_resource_defer,
         });
 
         const N: usize = 100;
@@ -553,7 +508,7 @@ mod tests {
         let mut ctx = ScriptContext::new();
         ctx.add_event_binding(EventBinding {
             name: "Boom",
-            emit: dummy_event_emit,
+            defer_emit: dummy_event_defer,
         });
 
         const N: usize = 100;

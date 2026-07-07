@@ -70,6 +70,17 @@ pub trait ScriptableRegistrar: Sized + 'static {
     fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()>;
 }
 
+// ── DeferredWorldOp ─────────────────────────────────────────────
+
+/// A deferred world mutation: extract the typed value from a Lua value NOW (while
+/// the VM is available) into a `Send` closure that applies it to a `&mut World`
+/// LATER. One code path serves both callers: the monolithic `run()` executes it
+/// directly against its exclusive `&mut World`, while a phase-B script SYSTEM
+/// queues it on its per-system `Commands` slot (`commands.add`) — applied by the
+/// scheduler after the stage. A builder returning `None` signals a type mismatch
+/// (the Lua value did not convert to the bound type).
+pub type DeferredWorldOp = Box<dyn FnOnce(&mut apex_core::World) + Send>;
+
 // ── ResourceBinding ─────────────────────────────────────────────
 
 /// Information about a resource registered for access from Lua scripts.
@@ -82,9 +93,9 @@ pub struct ResourceBinding {
     /// Read the resource from `&World` → mlua::Value.
     /// Takes Lua so it can create tables.
     pub read:   fn(&mlua::Lua, &apex_core::World) -> mlua::Result<mlua::Value>,
-    /// Write the resource into `&mut World` from an mlua::Value.
-    /// Returns `false` if the type is wrong.
-    pub write:  fn(&mlua::Value, &mut apex_core::World) -> bool,
+    /// Build a deferred writer from a Lua value (see [`DeferredWorldOp`]).
+    /// `None` ⇒ the value did not convert to the bound resource type.
+    pub defer_write: fn(&mlua::Value) -> Option<DeferredWorldOp>,
 }
 
 // ── EventBinding ────────────────────────────────────────────────
@@ -94,9 +105,9 @@ pub struct ResourceBinding {
 pub struct EventBinding {
     /// String type name of the event.
     pub name: &'static str,
-    /// Emit the event into `&mut World` (takes mlua::Value, converts to T).
-    /// Returns `false` if the event is not registered or the type is wrong.
-    pub emit: fn(&mlua::Value, &mut apex_core::World) -> bool,
+    /// Build a deferred emitter from a Lua value (see [`DeferredWorldOp`]).
+    /// `None` ⇒ the value did not convert to the bound event type.
+    pub defer_emit: fn(&mlua::Value) -> Option<DeferredWorldOp>,
 }
 
 // ── ScriptVm token + access translation (phase B) ───────────────

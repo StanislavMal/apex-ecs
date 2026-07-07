@@ -251,13 +251,18 @@ impl ScriptEngine {
                     .ok_or_else(|| mlua::Error::runtime(format!("resource '{}' not found", T::type_name_str())))?;
                 res.to_lua(lua)
             },
-            write: |value: &mlua::Value, world: &mut World| -> bool {
-                if let Some(new_val) = T::from_lua(value) {
-                    world.insert_resource(new_val);
-                    true
-                } else {
-                    log::warn!("write_resource: failed to convert Lua value to {}", T::type_name_str());
-                    false
+            // Extract the typed resource NOW into a Send closure that inserts it
+            // (T: Send + Sync + 'static). Run directly by the monolith, or queued on
+            // a script system's per-system Commands slot.
+            defer_write: |value: &mlua::Value| -> Option<crate::registrar::DeferredWorldOp> {
+                match T::from_lua(value) {
+                    Some(new_val) => Some(Box::new(move |world: &mut World| {
+                        world.insert_resource(new_val);
+                    })),
+                    None => {
+                        log::warn!("write_resource: failed to convert Lua value to {}", T::type_name_str());
+                        None
+                    }
                 }
             },
         };
@@ -277,14 +282,17 @@ impl ScriptEngine {
     {
         let binding = EventBinding {
             name: T::type_name_str(),
-            emit: |value: &mlua::Value, world: &mut World| -> bool {
-                if let Some(event) = T::from_lua(value) {
-                    // send_event auto-registers the type — sending always succeeds.
-                    world.send_event(event);
-                    true
-                } else {
-                    log::warn!("emit_event: failed to convert Lua value to {}", T::type_name_str());
-                    false
+            // Extract the typed event NOW into a Send closure that sends it
+            // (T: Send + Sync + 'static). send_event auto-registers the type.
+            defer_emit: |value: &mlua::Value| -> Option<crate::registrar::DeferredWorldOp> {
+                match T::from_lua(value) {
+                    Some(event) => Some(Box::new(move |world: &mut World| {
+                        world.send_event(event);
+                    })),
+                    None => {
+                        log::warn!("emit_event: failed to convert Lua value to {}", T::type_name_str());
+                        None
+                    }
                 }
             },
         };
@@ -439,20 +447,18 @@ impl ScriptEngine {
             return;
         }
 
-        // Resource writes / events need `&mut World` (via the still-set world_ptr);
-        // apply them first.
-        {
-            let mut ctx = self.ctx.borrow_mut();
-            ctx.apply_deferred_resources_and_events(&self.lua);
-        }
-
-        // Despawns + spawns drain into a `Commands` buffer (deterministic ids via
-        // the world's reserver), then applied — the same path a script SYSTEM uses
-        // through its per-system slot.
+        // Drain ALL deferred effects — despawns, spawns, resource writes, events —
+        // into one `Commands` buffer (deterministic spawn ids via the world's
+        // reserver), then apply. Exactly the path a script SYSTEM uses through its
+        // per-system slot: one unified structural+globals path for both.
         {
             let mut commands = Commands::new();
             commands.set_reserver(world.entity_reserver());
-            self.ctx.borrow_mut().apply_structural_to_commands(&self.lua, &mut commands);
+            {
+                let mut ctx = self.ctx.borrow_mut();
+                ctx.apply_structural_to_commands(&self.lua, &mut commands);
+                ctx.apply_globals_to_commands(&self.lua, &mut commands);
+            }
             commands.apply(world);
         }
 
@@ -567,7 +573,7 @@ impl ScriptEngine {
                         // SAFETY: the pointer set from `&World` is read back ONLY as
                         // `&World` (the query/commit declared-cell path) — never as
                         // `&mut World`; the parallel stage holds only `&World`.
-                        unsafe { c.set_world_ptr_shared(world); }
+                        unsafe { c.set_world_ptr(world); }
                         c.set_declared_access(read_ids.clone(), write_ids.clone());
                     }
 
@@ -584,20 +590,14 @@ impl ScriptEngine {
 
                     {
                         let mut c = ctx.borrow_mut();
-                        // Spawn/despawn drain into THIS system's per-system Commands
-                        // slot — deterministic ids (D8b reserver), applied by the
-                        // scheduler after the stage, never via `&mut World`.
-                        c.apply_structural_to_commands(&lua, sys_ctx.commands());
-                        // Resource-write/event ops need `&mut World`, unavailable to
-                        // a concurrent script system — drop them loudly (§0.2a).
-                        if c.discard_deferred_globals(&lua) {
-                            log::warn!(
-                                "script system '{}': resource-write / event ops are not \
-                                 applied from a script SYSTEM — dropped this frame (use a \
-                                 Rust system or the monolithic run())",
-                                sys_name
-                            );
-                        }
+                        // All deferred effects drain into THIS system's per-system
+                        // Commands slot — applied by the scheduler after the stage,
+                        // never via `&mut World`. Spawn/despawn reserve deterministic
+                        // ids (D8b); resource writes / events queue as `commands.add`
+                        // closures (the typed value was extracted while the VM was live).
+                        let cmds = sys_ctx.commands();
+                        c.apply_structural_to_commands(&lua, cmds);
+                        c.apply_globals_to_commands(&lua, cmds);
                         c.clear_declared_access();
                         c.clear_world_ptr();
                     }

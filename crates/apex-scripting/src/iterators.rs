@@ -592,7 +592,7 @@ mod tests {
         ctx.add_binding(test_comp_binding(id));
         // SAFETY: the ptr is used only for the commits below, all before
         // `clear_world_ptr`; `world` is not otherwise borrowed meanwhile.
-        unsafe { ctx.set_world_ptr(&mut world); }
+        unsafe { ctx.set_world_ptr(&world); }
 
         // Stale generation → must be ignored.
         let stale = format!("{}:{}", e.index(), e.generation().wrapping_add(1));

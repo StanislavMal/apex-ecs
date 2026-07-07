@@ -24,6 +24,16 @@ struct Velocity {
     y: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Scriptable)]
+struct Score {
+    value: i32,
+}
+
+#[derive(Clone, Debug, Scriptable)]
+struct Damage {
+    amount: i32,
+}
+
 /// Flagship: a `system{}` declaration runs as a scheduler system and its
 /// committed write persists in the world.
 #[test]
@@ -307,6 +317,53 @@ fn script_system_spawns_are_deterministic() {
     let b = run_once();
     assert_eq!(a.len(), 10, "5 spawns × 2 frames");
     assert_eq!(a, b, "script-system spawn ids are deterministic run-to-run (D8b)");
+}
+
+/// A script SYSTEM writes a resource and emits an event; both are applied through
+/// the per-system Commands slot (`commands.add`) after the stage — no `&mut World`
+/// needed during the concurrent run. Closes the resource/event tail on the
+/// golden path (parity with the monolithic `run()`).
+#[test]
+fn script_system_resource_and_event_apply_through_commands() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_scriptable::<Position>(&mut engine);
+    world.register_scriptable_resource::<Score>(&mut engine);
+    world.register_scriptable_event::<Damage>(&mut engine);
+    world.insert_resource(Score { value: 1 });
+
+    engine
+        .load_script_str(
+            "sfx",
+            r#"
+            system{
+                name = "sfx",
+                query = {"Read:Position"},
+                fn = function()
+                    local s = read_resource("Score")
+                    s.value = s.value + 41
+                    write_resource("Score", s)
+                    emit_event("Damage", Damage.new(7))
+                end,
+            }
+            "#,
+        )
+        .expect("script must compile");
+
+    let mut sched = Scheduler::new();
+    engine.register_systems(&mut sched);
+    sched.run(&mut world);
+
+    assert_eq!(
+        world.try_resource::<Score>(),
+        Some(&Score { value: 42 }),
+        "the script system's resource write was applied via the per-system Commands slot"
+    );
+    assert_eq!(
+        world.events::<Damage>().len(),
+        1,
+        "the script system's emitted event reached the world's Damage buffer"
+    );
 }
 
 /// Hot-reload: re-registering after a script changes REPLACES the old script
