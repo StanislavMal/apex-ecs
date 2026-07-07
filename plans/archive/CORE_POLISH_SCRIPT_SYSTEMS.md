@@ -1,25 +1,30 @@
 # Кампания CORE_POLISH + SCRIPT_SYSTEMS — хвосты TECH_DEBT, безусловный детерминизм, скриптинг на золотом пути
 
-> **Статус: 🚧 в работе (старт 2026-07-06). Волны 0, 1 и 2 ✅ ЗАКРЫТЫ.** Волна 0: 0.1–0.5 сделаны,
-> 0.6 string-table переоценён §0.2b (отдельный заход, 🟢 открыт). Волна 1: 1.1 D8b-overflow (эскроу),
-> 1.2 D6-полное (per-system change-окна), 1.3 детерминизм-гейт. Волна 2 (event-модель): 2.1 S3
-> (`World::event_*`→`&mut self`+`_unchecked`), 2.2 S4 (`ctx.event_reader`→`_unchecked`, blessed=param),
-> 2.3 F4b (⚠ переоценка §0.2b — macro-персистентность неисполнима чисто, golden path=plain-fn). Goldens
-> 649/0/9 байт-идентичны на всех трёх волнах. Далее — волна 3 (скриптинг/DynQuery). Источник истины
-> кампании. Статусы пунктов — ЗДЕСЬ; `plans/TECH_DEBT.md` держит указатель сюда для взятых в
-> работу пунктов. Ветка: `core-polish-script-systems` (заведена 2026-07-06 от HEAD
-> `api-golden-path`, НЕ от main — main отстаёт на 71 коммит и не содержит фундамента волны 7,
-> D9 и самого реестра TECH_DEBT; ветвление от main потеряло бы основу кампании).
-> Планка: `docs/CONVENTIONS.md` §0.2a (громко, не молча), §0.2b (без полумер / письменная
-> переоценка), §0.9 (анти-mimicry — козыри: relations, no-loss events, IsolatedWorld, детерминизм).
-> Канон API: `decisions/ADR-004` (Р-1 plain-fn = golden path). Эталон-исходник Bevy:
-> `C:\My\Projects\Rust_projects\bevy` (читать/грепать, не вспоминать).
+> # ✅ ЗАКРЫТА И РОТИРОВАНА (2026-07-07). ЗАМОРОЖЕНО — истина теперь в реестрах.
 >
-> **Гейты каждого шага (без исключений):** workspace-тесты apex-ecs зелёные · clippy
-> `--all-targets` net-neutral · Miri (targeted по затронутым unsafe-путям; полный `--lib` — при
-> правках unsafe-фундамента) · движок: `cargo build --workspace` + полный
-> `cargo test -p apex-render --lib --features visual_tests`, goldens **byte-identical** ·
-> пушить ядро ДО движка · коммиты `git commit -F <файл>`.
+> **Что сделано (волны 0→3, ветка `core-polish-script-systems` от `api-golden-path`, НЕ запушено):**
+> - **Волна 0 (честность/гигиена):** A5-актуализация реестра, `ParallelPolicy::Fixed` (лживый коммент→
+>   реальный enum, addendum ADR-003), B5 (возврат Entity-резерваций на drop/clear), B6 (паника
+>   `assert_bound` на PLACEHOLDER), §1.4-гигиена. 0.6 string-table — переоценён §0.2b → **🟢 ОСТАЁТСЯ
+>   ОТКРЫТ** (отдельный focused-заход «snapshot format v3», спек в TECH_DEBT).
+> - **Волна 1 (детерминизм):** D8b-overflow эскроу-margin (addendum ADR-001 + рук. §6.6a), D6-полное
+>   per-system `last_run`, детерминизм-гейт `determinism.rs`. Побочно исправлен pre-existing MIRI-CD.
+> - **Волна 2 (event-модель):** S3/S4 → `&mut self`+`_unchecked` (ADR-002), F4b — персистентные
+>   event-курсоры в раннере AutoSystem (золотой путь).
+> - **Волна 3 (скриптинг):** фаза A — `iterators.rs` → ядерный `DynQuery`/`DynQueryMut`, S7 write-гейт +
+>   S8 Changed/Added-термы (§10.8 закрыт). Фаза B — Lua `system{}` = первоклассные NonSend-системы
+>   планировщика (`ScriptVm`-токен, декларированный доступа, детерминизм спавнов, `Scheduler::remove_system`
+>   + hot-reload, resource/event через Commands). **Архитектура → `decisions/ADR-005`.** Фаза C
+>   (Lua↔Lua VM-пул) — ⛔ ROI-gated, вне кампании.
+>
+> **Где теперь истина:** статусы долга → `plans/TECH_DEBT.md`; архитектура скрипт-систем →
+> `decisions/ADR-005`; addendum'ы → ADR-001 (D8b-overflow) / ADR-003 (ParallelPolicy); детерминизм —
+> руководство §6.6a; Lua-`system{}` API — руководство §17.9. Открытый долг: **string-table 🟢** (0.6).
+>
+> **Гейты пройдены на каждом шаге:** apex-ecs workspace зелёный · clippy `--all-targets` net-neutral
+> (4 pre-existing serialization/bench) · Miri TB чист на затронутых unsafe-путях · **движок
+> `check --workspace` + goldens `visual_tests` 649/0/9 БАЙТ-ИДЕНТИЧНЫ на конце каждой волны/фазы**.
+> Ветка НЕ запушена (пуш ядра ДО движка — по решению юзера). Ниже — исходный план (заморожен).
 
 ## 0. TL;DR
 
