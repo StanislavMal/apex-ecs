@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-apex-core   = { path = "../apex-core" }
-apex-macros = { path = "../apex-macros" }
+apex-core      = { path = "../apex-core" }
+apex-scheduler = { path = "../apex-scheduler" }
+apex-macros    = { path = "../apex-macros" }
 
 mlua.workspace    = true
 log.workspace     = true

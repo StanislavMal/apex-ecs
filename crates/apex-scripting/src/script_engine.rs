@@ -53,7 +53,11 @@ type SpawnApplierFn = Box<dyn Fn(&str, &mlua::Value, apex_core::Entity, &mut Wor
 // ── ScriptEngine ───────────────────────────────────────────────
 
 pub struct ScriptEngine {
-    lua:            mlua::Lua,
+    /// The Lua VM. Held in an `Rc` so phase-B NonSend script-system runners can
+    /// share it (they hold their own clone and call the registered function each
+    /// frame); the VM stays single-threaded (`!Send`), which is exactly why those
+    /// systems are NonSend (main-thread) — wave 3 §5.
+    lua:            Rc<mlua::Lua>,
     ctx:            Rc<RefCell<ScriptContext>>,
     scripts:        HashMap<String, CompiledScript>,
     active_script:  String,
@@ -69,7 +73,7 @@ impl ScriptEngine {
     // ── Constructor ────────────────────────────────────────────
 
     pub fn new() -> Self {
-        let lua = mlua::Lua::new();
+        let lua = Rc::new(mlua::Lua::new());
 
         let ctx = Rc::new(RefCell::new(ScriptContext::new()));
 
@@ -139,7 +143,7 @@ impl ScriptEngine {
         }
 
         // API functions
-        for name in &["delta_time", "entity_count", "query", "commit",
+        for name in &["delta_time", "entity_count", "query", "commit", "system",
                       "spawn_entity", "despawn", "read_resource", "write_resource",
                       "emit_event", "log", "print", "log_debug", "log_warn", "log_error",
                       "inspect"] {
@@ -180,6 +184,7 @@ impl ScriptEngine {
         let binding = ComponentBinding {
             name: T::type_name_str(),
             id:   comp_id,
+            type_id: std::any::TypeId::of::<T>(),
             read: |ptr: *const u8, lua: &mlua::Lua| -> mlua::Result<mlua::Value> {
                 let val = unsafe { &*(ptr as *const T) };
                 val.to_lua(lua)
@@ -441,6 +446,142 @@ impl ScriptEngine {
         self.ctx.borrow_mut().clear_world_ptr();
 
         self.apply_spawn_queue(world);
+    }
+
+    // ── Phase-B: script systems as scheduler systems ──────────
+
+    /// Set the frame delta time seen by phase-B script systems. Call once before
+    /// `scheduler.run(world)` (all script systems share the one VM/context, so
+    /// they observe the same `delta_time()` for the frame).
+    pub fn set_delta_time(&mut self, dt: f32) {
+        self.ctx.borrow_mut().delta_time = dt;
+    }
+
+    /// Register the active script's `system{}` declarations as first-class
+    /// scheduler systems (phase B).
+    ///
+    /// Runs the active script's chunk to collect its `system{ name, query, fn }`
+    /// declarations, translates each `query` into a scheduler
+    /// [`AccessDescriptor`](apex_core::access::AccessDescriptor) (component
+    /// `TypeId`s + a `ScriptVm` write token that serializes Lua↔Lua), and
+    /// registers a NonSend (main-thread) runner per declaration. The runner shares
+    /// the VM (`Rc<Lua>`) and context, installs the declared access for the run,
+    /// and calls the Lua function each frame.
+    ///
+    /// A declaration referencing an unregistered component is REFUSED (not
+    /// registered) and logged loudly (§0.2a): registering it with an
+    /// under-declared access would let the scheduler run it concurrently with a
+    /// conflicting system (a data race). Register those components first.
+    ///
+    /// The monolithic [`run`](Self::run) remains the fallback for scripts that
+    /// define a top-level `run()` instead of `system{}` declarations.
+    pub fn register_systems(&mut self, scheduler: &mut apex_scheduler::Scheduler) {
+        // Run the active script's chunk so its top-level `system{}` calls record
+        // their declarations on the context. (No world access here — `system{}`
+        // only records name/query/fn.)
+        if self.active_script.is_empty() {
+            return;
+        }
+        let chunk_key = match self.scripts.get(&self.active_script) {
+            Some(s) => &s.chunk_key,
+            None => {
+                log::warn!("register_systems: active script '{}' not found", self.active_script);
+                return;
+            }
+        };
+        match self.lua.registry_value::<mlua::Function>(chunk_key) {
+            Ok(chunk) => {
+                if let Err(e) = chunk.call::<()>(()) {
+                    log::error!(
+                        "register_systems: error running chunk '{}': {}",
+                        self.active_script, e
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "register_systems: failed to get chunk '{}': {}",
+                    self.active_script, e
+                );
+                return;
+            }
+        }
+
+        let decls = self.ctx.borrow_mut().take_script_systems();
+        for decl in decls {
+            // Translate the query into scheduler access + declared component ids.
+            let access = {
+                let ctx = self.ctx.borrow();
+                crate::registrar::descs_to_access(&ctx.bindings, &decl.descs)
+            };
+            if !access.unresolved.is_empty() {
+                log::error!(
+                    "register_systems: script system '{}' references unregistered \
+                     component(s) {:?} — REFUSED (register the component(s) first; an \
+                     under-declared access would be a data race under parallelism)",
+                    decl.name, access.unresolved
+                );
+                // Free the function's registry slot — the system will not run.
+                let _ = self.lua.remove_registry_value(decl.fn_key);
+                continue;
+            }
+
+            let lua = self.lua.clone();
+            let ctx = self.ctx.clone();
+            let fn_key = decl.fn_key;
+            let read_ids = access.read_ids;
+            let write_ids = access.write_ids;
+            let sys_name = decl.name.clone();
+
+            scheduler.add_dynamic_nonsend_system(
+                decl.name,
+                access.descriptor,
+                move |sys_ctx: apex_core::world::SystemContext<'_>| {
+                    // The runtime-declared runner: install the world (SHARED) and
+                    // the declared access, run the Lua fn (its query/commit go
+                    // through the declared-cell path), then clean up.
+                    let world = sys_ctx.world_ref();
+                    {
+                        let mut c = ctx.borrow_mut();
+                        // SAFETY: the pointer set from `&World` is read back ONLY as
+                        // `&World` (the query/commit declared-cell path) — never as
+                        // `&mut World`; the parallel stage holds only `&World`.
+                        unsafe { c.set_world_ptr_shared(world); }
+                        c.set_declared_access(read_ids.clone(), write_ids.clone());
+                    }
+
+                    let result = match lua.registry_value::<mlua::Function>(&fn_key) {
+                        Ok(f) => f.call::<()>(()),
+                        Err(e) => {
+                            log::error!("script system '{}': function missing: {}", sys_name, e);
+                            Ok(())
+                        }
+                    };
+                    if let Err(e) = result {
+                        log::error!("script system '{}' runtime error: {}", sys_name, e);
+                    }
+
+                    {
+                        let mut c = ctx.borrow_mut();
+                        // Phase B4 wires structural/resource/event ops from a script
+                        // SYSTEM through the scheduler's per-system Commands slot. In
+                        // B3 a script system is data-only (query/commit); if the fn
+                        // queued any deferred op, drop it loudly (§0.2a) rather than
+                        // apply it via `&mut World` (UB under concurrency).
+                        if c.discard_deferred_structural(&lua) {
+                            log::warn!(
+                                "script system '{}': spawn/despawn/resource/event ops are \
+                                 not yet applied for script SYSTEMS (phase B4) — dropped this \
+                                 frame. Use the monolithic run() for structural changes.",
+                                sys_name
+                            );
+                        }
+                        c.clear_declared_access();
+                        c.clear_world_ptr();
+                    }
+                },
+            );
+        }
     }
 
     fn apply_spawn_queue(&mut self, world: &mut World) {

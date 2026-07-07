@@ -78,7 +78,7 @@ pub mod script_engine;
 
 pub use context::ScriptContext;
 pub use error::ScriptError;
-pub use registrar::ScriptableRegistrar;
+pub use registrar::{ScriptVm, ScriptableRegistrar};
 pub use script_engine::ScriptEngine;
 
 // Re-export the macro from apex-macros so users write

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::{
-    context::{ScriptContext, SpawnRequest},
+    context::{ScriptContext, ScriptSystemDecl, SpawnRequest},
     iterators,
 };
 
@@ -19,6 +19,7 @@ pub fn register_globals(lua: &mlua::Lua) -> mlua::Result<()> {
     register_entity_count(lua)?;
     register_query(lua)?;
     register_commit(lua)?;
+    register_system_decl(lua)?;
     register_spawn(lua)?;
     register_despawn(lua)?;
     register_resource_api(lua)?;
@@ -85,6 +86,32 @@ fn register_commit(lua: &mlua::Lua) -> mlua::Result<()> {
             .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
         let ctx_ref = ctx.borrow();
         iterators::commit_entity_table(&ctx_ref, &entity_table)
+    })?)
+}
+
+// ── system{ name, query, fn } ──────────────────────────────────
+
+/// Declare a phase-B script system: `system{ name = "...", query = {...},
+/// fn = function(it) ... end }`. Records the declaration on the `ScriptContext`;
+/// the engine later translates `query` into a scheduler access declaration and
+/// registers a NonSend runner that invokes `fn` each frame. Unlike the
+/// monolithic `run()`, a declared system participates in conflict detection and
+/// runs concurrently with disjoint Rust systems.
+fn register_system_decl(lua: &mlua::Lua) -> mlua::Result<()> {
+    lua.globals().set("system", lua.create_function(|lua, spec: mlua::Table| {
+        let name: String = spec.get("name")
+            .map_err(|_| mlua::Error::runtime("system{}: missing string field 'name'"))?;
+        let query_tbl: mlua::Table = spec.get("query")
+            .map_err(|_| mlua::Error::runtime("system{}: missing table field 'query'"))?;
+        let descs = iterators::parse_query_descs(&query_tbl)?;
+        let func: mlua::Function = spec.get("fn")
+            .map_err(|_| mlua::Error::runtime("system{}: missing function field 'fn'"))?;
+        let fn_key = lua.create_registry_value(func)?;
+
+        let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
+            .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
+        ctx.borrow_mut().script_systems.push(ScriptSystemDecl { name, descs, fn_key });
+        Ok(())
     })?)
 }
 

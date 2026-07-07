@@ -183,6 +183,25 @@ pub(crate) fn collect_matching_entities(
                 }
             }
         };
+        // Phase B: a script system may access ONLY the components it declared to
+        // the scheduler. An undeclared read/write is a scheduler-blind live access
+        // (a data race under parallelism) — refuse it loudly and empty the query
+        // (§0.2a). `With`/`Without` are structural filters (no component data), so
+        // they need no declaration. The monolithic `run()` fallback installs no
+        // declaration, so `declares_*` return `true` and nothing is restricted.
+        let declared_ok = match desc.mode {
+            QueryMode::Write => ctx.declares_write(id),
+            QueryMode::Read | QueryMode::Changed | QueryMode::Added => ctx.declares_read(id),
+            QueryMode::With | QueryMode::Without => true,
+        };
+        if !declared_ok {
+            apex_core::anomaly!(
+                world, Severity::Warn, "script query", None, None,
+                "component '{}' is not in the script system's declared access ({:?}) — query yields no results",
+                desc.type_name, desc.mode
+            );
+            return Vec::new();
+        }
         qb = match desc.mode {
             // Read AND Write both need read access here (the snapshot only reads;
             // the actual mutation happens in `commit` via `DynQueryMut`).
@@ -357,6 +376,17 @@ pub(crate) fn commit_entity_table(
                 continue;
             }
         };
+        // Phase B: refuse a write the script system did not declare (a forged or
+        // mismatched `_meta.writes`). The core S7 gate on `get_mut_ptr` also
+        // rejects it, but declaring the trusted set here keeps the anomaly at the
+        // scripting boundary. The monolith declares nothing ⇒ unrestricted.
+        if !ctx.declares_write(binding.id) {
+            log::warn!(
+                "commit: component '{}' is not in the script system's declared writes — skipped",
+                type_name
+            );
+            continue;
+        }
         let key = type_name.to_lowercase();
         let val: mlua::Value = match entity_table.get::<mlua::Value>(key.as_str()) {
             Ok(v) => v,
@@ -489,6 +519,7 @@ mod tests {
         ComponentBinding {
             name: "TestComp",
             id,
+            type_id: std::any::TypeId::of::<TestComp>(),
             read: |ptr: *const u8, _lua: &mlua::Lua| {
                 let c = unsafe { &*(ptr as *const TestComp) };
                 Ok(mlua::Value::Integer(c.v as i64))

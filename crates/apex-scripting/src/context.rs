@@ -26,7 +26,34 @@ use apex_core::{
     world::World,
 };
 
+use crate::iterators::QueryDesc;
 use crate::registrar::{ResourceBinding, EventBinding};
+
+// ── ScriptSystemDecl ───────────────────────────────────────────
+
+/// A phase-B script system declared from Lua via `system{ name, query, fn }`.
+///
+/// Holds the parsed query descriptors and a registry key for the Lua function.
+/// The engine translates `descs` into a scheduler access declaration and builds
+/// a NonSend runner that calls `fn` each frame.
+pub(crate) struct ScriptSystemDecl {
+    pub name:   String,
+    pub descs:  Vec<QueryDesc>,
+    pub fn_key: mlua::RegistryKey,
+}
+
+// ── DeclaredAccess ─────────────────────────────────────────────
+
+/// The component ids a phase-B script system declared. Installed on the
+/// `ScriptContext` for the duration of the system's run so `query`/`commit`
+/// resolve ONLY declared components — an undeclared access is a scheduler-blind
+/// live access and is refused loudly (§0.2a). `None` ⇒ the monolithic `run()`
+/// fallback (one whole-world exclusive system), which is unrestricted.
+#[derive(Default)]
+pub(crate) struct DeclaredAccess {
+    pub reads:  Vec<ComponentId>,
+    pub writes: Vec<ComponentId>,
+}
 
 // ── ComponentBinding ───────────────────────────────────────────
 
@@ -39,6 +66,11 @@ pub struct ComponentBinding {
     pub name: &'static str,
     /// ComponentId for lookup in archetypes
     pub id:   ComponentId,
+    /// `TypeId` of the component. Needed to build a scheduler [`AccessDescriptor`]
+    /// for a phase-B script system: conflict detection compares `TypeId` vectors
+    /// (not `ComponentId`s), so a script's `Write:Position` must carry
+    /// `TypeId::of::<Position>()` to conflict with a Rust `write<Position>`.
+    pub type_id: std::any::TypeId,
     /// Read a component from Column[row] → mlua::Value
     pub read:  unsafe fn(*const u8, &mlua::Lua) -> mlua::Result<mlua::Value>,
     /// Write a component into Column[row] from mlua::Value; returns false if the type is wrong
@@ -106,6 +138,15 @@ pub struct ScriptContext {
 
     /// Automatically call commit(entity) when moving to the next entity in the query iterator
     pub auto_commit: bool,
+
+    /// Phase-B script systems declared this compile via `system{}` (drained by
+    /// the engine when registering them with the scheduler).
+    pub(crate) script_systems: Vec<ScriptSystemDecl>,
+
+    /// The declared component access of the phase-B script system currently
+    /// running (`None` for the monolithic `run()` fallback). `query`/`commit`
+    /// refuse any component not in this set.
+    pub(crate) declared: Option<DeclaredAccess>,
 }
 
 impl ScriptContext {
@@ -122,6 +163,8 @@ impl ScriptContext {
             deferred_events:         Vec::new(),
             entity_count_cache:      0,
             auto_commit:             false,
+            script_systems:          Vec::new(),
+            declared:                None,
         }
     }
 
@@ -136,9 +179,92 @@ impl ScriptContext {
         self.deferred_events.clear();
     }
 
+    /// Set the world pointer from a SHARED `&World` — the phase-B script-system
+    /// runner path.
+    ///
+    /// Unlike [`set_world_ptr`](Self::set_world_ptr) this stores a pointer derived
+    /// from `&World`, so it may ONLY be read back as `&World` (via
+    /// [`world_ref`](Self::world_ref) — used by the `query`/`commit` declared-cell
+    /// path). It must NEVER reach [`world_mut`](Self::world_mut): a `&mut World`
+    /// derived from a `&World` provenance is UB, and the stage that vends this
+    /// `&World` holds only shared access. Structural changes from a script system
+    /// go through the scheduler's per-system `Commands` slot instead (phase B4).
+    pub(crate) unsafe fn set_world_ptr_shared(&mut self, world: &World) {
+        self.world_ptr = Some(NonNull::new_unchecked(world as *const World as *mut World));
+        self.entity_count_cache = world.entity_count();
+        self.deferred.clear();
+        self.deferred_resource_writes.clear();
+        self.deferred_events.clear();
+    }
+
     /// Reset the world pointer after the script finishes.
     pub(crate) fn clear_world_ptr(&mut self) {
         self.world_ptr = None;
+    }
+
+    // ── Phase-B declared access ────────────────────────────────
+
+    /// Install the running script system's declared component access. While set,
+    /// `query`/`commit` refuse any component not declared (§0.2a).
+    pub(crate) fn set_declared_access(&mut self, reads: Vec<ComponentId>, writes: Vec<ComponentId>) {
+        self.declared = Some(DeclaredAccess { reads, writes });
+    }
+
+    /// Clear the declared access (back to the unrestricted monolith default).
+    pub(crate) fn clear_declared_access(&mut self) {
+        self.declared = None;
+    }
+
+    /// Whether component `id` may be READ by the running script system. `true`
+    /// when no declaration is installed (the monolithic `run()` fallback).
+    pub(crate) fn declares_read(&self, id: ComponentId) -> bool {
+        match &self.declared {
+            None => true,
+            Some(d) => d.reads.contains(&id) || d.writes.contains(&id),
+        }
+    }
+
+    /// Whether component `id` may be WRITTEN by the running script system. `true`
+    /// when no declaration is installed.
+    pub(crate) fn declares_write(&self, id: ComponentId) -> bool {
+        match &self.declared {
+            None => true,
+            Some(d) => d.writes.contains(&id),
+        }
+    }
+
+    /// Drain the script systems declared this compile (for scheduler registration).
+    pub(crate) fn take_script_systems(&mut self) -> Vec<ScriptSystemDecl> {
+        std::mem::take(&mut self.script_systems)
+    }
+
+    /// Discard any deferred structural / resource / event operations WITHOUT
+    /// applying them (the phase-B script-system path, where applying them would
+    /// need a `&mut World` the concurrent stage does not grant — that is phase
+    /// B4). Frees the associated Lua registry slots so they do not leak. Returns
+    /// `true` if anything was discarded, so the caller can warn loudly (§0.2a).
+    pub(crate) fn discard_deferred_structural(&mut self, lua: &mlua::Lua) -> bool {
+        let mut had = false;
+        for (_name, key) in std::mem::take(&mut self.deferred_resource_writes) {
+            had = true;
+            let _ = lua.remove_registry_value(key);
+        }
+        for (_name, key) in std::mem::take(&mut self.deferred_events) {
+            had = true;
+            let _ = lua.remove_registry_value(key);
+        }
+        for req in std::mem::take(&mut self.deferred_spawns) {
+            had = true;
+            for (_name, key) in req.components {
+                let _ = lua.remove_registry_value(key);
+            }
+        }
+        // Despawns (and any other structural commands) buffered in `deferred`.
+        if !self.deferred.is_empty() {
+            had = true;
+            self.deferred.clear();
+        }
+        had
     }
 
     /// Get `&World` — read-only (query iterators).
