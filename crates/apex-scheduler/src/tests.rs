@@ -3176,6 +3176,42 @@
         assert_eq!(got, Some(42));
     }
 
+    /// B4b: `remove_system` drops a registered system — it no longer runs, while a
+    /// sibling with the SAME (conflicting) access keeps running, and its id stays
+    /// stable. Proves the id-map / index-list / graph rebuild is correct: removing
+    /// one of two Write<Val> systems (which the scheduler had sequenced into
+    /// separate stages) leaves a runnable plan. Removing a non-existent id is a
+    /// no-op returning `false`.
+    #[test]
+    fn remove_system_drops_it_and_rebuilds() {
+        #[derive(Component, Clone, Copy)]
+        struct Val(i32);
+
+        let mut world = World::new();
+        world.spawn((Val(0),));
+
+        let mut sched = Scheduler::new();
+        let add_ten = sched.add_dynamic_system("add_ten", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
+            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 += 10);
+        });
+        sched.add_dynamic_system("add_one", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
+            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 += 1);
+        });
+
+        sched.run(&mut world);
+        let mut got = 0;
+        Query::<Read<Val>>::new(&world).for_each(|_, v| got = v.0);
+        assert_eq!(got, 11, "both ran (+10, +1)");
+
+        // Remove add_ten; only add_one (+1) should run now.
+        assert!(sched.remove_system(add_ten), "existing id removed");
+        assert!(!sched.remove_system(add_ten), "already-removed id → no-op false");
+
+        sched.run(&mut world);
+        Query::<Read<Val>>::new(&world).for_each(|_, v| got = v.0);
+        assert_eq!(got, 12, "only add_one ran after removal (11 + 1); add_ten is gone");
+    }
+
     /// B1: a NonSend system's declared access PARTICIPATES in conflict detection.
     /// A NonSend writer and a Rust (parallel) writer of the SAME component both
     /// run and both writes land (each entity +2) — the conflict is seen, so there

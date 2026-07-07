@@ -309,6 +309,72 @@ fn script_system_spawns_are_deterministic() {
     assert_eq!(a, b, "script-system spawn ids are deterministic run-to-run (D8b)");
 }
 
+/// Hot-reload: re-registering after a script changes REPLACES the old script
+/// systems (they are removed from the scheduler), so the new behavior runs and
+/// the old does not. If removal failed, both would run and the value would be
+/// wrong.
+#[test]
+fn reregister_replaces_old_script_systems() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_scriptable::<Position>(&mut engine);
+    let e = world.spawn((Position { x: 0.0, y: 0.0 },));
+
+    // v1: bump x by 1.
+    engine
+        .load_script_str(
+            "gameplay",
+            r#"
+            system{
+                name = "bump",
+                query = {"Write:Position"},
+                fn = function()
+                    for e in query({"Write:Position"}) do
+                        e.position.x = e.position.x + 1.0
+                        commit(e)
+                    end
+                end,
+            }
+            "#,
+        )
+        .expect("v1 compiles");
+
+    let mut sched = Scheduler::new();
+    engine.register_systems(&mut sched);
+    sched.run(&mut world);
+    assert_eq!(world.get::<Position>(e).map(|p| p.x), Some(1.0), "v1 (+1) ran");
+
+    // Reload the SAME script name with new behavior: bump x by 10.
+    engine
+        .load_script_str(
+            "gameplay",
+            r#"
+            system{
+                name = "bump",
+                query = {"Write:Position"},
+                fn = function()
+                    for e in query({"Write:Position"}) do
+                        e.position.x = e.position.x + 10.0
+                        commit(e)
+                    end
+                end,
+            }
+            "#,
+        )
+        .expect("v2 compiles");
+
+    // Re-register: the old "bump" system must be removed and v2 registered.
+    engine.register_systems(&mut sched);
+    sched.run(&mut world);
+
+    assert_eq!(
+        world.get::<Position>(e).map(|p| p.x),
+        Some(11.0),
+        "only v2 (+10) ran after re-registration (1 + 10); the old v1 was removed \
+         (both running would give 12)"
+    );
+}
+
 /// A `system{}` referencing an UNREGISTERED component is refused registration
 /// (§0.2a: registering it with an under-declared access would be a data race), so
 /// it never runs and the world is untouched.

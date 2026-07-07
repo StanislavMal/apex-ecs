@@ -63,6 +63,10 @@ pub struct ScriptEngine {
     watch_rx:       Option<mpsc::Receiver<notify::Result<Event>>>,
     last_reload:    HashMap<String, Instant>,
     registered_components: Vec<String>,
+    /// Scheduler ids of the script systems this engine registered (phase B). Held
+    /// so a re-registration (hot-reload) can remove the previous set first, making
+    /// [`register_systems`](Self::register_systems) idempotent.
+    registered_system_ids: Vec<apex_scheduler::SystemId>,
 }
 
 impl ScriptEngine {
@@ -89,6 +93,7 @@ impl ScriptEngine {
             watch_rx:       None,
             last_reload:    HashMap::new(),
             registered_components: Vec::new(),
+            registered_system_ids: Vec::new(),
         }
     }
 
@@ -481,7 +486,17 @@ impl ScriptEngine {
     ///
     /// The monolithic [`run`](Self::run) remains the fallback for scripts that
     /// define a top-level `run()` instead of `system{}` declarations.
+    ///
+    /// Idempotent: calling it again (e.g. after a hot-reload) first REMOVES the
+    /// previously-registered script systems from the scheduler, then re-registers
+    /// from the current declarations — so a reloaded script's changed `system{}`
+    /// set replaces the old one cleanly (no duplicate/stale systems).
     pub fn register_systems(&mut self, scheduler: &mut apex_scheduler::Scheduler) {
+        // Remove the previous generation of script systems (hot-reload safety).
+        for id in std::mem::take(&mut self.registered_system_ids) {
+            scheduler.remove_system(id);
+        }
+
         // Run the active script's chunk so its top-level `system{}` calls record
         // their declarations on the context. (No world access here — `system{}`
         // only records name/query/fn.)
@@ -539,7 +554,7 @@ impl ScriptEngine {
             let write_ids = access.write_ids;
             let sys_name = decl.name.clone();
 
-            scheduler.add_dynamic_nonsend_system(
+            let sys_id = scheduler.add_dynamic_nonsend_system(
                 decl.name,
                 access.descriptor,
                 move |sys_ctx: apex_core::world::SystemContext<'_>| {
@@ -588,6 +603,7 @@ impl ScriptEngine {
                     }
                 },
             );
+            self.registered_system_ids.push(sys_id);
         }
     }
 

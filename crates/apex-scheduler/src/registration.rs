@@ -620,6 +620,71 @@ impl Scheduler {
         id
     }
 
+    /// Remove a previously-registered system by its [`SystemId`]. Returns `true`
+    /// if a system with that id existed and was removed.
+    ///
+    /// Removing a system shifts the positional `systems` vector, so the id→index
+    /// map and the seq/par index lists are rebuilt, the id is dropped from every
+    /// id-keyed structure, and any ordering edge referencing it is pruned. The
+    /// incremental dependency graph is reset (the next [`compile`](Self::compile)
+    /// rebuilds it from the surviving systems) — robust and cheaper to reason
+    /// about than surgical node/edge deletion, and hot-reload is infrequent.
+    ///
+    /// `SystemId`s are monotonic and never reused, so surviving systems keep their
+    /// ids (only their positions change). Intended for dynamic reconfiguration
+    /// such as script hot-reload (re-registering a script's systems).
+    pub fn remove_system(&mut self, id: SystemId) -> bool {
+        let Some(&index) = self.system_indices.get(&id) else {
+            return false;
+        };
+
+        // 1. Drop the descriptor, preserving the relative order of the rest.
+        self.systems.remove(index);
+
+        // 2. Rebuild the id→index map and the seq/par index lists (positions of
+        //    every system after `index` shifted down by one).
+        self.system_indices.clear();
+        self.seq_system_indices.clear();
+        self.par_system_indices.clear();
+        for (i, sys) in self.systems.iter().enumerate() {
+            self.system_indices.insert(sys.id, i);
+            if sys.kind.is_parallelizable() {
+                self.par_system_indices.push(i);
+            } else {
+                self.seq_system_indices.push(i);
+            }
+        }
+
+        // 3. Drop the id from every id-keyed structure.
+        self.system_archetype_indices.remove(&id);
+        self.system_last_run.remove(&id);
+        self.system_spawn_history.remove(&id);
+
+        // 4. Prune ordering references to the removed id.
+        self.explicit_orderings.retain(|(a, b)| *a != id && *b != id);
+        self.pending_orderings.retain(|(a, b)| {
+            !matches!(a, OrderEndpoint::Id(x) if *x == id)
+                && !matches!(b, OrderEndpoint::Id(x) if *x == id)
+        });
+        for sys in &mut self.systems {
+            sys.before.retain(|x| *x != id);
+            sys.after.retain(|x| *x != id);
+        }
+        if self.last_added_system_id == Some(id) {
+            self.last_added_system_id = None;
+        }
+
+        // 5. Reset the incremental dependency graph — the next compile rebuilds it
+        //    from the surviving systems (all "new" to an empty graph).
+        self.dependency_graph = Graph::new();
+        self.graph_nodes.clear();
+        self.edge_set.clear();
+        self.edge_info.clear();
+
+        self.invalidate_plan();
+        true
+    }
+
     // Stage-parallelism gating is configured on the World, not the scheduler
     // (wave 3, §1.7): `world.set_chunk_config(ChunkConfig {
     // stage_parallel_min_entities, auto_disable_stage_parallel, ..default() })`.
