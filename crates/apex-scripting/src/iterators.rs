@@ -371,10 +371,9 @@ pub(crate) fn commit_entity_table(
         return Ok(());
     }
 
-    // SAFETY: the commit runs between Lua iterations, so no other borrow of the
-    // world is live, and the gather phase above already released its ctx/Lua
-    // reads (see `ScriptContext::world_ptr_mut`).
-    let world = unsafe { &mut *ctx.world_ptr_mut() };
+    // Access the world as SHARED `&World` (the gather phase above already
+    // released its ctx/Lua reads).
+    let world = ctx.world_ref();
 
     // Build a dynamic WRITE query declaring exactly the components we intend to
     // write. `get_mut(entity)` re-resolves the entity against the LIVE allocator:
@@ -383,12 +382,18 @@ pub(crate) fn commit_entity_table(
     // access goes through `DynItemMut::get_mut_ptr`, which enforces the write
     // declaration (S7) and stamps the change tick.
     //
-    // Trust boundary: the write-set comes from `_meta.writes` (script-authored),
-    // so the S7 gate is tautological in this phase-A path — its scheduler-visible
-    // enforcement arrives with phase-B script systems that declare access up
-    // front. Memory safety does not depend on it: id-resolution plus the
-    // allocator lookup rule out OOB and type confusion whatever `_meta` claims.
-    let mut qb = world.query_builder_mut();
+    // SAFETY: `query_builder_mut_declared` writes only the declared columns
+    // through interior mutability and never forms a `&mut World`, so it is sound
+    // to call while a concurrent parallel stage holds only `&World` (a phase-B
+    // NonSend script system runs on the main thread alongside disjoint workers).
+    // The write access IS declared to the scheduler: for a phase-B `system{}`
+    // runner via the registrar's `AccessDescriptor`; for the monolithic `run()`
+    // fallback the engine holds exclusive `&mut World`, so the contract holds
+    // trivially. Trust boundary: the write-set here comes from `_meta.writes`
+    // (script-authored) — the S7 gate on `get_mut_ptr` still rejects any id the
+    // runner did not declare (phase B), and memory safety never depends on it
+    // (id-resolution + the allocator lookup rule out OOB / type confusion).
+    let mut qb = unsafe { world.query_builder_mut_declared() };
     for (id, _, _) in &plan {
         qb = qb.write_id(*id);
     }

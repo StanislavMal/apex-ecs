@@ -2031,6 +2031,23 @@ impl World {
         crate::query::QueryBuilderMut::new(self)
     }
 
+    /// Dynamic READ/WRITE query from a SHARED `&World`, for a runtime-declared
+    /// system (scripting / agent-IPC) whose write access the SCHEDULER validated.
+    /// Component writes go through the world's interior-mutable columns, so no
+    /// `&mut World` is formed — sound to call while the stage holds only `&World`
+    /// (a concurrent NonSend system on the main thread). See
+    /// [`QueryBuilderMut::from_declared_cell`](crate::query::QueryBuilderMut::from_declared_cell).
+    ///
+    /// # Safety
+    /// The caller MUST have declared every written component to the scheduler,
+    /// which MUST have serialized this system against every conflicting one (the
+    /// same disjoint-access contract as a worker's SubWorld). An under-declared
+    /// write is a data race.
+    #[doc(hidden)]
+    pub unsafe fn query_builder_mut_declared(&self) -> crate::query::QueryBuilderMut<'_> {
+        crate::query::QueryBuilderMut::from_declared_cell(self)
+    }
+
     // ── Internal methods ───────────────────────────────────────
 
     pub(crate) fn find_or_create_archetype_with(
@@ -2601,6 +2618,23 @@ impl<'w> SystemContext<'w> {
     /// Get the World (for backward compatibility).
     /// Used for query, resource, and event access.
     fn world(&self) -> &'w World {
+        self.sub_worlds[0].world()
+    }
+
+    /// `&World` escape hatch for a runtime-declared runner (a dynamic script /
+    /// agent-IPC system registered via
+    /// [`add_dynamic_nonsend_system`](../../apex_scheduler) whose access is known
+    /// only at run time). The runner must have DECLARED every component it reads
+    /// or writes — exactly like [`query_unchecked`](Self::query_unchecked) — so
+    /// the scheduler serialized conflicting systems and a whole-world `&World`
+    /// restricted to the declared components (mutation goes through the world's
+    /// interior-mutable columns, never a `&mut World`) is sound.
+    ///
+    /// `#[doc(hidden)]`: an internal scheduler↔runner seam, not blessed public
+    /// API (a typed system declares access as parameters instead).
+    #[doc(hidden)]
+    #[inline]
+    pub fn world_ref(&self) -> &World {
         self.sub_worlds[0].world()
     }
 

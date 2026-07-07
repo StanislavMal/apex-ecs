@@ -2672,26 +2672,70 @@ impl<'w> QueryBuilder<'w> {
 
 /// Builder for a runtime-composed (dynamic) WRITE query.
 ///
-/// Same term vocabulary as [`QueryBuilder`], but built from `&mut World` so
-/// the resulting [`DynQueryMut`] can hand out `&mut T` soundly (B1(v)). Terms
-/// use `&mut self` chaining. `write_*` terms request mutable access; the same
+/// Same term vocabulary as [`QueryBuilder`]. Two ways to construct it:
+/// - [`new`](Self::new) from `&mut World` — exclusivity proven by the borrow
+///   checker (the safe path).
+/// - [`from_declared_cell`](Self::from_declared_cell) from `&World` — for a
+///   runtime-declared system (scripting / agent-IPC) whose write access the
+///   SCHEDULER validated; exclusivity of the written columns is guaranteed by
+///   the declared access + conflict serialization, not by `&mut World`.
+///
+/// Either way the resulting [`DynQueryMut`] hands out `&mut T` through the
+/// world's interior-mutable columns (never a live `&mut World`), so both paths
+/// share one implementation. `write_*` terms request mutable access; the same
 /// component may not be written twice ([`DynQueryError::AliasedWrite`]).
 pub struct QueryBuilderMut<'w> {
-    world: &'w mut World,
+    /// Held as a cell (not `&mut World`) so the shared-`&World` construction path
+    /// never forms a `&mut World`. Term-building reads it as `&World`; `build`
+    /// hands the cell straight to `DynQueryMut` (which mutates only columns).
+    world: UnsafeWorldCell<'w>,
     terms: DynTerms,
 }
 
 impl<'w> QueryBuilderMut<'w> {
     pub fn new(world: &'w mut World) -> Self {
         Self {
-            world,
+            world: world.as_unsafe_world_cell(),
             terms: DynTerms::default(),
         }
     }
 
+    /// Build a WRITE query from a SHARED `&World` for a runtime-declared system
+    /// whose access the scheduler has validated. See [`QueryBuilderMut`].
+    ///
+    /// # Safety
+    /// The caller MUST have declared every component it will `write_*` to the
+    /// scheduler, which MUST have serialized this system against every
+    /// conflicting one — so no other actor concurrently accesses the written
+    /// columns. This is the same disjoint-access contract a worker's SubWorld
+    /// relies on; unlike [`new`](Self::new) it is NOT enforced by `&mut World`,
+    /// so an under-declared write here is a data race.
+    ///
+    /// `#[doc(hidden)]`: an internal escape for the dynamic-runner layer (mirrors
+    /// [`Query::new_unchecked`]), not blessed public API.
+    #[doc(hidden)]
+    pub unsafe fn from_declared_cell(world: &'w World) -> Self {
+        Self {
+            world: world.as_unsafe_world_cell_readonly(),
+            terms: DynTerms::default(),
+        }
+    }
+
+    /// Shared view of the world for term-building. The cell is `Copy`, so the
+    /// returned `&World` is tied to the cell's `'w`, not to `&self` — leaving the
+    /// builder's own fields free to be mutated alongside it.
+    ///
+    /// SAFETY: only ever vends a SHARED view; no `&mut World` is derived from the
+    /// cell during building (the mutable column access happens later, in
+    /// [`DynQueryMut`], through interior mutability).
+    #[inline]
+    fn world_view(&self) -> &'w World {
+        unsafe { self.world.world() }
+    }
+
     /// Read access to `T`.
     pub fn read<T: Component>(mut self) -> Self {
-        self.terms.reads.push(DynTerms::id_of::<T>(self.world));
+        self.terms.reads.push(DynTerms::id_of::<T>(self.world_view()));
         self
     }
 
@@ -2703,7 +2747,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Read access by full type name (unknown name is loud at build).
     pub fn read_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.reads.push(id);
         }
         self
@@ -2711,7 +2755,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Mutable access to `T`.
     pub fn write<T: Component>(mut self) -> Self {
-        self.terms.writes.push(DynTerms::id_of::<T>(self.world));
+        self.terms.writes.push(DynTerms::id_of::<T>(self.world_view()));
         self
     }
 
@@ -2723,7 +2767,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Mutable access by full type name (unknown name is loud at build).
     pub fn write_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.writes.push(id);
         }
         self
@@ -2731,7 +2775,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Presence filter: archetype must contain `T`.
     pub fn with<T: Component>(mut self) -> Self {
-        self.terms.withs.push(DynTerms::id_of::<T>(self.world));
+        self.terms.withs.push(DynTerms::id_of::<T>(self.world_view()));
         self
     }
 
@@ -2743,7 +2787,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Presence filter by full type name.
     pub fn with_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.withs.push(id);
         }
         self
@@ -2751,7 +2795,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Absence filter: archetype must NOT contain `T`.
     pub fn exclude<T: Component>(mut self) -> Self {
-        self.terms.excludes.push(DynTerms::id_of::<T>(self.world));
+        self.terms.excludes.push(DynTerms::id_of::<T>(self.world_view()));
         self
     }
 
@@ -2763,7 +2807,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// Absence filter by full type name.
     pub fn exclude_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.excludes.push(id);
         }
         self
@@ -2773,26 +2817,26 @@ impl<'w> QueryBuilderMut<'w> {
     /// [`QueryBuilder::with_relation`] — same per-entity semantics on the write
     /// path.
     pub fn with_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
-        self.terms.push_relation::<R>(self.world, Some(target), false);
+        self.terms.push_relation::<R>(self.world_view(), Some(target), false);
         self
     }
 
     /// Relation term: the entity must have relation `R` to ANY target.
     pub fn with_any_relation<R: crate::relations::RelationKind>(mut self, _kind: R) -> Self {
-        self.terms.push_relation::<R>(self.world, None, false);
+        self.terms.push_relation::<R>(self.world_view(), None, false);
         self
     }
 
     /// Absence relation term: the entity must NOT have relation `R` to `target`.
     pub fn without_relation<R: crate::relations::RelationKind>(mut self, _kind: R, target: Entity) -> Self {
-        self.terms.push_relation::<R>(self.world, Some(target), true);
+        self.terms.push_relation::<R>(self.world_view(), Some(target), true);
         self
     }
 
     /// S8: change filter — the entity's `T` must have CHANGED since the baseline
     /// ([`since`](Self::since)). Requires `T` present. See [`QueryBuilder::changed`].
     pub fn changed<T: Component>(mut self) -> Self {
-        self.terms.push_change(DynTerms::id_of::<T>(self.world), false);
+        self.terms.push_change(DynTerms::id_of::<T>(self.world_view()), false);
         self
     }
 
@@ -2804,7 +2848,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// S8: change filter by full type name (unknown name is loud at build).
     pub fn changed_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.push_change(id, false);
         }
         self
@@ -2812,7 +2856,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// S8: added filter — `T` must have been ADDED (added tick) since the baseline.
     pub fn added<T: Component>(mut self) -> Self {
-        self.terms.push_change(DynTerms::id_of::<T>(self.world), true);
+        self.terms.push_change(DynTerms::id_of::<T>(self.world_view()), true);
         self
     }
 
@@ -2824,7 +2868,7 @@ impl<'w> QueryBuilderMut<'w> {
 
     /// S8: added filter by full type name (unknown name is loud at build).
     pub fn added_name(mut self, name: &str) -> Self {
-        if let Some(id) = self.terms.resolve_name(self.world, name) {
+        if let Some(id) = self.terms.resolve_name(self.world_view(), name) {
             self.terms.push_change(id, true);
         }
         self
@@ -2839,16 +2883,17 @@ impl<'w> QueryBuilderMut<'w> {
     /// Build the read/write dynamic query.
     ///
     /// Errors loudly on unresolved names and on a component written twice
-    /// (§0.2a / C2). Consumes the `&mut World` borrow into the query.
+    /// (§0.2a / C2). Hands the world cell straight to the query.
     pub fn build(self) -> Result<DynQueryMut<'w>, DynQueryError> {
         if let Some(name) = self.terms.unknown {
             return Err(DynQueryError::UnknownComponent(name));
         }
         self.terms.check_write_alias()?;
-        let arch_ids = self.terms.matching_archetype_ids(self.world);
-        let last_run = self.terms.since.unwrap_or_else(|| self.world.last_run_tick());
+        let world = self.world_view();
+        let arch_ids = self.terms.matching_archetype_ids(world);
+        let last_run = self.terms.since.unwrap_or_else(|| world.last_run_tick());
         Ok(DynQueryMut {
-            world: self.world.as_unsafe_world_cell(),
+            world: self.world,
             reads: self.terms.reads,
             writes: self.terms.writes,
             arch_ids,
@@ -4456,6 +4501,50 @@ mod dyn_query_tests {
             Some(&Mana(50)),
             "Mana untouched — undeclared write refused"
         );
+    }
+
+    /// B3a: a WRITE query built from a SHARED `&World` via
+    /// `query_builder_mut_declared` (the runtime-declared / scripting path) writes
+    /// its declared component through interior mutability — WITHOUT ever forming a
+    /// `&mut World` — and the S7 gate still refuses an undeclared write. This is
+    /// the primitive that makes a phase-B NonSend script system sound while the
+    /// parallel stage holds only `&World`.
+    #[test]
+    fn dyn_write_from_declared_cell_writes_and_gates() {
+        let mut world = World::new();
+        let a = world.spawn((Hp(100), Mana(50)));
+        let hp_id = world.component_id_by_name(type_name::<Hp>()).unwrap();
+        let mana_id = world.component_id_by_name(type_name::<Mana>()).unwrap();
+
+        // A SHARED borrow only — as a concurrent parallel stage would hold.
+        let world_ref: &World = &world;
+        // SAFETY: this is the sole accessor of Hp in this test; the contract that
+        // the scheduler would otherwise enforce is trivially met here.
+        let mut q = unsafe { world_ref.query_builder_mut_declared() }
+            .write_id(hp_id)
+            .read_id(mana_id)
+            .build()
+            .unwrap();
+        assert_eq!(q.writes(), &[hp_id]);
+
+        q.for_each_mut(|mut item| {
+            // Declared write applied through the interior-mutable column.
+            item.get_mut::<Hp>(hp_id).unwrap().0 += 5;
+            // Shared read of the read-declared component still works.
+            assert_eq!(item.get::<Mana>(mana_id).map(|m| m.0), Some(50));
+            // S7: an undeclared write is refused even on the shared-cell path.
+            assert!(
+                item.get_mut_ptr(mana_id).is_none(),
+                "read-declared Mana must not yield a mut ptr on the declared-cell path"
+            );
+        });
+
+        assert_eq!(
+            world.get::<Hp>(a),
+            Some(&Hp(105)),
+            "declared write via the shared-&World cell persisted"
+        );
+        assert_eq!(world.get::<Mana>(a), Some(&Mana(50)), "undeclared write refused");
     }
 
     #[test]

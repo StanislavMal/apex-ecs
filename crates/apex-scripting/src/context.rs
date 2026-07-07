@@ -157,25 +157,6 @@ impl ScriptContext {
             .as_mut()
     }
 
-    /// Raw `*mut World` obtained from a SHARED `&self`.
-    ///
-    /// The dynamic write path (`commit_entity_table` → `DynQueryMut`) needs
-    /// exclusive world access, but the commit runs while the caller only holds a
-    /// shared `&ScriptContext` (the `RefCell` borrow that reaches the bindings).
-    /// The pointer targets the `World`, a distinct allocation from this
-    /// `ScriptContext`, so a `&mut World` derived from it does not alias the
-    /// `&self` borrow. Obtaining the pointer is safe; **dereferencing it** is
-    /// sound only when no other borrow of the pointed-to `World` is live — the
-    /// commit points satisfy this (a Lua `commit`/auto-commit runs BETWEEN query
-    /// iterations, after the previous `next()` returned its `&World`, and the
-    /// gather phase touches only bindings + the Lua table, never the world). See
-    /// the module invariant (ptr valid exactly within `run()`).
-    pub(crate) fn world_ptr_mut(&self) -> *mut World {
-        self.world_ptr
-            .expect("ScriptContext::world_ptr_mut called outside run()")
-            .as_ptr()
-    }
-
     // ── API for Lua functions ─────────────────────────────────
 
     pub fn delta_time(&self) -> f32 {
