@@ -496,11 +496,14 @@ clippy `--all-targets` net-neutral (4 pre-existing serialization/bench), Miri TB
 write, remove_system, nonsend concurrency); **движок `check --workspace` ✅ + goldens `visual_tests`
 649/0/9 БАЙТ-ИДЕНТИЧНЫ** ✅ (скриптинг в render-путь не входит). НЕ запушено.
 
-**Открытый хвост фазы B (мелочь, §0.2a-честно):** resource-write/event ops из скрипт-СИСТЕМЫ (не из
-монолита) требуют `&mut World` (не entity-local Commands-op) → сейчас громкий drop+warn; применять их
-из скрипт-системы = отдельный заход (deferred-typed-value binding через `commands.add(Send-closure)`),
-либо использовать Rust-систему/монолит. Spawn/despawn покрыты (per-system Commands). Фаза C (Lua↔Lua
-VM-пул) — ⛔ ROI-gated, вне кампании.
+**Хвост фазы B ✅ ЗАКРЫТ (golden path, `5b32b92`):** resource-write/event ops из скрипт-СИСТЕМЫ теперь
+применяются через per-system Commands-слот. Биндинги `ResourceBinding.write`/`EventBinding.emit` →
+`defer_write`/`defer_emit: fn(&Value)->Option<DeferredWorldOp=Box<dyn FnOnce(&mut World)+Send>>` (типизированное
+значение извлекается ПОКА жив VM → Send-замыкание). ЕДИНЫЙ путь: `drain_global_ops` + монолит и раннер
+дренят ВСЕ отложенные эффекты (despawn/spawn/resource/event) в один Commands. Раз `&mut World` из
+world_ptr больше не выводится нигде — set_world_ptr mut/shared схлопнут в один `set_world_ptr(&World)`,
+`world_mut`/drop-warn удалены. Тест `script_system_resource_and_event_apply_through_commands`. Фаза C
+(Lua↔Lua VM-пул) — ⛔ ROI-gated, вне кампании. **Открытых хвостов фазы B нет.**
 
 **⚠ B3 — уточнение дизайна (переоценка §0.2b, soundness):** план предполагал раннер использует
 «query()/commit() = путь фазы A», но commit фазы A = `&mut *world_ptr_mut()` → `query_builder_mut()`
