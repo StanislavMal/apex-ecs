@@ -486,9 +486,36 @@ scheduler ВНУТРИ `install`-замыкания (Scheduler живёт цел
 
 **Шаги (каждый — атомарный коммит со своими тестами + полные гейты шапки):**
 
-**Прогресс:** B1 ✅ (коммит `b39e0b1`) — фундамент NonSend, `Scheduler: !Send`. B2 ✅ (этот коммит) —
-параллельный executor (Lua‖Rust через `rayon::in_place_scope`; concurrency-тест rendezvous + Miri TB
-чист + goldens 649/0/9). ДАЛЬШЕ: B3 (ScriptVm+registrar+Lua-runner), B4 (детерминизм+hot-reload).
+**Прогресс: ФАЗА B ✅ ПОЛНОСТЬЮ (B1–B4).** B1 ✅ (`b39e0b1`) — фундамент NonSend, `Scheduler: !Send`.
+B2 ✅ (`6b545d9`) — параллельный executor (Lua‖Rust через `rayon::in_place_scope`; rendezvous + Miri TB).
+B3 ✅ (B3a `12a92ab` core-примитив declared-cell + B3b/c `6bd642c` scripting-интеграция `system{}`).
+B4 ✅ (B4a `cd5f532` spawn/despawn через per-system Commands + детерминизм-гейт; B4b `c6cdd49`
+`Scheduler::remove_system` + идемпотентный hot-reload re-register). **Гейт фазы B ПРОЙДЕН:** apex-ecs
+workspace зелёный (scheduler 108 + scripting 10 unit/4 access/9 engine_e2e/8 script_systems_e2e),
+clippy `--all-targets` net-neutral (4 pre-existing serialization/bench), Miri TB чист (declared-cell
+write, remove_system, nonsend concurrency); **движок `check --workspace` ✅ + goldens `visual_tests`
+649/0/9 БАЙТ-ИДЕНТИЧНЫ** ✅ (скриптинг в render-путь не входит). НЕ запушено.
+
+**Открытый хвост фазы B (мелочь, §0.2a-честно):** resource-write/event ops из скрипт-СИСТЕМЫ (не из
+монолита) требуют `&mut World` (не entity-local Commands-op) → сейчас громкий drop+warn; применять их
+из скрипт-системы = отдельный заход (deferred-typed-value binding через `commands.add(Send-closure)`),
+либо использовать Rust-систему/монолит. Spawn/despawn покрыты (per-system Commands). Фаза C (Lua↔Lua
+VM-пул) — ⛔ ROI-gated, вне кампании.
+
+**⚠ B3 — уточнение дизайна (переоценка §0.2b, soundness):** план предполагал раннер использует
+«query()/commit() = путь фазы A», но commit фазы A = `&mut *world_ptr_mut()` → `query_builder_mut()`
+(нужен `&mut World`), звучно ЛИШЬ когда ptr от genuine `&mut World` (монолит). В B3 раннер получает
+`&World` (`ctx.world_ref()`), а стадия B2 держит `&World` (`run_stage_parallel(world: &World)`; воркеры
+пишут через UnsafeCell из `*const World`). Формировать `&mut World` из `&World`-провенанса = **UB под
+Tree Borrows**. **Фикс (B3a, foundation-first):** `QueryBuilderMut` держит `UnsafeWorldCell` (не
+`&mut World`); новый `#[doc(hidden)] unsafe QueryBuilderMut::from_declared_cell(&World)` +
+`World::query_builder_mut_declared(&self)` — write-запрос из `&World` под контрактом декларированного
+доступа (эксклюзив доказывает планировщик, не `&mut World`; запись только в UnsafeCell-колонки, `&mut
+World` НЕ формируется). commit пересажен на `ctx.world_ref()`+declared-cell; `ScriptContext::world_ptr_mut`
+удалён. Работает и для монолита (эксклюзив тривиален), и для B3-раннера (звучно под конкуренцией).
+**Бонус: этот core-путь Miri-абелен** (чистый core) — покрыт `dyn_write_from_declared_cell_writes_and_gates`
+(Miri TB чист), чего mlua-путь фазы A не мог. Раннер НЕ зовёт `world_mut()`; структурные ops (spawn/
+despawn/resource/event) из скрипт-СИСТЕМЫ → B4 (per-system Commands); в B3 громкий drop+warn (§0.2a).
 
 - **B1 — фундамент NonSend (корректность-first, БЕЗ параллелизма):** `trait NonSendSystem {
   fn run(&mut self, ctx: SystemContext) }` (без Send/Sync); `SystemKind::NonSend { system:
@@ -509,7 +536,7 @@ scheduler ВНУТРИ `install`-замыкания (Scheduler живёт цел
   дизъюнктности, что воркер↔воркер). Per-system Commands-слот + `last_run`-окно как у прочих
   single-task. Тест: Lua-система `Write:Position` НЕ параллелится с Rust `Write:Position`,
   параллелится с независимой; детерминизм-гейт; goldens байт-идентичны.
-- **B3 — ScriptVm-токен + registrar `system{}` + Lua-runner:** `ScriptVm` — ZST-маркер-ресурс;
+- **B3 ✅ — ScriptVm-токен + registrar `system{}` + Lua-runner:** `ScriptVm` — ZST-маркер-ресурс;
   Lua-система декларирует write на него (→ Lua↔Lua сериализация) + component reads/writes из
   `QueryDesc` (через `ctx.binding`→`ComponentId`). Script-API `system{ name, query={...}, fn }`;
   runner (NonSend) держит `Rc<Lua>`+`Rc<RefCell<ScriptContext>>`+fn-handle+**доверенный write-set**
@@ -518,7 +545,7 @@ scheduler ВНУТРИ `install`-замыкания (Scheduler живёт цел
   без деклараций остаётся fallback = одна эксклюзивная (NonSend) система. Enforcement
   «только декларированные компоненты»: ScriptContext получает декларированные read/write ids →
   query()/commit() резолвят только их (undeclared → `anomaly!`).
-- **B4 — детерминизм спавнов + hot-reload:** script-спавны через per-system Commands-слот (D8b,
+- **B4 ✅ — детерминизм спавнов + hot-reload:** script-спавны через per-system Commands-слот (D8b,
   уже даёт детерминированные id для single-task на main); hot-reload = re-register скрипт-систем
   при reload (декларации могли смениться) → `invalidate_plan` → re-compile (планировщик умеет по
   dirty). Тест: детерминизм-гейт + script-спавн; hot-reload E2E.
