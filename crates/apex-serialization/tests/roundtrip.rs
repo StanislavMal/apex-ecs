@@ -331,7 +331,7 @@ fn corrupt_json_fails_to_parse() {
 }
 
 /// A snapshot from a newer, unmigratable format version is rejected loudly by
-/// `restore` (which does not migrate) with the expected/found versions.
+/// `restore` with the expected/found versions (no forward migrator exists).
 #[test]
 fn future_version_is_rejected_by_restore() {
     let mut world = World::new();
@@ -350,6 +350,37 @@ fn future_version_is_rejected_by_restore() {
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
+}
+
+/// An OLDER-version snapshot restores by migrating internally — the golden-path
+/// fix for A2. This exercises the same path the editor uses (`restore` /
+/// `restore_with`, not `read_from_file`), which previously bypassed migration
+/// and hard-rejected old versions. A v1 snapshot (pre-`resources`, v1→v2 no-op
+/// migrator) must load its entity + component through restore's centralised migrate.
+#[test]
+fn older_version_snapshot_is_migrated_on_restore() {
+    let mut world = World::new();
+    register_vocabulary(&mut world);
+    world.spawn((Position { x: 3.0, y: 4.0 },));
+    let mut snap = WorldSerializer::snapshot(&world).unwrap();
+    assert_eq!(snap.version, WorldSnapshot::CURRENT_VERSION);
+
+    // Downgrade the envelope to the previous version (as if loaded from an old
+    // on-disk scene). The caller's copy must NOT be mutated by restore.
+    snap.version = WorldSnapshot::CURRENT_VERSION - 1;
+
+    let mut restored = World::new();
+    register_vocabulary(&mut restored);
+    let map = WorldSerializer::restore(&mut restored, &snap)
+        .expect("old-version snapshot must migrate + restore, not be rejected");
+
+    assert_eq!(map.len(), 1, "the single entity must be restored");
+    // restore migrated a throwaway copy — the caller's snapshot is untouched.
+    assert_eq!(snap.version, WorldSnapshot::CURRENT_VERSION - 1);
+    // The migrated entity carries its component.
+    let (&_old, &new_entity) = map.iter().next().unwrap();
+    let pos = restored.get::<Position>(new_entity).expect("Position restored");
+    assert_eq!((pos.x, pos.y), (3.0, 4.0));
 }
 
 /// If a component's stored bytes are corrupt, restore must surface

@@ -202,7 +202,7 @@ impl WorldSerializer {
     /// Restore a world from a snapshot. Plain (de)serialization — for components with external references
     /// see [`restore_with`](Self::restore_with).
     ///
-    /// Before calling, you can call `snapshot.migrate()` if the version is outdated.
+    /// Older snapshot versions are migrated automatically (see `restore_with`).
     pub fn restore(
         world:    &mut World,
         snapshot: &WorldSnapshot,
@@ -212,17 +212,37 @@ impl WorldSerializer {
 
     /// Restore a world from a snapshot with a **(de)serialization context** (TD-44): context-dependent
     /// components resolve external references through `ctx`. Plain components ignore `ctx`.
+    ///
+    /// # Versioning (single choke point)
+    /// Migration is centralised here — the universal path every consumer passes through — so no loader
+    /// can skip it. An older-version snapshot is migrated up to [`WorldSnapshot::CURRENT_VERSION`] on a
+    /// throwaway working copy (the caller's snapshot is not mutated; the clone happens only on the rare
+    /// old-version path — a current-version snapshot restores with no copy). A newer, unmigratable
+    /// version is rejected with [`SerializationError::VersionMismatch`]. Previously the check was a strict
+    /// equality that rejected old versions too, and migration only ran in `read_from_file` — so the
+    /// editor's `from_json` + `restore_with` byte path silently bypassed it.
     pub fn restore_with(
         world:    &mut World,
         snapshot: &WorldSnapshot,
         ctx:      &mut dyn apex_core::SerdeContext,
     ) -> Result<RestoreEntityMap, SerializationError> {
-        if snapshot.version != WorldSnapshot::CURRENT_VERSION {
+        // Bring the snapshot to the current version (migrate old; reject future). The migrated copy is
+        // only allocated when the version is actually behind; at the current version `snapshot` is used
+        // directly, so the common path is allocation-free.
+        let migrated;
+        let snapshot = if snapshot.version == WorldSnapshot::CURRENT_VERSION {
+            snapshot
+        } else if snapshot.version < WorldSnapshot::CURRENT_VERSION {
+            let mut working = snapshot.clone();
+            working.migrate().map_err(SerializationError::Migration)?;
+            migrated = working;
+            &migrated
+        } else {
             return Err(SerializationError::VersionMismatch {
                 expected: WorldSnapshot::CURRENT_VERSION,
                 found:    snapshot.version,
             });
-        }
+        };
 
         let mut entity_map: RestoreEntityMap = HashMap::with_capacity(snapshot.entities.len());
         // Mark all restored data as **freshly changed at load time**: bump the change tick and stamp the
@@ -497,6 +517,17 @@ impl WorldSerializer {
         base: &WorldSnapshot,
         diff: &WorldDiff,
     ) -> Result<WorldSnapshot, SerializationError> {
+        // The diff embeds the same versioned wire structs as the base snapshot, so
+        // its wire version must match the base's. Mismatched versions would splice
+        // structs of a different shape — reject loudly rather than corrupt (§0.2a).
+        // (Previously `WorldDiff::version` was serialized but never checked.)
+        if diff.version != base.version {
+            return Err(SerializationError::VersionMismatch {
+                expected: base.version,
+                found:    diff.version,
+            });
+        }
+
         let mut result = base.clone();
 
         // Remove entities
@@ -629,11 +660,10 @@ impl WorldSerializer {
             }
         };
 
-        // §0.2a (E7): centralise versioning on the load path (read → migrate →
-        // restore). migrate() used to never run here, so an older-version save
-        // parsed fine but was then rejected by restore's version check with no
-        // migration attempted. Bring it to CURRENT_VERSION now (or fail loudly
-        // if it is too old to migrate) so callers get a restorable snapshot.
+        // Return a current-version snapshot for callers that inspect or re-save it
+        // WITHOUT restoring (restore migrates internally, so a restore-only caller
+        // does not depend on this). `migrate()` is idempotent — a current-version
+        // read is a no-op — and is the single migration routine shared with restore.
         snap.migrate().map_err(SerializationError::Migration)?;
         Ok(snap)
     }
@@ -723,6 +753,7 @@ impl WorldSerializer {
         }
 
         Ok(PrefabManifest {
+            version: PrefabManifest::CURRENT_VERSION,
             name: format!("entity_{}", entity.index()),
             components,
             children: Vec::new(),

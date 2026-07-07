@@ -12,36 +12,18 @@
 use serde::{Deserialize, Serialize};
 
 // ── Versioning ───────────────────────────────────────────────────
-
-/// Snapshot format version — major + minor.
-///
-/// - The major version changes on a breaking change
-/// - The minor version changes on backward-compatible changes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotVersion {
-    pub major: u32,
-    pub minor: u32,
-}
-
-impl SnapshotVersion {
-    pub const CURRENT: Self = Self { major: 2, minor: 0 };
-
-    pub fn new(major: u32, minor: u32) -> Self {
-        Self { major, minor }
-    }
-
-    /// Check whether this version is compatible with the given one.
-    /// Compatible = same major, minor >= expected.
-    pub fn is_compatible_with(&self, expected: SnapshotVersion) -> bool {
-        self.major == expected.major && self.minor >= expected.minor
-    }
-}
-
-impl std::fmt::Display for SnapshotVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "v{}.{}", self.major, self.minor)
-    }
-}
+//
+// The wire format has ONE version scheme: the `u32` on the envelope
+// ([`WorldSnapshot::version`]) plus the migration chain ([`WorldSnapshot::migrate`]).
+// "Compatible" is defined operationally — a snapshot is loadable iff it can be
+// migrated up to [`WorldSnapshot::CURRENT_VERSION`] (older versions migrate;
+// the current version loads as-is; a newer version is rejected because no
+// forward migrator exists). There is no separate semver type: a second,
+// unused `SnapshotVersion { major, minor }` used to shadow this `u32` with a
+// contradictory (range-based) compatibility policy and was removed so the
+// version has a single source of truth. [`WorldDiff`] shares this same wire
+// version — it is a delta over the same versioned wire structs, so its version
+// tracks [`WorldSnapshot::CURRENT_VERSION`] and is checked on apply.
 
 // ── Component data storage format ───────────────────────────────
 
@@ -126,6 +108,12 @@ impl WorldSnapshot {
     // ── Migration ────────────────────────────────────────────────
 
     /// Run the migration chain, bringing the snapshot up to the current version.
+    ///
+    /// A snapshot older than [`Self::CURRENT_VERSION`] is stepped forward one
+    /// version at a time; a snapshot at the current version is a no-op; a newer
+    /// (unmigratable) version returns an error. This is the single definition of
+    /// version compatibility — callers migrate then restore rather than
+    /// consulting a separate compatibility predicate.
     pub fn migrate(&mut self) -> Result<(), String> {
         while self.version < Self::CURRENT_VERSION {
             let migrator = migration_for(self.version)
@@ -134,13 +122,6 @@ impl WorldSnapshot {
             self.version += 1;
         }
         Ok(())
-    }
-
-    /// Check the snapshot version's compatibility with the current one.
-    pub fn is_version_compatible(&self) -> bool {
-        let expected = SnapshotVersion::CURRENT;
-        let found = SnapshotVersion::new(self.version, 0);
-        found.is_compatible_with(expected)
     }
 
     pub fn entity_count(&self) -> usize {
@@ -262,7 +243,11 @@ pub struct WorldDiff {
 }
 
 impl WorldDiff {
-    pub const CURRENT_VERSION: u32 = 1;
+    /// A diff is a delta over the same versioned wire structs as a snapshot
+    /// (`EntitySnapshot`/`ComponentSnapshot`/`RelationSnapshot`), so its wire
+    /// version IS the snapshot version — they bump together. Checked on
+    /// [`WorldSerializer::apply_diff_to_snapshot`](crate::WorldSerializer::apply_diff_to_snapshot).
+    pub const CURRENT_VERSION: u32 = WorldSnapshot::CURRENT_VERSION;
 
     pub fn new() -> Self {
         Self {
@@ -316,22 +301,6 @@ pub enum SaveFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn version_compatible() {
-        // CURRENT is v2 (E7 added resources). v2 is directly compatible; v2.1
-        // (same major, newer minor) too; v1 is not directly compatible (it is
-        // brought up via `migrate`), and a future v3 is not.
-        let v1 = SnapshotVersion::new(1, 0);
-        let v2 = SnapshotVersion::new(2, 0);
-        let v2_1 = SnapshotVersion::new(2, 1);
-        let v3 = SnapshotVersion::new(3, 0);
-
-        assert!(v2.is_compatible_with(SnapshotVersion::CURRENT));
-        assert!(v2_1.is_compatible_with(SnapshotVersion::CURRENT));
-        assert!(!v1.is_compatible_with(SnapshotVersion::CURRENT));
-        assert!(!v3.is_compatible_with(SnapshotVersion::CURRENT));
-    }
 
     #[test]
     fn snapshot_json_roundtrip() {
@@ -448,12 +417,29 @@ mod tests {
     }
 
     #[test]
-    fn version_compatibility_check() {
+    fn migrate_steps_old_version_up_to_current() {
+        // An older version migrates up through the chain to CURRENT.
         let mut snap = WorldSnapshot::new(0);
-        snap.version = 999;
-        assert!(!snap.is_version_compatible());
+        snap.version = 1; // pretend v1 (pre-resources)
+        snap.migrate().unwrap();
+        assert_eq!(snap.version, WorldSnapshot::CURRENT_VERSION);
+    }
 
-        snap.version = WorldSnapshot::CURRENT_VERSION;
-        assert!(snap.is_version_compatible());
+    #[test]
+    fn migrate_is_noop_on_future_version() {
+        // `migrate` only steps UP toward CURRENT; a future version has nothing to
+        // step to, so it is left untouched (no error). Rejecting an unmigratable
+        // future version is the RESTORE gate's job, not migrate's — see the
+        // `future_version_is_rejected_by_restore` integration test.
+        let mut snap = WorldSnapshot::new(0);
+        snap.version = WorldSnapshot::CURRENT_VERSION + 1;
+        snap.migrate().unwrap();
+        assert_eq!(snap.version, WorldSnapshot::CURRENT_VERSION + 1);
+    }
+
+    #[test]
+    fn world_diff_version_tracks_snapshot_version() {
+        // The diff wire version is the snapshot wire version — one source of truth.
+        assert_eq!(WorldDiff::CURRENT_VERSION, WorldSnapshot::CURRENT_VERSION);
     }
 }
