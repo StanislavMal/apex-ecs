@@ -11,8 +11,8 @@
 //!
 //! ScriptContext
 //!   ├── delta_time: f32
-//!   ├── world_ptr:  NonNull<World>   — lives ≤ ScriptEngine::run()
-//!   └── deferred:   Commands         — spawn/despawn buffer
+//!   ├── world_ptr:  NonNull<World>   — lives ≤ ScriptEngine::run() / a system run
+//!   └── deferred_{despawns,spawns}   — drained into a Commands buffer afterwards
 //! ```
 //!
 //! # Usage

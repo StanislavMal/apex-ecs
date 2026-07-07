@@ -13,7 +13,8 @@
 //!
 //! The Lua iterator holds a shared borrow on World through the ptr, so
 //! structural changes (spawn/despawn) cannot be applied during iteration.
-//! They accumulate in `deferred: Commands` and are applied after the script finishes.
+//! They accumulate in per-op buffers (`deferred_despawns`, `deferred_spawns`) and
+//! are drained into a `Commands` buffer after the script finishes.
 
 use std::{
     collections::HashMap,
@@ -23,11 +24,23 @@ use std::{
 use apex_core::{
     commands::Commands,
     component::ComponentId,
+    entity::Entity,
     world::World,
 };
 
 use crate::iterators::QueryDesc;
 use crate::registrar::{ResourceBinding, EventBinding};
+
+// ── SpawnApplierFn ─────────────────────────────────────────────
+
+/// Inserts one script-authored component onto a (reserved) entity via a
+/// [`Commands`] buffer. Boxed per registered component type: the closure knows
+/// the concrete `T`, converts the Lua value with `T::from_lua`, and queues a
+/// typed `commands.insert(entity, T)`. Deferring through `Commands` (rather than
+/// a direct `world.insert`) is what gives script spawns deterministic entity ids
+/// (the per-system slot's D8b reserver) and keeps them sound under concurrency
+/// (no `&mut World` from a script system).
+type SpawnApplierFn = Box<dyn Fn(&mlua::Value, Entity, &mut Commands)>;
 
 // ── ScriptSystemDecl ───────────────────────────────────────────
 
@@ -103,12 +116,17 @@ pub struct ScriptContext {
     /// returns an error instead of UB.
     world_ptr: Option<NonNull<World>>,
 
-    /// Buffer of deferred spawn/despawn commands.
-    /// Applied after the script finishes via `apply_deferred()`.
-    pub(crate) deferred: Commands,
+    /// Buffer of entities the script asked to despawn. Drained into a `Commands`
+    /// buffer after the script finishes (deterministic, deferred structural op).
+    pub(crate) deferred_despawns: Vec<Entity>,
 
     /// Buffer of spawn requests from scripts.
     pub(crate) deferred_spawns: Vec<SpawnRequest>,
+
+    /// Per-component appliers used to insert a spawn request's components via a
+    /// `Commands` buffer (name → applier). Owned here (not on `ScriptEngine`) so
+    /// both the monolithic `run()` and a phase-B script-system runner share them.
+    pub(crate) spawn_appliers: HashMap<String, SpawnApplierFn>,
 
     /// Registry of components accessible from scripts: name → binding
     pub(crate) bindings: HashMap<&'static str, ComponentBinding>,
@@ -154,8 +172,9 @@ impl ScriptContext {
         Self {
             delta_time:              0.0,
             world_ptr:               None,
-            deferred:                Commands::new(),
+            deferred_despawns:       Vec::new(),
             deferred_spawns:         Vec::new(),
+            spawn_appliers:          HashMap::new(),
             bindings:                HashMap::new(),
             resource_bindings:       HashMap::new(),
             event_bindings:          HashMap::new(),
@@ -174,7 +193,8 @@ impl ScriptContext {
     pub(crate) unsafe fn set_world_ptr(&mut self, world: &mut World) {
         self.world_ptr         = Some(NonNull::new_unchecked(world as *mut World));
         self.entity_count_cache = world.entity_count();
-        self.deferred.clear();
+        self.deferred_despawns.clear();
+        self.deferred_spawns.clear();
         self.deferred_resource_writes.clear();
         self.deferred_events.clear();
     }
@@ -192,7 +212,8 @@ impl ScriptContext {
     pub(crate) unsafe fn set_world_ptr_shared(&mut self, world: &World) {
         self.world_ptr = Some(NonNull::new_unchecked(world as *const World as *mut World));
         self.entity_count_cache = world.entity_count();
-        self.deferred.clear();
+        self.deferred_despawns.clear();
+        self.deferred_spawns.clear();
         self.deferred_resource_writes.clear();
         self.deferred_events.clear();
     }
@@ -238,12 +259,13 @@ impl ScriptContext {
         std::mem::take(&mut self.script_systems)
     }
 
-    /// Discard any deferred structural / resource / event operations WITHOUT
-    /// applying them (the phase-B script-system path, where applying them would
-    /// need a `&mut World` the concurrent stage does not grant — that is phase
-    /// B4). Frees the associated Lua registry slots so they do not leak. Returns
-    /// `true` if anything was discarded, so the caller can warn loudly (§0.2a).
-    pub(crate) fn discard_deferred_structural(&mut self, lua: &mlua::Lua) -> bool {
+    /// Discard any deferred RESOURCE-WRITE / EVENT operations WITHOUT applying
+    /// them, freeing their Lua registry slots. A script SYSTEM cannot apply these
+    /// (they need a `&mut World` the concurrent stage does not grant, and unlike
+    /// spawns/despawns they are not entity-local `Commands` ops) — they belong in
+    /// a Rust system or the monolithic `run()`. Returns `true` if anything was
+    /// discarded, so the caller can warn loudly (§0.2a).
+    pub(crate) fn discard_deferred_globals(&mut self, lua: &mlua::Lua) -> bool {
         let mut had = false;
         for (_name, key) in std::mem::take(&mut self.deferred_resource_writes) {
             had = true;
@@ -252,17 +274,6 @@ impl ScriptContext {
         for (_name, key) in std::mem::take(&mut self.deferred_events) {
             had = true;
             let _ = lua.remove_registry_value(key);
-        }
-        for req in std::mem::take(&mut self.deferred_spawns) {
-            had = true;
-            for (_name, key) in req.components {
-                let _ = lua.remove_registry_value(key);
-            }
-        }
-        // Despawns (and any other structural commands) buffered in `deferred`.
-        if !self.deferred.is_empty() {
-            had = true;
-            self.deferred.clear();
         }
         had
     }
@@ -297,15 +308,53 @@ impl ScriptContext {
         self.deferred_spawns.push(request);
     }
 
-    pub fn queue_despawn(&mut self, entity: apex_core::Entity) {
-        self.deferred.despawn(entity);
+    pub fn queue_despawn(&mut self, entity: Entity) {
+        self.deferred_despawns.push(entity);
     }
 
-    pub(crate) fn apply_deferred(&mut self) {
-        let mut deferred = std::mem::take(&mut self.deferred);
-        let world = unsafe { self.world_mut() };
-        deferred.apply(world);
-        self.deferred = deferred;
+    /// Register a per-component spawn applier (see [`SpawnApplierFn`]).
+    pub(crate) fn add_spawn_applier(&mut self, name: String, applier: SpawnApplierFn) {
+        self.spawn_appliers.insert(name, applier);
+    }
+
+    /// Drain the buffered despawns and spawns into `commands` (a per-system slot
+    /// for a script system, or a fresh buffer for the monolith). Despawns run
+    /// first, then each spawn reserves an entity id from `commands` (deterministic
+    /// via the D8b reserver) and its components are inserted via their appliers.
+    /// The Lua values are extracted here (the caller holds the VM) and their
+    /// registry slots freed.
+    pub(crate) fn apply_structural_to_commands(&mut self, lua: &mlua::Lua, commands: &mut Commands) {
+        for entity in std::mem::take(&mut self.deferred_despawns) {
+            commands.despawn(entity);
+        }
+
+        for req in std::mem::take(&mut self.deferred_spawns) {
+            // Reserve the entity up front (deterministic id via the reserver); the
+            // temporary `EntityCommands` is dropped here so the applier can reborrow
+            // `commands`.
+            let entity = commands.spawn(()).id();
+            for (key, reg_key) in req.components {
+                let val: mlua::Value = match lua.registry_value(&reg_key) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("spawn: failed to extract value for '{}': {}", key, e);
+                        let _ = lua.remove_registry_value(reg_key);
+                        continue;
+                    }
+                };
+                // Applier lookup tolerates casing / underscores (Position vs position).
+                let key_lower = key.to_lowercase();
+                let key_no_underscore: String = key_lower.chars().filter(|c| *c != '_').collect();
+                let applier = self.spawn_appliers.get(&key_lower)
+                    .or_else(|| self.spawn_appliers.get(&key_no_underscore))
+                    .or_else(|| self.spawn_appliers.get(key.as_str()));
+                match applier {
+                    Some(applier) => applier(&val, entity, commands),
+                    None => log::warn!("spawn: no handler for component '{}'", key),
+                }
+                let _ = lua.remove_registry_value(reg_key);
+            }
+        }
     }
 
     /// Apply deferred resource writes and event emissions.

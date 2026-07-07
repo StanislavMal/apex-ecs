@@ -27,10 +27,11 @@ use std::{
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
+use apex_core::commands::Commands;
 use apex_core::world::World;
 
 use crate::{
-    context::{ComponentBinding, ScriptContext, SpawnRequest},
+    context::{ComponentBinding, ScriptContext},
     error::ScriptError,
     registrar::{EventBinding, ResourceBinding, ScriptableRegistrar},
     lua_api,
@@ -45,10 +46,6 @@ struct CompiledScript {
     #[allow(dead_code)]
     path: PathBuf,
 }
-
-// ── SpawnApplier ───────────────────────────────────────────────
-
-type SpawnApplierFn = Box<dyn Fn(&str, &mlua::Value, apex_core::Entity, &mut World)>;
 
 // ── ScriptEngine ───────────────────────────────────────────────
 
@@ -65,7 +62,6 @@ pub struct ScriptEngine {
     watcher:        Option<Box<dyn Watcher>>,
     watch_rx:       Option<mpsc::Receiver<notify::Result<Event>>>,
     last_reload:    HashMap<String, Instant>,
-    spawn_appliers: HashMap<String, SpawnApplierFn>,
     registered_components: Vec<String>,
 }
 
@@ -92,7 +88,6 @@ impl ScriptEngine {
             watcher:        None,
             watch_rx:       None,
             last_reload:    HashMap::new(),
-            spawn_appliers: HashMap::new(),
             registered_components: Vec::new(),
         }
     }
@@ -208,12 +203,15 @@ impl ScriptEngine {
 
         self.registered_components.push(T::type_name_str().to_string());
 
+        // Spawn appliers insert the component via a `Commands` buffer (deterministic
+        // ids + no `&mut World` from a script system). Registered on the shared
+        // `ScriptContext` so both the monolith and a script-system runner reach them.
         let type_name_lower = T::type_name_str().to_lowercase();
-        self.spawn_appliers.insert(
-            type_name_lower.clone(),
-            Box::new(move |_key: &str, val: &mlua::Value, entity: apex_core::Entity, world: &mut World| {
+        self.ctx.borrow_mut().add_spawn_applier(
+            type_name_lower,
+            Box::new(move |val: &mlua::Value, entity: apex_core::Entity, commands: &mut apex_core::commands::Commands| {
                 if let Some(component) = T::from_lua(val) {
-                    world.insert(entity, component);
+                    commands.insert(entity, component);
                 } else {
                     log::warn!("spawn: failed to convert Lua value to {}", T::type_name_str());
                 }
@@ -222,11 +220,11 @@ impl ScriptEngine {
 
         let exact_name = T::type_name_str().to_string();
         if exact_name.to_lowercase() != exact_name {
-            self.spawn_appliers.insert(
+            self.ctx.borrow_mut().add_spawn_applier(
                 exact_name,
-                Box::new(move |_key: &str, val: &mlua::Value, entity: apex_core::Entity, world: &mut World| {
+                Box::new(move |val: &mlua::Value, entity: apex_core::Entity, commands: &mut apex_core::commands::Commands| {
                     if let Some(component) = T::from_lua(val) {
-                        world.insert(entity, component);
+                        commands.insert(entity, component);
                     }
                 }),
             );
@@ -436,16 +434,24 @@ impl ScriptEngine {
             return;
         }
 
-        self.ctx.borrow_mut().apply_deferred();
-
+        // Resource writes / events need `&mut World` (via the still-set world_ptr);
+        // apply them first.
         {
             let mut ctx = self.ctx.borrow_mut();
             ctx.apply_deferred_resources_and_events(&self.lua);
         }
 
-        self.ctx.borrow_mut().clear_world_ptr();
+        // Despawns + spawns drain into a `Commands` buffer (deterministic ids via
+        // the world's reserver), then applied — the same path a script SYSTEM uses
+        // through its per-system slot.
+        {
+            let mut commands = Commands::new();
+            commands.set_reserver(world.entity_reserver());
+            self.ctx.borrow_mut().apply_structural_to_commands(&self.lua, &mut commands);
+            commands.apply(world);
+        }
 
-        self.apply_spawn_queue(world);
+        self.ctx.borrow_mut().clear_world_ptr();
     }
 
     // ── Phase-B: script systems as scheduler systems ──────────
@@ -563,16 +569,17 @@ impl ScriptEngine {
 
                     {
                         let mut c = ctx.borrow_mut();
-                        // Phase B4 wires structural/resource/event ops from a script
-                        // SYSTEM through the scheduler's per-system Commands slot. In
-                        // B3 a script system is data-only (query/commit); if the fn
-                        // queued any deferred op, drop it loudly (§0.2a) rather than
-                        // apply it via `&mut World` (UB under concurrency).
-                        if c.discard_deferred_structural(&lua) {
+                        // Spawn/despawn drain into THIS system's per-system Commands
+                        // slot — deterministic ids (D8b reserver), applied by the
+                        // scheduler after the stage, never via `&mut World`.
+                        c.apply_structural_to_commands(&lua, sys_ctx.commands());
+                        // Resource-write/event ops need `&mut World`, unavailable to
+                        // a concurrent script system — drop them loudly (§0.2a).
+                        if c.discard_deferred_globals(&lua) {
                             log::warn!(
-                                "script system '{}': spawn/despawn/resource/event ops are \
-                                 not yet applied for script SYSTEMS (phase B4) — dropped this \
-                                 frame. Use the monolithic run() for structural changes.",
+                                "script system '{}': resource-write / event ops are not \
+                                 applied from a script SYSTEM — dropped this frame (use a \
+                                 Rust system or the monolithic run())",
                                 sys_name
                             );
                         }
@@ -581,49 +588,6 @@ impl ScriptEngine {
                     }
                 },
             );
-        }
-    }
-
-    fn apply_spawn_queue(&mut self, world: &mut World) {
-        let requests: Vec<SpawnRequest> = {
-            let mut ctx = self.ctx.borrow_mut();
-            std::mem::take(&mut ctx.deferred_spawns)
-        };
-
-        for req in requests {
-            if req.components.is_empty() {
-                world.spawn(());
-                continue;
-            }
-
-            let entity = world.spawn(());
-
-            let appliers: Vec<(String, Option<&SpawnApplierFn>)> = req.components.iter()
-                .map(|(key, _)| {
-                    let key_lower = key.to_lowercase();
-                    let key_no_underscore: String = key_lower.chars().filter(|c| *c != '_').collect();
-                    let applier = self.spawn_appliers.get(&key_lower)
-                        .or_else(|| self.spawn_appliers.get(&key_no_underscore))
-                        .or_else(|| self.spawn_appliers.get(key.as_str()));
-                    (key.clone(), applier)
-                })
-                .collect();
-
-            for ((key, reg_key), (_, applier)) in req.components.into_iter().zip(appliers.iter()) {
-                if let Some(applier) = applier {
-                    let val: mlua::Value = match self.lua.registry_value(&reg_key) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log::warn!("spawn: failed to extract value for '{}': {}", key, e);
-                            continue;
-                        }
-                    };
-                    applier(&key, &val, entity, world);
-                    let _ = self.lua.remove_registry_value(reg_key);
-                } else {
-                    log::warn!("spawn: no handler for component '{}'", key);
-                }
-            }
         }
     }
 

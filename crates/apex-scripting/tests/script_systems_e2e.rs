@@ -178,6 +178,137 @@ fn undeclared_component_access_is_refused() {
     );
 }
 
+/// A script SYSTEM spawns entities through its per-system Commands slot; the
+/// spawn persists (with its component) after the scheduler applies the slot.
+#[test]
+fn script_system_spawn_persists_through_commands() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_scriptable::<Position>(&mut engine);
+
+    engine
+        .load_script_str(
+            "spawner",
+            r#"
+            system{
+                name = "spawner",
+                query = {"Write:Position"},
+                fn = function()
+                    spawn_entity({ position = Position.new(5.0, 6.0) })
+                end,
+            }
+            "#,
+        )
+        .expect("script must compile");
+
+    let mut sched = Scheduler::new();
+    engine.register_systems(&mut sched);
+    sched.run(&mut world);
+
+    let mut found = Vec::new();
+    Query::<Read<Position>>::new(&world).for_each(|_, p| found.push(*p));
+    assert_eq!(
+        found,
+        vec![Position { x: 5.0, y: 6.0 }],
+        "the script system's deferred spawn was applied via the per-system Commands slot"
+    );
+}
+
+/// A script SYSTEM despawns a matched entity through its per-system Commands
+/// slot; the despawn applies after the stage.
+#[test]
+fn script_system_despawn_applies_through_commands() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_scriptable::<Position>(&mut engine);
+
+    world.spawn((Position { x: 1.0, y: 0.0 },));
+    world.spawn((Position { x: 2.0, y: 0.0 },));
+
+    engine
+        .load_script_str(
+            "reaper",
+            r#"
+            system{
+                name = "reaper",
+                query = {"Read:Position"},
+                fn = function()
+                    for e in query({"Read:Position"}) do
+                        if e.position.x > 1.5 then
+                            despawn(e.entity)
+                        end
+                    end
+                end,
+            }
+            "#,
+        )
+        .expect("script must compile");
+
+    let mut sched = Scheduler::new();
+    engine.register_systems(&mut sched);
+    sched.run(&mut world);
+
+    let mut remaining = Vec::new();
+    Query::<Read<Position>>::new(&world).for_each(|_, p| remaining.push(p.x));
+    assert_eq!(remaining, vec![1.0], "the x>1.5 entity was despawned via the per-system Commands slot");
+}
+
+/// Determinism gate: a script system spawning through its per-system Commands
+/// slot assigns identical entity ids run-to-run under `set_deterministic_spawn`
+/// (D8b seeds a rank-deterministic id block because the script access declares
+/// `uses_commands`).
+#[test]
+fn script_system_spawns_are_deterministic() {
+    fn run_once() -> Vec<Entity> {
+        let mut world = World::new();
+        let mut engine = ScriptEngine::new();
+        world.register_scriptable::<Position>(&mut engine);
+        // Seed some existing entities so the spawned ids are non-trivial.
+        world.spawn((Position { x: 0.0, y: 0.0 },));
+        world.spawn((Position { x: 1.0, y: 1.0 },));
+
+        engine
+            .load_script_str(
+                "burst",
+                r#"
+                system{
+                    name = "burst",
+                    query = {"Write:Position"},
+                    fn = function()
+                        for i = 1, 5 do
+                            spawn_entity({ position = Position.new(9.0, 9.0) })
+                        end
+                    end,
+                }
+                "#,
+            )
+            .expect("script must compile");
+
+        let mut sched = Scheduler::new();
+        sched.set_deterministic_spawn(true);
+        engine.register_systems(&mut sched);
+        // Two frames of bursts, to exercise block reuse across frames.
+        sched.run(&mut world);
+        sched.run(&mut world);
+
+        // Collect the entities matching the spawn marker (9.0, 9.0), sorted for a
+        // stable comparison independent of iteration order.
+        let mut ids = Vec::new();
+        Query::<Read<Position>>::new(&world).for_each(|e, p| {
+            if *p == (Position { x: 9.0, y: 9.0 }) {
+                ids.push(e);
+            }
+        });
+        ids.sort_by_key(|e| (e.index(), e.generation()));
+        ids
+    }
+
+    let a = run_once();
+    let b = run_once();
+    assert_eq!(a.len(), 10, "5 spawns × 2 frames");
+    assert_eq!(a, b, "script-system spawn ids are deterministic run-to-run (D8b)");
+}
+
 /// A `system{}` referencing an UNREGISTERED component is refused registration
 /// (§0.2a: registering it with an under-declared access would be a data race), so
 /// it never runs and the world is untouched.

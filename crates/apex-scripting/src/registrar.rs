@@ -156,6 +156,13 @@ pub(crate) fn descs_to_access(
     let mut descriptor = AccessDescriptor::new();
     // Lua↔Lua serialization token: one VM, never two script systems at once.
     descriptor.writes.push(TypeId::of::<ScriptVm>());
+    // A script system may spawn/despawn through its per-system Commands slot
+    // (structural ops are deferred there — B4). Declaring `uses_commands` makes the
+    // scheduler seed a rank-deterministic id block for the slot under
+    // `set_deterministic_spawn`, so script spawns get run-to-run identical ids
+    // (D8b). It does not affect conflict detection (only reads/writes do) and the
+    // system is already single-task (stateful), so it changes nothing else.
+    descriptor.uses_commands = true;
 
     let mut read_ids = Vec::new();
     let mut write_ids = Vec::new();
