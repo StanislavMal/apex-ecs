@@ -187,13 +187,19 @@
   резервер есть → дети реальны). Тесты: `standalone_spawn_chained_insert_panics`/`_with_children_panics`
   (should_panic), `world_attached_spawn_chained_insert_works`, `standalone_spawn_full_bundle_still_works`.
   Гейты: 260 core-тестов, clippy net-neutral.
-- **В4 🟡 — IsolatedWorld не дотянут до дифференциатора (осознанно ОТЛОЖЕН за scope CORE_POLISH —
-  кандидат на следующую кампанию-дифференциатор).** Решение §10.6 = ДА (Entity-ремаппинг между
-  мирами, bounded-каналы с телеметрией, кросс-поточные тесты). Сделано: только громкость дропа (E12,
-  волна 4) + кросс-поточные тесты (волна 7, `apex-isolated/tests/cross_thread.rs`). Каналы моста
-  unbounded, ремаппинга нет — эти два пункта бездомны намеренно: это отдельный дифференциатор (§0.9),
-  не хвост полиша; берётся отдельной кампанией, не CORE_POLISH. Прямое требование §0.9 (козырь-прототип
-  хуже отсутствия козыря).
+- **В4 ✅ ЗАКРЫТ (2026-07-07, EDITOR_GOLDEN_PATH волна 3) — IsolatedWorld дотянут до дифференциатора.**
+  Решение §10.6 выполнено полностью: (1) **soundness** — ложный `unsafe impl Sync` удалён (E12-остаток;
+  ни один потребитель не алиасит `&IsolatedWorld` — рендер передаёт владение; `Send` с исправленным
+  SAFETY); (2) **bounded-каналы + телеметрия** — `BridgeConfig{capacity, overflow}` +
+  `BridgeOverflow::{Block, DropLoud}` вместо безусловного unbounded; `BridgeStats` (sent/dropped/
+  high_water); дроп/сериализ-фейл считаются и громко (§0.2a); (3) **протокол обмена + Entity-ремаппинг** —
+  модуль `exchange` (`export_world`/`export_entities` субтри по ChildOf / `import` fresh+remap E6 /
+  `apply_back` merge-by-key / `transfer_entities`) ПОВЕРХ snapshot-машинерии (не вторая реализация;
+  `WorldSerializer::restore_merge_with` — apply-back примитив); (4) **schema-рецепт** — `WorldRegistrar`
+  (component-serde/event/relation-kind, replay на любой мир) убирает ручную дупликацию регистраций
+  (рендер ×35, editor Play). Кросс-поточные тесты новых способностей (transfer remaps relations,
+  shared-schema round-trip, apply-back onto original); Miri чист на мосту (атомики+Send, single+threaded).
+  Потребитель apply-back — preview-транзакции агента (EDITOR_GOLDEN_PATH волна 5.2, движок).
 - **§10.8 ✅ ЗАКРЫТ (2026-07-06, CORE_POLISH волна 3 фаза A) — Lua-путь пересажен на общий DynQuery.**
   Решение (волна 6 п.4): скриптинг «обязан встать на общий, валидируемый ядром механизм». **Сделано:**
   `apex-scripting` собственный unsafe-путь через `_meta`/`columns_raw` УДАЛЁН (`build_arch_states`/`ArchState`/
@@ -253,19 +259,19 @@
   внутренние шифры; брендинг ApexForge_ECS. Гейт: grep снятых имён = только migration-заметки; сниппеты
   золотого пути компилируются. **Уточнение:** §2.1-класс F3.1 (`ctx.query::<…Write>`) оказался не
   «~10 битых» — `run_if_cond`/`conditions` НЕ сняты (снят тест-`SystemBuilder`), §6.0a был корректен.
-- **string-table снапшота 🟢 ОТКРЫТ (переоценён 2026-07-06, CORE_POLISH волна 0.6 → отдельный
-  focused-заход; кампания CORE_POLISH ✅ РОТИРОВАНА 2026-07-07 → `plans/archive/CORE_POLISH_SCRIPT_SYSTEMS.md`)
-  — `type_name` per-instance.** Это ЕДИНСТВЕННЫЙ открытый долг кампании CORE_POLISH. `serializer.rs` пишет `info.name.to_string()` на каждый
-  инстанс (полный Rust-путь ~30-50 байт × инстансы). **ПЕРЕОЦЕНКА §0.2b:** брался в волну 0, но при
-  реализации вскрылось, что это НЕ «формат-минор», а полноценная эволюция формата — несоразмерна
-  быстрому закрытию и рискует on-disk сценами редактора. Bincode (единственный size-критичный путь)
-  позиционный → `serde(default)`-трюк работает только для JSON (мимо цели). Чистое решение =
-  version-gated wire-типы (`WireSnapshotV3` со `string_table` + `name_idx: u32`) + version-peek
-  по ведущему полю; in-memory `WorldSnapshot` не трогается. **Блокер-предзадача:** свести две
-  рассинхронизированные версионные схемы (`WorldSnapshot::CURRENT_VERSION` u32 vs `SnapshotVersion`
-  major/minor) к одной, иначе бамп 2→3 ломает `is_version_compatible`. Полный дизайн-спек +
-  тест-план — `plans/archive/CORE_POLISH_SCRIPT_SYSTEMS.md` §0.6. Не полумера, а честный перенос полного решения в соразмерный
-  заход. Выигрыш — только РАЗМЕР сейва (редкий путь) → низкий приоритет.
+- **string-table снапшота ✅ ЗАКРЫТ (2026-07-07, EDITOR_GOLDEN_PATH волны 1–2) — snapshot wire format v3.**
+  Было: `serializer.rs` писал `info.name.to_string()` на каждый инстанс (полный Rust-путь ~30-50 байт ×
+  инстансы). **Волна 1 (предзадача):** свёл две рассинхронизированные версионные схемы к ОДНОЙ — удалил
+  вестигиальный `SnapshotVersion{major,minor}` + `is_version_compatible` (0 живых потребителей); u32
+  `version` + миграционная цепочка = единственный источник; `restore_with` мигрирует централизованно
+  (старую версию — клоном, будущую — reject), редакторский `from_json`+`restore_with` путь больше не
+  минует миграцию; `WorldDiff::version` унифицирован с snapshot-версией и проверяется в
+  `apply_diff_to_snapshot`; префабы получили версию + migrate-on-load. **Волна 2:** приватный модуль
+  `wire` — `WireSnapshotV3` со `string_table: Vec<String>` + `name_idx: u32`; in-memory `WorldSnapshot`
+  не тронут (интернирование чисто wire); `to/from_json`/`bincode` конвертят на границе + version-peek
+  дисптчит v3/legacy; `CURRENT_VERSION` 2→3 (миграция v2→3 = no-op). Тесты: имя интернируется 1×,
+  v2-фикстуры (JSON+bincode) грузятся, corrupt-index reject, fuzz через v3. Движок: editor-host тест
+  адаптирован к интернированному on-disk JSON (name_idx через string_table).
 - **D9 ✅ ЗАКРЫТ (2026-07-06) — РЕШЕНИЕ: не фолд, а дифференциальный parity-гейт.** Прежняя рамка
   «свести `run_sequential` и `run_hybrid_parallel` в один путь под byte-identical goldens» — **оказалась
   НЕВЕРНОЙ целью** при разборе кода. Установленные факты: (1) движок использует ТОЛЬКО `run()`
