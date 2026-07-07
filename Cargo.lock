@@ -153,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "apex-core",
  "apex-scheduler",
+ "apex-serialization",
  "bincode",
  "crossbeam-channel",
  "log",
