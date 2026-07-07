@@ -1,33 +1,34 @@
 # Apex Scripting — Lua Integration
 
-Интеграция [Lua 5.4](https://www.lua.org/manual/5.4/) скриптинга с хот-релоадом в Apex ECS.
+Интеграция [Lua 5.4](https://www.lua.org/manual/5.4/) скриптинга с хот-релоадом в ApexForge_ECS.
 
 Реализована через крейт [`mlua`](https://docs.rs/mlua/) — безопасные Rust-привязки к Lua.
 
-## Общие понятия о макросах систем
+> Полное руководство — раздел **§17 «Lua Scripting»** в `Apex_ECS_Руководство_пользователя.md`
+> (в частности §17.9 — API `system{}`). Архитектурное решение (почему Lua-системы — main-thread
+> `NonSend`-вид, а не `Arc<Mutex<VM>>`) — `decisions/ADR-005-script-systems-architecture.md`.
 
-Перед началом работы с Lua-скриптингом важно понимать макросы, которыми объявляются
-системы в Apex ECS:
+## Две модели запуска
 
-- **`system!`** — для параллельных (`AutoSystem`) систем c декларацией доступа
-  (`Read<T>`, `Write<T>`). Планировщик автоматически находит неконфликтующие системы
-  и выполняет их параллельно. **`ScriptEngine::run()` нельзя вызывать внутри `ParSystem`**,
-  так как `run()` требует `&mut self`.
+Одна Lua-VM однопоточна (`ScriptEngine` привязан к потоку создания — **`!Send`**, держит `Rc<Lua>`).
+Есть две модели интеграции:
 
-- **`sequential_system!`** — для систем с эксклюзивным `&mut World`.
-  Lua-движку нужен полный доступ к миру, поэтому **рекомендуемый способ интеграции
-  скриптинга — через `sequential_system!` с состоянием**. Внутри такого макроса
-  `ScriptEngine` получает `&mut World` и может свободно выполнять spawn/despawn,
-  модифицировать компоненты, читать/писать ресурсы и отправлять события.
+- **Lua-системы `system{}`** (золотой путь) — отдельные скрипт-функции регистрируются как
+  **первоклассные системы планировщика** через `engine.register_systems(&mut scheduler)`. Несмотря на
+  однопоточность VM, они исполняются как main-thread `NonSend`-системы **конкурентно с непересекающимися
+  Rust-системами**, с конфликт-детекцией по декларациям доступа, детерминированными спавнами и hot-reload.
+- **Монолитный `run()`** — весь скрипт исполняется как одна эксклюзивная операция вне планировщика
+  (`engine.run(dt, &mut world)`). Проще, но без параллелизма и без scheduler-декларированного доступа.
 
-Подробнее — в [Руководстве пользователя Apex ECS](https://github.com/StanislavMal/apex-ecs#6-системы-и-планировщик).
+`ScriptEngine::run()` требует `&mut World`, поэтому его нельзя вызвать изнутри параллельной системы —
+для интеграции с планировщиком используйте `system{}` (`register_systems`).
 
-## Новые крейты
+## Крейты
 
 | Крейт | Назначение |
 |---|---|
 | `apex-macros` | `#[derive(Scriptable)]` proc-macro |
-| `apex-scripting` | `ScriptEngine`, `ScriptContext`, Lua-итераторы |
+| `apex-scripting` | `ScriptEngine`, `ScriptContext`, Lua-итераторы; зависит от `apex-core` и `apex-scheduler` |
 
 ## Быстрый старт
 
@@ -64,14 +65,14 @@ struct PlayerDied { x: f32, y: f32 }
 use apex_scripting::{ScriptEngine, WorldScriptingExt};
 use std::path::Path;
 
-// Создаём ScriptEngine
+// Создаём ScriptEngine с каталогом скриптов (включает файловый watcher)
 let mut engine = ScriptEngine::with_dir(Path::new("scripts/"));
 
 // Единый вызов — регистрирует и в ECS, и в ScriptEngine:
 world.register_scriptable::<Position>(&mut engine);
 world.register_scriptable::<Velocity>(&mut engine);
 
-// Ресурсы: сперва вставить в мир, потом зарегистрировать
+// Ресурсы: сперва вставить в мир, потом зарегистрировать в движке
 world.insert_resource(Gravity { value: 9.8 });
 world.insert_resource(Score { value: 0 });
 world.register_scriptable_resource::<Gravity>(&mut engine);
@@ -84,98 +85,103 @@ world.register_scriptable_event::<PlayerDied>(&mut engine);
 engine.load_scripts().expect("ошибка загрузки скриптов");
 ```
 
-### 3. Интеграция с планировщиком через `sequential_system!` (рекомендуется)
+> **Порядок важен:** регистрируйте компоненты ДО `register_systems` — система, ссылающаяся на
+> незарегистрированный компонент, будет отвергнута (иначе недо-декларация доступа = гонка).
 
-**Рекомендуемый способ** — обернуть `ScriptEngine` в `sequential_system!`
-с состоянием. Это даёт полный доступ к `&mut World` и корректно интегрируется
-с планировщиком:
+### 3. Lua-системы `system{}` + планировщик (золотой путь)
 
-```rust
-use apex_core::sequential_system;
-use apex_scripting::ScriptEngine;
-
-sequential_system! {
-    struct LuaRunner {
-        engine: ScriptEngine = ScriptEngine::with_dir("scripts/"),
-    }
-
-    fn run(
-        s: &mut Self,
-        world: &mut World,
-        dt: &DeltaTime,       // ресурс (опционально, только для примера)
-    ) {
-        s.engine.poll_hot_reload();
-        s.engine.run(dt.0, world);
-    }
-}
-```
-
-Затем зарегистрировать в планировщике:
+Скрипт объявляет системы на верхнем уровне; `register_systems` транслирует их в системы планировщика.
 
 ```rust
-use apex_scheduler::{Scheduler, StageLabel};
+use apex_scheduler::Scheduler;
 
-let mut sched = Scheduler::new();
-let system = LuaRunner::default().into_system();
-sched.add_system("lua_runner", system);
-// или в конкретный этап:
-// sched.add_system_to_stage("lua_runner", system, StageLabel::PostUpdate);
+let mut scheduler = Scheduler::new();
+scheduler.set_deterministic_spawn(true);      // детерминированные id спавнов (опционально)
+engine.register_systems(&mut scheduler);      // system{} → NonSend-системы планировщика
 
-sched.compile().unwrap();
-```
-
-### 4. Альтернативный способ — ручной вызов `engine.run()` (без Scheduler)
-
-Если вы не используете `Scheduler`:
-
-```rust
 loop {
-    engine.poll_hot_reload(); // проверяет изменения .lua файлов
-    engine.run(dt, &mut world); // выполняет функцию run() из скрипта
+    engine.poll_hot_reload();                 // при изменении .lua-файла
+    engine.register_systems(&mut scheduler);  // идемпотентно: заменяет прошлое поколение систем
+    engine.set_delta_time(dt);                // dt, видимый всеми Lua-системами этого кадра
+    scheduler.run(&mut world);                // Lua-системы бегут вместе с Rust-системами
     world.tick();
 }
 ```
 
-### 5. Скрипт
+`system{}`-скрипт (`scripts/gameplay.lua`):
+
+```lua
+system{
+    name  = "integrate",
+    query = {"Read:Velocity", "Write:Position"},
+    fn = function()
+        for e in query({"Read:Velocity", "Write:Position"}) do
+            e.position.x = e.position.x + e.velocity.x * delta_time()
+            e.position.y = e.position.y + e.velocity.y * delta_time()
+            commit(e)
+        end
+    end,
+}
+
+system{
+    name  = "spawner",
+    query = {"Write:Position"},
+    fn = function()
+        if entity_count() < 100 then
+            spawn_entity({ position = Position.new(0.0, 0.0) })  -- детерминированный id
+        end
+    end,
+}
+```
+
+**Модель исполнения.** Каждая Lua-система — main-thread `NonSend`-система. Все они декларируют скрытую
+запись на маркер-токен `ScriptVm`, поэтому планировщик **сериализует Lua↔Lua** (одна VM), но
+**параллелит Lua↔Rust** по реальным декларациям доступа. Внутри `fn` вызовы `query()`/`commit()`
+резолвят **только** объявленные в `query` компоненты — обращение к необъявленному даёт громкую
+аномалию (§0.2a) и пустой результат. Полный набор эффектов (`commit`, `spawn_entity`, `despawn`,
+`write_resource`, `emit_event`) применяется через per-system `Commands`-слот планировщика после стадии.
+
+### 4. Альтернатива — монолитный `run()` (без планировщика)
+
+Если планировщик не используется, весь скрипт исполняется как одна операция. Скрипт определяет
+функцию `run()`:
+
+```rust
+loop {
+    engine.poll_hot_reload();     // проверяет изменения .lua файлов
+    engine.run(dt, &mut world);   // выполняет функцию run() активного скрипта
+    world.tick();
+}
+```
 
 ```lua
 -- scripts/game.lua
-
 function run()
     local dt = delta_time()
-
-    -- Чтение ресурсов
     local gravity = read_resource("Gravity")
 
-    -- Итерация с Read и Write доступом
     for entity in query({"Read:Velocity", "Write:Position"}) do
         entity.position.x = entity.position.x + entity.velocity.x * dt
-        entity.position.y = entity.position.y + entity.velocity.y * dt
         commit(entity)
     end
 
-    -- Спавн новых entity
     if entity_count() < 100 then
-        spawn_entity({
-            position = Position.new(0.0, 0.0),
-            velocity = Velocity.new(1.0, 0.5),
-        })
+        spawn_entity({ position = Position.new(0.0, 0.0), velocity = Velocity.new(1.0, 0.5) })
     end
 
-    -- Деспавн по условию
     for entity in query({"Read:Health"}) do
         if entity.health.current <= 0.0 then
             despawn(entity.entity)
         end
     end
 
-    -- Запись ресурсов
     write_resource("Score", { value = 100 })
-
-    -- Отправка событий
     emit_event("PlayerDied", { x = 10.0, y = 20.0 })
 end
 ```
+
+> Не смешивайте модели в одном скрипте: `system{}`-объявления обрабатываются `register_systems`, а
+> `function run()` — `engine.run()`. Использование обоих привело бы к двойному исполнению.
 
 ## Поддерживаемые типы полей
 
@@ -203,15 +209,11 @@ end
 enum TileKind { Floor, Wall, Water }
 ```
 
-В Lua:
-
 ```lua
 -- Доступ как к полям таблицы
 if entity.tilekind == TileKind.Wall then
     print("Entity is a wall")
 end
-
--- Сравнение через числовые значения тоже работает
 -- TileKind.Floor = 0, TileKind.Wall = 1, TileKind.Water = 2
 ```
 
@@ -219,29 +221,19 @@ end
 
 ```rust
 #[derive(Component, Clone, Debug, Scriptable)]
-struct Tags {
-    list: Vec<String>,
-}
+struct Tags { list: Vec<String> }
 
 #[derive(Component, Clone, Debug, Scriptable)]
-struct Stats {
-    values: HashMap<String, f32>,
-}
+struct Stats { values: HashMap<String, f32> }
 ```
 
-В Lua:
-
 ```lua
--- Vec → Lua массив (1-indexed)
 for entity in query({"Read:Tags"}) do
-    print(entity.tags.list[1])  -- первый элемент
+    print(entity.tags.list[1])            -- Vec → Lua массив (1-indexed)
 end
 
--- HashMap → Lua хэш-таблица
 for entity in query({"Read:Stats"}) do
-    if entity.stats.values["hp"] > 50.0 then
-        print("High HP");
-    end
+    if entity.stats.values["hp"] > 50.0 then print("High HP") end  -- HashMap → хэш-таблица
 end
 ```
 
@@ -249,48 +241,53 @@ end
 
 | Функция | Описание |
 |---|---|
+| `system{ name, query, fn }` | Объявить Lua-систему (обрабатывается `register_systems`, см. §3) |
 | `delta_time() → number` | Delta time текущего кадра |
-| `entity_count() → integer` | Число живых entity (кешировано на момент `run()`) |
+| `entity_count() → integer` | Число живых entity (кешировано на момент запуска) |
 | `query(descs) → iterator` | Итератор entity с компонентами |
 | `commit(entity_table)` | Фиксирует Write-изменения в ECS |
 | `spawn_entity(table)` | Создать entity с компонентами (отложено) |
 | `despawn(entity_id)` | Уничтожить entity по id `entity.entity` (отложено; несовпадение поколения = no-op) |
 | `read_resource(type_name) → value/nil` | Прочитать глобальный ресурс по имени типа |
-| `write_resource(type_name, value)` | Записать глобальный ресурс |
-| `emit_event(type_name, value)` | Отправить событие |
-| `log(msg)` | Вывести `info` в лог движка |
-| `print(msg)` | Вывести `info` в лог движка |
-| `log_debug(msg)` | Вывести `debug` в лог движка |
-| `log_warn(msg)` | Вывести `warn` в лог движка |
-| `log_error(msg)` | Вывести `error` в лог движка |
+| `write_resource(type_name, value)` | Записать глобальный ресурс (отложено) |
+| `emit_event(type_name, value)` | Отправить событие (отложено) |
+| `log(msg)` / `print(msg)` | Вывести `info` в лог движка |
+| `log_debug(msg)` / `log_warn(msg)` / `log_error(msg)` | Вывести соответствующий уровень в лог |
 | `inspect(value) → string` | Рекурсивный дамп Lua-значения (отладка) |
 
 ### Примеры работы с ресурсами и событиями
 
 ```lua
--- Чтение ресурса (возвращает таблицу с полями)
-local g = read_resource("Gravity")
+local g = read_resource("Gravity")           -- чтение (таблица с полями)
 log("Gravity = " .. g.value)
 
--- Запись ресурса (передаётся таблица с полями структуры)
-write_resource("Score", { value = 100 })
-
--- Отправка события (передаётся таблица с полями структуры)
+write_resource("Score", { value = 100 })     -- запись (таблица полей структуры)
 emit_event("PlayerDied", { x = 10.0, y = 20.0 })
 ```
 
-> **Важно:** Значения для `write_resource` и `emit_event` должны передаваться как Lua-таблицы с ключами, соответствующими именам полей Rust-структуры. Например, для `Score { value: i64 }` — `{ value = 100 }`.
+> **Важно:** значения для `write_resource`/`emit_event` — Lua-таблицы с ключами по именам полей
+> Rust-структуры. Для `Score { value: i64 }` — `{ value = 100 }`.
 
 ## Форматы query-дескрипторов
 
 ```lua
 query({"Read:Position"})          -- явный Read
-query({"Write:Velocity"})         -- явный Write
+query({"Write:Velocity"})         -- явный Write (требует commit)
 query({"Position"})               -- Read по умолчанию
 query({"With:Player"})            -- фильтр: только entity с Player
 query({"Without:Enemy"})          -- фильтр: только entity без Enemy
+query({"Read:Position", "Changed:Position"})  -- реактивный: только изменённые с прошлого прогона
+query({"Read:Health",  "Added:Health"})       -- реактивный: только добавленные с прошлого прогона
 query({"Read:Position", "Write:Velocity", "With:Player"})  -- комбинированный
 ```
+
+- `Read` / `Write` — доступ к данным (значение видно в таблице элемента; `Write` требует `commit`).
+- `With` / `Without` — структурные фильтры (значение НЕ возвращается).
+- `Changed:X` / `Added:X` — реактивные фильтры (симметрично `With:`); чтобы получить значение
+  отфильтрованного компонента, добавьте `Read:X`.
+
+Внутри `query()`/`commit()` идут через ту же ядерную `DynQuery`/`DynQueryMut`-поверхность, что и
+типизированные запросы (общий валидируемый механизм доступа, §10.8) — своего unsafe-пути у скриптинга нет.
 
 ## Структура элемента query
 
@@ -298,102 +295,80 @@ query({"Read:Position", "Write:Velocity", "With:Player"})  -- комбиниро
 
 ```lua
 for entity in query({"Read:Position", "Write:Velocity"}) do
-    entity.entity       -- string "index:generation": непрозрачный id entity (передавать в despawn как есть)
+    entity.entity       -- string "index:generation": непрозрачный id (передавать в despawn как есть)
     entity.position     -- table: { x = float, y = float } (Read-only)
     entity.velocity     -- table: { x = float, y = float } (Write-доступ)
 end
 ```
 
-Ключи в таблице — имена типов в **lowercase** (`"position"`, `"velocity"`).
+Ключи — имена типов в **lowercase** (`"position"`, `"velocity"`).
 
-**Важно:** Для Read-компонентов устанавливается `__newindex` метатаблица,
-которая предупреждает при попытке модификации:
+Для Read-компонентов ставится `__newindex`-метатаблица, предупреждающая при попытке модификации:
 
 ```lua
-entity.position.x = 5.0  -- предупреждение в логе: "попытка изменить Read-компонент 'Position'"
+entity.position.x = 5.0  -- предупреждение в логе при Read:Position
 ```
-
-Для Write-компонентов изменения применяются только после вызова `commit(entity)`.
 
 ## commit(entity_table)
 
-Функция `commit()` записывает изменения Write-компонентов обратно в ECS:
+`commit()` записывает изменения Write-компонентов обратно в ECS (немедленно, между итерациями скрипта —
+через `DynQueryMut`, с автоматическим обновлением change ticks, так что `Changed<T>` их видит):
 
 ```lua
 for entity in query({"Write:Position", "Write:Velocity"}) do
     entity.position.x = entity.position.x + entity.velocity.x * dt
-    entity.position.y = entity.position.y + entity.velocity.y * dt
-    commit(entity)  -- фиксирует изменения
+    commit(entity)  -- без commit() изменения НЕ применяются
 end
 ```
 
-Без `commit()` изменения Write-компонентов **не будут применены**.
+`commit` перерезолвит entity против ЖИВОГО мира по `_meta.entity` (полное поколение), поэтому устаревший/
+подделанный элемент не может направить запись в чужую строку. Запись гейтится по декларированным `Write:`
+(S7): попытка записать необъявленный компонент отвергается.
 
 ### auto_commit
 
-`ScriptEngine::set_auto_commit(true)` включает автоматический вызов `commit()`
-при переходе к следующей entity в цикле `for entity in query(...) do ... end`:
+`ScriptEngine::set_auto_commit(true)` включает автоматический `commit()` при переходе к следующей entity
+в цикле `for entity in query(...) do ... end` — явный `commit(entity)` не нужен:
 
 ```rust
 engine.set_auto_commit(true);
 ```
 
-Когда авто-коммит включён, явный вызов `commit(entity)` не требуется.
-
 ## Конструкторы компонентов
 
-`#[derive(Scriptable)]` генерирует Lua-конструктор для каждого компонента:
+`#[derive(Scriptable)]` генерирует Lua-конструктор для каждого типа:
 
 ```lua
--- Position.new(x, y) — создаёт таблицу { x = ..., y = ... }
-local pos = Position.new(10.0, 20.0)
-
--- Health.new(current, max)
-local hp = Health.new(100.0, 100.0)
-
--- Velocity.new(x, y)
-local vel = Velocity.new(1.0, 0.5)
-
--- Tags.new({"enemy", "boss"}) — Vec<String>
-local tags = Tags.new({"enemy", "boss"})
-
--- Stats.new({ hp = 100.0, mp = 50.0 }) — HashMap<String, f32>
-local stats = Stats.new({ hp = 100.0, mp = 50.0 })
-
+local pos   = Position.new(10.0, 20.0)
+local hp    = Health.new(100.0, 100.0)
+local tags  = Tags.new({"enemy", "boss"})           -- Vec<String>
+local stats = Stats.new({ hp = 100.0, mp = 50.0 })  -- HashMap<String, f32>
 -- TileKind.Floor — C-like enum (доступ как поле таблицы)
 ```
 
-Конструкторы доступны внутри скриптов и используются в `spawn_entity()`:
+Используются в `spawn_entity()`:
 
 ```lua
 spawn_entity({
     position = Position.new(0.0, 0.0),
     velocity = Velocity.new(1.0, 0.5),
     health   = Health.new(100.0, 100.0),
-    tags     = Tags.new({"enemy", "boss"}),
-    stats    = Stats.new({ hp = 100.0, mp = 50.0 }),
-    tilekind = TileKind.Floor,
 })
 ```
 
 ## Хот-релоад
 
-`ScriptEngine::with_dir(path)` запускает файловый наблюдатель (`notify`).
+`ScriptEngine::with_dir(path)` запускает файловый наблюдатель (`notify`). При изменении `.lua`:
 
-При изменении `.lua` файла:
+1. `poll_hot_reload()` обнаруживает событие (с time-based debounce 50ms — ровно одна перекомпиляция
+   на одно сохранение);
+2. файл перекомпилируется с новым sandbox-`_ENV`, `CompiledScript` заменяется в `HashMap`;
+3. монолитный `run()` сразу использует новую версию;
+4. для `system{}`-модели повторный `register_systems` снимает прошлое поколение скрипт-систем из
+   планировщика (`Scheduler::remove_system`) и регистрирует текущее — изменённый набор `system{}`
+   заменяет старый без дублей.
 
-1. `poll_hot_reload()` обнаруживает событие
-2. Перекомпилирует изменённый файл с новым sandbox-окружением
-3. Заменяет `CompiledScript` в `HashMap`
-4. Следующий вызов `run()` использует новую версию
-
-### Дебаунс-защита
-
-При сохранении файла ОС генерирует несколько событий. `poll_hot_reload()` использует
-time-based debounce (50ms) — если файл был перезагружен менее 50ms назад, событие
-пропускается. Это гарантирует ровно одну перекомпиляцию на одно сохранение.
-
-При ошибке компиляции — старый скрипт продолжает работать, ошибка логируется.
+При ошибке компиляции старый скрипт продолжает работать, ошибка логируется.
 
 ## ScriptableRegistrar
 
@@ -402,7 +377,6 @@ time-based debounce (50ms) — если файл был перезагружен
 ```rust
 impl ScriptableRegistrar for Health {
     fn type_name_str() -> &'static str { "Health" }
-
     fn field_names() -> &'static [&'static str] { &["current", "max"] }
 
     fn to_lua(&self, lua: &mlua::Lua) -> mlua::Result<mlua::Value> {
@@ -414,18 +388,14 @@ impl ScriptableRegistrar for Health {
 
     fn from_lua(val: &mlua::Value) -> Option<Self> {
         let t = val.as_table()?;
-        let current = t.get::<f32>("current").ok()?;
-        let max     = t.get::<f32>("max").ok()?;
-        Some(Self { current, max })
+        Some(Self { current: t.get("current").ok()?, max: t.get("max").ok()? })
     }
 
     fn register_lua_type(lua: &mlua::Lua) -> mlua::Result<()> {
-        // Регистрирует Health.new(current, max) в Lua
         let t = lua.create_table()?;
         t.set("new", lua.create_function(|lua, (current, max): (f32, f32)| {
             let t = lua.create_table()?;
-            t.set("current", current)?;
-            t.set("max", max)?;
+            t.set("current", current)?; t.set("max", max)?;
             Ok(t)
         })?)?;
         lua.globals().set("Health", t)
@@ -435,7 +405,7 @@ impl ScriptableRegistrar for Health {
 
 ## WorldScriptingExt
 
-`WorldScriptingExt` — extension trait, объединяющий регистрацию в `World` и `ScriptEngine`:
+Extension trait, объединяющий регистрацию в `World` и `ScriptEngine`:
 
 ```rust
 // Было (два вызова):
@@ -446,12 +416,10 @@ engine.register_component::<Position>(&world);
 world.register_scriptable::<Position>(&mut engine);
 ```
 
-Методы:
-
 | Метод | Действие |
 |---|---|
 | `world.register_scriptable::<T>(&mut engine)` | Регистрирует компонент `T` в World + ScriptEngine |
-| `world.register_scriptable_resource::<T>(&mut engine)` | Регистрирует ресурс `T` в ScriptEngine |
+| `world.register_scriptable_resource::<T>(&mut engine)` | Регистрирует ресурс `T` в ScriptEngine (в мир вставьте `insert_resource` отдельно) |
 | `world.register_scriptable_event::<T>(&mut engine)` | Регистрирует событие `T` в World + ScriptEngine |
 
 ## Sandbox-изоляция
@@ -460,79 +428,69 @@ world.register_scriptable::<Position>(&mut engine);
 
 ```text
 Sandbox _ENV содержит:
-├── Стандартные библиотеки: math, string, table, ipairs, pairs, next
-├── API-функции: delta_time, entity_count, query, commit, spawn_entity,
+├── Стандартные библиотеки: math, string, table, ipairs, pairs, next, select,
+│   tonumber, tostring, type, unpack
+├── API-функции: delta_time, entity_count, query, commit, system, spawn_entity,
 │   despawn, read_resource, write_resource, emit_event, log, print,
 │   log_debug/log_warn/log_error, inspect
 └── Конструкторы компонентов: Position.new, Velocity.new, Health.new и т.д.
 ```
 
-Стандартные библиотеки `io` и `os` **не включены** — скрипты не имеют доступа к файловой системе.
+Библиотеки `io` и `os` **не включены** — скрипты не имеют доступа к файловой системе.
 
 ## Архитектура
 
 ```text
-ScriptEngine
-  ├── mlua::Lua              — Lua 5.4 VM
-  ├── ScriptContext          — мост World ↔ Lua (Rc<RefCell<>>)
+ScriptEngine  (!Send — держит Rc<Lua>, привязан к потоку создания)
+  ├── lua: Rc<mlua::Lua>             — Lua 5.4 VM (Rc: раннеры system{} делят её)
+  ├── ctx: Rc<RefCell<ScriptContext>>  — мост World ↔ Lua
   │     ├── delta_time: f32
-  │     ├── world_ptr: NonNull<World>  — живёт ≤ ScriptEngine::run()
-  │     ├── deferred: Commands         — буфер spawn/despawn
-  │     ├── deferred_spawns            — отложенные spawn_entity
-  │     ├── deferred_resource_writes   — отложенные write_resource
-  │     ├── deferred_events            — отложенные emit_event
-  │     ├── query_cache                — кэш сборки архетипов
-  │     ├── bindings: HashMap<name, ComponentBinding>
-  │     ├── resource_bindings: HashMap<name, ResourceBinding>
-  │     └── event_bindings: HashMap<name, EventBinding>
-  ├── HashMap<name, CompiledScript>    — скомпилированные скрипты
-  │     ├── chunk_key: RegistryKey     — main chunk
-  │     └── env_key: RegistryKey       — sandbox _ENV
-  ├── FileWatcher                      — хот-релоад .lua файлов
-  └── spawn_appliers                   — обработчики компонентов для spawn
+  │     ├── world_ptr: NonNull<World>  — из &World; читается ТОЛЬКО как &World (живёт ≤ прогона)
+  │     ├── deferred_despawns: Vec<Entity>          — отложенные despawn
+  │     ├── deferred_spawns: Vec<SpawnRequest>      — отложенные spawn_entity
+  │     ├── spawn_appliers: HashMap<name, applier>  — вставка компонентов спавна через Commands
+  │     ├── deferred_resource_writes / deferred_events — отложенные write_resource / emit_event
+  │     ├── bindings / resource_bindings / event_bindings — реестры доступа из Lua
+  │     ├── script_systems: Vec<ScriptSystemDecl>   — объявления system{} (дренит register_systems)
+  │     └── declared: Option<DeclaredAccess>        — декл. доступ бегущей system{} (enforcement)
+  ├── scripts: HashMap<name, CompiledScript>        — { chunk_key, env_key }
+  ├── watcher / watch_rx / last_reload              — хот-релоад .lua
+  └── registered_system_ids: Vec<SystemId>          — id зарегистрированных system{} (для re-register)
 ```
 
-### Жизненный цикл `run()`:
+Component/Resource/Event-запись идёт через `DeferredWorldOp = Box<dyn FnOnce(&mut World) + Send>`:
+типизированное значение извлекается пока жива VM, затем применяется — монолитом напрямую или скрипт-
+системой через `commands.add`. **`&mut World` из `world_ptr` не выводится нигде** (коммиты — через
+declared-cell `DynQueryMut` с interior-mutable колонками; структурные/глобальные ops — через `Commands`).
 
-1. Установить `world_ptr` + `delta_time` в `ScriptContext`
-2. Выполнить main chunk (определяет `function run()` в sandbox `_ENV`)
-3. Вызвать `run()` из sandbox-окружения
-4. Применить `deferred` команды (despawn)
-5. Применить `deferred_resource_writes` и `deferred_events`
-6. Сбросить `world_ptr`
-7. Применить отложенные `spawn_entity` (создание entity)
+### Жизненный цикл монолитного `run()`
 
-### Двухбуферность изменений
+1. Установить `delta_time` + `world_ptr` (из `&World`) в `ScriptContext`.
+2. Выполнить main chunk (определяет `function run()` в sandbox `_ENV`; там же исполняются любые
+   top-level-вызовы).
+3. Вызвать `run()` из sandbox-окружения (если определена).
+4. Дренировать ВСЕ отложенные эффекты (despawn → spawn → resource → event) в один `Commands`-буфер
+   (с reserver мира → детерминированные id) и применить.
+5. Сбросить `world_ptr`.
 
-Spawn/despawn из скрипта нельзя применять во время итерации по архетипам:
+Для `system{}`-модели ту же роль играет per-system `Commands`-слот планировщика (см. §3).
 
-- **Despawn** — накапливается в `Commands`, применяется после скрипта
-- **Spawn** — накапливается в `deferred_spawns`, применяется после скрипта
-- **Write-компоненты** — накапливаются через `commit()`, применяются через `flush_writes()`
-- **Write-ресурсы и события** — буферизируются в `deferred_resource_writes` / `deferred_events`,
-  применяются после скрипта
+### Отложенность изменений
 
-### Кэширование query-запросов
+Структурные и глобальные изменения нельзя применять во время итерации по архетипам — они
+буферизуются и дренятся в `Commands` после скрипта:
 
-`ScriptContext` содержит `query_cache: HashMap<Vec<String>, Vec<ArchState>>`:
-
-- Кэширует результат сканирования архетипов при повторных `query()` с теми же дескрипторами
-- Инвалидируется при каждом новом запуске скрипта (в `set_world_ptr`)
-- Ускоряет частые query из Lua-скриптов в 2-5× за счёт устранения повторного сканирования мира
-
-### Change ticks при записи
-
-При `commit()` автоматически обновляются change ticks. Это означает, что `Changed<T>`
-query корректно видит изменения, сделанные из Lua-скриптов.
+- **Despawn** → `deferred_despawns: Vec<Entity>` → `commands.despawn`.
+- **Spawn** → `deferred_spawns` → `commands.spawn().id()` + component appliers (детерминированные id).
+- **Write-ресурсы / события** → `deferred_resource_writes` / `deferred_events` → `commands.add(closure)`.
+- **Write-компоненты** — применяются немедленно при `commit()` через `DynQueryMut` (не буферизуются).
 
 ## Важные замечания
 
-- **НЕ ИСПОЛЬЗУЙТЕ** `ScriptEngine::run()` внутри `ParSystem` / `system!` — `run()` требует
-  `&mut self`, что несовместимо с параллельным доступом. Только `SequentialSystem`.
-- **Рекомендуется** интеграция через `sequential_system!` с состоянием (см. шаг 3 Быстрого старта).
-  Это даёт корректную интеграцию с планировщиком, эксклюзивный `&mut World` и возможность
-  использовать параметры макроса (`&Resource`, `&[Event]`, `Cmd`, `Ctx`).
-- **МОЖНО** передать `ScriptEngine` в другой поток при внешней синхронизации
-  (`Mutex<ScriptEngine>`) — он реализует `Send`.
-- Lua выполняется однопоточно внутри одного вызова `run()`. Для параллельной
-  обработки данных используйте `ParSystem` и `Commands`.
+- **Золотой путь интеграции с планировщиком — `system{}` + `register_systems`** (§3): Lua-логика
+  становится первоклассными системами с конфликт-детекцией и детерминизмом.
+- `engine.run(dt, &mut world)` — простой монолитный путь без планировщика (§4); требует `&mut World`,
+  поэтому не вызывается изнутри параллельной системы.
+- **`ScriptEngine` — `!Send`** (держит `Rc<Lua>`): одна VM живёт на своём потоке. Настоящий Lua↔Lua
+  параллелизм потребовал бы share-nothing VM-пула (не реализовано — ROI-gated, `decisions/ADR-005`).
+  Для CPU-bound обработки тысяч сущностей используйте чистые Rust-системы.
