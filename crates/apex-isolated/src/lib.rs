@@ -6,12 +6,20 @@
 //! - [`CloneableBridge`] — a cloneable wrapper for storing in resources
 //! - [`BridgeEvent`] — events passed through a WorldBridge
 //! - [`sync_bridge_cloneable`] — a synchronization system for the Scheduler
+//! - [`exchange`] — cross-world entity transfer with reference remapping (В4)
+//! - [`WorldRegistrar`] — a replayable world-schema recipe (shared registration)
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use apex_core::World;
 use apex_scheduler::Scheduler;
+
+pub mod exchange;
+pub mod registrar;
+
+pub use registrar::WorldRegistrar;
 
 // ---------------------------------------------------------------------------
 // BridgeEvent
@@ -23,6 +31,128 @@ pub enum BridgeEvent {
     Action(Box<dyn FnOnce(&mut World) + Send>),
     /// A typed event (serialized via bincode).
     Event { type_name: String, data: Vec<u8> },
+}
+
+// ---------------------------------------------------------------------------
+// Bounded channels — backpressure policy + telemetry (В4)
+// ---------------------------------------------------------------------------
+
+/// What a bounded bridge does when its queue is full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeOverflow {
+    /// Block the sender until the receiver drains space — lossless backpressure.
+    /// Correct when both worlds are ticking; a stalled receiver stalls the sender
+    /// (visible), never silently unbounded memory growth.
+    Block,
+    /// Drop the message, bump the dropped counter, and warn once — lossy but
+    /// non-blocking. For soft-real-time producers that must not stall (a render
+    /// or telemetry feed) and prefer to shed load loudly.
+    DropLoud,
+}
+
+/// Configuration for a bridge's channel.
+///
+/// The pre-В4 bridge used **unbounded** channels: a slow consumer grew memory
+/// without limit and without any signal. A bounded channel + explicit overflow
+/// policy makes backpressure a decision, not an accident.
+#[derive(Clone, Copy, Debug)]
+pub struct BridgeConfig {
+    /// Channel capacity (messages) per direction.
+    pub capacity: usize,
+    /// Behaviour when the channel is full.
+    pub overflow: BridgeOverflow,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        // Lossless by default: bounded so memory is capped, blocking so nothing
+        // is silently lost. A soft-real-time producer opts into `DropLoud`.
+        Self { capacity: 1024, overflow: BridgeOverflow::Block }
+    }
+}
+
+/// Live counters for one direction of a bridge. Shared (`Arc`) with the peer's
+/// receiver so both ends can observe the same figures.
+#[derive(Debug, Default)]
+pub struct BridgeStats {
+    /// Messages successfully enqueued.
+    pub sent:       AtomicU64,
+    /// Messages dropped (channel full under `DropLoud`, or peer disconnected).
+    pub dropped:    AtomicU64,
+    /// Peak observed queue depth — how close the channel came to saturation.
+    pub high_water: AtomicU64,
+}
+
+impl BridgeStats {
+    fn record_sent(&self, queue_len: usize) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        // Monotonic max — best-effort under Relaxed (telemetry, not a gate).
+        let len = queue_len as u64;
+        let mut hw = self.high_water.load(Ordering::Relaxed);
+        while len > hw {
+            match self.high_water.compare_exchange_weak(
+                hw, len, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => hw = cur,
+            }
+        }
+    }
+
+    fn record_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Messages successfully enqueued so far.
+    pub fn sent(&self) -> u64 { self.sent.load(Ordering::Relaxed) }
+    /// Messages dropped so far (full channel under `DropLoud`, or disconnect).
+    pub fn dropped(&self) -> u64 { self.dropped.load(Ordering::Relaxed) }
+    /// Peak observed queue depth.
+    pub fn high_water(&self) -> u64 { self.high_water.load(Ordering::Relaxed) }
+}
+
+/// Enqueue `ev` on `tx` honouring `config`, recording telemetry. Returns whether
+/// the message was accepted. A closed peer or a full `DropLoud` channel are both
+/// surfaced loudly (§0.2a) and counted, never swallowed silently.
+fn send_with_policy(
+    tx: &crossbeam_channel::Sender<BridgeEvent>,
+    ev: BridgeEvent,
+    config: BridgeConfig,
+    stats: &BridgeStats,
+    what: &str,
+) -> bool {
+    use crossbeam_channel::TrySendError;
+    match config.overflow {
+        BridgeOverflow::Block => match tx.send(ev) {
+            Ok(()) => {
+                stats.record_sent(tx.len());
+                true
+            }
+            Err(_) => {
+                stats.record_dropped();
+                apex_core::warn_once!("bridge send ({what}): peer channel closed — message dropped");
+                false
+            }
+        },
+        BridgeOverflow::DropLoud => match tx.try_send(ev) {
+            Ok(()) => {
+                stats.record_sent(tx.len());
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                stats.record_dropped();
+                apex_core::warn_once!(
+                    "bridge send ({what}): channel full (capacity reached) — message dropped (DropLoud)"
+                );
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                stats.record_dropped();
+                apex_core::warn_once!("bridge send ({what}): peer channel closed — message dropped");
+                false
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -49,17 +179,26 @@ pub struct WorldBridge {
     outbound: crossbeam_channel::Receiver<BridgeEvent>,
     /// Registry of deserializers: type_name → (data, world).
     event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
+    /// Channel capacity + overflow policy for this direction's sends.
+    config: BridgeConfig,
+    /// Telemetry for this direction's sends.
+    stats: Arc<BridgeStats>,
 }
 
 impl WorldBridge {
-    /// Create a pair of linked bridges.
+    /// Create a pair of linked bridges with the default (bounded, blocking) config.
     ///
     /// Returns `(main_to_sub, sub_to_main)`, where:
     /// - `main_to_sub` — used by the main world to send into the IsolatedWorld
     /// - `sub_to_main` — used by the IsolatedWorld to send into the main world
     pub fn new() -> (Self, Self) {
-        let (main_tx, sub_rx) = crossbeam_channel::unbounded();
-        let (sub_tx, main_rx) = crossbeam_channel::unbounded();
+        Self::with_config(BridgeConfig::default())
+    }
+
+    /// Create a pair of linked bridges with an explicit channel config (В4).
+    pub fn with_config(config: BridgeConfig) -> (Self, Self) {
+        let (main_tx, sub_rx) = crossbeam_channel::bounded(config.capacity);
+        let (sub_tx, main_rx) = crossbeam_channel::bounded(config.capacity);
 
         let handlers = Arc::new(RwLock::new(HashMap::new()));
 
@@ -67,15 +206,24 @@ impl WorldBridge {
             inbound: main_tx,
             outbound: main_rx,
             event_handlers: Arc::clone(&handlers),
+            config,
+            stats: Arc::new(BridgeStats::default()),
         };
 
         let sub_to_main = Self {
             inbound: sub_tx,
             outbound: sub_rx,
             event_handlers: handlers,
+            config,
+            stats: Arc::new(BridgeStats::default()),
         };
 
         (main_to_sub, sub_to_main)
+    }
+
+    /// Telemetry for this direction's sends (sent / dropped / peak depth).
+    pub fn stats(&self) -> &BridgeStats {
+        &self.stats
     }
 
     /// Register an event type for deserialization on the receiving side.
@@ -104,14 +252,17 @@ impl WorldBridge {
     }
 
     /// Send an action to the target world.
+    ///
+    /// Honours the bridge's overflow policy; a closed peer or a full `DropLoud`
+    /// channel is surfaced loudly and counted in [`stats`](Self::stats) (§0.2a).
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
-        // §0.2a (E12): a closed channel (peer world torn down) silently dropped
-        // the action. Surface it (throttled).
-        if self.inbound.send(BridgeEvent::Action(f)).is_err() {
-            apex_core::warn_once!(
-                "WorldBridge::send_action: peer world channel closed — action dropped"
-            );
-        }
+        send_with_policy(
+            &self.inbound,
+            BridgeEvent::Action(f),
+            self.config,
+            &self.stats,
+            "WorldBridge::send_action",
+        );
     }
 
     /// Send a typed event to the target world.
@@ -124,22 +275,20 @@ impl WorldBridge {
             Ok(bytes) => bytes,
             // §0.2a (E12): a serialize failure silently discarded the event.
             Err(e) => {
+                self.stats.record_dropped();
                 apex_core::warn_once!(
                     "WorldBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
                 );
                 return;
             }
         };
-        if self
-            .inbound
-            .send(BridgeEvent::Event { type_name, data })
-            .is_err()
-        {
-            apex_core::warn_once!(
-                "WorldBridge::send_event: peer world channel closed — `{}` event dropped",
-                std::any::type_name::<T>(),
-            );
-        }
+        send_with_policy(
+            &self.inbound,
+            BridgeEvent::Event { type_name, data },
+            self.config,
+            &self.stats,
+            "WorldBridge::send_event",
+        );
     }
 
     /// Apply all accumulated messages to the world.
@@ -204,11 +353,20 @@ pub struct IsolatedWorld {
     scheduler: Scheduler,
 }
 
-// SAFETY: IsolatedWorld is only accessed from a single thread at a time.
-// The scheduler's SystemDescriptor contains `Box<dyn FnMut>` which is Send but not Sync.
-// We assert Sync is safe because the caller guarantees single-thread access.
+// SAFETY (Send): an `IsolatedWorld` is *owned* by whichever thread runs it — the
+// pipelined renderer moves it into its render thread (`spawn(move || …)`) and no
+// other thread references it. Moving it across the thread boundary is sound as
+// long as its contents are `Send`; the render/simulation worlds it holds contain
+// only `Send` data (no `NonSend` resources), which is the standing contract for a
+// world that ticks off the main thread. The auto-derived `Send` does not apply
+// because a `World`/`Scheduler` may hold trait objects the compiler cannot prove
+// `Send`, so this asserts the invariant explicitly.
+//
+// `Sync` is deliberately NOT implemented: nothing shares an `&IsolatedWorld`
+// across threads (the old `unsafe impl Sync` had a false justification — E12 —
+// and no consumer required it; the renderer transfers ownership, it does not
+// alias). Withholding `Sync` keeps the type honest.
 unsafe impl Send for IsolatedWorld {}
-unsafe impl Sync for IsolatedWorld {}
 
 impl IsolatedWorld {
     /// Create a new isolated world.
@@ -217,6 +375,35 @@ impl IsolatedWorld {
             world: World::new(),
             scheduler: Scheduler::new(),
         }
+    }
+
+    /// Create an isolated world whose schema is registered from a shared recipe
+    /// (В4 / B5) — the same components/events/relations as the world it will
+    /// exchange data with, without hand-duplicating registrations.
+    pub fn from_registrar(recipe: &WorldRegistrar) -> Self {
+        Self {
+            world: recipe.new_world(),
+            scheduler: Scheduler::new(),
+        }
+    }
+
+    /// Export this world's entire state as a snapshot (fork it out).
+    /// See [`exchange`] for the subtree-scoped and apply-back variants.
+    pub fn export(
+        &self,
+        ctx: &mut dyn apex_core::SerdeContext,
+    ) -> Result<apex_serialization::WorldSnapshot, apex_serialization::SerializationError> {
+        exchange::export_world(&self.world, ctx)
+    }
+
+    /// Import a snapshot into this world (fresh entities, `Entity` refs remapped);
+    /// returns the old-index → new-`Entity` map.
+    pub fn import(
+        &mut self,
+        snapshot: &apex_serialization::WorldSnapshot,
+        ctx:      &mut dyn apex_core::SerdeContext,
+    ) -> Result<apex_serialization::RestoreEntityMap, apex_serialization::SerializationError> {
+        exchange::import(&mut self.world, snapshot, ctx)
     }
 
     /// Access to the internal [`World`] (careful: structural changes).
@@ -282,19 +469,44 @@ pub struct CloneableBridge {
     from_sub: crossbeam_channel::Receiver<BridgeEvent>,
     /// Registry of deserializers.
     event_handlers: Arc<RwLock<HashMap<String, EventHandler>>>,
+    /// Overflow policy applied on send (the channels are caller-provided, so
+    /// their capacity is whatever the caller chose; only the policy lives here).
+    config: BridgeConfig,
+    /// Telemetry for this bridge's sends (shared across clones — same channels).
+    stats: Arc<BridgeStats>,
 }
 
 impl CloneableBridge {
-    /// Create a `CloneableBridge` from a pair of channels.
+    /// Create a `CloneableBridge` from a pair of channels (default blocking policy).
+    ///
+    /// The caller supplies the channels, so bound them (`crossbeam_channel::bounded`)
+    /// for backpressure; an unbounded pair keeps the pre-В4 grow-without-limit
+    /// behaviour, now an explicit caller choice rather than the only option.
     pub fn new(
         to_sub: crossbeam_channel::Sender<BridgeEvent>,
         from_sub: crossbeam_channel::Receiver<BridgeEvent>,
+    ) -> Self {
+        Self::with_overflow(to_sub, from_sub, BridgeConfig::default().overflow)
+    }
+
+    /// Create a `CloneableBridge` with an explicit overflow policy (В4).
+    pub fn with_overflow(
+        to_sub: crossbeam_channel::Sender<BridgeEvent>,
+        from_sub: crossbeam_channel::Receiver<BridgeEvent>,
+        overflow: BridgeOverflow,
     ) -> Self {
         Self {
             to_sub,
             from_sub,
             event_handlers: Arc::new(RwLock::new(HashMap::new())),
+            config: BridgeConfig { capacity: 0, overflow },
+            stats: Arc::new(BridgeStats::default()),
         }
+    }
+
+    /// Telemetry for this bridge's sends (sent / dropped / peak depth).
+    pub fn stats(&self) -> &BridgeStats {
+        &self.stats
     }
 
     /// Register an event type for deserialization on the receiving side.
@@ -322,13 +534,17 @@ impl CloneableBridge {
     }
 
     /// Send an action into the IsolatedWorld.
+    ///
+    /// Honours the overflow policy; a closed peer or a full `DropLoud` channel is
+    /// surfaced loudly and counted in [`stats`](Self::stats) (§0.2a).
     pub fn send_action(&self, f: Box<dyn FnOnce(&mut World) + Send>) {
-        // §0.2a (E12): a closed channel silently dropped the action.
-        if self.to_sub.send(BridgeEvent::Action(f)).is_err() {
-            apex_core::warn_once!(
-                "CloneableBridge::send_action: peer world channel closed — action dropped"
-            );
-        }
+        send_with_policy(
+            &self.to_sub,
+            BridgeEvent::Action(f),
+            self.config,
+            &self.stats,
+            "CloneableBridge::send_action",
+        );
     }
 
     /// Send a typed event to the target world (serialized via bincode).
@@ -340,22 +556,20 @@ impl CloneableBridge {
             Ok(bytes) => bytes,
             // §0.2a (E12): a serialize failure silently discarded the event.
             Err(e) => {
+                self.stats.record_dropped();
                 apex_core::warn_once!(
                     "CloneableBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
                 );
                 return;
             }
         };
-        if self
-            .to_sub
-            .send(BridgeEvent::Event { type_name, data })
-            .is_err()
-        {
-            apex_core::warn_once!(
-                "CloneableBridge::send_event: peer world channel closed — `{}` event dropped",
-                std::any::type_name::<T>(),
-            );
-        }
+        send_with_policy(
+            &self.to_sub,
+            BridgeEvent::Event { type_name, data },
+            self.config,
+            &self.stats,
+            "CloneableBridge::send_event",
+        );
     }
 
     /// Send an event as an `Action`.
@@ -450,6 +664,77 @@ mod tests {
         drop(sub); // receiver for `main.inbound` is gone → send() errors
         main.send_action(Box::new(|_w: &mut World| {}));
         main.send_event(&7u32);
+        // The drop is counted, not swallowed silently (В4 telemetry).
+        assert_eq!(main.stats().dropped(), 2);
+        assert_eq!(main.stats().sent(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // В4: bounded channels + backpressure policy + telemetry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn iso_world_is_send_not_sync() {
+        // Send is asserted (renderer moves the world into its thread); Sync is
+        // deliberately withheld. This pins the Send contract at compile time.
+        fn assert_send<T: Send>() {}
+        assert_send::<IsolatedWorld>();
+    }
+
+    #[test]
+    fn bridge_stats_count_successful_sends() {
+        let (main, _sub) = WorldBridge::new();
+        main.send_action(Box::new(|_w: &mut World| {}));
+        main.send_action(Box::new(|_w: &mut World| {}));
+        assert_eq!(main.stats().sent(), 2);
+        assert_eq!(main.stats().dropped(), 0);
+        assert!(main.stats().high_water() >= 1, "peak depth observed");
+    }
+
+    #[test]
+    fn drop_loud_sheds_load_when_full_and_counts_it() {
+        // A tiny DropLoud channel: fill it, then the next send is dropped (loud)
+        // rather than blocking or growing memory. The consumer never drains here.
+        let (to_sub, sub_rx) = crossbeam_channel::bounded(2);
+        let (_unused_tx, from_sub) = crossbeam_channel::bounded::<BridgeEvent>(2);
+        let bridge = CloneableBridge::with_overflow(to_sub, from_sub, BridgeOverflow::DropLoud);
+
+        bridge.send_action(Box::new(|_w: &mut World| {})); // 1 → queued
+        bridge.send_action(Box::new(|_w: &mut World| {})); // 2 → queued (full)
+        bridge.send_action(Box::new(|_w: &mut World| {})); // 3 → dropped (loud)
+        bridge.send_action(Box::new(|_w: &mut World| {})); // 4 → dropped (loud)
+
+        assert_eq!(bridge.stats().sent(), 2, "capacity accepted");
+        assert_eq!(bridge.stats().dropped(), 2, "overflow shed loudly");
+        assert_eq!(sub_rx.len(), 2, "channel bounded at capacity");
+    }
+
+    #[test]
+    fn block_policy_backpressures_without_dropping() {
+        // With Block policy and a draining consumer on another thread, every
+        // message is delivered — bounded memory, zero loss.
+        let (to_sub, sub_rx) = crossbeam_channel::bounded(4);
+        let (_unused_tx, from_sub) = crossbeam_channel::bounded::<BridgeEvent>(4);
+        let bridge = CloneableBridge::with_overflow(to_sub, from_sub, BridgeOverflow::Block);
+
+        let drainer = std::thread::spawn(move || {
+            let mut count = 0;
+            while let Ok(_ev) = sub_rx.recv() {
+                count += 1;
+                if count == 100 {
+                    break;
+                }
+            }
+            count
+        });
+
+        for _ in 0..100 {
+            bridge.send_action(Box::new(|_w: &mut World| {}));
+        }
+        let received = drainer.join().unwrap();
+        assert_eq!(received, 100, "Block policy loses nothing");
+        assert_eq!(bridge.stats().sent(), 100);
+        assert_eq!(bridge.stats().dropped(), 0);
     }
 
     #[test]

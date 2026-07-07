@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-apex-core      = { path = "../apex-core" }
-apex-scheduler = { path = "../apex-scheduler" }
+apex-core          = { path = "../apex-core" }
+apex-scheduler     = { path = "../apex-scheduler" }
+apex-serialization = { path = "../apex-serialization" }
 
 crossbeam-channel = { workspace = true }
 serde             = { workspace = true }

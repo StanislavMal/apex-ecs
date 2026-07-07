@@ -7,21 +7,28 @@
 //! half of the bridge across, and assert the ARTIFACT that arrives (entity
 //! counts, deserialized events, a result echoed back) — not merely "no panic".
 //!
-//! Scope note (V4 / CORE_AUDIT §10.6): the bridge today is `unbounded` and has
-//! no entity remapping. Bounded channels with telemetry and a remap protocol
-//! are still design debt — these tests pin the EXISTING mechanism across
-//! threads so that work can build on a verified baseline.
+//! Scope note (В4 / CORE_AUDIT §10.6): as of the EDITOR_GOLDEN_PATH campaign the
+//! bridge is **bounded** with a backpressure policy + telemetry, and there is a
+//! first-class **exchange protocol** (`apex_isolated::exchange`) that moves
+//! entities between worlds with reference remapping, plus a `WorldRegistrar`
+//! schema recipe. The tests below cross real thread boundaries to exercise all
+//! of it — actions/events, entity transfer with remapped relations, apply-back
+//! by key, and a shared-schema round-trip.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use apex_core::relations::ChildOf;
 use apex_core::World;
-use apex_isolated::{CloneableBridge, IsolatedWorld, WorldBridge};
+use apex_isolated::{CloneableBridge, IsolatedWorld, WorldBridge, WorldRegistrar};
 use apex_scheduler::{par, StageLabel};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
 struct ScoreEvent(u32);
+
+#[derive(apex_core::Component, serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
+struct Tag(u32);
 
 /// Result echoed from the worker back into the main world.
 struct WorkerResult(usize);
@@ -229,4 +236,108 @@ fn isolated_world_ticks_on_worker_thread() {
     .unwrap();
 
     assert_eq!(observed, 2, "the isolated scheduler ran against its own world on the worker thread");
+}
+
+// ── Exchange protocol: entity transfer with remapping (В4) ────────
+
+/// Transfer a whole subtree (a parent + its `ChildOf` children) from a source
+/// world into a fresh world on a WORKER THREAD, and assert the relations arrive
+/// REMAPPED — the children re-parent under the newly-created parent, not the old
+/// (now-foreign) entity ids. This is the differentiator the renderer/editor used
+/// to hand-roll (MainEntity / EditorIdMap).
+#[test]
+fn transfer_subtree_across_thread_remaps_relations() {
+    // A shared recipe registers the component serde AND the ChildOf relation kind
+    // on both worlds — relation kinds are schema too, so a receiver must know them
+    // or the relations are dropped on transfer.
+    let mut recipe = WorldRegistrar::new();
+    recipe
+        .register_component_serde_json::<Tag>()
+        .register_relation_kind::<ChildOf>();
+
+    let mut src = recipe.new_world();
+    let parent = src.spawn((Tag(1),));
+    let c1 = src.spawn((Tag(2),));
+    let c2 = src.spawn((Tag(3),));
+    src.add_relation(c1, ChildOf, parent);
+    src.add_relation(c2, ChildOf, parent);
+
+    let (count, kids) = thread::spawn(move || {
+        let mut dst = recipe.new_world();
+        let map = apex_isolated::exchange::transfer_entities(&src, &mut dst, &[parent]).unwrap();
+
+        // The remapped parent is a DIFFERENT entity than the source parent.
+        let new_parent = map[&parent.index()];
+        // Both children re-parented under the remapped parent (relation remapped).
+        let kids = dst.targets_of(ChildOf, new_parent).count();
+        (dst.entity_count(), kids)
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(count, 3, "parent + two children all transferred");
+    assert_eq!(kids, 2, "both children re-parented under the remapped parent");
+}
+
+/// A `WorldRegistrar` recipe builds two worlds with an identical serde schema, so
+/// a component snapshotted in one deserializes in the other WITHOUT hand-copying
+/// registrations — proven by transferring the component across a thread boundary.
+#[test]
+fn registrar_gives_two_worlds_a_shared_schema_across_thread() {
+    let mut recipe = WorldRegistrar::new();
+    recipe.register_component_serde_json::<Tag>();
+
+    // Source world built from the recipe.
+    let mut src = recipe.new_world();
+    let e = src.spawn((Tag(99),));
+
+    // Worker builds ITS world from the SAME recipe and receives the transfer.
+    let value = thread::spawn(move || {
+        let mut dst = recipe.new_world();
+        let map = apex_isolated::exchange::transfer_entities(&src, &mut dst, &[e]).unwrap();
+        dst.get::<Tag>(map[&e.index()]).map(|t| t.0)
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(value, Some(99), "shared-schema world deserialized the transferred component");
+}
+
+/// Apply-back across a thread: fork a world (by snapshot), edit the fork on a
+/// worker, then commit the fork's changes back onto the ORIGINAL entity (keyed
+/// by the same external index) — the source entity is UPDATED in place, not
+/// duplicated. This is the editor preview-transaction shape (Wave 5.2) in the
+/// small: only the `WorldSnapshot` (Send) crosses the boundary, the live
+/// document stays put.
+#[test]
+fn apply_back_commits_fork_edits_onto_original_entities() {
+    let mut doc = World::new();
+    doc.register_component_serde_json::<Tag>();
+    let e = doc.spawn((Tag(1),));
+    let e_index = e.index();
+
+    // Fork out: snapshot the document on the main thread.
+    let doc_snap = apex_isolated::exchange::export_world(&doc, &mut apex_core::NoContext).unwrap();
+
+    // Worker: rebuild the fork from the snapshot, edit it, snapshot the edit back.
+    let edited = thread::spawn(move || {
+        let mut fork = World::new();
+        fork.register_component_serde_json::<Tag>();
+        let map = apex_isolated::exchange::import(&mut fork, &doc_snap, &mut apex_core::NoContext).unwrap();
+        let fork_e = map[&e_index];
+        *fork.get_mut::<Tag>(fork_e).unwrap() = Tag(42);
+        apex_isolated::exchange::export_world(&fork, &mut apex_core::NoContext).unwrap()
+    })
+    .join()
+    .unwrap();
+
+    // Apply-back onto the live document, resolving the snapshot entity to the ORIGINAL.
+    let before = doc.entity_count();
+    apex_isolated::exchange::apply_back(&mut doc, &edited, &mut apex_core::NoContext, &mut |idx| {
+        if idx == e_index { Some(e) } else { None }
+    })
+    .unwrap();
+
+    assert_eq!(doc.entity_count(), before, "apply-back updated in place, no duplicate");
+    assert_eq!(doc.get::<Tag>(e).map(|t| t.0), Some(42), "the fork's edit landed on the original entity");
 }
