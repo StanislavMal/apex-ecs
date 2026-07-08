@@ -1,6 +1,6 @@
-# Apex Scripting — Lua Integration
+# Apex Scripting — руководство (Lua 5.4)
 
-Интеграция [Lua 5.4](https://www.lua.org/manual/5.4/) скриптинга с хот-релоадом в ApexForge_ECS.
+Руководство по интеграции [Lua 5.4](https://www.lua.org/manual/5.4/)-скриптинга с хот-релоадом в ApexForge_ECS.
 
 Реализована через крейт [`mlua`](https://docs.rs/mlua/) — безопасные Rust-привязки к Lua.
 
