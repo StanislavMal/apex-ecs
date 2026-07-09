@@ -127,7 +127,7 @@
 
     struct AutoMovement;
     impl AutoSystem for AutoMovement {
-        type Query = (Read<Vel>, Write<Pos>);
+        type Query = (&'static Vel, &'static mut Pos);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
@@ -140,7 +140,7 @@
 
     struct AutoHealth;
     impl AutoSystem for AutoHealth {
-        type Query = Write<Hp>;
+        type Query = &'static mut Hp;
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
@@ -153,7 +153,7 @@
     #[test]
     fn auto_system_access_correct() {
         // AutoMovement must have read:Vel, write:Pos
-        let access = <(Read<Vel>, Write<Pos>) as WorldQuerySystemAccess>::system_access();
+        let access = <(&Vel, &mut Pos) as WorldQuerySystemAccess>::system_access();
         assert!(!access.reads.is_empty(), "must read Vel");
         assert!(!access.writes.is_empty(), "must write Pos");
     }
@@ -170,7 +170,7 @@
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+        Query::<&Pos>::new(&world).for_each(|_, p| {
             result = (p.x, p.y);
         });
         assert!((result.0 - 3.0).abs() < 1e-6);
@@ -296,7 +296,7 @@
 
     #[test]
     fn auto_system_no_conflict_same_stage() {
-        // AutoMovement (Write<Pos>) and AutoHealth (Write<Hp>) — no conflict
+        // AutoMovement (&mut Pos) and AutoHealth (&mut Hp) — no conflict
         let mut sched = Scheduler::new();
         sched.add_auto_system("movement", AutoMovement);
         sched.add_auto_system("health", AutoHealth);
@@ -313,15 +313,15 @@
         // Two AutoSystems write Pos — a conflict
         struct AutoMovement2;
         impl AutoSystem for AutoMovement2 {
-            type Query = Write<Pos>;
+            type Query = &'static mut Pos;
             type Resources = ();
             type Events = ();
             fn run(&mut self, _: SystemContext<'_>) {}
         }
 
         let mut sched = Scheduler::new();
-        sched.add_auto_system("m1", AutoMovement); // Write<Pos>
-        sched.add_auto_system("m2", AutoMovement2); // Write<Pos>
+        sched.add_auto_system("m1", AutoMovement); // &mut Pos
+        sched.add_auto_system("m2", AutoMovement2); // &mut Pos
         sched.compile().unwrap();
 
         assert_eq!(
@@ -515,7 +515,7 @@
                 AccessDescriptor::new().read::<Vel>().write::<Pos>()
             }
             fn run(&mut self, ctx: SystemContext<'_>) {
-                ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+                ctx.query_unchecked::<(&Vel, &mut Pos)>()
                     .for_each_mut(|_, (vel, mut pos)| {
                         pos.x += vel.x;
                         pos.y += vel.y;
@@ -625,7 +625,7 @@
             access_desc!(read<DeltaTime>, read<Vel>, write<Pos>),
             |ctx: SystemContext<'_>| {
                 let dt = ctx.resource::<DeltaTime>();
-                ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+                ctx.query_unchecked::<(&Vel, &mut Pos)>()
                     .for_each_mut(|_, (vel, mut pos)| {
                         pos.x += vel.x * (*dt).0;
                         pos.y += vel.y * (*dt).0;
@@ -641,7 +641,7 @@
         sched.run_sequential(&mut world);
 
         let mut result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+        Query::<&Pos>::new(&world).for_each(|_, p| {
             result = (p.x, p.y);
         });
 
@@ -665,14 +665,14 @@
         sched.run(&mut world);
 
         let mut pos_result = (0.0f32, 0.0f32);
-        Query::<Read<Pos>>::new(&world).for_each(|_, p| {
+        Query::<&Pos>::new(&world).for_each(|_, p| {
             pos_result = (p.x, p.y);
         });
         assert!((pos_result.0 - 1.0).abs() < 1e-6);
         assert!((pos_result.1 - 2.0).abs() < 1e-6);
 
         let mut hp_result = -1.0f32;
-        Query::<Read<Hp>>::new(&world).for_each(|_, hp| {
+        Query::<&Hp>::new(&world).for_each(|_, hp| {
             hp_result = hp.0;
         });
         assert!((hp_result - 0.0).abs() < 1e-6);
@@ -1316,7 +1316,7 @@
 
     #[test]
     fn independent_resolves_bidirectional_write_read_deterministically() {
-        // A: Read<Vel>, Write<Pos>; B: Read<Pos>, Write<Vel> — a true BidirectionalWriteRead
+        // A: &Vel, &mut Pos; B: &Pos, &mut Vel — a true BidirectionalWriteRead
         // (without an explicit order → CircularDependency).
         struct A;
         impl ParSystem for A {
@@ -1603,7 +1603,7 @@
         }
         fn reader(w: &mut World) {
             let mut n = 0u32;
-            let q = w.query::<(Read<Mark>, Changed<Mark>)>();
+            let q = w.query::<(&Mark, Changed<Mark>)>();
             q.for_each(|_, _| n += 1);
             w.resource_mut::<Ctl>().seen += n;
         }
@@ -1681,7 +1681,7 @@
         // read + ResMut<Ctl>) ⇒ it shares the stage with keeper rather than getting its
         // own. A `system!` system (so it can be wrapped by `sys(...).run_if`).
         system! {
-            fn reader(q: (Changed<Mark>, Read<Mark>), out: ResMut<Ctl>) {
+            fn reader(q: (Changed<Mark>, &Mark), out: ResMut<Ctl>) {
                 let mut n = 0u32;
                 q.for_each(|_, _| n += 1);
                 out.seen += n;
@@ -1735,7 +1735,7 @@
                 w.resource_mut::<Done>().0 = true;
             }
         }
-        fn counter(q: Query<Read<Fresh>>, mut count: ResMut<Count>) {
+        fn counter(q: Query<&Fresh>, mut count: ResMut<Count>) {
             let mut n = 0;
             q.for_each(|_, _| n += 1);
             count.0 = n;
@@ -1794,15 +1794,15 @@
 
     #[test]
     fn bidir_write_read_no_false_circular_dep() {
-        // SystemA: Read<Vel>, Write<Pos>
-        // SystemB: Read<Pos>, Write<Vel>
+        // SystemA: &Vel, &mut Pos
+        // SystemB: &Pos, &mut Vel
         // The real conflict must be LinearOrder (not a cycle).
         let mut sched = Scheduler::new();
         sched.add_auto_system("sys_a", AutoMovement);
         sched.add_auto_system("sys_b", AutoMovement);
 
         let result = sched.compile();
-        // Identical systems with Read<Vel>+Write<Pos> — they conflict
+        // Identical systems with &Vel+&mut Pos — they conflict
         // (WriteWrite over Pos, WriteWrite over Vel) but do not create a cycle.
         assert!(
             result.is_ok(),
@@ -2157,7 +2157,7 @@
             s.add_system("check_sys", move |world: &mut World| {
                 let spawned = ENTITY_SPAWNED.load(Ordering::SeqCst);
                 assert!(spawned, "spawn_system must run before check_system");
-                let count = Query::<Read<Spawned>>::new(world).iter().count();
+                let count = Query::<&Spawned>::new(world).iter().count();
                 assert_eq!(count, 1, "the spawn must be visible in the same frame");
             });
         });
@@ -2408,7 +2408,7 @@
         cmds.spawn((Sp,));
         let mut world = World::new();
         cmds.apply(&mut world);
-        assert_eq!(Query::<Read<Sp>>::new(&world).iter().count(), 1,
+        assert_eq!(Query::<&Sp>::new(&world).iter().count(), 1,
             "Commands::spawn + apply should work");
     }
 
@@ -2429,7 +2429,7 @@
         let mut sched = Scheduler::new();
         sched.add_auto_system("spn", sys_cmd);
         sched.add_system("chk", move |world: &mut World| {
-            if Query::<Read<Sp>>::new(world).iter().count() > 0 {
+            if Query::<&Sp>::new(world).iter().count() > 0 {
                 SAW.store(true, Ordering::SeqCst);
             }
         });
@@ -2455,7 +2455,7 @@
             world.spawn((Spawned,));
         });
         sched.add_system("camera", move |world: &mut World| {
-            let count = Query::<Read<Spawned>>::new(world).iter().count();
+            let count = Query::<&Spawned>::new(world).iter().count();
             if count > 0 {
                 CAMERA_SAW.store(true, Ordering::SeqCst);
             }
@@ -2617,7 +2617,7 @@
 
         // movement moved each entity twice.
         let mut sum = 0.0;
-        Q::<Read<Pos>>::new(&world).for_each(|_, p| sum += p.y);
+        Q::<&Pos>::new(&world).for_each(|_, p| sum += p.y);
         assert_eq!(sum, 20.0, "movement ran 2 frames over 10 entities");
 
         // Event pipeline: emit (10 per frame) → reader (per-stage flush).
@@ -2644,7 +2644,7 @@
         sched.add_systems(StageLabel::Update, spawner);
         sched.run(&mut world);
 
-        let n = apex_core::query::Query::<Read<Pos>>::new(&world)
+        let n = apex_core::query::Query::<&Pos>::new(&world)
             .iter()
             .count();
         assert_eq!(n, 1, "the spawn from &mut Commands is applied by the end of the frame");
@@ -2653,7 +2653,7 @@
     /// The system name is derived from the function name (D2-1/U.4).
     #[test]
     fn plain_fn_name_derived_from_fn() {
-        fn my_special_system(_q: apex_core::query::Query<'_, '_, Read<Pos>>) {}
+        fn my_special_system(_q: apex_core::query::Query<'_, '_, &Pos>) {}
         let cfg = SystemConfig::fn_sys(my_special_system);
         assert_eq!(cfg.name, "my_special_system");
     }
@@ -2662,13 +2662,13 @@
     /// (a parallel batch); with overlapping access — they conflict.
     #[test]
     fn plain_fn_access_inferred_for_conflicts() {
-        fn writes_pos(mut q: apex_core::query::Query<'_, '_, Write<Pos>>) {
+        fn writes_pos(mut q: apex_core::query::Query<'_, '_, &mut Pos>) {
             q.for_each_mut(|_, mut p| p.x += 1.0);
         }
-        fn writes_vel(mut q: apex_core::query::Query<'_, '_, Write<Vel>>) {
+        fn writes_vel(mut q: apex_core::query::Query<'_, '_, &mut Vel>) {
             q.for_each_mut(|_, mut v| v.x += 1.0);
         }
-        fn reads_pos(q: apex_core::query::Query<'_, '_, Read<Pos>>) {
+        fn reads_pos(q: apex_core::query::Query<'_, '_, &Pos>) {
             q.for_each(|_, _| {});
         }
 
@@ -3029,8 +3029,8 @@
         struct Hits(u32);
 
         system! {
-            fn bump(q: Write<Hits>) {
-                q.for_each_mut(|_, mut h| h.0 += 1);
+            fn bump(q: (&mut Hits,)) {
+                q.for_each_mut(|_, (mut h,)| h.0 += 1);
             }
         }
 
@@ -3045,7 +3045,7 @@
         }
 
         let mut bad = 0usize;
-        Query::<Read<Hits>>::new(&world).for_each(|_, h| {
+        Query::<&Hits>::new(&world).for_each(|_, h| {
             if h.0 != 3 {
                 bad += 1;
             }
@@ -3070,8 +3070,8 @@
         struct Hits(u32);
 
         system! {
-            fn bump(q: Write<Hits>) {
-                q.for_each_mut(|_, mut h| h.0 += 1);
+            fn bump(q: (&mut Hits,)) {
+                q.for_each_mut(|_, (mut h,)| h.0 += 1);
             }
         }
 
@@ -3108,7 +3108,7 @@
         });
 
         let mut bad = 0usize;
-        Query::<Read<Hits>>::new(&world).for_each(|_, h| {
+        Query::<&Hits>::new(&world).for_each(|_, h| {
             if h.0 != 1 {
                 bad += 1;
             }
@@ -3140,7 +3140,7 @@
             access_desc!(write<Counter>),
             move |ctx: SystemContext<'_>| {
                 runs_in.set(runs_in.get() + 1);
-                ctx.query_unchecked::<Write<Counter>>()
+                ctx.query_unchecked::<&mut Counter>()
                     .for_each_mut(|_, mut c| c.0 += 1);
             },
         );
@@ -3150,7 +3150,7 @@
 
         assert_eq!(runs.get(), 2, "the NonSend runner ran once per frame");
         let mut vals = Vec::new();
-        Query::<Read<Counter>>::new(&world).for_each(|_, c| vals.push(c.0));
+        Query::<&Counter>::new(&world).for_each(|_, c| vals.push(c.0));
         assert_eq!(vals, vec![2, 2], "declared write applied each frame to both entities");
     }
 
@@ -3166,20 +3166,20 @@
 
         let mut sched = Scheduler::new();
         sched.add_dynamic_system("set", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
-            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 = 42);
+            ctx.query_unchecked::<&mut Val>().for_each_mut(|_, mut v| v.0 = 42);
         });
 
         sched.run(&mut world);
 
         let mut got = None;
-        Query::<Read<Val>>::new(&world).for_each(|_, v| got = Some(v.0));
+        Query::<&Val>::new(&world).for_each(|_, v| got = Some(v.0));
         assert_eq!(got, Some(42));
     }
 
     /// B4b: `remove_system` drops a registered system — it no longer runs, while a
     /// sibling with the SAME (conflicting) access keeps running, and its id stays
     /// stable. Proves the id-map / index-list / graph rebuild is correct: removing
-    /// one of two Write<Val> systems (which the scheduler had sequenced into
+    /// one of two &mut Val systems (which the scheduler had sequenced into
     /// separate stages) leaves a runnable plan. Removing a non-existent id is a
     /// no-op returning `false`.
     #[test]
@@ -3192,15 +3192,15 @@
 
         let mut sched = Scheduler::new();
         let add_ten = sched.add_dynamic_system("add_ten", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
-            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 += 10);
+            ctx.query_unchecked::<&mut Val>().for_each_mut(|_, mut v| v.0 += 10);
         });
         sched.add_dynamic_system("add_one", access_desc!(write<Val>), |ctx: SystemContext<'_>| {
-            ctx.query_unchecked::<Write<Val>>().for_each_mut(|_, mut v| v.0 += 1);
+            ctx.query_unchecked::<&mut Val>().for_each_mut(|_, mut v| v.0 += 1);
         });
 
         sched.run(&mut world);
         let mut got = 0;
-        Query::<Read<Val>>::new(&world).for_each(|_, v| got = v.0);
+        Query::<&Val>::new(&world).for_each(|_, v| got = v.0);
         assert_eq!(got, 11, "both ran (+10, +1)");
 
         // Remove add_ten; only add_one (+1) should run now.
@@ -3208,7 +3208,7 @@
         assert!(!sched.remove_system(add_ten), "already-removed id → no-op false");
 
         sched.run(&mut world);
-        Query::<Read<Val>>::new(&world).for_each(|_, v| got = v.0);
+        Query::<&Val>::new(&world).for_each(|_, v| got = v.0);
         assert_eq!(got, 12, "only add_one ran after removal (11 + 1); add_ten is gone");
     }
 
@@ -3222,8 +3222,8 @@
         struct Hp(i32);
 
         system! {
-            fn rust_bump(q: Write<Hp>) {
-                q.for_each_mut(|_, mut h| h.0 += 1);
+            fn rust_bump(q: (&mut Hp,)) {
+                q.for_each_mut(|_, (mut h,)| h.0 += 1);
             }
         }
 
@@ -3236,14 +3236,14 @@
             "lua_bump",
             access_desc!(write<Hp>),
             |ctx: SystemContext<'_>| {
-                ctx.query_unchecked::<Write<Hp>>().for_each_mut(|_, mut h| h.0 += 1);
+                ctx.query_unchecked::<&mut Hp>().for_each_mut(|_, mut h| h.0 += 1);
             },
         );
 
         sched.run(&mut world);
 
         let mut got = None;
-        Query::<Read<Hp>>::new(&world).for_each(|_, h| got = Some(h.0));
+        Query::<&Hp>::new(&world).for_each(|_, h| got = Some(h.0));
         assert_eq!(
             got,
             Some(2),
@@ -3276,21 +3276,21 @@
 
         let mut sched = Scheduler::new();
         sched.add_dynamic_system("rust_a", access_desc!(write<A>), |ctx: SystemContext<'_>| {
-            ctx.query_unchecked::<Write<A>>().for_each_mut(|_, mut a| a.0 += 1);
+            ctx.query_unchecked::<&mut A>().for_each_mut(|_, mut a| a.0 += 1);
         });
         sched.add_dynamic_nonsend_system(
             "lua_b",
             access_desc!(write<B>),
             |ctx: SystemContext<'_>| {
-                ctx.query_unchecked::<Write<B>>().for_each_mut(|_, mut b| b.0 += 1);
+                ctx.query_unchecked::<&mut B>().for_each_mut(|_, mut b| b.0 += 1);
             },
         );
 
         sched.run(&mut world);
 
         let mut bad = 0;
-        Query::<Read<A>>::new(&world).for_each(|_, a| if a.0 != 1 { bad += 1 });
-        Query::<Read<B>>::new(&world).for_each(|_, b| if b.0 != 1 { bad += 1 });
+        Query::<&A>::new(&world).for_each(|_, a| if a.0 != 1 { bad += 1 });
+        Query::<&B>::new(&world).for_each(|_, b| if b.0 != 1 { bad += 1 });
         assert_eq!(bad, 0, "both the worker (A) and main-thread NonSend (B) writes landed exactly once");
     }
 
@@ -3346,7 +3346,7 @@
                         }
                         std::thread::yield_now();
                     }
-                    ctx.query_unchecked::<Write<B>>().for_each_mut(|_, mut b| b.0 += 1);
+                    ctx.query_unchecked::<&mut B>().for_each_mut(|_, mut b| b.0 += 1);
                 },
             );
             sched.add_dynamic_system(
@@ -3354,7 +3354,7 @@
                 access_desc!(write<A>),
                 move |ctx: SystemContext<'_>| {
                     flag_p.store(true, Ordering::SeqCst);
-                    ctx.query_unchecked::<Write<A>>().for_each_mut(|_, mut a| a.0 += 1);
+                    ctx.query_unchecked::<&mut A>().for_each_mut(|_, mut a| a.0 += 1);
                 },
             );
             sched.run(&mut world);
@@ -3379,7 +3379,7 @@
 
         system! {
             struct CountRows { seen: u64 = 0 }
-            fn run(s: &mut Self, q: Read<Tag>, out: ResMut<SeenTotal>) {
+            fn run(s: &mut Self, q: (&Tag,), out: ResMut<SeenTotal>) {
                 s.seen = 0;
                 q.for_each(|_, _| s.seen += 1);
                 out.0 = s.seen;

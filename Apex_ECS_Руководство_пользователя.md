@@ -409,7 +409,7 @@ if let Some(hp) = world.get_mut::<Health>(entity) {
 | `mut commands: Commands` | `cmd: &mut Commands` | параметр берётся по `&mut` (bump-arena живёт в контексте системы) |
 
 Ключевая семантическая разница внутри `system!`: там `&T` означает **ресурс** (не компонент запроса,
-как в Bevy) — ловушка мигранта; компоненты в `system!` пишутся `Read<T>`/`Write<T>`. В plain-fn
+как в Bevy) — ловушка мигранта; компоненты в `system!` пишутся `&T`/`&mut T`. В plain-fn
 системах этой ловушки нет: `&T`/`&mut T` внутри `Query` — компоненты, как в Bevy (см. §6).
 
 #### `Local<T>` — НЕ переносим (намеренно)
@@ -530,33 +530,33 @@ Query — основной способ итерации по компонент
 | Параметр | Bevy-эквивалент | Выдаёт | Описание |
 |---|---|---|---|
 | `Entity` | — | `Entity` | Id сущности в составе item (iter/for-цикл больше НЕ выдают entity сами) |
-| `Read<T>` | `&T` | `&T` | Чтение компонента |
-| `Write<T>` | `&mut T` | **`Mut<T>`** | Запись (smart-pointer, стампит change-tick) |
+| `&T` | `&T` | `&T` | Чтение компонента |
+| `&mut T` | `&mut T` | **`Mut<T>`** | Запись (smart-pointer, стампит change-tick) |
 | `With<T>` | — | `()` | Фильтр: entity должен иметь T |
 | `Without<T>` | — | `()` | Фильтр: entity не должен иметь T |
-| `Changed<T>` | — | `()` | Фильтр: изменённые с прошлого запуска; комбинируется с `Read<T>` |
+| `Changed<T>` | — | `()` | Фильтр: изменённые с прошлого запуска; комбинируется с `&T` |
 | `Added<T>` | — | `()` | Фильтр: компонент ДОБАВЛЕН entity с прошлого запуска (§4.3.4) |
 | `Maybe<T>` | `Option<&T>` | `Option<&T>` | Чтение, если компонент есть |
 | `MaybeWrite<T>` | `Option<&mut T>` | `Option<Mut<T>>` | Запись, если компонент есть |
 | `Or<(F1, F2, …)>` | `Or<…>` | `()` | Дизъюнкция фильтров: строка проходит, если проходит хотя бы одна ветка (§4.3) |
 
 > **Два словаря данных.** Компоненты в запросе можно писать двумя эквивалентными способами: маркерами
-> `Read<T>`/`Write<T>` **или** ссылками `&T`/`&mut T` — обе формы дают идентичный Item. `&T`/`&mut T` —
-> идиома plain-fn систем (1:1 Bevy); `Read<T>`/`Write<T>` — идиома `system!` (там `&T` занят под
+> `&T`/`&mut T` **или** ссылками `&T`/`&mut T` — обе формы дают идентичный Item. `&T`/`&mut T` —
+> идиома plain-fn систем (1:1 Bevy); `&T`/`&mut T` — идиома `system!` (там `&T` занят под
 > ресурсы). Прежний алиас `Ref<T>` **удалён** (в Bevy `Ref` = read + change-detection — другая
 > семантика; чтобы не путать, у нас его нет).
 
-> **`Mut<T>` и `mut`-биндинг (важно!).** `Write<T>`/`&mut T` выдают smart-pointer **`Mut<T>`** (как в
+> **`Mut<T>` и `mut`-биндинг (важно!).** `&mut T`/`&mut T` выдают smart-pointer **`Mut<T>`** (как в
 > Bevy): на `DerefMut` он автоматически стампит change-tick строки → `Changed<T>` достоверен на всех
 > путях мутации (через Query и через `World::get_mut`). Поэтому связка требует `mut`:
-> `q.for_each_mut(|_, (vel, mut pos)| pos.x += vel.x)`. Чистое чтение через `Write<T>` без мутации
+> `q.for_each_mut(|_, (vel, mut pos)| pos.x += vel.x)`. Чистое чтение через `&mut T` без мутации
 > **не** помечает изменённым (стамп — только на `DerefMut`).
 
 > **Read/write split (borrow-модель, как Bevy).** Итерация делится по типу заёма:
 > - **read-only аксессоры** (`for_each`/`iter`/`par_for_each`/`for_each_chunk`) берут `&self` и требуют
 >   `Q: ReadOnlyWorldQuery` (только `Read`/`&T`/`With`/`Without`/`Maybe`/фильтры);
 > - **write-аксессоры** (`for_each_mut`/`iter_mut`/`par_for_each_mut`/`for_each_chunk_mut`) берут
->   `&mut self` и работают с любой формой, включая `Write`/`&mut T`.
+>   `&mut self` и работают с любой формой, включая `&mut T`.
 >
 > Прямые конструкторы: `Query::new(&world)` — только read-only-формы; `Query::new_mut(&mut world)` —
 > любая форма (эксклюзивный заём ⇒ выдаваемые `&mut` заведомо не алиасят). Аналогично
@@ -602,14 +602,14 @@ q.get_mut(boss_entity).unwrap().0 -= 10;
 use apex_core::prelude::*;
 
 // Простой запрос — итерация по Position:
-Query::<Read<Position>>::new(&world)
+Query::<&Position>::new(&world)
     .for_each(|_, pos| {
         println!("pos: ({}, {})", pos.x, pos.y);
     });
 
-// Запрос с Entity + мутацией (Write<Position> → Mut<Position> → `mut pos`).
+// Запрос с Entity + мутацией (&mut Position → Mut<Position> → `mut pos`).
 // Write-форма ⇒ new_mut + for_each_mut (эксклюзивный заём):
-Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
+Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
     .for_each_mut(|entity, (vel, mut pos)| {
         pos.x += vel.x * 0.016;   // DerefMut → стампит change-tick
         pos.y += vel.y * 0.016;
@@ -621,20 +621,20 @@ Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
     .for_each_mut(|_, (vel, mut pos)| { pos.x += vel.x * 0.016; });
 
 // Фильтрация по маркерному компоненту:
-Query::<(Read<Health>, With<Player>)>::new(&world)
+Query::<(&Health, With<Player>)>::new(&world)
     .for_each(|_, hp| {
         println!("player HP: {}/{}", hp.current, hp.max);
     });
 
 // Исключение компонента:
-Query::<(Read<Position>, Without<Enemy>)>::new(&world)
+Query::<(&Position, Without<Enemy>)>::new(&world)
     .for_each(|_, pos| { /* только не-Enemy */ });
 
 // Change detection (фильтр — Changed<T> не возвращает данные, только фильтрует):
 let last_tick = world.current_tick();
 // ... (следующий тик) ...
 // Changed<Position> в составе кортежа — выбирает только изменённые entity:
-Query::<(Read<Position>, Read<Velocity>, Changed<Position>)>::new_with_tick(&world, last_tick)
+Query::<(&Position, &Velocity, Changed<Position>)>::new_with_tick(&world, last_tick)
     .for_each(|_, (pos, vel, ())| {
         println!("moved: pos=({},{}), vel=({},{})", pos.x, pos.y, vel.x, vel.y);
     });
@@ -645,7 +645,7 @@ let changed_count = Query::<(Changed<Position>,)>::new_with_tick(&world, last_ti
     .count();
 
 // Итератор (стандартный Iterator trait):
-let count = Query::<Read<Health>>::new(&world)
+let count = Query::<&Health>::new(&world)
     .iter()
     .filter(|(_, hp)| hp.current < 25.0)
     .count();
@@ -658,7 +658,7 @@ let count = Query::<Read<Health>>::new(&world)
 > **`Maybe<T>`** — опциональный компонент: возвращает `None` если компонент отсутствует, без фильтрации entity:
 > ```rust
 > // Все entity с Position, Health опционально — один проход:
-> Query::<(Read<Position>, Maybe<Health>)>::new(&world)
+> Query::<(&Position, Maybe<Health>)>::new(&world)
 >     .for_each(|entity, (pos, hp)| {
 >         match hp {
 >             Some(hp) => println!("HP: {}/{}", hp.current, hp.max),
@@ -667,7 +667,7 @@ let count = Query::<Read<Health>>::new(&world)
 >     });
 > 
 > // MaybeWrite<T> — опциональная мутация (write-форма → new_mut + for_each_mut):
-> Query::<(Read<Position>, MaybeWrite<Speed>)>::new_mut(&mut world)
+> Query::<(&Position, MaybeWrite<Speed>)>::new_mut(&mut world)
 >     .for_each_mut(|_, (pos, speed)| {
 >         if let Some(mut speed) = speed {   // Option<Mut<Speed>>
 >             speed.0 *= 0.9;  // замедлить, если есть Speed
@@ -680,29 +680,29 @@ let count = Query::<Read<Health>>::new(&world)
 
 ```rust
 // Read-only запрос через кэш мира (Bevy: world.query::<Q>()):
-world.query::<Read<Position>>()
+world.query::<&Position>()
     .for_each(|_, pos| { /* ... */ });
 
 // С мутацией и change detection — query_mut_changed (write-форма) + for_each_mut:
-world.query_mut_changed::<(Read<Velocity>, Write<Position>)>(last_tick)
+world.query_mut_changed::<(&Velocity, &mut Position)>(last_tick)
     .for_each_mut(|entity, (vel, mut pos)| {
         // Обрабатываются только entity с изменённым Position или Velocity
     });
 
-// Changed<T> как фильтр (read-only: данных Write нет → query_changed):
-world.query_changed::<(Read<Velocity>, Changed<Position>)>(last_tick)
+// Changed<T> как фильтр (read-only: mut-данных нет → query_changed):
+world.query_changed::<(&Velocity, Changed<Position>)>(last_tick)
     .for_each(|_, (vel, ())| {
         // vel только для изменившегося Position
     });
 
 // Стандартный Iterator через .iter() — выдаёт только item:
-let far = world.query::<(Entity, Read<Position>)>()
+let far = world.query::<(Entity, &Position)>()
     .iter()
     .filter(|(_, pos)| pos.x > 100.0)
     .count();
 
 // Параллельная итерация (rayon всегда доступен):
-world.query::<Read<Position>>()
+world.query::<&Position>()
     .par_for_each(|_, pos| {
         /* CPU-bound расчёты */
     });
@@ -711,11 +711,11 @@ world.query::<Read<Position>>()
 > **Внутри систем** запросы декларируются параметром `q: Query<…>` (плановщик выдаёт `Query` над
 > per-system SubWorld — индексы архетипов предвычислены, вызов не делает ни аллокаций, ни локов).
 > Read-only-доступ есть и через `ctx.query::<Q>()` (`Q: ReadOnlyWorldQuery`); для мутаций объявляйте
-> `Query<Write<T>>`-параметр, а не тянитесь за `ctx` (см. §6).
+> `Query<&mut T>`-параметр, а не тянитесь за `ctx` (см. §6).
 >
 > **Незарегистрированные компоненты.** Каждая форма запроса вносит в список ids ровно своё число записей;
 > не зарегистрированный ещё компонент кодируется сентинелом `ComponentId::INVALID`. Следствия: обязательная
-> форма (`Read`/`Write`/`With`/`Changed`) с незарегистрированным T даёт честно пустой запрос; `Maybe<T>`
+> форма (`&T`/`&mut T`/`With`/`Changed`) с незарегистрированным T даёт честно пустой запрос; `Maybe<T>`
 > выдаёт `None`; `Without<T>` пропускает всех; позиция формы в кортеже не влияет на корректность.
 
 ### 4.3 `Or<>` — дизъюнкция фильтров
@@ -725,12 +725,12 @@ world.query::<Read<Position>>()
 
 ```rust
 // Entity, у которых изменился Transform ИЛИ Visibility:
-Query::<(Read<Transform>, Read<Visibility>, Or<(Changed<Transform>, Changed<Visibility>)>)>
+Query::<(&Transform, &Visibility, Or<(Changed<Transform>, Changed<Visibility>)>)>
     ::new_with_tick(&world, last_tick)
     .for_each(|e, (tf, vis, ())| { /* пересинхронизировать */ });
 
 // Союз маркеров: With<A> ИЛИ With<B>:
-Query::<(Read<Position>, Or<(With<Player>, With<Npc>)>)>::new(&world)
+Query::<(&Position, Or<(With<Player>, With<Npc>)>)>::new(&world)
     .for_each(|_, (pos, ())| { /* персонажи обоих видов */ });
 ```
 
@@ -747,13 +747,13 @@ Query::<(Read<Position>, Or<(With<Player>, With<Npc>)>)>::new(&world)
 
 ```rust
 // |entities, (vel: &[Velocity], pos: &mut [Position])|  — write-форма → for_each_chunk_mut
-Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
+Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
     .for_each_chunk_mut(|_entities, (vel, pos)| {
         for (p, v) in pos.iter_mut().zip(vel) { p.x += v.x * 0.016; }
     });
 
 // Параллельно — те же диапазоны, что у par_for_each_mut:
-world.query_mut::<(Read<Velocity>, Write<Position>)>()
+world.query_mut::<(&Velocity, &mut Position)>()
     .par_for_each_chunk_mut(|_, (vel, pos)| { /* ... */ });
 ```
 
@@ -778,7 +778,7 @@ world.query_mut::<(Read<Velocity>, Write<Position>)>()
 
 ```rust
 struct ExtractMeshes {
-    q: QueryState<(Read<Mesh>, Read<GlobalTransform>)>,
+    q: QueryState<(&Mesh, &GlobalTransform)>,
 }
 
 // в горячем цикле:
@@ -797,7 +797,7 @@ self.q.query_with_tick(&world, last_run).for_each(|e, item| { /* ... */ });
 
 ```rust
 // Только что получившие PhysicsBody (spawn или insert):
-Query::<(Added<PhysicsBody>, Read<PhysicsBody>)>::new_with_tick(&world, last_run)
+Query::<(Added<PhysicsBody>, &PhysicsBody)>::new_with_tick(&world, last_run)
     .for_each(|e, ((), body)| { /* инициализация */ });
 
 // Внутри систем база last_run подставляется автоматически (как у Changed).
@@ -1154,7 +1154,7 @@ queue.send_batch((0..50).map(|i| DamageEvent { target: entity, amount: i as f32 
 // Для system! — резервируем через writer.reserve() прямо в теле:
 system! {
     fn collision_system(
-        q: Read<Collider>,
+        q: (&Collider,),
         writer: &mut Vec<DamageEvent>,
     ) {
         writer.reserve(10000);  // предаллоцировать буфер под 10000 событий
@@ -1416,7 +1416,7 @@ sched.add_systems(StageLabel::Update, (
     // par_access — advanced: доступ объявлен в access_desc!, поэтому write-запрос берётся через
     // ctx.query_unchecked (escape для закрытых-по-декларации замыканий):
     par_access("physics", access_desc!(read<Vel>, write<Pos>),
-        |ctx| ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>().for_each_mut(|_, (v, mut p)| p.x += v.x)),
+        |ctx| ctx.query_unchecked::<(&Vel, &mut Pos)>().for_each_mut(|_, (v, mut p)| p.x += v.x)),
 ));
 ```
 
@@ -1570,7 +1570,7 @@ sched.add_systems(StageLabel::Update, (
     spawner,    // bare-идентификатор system! (имя из fn)
     seq("camera", move |world: &mut World| {
         // ✅ видит заспавненные Enemy — Commands уже применены
-        let count = Query::<Read<Enemy>>::new(world).iter().count();
+        let count = Query::<&Enemy>::new(world).iter().count();
         assert!(count > 0);
     }),
 ));
@@ -1647,7 +1647,7 @@ world.resource_mut::<NextState<GameState>>().set(GameState::Playing);
 > идентификатора `fn` (не нужно дублировать строкой).
 
 > **Как выводится доступ:** макрос анализирует типы параметров:
-> - `q: (Read<A>, Write<B>)` → `type Query = (...)`
+> - `q: (&A, &mut B)` → `type Query = (...)`
 > - `name: Res<T>` → `ResRead<T>` · `name: ResMut<T>` → `ResWrite<T>` — **как в plain-fn**
 >   (bare `&T`/`&mut T` как ресурс — compile-ошибка с подсказкой; у Bevy `&T` означает
 >   компонент запроса, двойная семантика была ловушкой мигранта)
@@ -1665,10 +1665,10 @@ use apex_core::prelude::*;
 
 system! {
     fn movement_system(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
         keys: Res<Input<KeyCode>>,
     ) {
-        // ВАЖНО: Write<T> выдаёт smart-pointer Mut<T> → нужен for_each_mut и `mut pos`
+        // ВАЖНО: &mut T выдаёт smart-pointer Mut<T> → нужен for_each_mut и `mut pos`
         // (как `for mut x in &mut q` в Bevy); на DerefMut стампится change-tick.
         q.for_each_mut(|_, (vel, mut pos)| {
             if keys.pressed(KeyCode::A) { pos.x -= vel.x; }
@@ -1704,7 +1704,7 @@ system! {
 ```rust
 system! {
     fn full_featured(
-        q: (Read<Position>, Write<Velocity>),   // query
+        q: (&Position, &mut Velocity),   // query
         keys: Res<Input<KeyCode>>,               // resource read (bare &T — ошибка)
         exit: ResMut<Exit>,                      // resource write
         events: &[CollisionEvent],               // event reader (биндится EventReader'ом)
@@ -1753,8 +1753,8 @@ system! {
 
 | Параметр | Семантика / associated type | Примечание |
 |----------|------------------------------|------------|
-| `q: (Read<A>, Write<B>, With<C>, Without<D>, MaybeWrite<E>)` | `type Query` | `Write<T>` → итерация `Mut<T>` (нужен `mut`-биндинг) |
-| `q: Read<A>` (bare) | `type Query = (Read<A>)` | одиночный компонент |
+| `q: (&A, &mut B, With<C>, Without<D>, MaybeWrite<E>)` | `type Query` | `&mut T` → итерация `Mut<T>` (нужен `mut`-биндинг) |
+| `q: (&A,)` (1-кортеж) | `type Query = (&A,)` | одиночный компонент — ВСЕГДА кортеж; bare `q: &A`/`q: &mut A` — compile-ошибка (ловушка «ресурс», см. ниже) |
 | `name: Res<T>` | `ResRead<T>` | ресурс (чтение); bare `&T` — compile-ошибка |
 | `name: ResMut<T>` | `ResWrite<T>` | ресурс (запись); bare `&mut T` — compile-ошибка |
 | `name: &[E]` / `EventReader<E>` | `Listen<E>` | чтение событий |
@@ -1851,7 +1851,7 @@ system! {
 // Ручная реализация (для понимания):
 struct MovementSystem;
 impl AutoSystem for MovementSystem {
-    type Query = (Read<Velocity>, Write<Position>);
+    type Query = (&Velocity, &mut Position);
     type Resources = ();
     type Events = ();
     // HAS_DEFERRED = false по умолчанию — система не использует Commands
@@ -1862,9 +1862,9 @@ impl AutoSystem for MovementSystem {
 // Рекомендуемый способ — макрос system!:
 system! {
     fn movement_system(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
     ) {
-        q.for_each_mut(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
+        q.for_each_mut(|_, (vel, mut pos)| {   // &mut Position → Mut<Position>
             pos.x += vel.x * 0.016;
             pos.y += vel.y * 0.016;
         });
@@ -1881,7 +1881,7 @@ sched.add_systems(StageLabel::Update, movement_system);
 // Ручная реализация:
 struct PhysicsSystem;
 impl AutoSystem for PhysicsSystem {
-    type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
+    type Query     = (&Mass, &mut Velocity, &mut Position);
     type Resources = ResRead<PhysicsConfig>;
     type Events    = Emit<CollisionEvent>;
     const HAS_DEFERRED: bool = false;  // не использует Commands
@@ -1891,7 +1891,7 @@ impl AutoSystem for PhysicsSystem {
         let cfg = ctx.resource::<PhysicsConfig>();
         let mut writer = ctx.event_writer_unchecked::<CollisionEvent>();
         ctx.query_unchecked::<Self::Query>().for_each_mut(|entity, (mass, mut vel, pos)| {
-            vel.y -= cfg.gravity * mass.0 * cfg.dt;   // Write<Velocity> → Mut → mut
+            vel.y -= cfg.gravity * mass.0 * cfg.dt;   // &mut Velocity → Mut → mut
             if pos.y < 0.0 { writer.send(CollisionEvent { entity }); }
         });
     }
@@ -1900,7 +1900,7 @@ impl AutoSystem for PhysicsSystem {
 // Рекомендуемый способ — макрос system!:
 system! {
     fn physics_system(
-        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+        q: (&Mass, &mut Velocity, &mut Position),
         cfg: Res<PhysicsConfig>,
         writer: &mut Vec<CollisionEvent>,
     ) {
@@ -1922,7 +1922,7 @@ sched.add_systems(StageLabel::Update, physics_system);
 // Ручная реализация:
 struct OrbitalSystem;
 impl AutoSystem for OrbitalSystem {
-    type Query = (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>);
+    type Query = (&Position, &mut Velocity, &Mass, Maybe<Orbits>);
     type Resources = ResRead<SpaceSettings>;
     type Events = ();
     /// Гравитация собирает позиции ВСЕХ тел — ASD-чанкование запрещено.
@@ -1933,10 +1933,10 @@ impl AutoSystem for OrbitalSystem {
 // Рекомендуемый способ — макрос system! с __whole:
 system! {
     fn orbital_system(
-        q: (Read<Position>, Write<Velocity>, Read<Mass>, Maybe<Orbits>),
+        q: (&Position, &mut Velocity, &Mass, Maybe<Orbits>),
         __whole: WholeWorld,
     ) {
-        // Фаза 1: собираем глобальные данные (все entity). Запрос содержит Write<Velocity>
+        // Фаза 1: собираем глобальные данные (все entity). Запрос содержит &mut Velocity
         // ⇒ итерируем через for_each_mut (даже когда фаза только читает):
         let mut bodies: Vec<(Entity, Position, f32)> = Vec::new();
         q.for_each_mut(|entity, (pos, _, mass, _)| {
@@ -1994,8 +1994,8 @@ sched.add_systems(StageLabel::Update, par_access(
     access_desc!(read<Enemy>, write<Velocity>),
     |ctx| {
         // доступ объявлен в access_desc! ⇒ write-запрос через ctx.query_unchecked + for_each_mut
-        ctx.query_unchecked::<(Read<Enemy>, Write<Velocity>)>()
-            .for_each_mut(|_, (_, mut vel)| {   // Write<T> → Mut<T> → `mut`
+        ctx.query_unchecked::<(&Enemy, &mut Velocity)>()
+            .for_each_mut(|_, (_, mut vel)| {   // &mut T → Mut<T> → `mut`
                 vel.x *= 0.99;
                 vel.y *= 0.99;
             });
@@ -2012,7 +2012,7 @@ sched.add_systems(StageLabel::Update, par_access(
     "heavy_physics",
     access_desc!(write<Pos>, read<Vel>).par_for_each_used(),
     |ctx| {
-        ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+        ctx.query_unchecked::<(&Vel, &mut Pos)>()
             .par_for_each_mut(|_, (v, mut p)| { /* CPU-bound расчёты */ });
     },
 ));
@@ -2172,7 +2172,7 @@ sched.configure_stages(vec![
 
 #### 6.4.2 Явное упорядочивание систем
 
-Планировщик автоматически строит рёбра на основе access-дескрипторов (`Read<T>`, `Write<T>`, etc.). Но когда две системы «пинг-понг» читают/пишут компоненты друг друга (гравитация читает Position и пишет Velocity, физика читает Velocity и пишет Position), возникает `BidirectionalWriteRead` — планировщик не может автоматически определить порядок и сигнализирует об ошибке.
+Планировщик автоматически строит рёбра на основе access-дескрипторов (`&T`, `&mut T`, etc.). Но когда две системы «пинг-понг» читают/пишут компоненты друг друга (гравитация читает Position и пишет Velocity, физика читает Velocity и пишет Position), возникает `BidirectionalWriteRead` — планировщик не может автоматически определить порядок и сигнализирует об ошибке.
 
 Для разрешения конфликтов используется явное упорядочивание, которое имеет **приоритет** над авто-детектом:
 
@@ -2306,11 +2306,11 @@ declared-access escape (`*_unchecked`).
 ```rust
 fn run(&mut self, ctx: SystemContext<'_>) {
     // Read-only Query (Q: ReadOnlyWorldQuery):
-    ctx.query::<Read<Velocity>>()
+    ctx.query::<&Velocity>()
         .for_each(|entity, vel| { /* ... */ });
 
     // Write-запрос — только через declared-access escape (доступ объявлен в type Query):
-    ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+    ctx.query_unchecked::<(&Vel, &mut Pos)>()
         .for_each_mut(|_, (v, mut p)| { /* ... */ });
 
     // Ресурсы (чтение — обычный API):
@@ -2380,7 +2380,7 @@ use apex_core::prelude::*;
 // Набор параметров как тип-кортеж из маркеров:
 type MyParams = (
     ResRead<DeltaTime>,                            // → Res<'_, DeltaTime>
-    QueryParam<(Read<Vel>, Write<Pos>)>,           // → Query<'_, '_, (Read<Vel>, Write<Pos>)>
+    QueryParam<(&Vel, &mut Pos)>,           // → Query<'_, '_, (&Vel, &mut Pos)>
     Listen<CollisionEvent>,                        // → EventReader<'_, CollisionEvent>
 );
 
@@ -2415,13 +2415,13 @@ fn my_system(ctx: &SystemContext<'_>) {
 type P1 = ResRead<DeltaTime>;
 
 // 2 элемента
-type P2 = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>);
+type P2 = (ResRead<DeltaTime>, QueryParam<(&Vel, &mut Pos)>);
 
 // 4 элемента
 type P4 = (
     ResRead<DeltaTime>,
     ResWrite<FrameStats>,
-    QueryParam<(Read<Vel>, Write<Pos>)>,
+    QueryParam<(&Vel, &mut Pos)>,
     Emit<CollisionEvent>,
 );
 
@@ -2433,7 +2433,7 @@ fn my_system(ctx: &SystemContext<'_>) {
     let (dt, stats, mut q, mut writer) = ctx.fetch_unchecked::<P4>();
     // dt: Res<'_, DeltaTime>
     // stats: ResMut<'_, FrameStats>
-    // q: Query<'_, '_, (Read<Vel>, Write<Pos>)>
+    // q: Query<'_, '_, (&Vel, &mut Pos)>
     // writer: EventWriter<'_, CollisionEvent>
 }
 ```
@@ -2471,7 +2471,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMesh {
 |------|------|
 | `SystemParam` с разделением `State`/`Fetch` | `fetch_unchecked(ctx)` напрямую (declared-access escape) |
 | `#[derive(SystemParam)]` proc-макрос | Типы-маркеры + кортежи (без макроса) |
-| `Query<&T, &mut U>` через SystemParam | `QueryParam<(Read<T>, Write<U>)>` |
+| `Query<&T, &mut U>` через SystemParam | `QueryParam<(&T, &mut U)>` |
 | Интегрирован в планировщик | Ортогонален: `system!` (параллельный/эксклюзивный) работает независимо |
 
 #### `Extract<P>` — Bevy-совместимый доступ к MainWorld
@@ -2485,7 +2485,7 @@ use apex_core::prelude::*;
 
 // Extract-система: читает камеры и ресурс из MainWorld, пишет результат в текущий мир.
 type ExtractCams = (
-    Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,  // → Query из MainWorld
+    Extract<QueryParam<(&Camera, &GlobalTransform)>>,  // → Query из MainWorld
     Extract<ResRead<ShadowQuality>>,                             // → Res из MainWorld
 );
 
@@ -2506,7 +2506,7 @@ fn extract_cameras(ctx: &SystemContext<'_>) {
 
 | P | Что читает из MainWorld |
 |---|---|
-| `QueryParam<(Read<A>, Read<B>)>` | Компоненты (любой WorldQuery) |
+| `QueryParam<(&A, &B)>` | Компоненты (любой WorldQuery) |
 | `ResRead<T>` | Ресурс |
 | `Listen<E>` | События |
 
@@ -2522,7 +2522,7 @@ fn extract_cameras(ctx: &SystemContext<'_>) {
 let mut cmds = Commands::new();
 
 // Буферизация команд во время Query:
-Query::<(Read<Health>, Read<Position>)>::new(&world)
+Query::<(&Health, &Position)>::new(&world)
     .for_each(|entity, (hp, pos)| {
         if hp.current <= 0.0 {
             cmds.despawn(entity);
@@ -2706,12 +2706,12 @@ world.add_relation(archer, Targets, goblin);
 
 ```rust
 // Найти всех entity с ChildOf-связью к конкретному parent:
-for (entity, pos) in world.query_relation::<ChildOf, Read<Position>>(ChildOf, parent) {
+for (entity, pos) in world.query_relation::<ChildOf, &Position>(ChildOf, parent) {
     println!("child {:?} at ({}, {})", entity, pos.x, pos.y);
 }
 
 // Wildcard — все entity с любым ChildOf-target:
-for (entity, hp) in world.query_wildcard::<ChildOf, Read<Health>>(ChildOf) {
+for (entity, hp) in world.query_wildcard::<ChildOf, &Health>(ChildOf) {
     println!("entity with parent: {:?}", entity);
 }
 ```
@@ -2725,7 +2725,7 @@ system! {
     fn parent_system(
         ctx: Ctx,
         cmd: Cmd,
-        q: (Write<Position>,),
+        q: (&mut Position,),
     ) {
         // Чтение:
         for child in ctx.targets_of(ChildOf, root) {
@@ -2734,7 +2734,7 @@ system! {
             }
         }
         // Запрос с компонентами:
-        let iter = ctx.query_relation::<ChildOf, Read<Position>>(ChildOf, parent);
+        let iter = ctx.query_relation::<ChildOf, &Position>(ChildOf, parent);
         for (entity, pos) in iter { /* ... */ }
 
         // Запись:
@@ -3746,7 +3746,7 @@ chunk = min(chunk, entity_count)
 ```rust
 system! {
     fn physics_system(
-        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+        q: (&Mass, &mut Velocity, &mut Position),
     ) {
         q.par_for_each_mut(|_, (mass, mut vel, mut pos)| {   // write-форма → par_for_each_mut
             vel.y -= 9.8 * mass.0 * 0.016;
@@ -3757,7 +3757,7 @@ system! {
 }
 
 // par_for_each — read-only с Entity:
-ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
+ctx.query::<&Position>().par_for_each(|entity, pos| {
     /* обрабатывается параллельно */
 });
 ```
@@ -3766,7 +3766,7 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 > ```rust
 > sched.add_systems(StageLabel::Update, par_access("heavy_sys",
 >     access_desc!(read<A>, write<B>).par_for_each_used(),
->     |ctx| { ctx.query_unchecked::<(Read<A>, Write<B>)>().par_for_each_mut(|_, (a, mut b)| { /* … */ }); },
+>     |ctx| { ctx.query_unchecked::<(&A, &mut B)>().par_for_each_mut(|_, (a, mut b)| { /* … */ }); },
 > ));
 > ```
 > Для типизированных систем — декларативно, `.par_for_each_used()` на конфиге:
@@ -3791,7 +3791,7 @@ ctx.query::<Read<Position>>().par_for_each(|entity, pos| {
 
 Прямой вызов `world.insert()` / `world.remove()` / `world.despawn()` внутри `par_for_each` — **UB** (меняет мапу архетипов во время итерации). Используйте `Commands` для буферизации:
 ```rust
-ctx.query::<Read<Health>>()
+ctx.query::<&Health>()
     .par_for_each(|entity, hp| {
         // ✅ Безопасно: Commands буферизует изменения
         if hp.current <= 0.0 { cmds.despawn(entity); }
@@ -3882,13 +3882,13 @@ sched.add_systems(StageLabel::PostUpdate, ScriptedSystem::default());
 
 ```rust
 // Хорошо: CPU-bound, много entity (write-форма через declared-access escape + par_for_each_mut)
-ctx.query_unchecked::<(Read<Mass>, Write<Velocity>)>()
+ctx.query_unchecked::<(&Mass, &mut Velocity)>()
     .par_for_each_mut(|_, (mass, mut vel)| {
         vel.y -= 9.8 * mass.0 * 0.016; // CPU-bound
     });
 
 // Плохо: memory-bound, мало entity
-ctx.query::<Read<Position>>()
+ctx.query::<&Position>()
     .par_for_each(|_, pos| {
         let _ = pos.x.sqrt(); // memory-bound
     });
@@ -3929,7 +3929,7 @@ cargo run --release
 | `allocate_batch` (ZST) | 11.6 | **86.5 M ops/s** | 🟢 O(N) |
 | `Query::for_each` | 9.2 | **109 M ops/s** | 🟢 O(N) |
 | `world.query` `for_each` (кэш) | 9.0 | **111 M ops/s** | 🟢 O(N) |
-| `Query<(Read<Vel>, Write<Pos>)>` | 9.2 | **109 M ops/s** | 🟢 O(N) |
+| `Query<(&Vel, &mut Pos)>` | 9.2 | **109 M ops/s** | 🟢 O(N) |
 | `Query<With<_>>` 0 результатов | 8.3 | **121 M ops/s** | 🟢 O(N) |
 | insert component (archetype-move) | 78.0 | **12.8 M ops/s** | 🟢 O(N) |
 | despawn | 37.5 | **26.7 M ops/s** | 🟢 O(N) |
@@ -4125,10 +4125,10 @@ struct DeathEvent { entity: Entity }
 
 system! {
     fn movement_system(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
         dt: Res<DeltaTime>,
     ) {
-        q.for_each_mut(|_, (vel, mut pos)| {   // Write<Position> → Mut<Position>
+        q.for_each_mut(|_, (vel, mut pos)| {   // &mut Position → Mut<Position>
             pos.x += vel.x * dt.0;
             pos.y += vel.y * dt.0;
         });
@@ -4138,7 +4138,7 @@ system! {
 system! {
     fn cleanup_dead(world: &mut World) {
         let dead: Vec<Entity> = world
-            .query::<(Entity, Read<Health>)>()
+            .query::<(Entity, &Health)>()
             .iter()
             .filter(|(_, hp)| hp.current <= 0.0)
             .map(|(e, _)| e)
@@ -4459,7 +4459,7 @@ generation entity не участвует — НЕ использовать дл
 **Единый макрос** для параллельных и эксклюзивных систем (`sequential_system!` удалён).
 
 **Параллельная** (`impl AutoSystem`) — параметры:
-`q: (Read<A>, Write<B>)` (Write→`Mut<T>`, нужен `mut`-биндинг), `q: Read<A>`, `name: Res<T>`, `name: ResMut<T>`,
+`q: (&A, &mut B)` (Write→`Mut<T>`, нужен `mut`-биндинг), `q: &A`, `name: Res<T>`, `name: ResMut<T>`,
 `name: &[E]`, `name: &mut Vec<E>`, `name: Cmd`, `name: Ctx`, `__whole: WholeWorld`.
 
 **Эксклюзивная** (`impl ExclusiveSystem`, FULL access, alone) — параметр `world: &mut World`

@@ -234,13 +234,13 @@ fn bench_query_new(fw: &FragWorld, rep: &mut Report) {
         }};
     }
 
-    qbench!("Q1  Read<Transform>            (28k rows)", Read<Transform>);
-    qbench!("Q2  (Read<Position>, Read<Velocity>)  (1k)", (Read<Position>, Read<Velocity>));
-    qbench!("Q3  (Transform, Position, Rotation) (27k)", (Read<Transform>, Read<Position>, Read<Rotation>));
-    qbench!("Q4  (Read<Position>, Maybe<Velocity>)", (Read<Position>, Maybe<Velocity>));
-    qbench!("Q5  (Read<Position>, Without<Velocity>)", (Read<Position>, Without<Velocity>));
-    qbench!("Q7  (Read<Transform>, With<Prim>)    (1k)", (Read<Transform>, With<Prim>));
-    qbench!("Q8  (Read<Light>, Read<Position>)  (8 of)", (Read<Light>, Read<Position>));
+    qbench!("Q1  &Transform            (28k rows)", &Transform);
+    qbench!("Q2  (&Position, &Velocity)  (1k)", (&Position, &Velocity));
+    qbench!("Q3  (Transform, Position, Rotation) (27k)", (&Transform, &Position, &Rotation));
+    qbench!("Q4  (&Position, Maybe<Velocity>)", (&Position, Maybe<Velocity>));
+    qbench!("Q5  (&Position, Without<Velocity>)", (&Position, Without<Velocity>));
+    qbench!("Q7  (&Transform, With<Prim>)    (1k)", (&Transform, With<Prim>));
+    qbench!("Q8  (&Light, &Position)  (8 of)", (&Light, &Position));
 
     // Q6: Changed — via new_with_tick (like the engine's extract).
     let last = w.current_tick();
@@ -369,14 +369,14 @@ fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
 
         // extract: 3 "mesh" queries
         for _ in 0..3 {
-            let q = Query::<(Read<Transform>, Read<Position>, Read<Rotation>)>::new(w);
+            let q = Query::<(&Transform, &Position, &Rotation)>::new(w);
             q.for_each(|_, (t, p, _)| {
                 acc = acc.wrapping_add((t.0.x.x + p.0.x) as u64);
             });
         }
         // 2 whole-transform queries
         for _ in 0..2 {
-            let q = Query::<Read<Transform>>::new(w);
+            let q = Query::<&Transform>::new(w);
             q.for_each(|_, t| {
                 acc = acc.wrapping_add(t.0.w.w as u64);
             });
@@ -390,17 +390,17 @@ fn bench_extract_cycle(fw: &mut FragWorld, rep: &mut Report) {
         }
         // 8 queries over rare components (light: 8 entities)
         for _ in 0..8 {
-            let q = Query::<(Read<Light>, Read<Position>)>::new(w);
+            let q = Query::<(&Light, &Position)>::new(w);
             q.for_each(|_, (l, p)| {
                 acc = acc.wrapping_add((l.intensity + p.0.x) as u64);
             });
         }
         // 2 marker queries (Prim — 1k rows; Velocity — 1k roots)
-        let q = Query::<(Read<Position>, Read<Prim>)>::new(w);
+        let q = Query::<(&Position, &Prim)>::new(w);
         q.for_each(|_, (p, prim)| {
             acc = acc.wrapping_add(p.0.z as u64 + prim.lod as u64);
         });
-        let q = Query::<(Read<Position>, Read<Velocity>)>::new(w);
+        let q = Query::<(&Position, &Velocity)>::new(w);
         q.for_each(|_, (p, v)| {
             acc = acc.wrapping_add((p.0.x + v.0.x) as u64);
         });

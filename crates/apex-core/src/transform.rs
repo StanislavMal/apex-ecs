@@ -980,11 +980,10 @@ mod tests {
         );
     }
 
-    /// Key C1+C2: mutating `LocalTransform` via `Query<Write<_>>` (without
+    /// Key C1+C2: mutating `LocalTransform` via `Query<&mut _>` (without
     /// a manual `TransformDirty`) triggers a recompute of `GlobalTransform`.
     #[test]
     fn changed_local_via_write_query_triggers_recompute() {
-        use crate::query::Write;
 
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
@@ -1002,7 +1001,7 @@ mod tests {
         // any manual marker.
         world.tick();
         {
-            let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
+            let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|_, mut lt| {
                 lt.translation = Vec3::new(42.0, 0.0, 0.0);
             });
@@ -1105,7 +1104,6 @@ mod tests {
     /// to the sequential one — each child's global = parent.local * child.local.
     #[test]
     fn many_dirty_roots_take_parallel_descent_and_stay_correct() {
-        use crate::query::Write;
 
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
@@ -1125,7 +1123,7 @@ mod tests {
         // All parents are dirty at once → n independent subtrees → the parallel branch.
         world.tick();
         {
-            let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
+            let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|_, mut lt| {
                 if lt.translation.y == 0.0 {
                     lt.translation.x += 1000.0;
@@ -1153,7 +1151,6 @@ mod tests {
     /// descendants; the level's parent is passed to children by value across the level barrier.
     #[test]
     fn deep_wide_hierarchy_few_roots_propagates_in_parallel_levels() {
-        use crate::query::Write;
 
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
@@ -1173,7 +1170,7 @@ mod tests {
         // Move ONLY the root → the recompute cascades to 600 descendants through wide levels.
         world.tick();
         {
-            let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
+            let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|e, mut lt| {
                 if e == root {
                     lt.translation.x = 1000.0;
@@ -1195,7 +1192,6 @@ mod tests {
     /// Changing only the parent cascades the recompute to the children.
     #[test]
     fn parent_change_cascades_to_children() {
-        use crate::query::Write;
 
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
@@ -1213,7 +1209,7 @@ mod tests {
         // Move ONLY the parent.
         world.tick();
         {
-            let mut q = Query::<Write<LocalTransform>>::new_mut(&mut world);
+            let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|e, mut lt| {
                 if e == parent {
                     lt.translation = Vec3::new(100.0, 0.0, 0.0);

@@ -216,7 +216,7 @@ fn script_system_spawn_persists_through_commands() {
     sched.run(&mut world);
 
     let mut found = Vec::new();
-    Query::<Read<Position>>::new(&world).for_each(|_, p| found.push(*p));
+    Query::<&Position>::new(&world).for_each(|_, p| found.push(*p));
     assert_eq!(
         found,
         vec![Position { x: 5.0, y: 6.0 }],
@@ -259,7 +259,7 @@ fn script_system_despawn_applies_through_commands() {
     sched.run(&mut world);
 
     let mut remaining = Vec::new();
-    Query::<Read<Position>>::new(&world).for_each(|_, p| remaining.push(p.x));
+    Query::<&Position>::new(&world).for_each(|_, p| remaining.push(p.x));
     assert_eq!(remaining, vec![1.0], "the x>1.5 entity was despawned via the per-system Commands slot");
 }
 
@@ -304,7 +304,7 @@ fn script_system_spawns_are_deterministic() {
         // Collect the entities matching the spawn marker (9.0, 9.0), sorted for a
         // stable comparison independent of iteration order.
         let mut ids = Vec::new();
-        Query::<Read<Position>>::new(&world).for_each(|e, p| {
+        Query::<&Position>::new(&world).for_each(|e, p| {
             if *p == (Position { x: 9.0, y: 9.0 }) {
                 ids.push(e);
             }

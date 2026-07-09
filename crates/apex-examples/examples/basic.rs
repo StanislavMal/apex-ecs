@@ -49,7 +49,7 @@ struct DeathEvent { entity: Entity }
 
 system! {
     fn physics_system(
-        q: (Read<Mass>, Write<Velocity>, Write<Position>),
+        q: (&Mass, &mut Velocity, &mut Position),
         cfg: Res<PhysicsConfig>,
         _dt: Res<DeltaTime>,
     ) {
@@ -69,11 +69,11 @@ system! {
 
 system! {
     fn health_clamp_system(
-        q: Write<Health>,
+        q: (&mut Health,),
         cmd: Cmd,
     ) {
         let mut dead_entities: Vec<Entity> = Vec::new();
-        q.for_each_mut(|entity, mut hp| {
+        q.for_each_mut(|entity, (mut hp,)| {
             hp.current = hp.current.clamp(0.0, hp.max);
             if hp.current <= 0.0 {
                 dead_entities.push(entity);
@@ -90,7 +90,7 @@ system! {
 
 system! {
     fn movement_system(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
     ) {
         let count = q.len();
         q.for_each_mut(|_, (vel, mut pos)| {
@@ -229,7 +229,7 @@ system! {
 
 system! {
     fn enemy_ai_system(
-        q: (Read<Enemy>, Write<Velocity>),
+        q: (&Enemy, &mut Velocity),
     ) {
         let count = q.len();
         q.for_each_mut(|_, (_, mut vel)| {
@@ -291,10 +291,10 @@ fn main() {
     sched.run(&mut world);
 
     // Find player and goblin via query (created in startup)
-    let player = Query::<(Entity, Read<Player>)>::new(&world)
+    let player = Query::<(Entity, &Player)>::new(&world)
         .iter().next().map(|(e, _)| e)
         .expect("Player entity not found");
-    let goblin = Query::<(Entity, Read<Name>)>::new(&world)
+    let goblin = Query::<(Entity, &Name)>::new(&world)
         .iter().find(|(_, n)| n.0 == "Goblin")
         .map(|(e, _)| e)
         .expect("Goblin entity not found");
@@ -393,7 +393,7 @@ fn main() {
     let before = world.entity_count();
     let mut cmds = Commands::new();
 
-    Query::<Read<Health>>::new(&world).for_each(|e, hp| {
+    Query::<&Health>::new(&world).for_each(|e, hp| {
         if hp.current < 25.0 { cmds.despawn(e); }
     });
 

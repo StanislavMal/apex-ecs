@@ -192,7 +192,7 @@ end
 
     // Find an entity with both components (Position + Velocity)
     let before_pos = {
-        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        let q = Query::<(&Position, &Velocity)>::new(&world);
         q.iter().next().map(|(p, _)| *p)
     };
 
@@ -203,7 +203,7 @@ end
     world.tick();
 
     let after_pos = {
-        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        let q = Query::<(&Position, &Velocity)>::new(&world);
         q.iter().next().map(|(p, _)| *p)
     };
 
@@ -456,7 +456,7 @@ end
     world.tick();
 
     // Verify: only 1 entity with the Player marker (created above + possibly from test 4)
-    let player_count = Query::<(Read<Position>, With<Player>)>::new(&world).iter().count();
+    let player_count = Query::<(&Position, With<Player>)>::new(&world).iter().count();
     println!("  OK: With<T> filter works (Player entities: {})\n", player_count);
 
     // ═══════════════════════════════════════════════════════
@@ -481,8 +481,8 @@ end
     engine.run(0.016, &mut world);
     world.tick();
 
-    let non_enemy = Query::<(Read<Position>, Without<Enemy>)>::new(&world).iter().count();
-    let total_pos = Query::<Read<Position>>::new(&world).iter().count();
+    let non_enemy = Query::<(&Position, Without<Enemy>)>::new(&world).iter().count();
+    let total_pos = Query::<&Position>::new(&world).iter().count();
     if non_enemy < total_pos {
         println!("  OK: Without<T> filter works (non-Enemy: {} of {})\n", non_enemy, total_pos);
     } else {
@@ -510,7 +510,7 @@ end
 "#);
 
     let before = {
-        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        let q = Query::<(&Position, &Velocity)>::new(&world);
         q.iter().next().map(|(p, _)| *p)
     };
 
@@ -520,7 +520,7 @@ end
     world.tick();
 
     let after = {
-        let q = Query::<(Read<Position>, Read<Velocity>)>::new(&world);
+        let q = Query::<(&Position, &Velocity)>::new(&world);
         q.iter().next().map(|(p, _)| *p)
     };
 

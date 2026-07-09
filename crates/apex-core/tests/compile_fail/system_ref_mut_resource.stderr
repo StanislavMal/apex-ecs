@@ -1,6 +1,7 @@
 error: system!: `res: &mut u32` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).
        Use `res: ResMut<u32>`.
-       Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`.
+       Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`;
+       a single-component query — a 1-tuple: `q: (&mut u32,)`.
  --> tests/compile_fail/system_ref_mut_resource.rs:4:1
   |
 4 | / apex_core::system! {

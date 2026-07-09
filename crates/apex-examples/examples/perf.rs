@@ -141,7 +141,7 @@ fn make_world_3comp(n: usize) -> World {
 fn make_world_3comp_with_entities(n: usize) -> (World, Vec<Entity>) {
     let world = make_world_3comp(n);
     let mut entities = Vec::with_capacity(n);
-    world.query::<Read<Position>>().for_each(|e, _| entities.push(e));
+    world.query::<&Position>().for_each(|e, _| entities.push(e));
     (world, entities)
 }
 
@@ -164,7 +164,7 @@ fn make_world_5comp(n: usize) -> World {
 
 system! {
     fn move_sys(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
     ) {
         q.for_each_mut(|_, (v, mut p)| {
             p.x += v.x * 0.016;
@@ -176,9 +176,9 @@ system! {
 
 system! {
     fn hp_sys(
-        q: Write<Health>,
+        q: (&mut Health,),
     ) {
-        q.for_each_mut(|_, mut hp| {
+        q.for_each_mut(|_, (mut hp,)| {
             hp.current = hp.current.min(hp.max).max(0.0);
         });
     }
@@ -186,9 +186,9 @@ system! {
 
 system! {
     fn temp_sys(
-        q: Write<Temperature>,
+        q: (&mut Temperature,),
     ) {
-        q.for_each_mut(|_, mut t| {
+        q.for_each_mut(|_, (mut t,)| {
             t.0 += (20.0 - t.0) * 0.001;
         });
     }
@@ -196,9 +196,9 @@ system! {
 
 system! {
     fn mana_sys(
-        q: Write<Mana>,
+        q: (&mut Mana,),
     ) {
-        q.for_each_mut(|_, mut m| {
+        q.for_each_mut(|_, (mut m,)| {
             m.current = (m.current + 0.2).min(m.max);
         });
     }
@@ -206,7 +206,7 @@ system! {
 
 system! {
     fn heavy_phys_sys(
-        q: (Write<Velocity>, Write<Position>),
+        q: (&mut Velocity, &mut Position),
     ) {
         q.for_each_mut(|_, (mut v, mut p)| {
             let dt    = 0.016f32;
@@ -226,9 +226,9 @@ system! {
 
 system! {
     fn heavy_temp_sys(
-        q: Write<Temperature>,
+        q: (&mut Temperature,),
     ) {
-        q.for_each_mut(|_, mut t| {
+        q.for_each_mut(|_, (mut t,)| {
             let ambient = 20.0f32;
             let diff    = t.0 - ambient;
             let rate    = (diff * 0.1).tanh() * 0.05;
@@ -243,9 +243,9 @@ system! {
 
 system! {
     fn heavy_mana_sys(
-        q: Write<Mana>,
+        q: (&mut Mana,),
     ) {
-        q.for_each_mut(|_, mut m| {
+        q.for_each_mut(|_, (mut m,)| {
             let ratio = m.current / m.max;
             let regen = (1.0 - ratio).sqrt() * 0.5;
             m.current = (m.current + regen).min(m.max);
@@ -258,7 +258,7 @@ system! {
 
 system! {
     fn auto_move_sys(
-        q: (Read<Velocity>, Write<Position>),
+        q: (&Velocity, &mut Position),
     ) {
         q.for_each_mut(|_, (v, mut p)| {
             p.x += v.x * 0.016;
@@ -523,7 +523,7 @@ fn bench_scheduler_throughput(n: usize) {
             access_desc!(read<PhysicsConfig>, write<Position>),
             |ctx| {
                 let dt = ctx.resource::<PhysicsConfig>().dt;
-                ctx.query_unchecked::<Write<Position>>().for_each_mut(|_, mut pos| { pos.x += dt; });
+                ctx.query_unchecked::<&mut Position>().for_each_mut(|_, mut pos| { pos.x += dt; });
             },
         ));
         sched.compile().unwrap();
@@ -545,7 +545,7 @@ fn bench_scheduler_throughput(n: usize) {
     {
         let mut sched = Scheduler::new();
         sched.add_systems(StageLabel::Update, seq("move", |world: &mut World| {
-            Query::<(Read<Velocity>, Write<Position>)>::new_mut(world)
+            Query::<(&Velocity, &mut Position)>::new_mut(world)
                 .for_each_mut(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
         }));
         sched.compile().unwrap();
@@ -585,7 +585,7 @@ fn bench_compile_overhead() {
 
     struct SimpleSys;
     impl AutoSystem for SimpleSys {
-        type Query = Write<Position>;
+        type Query = &'static mut Position;
         type Resources = ();
         type Events = ();
         fn run(&mut self, _: SystemContext<'_>) {}
@@ -593,7 +593,7 @@ fn bench_compile_overhead() {
 
     struct OtherSys;
     impl AutoSystem for OtherSys {
-        type Query = Write<Velocity>;
+        type Query = &'static mut Velocity;
         type Resources = ();
         type Events = ();
         fn run(&mut self, _: SystemContext<'_>) {}
@@ -621,7 +621,7 @@ fn bench_compile_overhead() {
     println!();
     for &n_sys in &[2usize, 5, 10, 20] {
         bench_with_setup(
-            &format!("compile() {n_sys:>2} par (all Write<Pos>, max conflicts)"),
+            &format!("compile() {n_sys:>2} par (all &mut Pos, max conflicts)"),
             || (),
             |()| {
                 let mut sched = Scheduler::new();
@@ -879,7 +879,7 @@ fn bench_query(n: usize) {
         || make_world_3comp(n * 1000),
         |world: World| {
             let mut sum = 0.0f32;
-            Query::<Read<Position>>::new(&world)
+            Query::<&Position>::new(&world)
                 .for_each(|_, p| { sum += p.x; });
             std::hint::black_box(sum);
             (n * 1000) as u64
@@ -891,7 +891,7 @@ fn bench_query(n: usize) {
         || make_world_3comp(n * 1000),
         |world: World| {
             let mut sum = 0.0f32;
-            world.query::<Read<Position>>()
+            world.query::<&Position>()
                 .for_each(|_, p| { sum += p.x; });
             std::hint::black_box(sum);
             (n * 1000) as u64
@@ -899,10 +899,10 @@ fn bench_query(n: usize) {
     );
 
     bench_with_setup(
-        &format!("Query<(Read<Vel>, Write<Pos>)>    ({n}k)"),
+        &format!("Query<(&Vel, &mut Pos)>    ({n}k)"),
         || make_world_3comp(n * 1000),
         |mut world: World| {
-            Query::<(Read<Velocity>, Write<Position>)>::new_mut(&mut world)
+            Query::<(&Velocity, &mut Position)>::new_mut(&mut world)
                 .for_each_mut(|_, (v, mut p)| { p.x += v.x; p.y += v.y; });
             std::hint::black_box(world.entity_count());
             (n * 1000) as u64
@@ -919,7 +919,7 @@ fn bench_query(n: usize) {
             let mut world = make_world_3comp(n * 1000);
 
             // Add a few Player entities in a separate archetype
-            // (not matching the Read<Position> + With<Player> query
+            // (not matching the &Position + With<Player> query
             //  because they have no Position)
             for _ in 0..100 { world.spawn((Player,)); }
             world
@@ -927,7 +927,7 @@ fn bench_query(n: usize) {
         |world: World| {
             let mut c = 0u64;
             // Query: entities with both Position AND Player — there are none
-            Query::<(Read<Position>, With<Player>)>::new(&world)
+            Query::<(&Position, With<Player>)>::new(&world)
                 .for_each(|_, _| { c += 1; });
             std::hint::black_box(c);
             // ops = entity count in the world (we walked every archetype)
@@ -1194,11 +1194,11 @@ fn bench_parallel_scheduler(n: usize) {
 
     struct HeavyPhysParSys;
     impl AutoSystem for HeavyPhysParSys {
-        type Query = (Write<Velocity>, Write<Position>);
+        type Query = (&'static mut Velocity, &'static mut Position);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<(Write<Velocity>, Write<Position>)>().par_for_each_mut(|_, (mut v, mut p)| {
+            ctx.query_unchecked::<(&mut Velocity, &mut Position)>().par_for_each_mut(|_, (mut v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1216,11 +1216,11 @@ fn bench_parallel_scheduler(n: usize) {
 
     struct HeavyTempParSys;
     impl AutoSystem for HeavyTempParSys {
-        type Query = Write<Temperature>;
+        type Query = &'static mut Temperature;
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<Write<Temperature>>().par_for_each_mut(|_, mut t| {
+            ctx.query_unchecked::<&mut Temperature>().par_for_each_mut(|_, mut t| {
                 let ambient = 20.0f32;
                 let diff    = t.0 - ambient;
                 let rate    = (diff * 0.1).tanh() * 0.05;
@@ -1235,11 +1235,11 @@ fn bench_parallel_scheduler(n: usize) {
 
     struct HeavyManaParSys;
     impl AutoSystem for HeavyManaParSys {
-        type Query = Write<Mana>;
+        type Query = &'static mut Mana;
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<Write<Mana>>().par_for_each_mut(|_, mut m| {
+            ctx.query_unchecked::<&mut Mana>().par_for_each_mut(|_, mut m| {
                 let ratio = m.current / m.max;
                 let regen = (1.0 - ratio).sqrt() * 0.5;
                 m.current = (m.current + regen).min(m.max);
@@ -1331,9 +1331,9 @@ fn bench_parallel_scheduler(n: usize) {
         ($name:ident, $comp:ty) => {
             system! {
                 fn $name(
-                    q: Write<$comp>,
+                    q: (&mut $comp,),
                 ) {
-                    q.for_each_mut(|_, mut c| {
+                    q.for_each_mut(|_, (mut c,)| {
                         c.0 = (c.0 * 1.01 + 0.5).sin();
                     });
                 }
@@ -1545,11 +1545,11 @@ fn bench_intra_system_parallel(n: usize) {
 
     struct LightSeqSys;
     impl AutoSystem for LightSeqSys {
-        type Query = (Read<Velocity>, Write<Position>);
+        type Query = (&'static Velocity, &'static mut Position);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().for_each_mut(|_, (v, mut p)| {
+            ctx.query_unchecked::<(&Velocity, &mut Position)>().for_each_mut(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1560,11 +1560,11 @@ fn bench_intra_system_parallel(n: usize) {
 
     struct LightParSys;
     impl AutoSystem for LightParSys {
-        type Query = (Read<Velocity>, Write<Position>);
+        type Query = (&'static Velocity, &'static mut Position);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().par_for_each_mut(|_, (v, mut p)| {
+            ctx.query_unchecked::<(&Velocity, &mut Position)>().par_for_each_mut(|_, (v, mut p)| {
                 p.x += v.x * 0.016;
                 p.y += v.y * 0.016;
                 let len = (p.x * p.x + p.y * p.y).sqrt();
@@ -1575,11 +1575,11 @@ fn bench_intra_system_parallel(n: usize) {
 
     struct HeavySeqSys;
     impl AutoSystem for HeavySeqSys {
-        type Query = (Read<Velocity>, Write<Position>);
+        type Query = (&'static Velocity, &'static mut Position);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().for_each_mut(|_, (v, mut p)| {
+            ctx.query_unchecked::<(&Velocity, &mut Position)>().for_each_mut(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);
@@ -1593,11 +1593,11 @@ fn bench_intra_system_parallel(n: usize) {
 
     struct HeavyIntraParSys;
     impl AutoSystem for HeavyIntraParSys {
-        type Query = (Read<Velocity>, Write<Position>);
+        type Query = (&'static Velocity, &'static mut Position);
         type Resources = ();
         type Events = ();
         fn run(&mut self, ctx: SystemContext<'_>) {
-            ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>().par_for_each_mut(|_, (v, mut p)| {
+            ctx.query_unchecked::<(&Velocity, &mut Position)>().par_for_each_mut(|_, (v, mut p)| {
                 let dt    = 0.016f32;
                 let speed = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
                 let angle = speed.atan2(1.0);

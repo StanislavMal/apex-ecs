@@ -29,15 +29,15 @@ struct CacheEntry {
     seen_arch_count: usize,
 }
 
-/// Query cache key. The `ids` list ALONE is not enough: `(Read<A>, Read<B>)`
-/// and `(Read<A>, Without<B>)` produce the same `fill_ids` but different match
+/// Query cache key. The `ids` list ALONE is not enough: `(&A, &B)`
+/// and `(&A, Without<B>)` produce the same `fill_ids` but different match
 /// semantics — a key on ids alone would poison the cache between them. The
 /// triple (ids, positive, required) uniquely defines the shape's match
 /// semantics: without-set = ids − positive, optional-set = positive − required.
 /// Query cache key (CR-M2b): one `u64` per component — ComponentId in the
 /// lower 32 bits, role (required/without/optional) in the upper bits
 /// (`WorldQuery::fill_cache_key`). Uniquely encodes the shape's match semantics:
-/// `(Read<A>, Read<B>)`, `(Read<A>, Without<B>)` and `(Read<A>, Maybe<B>)` are
+/// `(&A, &B)`, `(&A, Without<B>)` and `(&A, Maybe<B>)` are
 /// DISTINCT entries (they previously shared one — cache poisoning).
 ///
 /// Allocation-free hot path: the key is built in a single pass into an inline
@@ -1884,7 +1884,7 @@ impl World {
     /// Mutable access that updates the row's change-tick (change detection).
     ///
     /// Stamps the world's current tick → `Changed<T>` fires (as with a mutation
-    /// through `Query<&mut T>`/`Write<T>`, C1).
+    /// through `Query<&mut T>`/`&mut T`, C1).
     #[inline]
     /// Mutable access with LAZY change-detection (A13): the returned [`Mut<T>`]
     /// stamps the change-tick only when the caller actually mutates it (via
@@ -2002,7 +2002,7 @@ impl World {
         crate::query::Query::from_world_cached(self, last_run)
     }
 
-    /// A query of any shape (including `Write<T>`) under an exclusive world
+    /// A query of any shape (including `&mut T`) under an exclusive world
     /// borrow.
     pub fn query_mut<Q: WorldQuery>(&mut self) -> crate::query::Query<'_, '_, Q> {
         crate::query::Query::from_world_cached(self, Tick::ZERO)
@@ -2642,7 +2642,7 @@ impl<'w> SystemContext<'w> {
     /// (F3): a mutable query obtained from `ctx` is UNDECLARED write access, and the
     /// scheduler parallelizes systems by their DECLARED access — an undeclared `&mut`
     /// is a safe-reachable data race (the exact class B1(v) closed for `Query::new`).
-    /// Declare mutable access as a system PARAMETER (`q: Query<Write<T>>` in the
+    /// Declare mutable access as a system PARAMETER (`q: Query<&mut T>` in the
     /// signature) — the scheduler validates it and serializes conflicts — rather than
     /// reaching for a mutable `ctx.query`.
     #[inline]
@@ -2948,7 +2948,7 @@ impl<'w> ParallelWorld<'w> {
 ///
 /// ```ignore
 /// struct ExtractMeshes {
-///     q: QueryState<(Read<Mesh>, Read<GlobalTransform>)>,
+///     q: QueryState<(&Mesh, &GlobalTransform)>,
 /// }
 /// // in the hot loop:
 /// self.q.query(&world).for_each(|e, (mesh, gt)| { ... });
@@ -3742,7 +3742,7 @@ mod tests {
 
     #[test]
     fn check_change_ticks_clamps_stale_rows() {
-        use crate::query::{Changed, Read};
+        use crate::query::Changed;
 
         struct P(#[allow(dead_code)] f32);
         impl crate::component::Component for P {}
@@ -3759,7 +3759,7 @@ mod tests {
 
         // last_run is "yesterday": the row is very old and must NOT be Changed.
         let last_run = Tick(world.current_tick.0.wrapping_sub(2));
-        let changed = crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world, last_run)
+        let changed = crate::query::Query::<(Changed<P>, &P)>::new_with_tick(&world, last_run)
             .iter()
             .count();
         assert_eq!(changed, 0, "the clamp kept the row as 'unchanged for a long time'");
@@ -3770,7 +3770,7 @@ mod tests {
         world2.current_tick.0 = world2.current_tick.0.wrapping_add(1 << 31).wrapping_add(8);
         let last_run2 = Tick(world2.current_tick.0.wrapping_sub(2));
         let false_changed =
-            crate::query::Query::<(Changed<P>, Read<P>)>::new_with_tick(&world2, last_run2)
+            crate::query::Query::<(Changed<P>, &P)>::new_with_tick(&world2, last_run2)
                 .iter()
                 .count();
         assert_eq!(false_changed, 1, "sanity: without the clamp, wrap gives a false Changed");
@@ -3847,7 +3847,6 @@ mod tests {
     /// uninitialized rows.
     #[test]
     fn spawn_many_panic_rolls_back_batch() {
-        use crate::query::Read;
 
         #[derive(Debug)]
         struct P(#[allow(dead_code)] u32);
@@ -3856,7 +3855,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((P(1),));
         world.spawn((P(2),));
-        let before = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        let before = crate::query::Query::<&P>::new(&world).iter().count();
         assert_eq!(before, 2);
 
         // `make_bundle` panics on the 4th element, after rows 0..3 were pushed.
@@ -3871,12 +3870,12 @@ mod tests {
         assert!(res.is_err(), "the make_bundle panic must propagate");
 
         // The partial batch was rolled back — the archetype is consistent again.
-        let after = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        let after = crate::query::Query::<&P>::new(&world).iter().count();
         assert_eq!(after, before, "partial spawn_many batch rolled back on panic");
 
         // The world remains fully usable after the rollback.
         world.spawn((P(9),));
-        let n = crate::query::Query::<Read<P>>::new(&world).iter().count();
+        let n = crate::query::Query::<&P>::new(&world).iter().count();
         assert_eq!(n, 3);
     }
 
@@ -3884,7 +3883,6 @@ mod tests {
 
     #[test]
     fn query_state_incremental_and_reusable() {
-        use crate::query::Read;
 
         struct P(f32);
         impl crate::component::Component for P {}
@@ -3894,7 +3892,7 @@ mod tests {
         let mut world = World::new();
         world.spawn((P(1.0),));
 
-        let mut state = QueryState::<Read<P>>::new();
+        let mut state = QueryState::<&P>::new();
         assert_eq!(state.query(&world).iter().count(), 1);
 
         // A new archetype AFTER the first query — the state is extended by the tail.
@@ -3910,7 +3908,6 @@ mod tests {
 
     #[test]
     fn query_state_rebinds_to_other_world() {
-        use crate::query::Read;
 
         struct P(#[allow(dead_code)] f32);
         impl crate::component::Component for P {}
@@ -3921,7 +3918,7 @@ mod tests {
         b.spawn((P(0.0),));
         b.spawn((P(0.0),));
 
-        let mut state = QueryState::<Read<P>>::new();
+        let mut state = QueryState::<&P>::new();
         assert_eq!(state.query(&a).iter().count(), 1);
         assert_eq!(state.query(&b).iter().count(), 2, "the state rebound to world B");
         assert_eq!(state.query(&a).iter().count(), 1, "and back to A");
@@ -3929,13 +3926,12 @@ mod tests {
 
     #[test]
     fn query_state_resolves_late_registered_component() {
-        use crate::query::Read;
 
         struct Late(#[allow(dead_code)] u32);
         impl crate::component::Component for Late {}
 
         let mut world = World::new();
-        let mut state = QueryState::<Read<Late>>::new();
+        let mut state = QueryState::<&Late>::new();
         // The component is not yet registered — the query is empty but does not panic.
         assert_eq!(state.query(&world).iter().count(), 0);
 
@@ -3945,7 +3941,7 @@ mod tests {
 
     #[test]
     fn query_state_changed_with_explicit_tick() {
-        use crate::query::{Changed, Read};
+        use crate::query::Changed;
 
         struct P(f32);
         impl crate::component::Component for P {}
@@ -3962,7 +3958,7 @@ mod tests {
             p.0 = 1.0;
         }
 
-        let mut state = QueryState::<(Entity, Changed<P>, Read<P>)>::new();
+        let mut state = QueryState::<(Entity, Changed<P>, &P)>::new();
         let hits: Vec<_> = state
             .query_with_tick(&world, last_run)
             .iter()
@@ -4145,14 +4141,13 @@ mod tests {
     /// TD-1: `Query::iter()` must not skip the first archetype.
     #[test]
     fn cached_query_iter_does_not_skip_first_archetype() {
-        use crate::query::Read;
 
         // One archetype (only Pos).
         let mut world = World::new();
         let a = world.spawn((Pos { x: 1.0, y: 0.0 },));
         let b = world.spawn((Pos { x: 2.0, y: 0.0 },));
         let got: Vec<_> = world
-            .query_changed::<(Entity, Read<Pos>)>(Tick::ZERO)
+            .query_changed::<(Entity, &Pos)>(Tick::ZERO)
             .iter()
             .map(|(e, _)| e)
             .collect();
@@ -4162,7 +4157,7 @@ mod tests {
         // Several archetypes: (Pos) and (Pos, Vel).
         let c = world.spawn((Pos { x: 3.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         let got2: Vec<_> = world
-            .query_changed::<(Entity, Read<Pos>)>(Tick::ZERO)
+            .query_changed::<(Entity, &Pos)>(Tick::ZERO)
             .iter()
             .map(|(e, _)| e)
             .collect();
@@ -4171,28 +4166,28 @@ mod tests {
 
         // for_each and iter produce the same set.
         let mut fe = 0usize;
-        world.query_changed::<Read<Pos>>(Tick::ZERO).for_each(|_, _| fe += 1);
+        world.query_changed::<&Pos>(Tick::ZERO).for_each(|_, _| fe += 1);
         assert_eq!(fe, got2.len(), "for_each and iter must be consistent");
     }
 
-    /// CR-M2: `(Read<A>, Read<B>)` and `(Read<A>, Without<B>)` have the same
+    /// CR-M2: `(&A, &B)` and `(&A, Without<B>)` have the same
     /// fill_ids — the cache entries must NOT poison each other.
     #[test]
     fn cached_query_without_does_not_share_entry_with_read() {
-        use crate::query::{Read, Without};
+        use crate::query::Without;
 
         let mut world = World::new();
         let _both = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
         let only_pos = world.spawn((Pos { x: 2.0, y: 0.0 },));
 
         // First warm the cache with the shape (Read, Read)…
-        let with_vel = world.query::<(Read<Pos>, Read<Vel>)>().len();
+        let with_vel = world.query::<(&Pos, &Vel)>().len();
         assert_eq!(with_vel, 1);
 
         // …then (Read, Without) must see ITS OWN archetype list.
         let mut seen = Vec::new();
         world
-            .query::<(Read<Pos>, Without<Vel>)>()
+            .query::<(&Pos, Without<Vel>)>()
             .for_each(|e, _| seen.push(e));
         assert_eq!(seen, vec![only_pos], "the Without shape must not share a cache entry with the Read shape");
     }
@@ -4201,15 +4196,14 @@ mod tests {
     /// AFTER the list was first built.
     #[test]
     fn cached_query_picks_up_new_archetypes() {
-        use crate::query::Read;
 
         let mut world = World::new();
         world.spawn((Pos { x: 1.0, y: 0.0 },));
-        assert_eq!(world.query::<Read<Pos>>().len(), 1);
+        assert_eq!(world.query::<&Pos>().len(), 1);
 
         // A new archetype (Pos, Vel) after warming the cache.
         world.spawn((Pos { x: 2.0, y: 0.0 }, Vel { x: 0.0, y: 0.0 }));
-        assert_eq!(world.query::<Read<Pos>>().len(), 2);
+        assert_eq!(world.query::<&Pos>().len(), 2);
     }
 
     /// CR-M2: an entity that moved into an EMPTIED archetype is not lost by the
@@ -4217,21 +4211,20 @@ mod tests {
     /// cache).
     #[test]
     fn cached_query_sees_entity_in_repopulated_archetype() {
-        use crate::query::Read;
 
         let mut world = World::new();
         let e = world.spawn((Pos { x: 1.0, y: 0.0 }, Vel { x: 3.0, y: 0.0 }));
-        assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 1);
+        assert_eq!(world.query::<(&Pos, &Vel)>().len(), 1);
 
         // The (Pos, Vel) archetype empties…
         world.remove::<Vel>(e);
-        assert_eq!(world.query::<(Read<Pos>, Read<Vel>)>().len(), 0);
+        assert_eq!(world.query::<(&Pos, &Vel)>().len(), 0);
 
         // …and fills up again — the cached list must see it.
         world.insert(e, Vel { x: 4.0, y: 0.0 });
         let mut seen = Vec::new();
         world
-            .query::<(Read<Pos>, Read<Vel>)>()
+            .query::<(&Pos, &Vel)>()
             .for_each(|ent, _| seen.push(ent));
         assert_eq!(seen, vec![e]);
     }
@@ -4240,7 +4233,7 @@ mod tests {
     /// from component_arch_index by the RAREST required component.
     #[test]
     fn query_new_candidates_from_rarest_component_on_large_world() {
-        use crate::query::{Query, Read, With};
+        use crate::query::{Query, With};
 
         struct F0;
         struct F1;
@@ -4282,18 +4275,18 @@ mod tests {
         assert!(world.archetype_count() > 128, "the test needs the candidate path");
 
         // Rare component: candidates = 1 archetype, the result is correct.
-        let got: Vec<_> = Query::<(Entity, Read<Pos>, Read<Rare>)>::new(&world)
+        let got: Vec<_> = Query::<(Entity, &Pos, &Rare)>::new(&world)
             .iter()
             .map(|(e, _, _)| e)
             .collect();
         assert_eq!(got, vec![rare_holder.unwrap()]);
 
         // The With shape via the same path.
-        let cnt = Query::<(Read<Pos>, With<Rare>)>::new(&world).iter().count();
+        let cnt = Query::<(&Pos, With<Rare>)>::new(&world).iter().count();
         assert_eq!(cnt, 1);
 
         // A wide query on the same world — all 200 rows are present.
-        let all = Query::<Read<Pos>>::new(&world).iter().count();
+        let all = Query::<&Pos>::new(&world).iter().count();
         assert_eq!(all, 200);
     }
 
@@ -4548,7 +4541,7 @@ mod tests {
 #[cfg(test)]
 mod hooks_and_added_tests {
     use super::*;
-    use crate::query::{Added, Changed, Query, Read};
+    use crate::query::{Added, Changed, Query};
 
     #[derive(Debug, PartialEq)]
     struct Hp(u32);
@@ -4582,14 +4575,14 @@ mod hooks_and_added_tests {
         world.spawn((Hp(1),));
 
         let lr = world.last_run_tick();
-        let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let n = Query::<(Added<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(n, 1, "a fresh spawn is visible to Added<T>");
 
         world.advance_change_tick();
         let lr = world.last_run_tick();
-        let n = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let n = Query::<(Added<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(n, 0, "on the next frame Added<T> expires");
@@ -4605,10 +4598,10 @@ mod hooks_and_added_tests {
         // insert Armor moves the entity into a new archetype: Added<Armor> — yes,
         // Added<Hp> — NO (the added-tick survived the move).
         world.insert(e, Armor(5));
-        let added_armor = Query::<(Added<Armor>, Read<Armor>)>::new_with_tick(&world, lr)
+        let added_armor = Query::<(Added<Armor>, &Armor)>::new_with_tick(&world, lr)
             .iter()
             .count();
-        let added_hp = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let added_hp = Query::<(Added<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(added_armor, 1);
@@ -4623,10 +4616,10 @@ mod hooks_and_added_tests {
         let lr = world.last_run_tick();
 
         world.insert(e, Hp(2)); // replace of an existing one
-        let added = Query::<(Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let added = Query::<(Added<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .count();
-        let changed = Query::<(Changed<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let changed = Query::<(Changed<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(added, 0, "replace does not re-trigger Added (like Bevy)");
@@ -4646,7 +4639,7 @@ mod hooks_and_added_tests {
         let e3 = world.spawn((Hp(3),)); // the only "fresh" one
         world.despawn(e0); // swap_remove: e3 moves to row 0
 
-        let fresh: Vec<Entity> = Query::<(Entity, Added<Hp>, Read<Hp>)>::new_with_tick(&world, lr)
+        let fresh: Vec<Entity> = Query::<(Entity, Added<Hp>, &Hp)>::new_with_tick(&world, lr)
             .iter()
             .map(|(e, _, _)| e)
             .collect();
@@ -5162,7 +5155,7 @@ mod wave5_par_split {
     fn par_split_visits_every_entity_exactly_once() {
         let (world, total) = skewed_world();
         let count = AtomicUsize::new(0);
-        world.query::<crate::query::Read<N>>().par_for_each(|_, _| {
+        world.query::<&N>().par_for_each(|_, _| {
             count.fetch_add(1, Ordering::Relaxed);
         });
         assert_eq!(count.load(Ordering::Relaxed), total);
@@ -5172,10 +5165,10 @@ mod wave5_par_split {
     fn par_split_write_matches_sequential() {
         // Parallel (adaptive-split) mutation.
         let (mut wp, _) = skewed_world();
-        wp.query_mut::<crate::query::Write<N>>()
+        wp.query_mut::<&mut N>()
             .par_for_each_mut(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut par: Vec<u32> = wp
-            .query::<crate::query::Read<N>>()
+            .query::<&N>()
             .iter()
             .map(|n| n.0)
             .collect();
@@ -5183,10 +5176,10 @@ mod wave5_par_split {
 
         // Sequential reference on an identically-built world.
         let (mut ws, _) = skewed_world();
-        ws.query_mut::<crate::query::Write<N>>()
+        ws.query_mut::<&mut N>()
             .for_each_mut(|_, mut n| n.0 = n.0.wrapping_mul(2).wrapping_add(1));
         let mut seq: Vec<u32> = ws
-            .query::<crate::query::Read<N>>()
+            .query::<&N>()
             .iter()
             .map(|n| n.0)
             .collect();

@@ -9,10 +9,10 @@ use apex_scheduler::{Scheduler, StageLabel};
 #[derive(Component)]
 struct Counter(u32);
 
-// Parallel system — access derived from the parameters (Write<Counter>).
+// Parallel system — access derived from the parameters (&mut Counter).
 system! {
-    fn parallel_inc(q: Write<Counter>) {
-        q.for_each_mut(|_, mut c| {
+    fn parallel_inc(q: (&mut Counter,)) {
+        q.for_each_mut(|_, (mut c,)| {
             c.0 += 1;
         });
     }
@@ -37,7 +37,7 @@ fn unified_add_systems_bare_identifiers() {
     sched.compile_with_world(&world).unwrap();
     sched.run_sequential(&mut world);
 
-    let counters: Vec<u32> = Query::<Read<Counter>>::new(&world)
+    let counters: Vec<u32> = Query::<&Counter>::new(&world)
         .iter()
         .map(|c| c.0)
         .collect();
@@ -54,8 +54,8 @@ fn unified_add_systems_bare_identifiers() {
 // State without a required Default (U.5) — pub fields, constructed manually.
 system! {
     struct Accumulator { step: u32 }
-    fn run(s: &mut Self, q: Write<Counter>) {
-        q.for_each_mut(|_, mut c| {
+    fn run(s: &mut Self, q: (&mut Counter,)) {
+        q.for_each_mut(|_, (mut c,)| {
             c.0 += s.step;
         });
     }
@@ -73,7 +73,7 @@ fn stateful_system_without_default() {
     sched.run_sequential(&mut world);
     sched.run_sequential(&mut world);
 
-    let v = Query::<Read<Counter>>::new(&world)
+    let v = Query::<&Counter>::new(&world)
         .iter()
         .next()
         .map(|c| c.0)
@@ -102,7 +102,7 @@ fn exclusive_system_full_world_access() {
 struct ChangedCount(usize);
 
 system! {
-    fn detect_changed(q: (Changed<Counter>, Read<Counter>), out: ResMut<ChangedCount>) {
+    fn detect_changed(q: (Changed<Counter>, &Counter), out: ResMut<ChangedCount>) {
         let mut n = 0;
         q.for_each(|_, _| n += 1);
         out.0 = n;

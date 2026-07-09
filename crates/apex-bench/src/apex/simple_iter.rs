@@ -7,7 +7,7 @@ use cgmath::{Matrix4, Vector3};
 pub struct SimpleIter {
     world: World,
     // W2-0/W2-0.5: per-state query for the chunked variant (Bevy QueryState model)
-    state: QueryState<(Read<Velocity>, Write<Position>)>,
+    state: QueryState<(&'static Velocity, &'static mut Position)>,
 }
 
 impl Default for SimpleIter {

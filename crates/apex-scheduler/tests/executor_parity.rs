@@ -19,16 +19,15 @@
 //! the shared-buffer and per-system-slot allocation strategies.
 
 use apex_core::prelude::*;
-use apex_core::query::{Read, Write};
 use apex_core::world::ChunkConfig;
 use apex_scheduler::{conditions, par, seq, Scheduler, StageLabel};
 
-// A system with DECLARED access (Read<Vel>, Write<Pos>) — the scheduler sees a
+// A system with DECLARED access (&Vel, &mut Pos) — the scheduler sees a
 // concrete component filter, so under ASD it is row-split across rayon workers.
 // A raw `par(|ctx| …)` closure declares no access and would run as a single
 // whole-world task, never exercising the row-split path.
 apex_core::system! {
-    fn move_split(q: (Read<Vel>, Write<Pos>)) {
+    fn move_split(q: (&Vel, &mut Pos)) {
         q.for_each_mut(|_e, (vel, mut pos)| {
             pos.x += vel.x;
             pos.y += vel.y;
@@ -60,7 +59,7 @@ struct Observation {
 
 fn observe(world: &World) -> Observation {
     let mut positions = Vec::new();
-    world.query::<Read<Pos>>().for_each(|_e, p| positions.push((p.x, p.y)));
+    world.query::<&Pos>().for_each(|_e, p| positions.push((p.x, p.y)));
     positions.sort_unstable();
     Observation {
         entity_count: world.entity_count(),
@@ -118,7 +117,7 @@ fn parity_spawn_then_move() {
             sched.add_systems(
                 StageLabel::Update,
                 par("move", |ctx| {
-                    ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+                    ctx.query_unchecked::<(&Vel, &mut Pos)>()
                         .for_each_mut(|_e, (vel, mut pos)| {
                             pos.x += vel.x;
                             pos.y += vel.y;
@@ -175,7 +174,7 @@ fn parity_growing_world_with_mutation() {
             sched.add_systems(
                 StageLabel::PostUpdate,
                 par("move", |ctx| {
-                    ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+                    ctx.query_unchecked::<(&Vel, &mut Pos)>()
                         .for_each_mut(|_e, (vel, mut pos)| {
                             pos.x += vel.x;
                             pos.y += vel.y;
@@ -248,7 +247,7 @@ fn parity_multi_stage_ordering() {
                 sched.add_systems(
                     stage,
                     par("move", |ctx| {
-                        ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>()
+                        ctx.query_unchecked::<(&Vel, &mut Pos)>()
                             .for_each_mut(|_e, (vel, mut pos)| {
                                 pos.x += vel.x;
                                 pos.y += vel.y;

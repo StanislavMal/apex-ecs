@@ -1,8 +1,8 @@
 error: unsupported parameter in system! macro: "mut"
 
        Expected one of:
-         - q: (Read<A>, Write<B>) — query (tuple)
-         - q: Read<A>             — query (single)
+         - q: (&A, &mut B)        — query (tuple)
+         - q: (&A,)               — query (single component, a 1-tuple)
          - name: Res<T>           — resource read
          - name: ResMut<T>        — resource write
          - name: &[E]             — event reader

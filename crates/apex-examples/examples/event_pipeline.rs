@@ -51,11 +51,11 @@ struct DamageEvent {
 
 system! {
     fn collision_system(
-        q: Read<Collider>,
+        q: (&Collider,),
         writer: &mut Vec<DamageEvent>,
     ) {
         let count = q.len();
-        q.for_each(|entity, _| {
+        q.for_each(|entity, (_,)| {
             writer.send(DamageEvent { target: entity, amount: 25.0 });
         });
         println!("  [CollisionSystem] emitted {}x DamageEvent(25.0)", count);
@@ -68,7 +68,7 @@ system! {
 
 system! {
     fn armor_system(
-        q: (Read<Armor>, Write<Health>),
+        q: (&Armor, &mut Health),
         reader: &[DamageEvent],
         writer: &mut Vec<DamageEvent>,
     ) {
@@ -107,9 +107,9 @@ system! {
 
 system! {
     fn health_system(
-        q: Read<Health>,
+        q: (&Health,),
     ) {
-        q.for_each(|entity, hp| {
+        q.for_each(|entity, (hp,)| {
             println!("  [HealthSystem] entity={:?} HP={:.1}/{}", entity, hp.current, hp.max);
         });
     }
@@ -119,7 +119,7 @@ system! {
 
 system! {
     fn sound_system(
-        q: Read<Collider>,
+        q: (&Collider,),
         reader: &[DamageEvent],
     ) {
         let events: Vec<_> = reader.iter().to_vec();

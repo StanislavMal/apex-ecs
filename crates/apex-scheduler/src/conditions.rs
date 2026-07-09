@@ -18,7 +18,7 @@
 
 use crate::Condition;
 use apex_core::component::Component;
-use apex_core::query::{Query, Read};
+use apex_core::query::Query;
 use apex_core::world::World;
 use apex_core::AccessDescriptor;
 use std::marker::PhantomData;
@@ -82,7 +82,7 @@ impl<T> Clone for AnyWithComponent<T> {
 
 impl<T: Component> Condition for AnyWithComponent<T> {
     fn check(&self, w: &World) -> bool {
-        Query::<Read<T>>::new(w).iter().count() > 0
+        Query::<&T>::new(w).iter().count() > 0
     }
     fn access(&self) -> AccessDescriptor {
         AccessDescriptor::new().read::<T>()

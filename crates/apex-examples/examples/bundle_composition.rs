@@ -189,7 +189,7 @@ fn main() {
 
     println!("\n═══ 7. Query over components from nested Bundles ═══\n");
     {
-        let query = world.query::<(Read<Pos>, Read<Hp>)>();
+        let query = world.query::<(&Pos, &Hp)>();
         let mut count = 0;
         query.for_each(|entity, (pos, hp)| {
             count += 1;

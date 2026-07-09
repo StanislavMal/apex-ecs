@@ -47,7 +47,7 @@ pub unsafe trait WorldQuery: Sized {
     type State: Copy;
 
     /// Read-only projection of this shape: every `&mut T` / `Mut<T>` becomes
-    /// `&T`. `Read<T>::ReadOnly = Read<T>`, `Write<T>::ReadOnly = Read<T>`,
+    /// `&T`. `&T::ReadOnly = &T`, `&mut T::ReadOnly = &T`,
     /// filters map to themselves, tuples element-wise. Lets a shared-borrow
     /// (`&self`) iterator hand out read-only items even for a write-shaped query
     /// (Bevy `QueryData::ReadOnly`): the bound guarantees the projection yields
@@ -83,7 +83,7 @@ pub unsafe trait WorldQuery: Sized {
     /// Query cache key (CR-M2b): one `u64` per component — ComponentId in the low
     /// 32 bits, the role in the high bits ([`KEY_ROLE_WITHOUT`]/[`KEY_ROLE_OPTIONAL`];
     /// required — 0). Unambiguously encodes the match semantics of the query shape
-    /// ((Read<A>, Read<B>) ≠ (Read<A>, Without<B>) ≠ (Read<A>, Maybe<B>)).
+    /// ((&A, &B) ≠ (&A, Without<B>) ≠ (&A, Maybe<B>)).
     ///
     /// IMPORTANT: the sequence of low 32 bits must match `fill_ids` (CachedQuery
     /// reconstructs the ids from the key without a second registry pass). A single
@@ -107,7 +107,7 @@ pub unsafe trait WorldQuery: Sized {
     /// Captures per-archetype state for iteration.
     ///
     /// `last_run` — the tick of the previous run (for `Changed<T>` filtering).
-    /// `this_run` — the current world tick; `Write<T>`/`MaybeWrite<T>` stamp it
+    /// `this_run` — the current world tick; `&mut T`/`MaybeWrite<T>` stamp it
     /// into the row's change-tick on `DerefMut` through the returned `Mut<T>`.
     ///
     /// # Safety
@@ -172,11 +172,11 @@ pub unsafe trait WorldQuery: Sized {
     }
 }
 
-// ── Mut<T> — smart-pointer for Write<T> (change detection) ──────
+// ── Mut<T> — smart-pointer for &mut T (change detection) ──────
 
 /// Mutable access to a component with automatic change-detection.
 ///
-/// Returned from `Query<Write<T>>`. On `DerefMut` it stamps the current world
+/// Returned from `Query<&mut T>`. On `DerefMut` it stamps the current world
 /// tick into the row's change-tick → `Changed<T>` reliably fires on ALL mutation
 /// paths (not only `World::get_mut`). Semantics as in Bevy `Mut<T>`: any mutable
 /// borrow marks the component changed, even if it was in fact only read — an
@@ -225,7 +225,7 @@ impl<T: std::fmt::Debug + 'static> std::fmt::Debug for Mut<'_, T> {
     }
 }
 
-/// Per-archetype state of `Write<T>`: base data pointer + pointer to the
+/// Per-archetype state of `&mut T`: base data pointer + pointer to the
 /// change-ticks array + current world tick.
 pub struct WriteState<T> {
     data: *mut T,
@@ -241,14 +241,41 @@ impl<T> Clone for WriteState<T> {
 }
 impl<T> Copy for WriteState<T> {}
 
-// ── Read<T> ────────────────────────────────────────────────────
+// ── &T / &mut T (the ADR-004 Р-5 canon; the sole single-component specifiers
+// since the pre-release removal of the `&T`/`&mut T` markers, wave P) ──
 
-pub struct Read<T: Component>(std::marker::PhantomData<T>);
+// ── ReadOnlyWorldQuery ─────────────────────────────────────────
 
-unsafe impl<T: Component> WorldQuery for Read<T> {
+/// Marker for query shapes that can never hand out mutable component access.
+///
+/// This is the type-level knob of the borrow model: `Query::new(&World)` (and
+/// every other shared-`&World` constructor) is only available for shapes that
+/// are read-only end to end, so safe code cannot obtain two aliasing `&mut T`
+/// through shared world borrows. Write shapes construct from `&mut World`
+/// ([`Query::new_mut`]) or through the scheduler's validated unsafe escape.
+///
+/// # Safety
+/// Implement only for shapes whose `Item` (and the items of every nested
+/// element) provides no mutable access to component data. `&mut T` and
+/// `MaybeWrite<T>` must NOT implement this.
+pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
+
+// SAFETY: items are shared references / entity ids / filter unit types.
+unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
+unsafe impl ReadOnlyWorldQuery for Entity {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for With<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Without<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Maybe<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
+unsafe impl<T: Component> ReadOnlyWorldQuery for Added<T> {}
+unsafe impl ReadOnlyWorldQuery for () {}
+
+/// `&T` as a query specifier (the read canon): yields `&T`, no change-tick
+/// bookkeeping — plain shared access to the component data.
+unsafe impl<'a, T: Component> WorldQuery for &'a T {
     type Item<'w> = &'w T;
     type State = *const T;
-    type ReadOnly = Read<T>;
+    type ReadOnly = &'a T;
 
     #[inline]
     fn component_count() -> usize {
@@ -286,20 +313,19 @@ unsafe impl<T: Component> WorldQuery for Read<T> {
     }
 }
 
-impl<T: Component + 'static> WorldQuerySystemAccess for Read<T> {
+impl<T: Component + 'static> WorldQuerySystemAccess for &T {
     fn system_access() -> AccessDescriptor {
         AccessDescriptor::new().read::<T>()
     }
 }
 
-// ── Write<T> ───────────────────────────────────────────────────
-
-pub struct Write<T: Component>(std::marker::PhantomData<T>);
-
-unsafe impl<T: Component> WorldQuery for Write<T> {
+/// `&mut T` as a query specifier (the write canon): yields [`Mut<T>`],
+/// stamping the change-tick on `DerefMut` — change detection is inherent to
+/// mutable access, there is no untracked mutable specifier.
+unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
     type Item<'w> = Mut<'w, T>;
     type State = WriteState<T>;
-    type ReadOnly = Read<T>;
+    type ReadOnly = &'a T;
 
     #[inline]
     fn component_count() -> usize {
@@ -348,111 +374,6 @@ unsafe impl<T: Component> WorldQuery for Write<T> {
             change_tick: state.ticks.add(row),
             this_run: state.this_run,
         })
-    }
-}
-
-impl<T: Component + 'static> WorldQuerySystemAccess for Write<T> {
-    fn system_access() -> AccessDescriptor {
-        AccessDescriptor::new().write::<T>()
-    }
-}
-
-// ── ReadOnlyWorldQuery ─────────────────────────────────────────
-
-/// Marker for query shapes that can never hand out mutable component access.
-///
-/// This is the type-level knob of the borrow model: `Query::new(&World)` (and
-/// every other shared-`&World` constructor) is only available for shapes that
-/// are read-only end to end, so safe code cannot obtain two aliasing `&mut T`
-/// through shared world borrows. Write shapes construct from `&mut World`
-/// ([`Query::new_mut`]) or through the scheduler's validated unsafe escape.
-///
-/// # Safety
-/// Implement only for shapes whose `Item` (and the items of every nested
-/// element) provides no mutable access to component data. `Write<T>`,
-/// `&mut T` and `MaybeWrite<T>` must NOT implement this.
-pub unsafe trait ReadOnlyWorldQuery: WorldQuery {}
-
-// SAFETY: items are shared references / entity ids / filter unit types.
-unsafe impl<T: Component> ReadOnlyWorldQuery for Read<T> {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for &T {}
-unsafe impl ReadOnlyWorldQuery for Entity {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for With<T> {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for Without<T> {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for Maybe<T> {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for Changed<T> {}
-unsafe impl<T: Component> ReadOnlyWorldQuery for Added<T> {}
-unsafe impl ReadOnlyWorldQuery for () {}
-
-/// `&T` as a query specifier (1:1 port from Bevy). Delegates to [`Read<T>`],
-/// yields `&T`.
-unsafe impl<'a, T: Component> WorldQuery for &'a T {
-    type Item<'w> = &'w T;
-    type State = <Read<T> as WorldQuery>::State;
-    type ReadOnly = &'a T;
-
-    #[inline]
-    fn component_count() -> usize {
-        <Read<T> as WorldQuery>::component_count()
-    }
-    fn fill_ids(world: &World, ids: &mut IdBuf) {
-        <Read<T> as WorldQuery>::fill_ids(world, ids)
-    }
-    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        <Read<T> as WorldQuery>::fill_cache_key(world, key)
-    }
-    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
-        <Read<T> as WorldQuery>::fill_data_access(world, out)
-    }
-    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
-        <Read<T> as WorldQuery>::matches_archetype(arch, ids)
-    }
-    #[inline]
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], lr: Tick, tr: Tick) -> Self::State {
-        <Read<T> as WorldQuery>::fetch_state(arch, ids, lr, tr)
-    }
-    #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
-        <Read<T> as WorldQuery>::fetch_item(state, row)
-    }
-}
-
-impl<T: Component + 'static> WorldQuerySystemAccess for &T {
-    fn system_access() -> AccessDescriptor {
-        AccessDescriptor::new().read::<T>()
-    }
-}
-
-/// `&mut T` as a query specifier (1:1 port from Bevy). Delegates to
-/// [`Write<T>`], yields [`Mut<T>`] (stamping the change-tick on `DerefMut`).
-unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
-    type Item<'w> = Mut<'w, T>;
-    type State = <Write<T> as WorldQuery>::State;
-    type ReadOnly = &'a T;
-
-    #[inline]
-    fn component_count() -> usize {
-        <Write<T> as WorldQuery>::component_count()
-    }
-    fn fill_ids(world: &World, ids: &mut IdBuf) {
-        <Write<T> as WorldQuery>::fill_ids(world, ids)
-    }
-    fn fill_cache_key(world: &World, key: &mut smallvec::SmallVec<[u64; 8]>) {
-        <Write<T> as WorldQuery>::fill_cache_key(world, key)
-    }
-    fn fill_data_access(world: &World, out: &mut smallvec::SmallVec<[(ComponentId, bool); 8]>) {
-        <Write<T> as WorldQuery>::fill_data_access(world, out)
-    }
-    fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
-        <Write<T> as WorldQuery>::matches_archetype(arch, ids)
-    }
-    #[inline]
-    unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], lr: Tick, tr: Tick) -> Self::State {
-        <Write<T> as WorldQuery>::fetch_state(arch, ids, lr, tr)
-    }
-    #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
-        <Write<T> as WorldQuery>::fetch_item(state, row)
     }
 }
 
@@ -607,13 +528,13 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Without<T> {
 
 /// Optional component — the analogue of `Option<&T>`.
 ///
-/// Unlike `Read<T>`, it does not require the component to be present.
+/// Unlike `&T`, it does not require the component to be present.
 /// Always iterates every entity: if the component is absent — returns `None`.
 ///
 /// # Example
 ///
 /// ```ignore
-/// Query::<(Read<A>, Maybe<B>)>::new(&world)
+/// Query::<(&A, Maybe<B>)>::new(&world)
 ///     .for_each(|entity, (a, b)| {
 ///         // a: &A — always present
 ///         // b: Option<&B> — may be None
@@ -996,7 +917,7 @@ impl<T: Component + 'static> WorldQuerySystemAccess for Added<T> {
 /// queries + a dedup-set (the pattern of the engine's extract systems).
 ///
 /// ```ignore
-/// Query::<(Read<A>, Read<B>, Or<(Changed<A>, Changed<B>)>)>::new(&world)
+/// Query::<(&A, &B, Or<(Changed<A>, Changed<B>)>)>::new(&world)
 ///     .for_each(|e, (a, b, _)| { /* A OR B changed */ });
 /// ```
 ///
@@ -1349,7 +1270,7 @@ impl<'s> StateSrc<'s> {
 
 /// C2: reject a query shape that borrows the same component's data mutably
 /// more than once (`(&mut T, &mut T)`) or both mutably and immutably
-/// (`(&T, &mut T)`, `(Read<T>, Write<T>)`). Such a shape would hand out
+/// (`(&T, &mut T)`, `(&T, &mut T)`). Such a shape would hand out
 /// aliasing references to one row on every iteration — undefined behavior
 /// reachable from entirely safe code. Mirrors Bevy, which panics on the same
 /// shapes. Runs once at construction over the (typically ≤ 8) declared
@@ -1387,7 +1308,7 @@ pub(crate) fn assert_no_self_alias<S: WorldQuery>(world: &World) {
 /// A component query. The second parameter is the FILTER (Bevy form):
 /// `Query<(&A, &mut B), (With<C>, Changed<A>)>` — data and filtering are split,
 /// the filter's item is not yielded. `F` defaults to `()`; the single-tuple form
-/// stays valid too (`Query<(Read<A>, With<C>)>` is equivalent).
+/// stays valid too (`Query<(&A, With<C>)>` is equivalent).
 ///
 /// The shape `(D, F)` runs in a single pass: `matches_archetype` is the AND of
 /// both, and the filter's `fetch_item` is dropped on output (leaving `D::Item`).
@@ -1413,7 +1334,7 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
 
     /// Read-only ad-hoc query over a shared world borrow.
     ///
-    /// Write shapes (`Write<T>`, `&mut T`, `MaybeWrite<T>`) do not satisfy
+    /// Write shapes (`&mut T`, `&mut T`, `MaybeWrite<T>`) do not satisfy
     /// [`ReadOnlyWorldQuery`]: construct those with [`Query::new_mut`] (the
     /// exclusive borrow proves no aliasing), or receive the query from the
     /// scheduler as a system parameter — cross-system exclusivity is validated
@@ -3447,7 +3368,7 @@ mod query_filter_tests {
 
         // With a filter (With<Boss>,): the item is data only; entity — via an
         // explicit query shape (P1).
-        let q = Query::<(Entity, Read<Hp>, Read<Mana>), (With<Boss>,)>::new(&world);
+        let q = Query::<(Entity, &Hp, &Mana), (With<Boss>,)>::new(&world);
         let got: Vec<(Entity, &Hp, &Mana)> = q.iter().collect();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].0, boss);
@@ -3455,18 +3376,18 @@ mod query_filter_tests {
         drop(q);
 
         // A single filter without a tuple works too.
-        let n = Query::<Read<Hp>, With<Boss>>::new(&world).iter().count();
+        let n = Query::<&Hp, With<Boss>>::new(&world).iter().count();
         assert_eq!(n, 1);
 
         // Changed in the filter: after advance — empty, after mutation — 1 again.
         world.advance_change_tick();
         let lr = world.last_run_tick();
-        let n = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+        let n = Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(n, 0);
         world.get_mut::<Hp>(boss).unwrap().0 += 1;
-        let n = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+        let n = Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr)
             .iter()
             .count();
         assert_eq!(n, 1);
@@ -3480,28 +3401,28 @@ mod query_filter_tests {
         world.spawn((Hp(1),));
         world.spawn((Hp(2),));
 
-        let q = Query::<Read<Hp>>::new(&world);
+        let q = Query::<&Hp>::new(&world);
         let mut sum = 0;
         for hp in &q {
             sum += hp.0;
         }
         assert_eq!(sum, 3);
 
-        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+        let mut q = Query::<&mut Hp>::new_mut(&mut world);
         for mut hp in &mut q {
             hp.0 *= 10;
         }
-        let total: u32 = Query::<Read<Hp>>::new(&world).iter().map(|hp| hp.0).sum();
+        let total: u32 = Query::<&Hp>::new(&world).iter().map(|hp| hp.0).sum();
         assert_eq!(total, 30);
 
         // Entity — via an explicit shape, as in Bevy:
-        let q = Query::<(Entity, Read<Hp>)>::new(&world);
+        let q = Query::<(Entity, &Hp)>::new(&world);
         let pairs: Vec<(Entity, &Hp)> = q.iter().collect();
         assert_eq!(pairs.len(), 2);
         assert!(pairs.iter().all(|(e, _)| world.is_alive(*e)));
     }
 
-    /// A2 regression: mutating through `Query<Write<T>>` stamps the row's
+    /// A2 regression: mutating through `Query<&mut T>` stamps the row's
     /// change-tick via a `*mut Tick` whose provenance is the `TickCell`
     /// interior — a write through a *shared* `&Column`. Under the pre-fix
     /// `Vec<Tick>` layout that write was undefined behavior (Miri Tree Borrows
@@ -3520,7 +3441,7 @@ mod query_filter_tests {
 
         // Nothing changed since the advance.
         assert_eq!(
-            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+            Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr)
                 .iter()
                 .count(),
             0
@@ -3529,25 +3450,25 @@ mod query_filter_tests {
         // Per-item Write path: `Mut::deref_mut` writes the tick through the
         // shared `&Column` via `ticks_ptr()`.
         {
-            let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+            let mut q = Query::<&mut Hp>::new_mut(&mut world);
             for mut hp in &mut q {
                 hp.0 += 100;
             }
         }
         assert_eq!(world.get::<Hp>(e), Some(&Hp(101)));
         assert_eq!(
-            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr)
+            Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr)
                 .iter()
                 .count(),
             2
         );
 
-        // Dense chunk path: `Write<T>::fetch_slices` calls `stamp_range` over
+        // Dense chunk path: `&mut T::fetch_slices` calls `stamp_range` over
         // the same cell buffer.
         world.advance_change_tick();
         let lr2 = world.last_run_tick();
         {
-            let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+            let mut q = Query::<&mut Hp>::new_mut(&mut world);
             q.for_each_chunk_mut(|_entities, hps: &mut [Hp]| {
                 for hp in hps {
                     hp.0 += 1;
@@ -3557,7 +3478,7 @@ mod query_filter_tests {
         assert_eq!(world.get::<Hp>(e), Some(&Hp(102)));
         assert_eq!(world.get::<Hp>(f), Some(&Hp(103)));
         assert_eq!(
-            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr2)
+            Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr2)
                 .iter()
                 .count(),
             2
@@ -3577,12 +3498,12 @@ mod query_filter_tests {
 
         // Aliasing shapes must panic.
         let ww = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, Write<Hp>)>::new_mut(&mut world);
+            let _ = Query::<(&mut Hp, &mut Hp)>::new_mut(&mut world);
         }));
         assert!(ww.is_err(), "write+write of same component must panic");
 
         let rw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Read<Hp>, Write<Hp>)>::new_mut(&mut world);
+            let _ = Query::<(&Hp, &mut Hp)>::new_mut(&mut world);
         }));
         assert!(rw.is_err(), "read+write of same component must panic");
 
@@ -3592,16 +3513,16 @@ mod query_filter_tests {
         assert!(refmut.is_err(), "&mut + &mut of same component must panic");
 
         let maybe_alias = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = Query::<(Write<Hp>, MaybeWrite<Hp>)>::new_mut(&mut world);
+            let _ = Query::<(&mut Hp, MaybeWrite<Hp>)>::new_mut(&mut world);
         }));
         assert!(maybe_alias.is_err(), "write + optional write of same component must panic");
 
         // Legal shapes must NOT panic (construction runs the check).
-        let _ = Query::<(Read<Hp>, Read<Hp>)>::new(&world); // shared + shared
-        let _ = Query::<(Write<Hp>, Write<Mana>)>::new_mut(&mut world); // distinct components
-        let _ = Query::<(Write<Hp>,), (With<Hp>,)>::new_mut(&mut world); // filter over written comp
-        let _ = Query::<Write<Hp>, Changed<Hp>>::new_mut(&mut world); // Changed filter is not a data borrow
-        let _ = Query::<(Write<Hp>, Maybe<Mana>)>::new_mut(&mut world); // write + optional distinct
+        let _ = Query::<(&Hp, &Hp)>::new(&world); // shared + shared
+        let _ = Query::<(&mut Hp, &mut Mana)>::new_mut(&mut world); // distinct components
+        let _ = Query::<(&mut Hp,), (With<Hp>,)>::new_mut(&mut world); // filter over written comp
+        let _ = Query::<&mut Hp, Changed<Hp>>::new_mut(&mut world); // Changed filter is not a data borrow
+        let _ = Query::<(&mut Hp, Maybe<Mana>)>::new_mut(&mut world); // write + optional distinct
     }
 
     /// A12: `len`/`is_empty` must honor per-row filters (and row ranges), not
@@ -3616,21 +3537,21 @@ mod query_filter_tests {
         let lr = world.last_run_tick();
 
         // Nothing changed since the advance → the Changed query is empty.
-        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        let q = Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr);
         assert_eq!(q.len(), 0, "no rows changed — len must be 0, not the archetype size");
         assert!(q.is_empty());
         drop(q);
 
         // Change exactly one row → len == 1.
         world.get_mut::<Hp>(e1).unwrap().0 += 10;
-        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        let q = Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr);
         assert_eq!(q.len(), 1);
         assert!(!q.is_empty());
         assert_eq!(q.iter().count(), 1, "len must agree with the actual iteration");
         drop(q);
 
         // Control: the unfiltered query still counts every row via the fast path.
-        assert_eq!(Query::<Read<Hp>>::new(&world).len(), 2);
+        assert_eq!(Query::<&Hp>::new(&world).len(), 2);
     }
 
     /// `single()` — Bevy parity: 0 → NoEntities, 1 → Ok, 2+ → MultipleEntities.
@@ -3638,19 +3559,19 @@ mod query_filter_tests {
     fn query_single() {
         let mut world = World::new();
         assert_eq!(
-            Query::<Read<Hp>>::new(&world).single().unwrap_err(),
+            Query::<&Hp>::new(&world).single().unwrap_err(),
             QuerySingleError::NoEntities
         );
 
         let e = world.spawn((Hp(42),));
         // Entity when needed — via the query shape (P1).
-        let q = Query::<(Entity, Read<Hp>)>::new(&world);
+        let q = Query::<(Entity, &Hp)>::new(&world);
         let (got_e, hp) = q.single().unwrap();
         assert_eq!((got_e, hp.0), (e, 42));
         drop(q);
 
         // single_mut: mutation through Mut<T>.
-        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+        let mut q = Query::<&mut Hp>::new_mut(&mut world);
         let mut hp = q.single_mut().unwrap();
         hp.0 = 7;
         drop(q);
@@ -3658,7 +3579,7 @@ mod query_filter_tests {
 
         world.spawn((Hp(1),));
         assert_eq!(
-            Query::<Read<Hp>>::new(&world).single().unwrap_err(),
+            Query::<&Hp>::new(&world).single().unwrap_err(),
             QuerySingleError::MultipleEntities
         );
     }
@@ -3671,7 +3592,7 @@ mod query_filter_tests {
         let boss = world.spawn((Hp(100), Boss));
         let mob = world.spawn((Hp(10),));
 
-        let q = Query::<Read<Hp>, With<Boss>>::new(&world);
+        let q = Query::<&Hp, With<Boss>>::new(&world);
         assert_eq!(q.get(boss), Some(&Hp(100)));
         assert_eq!(q.get(mob), None, "does not match the With<Boss> filter");
         drop(q);
@@ -3680,13 +3601,13 @@ mod query_filter_tests {
         world.advance_change_tick();
         let lr = world.last_run_tick();
         world.get_mut::<Hp>(mob).unwrap().0 += 1;
-        let q = Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr);
+        let q = Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr);
         assert_eq!(q.get(mob), Some(&Hp(11)));
         assert_eq!(q.get(boss), None, "boss did not change");
         drop(q);
 
         // get_mut: mutation through Mut<T>.
-        let mut q = Query::<Write<Hp>>::new_mut(&mut world);
+        let mut q = Query::<&mut Hp>::new_mut(&mut world);
         q.get_mut(boss).unwrap().0 = 1;
         drop(q);
         assert_eq!(world.get::<Hp>(boss), Some(&Hp(1)));
@@ -3701,7 +3622,7 @@ mod query_filter_tests {
         world.spawn((Hp(2),));
 
         let mut sum = 0;
-        Query::<Read<Hp>, With<Boss>>::new(&world).for_each_chunk(|_, hp| {
+        Query::<&Hp, With<Boss>>::new(&world).for_each_chunk(|_, hp| {
             sum += hp.iter().map(|h| h.0).sum::<u32>();
         });
         assert_eq!(sum, 1, "for_each_chunk respects the archetype filter");
@@ -3731,8 +3652,8 @@ mod tests {
         // Spawn an entity with only B
         let e3 = world.spawn((B,));
 
-        // Query<Read<A>, Without<B>> must return only e1
-        let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        // Query<&A, Without<B>> must return only e1
+        let query: Query<'_, '_, (Entity, &A, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
@@ -3740,8 +3661,8 @@ mod tests {
             "Without<B> must exclude entities with B"
         );
 
-        // Query<Read<B>, Without<A>> must return only e3
-        let query: Query<'_, '_, (Entity, Read<B>, Without<A>)> = Query::new(&world);
+        // Query<&B, Without<A>> must return only e3
+        let query: Query<'_, '_, (Entity, &B, Without<A>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
         assert_eq!(
             results,
@@ -3769,8 +3690,8 @@ mod tests {
             with_b.push(world.spawn((A, B)));
         }
 
-        // Query<Read<A>, Without<B>> — must get only entities with A and without B
-        let query: Query<'_, '_, (Entity, Read<A>, Without<B>)> = Query::new(&world);
+        // Query<&A, Without<B>> — must get only entities with A and without B
+        let query: Query<'_, '_, (Entity, &A, Without<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(e, _, _)| e).collect();
 
         assert_eq!(results.len(), 50, "There must be 50 entities with A and without B");
@@ -3786,7 +3707,7 @@ mod tests {
     }
     impl Component for Pos {}
 
-    /// C1: mutation through `Query<Write<T>>` must make `Changed<T>` reliable
+    /// C1: mutation through `Query<&mut T>` must make `Changed<T>` reliable
     /// (previously the change-tick was set only in `World::get_mut`).
     #[test]
     fn write_query_marks_changed() {
@@ -3799,9 +3720,9 @@ mod tests {
         let last_run = world.current_tick();
         world.tick();
 
-        // Mutate ONLY target through Query<Write<Pos>>.
+        // Mutate ONLY target through Query<&mut Pos>.
         {
-            let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
+            let mut q: Query<'_, '_, &mut Pos> = Query::new_mut(&mut world);
             q.for_each_mut(|e, mut p| {
                 if e == target {
                     p.x += 1.0;
@@ -3811,14 +3732,14 @@ mod tests {
 
         // Changed<Pos> relative to last_run must return exactly target.
         let changed: Vec<_> =
-            Query::<(Entity, crate::query::Changed<Pos>, Read<Pos>)>::new_with_tick(&world, last_run)
+            Query::<(Entity, crate::query::Changed<Pos>, &Pos)>::new_with_tick(&world, last_run)
                 .iter()
                 .map(|(e, _, _)| e)
                 .collect();
         assert_eq!(
             changed,
             vec![target],
-            "mutation through Query<Write<T>> must mark Changed<T>"
+            "mutation through Query<&mut T> must mark Changed<T>"
         );
     }
 
@@ -3847,10 +3768,10 @@ mod tests {
         let changed = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, lr)
             .iter()
             .count();
-        assert_eq!(changed, 1, "&mut T must mark Changed like Write<T>");
+        assert_eq!(changed, 1, "&mut T must mark Changed like &mut T");
     }
 
-    /// A pure read through `Write<T>` without `DerefMut` must NOT mark it changed
+    /// A pure read through `&mut T` without `DerefMut` must NOT mark it changed
     /// (the stamp happens only on a mutable dereference).
     #[test]
     fn write_query_read_only_no_change() {
@@ -3862,7 +3783,7 @@ mod tests {
         world.tick();
 
         {
-            let mut q: Query<'_, '_, Write<Pos>> = Query::new_mut(&mut world);
+            let mut q: Query<'_, '_, &mut Pos> = Query::new_mut(&mut world);
             let mut sink = 0.0;
             q.for_each_mut(|_, p| {
                 // Only Deref (read) — no DerefMut.
@@ -3874,7 +3795,7 @@ mod tests {
         let changed_count = Query::<crate::query::Changed<Pos>>::new_with_tick(&world, last_run)
             .iter()
             .count();
-        assert_eq!(changed_count, 0, "reading through Write<T> must not mark Changed");
+        assert_eq!(changed_count, 0, "reading through &mut T must not mark Changed");
     }
 
     #[test]
@@ -3902,7 +3823,7 @@ mod tests {
         world.spawn((A, B));
         world.spawn((A, B));
 
-        let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (&A, Maybe<B>)> = Query::new(&world);
         let count = query.iter().count();
         assert_eq!(count, 2, "There must be 2 entities with A");
     }
@@ -3915,7 +3836,7 @@ mod tests {
         world.spawn((A,));
         world.spawn((B,));
 
-        let query: Query<'_, '_, (Read<A>, Maybe<B>)> = Query::new(&world);
+        let query: Query<'_, '_, (&A, Maybe<B>)> = Query::new(&world);
         let results: Vec<_> = query.iter().map(|(_, b)| b.is_some()).collect();
 
         assert_eq!(results.len(), 2, "There must be 2 entities with A");
@@ -3932,7 +3853,7 @@ mod tests {
         world.spawn((A,));
 
         // Optional write: those that have B — double them
-        let mut query: Query<'_, '_, (Read<A>, MaybeWrite<B>)> = Query::new_mut(&mut world);
+        let mut query: Query<'_, '_, (&A, MaybeWrite<B>)> = Query::new_mut(&mut world);
         let results: Vec<_> = query
             .iter_mut()
             .map(|(_, b_opt)| b_opt.is_some())
@@ -3957,8 +3878,8 @@ mod tests {
         assert!(results[0].is_none(), "B must be None");
     }
 
-    /// W2 regression: (Maybe<X>, Read<A>) with an UNregistered X used to shift
-    /// the ids — Read<A> read the wrong segment and the query was falsely empty.
+    /// W2 regression: (Maybe<X>, &A) with an UNregistered X used to shift
+    /// the ids — &A read the wrong segment and the query was falsely empty.
     /// The INVALID sentinel preserves the alignment.
     #[test]
     fn maybe_unregistered_does_not_misalign_following_ids() {
@@ -3969,7 +3890,7 @@ mod tests {
         world.spawn((A,));
         world.spawn((A, B));
 
-        let query: Query<'_, '_, (Maybe<NeverRegistered>, Read<A>)> = Query::new(&world);
+        let query: Query<'_, '_, (Maybe<NeverRegistered>, &A)> = Query::new(&world);
         assert_eq!(
             query.iter().count(),
             2,
@@ -4005,7 +3926,7 @@ mod tests {
 
         let hits: Vec<_> = Query::<(
             Entity,
-            Read<Pos>,
+            &Pos,
             Or<(Changed<Pos>, Changed<Marker2>)>,
         )>::new_with_tick(&world, last_run)
         .iter()
@@ -4041,7 +3962,7 @@ mod tests {
             m.x = 9.0;
         }
 
-        let changed: Vec<_> = Query::<(Entity, Read<Pos>, Changed<Pos>)>::new_with_tick(
+        let changed: Vec<_> = Query::<(Entity, &Pos, Changed<Pos>)>::new_with_tick(
             &world, last_run,
         )
         .iter()
@@ -4065,7 +3986,7 @@ mod tests {
         let eb = world.spawn((Pos { x: 0.0 }, B));
         let none = world.spawn((Pos { x: 0.0 },));
 
-        let hits: Vec<_> = Query::<(Entity, Read<Pos>, Or<(With<A>, With<B>)>)>::new(&world)
+        let hits: Vec<_> = Query::<(Entity, &Pos, Or<(With<A>, With<B>)>)>::new(&world)
             .iter()
             .map(|(e, _, _)| e)
             .collect();
@@ -4086,7 +4007,7 @@ mod tests {
         let _e = world.spawn((Pos { x: 0.0 },));
 
         let hits: Vec<_> =
-            Query::<(Entity, Read<Pos>, Or<(With<NeverRegistered>, With<A>)>)>::new(&world)
+            Query::<(Entity, &Pos, Or<(With<NeverRegistered>, With<A>)>)>::new(&world)
                 .iter()
                 .map(|(e, _, _)| e)
                 .collect();
@@ -4582,7 +4503,7 @@ mod dyn_query_tests {
 
         // Nothing changed since `lr` yet.
         assert_eq!(
-            Query::<Read<Hp>, Changed<Hp>>::new_with_tick(&world, lr).iter().count(),
+            Query::<&Hp, Changed<Hp>>::new_with_tick(&world, lr).iter().count(),
             0
         );
 
@@ -4814,19 +4735,19 @@ mod dyn_query_tests {
         }
 
         // Exclusive `&mut self` write iteration mutates every row.
-        Query::<Write<Hp>>::new_mut(&mut world).for_each_mut(|_, mut hp| hp.0 += 100);
+        Query::<&mut Hp>::new_mut(&mut world).for_each_mut(|_, mut hp| hp.0 += 100);
         // `iter_mut` yields `Mut<T>` too (bump a second time via the iterator).
-        for mut hp in Query::<Write<Hp>>::new_mut(&mut world).iter_mut() {
+        for mut hp in Query::<&mut Hp>::new_mut(&mut world).iter_mut() {
             hp.0 += 1000;
         }
 
         // Read-only `&self` iteration observes the writes; sum is stable.
-        let sum: u32 = Query::<Read<Hp>>::new(&world).iter().map(|hp| hp.0).sum();
+        let sum: u32 = Query::<&Hp>::new(&world).iter().map(|hp| hp.0).sum();
         // Σ i + 8*(100+1000) = 28 + 8800.
         assert_eq!(sum, 28 + 8800);
 
         let mut via_for_each = 0u32;
-        Query::<Read<Hp>>::new(&world).for_each(|_, hp| via_for_each += hp.0);
+        Query::<&Hp>::new(&world).for_each(|_, hp| via_for_each += hp.0);
         assert_eq!(via_for_each, sum);
     }
 }

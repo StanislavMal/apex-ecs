@@ -22,7 +22,7 @@ pub struct E(pub f32);
 
 system! {
     fn sys_ab(
-        q: (Write<A>, Write<B>),
+        q: (&mut A, &mut B),
     ) {
         q.for_each_mut(|_, (mut a, mut b)| {
             std::mem::swap(&mut a.0, &mut b.0);
@@ -32,7 +32,7 @@ system! {
 
 system! {
     fn sys_cd(
-        q: (Write<C>, Write<D>),
+        q: (&mut C, &mut D),
     ) {
         q.for_each_mut(|_, (mut c, mut d)| {
             std::mem::swap(&mut c.0, &mut d.0);
@@ -42,7 +42,7 @@ system! {
 
 system! {
     fn sys_ce(
-        q: (Write<C>, Write<E>),
+        q: (&mut C, &mut E),
     ) {
         q.for_each_mut(|_, (mut c, mut e)| {
             std::mem::swap(&mut c.0, &mut e.0);

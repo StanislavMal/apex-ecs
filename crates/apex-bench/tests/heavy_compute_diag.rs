@@ -31,7 +31,7 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     // (1b) VIA for_each (the lazy-entity path that I changed).
     let mut count = 0u64;
     let mut bad = 0u64;
-    world.query::<Read<Matrix4<f32>>>().for_each(|_, m| {
+    world.query::<&Matrix4<f32>>().for_each(|_, m| {
         count += 1;
         if (m.determinant() - 1.0).abs() >= 1e-4 {
             bad += 1;
@@ -43,7 +43,7 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     // (2) par_for_each visits each entity EXACTLY once.
     let visits = AtomicU64::new(0);
     world
-        .query::<Read<Matrix4<f32>>>()
+        .query::<&Matrix4<f32>>()
         .par_for_each(|_, _| {
             visits.fetch_add(1, Ordering::Relaxed);
         });
@@ -65,12 +65,12 @@ fn heavy_compute_matrices_healthy_and_visited_once() {
     let sink = AtomicU64::new(0);
 
     let t = Instant::now();
-    world.query_mut::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
+    world.query_mut::<(&Matrix4<f32>, &mut apex_bench::Position)>()
         .for_each_mut(|_, (m, _p)| { sink.fetch_add(heavy(*m).to_bits() as u64, Ordering::Relaxed); });
     let seq = t.elapsed();
 
     let t = Instant::now();
-    world.query_mut::<(Read<Matrix4<f32>>, Write<apex_bench::Position>)>()
+    world.query_mut::<(&Matrix4<f32>, &mut apex_bench::Position)>()
         .par_for_each_mut(|_, (m, _p)| { sink.fetch_add(heavy(*m).to_bits() as u64, Ordering::Relaxed); });
     let par = t.elapsed();
 

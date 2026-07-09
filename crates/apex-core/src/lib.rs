@@ -117,7 +117,7 @@ pub use dense::DenseQuery;
 pub use query::{
     Added, ArchetypeFilter, Changed, DynItem, DynItemMut, DynIter, DynQuery, DynQueryError,
     DynQueryMut, Maybe, MaybeWrite, Mut, Or, Query, QueryBuilder, QueryBuilderMut, QueryIter,
-    QuerySingleError, Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
+    QuerySingleError, ReadOnlyWorldQuery, Single, With, Without, WorldQuery,
 };
 pub use registrar::WorldRegistrar;
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
@@ -155,7 +155,7 @@ pub mod prelude {
     pub use crate::impl_entity_template;
     pub use crate::query::{
         Added, ArchetypeFilter, Changed, Maybe, MaybeWrite, Mut, Or, Query, QuerySingleError,
-        Read, ReadOnlyWorldQuery, Single, With, Without, WorldQuery, Write,
+        ReadOnlyWorldQuery, Single, With, Without, WorldQuery,
     };
     pub use crate::relations::{ChildOf, Owns, RelationKind};
     pub use crate::system;

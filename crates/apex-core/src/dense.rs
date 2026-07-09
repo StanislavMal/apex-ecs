@@ -18,7 +18,7 @@
 use crate::{
     archetype::Archetype,
     component::{ComponentId, Tick},
-    query::{Maybe, MaybeWrite, Read, With, Without, WorldQuery, Write},
+    query::{Maybe, MaybeWrite, With, Without, WorldQuery},
 };
 use crate::component::Component;
 
@@ -51,9 +51,9 @@ pub trait DenseQuery: WorldQuery {
     ) -> Self::Slices<'w>;
 }
 
-// ── Read<T> / &T ───────────────────────────────────────────────
+// ── &T ────────────────────────────────────────────────────────
 
-impl<T: Component> DenseQuery for Read<T> {
+impl<T: Component> DenseQuery for &T {
     type Slices<'w> = &'w [T];
 
     #[inline]
@@ -71,24 +71,9 @@ impl<T: Component> DenseQuery for Read<T> {
     }
 }
 
-impl<T: Component> DenseQuery for &T {
-    type Slices<'w> = &'w [T];
+// ── &mut T ────────────────────────────────────────────────────
 
-    #[inline]
-    unsafe fn fetch_slices<'w>(
-        arch: &'w Archetype,
-        ids: &[ComponentId],
-        start: usize,
-        len: usize,
-        this_run: Tick,
-    ) -> &'w [T] {
-        <Read<T> as DenseQuery>::fetch_slices(arch, ids, start, len, this_run)
-    }
-}
-
-// ── Write<T> / &mut T ──────────────────────────────────────────
-
-impl<T: Component> DenseQuery for Write<T> {
+impl<T: Component> DenseQuery for &mut T {
     type Slices<'w> = &'w mut [T];
 
     #[inline]
@@ -105,21 +90,6 @@ impl<T: Component> DenseQuery for Write<T> {
         col.stamp_range(start, start + len, this_run);
         let ptr = col.get_ptr(start) as *mut T;
         std::slice::from_raw_parts_mut(ptr, len)
-    }
-}
-
-impl<T: Component> DenseQuery for &mut T {
-    type Slices<'w> = &'w mut [T];
-
-    #[inline]
-    unsafe fn fetch_slices<'w>(
-        arch: &'w Archetype,
-        ids: &[ComponentId],
-        start: usize,
-        len: usize,
-        this_run: Tick,
-    ) -> &'w mut [T] {
-        <Write<T> as DenseQuery>::fetch_slices(arch, ids, start, len, this_run)
     }
 }
 
@@ -230,7 +200,7 @@ impl_dense_query_tuple!(A, B, C, D, E, F, G, H);
 #[cfg(test)]
 mod tests {
     use crate::component::Component;
-    use crate::query::{Changed, Maybe, Query, Read, Write};
+    use crate::query::{Changed, Maybe, Query};
     use crate::world::World;
 
     #[derive(Debug, PartialEq)]
@@ -253,7 +223,7 @@ mod tests {
         }
 
         let mut total = 0usize;
-        Query::<(Read<V>, Write<P>)>::new_mut(&mut world).for_each_chunk_mut(|entities, (v, p)| {
+        Query::<(&V, &mut P)>::new_mut(&mut world).for_each_chunk_mut(|entities, (v, p)| {
             assert_eq!(entities.len(), v.len());
             assert_eq!(v.len(), p.len());
             for i in 0..p.len() {
@@ -265,7 +235,7 @@ mod tests {
 
         // Verify the actual write: P was incremented by V.
         let mut sum = 0.0;
-        Query::<Read<P>>::new(&world).for_each(|_, p| sum += p.0);
+        Query::<&P>::new(&world).for_each(|_, p| sum += p.0);
         let expected: f32 = (0..100).map(|i| i as f32 + 1.0).sum::<f32>()
             + (0..50).map(|i| i as f32 + 2.0).sum::<f32>();
         assert_eq!(sum, expected);
@@ -283,7 +253,7 @@ mod tests {
 
         // Take a slice for writing but write NOTHING — by the dense-write
         // contract the whole range still becomes changed.
-        Query::<Write<P>>::new_mut(&mut world).for_each_chunk_mut(|_, _p| {});
+        Query::<&mut P>::new_mut(&mut world).for_each_chunk_mut(|_, _p| {});
 
         let changed = Query::<Changed<P>>::new_with_tick(&world, last_run)
             .iter()
@@ -298,7 +268,7 @@ mod tests {
         world.spawn((P(2.0),));
 
         let mut seen = Vec::new();
-        Query::<(Read<P>, Maybe<V>)>::new(&world).for_each_chunk(|_, (p, v)| {
+        Query::<(&P, Maybe<V>)>::new(&world).for_each_chunk(|_, (p, v)| {
             seen.push((p.len(), v.is_some()));
         });
         seen.sort();
@@ -311,13 +281,13 @@ mod tests {
         for i in 0..10_000 {
             world.spawn((P(i as f32), V(1.0)));
         }
-        Query::<(Read<V>, Write<P>)>::new_mut(&mut world).par_for_each_chunk_mut(|_, (v, p)| {
+        Query::<(&V, &mut P)>::new_mut(&mut world).par_for_each_chunk_mut(|_, (v, p)| {
             for i in 0..p.len() {
                 p[i].0 += v[i].0;
             }
         });
         let mut sum = 0.0f64;
-        Query::<Read<P>>::new(&world).for_each(|_, p| sum += p.0 as f64);
+        Query::<&P>::new(&world).for_each(|_, p| sum += p.0 as f64);
         let expected: f64 = (0..10_000).map(|i| i as f64 + 1.0).sum();
         assert_eq!(sum, expected);
     }

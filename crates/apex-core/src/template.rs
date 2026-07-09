@@ -536,7 +536,6 @@ mod tests {
 
     #[test]
     fn template_in_commands() {
-        use crate::query::Read;
 
         let mut world = World::new();
         world.register_component::<Position>();
@@ -554,7 +553,7 @@ mod tests {
         commands.apply(&mut world);
 
         // There should be exactly one entity with Position
-        let query = world.query::<Read<Position>>();
+        let query = world.query::<&Position>();
         let mut count = 0;
         query.for_each(|_, _| count += 1);
         assert_eq!(count, 1);

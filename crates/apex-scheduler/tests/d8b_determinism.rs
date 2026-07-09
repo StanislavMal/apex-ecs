@@ -33,18 +33,18 @@ struct Made {
 // `non_query_side_effects` ⇒ never row-split) and runs as its own rayon task, so the
 // three spawn concurrently — the exact case a shared reserver makes non-deterministic.
 system! {
-    fn spawn_a(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Made { sys: 0, seed: s.0 },)); });
+    fn spawn_a(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Made { sys: 0, seed: s.0 },)); });
     }
 }
 system! {
-    fn spawn_b(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Made { sys: 1, seed: s.0 },)); });
+    fn spawn_b(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Made { sys: 1, seed: s.0 },)); });
     }
 }
 system! {
-    fn spawn_c(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Made { sys: 2, seed: s.0 },)); });
+    fn spawn_c(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Made { sys: 2, seed: s.0 },)); });
     }
 }
 
@@ -71,7 +71,7 @@ fn run_once() -> Vec<(u32, u32, u32)> {
     sched.run(&mut world);
 
     let mut out = Vec::new();
-    Query::<Read<Made>>::new(&world).for_each(|e, m| out.push((e.index(), m.sys, m.seed)));
+    Query::<&Made>::new(&world).for_each(|e, m| out.push((e.index(), m.sys, m.seed)));
     out.sort_unstable();
     out
 }
@@ -137,7 +137,7 @@ fn non_deterministic_mode_still_spawns_correctly() {
     sched.run(&mut world);
 
     let mut content: Vec<(u32, u32)> = Vec::new();
-    Query::<Read<Made>>::new(&world).for_each(|_, m| content.push((m.sys, m.seed)));
+    Query::<&Made>::new(&world).for_each(|_, m| content.push((m.sys, m.seed)));
     content.sort_unstable();
 
     let mut expected: Vec<(u32, u32)> = Vec::new();
@@ -172,7 +172,7 @@ fn run_spike(n: u32) -> (Vec<(u32, u32, u32)>, u64) {
     sched.run(&mut world);
 
     let mut out = Vec::new();
-    Query::<Read<Made>>::new(&world).for_each(|e, m| out.push((e.index(), m.sys, m.seed)));
+    Query::<&Made>::new(&world).for_each(|e, m| out.push((e.index(), m.sys, m.seed)));
     out.sort_unstable();
     (out, sched.deterministic_overflow_count())
 }
@@ -235,16 +235,16 @@ struct Child {
 // Each frame: spawn one Child per seed (Update). The seed set is stable, so the spawn
 // COUNT and content are identical every frame.
 system! {
-    fn churn_spawn(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Child { tag: s.0 },)); });
+    fn churn_spawn(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Child { tag: s.0 },)); });
     }
 }
 
 // Each frame BEFORE spawning (PreUpdate): despawn every Child from the previous frame,
 // freeing their slots back to the reuse pool.
 system! {
-    fn churn_despawn(q: Read<Child>, cmds: Cmd) {
-        q.for_each(|e, _| { cmds.despawn(e); });
+    fn churn_despawn(q: (&Child,), cmds: Cmd) {
+        q.for_each(|e, (_,)| { cmds.despawn(e); });
     }
 }
 
@@ -278,7 +278,7 @@ fn deterministic_reuse_under_churn_is_reproducible_and_bounded() {
         // Snapshot the surviving children: (entity index, tag), plus the max index.
         let mut snap: Vec<(u32, u32)> = Vec::new();
         let mut max_index = 0u32;
-        Query::<Read<Child>>::new(&world).for_each(|e, c| {
+        Query::<&Child>::new(&world).for_each(|e, c| {
             snap.push((e.index(), c.tag));
             max_index = max_index.max(e.index());
         });

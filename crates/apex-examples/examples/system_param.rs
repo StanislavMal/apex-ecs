@@ -148,17 +148,17 @@ fn test_query_param() {
     world.spawn((Position { x: 0.0, y: 0.0 }, Health { current: 100.0, max: 100.0 }));
 
     with_ctx(&mut world, |ctx| {
-        // Read<T> single
+        // &T single
         {
-            type P = QueryParam<Read<Position>>;
+            type P = QueryParam<&'static Position>;
             let q = ctx.fetch_unchecked::<P>();
             assert_eq!(q.iter().count(), 3);
-            println!("  Read<Position>: 3 entities");
+            println!("  &Position: 3 entities");
         }
 
         // (Read, Read, Read) — three components
         {
-            type P = QueryParam<(Read<Position>, Read<Velocity>, Read<Mass>)>;
+            type P = QueryParam<(&'static Position, &'static Velocity, &'static Mass)>;
             let q = ctx.fetch_unchecked::<P>();
             let mut count = 0;
             let mut vel_sum = (0.0f32, 0.0f32);
@@ -170,35 +170,35 @@ fn test_query_param() {
             assert_eq!(count, 2);
             assert!((vel_sum.0 - 10.0).abs() < 1e-6);
             assert!((vel_sum.1 - 12.0).abs() < 1e-6);
-            println!("  (Read<Pos>, Read<Vel>, Read<Mass>): 2 entities, vel_sum=({}, {})", vel_sum.0, vel_sum.1);
+            println!("  (&Pos, &Vel, &Mass): 2 entities, vel_sum=({}, {})", vel_sum.0, vel_sum.1);
         }
 
         // Read with a With filter
         {
-            type P = QueryParam<(Read<Position>, With<Mass>)>;
+            type P = QueryParam<(&'static Position, With<Mass>)>;
             let q = ctx.fetch_unchecked::<P>();
             let count = q.iter().count();
             assert_eq!(count, 2, "With<Mass> should filter down to 2 entities");
-            println!("  (Read<Pos>, With<Mass>): {} entities", count);
+            println!("  (&Pos, With<Mass>): {} entities", count);
 
             let access = P::access();
             assert!(!access.reads.is_empty());
             println!("  access(): reads components");
         }
 
-        // Write<T> — mutable access
+        // &mut T — mutable access
         {
-            type P = QueryParam<Write<Position>>;
+            type P = QueryParam<&'static mut Position>;
             let mut q = ctx.fetch_unchecked::<P>();
             let count = q.iter_mut().count();
             assert_eq!(count, 3);
             q.for_each_mut(|_, mut pos| { pos.x += 100.0; });
-            println!("  Write<Position>: {} entities mutated", count);
+            println!("  &mut Position: {} entities mutated", count);
         }
     });
 
     // Verify the mutation
-    let q = Query::<Read<Position>>::new(&world);
+    let q = Query::<&Position>::new(&world);
     let first = q.iter().next().unwrap();
     assert!((first.x - 101.0).abs() < 1e-6, "x should be 101.0 after mutation");
 
@@ -283,7 +283,7 @@ fn test_tuples() {
         {
             type P = (
                 ResRead<PhysicsConfig>,
-                QueryParam<(Read<Position>, Read<Velocity>)>,
+                QueryParam<(&'static Position, &'static Velocity)>,
                 Emit<CollisionEvent>,
             );
             let (cfg, q, mut writer) = ctx.fetch_unchecked::<P>();
@@ -305,7 +305,7 @@ fn test_tuples() {
             type P = (
                 ResRead<PhysicsConfig>,
                 ResWrite<FrameStats>,
-                QueryParam<Read<Position>>,
+                QueryParam<&'static Position>,
                 CommandsParam,
             );
             let (cfg, stats, q, _cmds) = ctx.fetch_unchecked::<P>();
@@ -339,7 +339,7 @@ fn test_inside_exclusive_system() {
         with_ctx(world, |ctx| {
             type Params = (
                 ResRead<PhysicsConfig>,
-                QueryParam<(Read<Position>, Read<Velocity>)>,
+                QueryParam<(&'static Position, &'static Velocity)>,
             );
             let (cfg, q) = ctx.fetch_unchecked::<Params>();
 
@@ -401,9 +401,9 @@ fn test_access_descriptors() {
 
     // QueryParam
     {
-        let a = <QueryParam<(Read<Position>, Write<Velocity>)> as SystemParam>::access();
-        assert!(!a.reads.is_empty(), "Read<Position> should be in reads");
-        assert!(!a.writes.is_empty(), "Write<Velocity> should be in writes");
+        let a = <QueryParam<(&Position, &mut Velocity)> as SystemParam>::access();
+        assert!(!a.reads.is_empty(), "&Position should be in reads");
+        assert!(!a.writes.is_empty(), "&mut Velocity should be in writes");
         println!("  QueryParam: {} reads, {} writes", a.reads.len(), a.writes.len());
     }
 

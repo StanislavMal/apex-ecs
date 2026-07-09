@@ -10,7 +10,7 @@
 //! ```ignore
 //! struct MovementSystem;
 //! impl AutoSystem for MovementSystem {
-//!     type Query = (Read<Velocity>, Write<Position>);
+//!     type Query = (&Velocity, &mut Position);
 //!     type Resources = ();
 //!     type Events = ();
 //!     fn run(&mut self, ctx: SystemContext<'_>) {
@@ -25,7 +25,7 @@
 //! ```ignore
 //! struct PhysicsSystem;
 //! impl AutoSystem for PhysicsSystem {
-//!     type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
+//!     type Query     = (&Mass, &mut Velocity, &mut Position);
 //!     type Resources = (ResRead<PhysicsConfig>, ResRead<DeltaTime>);
 //!     type Events    = Emit<CollisionEvent>;
 //!     fn run(&mut self, ctx: SystemContext<'_>) {
@@ -423,7 +423,7 @@ impl_event_access_list_tuple!(A, B, C, D, E, F, G, H);
 /// let dt = MyParam::fetch(&ctx);
 ///
 /// // A tuple: resource + query + events
-/// type MyParam = (ResRead<DeltaTime>, QueryParam<(Read<Vel>, Write<Pos>)>, Listen<CollisionEvent>);
+/// type MyParam = (ResRead<DeltaTime>, QueryParam<(&Vel, &mut Pos)>, Listen<CollisionEvent>);
 /// let (dt, q, events) = MyParam::fetch(&ctx);
 /// ```
 ///
@@ -528,7 +528,7 @@ impl<E: Send + Sync + 'static> SystemParam for Emit<E> {
 /// Marker: a component-query param via [`SystemParam`].
 ///
 /// ```ignore
-/// type MyParams = QueryParam<(Read<Position>, Write<Velocity>)>;
+/// type MyParams = QueryParam<(&Position, &mut Velocity)>;
 /// let q = MyParams::fetch(&ctx);
 /// q.for_each(|entity, (pos, vel)| { ... });
 /// ```
@@ -541,7 +541,7 @@ impl<Q: WorldQuery + WorldQuerySystemAccess> SystemParam for QueryParam<Q> {
         Q::system_access()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> crate::query::Query<'w, 'w, Q> {
-        // `query_unchecked`: `Q` may be mutable (`Write<T>`), which is sound here —
+        // `query_unchecked`: `Q` may be mutable (`&mut T`), which is sound here —
         // this IS the declared parameter, so the scheduler validated the access and
         // serializes conflicts (F3). The public `ctx.query` is read-only-bound.
         ctx.query_unchecked::<Q>()
@@ -822,7 +822,7 @@ impl_system_param_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
 
 /// An extension of WorldQuery — a static R/W access declaration for the scheduler.
 ///
-/// Implemented for Read<T>, Write<T>, With<T>, Without<T>, Changed<T>
+/// Implemented for &T, &mut T, With<T>, Without<T>, Changed<T>
 /// and tuples of them in query.rs.
 ///
 /// It is the basis for `AutoSystem::access()` — it lets the scheduler
@@ -841,12 +841,12 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 /// of forgetting to declare a component:
 ///
 /// ```ignore
-/// // BUG: Write<Position> is not listed — the scheduler does not see the conflict
+/// // BUG: &mut Position is not listed — the scheduler does not see the conflict
 /// fn access() -> AccessDescriptor {
 ///     AccessDescriptor::new().read::<Velocity>() // forgot write::<Position>()
 /// }
 /// fn run(&mut self, ctx: SystemContext<'_>) {
-///     ctx.for_each::<(Read<Velocity>, Write<Position>), _>(...)
+///     ctx.for_each::<(&Velocity, &mut Position), _>(...)
 ///     //                                        ^^^^^^^^^^^^^^^ we write, but did not declare it
 /// }
 /// ```
@@ -865,7 +865,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 /// // Components only
 /// struct MovementSystem;
 /// impl AutoSystem for MovementSystem {
-///     type Query = (Read<Velocity>, Write<Position>);
+///     type Query = (&Velocity, &mut Position);
 ///     fn run(&mut self, ctx: SystemContext<'_>) {
 ///         ctx.query::<Self::Query>().for_each(|_, (vel, pos)| {
 ///             pos.x += vel.x * 0.016;
@@ -876,7 +876,7 @@ pub trait WorldQuerySystemAccess: WorldQuery {
 /// // Components + resources + events
 /// struct PhysicsSystem;
 /// impl AutoSystem for PhysicsSystem {
-///     type Query     = (Read<Mass>, Write<Velocity>, Write<Position>);
+///     type Query     = (&Mass, &mut Velocity, &mut Position);
 ///     type Resources = ResRead<DeltaTime>;
 ///     type Events    = Emit<CollisionEvent>;
 ///     fn run(&mut self, ctx: SystemContext<'_>) {
@@ -965,7 +965,7 @@ where
 /// ```ignore
 /// system! {
 ///     fn extract_cameras(
-///         q: &Extract<QueryParam<(Read<Camera>, Read<GlobalTransform>)>>,
+///         q: &Extract<QueryParam<(&Camera, &GlobalTransform)>>,
 ///         out: &mut ExtractedCamera,
 ///     ) {
 ///         for (_, (cam, transform)) in q.iter() {

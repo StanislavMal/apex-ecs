@@ -16,7 +16,7 @@ pub struct ChangedIter {
     last_run: Tick,
     // Persistent QueryState (the idiomatic path = counterpart of bevy's stored QueryState) — the
     // archetype match is cached, not rebuilt every frame.
-    state: QueryState<(Changed<Data>, Read<Data>)>,
+    state: QueryState<(Changed<Data>, &'static Data)>,
 }
 
 impl Default for ChangedIter {

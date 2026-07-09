@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use apex_core::prelude::*;
-use apex_core::query::{Read, Write};
 
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 struct Value(u64);
@@ -50,7 +49,7 @@ fn par_for_each_visits_every_entity_exactly_once() {
 
     let seen = Mutex::new(HashSet::new());
     let sum = AtomicU64::new(0);
-    world.query::<Read<Value>>().par_for_each(|e, v| {
+    world.query::<&Value>().par_for_each(|e, v| {
         seen.lock().unwrap().insert(e);
         // If any entity were visited twice, the sum would exceed the closed form.
         sum.fetch_add(v.0, Ordering::Relaxed);
@@ -75,13 +74,13 @@ fn par_for_each_matches_sequential_iteration() {
 
     // Sequential reference.
     let mut seq = Vec::new();
-    world.query::<Read<Value>>().for_each(|_e, v| seq.push(v.0));
+    world.query::<&Value>().for_each(|_e, v| seq.push(v.0));
     seq.sort_unstable();
 
     // Parallel, then sort (order is nondeterministic).
     let par = Mutex::new(Vec::new());
     world
-        .query::<Read<Value>>()
+        .query::<&Value>()
         .par_for_each(|_e, v| par.lock().unwrap().push(v.0));
     let mut par = par.into_inner().unwrap();
     par.sort_unstable();
@@ -108,14 +107,14 @@ fn par_for_each_mut_increments_each_element_once() {
     }
 
     world
-        .query_mut::<Write<Counter>>()
+        .query_mut::<&mut Counter>()
         .par_for_each_mut(|_e, mut c| c.0 += 1);
 
     // Every counter must be exactly 1: no row processed twice (overlapping
     // ranges) and none skipped (gap in the split).
     let mut wrong = 0u64;
     let mut total = 0u64;
-    world.query::<Read<Counter>>().for_each(|_e, c| {
+    world.query::<&Counter>().for_each(|_e, c| {
         total += 1;
         if c.0 != 1 {
             wrong += 1;
@@ -133,7 +132,7 @@ fn par_for_each_chunk_covers_all_rows() {
 
     let sum = AtomicU64::new(0);
     let count = AtomicU64::new(0);
-    world.query::<Read<Value>>().par_for_each_chunk(|entities, values: &[Value]| {
+    world.query::<&Value>().par_for_each_chunk(|entities, values: &[Value]| {
         assert_eq!(entities.len(), values.len(), "entity and value slices align");
         for v in values {
             sum.fetch_add(v.0, Ordering::Relaxed);
@@ -164,7 +163,7 @@ fn par_for_each_chunk_mut_mutates_all_rows() {
     }
 
     world
-        .query_mut::<Write<Counter>>()
+        .query_mut::<&mut Counter>()
         .par_for_each_chunk_mut(|_entities, counters: &mut [Counter]| {
             for c in counters {
                 c.0 += 1;
@@ -172,7 +171,7 @@ fn par_for_each_chunk_mut_mutates_all_rows() {
         });
 
     let mut wrong = 0u64;
-    world.query::<Read<Counter>>().for_each(|_e, c| {
+    world.query::<&Counter>().for_each(|_e, c| {
         if c.0 != 1 {
             wrong += 1;
         }

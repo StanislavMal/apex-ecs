@@ -276,7 +276,7 @@ fn insert_target(cmd: &Command) -> Option<Entity> {
 /// # Example
 /// ```ignore
 /// let mut cmds = Commands::new();
-/// Query::<Read<Health>>::new(&world).for_each(|entity, health| {
+/// Query::<&Health>::new(&world).for_each(|entity, health| {
 ///     if health.current <= 0.0 {
 ///         cmds.despawn(entity);
 ///     }
@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(cmds.len(), 0);
 
         // Verify the entity was created with the component
-        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let query = crate::query::Query::<&Pos>::new(&world);
         let mut count = 0;
         query.for_each(|_, pos| {
             count += 1;
@@ -1166,7 +1166,7 @@ mod tests {
         cmds.spawn((Pos(3.0), Vel(4.0))); // full bundle up front — no chaining
         cmds.apply(&mut world);
         let mut count = 0;
-        crate::query::Query::<(crate::query::Read<Pos>, crate::query::Read<Vel>)>::new(&world)
+        crate::query::Query::<(&Pos, &Vel)>::new(&world)
             .for_each(|_, (p, v)| {
                 count += 1;
                 assert_eq!((p.0, v.0), (3.0, 4.0));
@@ -1371,7 +1371,7 @@ mod tests {
         cmds.spawn_template("test");
         cmds.apply(&mut world);
 
-        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let query = crate::query::Query::<&Pos>::new(&world);
         let mut count = 0;
         query.for_each(|_, pos| {
             count += 1;
@@ -1382,7 +1382,6 @@ mod tests {
 
     #[test]
     fn commands_spawn_from_template_with_params() {
-        use crate::query::Read;
         use crate::template::{EntityTemplate, TemplateParam, TemplateParams};
 
         struct ParamVal;
@@ -1410,7 +1409,7 @@ mod tests {
         cmds.spawn_template_with("param_test", TemplateParams::new().set::<ParamVal>(42.0f32));
         cmds.apply(&mut world);
 
-        let query = crate::query::Query::<Read<Pos>>::new(&world);
+        let query = crate::query::Query::<&Pos>::new(&world);
         let mut found = None;
         query.for_each(|_, pos| found = Some(pos.0));
         assert_eq!(found, Some(42.0));
@@ -1457,7 +1456,7 @@ mod tests {
         }
         cmds.apply(&mut world);
 
-        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let query = crate::query::Query::<&Pos>::new(&world);
         let mut values: Vec<f32> = Vec::new();
         query.for_each(|_, pos| values.push(pos.0));
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1485,7 +1484,7 @@ mod tests {
         cmds.apply(&mut world);
         assert_eq!(cmds.len(), 0);
 
-        let query = crate::query::Query::<crate::query::Read<Pos>>::new(&world);
+        let query = crate::query::Query::<&Pos>::new(&world);
         let count = query.iter().count();
         assert_eq!(count, 20);
     }

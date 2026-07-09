@@ -9,7 +9,6 @@
 //! modes (syntax error, runtime error).
 
 use apex_core::prelude::*;
-use apex_core::query::Read;
 use apex_scripting::{ScriptEngine, Scriptable, WorldScriptingExt};
 
 #[derive(Component, Clone, Copy, Debug, PartialEq, Scriptable)]
@@ -141,7 +140,7 @@ fn script_spawn_entity_creates_entity_with_components() {
 
     assert_eq!(world.entity_count(), 1, "the script spawned exactly one entity");
     let mut found = None;
-    world.query::<Read<Position>>().for_each(|_e, p| found = Some(*p));
+    world.query::<&Position>().for_each(|_e, p| found = Some(*p));
     assert_eq!(
         found,
         Some(Position { x: 3.0, y: 4.0 }),
@@ -317,9 +316,9 @@ fn set_active_selects_the_running_script() {
 
     // Only the active script ran: the spawned entity has Velocity, not Position.
     let mut pos_count = 0;
-    world.query::<Read<Position>>().for_each(|_e, _p| pos_count += 1);
+    world.query::<&Position>().for_each(|_e, _p| pos_count += 1);
     let mut vel_count = 0;
-    world.query::<Read<Velocity>>().for_each(|_e, _v| vel_count += 1);
+    world.query::<&Velocity>().for_each(|_e, _v| vel_count += 1);
     assert_eq!(pos_count, 0, "the inactive Position script must not have run");
     assert_eq!(vel_count, 1, "the active Velocity script must have run");
 

@@ -84,7 +84,7 @@ fn main() {
     println!("--- 1. Maybe<Health>: all entities with Position, Health optional ---");
 
     // A single pass over ALL entities with Position; Health is optional
-    let query = Query::<(Read<Position>, Maybe<Health>)>::new(&world);
+    let query = Query::<(&Position, Maybe<Health>)>::new(&world);
     query.for_each(|entity, (pos, hp_opt)| {
         match hp_opt {
             Some(hp) => println!(

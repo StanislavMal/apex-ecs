@@ -1223,7 +1223,7 @@ mod tests {
         world.add_relation(c2, ChildOf, parent);
 
         let mut seen: Vec<(Entity, f32)> = world
-            .query_relation::<ChildOf, crate::query::Read<Position>>(ChildOf, parent)
+            .query_relation::<ChildOf, &Position>(ChildOf, parent)
             .map(|(e, p)| (e, p.x))
             .collect();
         seen.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -1244,7 +1244,7 @@ mod tests {
         world.add_relation(c2, ChildOf, p2);
 
         let count = world
-            .query_wildcard::<ChildOf, crate::query::Read<Position>>(ChildOf)
+            .query_wildcard::<ChildOf, &Position>(ChildOf)
             .count();
         assert_eq!(count, 2);
     }

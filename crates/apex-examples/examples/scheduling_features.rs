@@ -112,7 +112,7 @@ fn check_s1(sched: &mut Scheduler, world: &mut World) {
 // .run_if_cond(conditions::any_with_component::<Player>()) — the scheduler sees read<Player>
 
 system! {
-    fn s2_system(q: (Read<Player>, Write<Pos>)) {
+    fn s2_system(q: (&Player, &mut Pos)) {
         q.for_each_mut(|_, (_, mut pos)| { pos.x += 1.0; });
         S2_CALLED.store(true, Ordering::SeqCst);
     }
@@ -275,7 +275,7 @@ fn check_s5a() {
     sched.add_systems(StageLabel::Update, (
         s5a_spawner,
         seq("reader", move |world: &mut World| {
-            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            let c = Query::<&Spawned>::new(world).iter().count();
             if c > 0 {
                 S5_SEEN.store(true, Ordering::SeqCst);
             }
@@ -325,7 +325,7 @@ fn check_s5b() {
     sched2.add_systems(StageLabel::Update, (
         sys("spawner_r", s5b_spawner),
         seq("reader_r", move |world: &mut World| {
-            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            let c = Query::<&Spawned>::new(world).iter().count();
             if c > 0 {
                 S5B_SEEN.store(true, Ordering::SeqCst);
             }
@@ -655,7 +655,7 @@ fn bench_run_if_overhead() {
             }
         }),
         seq("b4_read", move |world: &mut World| {
-            let c = Query::<Read<Spawned>>::new(world).iter().count();
+            let c = Query::<&Spawned>::new(world).iter().count();
             B4_COUNT.store(c, Ordering::Relaxed);
         }),
     ));

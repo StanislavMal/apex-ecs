@@ -5,10 +5,10 @@
 /// ```ignore
 /// system! {
 ///     fn movement_system(
-///         q: (Read<Velocity>, Write<Position>),
+///         q: (&Velocity, &mut Position),
 ///         keys: Res<Input<KeyCode>>,
 ///     ) {
-///         // Write query ⇒ mutable iteration: `iter_mut` / `for_each_mut`
+///         // A `&mut` element ⇒ mutable iteration: `iter_mut` / `for_each_mut`
 ///         // (`iter`/`for_each` are read-only; see `Query::iter`). `q` is
 ///         // already `mut`-bound by this macro.
 ///         for (vel, mut pos) in q.iter_mut() {
@@ -41,8 +41,8 @@
 ///
 /// | Parameter | Access type | Description |
 /// |----------|------------|----------|
-/// | `q: (Read<A>, Write<B>)` | Query (tuple) | Iterate over components |
-/// | `q: Read<A>` | Query (single) | Iterate over a single component |
+/// | `q: (&A, &mut B)` | Query (tuple) | Iterate over components (the macro adds the `'static` spelling the associated type needs) |
+/// | `q: (&A,)` | Query (single) | Iterate over a single component — a 1-tuple (bare `&A`/`&mut A` params are the resource trap below) |
 /// | `name: Res<T>` | ResRead\<T\> | Immutable resource (P2; `&T` — compile error: in Bevy `&T` = component) |
 /// | `name: ResMut<T>` | ResWrite\<T\> | Mutable resource (P2; `&mut T` — compile error) |
 /// | `name: &[E]` / `EventReader<E>` | Listen\<E\> | Read events |
@@ -73,13 +73,12 @@
 ///
 /// ```compile_fail
 /// use apex_core::system;
-/// use apex_core::query::Read;
 /// struct A;
 /// impl apex_core::component::Component for A {}
 /// struct B;
 /// impl apex_core::component::Component for B {}
 /// system! {
-///     fn two_queries(q1: (Read<A>,), q2: (Read<B>,)) {
+///     fn two_queries(q1: (&A,), q2: (&B,)) {
 ///         let _ = (q1, q2);
 ///     }
 /// }
@@ -266,6 +265,33 @@ macro_rules! __sys_has_deferred {
     };
 }
 
+/// Rewrites a comma-separated query-element list into the tuple type the
+/// lifetime-free `AutoSystem::Query` associated type needs: `&T` → `&'static T`,
+/// `&mut T` → `&'static mut T`, plain elements (`Entity`, `Maybe<T>`, filters)
+/// pass through. The `'static` is the canonical associated-type spelling — the
+/// borrow is re-bound to the world's lifetime at fetch via `WorldQuery::Item<'_>`.
+/// Always emits a real tuple (trailing comma), so a single element is a 1-tuple.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __q_static {
+    // ── @parse arms first: the entry arm below matches anything ──
+    (@parse [ $($out:tt)* ]) => { ( $($out)* ) };
+    (@parse [ $($out:tt)* ] & mut $ty:ty) => { ( $($out)* &'static mut $ty, ) };
+    (@parse [ $($out:tt)* ] & mut $ty:ty , $($rest:tt)*) => {
+        $crate::__q_static!(@parse [ $($out)* &'static mut $ty, ] $($rest)*)
+    };
+    (@parse [ $($out:tt)* ] & $ty:ty) => { ( $($out)* &'static $ty, ) };
+    (@parse [ $($out:tt)* ] & $ty:ty , $($rest:tt)*) => {
+        $crate::__q_static!(@parse [ $($out)* &'static $ty, ] $($rest)*)
+    };
+    (@parse [ $($out:tt)* ] $ty:ty) => { ( $($out)* $ty, ) };
+    (@parse [ $($out:tt)* ] $ty:ty , $($rest:tt)*) => {
+        $crate::__q_static!(@parse [ $($out)* $ty, ] $($rest)*)
+    };
+    // Entry.
+    ( $($input:tt)* ) => { $crate::__q_static!(@parse [] $($input)*) };
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __sys_compile_error {
@@ -275,8 +301,8 @@ macro_rules! __sys_compile_error {
             stringify!($first),
             "\"\n\n\
             Expected one of:\n  \
-            - q: (Read<A>, Write<B>) — query (tuple)\n  \
-            - q: Read<A>             — query (single)\n  \
+            - q: (&A, &mut B)        — query (tuple)\n  \
+            - q: (&A,)               — query (single component, a 1-tuple)\n  \
             - name: Res<T>           — resource read\n  \
             - name: ResMut<T>        — resource write\n  \
             - name: &[E]             — event reader\n  \
@@ -307,7 +333,7 @@ macro_rules! __system_impl {
     } => {
         $crate::__emit_struct! { [ $( $struct_tokens )* ] $fn_name }
         impl $crate::AutoSystem for $fn_name {
-            type Query = ( $( $($q)+ ),* );
+            type Query = $crate::__q_static!( $( $($q)+ ),* );
             type Resources = ( $( $($r)+ ),* );
             type Events = ( $( $($e)+ ),* );
             $crate::__sys_whole_world!([ $( $whole )* ]);
@@ -481,7 +507,8 @@ macro_rules! __system_impl {
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
         "` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
          Use `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
-         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`."
+         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`;\n\
+         a single-component query — a 1-tuple: `q: (&mut ", stringify!($ty), ",)`."
     )); };
 
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
@@ -495,7 +522,7 @@ macro_rules! __system_impl {
         "` — `&T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
          Use `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
          Event reading — `name: &[E]` or `name: EventReader<E>`;\n\
-         components — inside a query: `q: (Read<", stringify!($ty), ">, …)`."
+         components — inside a query (a 1-tuple for one component): `q: (&", stringify!($ty), ",)`."
     )); };
 
     // Commands
@@ -665,7 +692,8 @@ macro_rules! __system_impl {
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
         "` — `&mut T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
          Use `", stringify!($pname), ": ResMut<", stringify!($ty), ">`.\n\
-         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`."
+         Event writing — `name: &mut Vec<E>` or `name: EventWriter<E>`;\n\
+         a single-component query — a 1-tuple: `q: (&mut ", stringify!($ty), ",)`."
     )); };
 
     { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
@@ -679,7 +707,7 @@ macro_rules! __system_impl {
         "` — `&T` no longer denotes a resource (Bevy-semantics trap, P2).\n\
          Use `", stringify!($pname), ": Res<", stringify!($ty), ">`.\n\
          Event reading — `name: &[E]` or `name: EventReader<E>`;\n\
-         components — inside a query: `q: (Read<", stringify!($ty), ">, …)`."
+         components — inside a query (a 1-tuple for one component): `q: (&", stringify!($ty), ",)`."
     )); };
 
     // Commands (last)

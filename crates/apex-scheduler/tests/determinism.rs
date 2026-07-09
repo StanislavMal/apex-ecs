@@ -16,7 +16,6 @@
 //! by allocation strategy), this asserts the strong guarantee: identical ENTITY IDS too.
 
 use apex_core::prelude::*;
-use apex_core::query::Read;
 use apex_core::world::ChunkConfig;
 use apex_core::{system, World};
 use apex_macros::Component;
@@ -48,8 +47,8 @@ struct Spawned {
 /// match only if the deterministic id assignment is reproduced exactly.
 fn snapshot(world: &World) -> Vec<(u32, u8, u32, u32)> {
     let mut out = Vec::new();
-    Query::<Read<Tag>>::new(world).for_each(|e, t| out.push((e.index(), 0u8, t.sys, t.val)));
-    Query::<Read<Live>>::new(world).for_each(|e, l| out.push((e.index(), 1u8, l.0, 0)));
+    Query::<&Tag>::new(world).for_each(|e, t| out.push((e.index(), 0u8, t.sys, t.val)));
+    Query::<&Live>::new(world).for_each(|e, l| out.push((e.index(), 1u8, l.0, 0)));
     out.sort_unstable();
     out
 }
@@ -102,37 +101,37 @@ fn assert_run_to_run_deterministic(
 // exact case a shared reserver makes non-deterministic (each is single-task, its own
 // rayon task).
 system! {
-    fn spawn_a(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Tag { sys: 0, val: s.0 },)); });
+    fn spawn_a(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Tag { sys: 0, val: s.0 },)); });
     }
 }
 system! {
-    fn spawn_b(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Tag { sys: 1, val: s.0 },)); });
+    fn spawn_b(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Tag { sys: 1, val: s.0 },)); });
     }
 }
 system! {
-    fn spawn_c(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Tag { sys: 2, val: s.0 },)); });
+    fn spawn_c(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Tag { sys: 2, val: s.0 },)); });
     }
 }
 
 // Churn: PreUpdate despawns last frame's Live children; Update respawns one per seed.
 system! {
-    fn churn_despawn(q: Read<Live>, cmds: Cmd) {
-        q.for_each(|e, _| { cmds.despawn(e); });
+    fn churn_despawn(q: (&Live,), cmds: Cmd) {
+        q.for_each(|e, (_,)| { cmds.despawn(e); });
     }
 }
 system! {
-    fn churn_spawn(seeds: Read<Seed>, cmds: Cmd) {
-        seeds.for_each(|_, s| { cmds.spawn((Live(s.0),)); });
+    fn churn_spawn(seeds: (&Seed,), cmds: Cmd) {
+        seeds.for_each(|_, (s,)| { cmds.spawn((Live(s.0),)); });
     }
 }
 
 // Event-driven spawn: a producer emits N events; a consumer spawns one child per event.
 system! {
-    fn emit_spawns(seeds: Read<Seed>, writer: &mut Vec<Spawned>) {
-        seeds.for_each(|_, s| { writer.send(Spawned { val: s.0 }); });
+    fn emit_spawns(seeds: (&Seed,), writer: &mut Vec<Spawned>) {
+        seeds.for_each(|_, (s,)| { writer.send(Spawned { val: s.0 }); });
     }
 }
 system! {

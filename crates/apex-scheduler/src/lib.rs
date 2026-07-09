@@ -7,7 +7,7 @@
 //! ```ignore
 //! struct MovementSystem;
 //! impl AutoSystem for MovementSystem {
-//!     type Query = (Read<Velocity>, Write<Position>);
+//!     type Query = (&Velocity, &mut Position);
 //!     fn run(&mut self, ctx: SystemContext<'_>) {
 //!         ctx.for_each::<Self::Query, _>(|(vel, pos)| {
 //!             pos.x += vel.x;

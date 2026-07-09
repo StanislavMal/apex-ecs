@@ -23,7 +23,7 @@ pub struct Data(pub f32);
 // match is computed once, not on every call.
 pub struct FragIter {
     world: World,
-    state: QueryState<Write<Data>>,
+    state: QueryState<&'static mut Data>,
 }
 
 macro_rules! spawn_batches {

@@ -88,7 +88,7 @@ impl ParSkew {
     /// uniform / ~2-3% skew) is archived in the plan; this monitors regressions.
     pub fn run(&mut self) {
         self.world
-            .query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
+            .query_mut::<(&Matrix4<f32>, &mut Position)>()
             .par_for_each_mut(|_, (mat, mut pos)| Self::heavy(mat, &mut pos));
     }
 }

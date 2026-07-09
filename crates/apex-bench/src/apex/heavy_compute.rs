@@ -34,7 +34,7 @@ impl HeavyCompute {
         // arithmetic ~100× slower → a nondeterministic death-spiral). Reading a healthy seed
         // on every iteration makes the bench deterministic and fair for all engines; the load
         // (100 inversions per entity + position write) is preserved. unwrap_or — a safeguard.
-        self.world.query_mut::<(Read<Matrix4<f32>>, Write<Position>)>()
+        self.world.query_mut::<(&Matrix4<f32>, &mut Position)>()
             .par_for_each_mut(|_, (mat, mut pos)| {
                 let mut m = *mat;
                 for _ in 0..100 {

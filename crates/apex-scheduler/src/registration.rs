@@ -416,7 +416,7 @@ impl Scheduler {
     ///     "physics",
     ///     access_desc!(read<Vel>, write<Pos>),
     ///     |ctx| {
-    ///         ctx.query_unchecked::<(Read<Vel>, Write<Pos>)>().for_each(|_, (v, mut p)| {
+    ///         ctx.query_unchecked::<(&Vel, &mut Pos)>().for_each(|_, (v, mut p)| {
     ///             p.x += v.x;
     ///         });
     ///     },

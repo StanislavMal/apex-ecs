@@ -17,7 +17,7 @@ pub struct E(pub f32);
 
 pub struct WideIter {
     world: World,
-    state: QueryState<(Read<B>, Read<C>, Read<D>, Read<E>, Write<A>)>,
+    state: QueryState<(&'static B, &'static C, &'static D, &'static E, &'static mut A)>,
 }
 
 impl Default for WideIter {

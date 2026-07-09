@@ -77,7 +77,7 @@ struct DamageEvent { target: Entity, amount: f32 }
 
 system! {
     fn movement_reader_system(
-        q: (Read<Position>, Read<Velocity>),
+        q: (&Position, &Velocity),
         dt: Res<DeltaTime>,
     ) {
         let mut sum = 0.0f32;
@@ -90,10 +90,10 @@ system! {
 
 system! {
     fn health_reader_system(
-        q: Read<Health>,
+        q: (&Health,),
     ) {
         let mut dead = 0u32;
-        q.for_each(|_, hp| {
+        q.for_each(|_, (hp,)| {
             if hp.current <= 0.0 { dead += 1; }
         });
         std::hint::black_box(dead);
@@ -102,7 +102,7 @@ system! {
 
 system! {
     fn physics_reader_system(
-        q: (Read<Mass>, Read<Acceleration>),
+        q: (&Mass, &Acceleration),
         g: Res<Gravity>,
     ) {
         let mut force_sum = 0.0f32;
@@ -115,7 +115,7 @@ system! {
 
 system! {
     fn movement_writer_system(
-        q: (Write<Position>, Read<Velocity>),
+        q: (&mut Position, &Velocity),
         dt: Res<DeltaTime>,
     ) {
         q.for_each_mut(|_, (mut pos, vel)| {
@@ -128,7 +128,7 @@ system! {
 
 system! {
     fn movement_writer_system2(
-        q: (Write<Position>, Read<Acceleration>),
+        q: (&mut Position, &Acceleration),
         dt: Res<DeltaTime>,
     ) {
         q.for_each_mut(|_, (mut pos, acc)| {
@@ -140,7 +140,7 @@ system! {
 
 system! {
     fn health_writer_system(
-        q: (Write<Health>, Read<Damage>),
+        q: (&mut Health, &Damage),
         writer: &mut Vec<DamageEvent>,
     ) {
         let n = q.len();
@@ -156,7 +156,7 @@ system! {
 
 system! {
     fn damage_listener_system(
-        q: Read<Health>,
+        q: (&Health,),
         reader: &[DamageEvent],
     ) {
         let count = reader.iter().len() as u32;
@@ -166,19 +166,19 @@ system! {
 
 system! {
     fn counter_writer_system(
-        q: Read<Health>,
+        q: (&Health,),
         counter: ResMut<GlobalCounter>,
     ) {
-        q.for_each(|_, _| { counter.0 += 1; });
+        q.for_each(|_, (_,)| { counter.0 += 1; });
     }
 }
 
 system! {
     fn cooldown_system(
-        q: Write<Cooldown>,
+        q: (&mut Cooldown,),
         dt: Res<DeltaTime>,
     ) {
-        q.for_each_mut(|_, mut cd| {
+        q.for_each_mut(|_, (mut cd,)| {
             if cd.0 > 0.0 { cd.0 -= dt.0; }
         });
     }
@@ -201,7 +201,7 @@ fn register_par_for_each_demo(sched: &mut Scheduler) {
             "demo_intra_par",
             access_desc!(write<Position>, read<Velocity>).par_for_each_used(),
             |ctx| {
-                ctx.query_unchecked::<(Read<Velocity>, Write<Position>)>()
+                ctx.query_unchecked::<(&Velocity, &mut Position)>()
                     .par_for_each_mut(|_, (vel, mut pos)| {
                         pos.x += vel.x * 0.016;
                         pos.y += vel.y * 0.016;
