@@ -1851,7 +1851,7 @@ system! {
 // Ручная реализация (для понимания):
 struct MovementSystem;
 impl AutoSystem for MovementSystem {
-    type Query = (&Velocity, &mut Position);
+    type Query = (&'static Velocity, &'static mut Position);
     type Resources = ();
     type Events = ();
     // HAS_DEFERRED = false по умолчанию — система не использует Commands
@@ -1922,7 +1922,7 @@ sched.add_systems(StageLabel::Update, physics_system);
 // Ручная реализация:
 struct OrbitalSystem;
 impl AutoSystem for OrbitalSystem {
-    type Query = (&Position, &mut Velocity, &Mass, Maybe<Orbits>);
+    type Query = (&'static Position, &'static mut Velocity, &'static Mass, Maybe<Orbits>);
     type Resources = ResRead<SpaceSettings>;
     type Events = ();
     /// Гравитация собирает позиции ВСЕХ тел — ASD-чанкование запрещено.
@@ -2181,6 +2181,13 @@ sched.add_systems(StageLabel::Update, (
     sys("gravity", GravitySystem),
     sys("physics", PhysicsSystem),
 ));
+
+// Способ 0: ТИПИЗИРОВАННЫЕ цели на конфиге (golden path) — цель = сама
+// система (fn-item или AutoSystem-значение), имя ребра выводится из ТИПА:
+// опечатка ломает компиляцию, а не молча теряет ребро. Работает для систем,
+// зарегистрированных под своим типовым именем (bare add_systems); для
+// переименованных `sys("имя", …)`-регистраций цель остаётся строкой.
+sched.add_systems(StageLabel::Update, (GravitySystem, PhysicsSystem.after(GravitySystem)));
 
 // Способ 1: .chain() — цепочка систем (рекомендуется)
 sched.chain(&["gravity", "physics"]).unwrap();

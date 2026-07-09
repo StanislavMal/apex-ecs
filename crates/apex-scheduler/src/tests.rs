@@ -1424,6 +1424,48 @@
         );
     }
 
+    /// TYPED order targets (TD-118): `.after(system_value)` derives the edge
+    /// name from the target's TYPE — the same name registration uses — so the
+    /// edge cannot drift from a rename the way a string literal can. Covers a
+    /// plain-fn target and an `AutoSystem` target; string targets stay valid
+    /// (the dynamic editor/script path, ADR-004 Р-3).
+    #[test]
+    fn config_typed_order_targets() {
+        use crate::config::IntoScheduleConfigs;
+
+        fn tick(_q: Query<&Pos>) {}
+
+        struct AutoTick;
+        impl AutoSystem for AutoTick {
+            type Query = ();
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, _: SystemContext<'_>) {}
+            fn name() -> &'static str {
+                "AutoTick"
+            }
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_systems(
+            StageLabel::Update,
+            (
+                tick,
+                AutoTick.after(tick),
+                par("c", |_: SystemContext<'_>| {}).after(AutoTick),
+            ),
+        );
+        sched.compile().unwrap();
+        assert!(
+            stage_of(&sched, "tick") < stage_of(&sched, "AutoTick"),
+            ".after(tick) — the fn-item target must resolve to the registered name"
+        );
+        assert!(
+            stage_of(&sched, "AutoTick") < stage_of(&sched, "c"),
+            ".after(AutoTick) — the AutoSystem target must resolve to AutoSystem::name()"
+        );
+    }
+
     /// `.before("x")` accepts a FORWARD reference (target registered later in the
     /// same tuple) — name resolution is deferred to compile().
     #[test]

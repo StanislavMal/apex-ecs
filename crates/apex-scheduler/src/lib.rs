@@ -67,7 +67,8 @@ pub mod stage;
 
 pub use config::{
     par, par_access, seq, sys, AutoMarker, ConfigMarker, ExclusiveMarker, FnSystemExt,
-    FnSystemMarker, IntoScheduleConfigs, ScheduleConfigs, ScheduleConfigsMarker, SystemConfig,
+    FnSystemMarker, IntoScheduleConfigs, OrderTarget, ScheduleConfigs, ScheduleConfigsMarker,
+    SystemConfig,
 };
 pub mod fixed;
 pub use fixed::FixedTime;
@@ -81,7 +82,8 @@ pub use states::{in_state, init_state, on_enter, on_exit, NextState, State, Stat
 /// `SystemConfig`), run conditions/states, and the fixed-timestep clock.
 pub mod prelude {
     pub use crate::config::{
-        par, par_access, seq, sys, IntoScheduleConfigs, ScheduleConfigs, SystemConfig,
+        par, par_access, seq, sys, IntoScheduleConfigs, OrderTarget, ScheduleConfigs,
+        SystemConfig,
     };
     pub use crate::fixed::FixedTime;
     pub use crate::stage::{Stage, StageLabel};

@@ -372,13 +372,57 @@ impl ScheduleConfigs {
     }
 }
 
+/// A target for [`IntoScheduleConfigs::before`]/[`IntoScheduleConfigs::after`]:
+/// either the SYSTEM itself (the typed golden path — typo-proof and
+/// rename-safe: the target name is derived from the value's type, exactly the
+/// name the scheduler registers) or a system NAME (`&str`/`String` — the
+/// dynamic path for editor/scripts, ADR-004 Р-3). The `Marker` parameter only
+/// disambiguates the blanket impls; call sites never name it.
+pub trait OrderTarget<Marker> {
+    /// The registered-name string this target resolves to at `compile()`.
+    fn order_target_name(self) -> String;
+}
+
+#[doc(hidden)]
+pub struct NameTarget;
+#[doc(hidden)]
+pub struct FnTarget;
+#[doc(hidden)]
+pub struct AutoTarget;
+
+impl OrderTarget<NameTarget> for String {
+    fn order_target_name(self) -> String {
+        self
+    }
+}
+impl OrderTarget<NameTarget> for &str {
+    fn order_target_name(self) -> String {
+        self.to_string()
+    }
+}
+/// Typed: a plain-fn system — the same `short_system_name` the registration
+/// derives (`config.rs`), so the edge cannot drift from the actual name.
+impl<Marker, F: apex_core::SystemParamFunction<Marker>> OrderTarget<(FnTarget, Marker)> for F {
+    fn order_target_name(self) -> String {
+        apex_core::short_system_name::<F>().to_string()
+    }
+}
+/// Typed: an [`AutoSystem`](apex_core::AutoSystem) (struct / `system!`-macro
+/// systems) — `AutoSystem::name()`, the registered name.
+impl<S: apex_core::AutoSystem> OrderTarget<AutoTarget> for S {
+    fn order_target_name(self) -> String {
+        S::name().to_string()
+    }
+}
+
 /// Conversion of systems/tuples into [`ScheduleConfigs`] — the single entry
 /// point for `add_systems`.
 ///
 /// Implemented for `SystemConfig`, bare `AutoSystem`/`ExclusiveSystem`/plain-fn
 /// systems, [`ScheduleConfigs`], and tuples of up to 12 elements. The ordering
 /// methods (`before`/`after`/`chain`) are the golden path for declaring
-/// dependencies directly on the configs (Bevy idiom); the string-based
+/// dependencies directly on the configs (Bevy idiom); targets are TYPED
+/// (`.after(other_system)`) or names; the string-based
 /// `Scheduler::before/after/chain` remains for DYNAMIC ordering by name
 /// (editor/scripts).
 pub trait IntoScheduleConfigs<M>: Sized {
@@ -386,11 +430,11 @@ pub trait IntoScheduleConfigs<M>: Sized {
     fn into_configs(self) -> ScheduleConfigs;
 
     /// Declare that THIS system (or all systems of the group) run BEFORE the
-    /// system named `name`. The name is resolved at `compile()` (forward
-    /// references allowed).
-    fn before(self, name: impl Into<String>) -> ScheduleConfigs {
+    /// target system — the system value itself (typed, typo-proof) or its
+    /// name. Resolved at `compile()` (forward references allowed).
+    fn before<TM>(self, target: impl OrderTarget<TM>) -> ScheduleConfigs {
         let mut c = self.into_configs();
-        let name = name.into();
+        let name = target.order_target_name();
         for cfg in &mut c.configs {
             cfg.before_names.push(name.clone());
         }
@@ -398,10 +442,11 @@ pub trait IntoScheduleConfigs<M>: Sized {
     }
 
     /// Declare that THIS system (or all systems of the group) run AFTER the
-    /// system named `name`. The name is resolved at `compile()`.
-    fn after(self, name: impl Into<String>) -> ScheduleConfigs {
+    /// target system (the system value itself, or its name). Resolved at
+    /// `compile()`.
+    fn after<TM>(self, target: impl OrderTarget<TM>) -> ScheduleConfigs {
         let mut c = self.into_configs();
-        let name = name.into();
+        let name = target.order_target_name();
         for cfg in &mut c.configs {
             cfg.after_names.push(name.clone());
         }
