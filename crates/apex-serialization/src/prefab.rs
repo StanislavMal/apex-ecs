@@ -237,6 +237,11 @@ impl PrefabLoader {
     /// `instantiate` with a **(de)serialization context** (TD-44): prefab components with external refs
     /// (asset Handle, etc.) resolve them through `ctx` — consistently with snapshots. The context is
     /// threaded through the whole hierarchy. Ordinary components ignore `ctx`.
+    ///
+    /// **Atomic:** on any error (unregistered component, missing sub-prefab, cycle, depth) every
+    /// entity spawned so far is despawned before the error returns — a failed instantiation must not
+    /// leave a partial hierarchy in the world (the editor observed orphaned sub-tree fragments from
+    /// exactly such a midway failure).
     #[allow(clippy::too_many_arguments)]
     pub fn instantiate_with(
         &self,
@@ -248,7 +253,19 @@ impl PrefabLoader {
         ctx: &mut dyn apex_core::SerdeContext,
     ) -> Result<Entity, PrefabError> {
         let mut chain: Vec<String> = Vec::new();
-        self.instantiate_rec(world, manifest, overrides, parent, params, ctx, &mut chain, 0)
+        let mut spawned: Vec<Entity> = Vec::new();
+        let result =
+            self.instantiate_rec(world, manifest, overrides, parent, params, ctx, &mut chain, 0, &mut spawned);
+        if result.is_err() {
+            // Children were spawned after their parents; despawn in reverse so no child ever holds a
+            // relation to an already-dead parent mid-cleanup.
+            for entity in spawned.into_iter().rev() {
+                if world.is_alive(entity) {
+                    world.despawn(entity);
+                }
+            }
+        }
+        result
     }
 
     /// Recursive worker for [`instantiate_with`]. `chain` is the stack of named
@@ -266,13 +283,14 @@ impl PrefabLoader {
         ctx: &mut dyn apex_core::SerdeContext,
         chain: &mut Vec<String>,
         depth: usize,
+        spawned: &mut Vec<Entity>,
     ) -> Result<Entity, PrefabError> {
         if depth > MAX_PREFAB_DEPTH {
             return Err(PrefabError::DepthLimitExceeded {
                 limit: MAX_PREFAB_DEPTH,
             });
         }
-        let entity = self.spawn_entity(world, manifest, overrides, ctx)?;
+        let entity = self.spawn_entity(world, manifest, overrides, ctx, spawned)?;
 
         // Parent relation
         if let Some(parent_entity) = parent {
@@ -305,6 +323,7 @@ impl PrefabLoader {
                         ctx,
                         chain,
                         depth + 1,
+                        spawned,
                     )?;
                     chain.pop();
                 }
@@ -318,6 +337,7 @@ impl PrefabLoader {
                         ctx,
                         chain,
                         depth + 1,
+                        spawned,
                     )?;
                 }
             }
@@ -327,14 +347,18 @@ impl PrefabLoader {
     }
 
     /// Internal method: creates a single entity with components from manifest + overrides (via `ctx`).
+    /// The entity is recorded into `spawned` immediately, so [`instantiate_with`]'s atomic cleanup
+    /// covers it even when a later component of this same entity fails to deserialize.
     fn spawn_entity(
         &self,
         world: &mut World,
         manifest: &PrefabManifest,
         overrides: &[PrefabComponent],
         ctx: &mut dyn apex_core::SerdeContext,
+        spawned: &mut Vec<Entity>,
     ) -> Result<Entity, PrefabError> {
         let entity = world.spawn(());
+        spawned.push(entity);
         let tick = world.current_tick();
 
         // Build a HashMap of overrides for fast lookup
@@ -500,6 +524,44 @@ mod tests {
         let migrated = PrefabManifest::from_json_str(json).unwrap();
         assert_eq!(migrated.version, PrefabManifest::CURRENT_VERSION);
         assert_eq!(migrated.name, "Legacy");
+    }
+
+    /// A midway instantiation failure must not leave a partial hierarchy: the root and an earlier
+    /// child spawn fine, then a later child with an unregistered component fails — EVERY entity
+    /// spawned so far must be rolled back (the editor observed orphaned sub-tree fragments from
+    /// exactly such a leak on a failed duplicate).
+    #[test]
+    fn failed_instantiate_rolls_back_all_spawned_entities() {
+        let mut world = setup_world();
+        let ok_child = PrefabManifest {
+            version: PrefabManifest::CURRENT_VERSION,
+            name: "Ok".to_string(),
+            components: vec![],
+            children: vec![],
+        };
+        let bad_child = PrefabManifest {
+            version: PrefabManifest::CURRENT_VERSION,
+            name: "Bad".to_string(),
+            components: vec![PrefabComponent {
+                type_name: "Nonexistent".to_string(),
+                value: serde_json::json!({}),
+            }],
+            children: vec![],
+        };
+        let manifest = PrefabManifest {
+            version: PrefabManifest::CURRENT_VERSION,
+            name: "Root".to_string(),
+            components: vec![],
+            children: vec![PrefabChild::Inline(ok_child), PrefabChild::Inline(bad_child)],
+        };
+        let before = world.entity_count();
+        let result = PrefabLoader::new().instantiate(&mut world, &manifest, &[], None, None);
+        assert!(result.is_err(), "an unregistered component must fail the instantiation");
+        assert_eq!(
+            world.entity_count(),
+            before,
+            "a failed instantiation must roll back every spawned entity (root + ok-child + bad-child)"
+        );
     }
 
     /// §0.2a: `EntityTemplate::spawn` cannot return a Result, but a failed
