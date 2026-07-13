@@ -22,6 +22,23 @@
 //!   reusing `entity.index` for a new generation does not return foreign
 //!   relations; the encoding limits (2^20 for index, 2^11 for kind) are gone.
 //!
+//! # Sibling order (core ADR-008, 2026-07-13)
+//!
+//! The subject list of every `(kind, target)` entry is ORDERED and the order is a
+//! public guarantee for ALL kinds:
+//!
+//! - `add_relation` appends; removal is order-preserving (no `swap_remove` holes);
+//! - [`World::insert_relation_at`] / [`World::set_relation_index`] /
+//!   [`World::relation_index`] position subjects explicitly (UI z-order, editor
+//!   sibling order, scene determinism);
+//! - `targets_of` yields subjects in exactly that order; snapshot/restore
+//!   reproduces it (target-major emission in `WorldSerializer`).
+//!
+//! The one deliberate exception: `query_relation`/`query_wildcard` re-group
+//! subjects by (archetype, row) for fetch efficiency and do NOT preserve sibling
+//! order — callers that need both order and component data iterate `targets_of`
+//! and fetch per entity.
+//!
 //! The historical model where "the pair is encoded into a ComponentId and forms
 //! part of the archetype" fragmented the world into an archetype-per-parent
 //! (many_foxes @1000 — 22k archetypes) and has been removed; see
@@ -358,29 +375,97 @@ impl TargetIndex {
     }
 
     #[inline]
-    pub fn add(&mut self, kind_idx: u32, target: Entity, subject: Entity) {
-        self.ensure_kind(kind_idx)
-            .entry(target.index())
-            .or_default()
-            .push(subject);
-        let ti = target.index() as usize;
+    fn bump_target_count(&mut self, target_index: u32) {
+        let ti = target_index as usize;
         if ti >= self.target_counts.len() {
             self.target_counts.resize(ti + 1, 0);
         }
         self.target_counts[ti] += 1;
     }
 
-    /// Remove one `subject` from the `(kind, target)` entry.
+    #[inline]
+    pub fn add(&mut self, kind_idx: u32, target: Entity, subject: Entity) {
+        self.ensure_kind(kind_idx)
+            .entry(target.index())
+            .or_default()
+            .push(subject);
+        self.bump_target_count(target.index());
+    }
+
+    /// Insert `subject` at `index` (clamped to the list length) of the
+    /// `(kind, target)` sibling list. Same index bookkeeping as [`Self::add`].
+    #[inline]
+    pub fn add_at(&mut self, kind_idx: u32, target: Entity, subject: Entity, index: usize) {
+        let list = self.ensure_kind(kind_idx).entry(target.index()).or_default();
+        let pos = index.min(list.len());
+        list.insert(pos, subject);
+        self.bump_target_count(target.index());
+    }
+
+    /// Position of `subject` within the `(kind, target)` sibling list.
+    #[inline]
+    pub fn position(&self, kind_idx: u32, target_index: u32, subject: Entity) -> Option<usize> {
+        self.by_kind
+            .get(kind_idx as usize)?
+            .get(&target_index)?
+            .iter()
+            .position(|&s| s == subject)
+    }
+
+    /// Move `subject` to `index` (clamped) within the `(kind, target)` sibling
+    /// list. Pure order change: the edge set, counts and hooks are untouched.
+    /// Returns `false` if the subject is not in the list.
+    #[inline]
+    pub fn move_to(
+        &mut self,
+        kind_idx: u32,
+        target_index: u32,
+        subject: Entity,
+        index: usize,
+    ) -> bool {
+        let Some(map) = self.by_kind.get_mut(kind_idx as usize) else {
+            return false;
+        };
+        let Some(list) = map.get_mut(&target_index) else {
+            return false;
+        };
+        let Some(pos) = list.iter().position(|&s| s == subject) else {
+            return false;
+        };
+        list.remove(pos);
+        let new_pos = index.min(list.len());
+        list.insert(new_pos, subject);
+        true
+    }
+
+    /// `(target_index, subjects)` entries of a kind with targets sorted by index —
+    /// a DETERMINISTIC target-major view (the backing map iterates in hash order).
+    /// Cold-path only (snapshot): allocates the sorted key vector.
+    pub fn entries_sorted(&self, kind_idx: u32) -> Vec<(u32, &[Entity])> {
+        let Some(map) = self.by_kind.get(kind_idx as usize) else {
+            return Vec::new();
+        };
+        let mut entries: Vec<(u32, &[Entity])> =
+            map.iter().map(|(&t, sv)| (t, sv.as_slice())).collect();
+        entries.sort_unstable_by_key(|&(t, _)| t);
+        entries
+    }
+
+    /// Remove one `subject` from the `(kind, target)` entry, PRESERVING the order
+    /// of the remaining subjects (sibling order is a public guarantee — see the
+    /// module docs; a `swap_remove` here would teleport the last sibling into the
+    /// hole and break UI z-order / editor sibling order on every removal).
     ///
     /// §1.4 compromise (documented, not a footgun): the `position` scan is O(N) in the
     /// entry's FAN-IN — how many subjects point at THIS target via THIS kind (e.g. a
     /// parent's direct children for `ChildOf`). That fan-in is small for typical
-    /// relations (dozens), so the inline `SmallVec<[Entity; 4]>` scan + O(1)
-    /// `swap_remove` beats maintaining a secondary per-entry index (a `HashSet` would
-    /// add hashing + an allocation per entry, losing the cache-friendly inline path for
-    /// the common small case). It degrades only under a pathological single target with
+    /// relations (dozens), so the inline `SmallVec<[Entity; 4]>` scan + shift-remove
+    /// beats maintaining a secondary per-entry index (a `HashSet` would add hashing +
+    /// an allocation per entry, losing the cache-friendly inline path for the common
+    /// small case; the ordered `remove(pos)` memmove is the same O(fan-in) class the
+    /// scan already pays). It degrades only under a pathological single target with
     /// a huge fan-in whose subjects are removed one-by-one (O(N²) total) — if such a
-    /// workload appears, switch this entry's list to an indexed structure.
+    /// workload appears, switch this entry's list to an order-indexed structure.
     #[inline]
     pub fn remove(&mut self, kind_idx: u32, target_index: u32, subject: Entity) -> bool {
         let Some(map) = self.by_kind.get_mut(kind_idx as usize) else {
@@ -392,7 +477,7 @@ impl TargetIndex {
         let Some(pos) = subjects.iter().position(|&s| s == subject) else {
             return false;
         };
-        subjects.swap_remove(pos);
+        subjects.remove(pos);
         if subjects.is_empty() {
             map.remove(&target_index);
         }
@@ -654,8 +739,21 @@ impl World {
     }
 
     /// Low-level variant of `add_relation` by an already-known kind_idx
-    /// (hot loops, restore in apex-serialization).
+    /// (hot loops, restore in apex-serialization). Appends to the sibling list.
     pub fn add_relation_by_kind_idx(&mut self, subject: Entity, kind_idx: u32, target: Entity) {
+        self.add_relation_positioned(subject, kind_idx, target, None);
+    }
+
+    /// Shared add path: `position: None` appends, `Some(i)` inserts at `i`
+    /// (clamped) in the `(kind, target)` sibling list. All add invariants
+    /// (aliveness, cycle rejection, exclusive replace, hooks) live here once.
+    fn add_relation_positioned(
+        &mut self,
+        subject: Entity,
+        kind_idx: u32,
+        target: Entity,
+        position: Option<usize>,
+    ) {
         debug_assert!(
             (kind_idx as usize) < self.relations.kind_count(),
             "add_relation_by_kind_idx: unregistered kind_idx {kind_idx}"
@@ -729,7 +827,10 @@ impl World {
 
         let pair = RelationPair { kind_idx, target };
         if self.subject_index.insert(subject.index, pair) {
-            self.target_index.add(kind_idx, target, subject);
+            match position {
+                None => self.target_index.add(kind_idx, target, subject),
+                Some(i) => self.target_index.add_at(kind_idx, target, subject, i),
+            }
             if self.relations.on_add_hook(kind_idx).is_some() {
                 self.hook_queue.push(crate::world::HookEvent::RelationAdded {
                     kind_idx,
@@ -759,6 +860,85 @@ impl World {
                 self.flush_hooks();
             }
         }
+    }
+
+    /// Ensure the relation `(kind, target)` exists on `subject` AT `index` of the
+    /// target's sibling list (clamped to the list length).
+    ///
+    /// - Pair already exists → pure reorder to `index` (no hooks: the edge set is
+    ///   unchanged — same semantics as [`set_relation_index`](Self::set_relation_index));
+    /// - pair absent → full add (aliveness/cycle/exclusive invariants identical to
+    ///   [`add_relation`](Self::add_relation), including the exclusive re-parent)
+    ///   with a positioned insert instead of an append.
+    ///
+    /// This is the write half of the sibling-order guarantee (module docs): UI
+    /// z-order, editor "move child up/down", deterministic scene assembly.
+    pub fn insert_relation_at<R: RelationKind>(
+        &mut self,
+        subject: Entity,
+        _kind: R,
+        target: Entity,
+        index: usize,
+    ) {
+        let kind_idx = self.relations.get_or_register::<R>();
+        if self.entities.is_alive(subject)
+            && self.entities.is_alive(target)
+            && self
+                .subject_index
+                .has(subject.index, RelationPair { kind_idx, target })
+        {
+            self.target_index.move_to(kind_idx, target.index, subject, index);
+            return;
+        }
+        self.add_relation_positioned(subject, kind_idx, target, Some(index));
+    }
+
+    /// Move an EXISTING relation's subject to `index` (clamped) in the target's
+    /// sibling list. Pure order change: no hooks fire, counts are untouched.
+    /// Returns `false` when the pair does not exist (or either entity is dead) —
+    /// this never creates a relation (use
+    /// [`insert_relation_at`](Self::insert_relation_at) for ensure-at semantics).
+    pub fn set_relation_index<R: RelationKind>(
+        &mut self,
+        subject: Entity,
+        _kind: R,
+        target: Entity,
+        index: usize,
+    ) -> bool {
+        if !self.entities.is_alive(subject) || !self.entities.is_alive(target) {
+            return false;
+        }
+        let Some(kind_idx) = self.relations.get_idx::<R>() else {
+            return false;
+        };
+        if !self
+            .subject_index
+            .has(subject.index, RelationPair { kind_idx, target })
+        {
+            return false;
+        }
+        self.target_index.move_to(kind_idx, target.index, subject, index)
+    }
+
+    /// Position of `subject` in the `(kind, target)` sibling list — the read half
+    /// of the sibling-order guarantee. `None` if the pair does not exist.
+    pub fn relation_index<R: RelationKind>(
+        &self,
+        subject: Entity,
+        _kind: R,
+        target: Entity,
+    ) -> Option<usize> {
+        if !self.entities.is_alive(subject) || !self.entities.is_alive(target) {
+            return None;
+        }
+        let kind_idx = self.relations.get_idx::<R>()?;
+        if !self
+            .subject_index
+            .has(subject.index, RelationPair { kind_idx, target })
+        {
+            return None;
+        }
+        self.target_index.position(kind_idx, target.index, subject)
     }
 
     /// O(1) check via SubjectIndex: kind_mask check + binary_search.
@@ -811,6 +991,10 @@ impl World {
     ///
     /// Execution plan: subjects from TargetIndex → grouping by archetypes →
     /// `fetch_state` per archetype + pinpoint rows. O(children), not O(archetypes).
+    ///
+    /// **Does NOT preserve sibling order** (subjects are re-grouped by
+    /// (archetype, row) for fetch efficiency) — deliberate; callers that need
+    /// order AND data iterate [`targets_of`](Self::targets_of) + per-entity get.
     pub fn query_relation<'w, R: RelationKind, Q: WorldQuery>(
         &'w self,
         _kind: R,
@@ -895,6 +1079,11 @@ impl World {
     /// Subjects pointing at `parent` via relation `R` — O(number of subjects).
     /// The plural pairs with [`target_of`](Self::target_of) (single target of a
     /// subject); `_of` naming reads uniformly for both directions.
+    ///
+    /// **Order guarantee (core ADR-008):** subjects are yielded in SIBLING ORDER —
+    /// insertion order, stable across removals, explicitly controllable via
+    /// [`insert_relation_at`](Self::insert_relation_at) /
+    /// [`set_relation_index`](Self::set_relation_index).
     pub fn targets_of<'w, R: RelationKind>(
         &'w self,
         _kind: R,
@@ -942,11 +1131,33 @@ impl World {
         self.despawn(entity);
     }
 
-    /// All relations of the world: `(subject.index, kind_idx, target)` — for serialization.
+    /// All relations of the world: `(subject.index, kind_idx, target)` — subject-major
+    /// (entity-index order). Does NOT encode sibling order — snapshots use
+    /// [`iter_relations_target_major`](Self::iter_relations_target_major) instead.
     pub fn iter_relations(&self) -> impl Iterator<Item = (u32, u32, Entity)> + '_ {
         self.subject_index
             .iter_all()
             .map(|(subject_index, pair)| (subject_index, pair.kind_idx, pair.target))
+    }
+
+    /// All relations in DETERMINISTIC target-major order: kinds ascending, targets
+    /// by index ascending, subjects in SIBLING ORDER. Yields
+    /// `(subject, kind_idx, target_index)`.
+    ///
+    /// This is the snapshot emission order: restore re-adds relations in list
+    /// order (appends), so per-`(kind, target)` sibling order round-trips exactly
+    /// while the byte stream stays deterministic (the backing map iterates in
+    /// hash order, hence the sorted collection). Cold path — allocates.
+    pub fn iter_relations_target_major(&self) -> Vec<(Entity, u32, u32)> {
+        let mut out = Vec::new();
+        for kind_idx in 0..self.relations.kind_count() as u32 {
+            for (target_index, subjects) in self.target_index.entries_sorted(kind_idx) {
+                for &subject in subjects {
+                    out.push((subject, kind_idx, target_index));
+                }
+            }
+        }
+        out
     }
 }
 
@@ -1322,6 +1533,170 @@ mod tests {
         assert_eq!(world.target_of(c, ChildOf), None, "cycle edge rejected");
         assert_eq!(world.target_of(a, ChildOf), Some(b), "existing edges intact");
         assert_eq!(world.target_of(b, ChildOf), Some(c));
+    }
+
+    // ── Sibling order (core ADR-008) ───────────────────────────
+
+    /// Children are yielded in insertion order.
+    #[test]
+    fn children_order_is_insertion_order() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let kids: Vec<Entity> = (0..5)
+            .map(|i| {
+                let c = world.spawn((Position { x: i as f32, y: 0.0 },));
+                world.add_relation(c, ChildOf, parent);
+                c
+            })
+            .collect();
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, kids, "targets_of yields insertion order");
+    }
+
+    /// Removing a middle child preserves the order of the remaining siblings
+    /// (the historical swap_remove teleported the last sibling into the hole).
+    #[test]
+    fn children_order_stable_across_removal() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let kids: Vec<Entity> = (0..5)
+            .map(|i| {
+                let c = world.spawn((Position { x: i as f32, y: 0.0 },));
+                world.add_relation(c, ChildOf, parent);
+                c
+            })
+            .collect();
+
+        // Remove the middle child via remove_relation…
+        world.remove_relation(kids[2], ChildOf, parent);
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, vec![kids[0], kids[1], kids[3], kids[4]]);
+
+        // …and another via despawn (index cleanup path).
+        world.despawn(kids[3]);
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, vec![kids[0], kids[1], kids[4]]);
+    }
+
+    /// insert_relation_at positions a NEW child; out-of-range clamps to append.
+    #[test]
+    fn insert_relation_at_positions_child() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let a = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Position { x: 2.0, y: 0.0 },));
+        let c = world.spawn((Position { x: 3.0, y: 0.0 },));
+        let d = world.spawn((Position { x: 4.0, y: 0.0 },));
+
+        world.add_relation(a, ChildOf, parent);
+        world.add_relation(b, ChildOf, parent);
+        world.insert_relation_at(c, ChildOf, parent, 0); // head
+        world.insert_relation_at(d, ChildOf, parent, 99); // clamp → append
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, vec![c, a, b, d]);
+        assert_eq!(world.relation_index(c, ChildOf, parent), Some(0));
+        assert_eq!(world.relation_index(d, ChildOf, parent), Some(3));
+    }
+
+    /// insert_relation_at on an EXISTING pair is a pure reorder (ensure-at).
+    #[test]
+    fn insert_relation_at_existing_reorders() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let kids: Vec<Entity> = (0..3)
+            .map(|i| {
+                let c = world.spawn((Position { x: i as f32, y: 0.0 },));
+                world.add_relation(c, ChildOf, parent);
+                c
+            })
+            .collect();
+        world.insert_relation_at(kids[2], ChildOf, parent, 0);
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, vec![kids[2], kids[0], kids[1]]);
+    }
+
+    /// set_relation_index reorders and reports honestly.
+    #[test]
+    fn set_relation_index_reorders() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let parent = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let kids: Vec<Entity> = (0..4)
+            .map(|i| {
+                let c = world.spawn((Position { x: i as f32, y: 0.0 },));
+                world.add_relation(c, ChildOf, parent);
+                c
+            })
+            .collect();
+
+        assert!(world.set_relation_index(kids[0], ChildOf, parent, 3)); // head → tail
+        assert!(world.set_relation_index(kids[3], ChildOf, parent, 0)); // (now-)tail… → head
+        let seen: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+        assert_eq!(seen, vec![kids[3], kids[1], kids[2], kids[0]]);
+
+        // Not related / dead → false, never creates an edge.
+        let stranger = world.spawn((Position { x: 9.0, y: 0.0 },));
+        assert!(!world.set_relation_index(stranger, ChildOf, parent, 0));
+        assert_eq!(world.target_of(stranger, ChildOf), None);
+    }
+
+    /// An exclusive re-parent APPENDS to the new parent's sibling list;
+    /// insert_relation_at re-parents AT the requested position.
+    #[test]
+    fn reparent_order_semantics() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let p1 = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let p2 = world.spawn((Position { x: 0.0, y: 1.0 },));
+        let a = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Position { x: 2.0, y: 0.0 },));
+        let c = world.spawn((Position { x: 3.0, y: 0.0 },));
+        world.add_relation(a, ChildOf, p2);
+        world.add_relation(b, ChildOf, p1);
+        world.add_relation(c, ChildOf, p1);
+
+        // Plain re-parent (b: p1 → p2) appends after a.
+        world.add_relation(b, ChildOf, p2);
+        let seen: Vec<Entity> = world.targets_of(ChildOf, p2).collect();
+        assert_eq!(seen, vec![a, b]);
+
+        // Positioned re-parent (c: p1 → p2 at head).
+        world.insert_relation_at(c, ChildOf, p2, 0);
+        let seen: Vec<Entity> = world.targets_of(ChildOf, p2).collect();
+        assert_eq!(seen, vec![c, a, b]);
+        assert_eq!(world.targets_of(ChildOf, p1).count(), 0);
+    }
+
+    /// Target-major iteration is deterministic and preserves sibling order
+    /// (the snapshot emission contract).
+    #[test]
+    fn iter_relations_target_major_order() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let p1 = world.spawn((Position { x: 0.0, y: 0.0 },));
+        let p2 = world.spawn((Position { x: 0.0, y: 1.0 },));
+        let a = world.spawn((Position { x: 1.0, y: 0.0 },));
+        let b = world.spawn((Position { x: 2.0, y: 0.0 },));
+        let c = world.spawn((Position { x: 3.0, y: 0.0 },));
+        world.add_relation(b, ChildOf, p2);
+        world.add_relation(a, ChildOf, p2);
+        world.insert_relation_at(c, ChildOf, p2, 1);
+        world.add_relation(p2, ChildOf, p1);
+
+        let rels = world.iter_relations_target_major();
+        // Targets ascending: p1 (its child p2), then p2 (children b, c, a).
+        let expected: Vec<(Entity, u32)> = vec![
+            (p2, p1.index()),
+            (b, p2.index()),
+            (c, p2.index()),
+            (a, p2.index()),
+        ];
+        let seen: Vec<(Entity, u32)> = rels.iter().map(|&(s, _k, t)| (s, t)).collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]

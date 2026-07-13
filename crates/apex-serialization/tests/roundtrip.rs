@@ -419,6 +419,41 @@ fn older_version_snapshot_is_migrated_on_restore() {
     assert_eq!((pos.x, pos.y), (3.0, 4.0));
 }
 
+/// Sibling ORDER round-trips (core ADR-008): the snapshot emits relations
+/// target-major with subjects in sibling order, restore re-adds them in list
+/// order — so an explicitly authored child order (including a positioned
+/// insert) survives snapshot → JSON → restore exactly, not just as a set.
+#[test]
+fn sibling_order_roundtrips_exactly() {
+    let mut world = World::new();
+    register_vocabulary(&mut world);
+
+    let parent = world.spawn((Name("parent".into()),));
+    let a = world.spawn((Name("a".into()),));
+    let b = world.spawn((Name("b".into()),));
+    let c = world.spawn((Name("c".into()),));
+    let d = world.spawn((Name("d".into()),));
+    // Deliberately NOT spawn order: b, then d at head, then a, then c at 2.
+    world.add_relation(b, ChildOf, parent);
+    world.insert_relation_at(d, ChildOf, parent, 0);
+    world.add_relation(a, ChildOf, parent);
+    world.insert_relation_at(c, ChildOf, parent, 2);
+    let authored: Vec<Entity> = world.targets_of(ChildOf, parent).collect();
+    assert_eq!(authored, vec![d, b, c, a], "authored order sanity");
+
+    let snap = WorldSerializer::snapshot(&world).unwrap();
+    let json = snap.to_json().unwrap();
+    let parsed = WorldSnapshot::from_json(&json).unwrap();
+
+    let mut restored = World::new();
+    register_vocabulary(&mut restored);
+    let map = WorldSerializer::restore(&mut restored, &parsed).unwrap();
+
+    let expected: Vec<Entity> = authored.iter().map(|e| map[&e.index()]).collect();
+    let seen: Vec<Entity> = restored.targets_of(ChildOf, map[&parent.index()]).collect();
+    assert_eq!(seen, expected, "sibling order must round-trip exactly");
+}
+
 /// If a component's stored bytes are corrupt, restore must surface
 /// `DeserializeFailed` naming the type — never spawn a half-decoded value.
 #[test]

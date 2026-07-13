@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Added — упорядоченные relations: sibling order = публичная гарантия (2026-07-13, ADR-008)
+
+- **Порядок subjects каждой пары `(kind, target)` — гарантия для ВСЕХ видов связей:**
+  `add_relation` добавляет в конец, удаление сохраняет порядок остальных (был `swap_remove` —
+  последний ребёнок телепортировался в дырку), `targets_of` выдаёт детей ровно в этом порядке,
+  эксклюзивный re-parent добавляет в конец списка нового родителя.
+- **Новые API:** `World::insert_relation_at` (ensure-at-позиции), `World::set_relation_index`
+  (чистая перестановка, без хуков), `World::relation_index` (позиция). Руководство §8.1a.
+- **Snapshot: relations эмитятся target-major детерминированно** (kinds ↑, targets ↑, subjects
+  в sibling-порядке; `World::iter_relations_target_major`) — restore воспроизводит порядок детей
+  точно. Wire-формат не менялся; байтовый порядок relations-секции при пересохранении изменится.
+  Дифф снапшотов к чистой перестановке слеп (edge-set) — долг DIFF-REORDER в `plans/TECH_DEBT.md`.
+- Осознанное исключение: `query_relation`/`query_wildcard` порядок НЕ сохраняют
+  (перегруппировка по архетипам ради скорости) — задокументировано.
+
 ### Changed — волна P ADR-004: `Read<T>`/`Write<T>` УДАЛЕНЫ (2026-07-10, пред-релизно — без deprecation)
 
 - **Единственный словарь запросов — канон ADR-004 Р-5: `&T` / `&mut T`.** Маркер-типы

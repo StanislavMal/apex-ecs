@@ -226,6 +226,14 @@
 
 ## 🟢 Бездомные — чистота/эргономика/док-честность
 
+- **DIFF-REORDER 🟢 (ADR-008, 2026-07-13) — дифф снапшотов слеп к чистой перестановке детей.**
+  `WorldSnapshotDiff` сравнивает relations как МНОЖЕСТВО рёбер `(subject, kind, target)`: sibling-
+  перестановка (ADR-008) не меняет набор рёбер ⇒ пустой relation-дифф, `apply_diff` оставляет старый
+  порядок. Полные снапшоты round-trip'ят порядок корректно (target-major эмит); слеп только
+  дифф/patch-путь. Loud-нота в `serializer.rs` (у HashSet-сравнения). Закрытие = вынести порядок в
+  дифф (per-target список позиций или ordered-рёбра) — брать при первом реальном потребителе
+  диффов иерархий (сейчас дифф используется для компонент-датой, не для порядка).
+
 - **ErrorHandler world-less хвост 🟢 (API_GOLDEN_PATH волна 4, 2026-07-05).** Системный §0.2a
   `ErrorHandler` (per-World поле, `anomaly!`-макрос, режимы Warn/Panic/Silent/Custom + счётчики; ecs
   `754ed44`) охватил 9 сайтов с World в scope (world.rs ×6, commands.rs ×2, serializer restore ×1).

@@ -166,12 +166,15 @@ impl WorldSerializer {
         }
 
         // ── Relations ──────────────────────────────────────────
-        // SubjectIndex — source of truth: entries are cleaned up on despawn,
-        // so iter_relations yields only relations of live entities.
-        for (subject_index, kind_idx, target) in world.iter_relations() {
+        // Target-major DETERMINISTIC order (kinds ↑, targets ↑, subjects in sibling
+        // order): restore re-adds relations in list order, so sibling order (core
+        // ADR-008 — UI z-order, editor child order) round-trips exactly. The indexes
+        // are cleaned up on despawn, so only relations of live entities are yielded.
+        for (subject, kind_idx, target_index) in world.iter_relations_target_major() {
+            let subject_index = subject.index();
             // Only keep relations between snapshotted entities — a relation to a filtered-out entity
             // (e.g. a scene instance's inner node) can't restore, so don't save it (avoids restore warns).
-            if !kept.contains(&subject_index) || !kept.contains(&target.index()) {
+            if !kept.contains(&subject_index) || !kept.contains(&target_index) {
                 continue;
             }
             let kind_name = world.relation_registry()
@@ -181,7 +184,7 @@ impl WorldSerializer {
 
             snap.relations.push(RelationSnapshot {
                 subject_index,
-                target_index: target.index(),
+                target_index,
                 kind_name,
             });
         }
@@ -529,6 +532,11 @@ impl WorldSerializer {
 
         // Relations — HashSet membership makes the added/removed scan O(R)
         // instead of O(R²) (`Vec::contains` was linear inside each loop).
+        //
+        // KNOWN LIMIT (loud, core TECH_DEBT): the diff is EDGE-SET based, so a pure
+        // sibling REORDER (same edges, different order — core ADR-008) produces an
+        // empty relation diff and `apply_diff` keeps the old order. Full snapshots
+        // round-trip order correctly; only the diff/patch path is order-blind.
         let old_relations: HashSet<(u32, u32, &str)> = old.relations.iter()
             .map(|r| (r.subject_index, r.target_index, r.kind_name.as_str()))
             .collect();
