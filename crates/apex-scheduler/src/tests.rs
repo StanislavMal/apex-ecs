@@ -1315,6 +1315,59 @@
     }
 
     #[test]
+    fn chained_sequential_before_parallel_compiles_on_first_compile() {
+        // A user chain may legally order an EXCLUSIVE (Sequential) system
+        // BEFORE an access-declared (Parallel) one: seq → par → seq.
+        // The sequential-barrier step must respect the explicit edges on the
+        // FIRST compile too — the old "empty graph ⇒ skip has_path guards"
+        // fast path was taken before the explicit edges were added, so the
+        // blind `par → barrier → seq` edges fabricated a CircularDependency
+        // (found by the engine's UI chain: viewport(seq) → watchers(par) →
+        // layout/stack(seq)).
+        struct P;
+        impl ParSystem for P {
+            fn access() -> AccessDescriptor {
+                AccessDescriptor::new().read::<Pos>()
+            }
+            fn run(&mut self, _: SystemContext<'_>) {}
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_system("seq_first", |_: &mut World| {});
+        sched.add_par_system("par_mid", P);
+        sched.add_system("seq_last", |_: &mut World| {});
+        sched.chain(&["seq_first", "par_mid", "seq_last"]).unwrap();
+
+        let result = sched.compile();
+        assert!(
+            result.is_ok(),
+            "seq → par → seq chain must compile (barrier must yield to explicit edges): {:?}",
+            result.err()
+        );
+
+        // The explicit order must survive into the plan: seq_first before
+        // par_mid before seq_last (stage order = execution order).
+        let id_of = |name: &str| {
+            sched
+                .systems
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("system {name} registered"))
+                .id
+        };
+        let (a, b, c) = (id_of("seq_first"), id_of("par_mid"), id_of("seq_last"));
+        let stages = sched.stages().unwrap();
+        let pos_of = |id| {
+            stages
+                .iter()
+                .position(|s| s.system_ids.contains(&id))
+                .expect("system in plan")
+        };
+        assert!(pos_of(a) <= pos_of(b), "seq_first must precede par_mid");
+        assert!(pos_of(b) <= pos_of(c), "par_mid must precede seq_last");
+    }
+
+    #[test]
     fn independent_resolves_bidirectional_write_read_deterministically() {
         // A: &Vel, &mut Pos; B: &Pos, &mut Vel — a true BidirectionalWriteRead
         // (without an explicit order → CircularDependency).

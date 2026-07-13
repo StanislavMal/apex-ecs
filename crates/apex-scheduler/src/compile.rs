@@ -314,10 +314,6 @@ impl Scheduler {
             new_system_indices
         };
 
-        // Optimization: on the first compile() the graph is still empty — has_path() is always false.
-        // Skip the O(N²) BFS runs, since an empty graph cannot have cycles.
-        let has_existing_edges = !self.edge_set.is_empty();
-
         // ── 2. Explicit dependencies for new/changed systems ──
         for &idx in &systems_to_process {
             let system = &self.systems[idx];
@@ -361,6 +357,14 @@ impl Scheduler {
                 }
             }
         }
+
+        // Optimization: when the graph has no edges at all, has_path() is always
+        // false — skip the O(N²) BFS runs. Taken AFTER the explicit-dependency
+        // section: the user's `.before/.after/.chain` edges are already in the
+        // graph on the FIRST compile too, and the barrier guards below must see
+        // them (a chain ordering an exclusive system BEFORE a params system is
+        // legal — blind barrier edges would fabricate a CircularDependency).
+        let has_existing_edges = !self.edge_set.is_empty();
 
         // ── 3. Sequential barriers ──
         // Use one dummy barrier node instead of O(N×M) edges:
