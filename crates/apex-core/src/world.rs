@@ -252,6 +252,13 @@ pub(crate) enum HookEvent {
         subject: Entity,
         target: Entity,
     },
+    /// Pure sibling reorder (ADR-008): the edge set is unchanged — dispatched
+    /// only to `on_relation_reorder` observers, never to add/remove hooks.
+    RelationReordered {
+        kind_idx: u32,
+        subject: Entity,
+        target: Entity,
+    },
 }
 
 /// Rolls back a partially-built bulk-spawn batch on unwind (A6).
@@ -654,26 +661,40 @@ impl World {
     }
 
     /// Register an `on_add` hook for relation kind `R`: called after a successful
-    /// `add_relation` with `(subject, target)`.
-    /// One hook per kind; re-registration panics.
+    /// `add_relation` with `(subject, target)`. Multiple hooks per kind are
+    /// allowed (fan-out) and fire in registration order.
     pub fn on_relation_add<R: crate::relations::RelationKind>(
         &mut self,
         hook: crate::relations::RelationHookFn,
     ) {
         let kind_idx = self.relations.get_or_register::<R>();
-        self.relations.set_on_add(kind_idx, hook);
+        self.relations.add_on_add(kind_idx, hook);
     }
 
     /// Register an `on_remove` hook for relation kind `R`: called after a pair
     /// disappears — an explicit `remove_relation` OR cleanup on despawn of the
-    /// subject/target (including cascade; the entities may be dead by then). One
-    /// hook per kind; re-registration panics.
+    /// subject/target (including cascade; the entities may be dead by then).
+    /// Multiple hooks per kind are allowed (fan-out), registration order.
     pub fn on_relation_remove<R: crate::relations::RelationKind>(
         &mut self,
         hook: crate::relations::RelationHookFn,
     ) {
         let kind_idx = self.relations.get_or_register::<R>();
-        self.relations.set_on_remove(kind_idx, hook);
+        self.relations.add_on_remove(kind_idx, hook);
+    }
+
+    /// Register an `on_reorder` hook for relation kind `R`: called after a PURE
+    /// sibling reorder (`set_relation_index`, or `insert_relation_at` on an
+    /// existing pair) with `(subject, target)`. The edge set is unchanged on
+    /// reorder, so add/remove hooks deliberately do not fire (ADR-008) — order
+    /// mirrors (UI paint order, editor outliner) subscribe here. Multiple hooks
+    /// per kind are allowed (fan-out), registration order.
+    pub fn on_relation_reorder<R: crate::relations::RelationKind>(
+        &mut self,
+        hook: crate::relations::RelationHookFn,
+    ) {
+        let kind_idx = self.relations.get_or_register::<R>();
+        self.relations.add_on_reorder(kind_idx, hook);
     }
 
     /// Hook dispatcher: called at the END of public structural operations.
@@ -744,7 +765,18 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = world.relations.on_add_hook(kind_idx) {
+                    // Copy the inline list out: hooks take &mut World and may
+                    // register further hooks mid-dispatch.
+                    for f in world.relations.add_hooks(kind_idx) {
+                        f(world, subject, target);
+                    }
+                }
+                HookEvent::RelationReordered {
+                    kind_idx,
+                    subject,
+                    target,
+                } => {
+                    for f in world.relations.reorder_hooks(kind_idx) {
                         f(world, subject, target);
                     }
                 }
@@ -753,7 +785,7 @@ impl World {
                     subject,
                     target,
                 } => {
-                    if let Some(f) = world.relations.on_remove_hook(kind_idx) {
+                    for f in world.relations.remove_hooks(kind_idx) {
                         f(world, subject, target);
                     }
                 }
@@ -4559,6 +4591,8 @@ mod hooks_and_added_tests {
         removed_alive: Vec<bool>,
         rel_added: Vec<(Entity, Entity)>,
         rel_removed: Vec<(Entity, Entity)>,
+        rel_reordered: Vec<(Entity, Entity)>,
+        markers: Vec<u32>,
     }
 
     fn log_world() -> World {
@@ -4792,6 +4826,67 @@ mod hooks_and_added_tests {
             vec![(owner, item), (owner, item)],
             "explicit remove + despawn cleanup"
         );
+    }
+
+    /// Fan-out: several subsystems can watch the same kind — hooks fire in
+    /// registration order (e.g. UI layout + editor both observing ChildOf).
+    #[test]
+    fn relation_hooks_fan_out_in_registration_order() {
+        let mut world = log_world();
+        world.on_relation_add::<crate::relations::Owns>(|w, _, _| {
+            w.resource_mut::<HookLog>().markers.push(1)
+        });
+        world.on_relation_add::<crate::relations::Owns>(|w, _, _| {
+            w.resource_mut::<HookLog>().markers.push(2)
+        });
+        world.on_relation_remove::<crate::relations::Owns>(|w, _, _| {
+            w.resource_mut::<HookLog>().markers.push(10)
+        });
+        world.on_relation_remove::<crate::relations::Owns>(|w, _, _| {
+            w.resource_mut::<HookLog>().markers.push(20)
+        });
+
+        let owner = world.spawn((Hp(1),));
+        let item = world.spawn((Armor(0),));
+        world.add_relation(owner, crate::relations::Owns, item);
+        world.remove_relation(owner, crate::relations::Owns, item);
+
+        assert_eq!(world.resource::<HookLog>().markers, vec![1, 2, 10, 20]);
+    }
+
+    /// A pure reorder fires ONLY the reorder hook — never add/remove (the edge
+    /// set is unchanged, ADR-008).
+    #[test]
+    fn reorder_fires_only_reorder_hook() {
+        let mut world = log_world();
+        world.on_relation_add::<crate::relations::ChildOf>(|w, s, t| {
+            w.resource_mut::<HookLog>().rel_added.push((s, t))
+        });
+        world.on_relation_remove::<crate::relations::ChildOf>(|w, s, t| {
+            w.resource_mut::<HookLog>().rel_removed.push((s, t))
+        });
+        world.on_relation_reorder::<crate::relations::ChildOf>(|w, s, t| {
+            w.resource_mut::<HookLog>().rel_reordered.push((s, t))
+        });
+
+        let parent = world.spawn((Hp(0),));
+        let a = world.spawn((Hp(1),));
+        let b = world.spawn((Hp(2),));
+        world.add_relation(a, crate::relations::ChildOf, parent);
+        world.add_relation(b, crate::relations::ChildOf, parent);
+        let adds_before = world.resource::<HookLog>().rel_added.len();
+
+        // set_relation_index and insert_relation_at on an existing pair = reorders.
+        assert!(world.set_relation_index(a, crate::relations::ChildOf, parent, 1));
+        world.insert_relation_at(b, crate::relations::ChildOf, parent, 0);
+
+        let log = world.resource::<HookLog>();
+        assert_eq!(log.rel_reordered, vec![(a, parent), (b, parent)]);
+        assert_eq!(log.rel_added.len(), adds_before, "no add hooks on reorder");
+        assert!(log.rel_removed.is_empty(), "no remove hooks on reorder");
+
+        // A no-move reorder (same position) still counts as a successful move_to
+        // (clamped) — the hook reports the call, consumers dedupe by state.
     }
 
     // ── track_removals / Removed<T> ────────────────────────────

@@ -553,8 +553,13 @@ pub trait RelationKind: Copy + Send + Sync + 'static {
 
 /// Relation hook (W3-1): `fn(&mut World, subject, target)` — called after the
 /// operation completes on a consistent world (despawn cleanup: entities may
-/// already be dead). fn-pointer only; one hook per kind per event.
+/// already be dead). fn-pointer only; MULTIPLE hooks per kind per event are
+/// allowed and fire in registration order (fan-out — several subsystems can
+/// observe the same kind, e.g. UI layout + editor both watching `ChildOf`).
 pub type RelationHookFn = fn(&mut crate::world::World, Entity, Entity);
+
+/// Per-event hook list of one kind (inline for the common 0–1 case).
+type HookList = SmallVec<[RelationHookFn; 1]>;
 
 pub struct RelationRegistry {
     type_to_idx: FxHashMap<TypeId, u32>,
@@ -567,8 +572,13 @@ pub struct RelationRegistry {
     name_to_idx: FxHashMap<String, u32>,
     next_idx: u32,
     /// Hooks per kind_idx (W3-1); `any_hooks` — fast-path gate for hot paths.
-    on_add_hooks: Vec<Option<RelationHookFn>>,
-    on_remove_hooks: Vec<Option<RelationHookFn>>,
+    on_add_hooks: Vec<HookList>,
+    on_remove_hooks: Vec<HookList>,
+    /// Fired on a PURE sibling reorder (`set_relation_index` / positioned
+    /// re-insert of an existing pair) — the edge set is unchanged, so add/
+    /// remove hooks deliberately do NOT fire (ADR-008); consumers that mirror
+    /// sibling order (UI paint order, editor outliner) subscribe here.
+    on_reorder_hooks: Vec<HookList>,
     any_hooks: bool,
 }
 
@@ -583,6 +593,7 @@ impl RelationRegistry {
             next_idx: 0,
             on_add_hooks: Vec::new(),
             on_remove_hooks: Vec::new(),
+            on_reorder_hooks: Vec::new(),
             any_hooks: false,
         }
     }
@@ -598,8 +609,9 @@ impl RelationRegistry {
         self.cascade_flags
             .push(R::cascade_delete_on_target_despawn());
         self.exclusive_flags.push(R::exclusive());
-        self.on_add_hooks.push(None);
-        self.on_remove_hooks.push(None);
+        self.on_add_hooks.push(HookList::new());
+        self.on_remove_hooks.push(HookList::new());
+        self.on_reorder_hooks.push(HookList::new());
 
         // Register the name for serialization
         let name = std::any::type_name::<R>().to_string();
@@ -611,51 +623,80 @@ impl RelationRegistry {
 
     // ── Relation hooks (W3-1) ──────────────────────────────────
 
-    pub(crate) fn set_on_add(&mut self, kind_idx: u32, hook: RelationHookFn) {
-        let slot = &mut self.on_add_hooks[kind_idx as usize];
-        assert!(
-            slot.is_none(),
-            "on_relation_add hook for kind {} is already registered (one hook per kind)",
-            self.idx_to_name[kind_idx as usize]
-        );
-        *slot = Some(hook);
+    pub(crate) fn add_on_add(&mut self, kind_idx: u32, hook: RelationHookFn) {
+        self.on_add_hooks[kind_idx as usize].push(hook);
         self.any_hooks = true;
     }
 
-    pub(crate) fn set_on_remove(&mut self, kind_idx: u32, hook: RelationHookFn) {
-        let slot = &mut self.on_remove_hooks[kind_idx as usize];
-        assert!(
-            slot.is_none(),
-            "on_relation_remove hook for kind {} is already registered (one hook per kind)",
-            self.idx_to_name[kind_idx as usize]
-        );
-        *slot = Some(hook);
+    pub(crate) fn add_on_remove(&mut self, kind_idx: u32, hook: RelationHookFn) {
+        self.on_remove_hooks[kind_idx as usize].push(hook);
         self.any_hooks = true;
     }
 
+    pub(crate) fn add_on_reorder(&mut self, kind_idx: u32, hook: RelationHookFn) {
+        self.on_reorder_hooks[kind_idx as usize].push(hook);
+        self.any_hooks = true;
+    }
+
+    /// Snapshot of the kind's hooks for one event (dispatch copies the inline
+    /// list out first — hooks take `&mut World` and may register more hooks).
     #[inline]
-    pub(crate) fn on_add_hook(&self, kind_idx: u32) -> Option<RelationHookFn> {
+    pub(crate) fn add_hooks(&self, kind_idx: u32) -> HookList {
         if !self.any_hooks {
-            return None;
+            return HookList::new();
         }
-        self.on_add_hooks.get(kind_idx as usize).copied().flatten()
+        self.on_add_hooks.get(kind_idx as usize).cloned().unwrap_or_default()
     }
 
     #[inline]
-    pub(crate) fn on_remove_hook(&self, kind_idx: u32) -> Option<RelationHookFn> {
+    pub(crate) fn remove_hooks(&self, kind_idx: u32) -> HookList {
         if !self.any_hooks {
-            return None;
+            return HookList::new();
         }
         self.on_remove_hooks
             .get(kind_idx as usize)
-            .copied()
-            .flatten()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[inline]
+    pub(crate) fn reorder_hooks(&self, kind_idx: u32) -> HookList {
+        if !self.any_hooks {
+            return HookList::new();
+        }
+        self.on_reorder_hooks
+            .get(kind_idx as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Fast queue-push gates for the hot paths.
+    #[inline]
+    pub(crate) fn has_add_hook(&self, kind_idx: u32) -> bool {
+        self.any_hooks
+            && self
+                .on_add_hooks
+                .get(kind_idx as usize)
+                .is_some_and(|h| !h.is_empty())
     }
 
     /// Fast check "the kind has an on_remove hook" (despawn cleanup).
     #[inline]
     pub(crate) fn has_remove_hook(&self, kind_idx: u32) -> bool {
-        self.on_remove_hook(kind_idx).is_some()
+        self.any_hooks
+            && self
+                .on_remove_hooks
+                .get(kind_idx as usize)
+                .is_some_and(|h| !h.is_empty())
+    }
+
+    #[inline]
+    pub(crate) fn has_reorder_hook(&self, kind_idx: u32) -> bool {
+        self.any_hooks
+            && self
+                .on_reorder_hooks
+                .get(kind_idx as usize)
+                .is_some_and(|h| !h.is_empty())
     }
 
     pub fn get_idx<R: RelationKind>(&self) -> Option<u32> {
@@ -814,7 +855,7 @@ impl World {
                 }
                 self.subject_index.remove(subject.index, old);
                 self.target_index.remove(kind_idx, old.target.index, subject);
-                if self.relations.on_remove_hook(kind_idx).is_some() {
+                if self.relations.has_remove_hook(kind_idx) {
                     self.hook_queue
                         .push(crate::world::HookEvent::RelationRemoved {
                             kind_idx,
@@ -831,7 +872,7 @@ impl World {
                 None => self.target_index.add(kind_idx, target, subject),
                 Some(i) => self.target_index.add_at(kind_idx, target, subject, i),
             }
-            if self.relations.on_add_hook(kind_idx).is_some() {
+            if self.relations.has_add_hook(kind_idx) {
                 self.hook_queue.push(crate::world::HookEvent::RelationAdded {
                     kind_idx,
                     subject,
@@ -850,7 +891,7 @@ impl World {
         let pair = RelationPair { kind_idx, target };
         if self.subject_index.remove(subject.index, pair) {
             self.target_index.remove(kind_idx, target.index, subject);
-            if self.relations.on_remove_hook(kind_idx).is_some() {
+            if self.relations.has_remove_hook(kind_idx) {
                 self.hook_queue
                     .push(crate::world::HookEvent::RelationRemoved {
                         kind_idx,
@@ -887,14 +928,17 @@ impl World {
                 .subject_index
                 .has(subject.index, RelationPair { kind_idx, target })
         {
-            self.target_index.move_to(kind_idx, target.index, subject, index);
+            if self.target_index.move_to(kind_idx, target.index, subject, index) {
+                self.queue_reorder_hook(kind_idx, subject, target);
+            }
             return;
         }
         self.add_relation_positioned(subject, kind_idx, target, Some(index));
     }
 
     /// Move an EXISTING relation's subject to `index` (clamped) in the target's
-    /// sibling list. Pure order change: no hooks fire, counts are untouched.
+    /// sibling list. Pure order change: the edge set and counts are untouched,
+    /// so add/remove hooks do NOT fire — only `on_relation_reorder` observers.
     /// Returns `false` when the pair does not exist (or either entity is dead) —
     /// this never creates a relation (use
     /// [`insert_relation_at`](Self::insert_relation_at) for ensure-at semantics).
@@ -917,7 +961,25 @@ impl World {
         {
             return false;
         }
-        self.target_index.move_to(kind_idx, target.index, subject, index)
+        let moved = self.target_index.move_to(kind_idx, target.index, subject, index);
+        if moved {
+            self.queue_reorder_hook(kind_idx, subject, target);
+        }
+        moved
+    }
+
+    /// Queue + flush the reorder hook event (shared by the two reorder paths).
+    #[inline]
+    fn queue_reorder_hook(&mut self, kind_idx: u32, subject: Entity, target: Entity) {
+        if self.relations.has_reorder_hook(kind_idx) {
+            self.hook_queue
+                .push(crate::world::HookEvent::RelationReordered {
+                    kind_idx,
+                    subject,
+                    target,
+                });
+            self.flush_hooks();
+        }
     }
 
     /// Position of `subject` in the `(kind, target)` sibling list — the read half

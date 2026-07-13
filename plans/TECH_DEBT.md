@@ -23,6 +23,18 @@
 
 ## 🔴 Soundness — недоделки borrow-модели (верификация 2026-07-04)
 
+- **MIRI-ER 🔴 ОТКРЫТ (найден 2026-07-13, попутно UI-кампании — PRE-EXISTING, подтверждено
+  stash-прогоном на `2303d76`) — Miri UB в `EventReader::read` вне планировщика.**
+  `system_param.rs:160` берёт `ptr: events as *const Events<T>` (указатель, унаследовавший
+  shared-borrow-tag) и в `read()` (`system_param.rs:190`) мутирует через `as_mut` — запись через
+  указатель, производный от `&` ⇒ UB под Stacked/Tree Borrows. Класс — тот же, что закрытый
+  MIRI-CD (raw-ptr без наследования тега); не ловилось раньше: тест
+  `removed_events_emitted_for_remove_and_despawn` не входил в целевой Miri-скоуп. Репро:
+  `cargo +nightly miri test -p apex-core --lib removed_events_emitted`. Фикс-класс: исходный
+  указатель без borrow-tag (`*const`-путь MIRI-CD) либо `UnsafeCell`-обёртка курсора. Брать
+  отдельным soundness-заходом (EventReader — горячий путь всего движка), не drive-by в
+  UI-кампании.
+
 > B1(в) (волна 6) выразила эксклюзивность в типах на КОНСТРУКТОРАХ запроса; аксессоры и часть
 > `World`/`SystemContext`-поверхности остались лазейками. Заявка «soundness в типах» до конца НЕ
 > выполнена. Приоритет — первым заходом.
