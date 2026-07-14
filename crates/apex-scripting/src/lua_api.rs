@@ -222,7 +222,7 @@ fn register_component_serde_api(lua: &mlua::Lua) -> mlua::Result<()> {
             let world = ctx_ref.world_ref();
             // Phase-B declared access applies to the serde path too — an
             // undeclared read is scheduler-blind (§0.2a: refuse loudly).
-            if let Ok(info) = crate::reflect::resolve_component(world, &name) {
+            if let Ok(info) = world.registry().find_by_name(&name) {
                 if !ctx_ref.declares_read(info.id) {
                     log::warn!("get_component: '{}' is not in the system's declared access", name);
                     return Ok(mlua::Value::Nil);
@@ -257,7 +257,7 @@ fn register_component_serde_api(lua: &mlua::Lua) -> mlua::Result<()> {
             let mut ctx_mut = ctx.borrow_mut();
             {
                 let world = ctx_mut.world_ref();
-                if let Ok(info) = crate::reflect::resolve_component(world, &name) {
+                if let Ok(info) = world.registry().find_by_name(&name) {
                     if !ctx_mut.declares_write(info.id) {
                         log::warn!(
                             "set_component: '{}' is not in the system's declared WRITE access",

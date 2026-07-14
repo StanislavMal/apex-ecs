@@ -1969,6 +1969,106 @@ impl World {
         self.component_tick(entity, component_id)
     }
 
+    // ── Dynamic serde-tree component access (RT-2) ─────────────
+    //
+    // The reflective path shared by the editor inspector, scripting
+    // (`get_component`/`set_component`) and reflective UI bindings: a
+    // JSON-registered component round-trips through `ComponentSerdeFns`
+    // as a `serde_json::Value` tree.
+
+    /// Read one component of one entity as a JSON tree. `Ok(None)` — the
+    /// entity is dead or lacks the component (probing is not an error);
+    /// `Err` — unknown/ambiguous name, no serde registration, or a non-JSON
+    /// serde format.
+    pub fn component_json(
+        &self,
+        entity: Entity,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let info = self.registry.find_by_name(name)?;
+        let component_id = info.id;
+        let serde_fns = info.serde.as_ref().ok_or_else(|| {
+            format!(
+                "component '{}' has no serde registration — register_component_serde_json it",
+                info.name
+            )
+        })?;
+        let Some(location) = self.entities.get_location(entity) else {
+            return Ok(None);
+        };
+        let arch = &self.archetypes[location.archetype_id.0 as usize];
+        let Some(col_idx) = arch.column_index(component_id) else {
+            return Ok(None);
+        };
+        // SAFETY: the row is alive (location just resolved), the column is the
+        // registered component's; serialize_fn reads it as the registered `T`.
+        let bytes = unsafe {
+            let ptr = arch.columns_raw()[col_idx].get_raw_ptr(location.row as usize);
+            (serde_fns.serialize_fn)(ptr, &mut crate::component::NoContext)
+        }
+        .map_err(|e| format!("serialize of '{}' failed: {e:?}", info.name))?;
+        let value = serde_json::from_slice(&bytes).map_err(|e| {
+            format!(
+                "component '{}' is registered with the '{}' serde format, not JSON \
+                 (register_component_serde_json for dynamic access): {e}",
+                info.name, serde_fns.format
+            )
+        })?;
+        Ok(Some(value))
+    }
+
+    /// REPLACE one component of one entity from a WHOLE JSON value tree
+    /// (deserialize + [`insert_dyn`](Self::insert_dyn); adds the component if
+    /// absent). The change tick is stamped — the write is visible to
+    /// `Changed<T>`. For a partial edit use
+    /// [`apply_component_json`](Self::apply_component_json).
+    pub fn set_component_json(
+        &mut self,
+        entity: Entity,
+        name: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        let info = self.registry.find_by_name(name)?;
+        let component_id = info.id;
+        let serde_fns = info.serde.as_ref().ok_or_else(|| {
+            format!(
+                "component '{}' has no serde registration — register_component_serde_json it",
+                info.name
+            )
+        })?;
+        if !self.is_alive(entity) {
+            return Err(format!("entity {entity:?} is not alive"));
+        }
+        let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+        let raw = (serde_fns.deserialize_fn)(&bytes, &mut crate::component::NoContext)
+            .map_err(|e| format!("deserialize into '{}' failed: {e:?}", info.name))?;
+        let tick = self.current_tick;
+        self.insert_dyn(entity, component_id, raw, tick);
+        Ok(())
+    }
+
+    /// PARTIAL component edit: current tree ⊕ `partial` (deep-merge,
+    /// [`json_merge`](crate::json_merge) — the `edit_setComponent` semantics)
+    /// → whole write via [`set_component_json`](Self::set_component_json).
+    /// On an absent component the partial must be a complete value.
+    pub fn apply_component_json(
+        &mut self,
+        entity: Entity,
+        name: &str,
+        partial: &serde_json::Value,
+    ) -> Result<(), String> {
+        let merged = match self.component_json(entity, name)? {
+            Some(mut base) => {
+                crate::component::json_merge(&mut base, partial);
+                base
+            }
+            None => partial.clone(),
+        };
+        self.set_component_json(entity, name, &merged).map_err(|e| {
+            format!("{e} (a partial write on an absent component must carry ALL fields)")
+        })
+    }
+
     /// Mutable access that updates the row's change-tick (change detection).
     ///
     /// Stamps the world's current tick → `Changed<T>` fires (as with a mutation

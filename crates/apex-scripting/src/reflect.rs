@@ -1,145 +1,42 @@
 //! Serde-tree component access from Lua (RT-2): `get_component` /
 //! `set_component` globals.
 //!
-//! This is the SAME reflective path the editor inspector uses
-//! (`ComponentSerdeFns` → JSON value tree → partial deep-merge →
-//! `insert_dyn`), lifted to scripting — a component registered with
+//! Thin scripting shims over the CORE dynamic serde-tree path
+//! (`World::component_json` / `apply_component_json` — the same mechanism the
+//! editor inspector's `edit_setComponent` uses): a component registered with
 //! `register_component_serde_json` is readable/writable from Lua WITHOUT a
-//! per-type `Scriptable` binding. Writes follow the partial-merge semantics of
-//! the editor's `edit_setComponent`: the Lua table carries ONLY the fields to
-//! change ([`apex_core::json_merge`]).
+//! per-type `Scriptable` binding. Writes follow partial-merge semantics (the
+//! Lua table carries ONLY the fields to change, [`apex_core::json_merge`]).
 //!
 //! Reads are immediate (`&World` is valid for the whole script run); writes
 //! are DEFERRED like every other script mutation (drained into the system's
 //! `Commands` buffer, applied at the sync point).
 
-use apex_core::component::{ComponentId, ComponentInfo};
 use apex_core::world::World;
-use apex_core::{json_merge, Entity, NoContext};
+use apex_core::Entity;
 
-/// Resolve a component by name: the full `type_name`, or its unambiguous last
-/// `::`-segment (`"UiText"` for `"apex_ui::text::UiText"`). Errors are strings
-/// for direct Lua warn/propagation (§0.2a — never silently no-op).
-pub(crate) fn resolve_component<'w>(
-    world: &'w World,
-    name: &str,
-) -> Result<&'w ComponentInfo, String> {
-    let registry = world.registry();
-    if let Some(info) = registry.iter().find(|i| i.name == name) {
-        return Ok(info);
-    }
-    let mut found: Option<&ComponentInfo> = None;
-    for info in registry.iter() {
-        if info.name.rsplit("::").next() == Some(name) {
-            if let Some(prev) = found {
-                return Err(format!(
-                    "component name '{}' is ambiguous ('{}' vs '{}') — use the full type name",
-                    name, prev.name, info.name
-                ));
-            }
-            found = Some(info);
-        }
-    }
-    found.ok_or_else(|| format!("component '{}' is not registered", name))
-}
-
-/// Read one component of one entity as a JSON tree via its serde fns.
-/// `Ok(None)` — the entity lacks the component (not an error: scripts probe).
+/// Read one component of one entity as a JSON tree (see
+/// [`World::component_json`]). `Ok(None)` — the entity lacks the component.
 pub(crate) fn component_json(
     world: &World,
     entity: Entity,
     name: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let info = resolve_component(world, name)?;
-    let serde_fns = info.serde.as_ref().ok_or_else(|| {
-        format!(
-            "component '{}' has no serde registration — register_component_serde_json it",
-            info.name
-        )
-    })?;
-    if !world.is_alive(entity) {
-        return Ok(None);
-    }
-    let query = world
-        .query_builder()
-        .build()
-        .map_err(|e| format!("point query failed: {e:?}"))?;
-    let Some(item) = query.get(entity) else {
-        return Ok(None);
-    };
-    let Some(ptr) = item.get_ptr(info.id) else {
-        return Ok(None);
-    };
-    // SAFETY: `ptr` is the live column slot of `info.id` on this entity's row;
-    // the serialize fn reads it as the registered `T`.
-    let bytes = unsafe { (serde_fns.serialize_fn)(ptr, &mut NoContext) }
-        .map_err(|e| format!("serialize of '{}' failed: {e:?}", info.name))?;
-    let value = serde_json::from_slice(&bytes).map_err(|e| {
-        format!(
-            "component '{}' is registered with the '{}' serde format, not JSON \
-             (register_component_serde_json for script access): {e}",
-            info.name, serde_fns.format
-        )
-    })?;
-    Ok(Some(value))
+    world.component_json(entity, name)
 }
 
 /// Apply a PARTIAL JSON value to one component of one entity (the deferred
-/// half of `set_component`): current tree ⊕ partial → whole write via
-/// `insert_dyn`. When the component is absent the partial must be a complete
-/// value (it becomes the insert). Failures warn loudly (§0.2a) — a script
-/// write must never crash the app.
+/// half of `set_component`). Failures warn loudly (§0.2a) — a script write
+/// must never crash the app.
 pub(crate) fn apply_component_json(
     world: &mut World,
     entity: Entity,
     name: &str,
     partial: &serde_json::Value,
 ) {
-    let (component_id, merged) = match prepare_component_write(world, entity, name, partial) {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            log::warn!("set_component('{name}'): {e}");
-            return;
-        }
-    };
-    let tick = world.current_tick();
-    world.insert_dyn(entity, component_id, merged, tick);
-}
-
-/// Resolve + merge + deserialize to raw column bytes (everything fallible
-/// before the world mutation).
-fn prepare_component_write(
-    world: &World,
-    entity: Entity,
-    name: &str,
-    partial: &serde_json::Value,
-) -> Result<(ComponentId, Vec<u8>), String> {
-    if !world.is_alive(entity) {
-        return Err(format!("entity {entity:?} is not alive"));
+    if let Err(e) = world.apply_component_json(entity, name, partial) {
+        log::warn!("set_component('{name}'): {e}");
     }
-    let current = component_json(world, entity, name)?;
-    let info = resolve_component(world, name)?;
-    let serde_fns = info
-        .serde
-        .as_ref()
-        .expect("checked by component_json above");
-    let merged = match current {
-        Some(mut base) => {
-            json_merge(&mut base, partial);
-            base
-        }
-        // Absent component: the partial must be the complete value.
-        None => partial.clone(),
-    };
-    let bytes = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
-    let raw = (serde_fns.deserialize_fn)(&bytes, &mut NoContext).map_err(|e| {
-        format!(
-            "deserialize into '{}' failed (partial write on an absent component \
-             must carry ALL fields): {e:?}",
-            info.name
-        )
-    })?;
-    Ok((info.id, raw))
 }
 
 #[cfg(test)]

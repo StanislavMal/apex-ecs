@@ -554,6 +554,31 @@ impl ComponentRegistry {
         self.by_id.get(id.0 as usize)
     }
 
+    /// RT-2: resolve a component by name — the full `type_name`, or its
+    /// unambiguous last `::`-segment (`"UiText"` for `"apex_ui::text::UiText"`).
+    /// The shared resolver of every dynamic consumer (scripting
+    /// `get_component`/`set_component`, reflective bindings). Errors are
+    /// human-readable strings (§0.2a: unknown and AMBIGUOUS names refuse
+    /// loudly instead of guessing).
+    pub fn find_by_name(&self, name: &str) -> Result<&ComponentInfo, String> {
+        if let Some(info) = self.by_id.iter().find(|i| i.name == name) {
+            return Ok(info);
+        }
+        let mut found: Option<&ComponentInfo> = None;
+        for info in &self.by_id {
+            if info.name.rsplit("::").next() == Some(name) {
+                if let Some(prev) = found {
+                    return Err(format!(
+                        "component name '{}' is ambiguous ('{}' vs '{}') — use the full type name",
+                        name, prev.name, info.name
+                    ));
+                }
+                found = Some(info);
+            }
+        }
+        found.ok_or_else(|| format!("component '{}' is not registered", name))
+    }
+
     /// Iterate over all registered components.
     pub fn iter(&self) -> impl Iterator<Item = &ComponentInfo> {
         self.by_id.iter()
