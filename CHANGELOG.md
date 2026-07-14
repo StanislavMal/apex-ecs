@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Added — реактивная обвязка для динамических потребителей (2026-07-14, ADR-009)
+
+- **Change-ticks у ресурсов (RT-1):** слот ресурса несёт тик; стемп на `insert_resource`,
+  на `&mut`-acquisition через эксклюзивный мир и на restore; `ResMut<T>` стемпит ЛЕНИВО на
+  `deref_mut` (аналог A13 у `Mut<T>`) — система, не писавшая в кадре, изменения не
+  создаёт. Чтение: `World::resource_changed_tick::<T>()`; клампинг wrap — в общем
+  `check_change_ticks`. Внутренние сигнатуры `Resources::insert/get_mut/try_get_mut` и
+  `ResourceSerdeFns::deserialize` получили `Tick` (внешний `World`-API не менялся).
+- **Ручной тик компонента:** `World::component_tick(entity, id)` /
+  `component_tick_of::<T>(entity)` — для потребителей вне запросов (биндинги, тулинг);
+  внутри систем канон прежний (`Changed<T>`).
+- **JSON-рефлексия ресурсов (RT-2, read-only):** `World::register_resource_reflect::<R>()`,
+  `resource_json_by_name`, `resource_changed_tick_by_name` (полное имя или однозначный
+  последний сегмент; неоднозначность — отказ).
+- **Lua: serde-путь к компонентам:** глобалы `get_component`/`set_component` (partial
+  deep-merge, семантика `edit_setComponent` редактора) через `ComponentSerdeFns`+`insert_dyn`
+  — достаточно `register_component_serde_json`, без per-type `Scriptable`; чтение немедленное,
+  запись отложенная через `Commands`; declared-access phase-B уважается. Канонический
+  `apex_core::json_merge` — один deep-merge на редактор/скрипты/движок. Sandbox дополнен
+  `assert`/`error`/`pcall`. Потребитель-первопроходец — рефлексивный `UiBind` движка (UI.5).
+
 ### Fixed — scheduler: ложный CircularDependency на chain «exclusive до params» (2026-07-13)
 
 - **Первый `compile()` игнорировал явные рёбра пользователя при построении

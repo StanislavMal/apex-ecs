@@ -136,7 +136,8 @@ impl ScriptEngine {
 
         // Standard libraries
         for name in &["math", "string", "table", "ipairs", "pairs", "next",
-                      "select", "tonumber", "tostring", "type", "unpack"] {
+                      "select", "tonumber", "tostring", "type", "unpack", "assert",
+                      "error", "pcall"] {
             if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
                 env.set(*name, val)?;
             }
@@ -145,7 +146,8 @@ impl ScriptEngine {
         // API functions
         for name in &["delta_time", "entity_count", "query", "commit", "system",
                       "spawn_entity", "despawn", "read_resource", "write_resource",
-                      "emit_event", "log", "print", "log_debug", "log_warn", "log_error",
+                      "emit_event", "get_component", "set_component",
+                      "log", "print", "log_debug", "log_warn", "log_error",
                       "inspect"] {
             if let Ok(val) = self.lua.globals().get::<mlua::Value>(*name) {
                 env.set(*name, val)?;

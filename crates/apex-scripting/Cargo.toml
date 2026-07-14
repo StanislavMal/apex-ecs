@@ -12,8 +12,12 @@ mlua.workspace    = true
 log.workspace     = true
 rustc-hash.workspace = true
 thiserror.workspace  = true
+# Serde-tree component access from Lua (get_component/set_component, RT-2).
+serde_json.workspace = true
 notify = "6.1"
 
 [dev-dependencies]
 # Compile-fail tests for the `#[derive(Scriptable)]` migrant traps
 trybuild = { workspace = true }
+# Serde derives for the serde-path (get_component/set_component) e2e tests
+serde = { workspace = true }

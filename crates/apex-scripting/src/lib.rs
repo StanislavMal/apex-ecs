@@ -73,6 +73,7 @@ pub mod context;
 pub mod error;
 pub mod iterators;
 pub mod lua_api;
+pub mod reflect;
 pub mod registrar;
 pub mod script_engine;
 

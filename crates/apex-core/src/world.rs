@@ -376,6 +376,7 @@ impl World {
     /// their own loop.
     pub fn check_change_ticks(&mut self) {
         let current = self.current_tick;
+        self.resources.check_change_ticks(current);
         for arch in &mut self.archetypes {
             for col in &mut arch.columns {
                 col.check_change_ticks(current);
@@ -902,7 +903,8 @@ impl World {
     // ── Resources ──────────────────────────────────────────────
 
     pub fn insert_resource<T: Send + Sync + 'static>(&mut self, value: T) {
-        self.resources.insert(value);
+        let tick = self.current_tick;
+        self.resources.insert(value, tick);
     }
 
     /// E7: include resource `R` in the snapshot (opt-in, bincode). After this,
@@ -928,7 +930,38 @@ impl World {
     /// `Ok(false)` = type not registered for serde on this world (caller warns,
     /// §0.2a). Consumed by `WorldSerializer`.
     pub fn restore_resource_serde(&mut self, type_name: &str, bytes: &[u8]) -> Result<bool, String> {
-        self.resources.restore_serde(type_name, bytes)
+        let tick = self.current_tick;
+        self.resources.restore_serde(type_name, bytes, tick)
+    }
+
+    /// RT-2: opt resource `R` into the name-addressed read-only JSON view
+    /// (dynamic consumers: reflective bindings, scripting, inspector-class
+    /// tools). Independent of the snapshot registry.
+    pub fn register_resource_reflect<R: serde::Serialize + Send + Sync + 'static>(&mut self) {
+        self.resources.register_reflect::<R>();
+    }
+
+    /// RT-2: serialize a reflect-registered resource to a JSON tree by name
+    /// (full `type_name` or unambiguous last segment). `None` — name unknown/
+    /// ambiguous or the resource is not currently present.
+    pub fn resource_json_by_name(&self, name: &str) -> Option<Result<serde_json::Value, String>> {
+        let fns = self.resources.reflect_by_name(name)?;
+        (fns.to_json)(&self.resources)
+    }
+
+    /// RT-1: the change tick of resource `T` (`None` when absent). Stamped by
+    /// `insert_resource`, `&mut` acquisition through the world, and
+    /// `ResMut::deref_mut` (lazy). Compare with
+    /// [`Tick::is_newer_than`](crate::component::Tick::is_newer_than).
+    pub fn resource_changed_tick<T: Send + Sync + 'static>(&self) -> Option<Tick> {
+        self.resources.changed_tick::<T>()
+    }
+
+    /// RT-1 + RT-2: the change tick of a REFLECT-REGISTERED resource by name
+    /// (same resolution as [`resource_json_by_name`](Self::resource_json_by_name)).
+    pub fn resource_changed_tick_by_name(&self, name: &str) -> Option<Tick> {
+        let fns = self.resources.reflect_by_name(name)?;
+        self.resources.changed_tick_by_type(&fns.type_id)
     }
 
     #[track_caller]
@@ -936,17 +969,23 @@ impl World {
         self.resources.get::<T>()
     }
 
+    /// Exclusive resource access. Stamps the change tick on ACQUISITION (RT-1:
+    /// `&mut T` through the exclusive world is presumed a write; the precise
+    /// lazy path is a `ResMut<T>` system parameter).
     #[track_caller]
     pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
-        self.resources.get_mut::<T>()
+        let tick = self.current_tick;
+        self.resources.get_mut::<T>(tick)
     }
 
     pub fn try_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.resources.try_get::<T>()
     }
 
+    /// See [`resource_mut`](Self::resource_mut) for the stamping contract.
     pub fn try_resource_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
-        self.resources.try_get_mut::<T>()
+        let tick = self.current_tick;
+        self.resources.try_get_mut::<T>(tick)
     }
 
     pub fn remove_resource<T: Send + Sync + 'static>(&mut self) -> Option<T> {
@@ -1913,6 +1952,23 @@ impl World {
         }
     }
 
+    /// RT-1: the change tick of one component on one entity (`None` when the
+    /// entity is dead or lacks the component). Manual change detection for
+    /// dynamic consumers (reflective bindings, tooling) — compare with
+    /// [`Tick::is_newer_than`](crate::component::Tick::is_newer_than); inside
+    /// a query prefer the `Changed<T>` filter.
+    pub fn component_tick(&self, entity: Entity, component_id: ComponentId) -> Option<Tick> {
+        let location = self.entities.get_location(entity)?;
+        self.archetypes[location.archetype_id.0 as usize]
+            .change_tick_of(location.row as usize, component_id)
+    }
+
+    /// Typed [`component_tick`](Self::component_tick).
+    pub fn component_tick_of<T: Component>(&self, entity: Entity) -> Option<Tick> {
+        let component_id = self.registry.get_id::<T>()?;
+        self.component_tick(entity, component_id)
+    }
+
     /// Mutable access that updates the row's change-tick (change detection).
     ///
     /// Stamps the world's current tick → `Changed<T>` fires (as with a mutation
@@ -2729,12 +2785,12 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn resource_mut_unchecked<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
-            let ptr = self
-                .world()
+            let world = self.world();
+            let (ptr, tick) = world
                 .resources
-                .get_raw_ptr::<T>()
+                .get_raw_parts::<T>()
                 .expect("resource_mut_unchecked: resource not found");
-            ResMut::from_ptr(ptr)
+            ResMut::from_raw_parts(ptr, tick, world.current_tick())
         }
     }
 
@@ -2749,10 +2805,11 @@ impl<'w> SystemContext<'w> {
     #[inline]
     pub fn try_resource_mut_unchecked<T: Send + Sync + 'static>(&self) -> Option<ResMut<'_, T>> {
         unsafe {
-            self.world()
+            let world = self.world();
+            world
                 .resources
-                .get_raw_ptr::<T>()
-                .map(|ptr| ResMut::from_ptr(ptr))
+                .get_raw_parts::<T>()
+                .map(|(ptr, tick)| ResMut::from_raw_parts(ptr, tick, world.current_tick()))
         }
     }
 
@@ -3769,6 +3826,99 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     struct Score(u32);
+
+    // ── RT-1: resource change ticks ────────────────────────────
+
+    #[test]
+    fn resource_change_tick_lifecycle() {
+        let mut world = World::new();
+        assert_eq!(world.resource_changed_tick::<Score>(), None, "absent = None");
+
+        world.insert_resource(Score(1));
+        let inserted_at = world.resource_changed_tick::<Score>().expect("stamped on insert");
+        assert_eq!(inserted_at, world.current_tick());
+
+        // A frame boundary later the stale tick is NOT newer than last_run.
+        world.advance_change_tick();
+        let last_run = world.last_run_tick();
+        assert!(
+            !world.resource_changed_tick::<Score>().expect("present").is_newer_than(last_run),
+            "no mutation this frame — not 'changed'"
+        );
+
+        // `&mut` acquisition through the exclusive world stamps.
+        world.resource_mut::<Score>().0 = 2;
+        assert!(
+            world.resource_changed_tick::<Score>().expect("present").is_newer_than(last_run),
+            "mutation this frame — 'changed'"
+        );
+    }
+
+    #[test]
+    fn shared_resource_read_does_not_change_tick() {
+        let mut world = World::new();
+        world.insert_resource(Score(7));
+        world.advance_change_tick();
+        let last_run = world.last_run_tick();
+        let _ = world.resource::<Score>();
+        let _ = world.try_resource::<Score>();
+        assert!(
+            !world.resource_changed_tick::<Score>().expect("present").is_newer_than(last_run)
+        );
+    }
+
+    // ── RT-1: manual component tick access ─────────────────────
+
+    #[test]
+    fn component_tick_manual_change_detection() {
+        struct Hp(u32);
+        impl crate::component::Component for Hp {}
+        struct Unrelated(#[allow(dead_code)] u32);
+        impl crate::component::Component for Unrelated {}
+
+        let mut world = World::new();
+        world.register_component::<Unrelated>();
+        let e = world.spawn((Hp(10),));
+        let dead = world.spawn((Hp(1),));
+        world.despawn(dead);
+
+        assert!(world.component_tick_of::<Hp>(e).is_some());
+        assert_eq!(world.component_tick_of::<Hp>(dead), None, "dead entity = None");
+        assert_eq!(world.component_tick_of::<Unrelated>(e), None, "missing component = None");
+
+        world.advance_change_tick();
+        let last_run = world.last_run_tick();
+        assert!(
+            !world.component_tick_of::<Hp>(e).expect("present").is_newer_than(last_run),
+            "untouched row is not 'changed'"
+        );
+        world.get_mut::<Hp>(e).expect("alive").0 = 11;
+        assert!(
+            world.component_tick_of::<Hp>(e).expect("present").is_newer_than(last_run),
+            "get_mut write stamps the row tick"
+        );
+    }
+
+    // ── RT-2: resource JSON reflection through the world ───────
+
+    #[test]
+    fn resource_json_by_name_roundtrip() {
+        #[derive(serde::Serialize)]
+        struct Inventory {
+            gold: u32,
+        }
+        let mut world = World::new();
+        world.register_resource_reflect::<Inventory>();
+        assert!(world.resource_json_by_name("Inventory").is_none(), "not inserted yet");
+        world.insert_resource(Inventory { gold: 250 });
+        let json = world
+            .resource_json_by_name("Inventory")
+            .expect("present")
+            .expect("serializes");
+        assert_eq!(json.pointer("/gold").and_then(|v| v.as_u64()), Some(250));
+        assert!(world.resource_changed_tick_by_name("Inventory").is_some());
+        assert!(world.resource_json_by_name("Unknown").is_none());
+    }
 
     // ── W2-3: tick-wrap clamp ──────────────────────────────────
 

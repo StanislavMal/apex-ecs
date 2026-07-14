@@ -200,12 +200,12 @@ impl<'w> SubWorld<'w> {
     #[inline]
     pub fn resource_mut<T: Send + Sync + 'static>(&self) -> ResMut<'_, T> {
         unsafe {
-            let ptr = self
-                .world_ref()
+            let world = self.world_ref();
+            let (ptr, tick) = world
                 .resources
-                .get_raw_ptr::<T>()
+                .get_raw_parts::<T>()
                 .expect("resource_mut: resource not found");
-            ResMut::from_ptr(ptr)
+            ResMut::from_raw_parts(ptr, tick, world.current_tick())
         }
     }
 

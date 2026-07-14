@@ -151,6 +151,12 @@ pub struct ScriptContext {
     /// in the comment on `deferred_resource_writes`.
     pub(crate) deferred_events: Vec<(String, mlua::RegistryKey)>,
 
+    /// Buffer of deferred serde-path component writes (`set_component`, RT-2):
+    /// (entity, component name, PARTIAL JSON value). The value is converted
+    /// out of the VM at queue time (no RegistryKey needed — it is plain data),
+    /// applied via the `Commands` buffer at the sync point.
+    pub(crate) deferred_component_serde_writes: Vec<(Entity, String, serde_json::Value)>,
+
     /// Entity count — cached to avoid calling world through the ptr every time
     entity_count_cache: usize,
 
@@ -180,6 +186,7 @@ impl ScriptContext {
             event_bindings:          HashMap::new(),
             deferred_resource_writes: Vec::new(),
             deferred_events:         Vec::new(),
+            deferred_component_serde_writes: Vec::new(),
             entity_count_cache:      0,
             auto_commit:             false,
             script_systems:          Vec::new(),
@@ -211,6 +218,7 @@ impl ScriptContext {
         self.deferred_spawns.clear();
         self.deferred_resource_writes.clear();
         self.deferred_events.clear();
+        self.deferred_component_serde_writes.clear();
     }
 
     /// Reset the world pointer after the script finishes.
@@ -284,6 +292,16 @@ impl ScriptContext {
         self.deferred_despawns.push(entity);
     }
 
+    /// Queue a deferred serde-path component write (`set_component`, RT-2).
+    pub fn queue_component_serde_write(
+        &mut self,
+        entity: Entity,
+        component: String,
+        partial: serde_json::Value,
+    ) {
+        self.deferred_component_serde_writes.push((entity, component, partial));
+    }
+
     /// Register a per-component spawn applier (see [`SpawnApplierFn`]).
     pub(crate) fn add_spawn_applier(&mut self, name: String, applier: SpawnApplierFn) {
         self.spawn_appliers.insert(name, applier);
@@ -326,6 +344,14 @@ impl ScriptContext {
                 }
                 let _ = lua.remove_registry_value(reg_key);
             }
+        }
+
+        // Serde-path component writes (RT-2) apply after spawns, in buffered
+        // order — plain data, no VM access needed at apply time.
+        for (entity, name, partial) in std::mem::take(&mut self.deferred_component_serde_writes) {
+            commands.add(move |world: &mut apex_core::world::World| {
+                crate::reflect::apply_component_json(world, entity, &name, &partial);
+            });
         }
     }
 

@@ -56,6 +56,7 @@
 
 use crate::{
     access::AccessDescriptor,
+    component::Tick,
     events::{EventCursor, EventReadGuard, Events},
     query::WorldQuery,
 };
@@ -101,17 +102,47 @@ impl<T: Send + Sync + 'static + std::fmt::Debug> std::fmt::Debug for Res<'_, T> 
 }
 
 /// Mutable access to a resource.
+///
+/// Carries the resource's change-tick cell and stamps it LAZILY on `deref_mut`
+/// (RT-1, the A13 discipline of `Mut<T>`): merely holding a `ResMut<T>` is not
+/// a change; writing through it is. `World::resource_changed_tick` /
+/// `Resources::changed_tick` read the stamp.
 pub struct ResMut<'w, T: Send + Sync + 'static> {
     ptr: *mut T,
+    /// The resource's change-tick cell (`None` for bridge constructions that
+    /// have no tick to stamp — see [`from_ptr`](Self::from_ptr)).
+    tick: Option<*const crate::archetype::TickCell>,
+    /// The tick stamped on mutation (the world's current tick at fetch).
+    this_run: Tick,
     _marker: PhantomData<&'w mut T>,
 }
 
 impl<'w, T: Send + Sync + 'static> ResMut<'w, T> {
     /// # Safety
     /// `ptr` is valid for `'w`; the scheduler guarantees exclusive access.
+    /// Change detection is BLIND through this constructor (no tick cell) —
+    /// world/context fetch paths use [`from_raw_parts`](Self::from_raw_parts).
     pub unsafe fn from_ptr(ptr: *mut T) -> Self {
         Self {
             ptr,
+            tick: None,
+            this_run: Tick::ZERO,
+            _marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    /// `ptr` and `tick` come from `Resources::get_raw_parts` and are valid for
+    /// `'w`; the scheduler guarantees exclusive access to the resource.
+    pub(crate) unsafe fn from_raw_parts(
+        ptr: *mut T,
+        tick: *const crate::archetype::TickCell,
+        this_run: Tick,
+    ) -> Self {
+        Self {
+            ptr,
+            tick: Some(tick),
+            this_run,
             _marker: PhantomData,
         }
     }
@@ -128,6 +159,11 @@ impl<T: Send + Sync + 'static> std::ops::Deref for ResMut<'_, T> {
 impl<T: Send + Sync + 'static> std::ops::DerefMut for ResMut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
+        if let Some(tick) = self.tick {
+            // SAFETY: the cell outlives `'w` (it lives in the resource slot);
+            // exclusive access is the scheduler's guarantee for this ResMut.
+            unsafe { (*tick).set(self.this_run) };
+        }
         unsafe { &mut *self.ptr }
     }
 }
@@ -1038,6 +1074,25 @@ impl<E: Send + Sync + 'static> SystemParam for Extract<Listen<E>> {
 mod tests {
     use super::*;
     use crate::events::{EventCursor, Events};
+
+    /// RT-1: `ResMut` stamps the resource change tick LAZILY — holding it or
+    /// reading through it is not a change; `deref_mut` is (the resource analog
+    /// of `Mut<T>`'s A13 discipline).
+    #[test]
+    fn resmut_stamps_tick_only_on_deref_mut() {
+        struct Score(u32);
+        let mut res = crate::resources::Resources::new();
+        res.insert(Score(1), Tick(1));
+        let (ptr, tick) = res.get_raw_parts::<Score>().expect("present");
+
+        // SAFETY: the test is the sole owner of the resource.
+        let mut rm: ResMut<'_, Score> = unsafe { ResMut::from_raw_parts(ptr, tick, Tick(5)) };
+        assert_eq!(rm.0, 1, "read through Deref");
+        assert_eq!(res.changed_tick::<Score>(), Some(Tick(1)), "read is not a change");
+
+        rm.0 = 2;
+        assert_eq!(res.changed_tick::<Score>(), Some(Tick(5)), "deref_mut stamped this_run");
+    }
 
     /// F4: a persistent per-system cursor resumes across runs — reading the same
     /// readable buffer twice (a FixedUpdate catch-up) does NOT duplicate, unlike

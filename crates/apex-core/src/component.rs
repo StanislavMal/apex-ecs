@@ -328,6 +328,32 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
     }
 }
 
+// ── JSON deep merge (RT-2) ─────────────────────────────────────
+
+/// Deep-merge a PARTIAL JSON value tree into `base`: objects merge key-by-key
+/// recursively; any non-object (numbers, strings, arrays, enum-variant
+/// switches) overwrites the base value at that spot.
+///
+/// The canonical "partial component edit" semantics shared by every dynamic
+/// writer of the serde tree (the editor's `edit_setComponent`, script
+/// `set_component`, reflective UI bindings): read the whole component to JSON,
+/// merge the partial, write the whole component back.
+pub fn json_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(over_map)) => {
+            for (k, v) in over_map {
+                match base_map.get_mut(k) {
+                    Some(slot) => json_merge(slot, v),
+                    None => {
+                        base_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (slot, over) => *slot = over.clone(),
+    }
+}
+
 // ── ComponentRegistry ──────────────────────────────────────────
 
 pub struct ComponentRegistry {

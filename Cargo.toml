@@ -52,8 +52,10 @@ glam = { version = "0.32", features = ["serde"] }
 # Channels for WorldBridge
 crossbeam-channel = "0.5"
 
-# Scripting — Lua 5.4 via mlua
-mlua = { version = "0.10", features = ["lua54", "vendored"] }
+# Scripting — Lua 5.4 via mlua. `serialize` powers the serde-tree component
+# access (`get_component`/`set_component` Lua globals, RT-2): mlua::Value ↔
+# serde_json::Value conversion via LuaSerdeExt.
+mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
 
 # External impl Component for cgmath::Matrix4<f32> (optional)
 cgmath = "0.18"

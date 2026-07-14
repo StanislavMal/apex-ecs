@@ -325,3 +325,80 @@ fn set_active_selects_the_running_script() {
     // Selecting a non-existent script is a loud error, not a silent no-op.
     assert!(engine.set_active("does_not_exist").is_err());
 }
+
+// ── Serde-path component access (RT-2): get_component / set_component ──
+
+#[derive(Component, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Inventory {
+    gold: u32,
+    label: String,
+}
+
+/// The reflective (serde-tree) path from Lua: a component registered ONLY with
+/// `register_component_serde_json` (no `Scriptable` binding) is readable as a
+/// table and writable with a PARTIAL table (deep-merge, the editor
+/// `edit_setComponent` semantics).
+#[test]
+fn script_serde_path_get_and_partial_set() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_component_serde_json::<Inventory>();
+
+    let e = world.spawn((Inventory { gold: 100, label: "start".into() },));
+    let id = format!("{}:{}", e.index(), e.generation());
+
+    engine
+        .load_script_str(
+            "serde_path",
+            &format!(
+                r#"
+                function run()
+                    local inv = get_component("{id}", "Inventory")
+                    -- partial write: only gold changes, label must survive
+                    set_component("{id}", "Inventory", {{ gold = inv.gold + 23 }})
+                end
+            "#
+            ),
+        )
+        .expect("script must compile");
+
+    engine.run(0.016, &mut world);
+
+    assert_eq!(
+        world.get::<Inventory>(e),
+        Some(&Inventory { gold: 123, label: "start".into() }),
+        "read via get_component fed a partial set_component; untouched fields survived"
+    );
+}
+
+/// Unknown names / non-serde components warn and return nil instead of crashing.
+#[test]
+fn script_serde_path_is_loud_but_safe_on_errors() {
+    let mut world = World::new();
+    let mut engine = ScriptEngine::new();
+    world.register_component_serde_json::<Inventory>();
+    let e = world.spawn((Inventory { gold: 1, label: "x".into() },));
+    let id = format!("{}:{}", e.index(), e.generation());
+
+    engine
+        .load_script_str(
+            "bad_names",
+            &format!(
+                r#"
+                function run()
+                    assert(get_component("{id}", "NoSuchComponent") == nil)
+                    assert(get_component("not-an-id", "Inventory") == nil)
+                    set_component("{id}", "NoSuchComponent", {{ x = 1 }})
+                end
+            "#
+            ),
+        )
+        .expect("script must compile");
+
+    engine.run(0.016, &mut world);
+    assert_eq!(
+        world.get::<Inventory>(e),
+        Some(&Inventory { gold: 1, label: "x".into() }),
+        "error paths must not corrupt the world"
+    );
+}

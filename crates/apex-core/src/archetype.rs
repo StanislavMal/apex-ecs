@@ -51,6 +51,16 @@ impl TickCell {
     pub(crate) fn get_mut(&mut self) -> &mut Tick {
         self.0.get_mut()
     }
+
+    /// Interior write through `&self` — the `ResMut::deref_mut` lazy stamp
+    /// (RT-1). Concurrent writers are excluded by the same scheduler
+    /// `AccessDescriptor` discipline that guards row ticks.
+    #[inline]
+    pub(crate) fn set(&self, tick: Tick) {
+        // SAFETY: exclusive access to the resource (and thus its tick cell) is
+        // guaranteed by the scheduler while a `ResMut` is live.
+        unsafe { *self.0.get() = tick }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -592,6 +602,14 @@ impl Archetype {
     ) -> Option<&mut T> {
         let col_idx = self.column_index(component_id)?;
         Some(self.columns[col_idx].get_mut::<T>(row))
+    }
+
+    /// The change tick of one component in the given row (`None` if the
+    /// archetype lacks the component). Manual change detection for dynamic
+    /// consumers (RT-1) — compare with `Tick::is_newer_than`.
+    pub fn change_tick_of(&self, row: usize, component_id: ComponentId) -> Option<Tick> {
+        let col_idx = self.column_index(component_id)?;
+        Some(self.columns[col_idx].get_tick(row))
     }
 
     /// Update the change tick for a component in the given row.

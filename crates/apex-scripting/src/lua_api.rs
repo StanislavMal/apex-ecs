@@ -1,6 +1,6 @@
 //! Registration of the global Lua functions: `delta_time`, `entity_count`,
 //! `query`, `commit`, `spawn_entity`, `despawn`, `read_resource`,
-//! `write_resource`, `emit_event`, `log`.
+//! `write_resource`, `emit_event`, `get_component`, `set_component`, `log`.
 //!
 //! All functions obtain the context via `lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()`
 //! and work with the world through it within the scope of a `ScriptEngine::run()` call.
@@ -24,6 +24,7 @@ pub fn register_globals(lua: &mlua::Lua) -> mlua::Result<()> {
     register_despawn(lua)?;
     register_resource_api(lua)?;
     register_event_api(lua)?;
+    register_component_serde_api(lua)?;
     register_log(lua)?;
     register_log_levels(lua)?;
     register_inspect(lua)?;
@@ -197,6 +198,79 @@ fn register_resource_api(lua: &mlua::Lua) -> mlua::Result<()> {
         let result = ctx.borrow_mut().write_resource(lua, &type_name, value);
         result
     })?)
+}
+
+// ── get_component / set_component (serde path, RT-2) ──────────
+
+/// `get_component(entity_id, name)` — read one component as a Lua table via
+/// the serde-tree path (the editor inspector's mechanism); `set_component(
+/// entity_id, name, partial_table)` — deferred PARTIAL write (only the fields
+/// to change, deep-merged; the editor `edit_setComponent` semantics). `name`
+/// is the full type name or its unambiguous last segment. Requires the
+/// component to be registered with `register_component_serde_json`; no
+/// per-type `Scriptable` binding is needed.
+fn register_component_serde_api(lua: &mlua::Lua) -> mlua::Result<()> {
+    lua.globals().set("get_component", lua.create_function(
+        |lua, (entity_id, name): (mlua::Value, String)| {
+            let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
+                .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
+            let Some(entity) = iterators::parse_entity_id(&entity_id) else {
+                log::warn!("get_component: invalid entity id {:?}", entity_id);
+                return Ok(mlua::Value::Nil);
+            };
+            let ctx_ref = ctx.borrow();
+            let world = ctx_ref.world_ref();
+            // Phase-B declared access applies to the serde path too — an
+            // undeclared read is scheduler-blind (§0.2a: refuse loudly).
+            if let Ok(info) = crate::reflect::resolve_component(world, &name) {
+                if !ctx_ref.declares_read(info.id) {
+                    log::warn!("get_component: '{}' is not in the system's declared access", name);
+                    return Ok(mlua::Value::Nil);
+                }
+            }
+            match crate::reflect::component_json(world, entity, &name) {
+                Ok(Some(value)) => {
+                    use mlua::LuaSerdeExt;
+                    Ok(lua.to_value(&value)?)
+                }
+                Ok(None) => Ok(mlua::Value::Nil),
+                Err(e) => {
+                    log::warn!("get_component('{}'): {}", name, e);
+                    Ok(mlua::Value::Nil)
+                }
+            }
+        },
+    )?)?;
+
+    lua.globals().set("set_component", lua.create_function(
+        |lua, (entity_id, name, value): (mlua::Value, String, mlua::Value)| {
+            let ctx = lua.app_data_ref::<Rc<RefCell<ScriptContext>>>()
+                .ok_or_else(|| mlua::Error::runtime("no ScriptContext"))?;
+            let Some(entity) = iterators::parse_entity_id(&entity_id) else {
+                log::warn!("set_component: invalid entity id {:?}", entity_id);
+                return Ok(());
+            };
+            let partial: serde_json::Value = {
+                use mlua::LuaSerdeExt;
+                lua.from_value(value)?
+            };
+            let mut ctx_mut = ctx.borrow_mut();
+            {
+                let world = ctx_mut.world_ref();
+                if let Ok(info) = crate::reflect::resolve_component(world, &name) {
+                    if !ctx_mut.declares_write(info.id) {
+                        log::warn!(
+                            "set_component: '{}' is not in the system's declared WRITE access",
+                            name
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            ctx_mut.queue_component_serde_write(entity, name, partial);
+            Ok(())
+        },
+    )?)
 }
 
 // ── emit_event(name, value) ────────────────────────────────────
