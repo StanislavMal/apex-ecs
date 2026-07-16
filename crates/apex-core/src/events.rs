@@ -27,6 +27,24 @@
 //!
 //! For "peek without advancing" use [`EventReadGuard::peek`].
 //!
+//! # Retention semantics: "running is reading"
+//!
+//! Events are retained (no-loss) while some reader cursor lags. What moves a
+//! cursor is defined at the READER level, not here:
+//!
+//! - A DECLARED system reader (the `EventReader<E>` param / `system!` event
+//!   param / `Listen<E>`) advances to the end of the buffer when its system
+//!   finishes a run — whether or not the body called `.read()`. Running IS
+//!   reading; an early return can never stall retention.
+//! - A system the scheduler did NOT run (run-condition gate, disabled stage)
+//!   keeps its cursor in place — events wait for it. This is the no-loss
+//!   guarantee: declarative gating is the sanctioned way to accumulate.
+//! - Standalone cursors ([`Events::add_reader`]) move only via explicit
+//!   `read`/`advance_*` calls — the caller owns the retention trade-off.
+//!
+//! A buffer starved for ≥ 64 consecutive ticks logs a rate-limited warning
+//! (see [`Events::retained_ticks`]) — a very long gate or a stalled cursor.
+//!
 //! # Thread-safety
 //!
 //! `Events<T>` is not `Sync`. To send events from parallel
@@ -82,7 +100,16 @@ pub struct Events<T> {
     /// Invariant: lagging_count == cursors.iter().flatten().filter(|&&p| p < events.len()).count()
     /// Used for the O(1) check in `all_readers_caught_up()`.
     lagging_count: u32,
+    /// Consecutive `update()` calls the buffer was RETAINED (some reader
+    /// lagging). Legitimate for a scheduler-gated system, but a long-starved
+    /// buffer is a loud diagnostic (§0.2a) — see [`Self::update`]. Reset when
+    /// every reader catches up.
+    retained_ticks: u32,
 }
+
+/// First retained-tick count that logs the starvation warning; every power of
+/// two after that logs again (64 → 128 → 256 …, rate-limited by construction).
+const STARVATION_WARN_TICKS: u32 = 64;
 
 impl<T> Events<T> {
     pub fn new() -> Self {
@@ -94,7 +121,14 @@ impl<T> Events<T> {
             next_cursor_id: 0,
             free_list: Vec::new(),
             lagging_count: 0,
+            retained_ticks: 0,
         }
+    }
+
+    /// Consecutive ticks the read buffer has been retained by a lagging reader
+    /// (`0` = every reader caught up). Diagnostic accessor (starvation tests).
+    pub fn retained_ticks(&self) -> u32 {
+        self.retained_ticks
     }
 
     /// Send an event into the current tick.
@@ -260,7 +294,23 @@ impl<T> Events<T> {
             }
             std::mem::swap(&mut self.events, &mut self.pending);
             self.pending.clear();
+            self.retained_ticks = 0;
         } else {
+            // Starvation diagnostic (§0.2a): retention is the no-loss guarantee
+            // working for a scheduler-gated system, but a buffer starved for
+            // MANY ticks is either a very long gate (worth knowing about) or a
+            // stalled reader bug — say so loudly, rate-limited (64/256/1024…).
+            self.retained_ticks = self.retained_ticks.saturating_add(1);
+            let t = self.retained_ticks;
+            if t >= STARVATION_WARN_TICKS && t.is_power_of_two() {
+                let lagging = self.lagging_count;
+                let held = self.events.len();
+                log::warn!(
+                    "events<{}>: buffer retained for {t} ticks ({held} events held, \
+                     {lagging} lagging reader(s)) — a long-gated system, or a stalled cursor",
+                    std::any::type_name::<T>(),
+                );
+            }
             // Some readers are still behind. Append the NEW events AFTER the old
             // ones, so a lagging cursor at position `p` reads `old[p..]` and then
             // flows straight into the new events, and a caught-up cursor sitting

@@ -23,17 +23,18 @@
 
 ## 🔴 Soundness — недоделки borrow-модели (верификация 2026-07-04)
 
-- **MIRI-ER 🔴 ОТКРЫТ (найден 2026-07-13, попутно UI-кампании — PRE-EXISTING, подтверждено
-  stash-прогоном на `2303d76`) — Miri UB в `EventReader::read` вне планировщика.**
-  `system_param.rs:160` берёт `ptr: events as *const Events<T>` (указатель, унаследовавший
-  shared-borrow-tag) и в `read()` (`system_param.rs:190`) мутирует через `as_mut` — запись через
-  указатель, производный от `&` ⇒ UB под Stacked/Tree Borrows. Класс — тот же, что закрытый
-  MIRI-CD (raw-ptr без наследования тега); не ловилось раньше: тест
-  `removed_events_emitted_for_remove_and_despawn` не входил в целевой Miri-скоуп. Репро:
-  `cargo +nightly miri test -p apex-core --lib removed_events_emitted`. Фикс-класс: исходный
-  указатель без borrow-tag (`*const`-путь MIRI-CD) либо `UnsafeCell`-обёртка курсора. Брать
-  отдельным soundness-заходом (EventReader — горячий путь всего движка), не drive-by в
-  UI-кампании.
+- **MIRI-ER ✅ ЗАКРЫТ (2026-07-16, заход «running is reading», ADR-010) — Miri UB в
+  `EventReader::read` устранён.** Было: `ptr: events as *const Events<T>` (указатель, унаследовавший
+  shared-borrow-tag от `&mut`) + мутация через `as_mut` в `read()` ⇒ UB под Stacked/Tree Borrows
+  (класс MIRI-CD). Фикс: `EventReader.ptr` = `*mut Events<T>` ПРЯМЫМ кастом из `&mut` (провенанс
+  записи сохранён); `iter`/`read`/`Drop` через него. Закрыт совместно с семантическим редизайном
+  ридеров (**ADR-010 «запуск = прочтение»**: drop-advance персистентного курсора — ран-но-не-читавшая
+  система не может удержать retention и вызвать пере-доставку; `Listen::fetch` →
+  `event_reader_persistent_auto`; starvation-warn ≥64 тиков, `Events::retained_ticks()`).
+  Триггер: движковый баг «клавиша A при фокусе списка спамит каждый кадр» (ui_virtual_list, найден
+  юзером). Верификация: Miri чист на репро (`removed_events_emitted`) + событийных тестах (5/5);
+  ядро 44 тест-группы + clippy 0; движок: apex-input на `_auto`-курсорах, регресс-тест спама зелен
+  БЕЗ per-site дренажа (откачен), goldens 720/0 байт-идентичны.
 
 > B1(в) (волна 6) выразила эксклюзивность в типах на КОНСТРУКТОРАХ запроса; аксессоры и часть
 > `World`/`SystemContext`-поверхности остались лазейками. Заявка «soundness в типах» до конца НЕ

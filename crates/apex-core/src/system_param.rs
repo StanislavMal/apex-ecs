@@ -174,14 +174,35 @@ unsafe impl<T: Send + Sync + 'static> Sync for ResMut<'_, T> {}
 // ── EventReader / EventWriter ──────────────────────────────────
 
 /// Event reader — uses a per-reader cursor.
+///
+/// # "Running is reading" (the retention contract)
+///
+/// A PERSISTENT reader (the declared `EventReader<E>` system param / `system!`
+/// event param / `Listen<E>`) consumes its backlog by the mere fact that its
+/// system RAN: on drop at the end of the run the cursor advances to the end of
+/// the buffer, exactly as if the body had called `.read()` and ignored the
+/// items. A system therefore NEVER has to "drain" its readers on an early
+/// return — an un-drained reader cannot pin the queue's no-loss retention and
+/// re-deliver stale events (the input-spam class of bug is unrepresentable).
+///
+/// No-loss retention remains for systems the SCHEDULER did not run (a
+/// run-condition gate, a disabled stage): their cursor does not move and
+/// events wait for them. "I want to accumulate" is expressed by declarative
+/// gating, not by an early return inside the body. For a deliberate partial
+/// consume use the queue-level [`Events::read_partial`]/`advance_reader_by`.
 pub struct EventReader<'w, T: Send + Sync + 'static> {
-    /// Raw pointer to allow mutable access via `read()`.
-    ptr: *const Events<T>,
+    /// Mutable queue pointer. Derived from `&mut Events<T>` via a DIRECT
+    /// `as *mut` cast (never through a shared reborrow), so writes through it
+    /// keep provenance under Stacked/Tree Borrows (the MIRI-ER fix: the old
+    /// `*const` cast inherited a read-only tag and `read()`'s `as_mut` write
+    /// through it was UB).
+    ptr: *mut Events<T>,
     cursor: EventCursor,
     /// `false` (default) — this reader OWNS its cursor and frees it on drop
     /// (standalone / one-shot use). `true` — the cursor is PERSISTENT, owned by
     /// a system's `SystemParam` state across frames (F4), so drop must NOT free
-    /// it — the next frame reuses the same cursor and resumes where it left off.
+    /// it — the next frame reuses the same cursor; drop instead ADVANCES it to
+    /// the end of the buffer ("running is reading", see the type docs).
     persistent: bool,
     _marker: PhantomData<&'w Events<T>>,
 }
@@ -193,7 +214,7 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
     pub fn new(events: &'w mut Events<T>) -> Self {
         let cursor = events.add_reader();
         Self {
-            ptr: events as *const Events<T>,
+            ptr: events as *mut Events<T>,
             cursor,
             persistent: false,
             _marker: PhantomData,
@@ -206,14 +227,17 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
     /// FixedUpdate catch-up reads each event exactly once (no reset-to-zero).
     pub(crate) fn from_persistent(events: &'w mut Events<T>, cursor: EventCursor) -> Self {
         Self {
-            ptr: events as *const Events<T>,
+            ptr: events as *mut Events<T>,
             cursor,
             persistent: true,
             _marker: PhantomData,
         }
     }
 
-    /// Iterate over unread events.
+    /// Iterate over unread events WITHOUT advancing the cursor (a peek). Note
+    /// that a persistent reader still advances on drop at the end of the run —
+    /// a peek defers within the run, not across frames (use a run-condition
+    /// gate or [`Events::read_partial`] for cross-frame accumulation).
     #[inline]
     pub fn iter(&self) -> &[T] {
         unsafe { (*self.ptr).iter(&self.cursor) }
@@ -222,12 +246,7 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
     /// Read and automatically advance the cursor (RAII).
     #[inline]
     pub fn read(&mut self) -> EventReadGuard<'_, T> {
-        unsafe {
-            (self.ptr as *mut Events<T>)
-                .as_mut()
-                .unwrap()
-                .read(&self.cursor)
-        }
+        unsafe { (*self.ptr).read(&self.cursor) }
     }
 
     /// Number of unread events.
@@ -244,15 +263,18 @@ impl<'w, T: Send + Sync + 'static> EventReader<'w, T> {
 
 impl<T: Send + Sync + 'static> Drop for EventReader<'_, T> {
     fn drop(&mut self) {
-        // A persistent cursor is owned by the system's state and reused next
-        // frame — freeing it here would reset the read position (the F4 bug).
         if self.persistent {
+            // "Running is reading": the system had its scheduled chance this
+            // run — advance to the end of the buffer (idempotent after
+            // `.read()`, which already advanced). The cursor itself is owned by
+            // the system's state and survives; only a NOT-RUN system (gated by
+            // the scheduler) retains events. This closes the class of bug where
+            // an early return skipped `.read()` and the stalled cursor pinned
+            // retention forever (unbounded growth + re-delivery every frame).
+            unsafe { (*self.ptr).advance_reader_mut(&self.cursor) };
             return;
         }
-        unsafe {
-            let events = self.ptr as *mut Events<T>;
-            (*events).remove_reader(self.cursor);
-        }
+        unsafe { (*self.ptr).remove_reader(self.cursor) };
     }
 }
 
@@ -542,9 +564,11 @@ impl<E: Send + Sync + 'static> SystemParam for Listen<E> {
         <Self as EventAccessList>::event_accesses()
     }
     fn fetch<'w>(ctx: &'w crate::world::SystemContext<'w>) -> EventReader<'w, E> {
-        // Declared access (`Listen<E>`) validated by the scheduler; `_unchecked` is
-        // the honest signal (S4 / ADR-002).
-        ctx.event_reader_unchecked::<E>()
+        // Declared access (`Listen<E>`) validated by the scheduler. Route through
+        // the per-system persistent cursor store (installed by the AutoSystem
+        // adapter) — exactly-once delivery + "running is reading"; falls back to
+        // a one-shot reader only outside a scheduler context.
+        ctx.event_reader_persistent_auto::<E>()
     }
 }
 
@@ -1141,5 +1165,65 @@ mod tests {
                 "a fresh reader restarts at 0 — exactly the duplicate F4 removes"
             );
         }
+    }
+
+    /// "Running is reading": a persistent reader that is created and dropped
+    /// WITHOUT `.read()` (a system body that early-returned) still advances its
+    /// cursor — retention never pins on a ran-but-unread system, the buffer is
+    /// GC'd on the next update, and nothing is re-delivered.
+    #[test]
+    fn persistent_reader_advances_on_drop_without_read() {
+        let mut events = Events::<u32>::new();
+        let cursor = events.add_reader();
+
+        events.send(1);
+        events.update(); // [1] readable
+
+        // Run 1: the system ran but its body never called .read() (early return).
+        {
+            let _r = EventReader::from_persistent(&mut events, cursor);
+        }
+        // The scheduled chance was used: cursor advanced, everyone caught up.
+        events.send(2);
+        events.update();
+        assert_eq!(events.retained_ticks(), 0, "no retention from a ran-but-unread system");
+
+        // Run 2 actually reads: it sees ONLY the new event — no re-delivery of 1.
+        {
+            let mut r = EventReader::from_persistent(&mut events, cursor);
+            assert_eq!(
+                r.read().as_slice().to_vec(),
+                vec![2],
+                "event 1 was consumed by RUNNING (drop-advance); only 2 is new"
+            );
+        }
+    }
+
+    /// The no-loss counterpart: a cursor whose system did NOT run (scheduler
+    /// gate ⇒ no reader wrapper was ever constructed) holds the buffer — events
+    /// wait, and the gated system receives ALL of them when it finally runs.
+    #[test]
+    fn gated_reader_still_retains_events() {
+        let mut events = Events::<u32>::new();
+        let gated = events.add_reader(); // registered, but its system never runs
+
+        events.send(1);
+        events.update();
+        events.send(2);
+        events.update(); // gated cursor lags ⇒ retained, appended
+
+        assert!(events.retained_ticks() > 0, "buffer retained for the gated system");
+
+        // The gate finally opens: the system runs and reads EVERYTHING.
+        {
+            let mut r = EventReader::from_persistent(&mut events, gated);
+            assert_eq!(
+                r.read().as_slice().to_vec(),
+                vec![1, 2],
+                "no-loss: the gated system received every event on wake"
+            );
+        }
+        events.update();
+        assert_eq!(events.retained_ticks(), 0, "retention released after catch-up");
     }
 }

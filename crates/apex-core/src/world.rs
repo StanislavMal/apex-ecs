@@ -2920,8 +2920,13 @@ impl<'w> SystemContext<'w> {
     /// scheduler ran in parallel — it cannot see the undeclared access. Declare it as
     /// an `EventReader<E>` PARAMETER — the scheduler validates it, serializes
     /// conflicts, and (via `SystemParam::State`) keeps the cursor PERSISTENT across
-    /// frames (F4, no duplicate reads). The ONLY intended callers are `SystemParam`
-    /// (`EventReader`/`Listen`) and the `system!` macro, where access is validated.
+    /// frames (F4, no duplicate reads).
+    ///
+    /// ONE-SHOT SNAPSHOT semantics: the fresh cursor starts at 0 and is freed on
+    /// drop, so under retention (a lagging gated reader elsewhere) it re-reads
+    /// the whole retained buffer — fine for inspection/tools, WRONG for
+    /// side-effectful exactly-once consumption. Consumers use a declared param
+    /// or [`event_reader_persistent_auto`](Self::event_reader_persistent_auto).
     /// `#[doc(hidden)]`: an internal escape mirroring `event_writer_unchecked`, not
     /// blessed API.
     #[doc(hidden)]
