@@ -201,6 +201,26 @@ impl<T: 'static> Mut<'_, T> {
     pub fn bypass_change_detection(&mut self) -> &mut T {
         self.value
     }
+
+    /// Assign `value` ONLY if it differs — the change-detection guard for
+    /// per-frame writers (Bevy `Mut::set_if_neq` parity). The compare happens
+    /// WITHOUT a mutable dereference, so an equal value stamps nothing and
+    /// `Changed<T>` stays quiet; a differing value writes and stamps. This is
+    /// the correct form of the "compare before write" idiom: calling a
+    /// `&mut self` compare-helper ON THE COMPONENT through `Mut` auto-derefs
+    /// mutably and stamps the tick before the helper ever compares.
+    #[inline]
+    pub fn set_if_neq(&mut self, value: T) -> bool
+    where
+        T: PartialEq,
+    {
+        if *self.value == value {
+            return false;
+        }
+        *self.value = value;
+        unsafe { *self.change_tick = self.this_run };
+        true
+    }
 }
 
 impl<T: 'static> std::ops::Deref for Mut<'_, T> {
@@ -3976,6 +3996,43 @@ mod tests {
         assert!(
             !changed.contains(&e_read),
             "read-only get_mut must NOT mark Changed (A13)"
+        );
+    }
+
+    /// `Mut::set_if_neq`: an equal value stamps NOTHING (the per-frame status
+    /// writer stays honest — IDLE_POWER: a static frame must read as clean);
+    /// a differing value writes and stamps.
+    #[test]
+    fn set_if_neq_stamps_only_on_difference() {
+        #[derive(PartialEq)]
+        struct Label(String);
+        impl Component for Label {}
+
+        let mut world = World::new();
+        let e_same = world.spawn((Label("idle".into()),));
+        let e_diff = world.spawn((Label("idle".into()),));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        assert!(!world
+            .get_mut::<Label>(e_same)
+            .expect("alive")
+            .set_if_neq(Label("idle".into())));
+        assert!(world
+            .get_mut::<Label>(e_diff)
+            .expect("alive")
+            .set_if_neq(Label("busy".into())));
+
+        let changed: Vec<_> =
+            Query::<(Entity, &Label, Changed<Label>)>::new_with_tick(&world, last_run)
+                .iter()
+                .map(|(e, _, _)| e)
+                .collect();
+        assert!(changed.contains(&e_diff), "a real write must be Changed");
+        assert!(
+            !changed.contains(&e_same),
+            "an equal set_if_neq must NOT mark Changed"
         );
     }
 
