@@ -1,6 +1,6 @@
 use apex_core::prelude::*;
 use apex_core::transform::{propagate_transforms, GlobalTransform, LocalTransform, TransformPlugin};
-use glam::{Mat4, Quat, Vec3};
+use glam::{DVec3, Quat, Vec3};
 
 // Propagate — hierarchical transform propagation (our differentiator; perf-sensitive, in the past
 // there was a perf bug of subtree duplication). 200 roots × a chain of 50 = 10k nodes; every frame all
@@ -8,7 +8,7 @@ use glam::{Mat4, Quat, Vec3};
 // propagate — a separate crate/schedule); a criterion guard against propagation regressions.
 fn lt(seed: f32) -> LocalTransform {
     LocalTransform {
-        translation: Vec3::new(seed, 0.0, 0.0),
+        translation: DVec3::new(seed as f64, 0.0, 0.0),
         rotation: Quat::from_rotation_y(0.01 * seed),
         scale: Vec3::ONE,
     }
@@ -31,11 +31,11 @@ impl Propagate {
         TransformPlugin::register_components(&mut world);
         let mut nodes = Vec::with_capacity(10_000);
         for r in 0..200 {
-            let root = world.spawn((lt(r as f32), GlobalTransform(Mat4::IDENTITY)));
+            let root = world.spawn((lt(r as f32), GlobalTransform::IDENTITY));
             nodes.push(root);
             let mut parent = root;
             for d in 0..49 {
-                let child = world.spawn((lt(d as f32), GlobalTransform(Mat4::IDENTITY)));
+                let child = world.spawn((lt(d as f32), GlobalTransform::IDENTITY));
                 world.add_relation(child, ChildOf, parent);
                 nodes.push(child);
                 parent = child;

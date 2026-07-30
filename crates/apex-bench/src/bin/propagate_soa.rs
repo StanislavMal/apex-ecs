@@ -68,19 +68,19 @@ fn main() {
     let t = Instant::now();
     let mut roots = Vec::new();
     let lt = |x: f32, y: f32, z: f32| LocalTransform {
-        translation: Vec3::new(x, y, z),
+        translation: glam::DVec3::new(x as f64, y as f64, z as f64),
         rotation: Quat::from_rotation_y(0.01 * (x + y + z)),
         scale: Vec3::ONE,
     };
     for r in 0..rings {
-        let ring = world.spawn((lt(r as f32, 0.0, 0.0), GlobalTransform(Mat4::IDENTITY)));
+        let ring = world.spawn((lt(r as f32, 0.0, 0.0), GlobalTransform::IDENTITY));
         roots.push(ring);
         for c in 0..chars {
-            let ch = world.spawn((lt(0.0, c as f32, 0.0), GlobalTransform(Mat4::IDENTITY)));
+            let ch = world.spawn((lt(0.0, c as f32, 0.0), GlobalTransform::IDENTITY));
             world.add_relation(ch, ChildOf, ring);
             let mut parent = ch;
             for b in 0..bones {
-                let bone = world.spawn((lt(0.0, 0.0, b as f32 + 1.0), GlobalTransform(Mat4::IDENTITY)));
+                let bone = world.spawn((lt(0.0, 0.0, b as f32 + 1.0), GlobalTransform::IDENTITY));
                 world.add_relation(bone, ChildOf, parent);
                 parent = bone;
             }
@@ -151,7 +151,7 @@ fn main() {
         .iter()
         .map(|&e| {
             let l = world.get::<LocalTransform>(e).unwrap();
-            Affine3A::from_scale_rotation_translation(l.scale, l.rotation, l.translation)
+            Affine3A::from_scale_rotation_translation(l.scale, l.rotation, l.translation.as_vec3())
         })
         .collect();
     let mut global_mat = vec![Mat4::IDENTITY; n];
@@ -204,7 +204,7 @@ fn main() {
     kernel_seq_mat4(&mut global_mat);
     let mut max_err = 0.0f32;
     for (slot, &e) in order.iter().enumerate() {
-        let wg = world.get::<GlobalTransform>(e).unwrap().0;
+        let wg = world.get::<GlobalTransform>(e).unwrap().to_mat4_lossy();
         let err = (wg - global_mat[slot]).to_cols_array().iter().map(|x| x.abs()).fold(0.0, f32::max);
         max_err = max_err.max(err);
     }
@@ -279,7 +279,7 @@ fn main() {
         for &e in &all_nodes {
             let slot = entity_to_slot[e.index() as usize] as usize;
             if let Some(mut g) = world.get_mut::<GlobalTransform>(e) {
-                g.0 = global_mat[slot];
+                *g = GlobalTransform::from_mat4(global_mat[slot]);
             }
         }
         0
@@ -288,7 +288,7 @@ fn main() {
         for &e in &leaves {
             let slot = entity_to_slot[e.index() as usize] as usize;
             if let Some(mut g) = world.get_mut::<GlobalTransform>(e) {
-                g.0 = global_mat[slot];
+                *g = GlobalTransform::from_mat4(global_mat[slot]);
             }
         }
         0

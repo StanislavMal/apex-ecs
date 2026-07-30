@@ -31,7 +31,7 @@ use apex_core::prelude::*;
 use apex_core::query::{Changed, Query};
 use apex_core::transform::{self, GlobalTransform, LocalTransform, TransformPlugin};
 use apex_scheduler::{seq, Scheduler, StageLabel};
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 
 fn main() {
     println!("=== Apex ECS — TransformPropagation Example ===\n");
@@ -54,9 +54,9 @@ fn main() {
     //     Spawn only LocalTransform — GlobalTransform is created by propagate.
     println!("--- Creating the hierarchy ---\n");
 
-    let grandparent = create_transform_entity(&mut world, "Grandparent", Vec3::new(50.0, 0.0, 0.0), None);
-    let parent = create_transform_entity(&mut world, "Parent", Vec3::new(30.0, 0.0, 0.0), Some(grandparent));
-    let child = create_transform_entity(&mut world, "Child", Vec3::new(20.0, 0.0, 0.0), Some(parent));
+    let grandparent = create_transform_entity(&mut world, "Grandparent", DVec3::new(50.0, 0.0, 0.0), None);
+    let parent = create_transform_entity(&mut world, "Parent", DVec3::new(30.0, 0.0, 0.0), Some(grandparent));
+    let child = create_transform_entity(&mut world, "Child", DVec3::new(20.0, 0.0, 0.0), Some(parent));
 
     // ── 4. Run propagate_transforms ──────────────────────────────
     //     All three entities are "changed" (just spawned) → recomputed,
@@ -71,13 +71,13 @@ fn main() {
     print_entity(&world, parent, "Parent");
     print_entity(&world, child, "Child");
 
-    let gp_pos = world.get::<GlobalTransform>(grandparent).unwrap().0.transform_point3(Vec3::ZERO);
-    let p_pos = world.get::<GlobalTransform>(parent).unwrap().0.transform_point3(Vec3::ZERO);
-    let c_pos = world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO);
+    let gp_pos = world.get::<GlobalTransform>(grandparent).unwrap().translation;
+    let p_pos = world.get::<GlobalTransform>(parent).unwrap().translation;
+    let c_pos = world.get::<GlobalTransform>(child).unwrap().translation;
 
-    assert_eq!(gp_pos, Vec3::new(50.0, 0.0, 0.0), "Grandparent should be at (50,0,0)");
-    assert_eq!(p_pos, Vec3::new(80.0, 0.0, 0.0), "Parent should be at (80,0,0)");
-    assert_eq!(c_pos, Vec3::new(100.0, 0.0, 0.0), "Child should be at (100,0,0)");
+    assert_eq!(gp_pos, DVec3::new(50.0, 0.0, 0.0), "Grandparent should be at (50,0,0)");
+    assert_eq!(p_pos, DVec3::new(80.0, 0.0, 0.0), "Parent should be at (80,0,0)");
+    assert_eq!(c_pos, DVec3::new(100.0, 0.0, 0.0), "Child should be at (100,0,0)");
     println!("\n✅ All checks passed!\n");
 
     // ── 6. Demo: changing the parent's LocalTransform ───────────
@@ -89,19 +89,19 @@ fn main() {
     // In a real application this is done by the scheduler (C7); here — manually.
     world.tick();
     if let Some(mut lt) = world.get_mut::<LocalTransform>(parent) {
-        lt.translation = Vec3::new(100.0, 0.0, 0.0);
+        lt.translation = DVec3::new(100.0, 0.0, 0.0);
     }
     transform::propagate_transforms(&mut world);
 
-    let p_pos2 = world.get::<GlobalTransform>(parent).unwrap().0.transform_point3(Vec3::ZERO);
-    let c_pos2 = world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO);
+    let p_pos2 = world.get::<GlobalTransform>(parent).unwrap().translation;
+    let c_pos2 = world.get::<GlobalTransform>(child).unwrap().translation;
 
     // Parent — child of Grandparent(50): 50 + 100 = 150. Child: 150 + 20 = 170.
     println!("Parent after the change: ({:.1}, {:.1}, {:.1}) — expected (150, 0, 0)", p_pos2.x, p_pos2.y, p_pos2.z);
     println!("Child after the change:  ({:.1}, {:.1}, {:.1}) — expected (170, 0, 0)", c_pos2.x, c_pos2.y, c_pos2.z);
 
-    assert_eq!(p_pos2, Vec3::new(150.0, 0.0, 0.0), "Parent must be at (150,0,0)");
-    assert_eq!(c_pos2, Vec3::new(170.0, 0.0, 0.0), "Child must be at (170,0,0) via cascade");
+    assert_eq!(p_pos2, DVec3::new(150.0, 0.0, 0.0), "Parent must be at (150,0,0)");
+    assert_eq!(c_pos2, DVec3::new(170.0, 0.0, 0.0), "Child must be at (170,0,0) via cascade");
 
     println!("\n✅ The parent's LocalTransform change cascaded down to the children!\n");
 
@@ -118,7 +118,7 @@ fn main() {
         let mut w = World::new();
         TransformPlugin::register_components(&mut w);
         w.insert_resource(Detected::default());
-        let ent = w.spawn((LocalTransform::from_translation(Vec3::ZERO),));
+        let ent = w.spawn((LocalTransform::from_translation(DVec3::ZERO),));
 
         let mut s = Scheduler::new();
         // PreUpdate: count entities with Changed<GlobalTransform> since the last run of THIS stage.
@@ -139,7 +139,7 @@ fn main() {
 
         // Move the object: LocalTransform changes NOW, GlobalTransform updates in PostUpdate of frame A.
         if let Some(mut lt) = w.get_mut::<LocalTransform>(ent) {
-            lt.translation = Vec3::new(7.0, 0.0, 0.0);
+            lt.translation = DVec3::new(7.0, 0.0, 0.0);
         }
         s.run(&mut w); // frame A: PreUpdate (GT still old) → PostUpdate propagate writes the new GT
         let mid = w.resource::<Detected>().0;
@@ -164,7 +164,7 @@ fn main() {
 fn create_transform_entity(
     world: &mut World,
     name: &'static str,
-    translation: Vec3,
+    translation: DVec3,
     parent: Option<Entity>,
 ) -> Entity {
     let entity = world.spawn((LocalTransform::from_translation(translation),));
@@ -184,7 +184,7 @@ fn create_transform_entity(
 fn print_entity(world: &World, entity: Entity, label: &str) {
     let name = world.get::<DebugName>(entity).map(|n| n.0).unwrap_or("?");
     if let Some(gt) = world.get::<GlobalTransform>(entity) {
-        let pos = gt.0.transform_point3(Vec3::ZERO);
+        let pos = gt.translation;
         println!("  {:<24} pos=({:6.1}, {:6.1}, {:6.1})", format!("{} ({})", name, label), pos.x, pos.y, pos.z);
     }
 }

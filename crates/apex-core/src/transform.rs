@@ -41,7 +41,7 @@
 //! );
 //! ```
 
-use glam::{Mat3, Mat4, Quat, Vec3};
+use glam::{DVec3, Mat3, Mat4, Quat, Vec3};
 
 use crate::{component::Tick, entity::Entity, relations::ChildOf, world::World};
 
@@ -93,9 +93,17 @@ impl IndexStamp {
 /// Local transform of an entity (relative to the parent).
 ///
 /// If the entity has no parent (no ChildOf) — this is its world transform.
+///
+/// # Precision model (large worlds, engine ADR-056 / TD-203)
+///
+/// `translation` is **f64**: the representable step of an f32 coordinate is
+/// `|v|·2⁻²³` (a millimetre-true world ends at ~±16 km), and the loss happens
+/// at the WRITE — a 1 cm step authored a thousand km out is swallowed before
+/// any system sees it. Rotation and scale stay f32: their precision does not
+/// decay with distance from the origin. This is the UE5 LWC split.
 #[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
 pub struct LocalTransform {
-    pub translation: Vec3,
+    pub translation: DVec3,
     pub rotation: Quat,
     pub scale: Vec3,
 }
@@ -103,12 +111,12 @@ pub struct LocalTransform {
 impl LocalTransform {
     /// Identity transform (zero translation, identity rotation, unit scale).
     pub const IDENTITY: Self = Self {
-        translation: Vec3::ZERO,
+        translation: DVec3::ZERO,
         rotation: Quat::IDENTITY,
         scale: Vec3::ONE,
     };
 
-    pub fn from_translation(t: Vec3) -> Self {
+    pub fn from_translation(t: DVec3) -> Self {
         Self {
             translation: t,
             ..Self::IDENTITY
@@ -116,10 +124,17 @@ impl LocalTransform {
     }
 
     /// Transform from coordinates (the most frequent constructor, 1:1 Bevy
-    /// `Transform::from_xyz`).
+    /// `Transform::from_xyz` — but f64, see the type's precision model).
     #[inline]
-    pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
-        Self::from_translation(Vec3::new(x, y, z))
+    pub fn from_xyz(x: f64, y: f64, z: f64) -> Self {
+        Self::from_translation(DVec3::new(x, y, z))
+    }
+
+    /// `from_translation` for an f32 vector (glTF node locals, math results
+    /// that are f32 anyway). Exact: f32 → f64 widening is lossless.
+    #[inline]
+    pub fn from_translation_f32(t: Vec3) -> Self {
+        Self::from_translation(t.as_dvec3())
     }
 
     pub fn from_rotation(r: Quat) -> Self {
@@ -141,7 +156,7 @@ impl LocalTransform {
     /// Replace translation (builder).
     #[inline]
     #[must_use]
-    pub fn with_translation(mut self, translation: Vec3) -> Self {
+    pub fn with_translation(mut self, translation: DVec3) -> Self {
         self.translation = translation;
         self
     }
@@ -170,8 +185,9 @@ impl LocalTransform {
     /// (the horizon tilts).
     #[inline]
     #[must_use]
-    pub fn looking_at(self, target: Vec3, up: Vec3) -> Self {
-        self.looking_to(target - self.translation, up)
+    pub fn looking_at(self, target: DVec3, up: Vec3) -> Self {
+        // The difference of two far points is small — narrow AFTER subtracting.
+        self.looking_to((target - self.translation).as_vec3(), up)
     }
 
     /// Rotate so the local forward (−Z) points along `direction`
@@ -221,10 +237,31 @@ impl LocalTransform {
         self.rotation * Vec3::NEG_Y
     }
 
-    /// Convert into a 4x4 affine matrix.
+    /// Convert into a 4x4 affine matrix. **Lossy for far-out translations**
+    /// (f64 → f32): fine for local-space math (bone chains, node templates,
+    /// near-origin fixtures); the propagation itself never uses it — the
+    /// translation column stays f64 end to end.
     #[inline]
     pub fn to_matrix(&self) -> Mat4 {
-        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+        Mat4::from_scale_rotation_translation(
+            self.scale,
+            self.rotation,
+            self.translation.as_vec3(),
+        )
+    }
+
+    /// The linear (rotation·scale) part — bit-identical to the upper-left 3×3
+    /// of [`Self::to_matrix`] (same glam op sequence: quat basis, columns
+    /// scaled), which keeps propagation results bit-stable vs the old Mat4
+    /// composition.
+    #[inline]
+    pub fn linear_m3(&self) -> Mat3 {
+        let r = Mat3::from_quat(self.rotation);
+        Mat3::from_cols(
+            r.x_axis * self.scale.x,
+            r.y_axis * self.scale.y,
+            r.z_axis * self.scale.z,
+        )
     }
 }
 
@@ -270,65 +307,139 @@ impl Default for LocalTransform {
 ///
 /// Recomputed in PostUpdate by the `propagate_transforms` system.
 /// Not serialized — reconstructed from the hierarchy + LocalTransform.
+///
+/// # Representation (engine ADR-056 hybrid, ratified 2026-07-30)
+///
+/// The linear part (`m3`: rotation·scale·shear — the full upper-left 3×3 of
+/// the old `Mat4`, so non-uniform-scaled hierarchies keep their shear) stays
+/// **f32**; the translation is **f64**. Same 64 bytes as the old `Mat4`
+/// newtype; orientation precision does not decay with distance, translation
+/// precision no longer decays either. A full `DMat4` would double both the
+/// memory and the propagation cost for no measurable gain.
+///
+/// Consumers narrow through ONE of two funnels:
+/// - [`Self::rebased_mat4`] — exact narrowing into a render/anchor window
+///   (subtract the f64 origin FIRST); the engine's extract boundary.
+/// - [`Self::to_mat4_lossy`] — the absolute matrix in f32, i.e. exactly the
+///   pre-C2 behavior; fine near the origin, quantizes far out (`|v|·2⁻²³`).
 #[derive(Debug, Clone, Copy, PartialEq, apex_macros::Component)]
-pub struct GlobalTransform(pub Mat4);
+pub struct GlobalTransform {
+    /// Rotation·scale·shear — the full linear part, f32.
+    pub m3: Mat3,
+    /// World translation, f64 (the authoritative half; engine TD-203).
+    pub translation: DVec3,
+}
 
 impl GlobalTransform {
-    pub const IDENTITY: Self = Self(Mat4::IDENTITY);
+    pub const IDENTITY: Self = Self {
+        m3: Mat3::IDENTITY,
+        translation: DVec3::ZERO,
+    };
 
     /// World transform from coordinates (for spawning root entities
     /// that need the matrix immediately — before the first propagate).
     #[inline]
-    pub fn from_xyz(x: f32, y: f32, z: f32) -> Self {
-        Self(Mat4::from_translation(Vec3::new(x, y, z)))
+    pub fn from_xyz(x: f64, y: f64, z: f64) -> Self {
+        Self {
+            m3: Mat3::IDENTITY,
+            translation: DVec3::new(x, y, z),
+        }
+    }
+
+    /// Exact widening from an affine f32 matrix (fixtures, glTF spawn
+    /// matrices, math results that were f32 anyway). f32 → f64 is lossless.
+    #[inline]
+    pub fn from_mat4(m: Mat4) -> Self {
+        Self {
+            m3: Mat3::from_mat4(m),
+            translation: m.w_axis.truncate().as_dvec3(),
+        }
     }
 
     /// World transform "from `eye`, looking at `target`" (the same
     /// roll-free look-rotation as [`LocalTransform::looking_at`]).
     /// Typical case — spawning a light/camera by matrix.
     #[inline]
-    pub fn looking_at(eye: Vec3, target: Vec3, up: Vec3) -> Self {
-        Self(Mat4::from_rotation_translation(
-            look_to_rotation(target - eye, up),
-            eye,
-        ))
+    pub fn looking_at(eye: DVec3, target: DVec3, up: Vec3) -> Self {
+        Self {
+            m3: Mat3::from_quat(look_to_rotation((target - eye).as_vec3(), up)),
+            translation: eye,
+        }
     }
 
+    /// The absolute world matrix, narrowed to f32 — **exactly the pre-C2
+    /// value** (the old `Mat4` newtype), including its far-from-origin
+    /// quantization. For near-origin/main-thread math that tolerated f32
+    /// before; anything crossing to the GPU goes through [`Self::rebased_mat4`].
     #[inline]
-    pub fn to_matrix(&self) -> &Mat4 {
-        &self.0
+    pub fn to_mat4_lossy(&self) -> Mat4 {
+        mat4_from_m3_t(self.m3, self.translation.as_vec3())
+    }
+
+    /// The window-relative world matrix: the translation is rebased against
+    /// `origin` in f64 BEFORE narrowing, the 3×3 passes through bit-for-bit.
+    /// This is the single exact f64 → f32 funnel (the engine's extract
+    /// boundary; ADR-056 camera-relative rendering).
+    #[inline]
+    pub fn rebased_mat4(&self, origin: DVec3) -> Mat4 {
+        mat4_from_m3_t(self.m3, (self.translation - origin).as_vec3())
     }
 
     /// World forward (−Z), 1:1 Bevy `GlobalTransform::forward`. See [`TransformDirections`].
     #[inline]
     pub fn forward(&self) -> Vec3 {
-        self.0.forward()
+        (-self.m3.z_axis).normalize_or_zero()
     }
     /// World back (+Z), 1:1 Bevy `GlobalTransform::back`. See [`TransformDirections`].
     #[inline]
     pub fn back(&self) -> Vec3 {
-        self.0.back()
+        self.m3.z_axis.normalize_or_zero()
     }
     /// World right (+X), 1:1 Bevy `GlobalTransform::right`.
     #[inline]
     pub fn right(&self) -> Vec3 {
-        self.0.right()
+        self.m3.x_axis.normalize_or_zero()
     }
     /// World left (−X), 1:1 Bevy `GlobalTransform::left`.
     #[inline]
     pub fn left(&self) -> Vec3 {
-        self.0.left()
+        (-self.m3.x_axis).normalize_or_zero()
     }
     /// World up (+Y), 1:1 Bevy `GlobalTransform::up`.
     #[inline]
     pub fn up(&self) -> Vec3 {
-        self.0.up()
+        self.m3.y_axis.normalize_or_zero()
     }
     /// World down (−Y), 1:1 Bevy `GlobalTransform::down`.
     #[inline]
     pub fn down(&self) -> Vec3 {
-        self.0.down()
+        (-self.m3.y_axis).normalize_or_zero()
     }
+
+    /// Compose with a child's local transform: `world = self ∘ local`.
+    /// The linear parts multiply in f32 (bit-identical to the old Mat4×Mat4
+    /// 3×3 block); the translation accumulates in f64 — the local offset is
+    /// rotated/scaled through the parent's linear part widened to f64, so a
+    /// kilometre-scale child offset loses nothing either.
+    #[inline]
+    pub fn mul_local(&self, local: &LocalTransform) -> Self {
+        Self {
+            m3: self.m3 * local.linear_m3(),
+            translation: self.translation + self.m3.as_dmat3() * local.translation,
+        }
+    }
+}
+
+/// Affine 4×4 from a linear 3×3 + translation (glam has no such constructor
+/// for `Mat4`; column extension is exact — no arithmetic involved).
+#[inline]
+fn mat4_from_m3_t(m3: Mat3, t: Vec3) -> Mat4 {
+    Mat4::from_cols(
+        m3.x_axis.extend(0.0),
+        m3.y_axis.extend(0.0),
+        m3.z_axis.extend(0.0),
+        t.extend(1.0),
+    )
 }
 
 /// Semantic accessors for world directions of a transform matrix (local→world),
@@ -383,10 +494,13 @@ impl TransformDirections for Mat4 {
 }
 
 impl From<&LocalTransform> for GlobalTransform {
-    /// World matrix of a root entity == its local TRS (no parent).
+    /// World transform of a root entity == its local TRS (no parent).
     #[inline]
     fn from(local: &LocalTransform) -> Self {
-        Self(local.to_matrix())
+        Self {
+            m3: local.linear_m3(),
+            translation: local.translation,
+        }
     }
 }
 
@@ -408,8 +522,8 @@ pub struct TransformScratch {
     pub(crate) dirty_entities: Vec<Entity>,
     /// O(1) dirty check by entity.index (generational stamp instead of a hash-set)
     pub(crate) dirty: IndexStamp,
-    /// DFS descent stack over subtrees: (entity, PARENT world matrix).
-    pub(crate) stack: Vec<(Entity, Mat4)>,
+    /// DFS descent stack over subtrees: (entity, PARENT world transform).
+    pub(crate) stack: Vec<(Entity, GlobalTransform)>,
 }
 
 /// Exclusive system: recomputes `GlobalTransform` for every entity
@@ -523,7 +637,7 @@ pub fn propagate_transforms(world: &mut World) {
             ..
         } = &mut scratch;
         let dirty: &IndexStamp = dirty;
-        let seed = |world: &World, entity: Entity| -> Option<(Entity, Mat4)> {
+        let seed = |world: &World, entity: Entity| -> Option<(Entity, GlobalTransform)> {
             let parent = world.target_of(entity, ChildOf);
             let mut ancestor = parent;
             let mut depth = 0usize;
@@ -548,8 +662,8 @@ pub fn propagate_transforms(world: &mut World) {
             // frames; a missing GlobalTransform is treated as identity (previous semantics).
             let parent_global = parent
                 .and_then(|p| world.get::<GlobalTransform>(p))
-                .map(|g| g.0)
-                .unwrap_or(Mat4::IDENTITY);
+                .copied()
+                .unwrap_or(GlobalTransform::IDENTITY);
             Some((entity, parent_global))
         };
         const PAR_MIN_DIRTY: usize = 4096;
@@ -592,8 +706,8 @@ pub fn propagate_transforms(world: &mut World) {
     let gt_id = world.registry.get_id::<GlobalTransform>();
     // Auto-creation of GlobalTransform (entity with a single LocalTransform): empty on the hot path
     // (required components); the structural insert happens at the end, not during the parallel descent.
-    let mut missing: Vec<(Entity, Mat4)> = Vec::new();
-    let mut frontier: Vec<(Entity, Mat4)> = scratch.stack.drain(..).collect();
+    let mut missing: Vec<(Entity, GlobalTransform)> = Vec::new();
+    let mut frontier: Vec<(Entity, GlobalTransform)> = scratch.stack.drain(..).collect();
 
     // ── Widen phase: sequentially process the top (narrow) levels until the frontier becomes
     //    wide enough for good parallelism over subtrees. ──
@@ -603,7 +717,7 @@ pub fn propagate_transforms(world: &mut World) {
             break;
         }
         let prev_len = frontier.len();
-        let mut next: Vec<(Entity, Mat4)> = Vec::new();
+        let mut next: Vec<(Entity, GlobalTransform)> = Vec::new();
         for &(entity, pg) in &frontier {
             if !world.is_alive(entity) {
                 continue;
@@ -613,10 +727,10 @@ pub fn propagate_transforms(world: &mut World) {
                 Some(l) => *l,
                 None => continue,
             };
-            let global = pg * local.to_matrix();
+            let global = pg.mul_local(&local);
             visits += 1;
             if let Some(mut gt) = world.get_mut::<GlobalTransform>(entity) {
-                gt.0 = global;
+                *gt = global;
             } else {
                 missing.push((entity, global));
             }
@@ -641,13 +755,14 @@ pub fn propagate_transforms(world: &mut World) {
         // contract as parallel Write-queries (a row is written by exactly one thread): subtrees are
         // disjoint, an entity is visited once; there are no structural changes in this phase (missing is deferred).
         let roots = frontier;
-        let missing_par: std::sync::Mutex<Vec<(Entity, Mat4)>> = std::sync::Mutex::new(Vec::new());
+        let missing_par: std::sync::Mutex<Vec<(Entity, GlobalTransform)>> =
+            std::sync::Mutex::new(Vec::new());
         let visited = AtomicUsize::new(0);
         let world_ref: &World = world;
         roots.par_iter().for_each(|&(root, parent_global)| {
-            let mut stack: Vec<(Entity, Mat4)> = Vec::with_capacity(64);
+            let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
             stack.push((root, parent_global));
-            let mut local_missing: Vec<(Entity, Mat4)> = Vec::new();
+            let mut local_missing: Vec<(Entity, GlobalTransform)> = Vec::new();
             let mut n = 0usize;
             while let Some((entity, pg)) = stack.pop() {
                 if !world_ref.is_alive(entity) {
@@ -657,7 +772,7 @@ pub fn propagate_transforms(world: &mut World) {
                     Some(l) => *l,
                     None => continue,
                 };
-                let global = pg * local.to_matrix();
+                let global = pg.mul_local(&local);
                 n += 1;
                 if !write_global_parallel(world_ref, gt_id, entity, global, this_run) {
                     local_missing.push((entity, global));
@@ -686,10 +801,10 @@ pub fn propagate_transforms(world: &mut World) {
                 Some(l) => *l,
                 None => continue,
             };
-            let global = parent_global * local.to_matrix();
+            let global = parent_global.mul_local(&local);
             visits += 1;
             if let Some(mut gt) = world.get_mut::<GlobalTransform>(entity) {
-                gt.0 = global;
+                *gt = global;
             } else {
                 missing.push((entity, global));
             }
@@ -701,7 +816,7 @@ pub fn propagate_transforms(world: &mut World) {
 
     // Auto-initialize missing GlobalTransforms (each entity is visited exactly once).
     for (entity, global) in missing {
-        world.insert(entity, GlobalTransform(global));
+        world.insert(entity, global);
     }
 
     if trace {
@@ -734,7 +849,7 @@ fn write_global_parallel(
     world: &World,
     gt_id: Option<crate::component::ComponentId>,
     entity: Entity,
-    global: Mat4,
+    global: GlobalTransform,
     tick: Tick,
 ) -> bool {
     let Some(cid) = gt_id else {
@@ -754,9 +869,12 @@ fn write_global_parallel(
         return true;
     }
     // SAFETY: the row is valid (row < len); exclusive access to the row and the absence of structural
-    // changes are the caller's contract (see doc). GlobalTransform: Copy, no Drop.
+    // changes are the caller's contract (see doc). GlobalTransform: Copy, no Drop — the pointer
+    // cast is layout-agnostic (the column was created for THIS GlobalTransform type; the C2
+    // Mat4 → { Mat3, DVec3 } re-shape keeps size 64 B / raises align to 8, both properties of
+    // the registered component, so the column stride/align already match).
     unsafe {
-        *(col.get_ptr(row) as *mut GlobalTransform) = GlobalTransform(global);
+        *(col.get_ptr(row) as *mut GlobalTransform) = global;
         col.set_change_tick(row, tick);
     }
     true
@@ -805,19 +923,19 @@ mod tests {
     #[test]
     fn local_transform_default_is_identity() {
         let lt = LocalTransform::default();
-        assert_eq!(lt.translation, Vec3::ZERO);
+        assert_eq!(lt.translation, DVec3::ZERO);
         assert_eq!(lt.rotation, Quat::IDENTITY);
         assert_eq!(lt.scale, Vec3::ONE);
     }
 
     #[test]
     fn looking_at_points_forward_at_target_without_roll() {
-        let eye = Vec3::new(3.0, 4.0, 5.0);
-        let target = Vec3::new(0.0, 1.0, 0.0);
+        let eye = DVec3::new(3.0, 4.0, 5.0);
+        let target = DVec3::new(0.0, 1.0, 0.0);
         let t = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
 
         // forward (−Z) points exactly at target
-        let expected = (target - eye).normalize();
+        let expected = (target - eye).as_vec3().normalize();
         assert!((t.forward() - expected).length() < 1e-6);
         // no roll: right is horizontal (⊥ to world Y)
         assert!(t.right().dot(Vec3::Y).abs() < 1e-6);
@@ -829,7 +947,8 @@ mod tests {
     #[test]
     fn looking_at_degenerate_inputs_do_not_produce_nan() {
         // direction == 0 (target == eye) and up ∥ direction — must not produce NaN.
-        let t = LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::new(1.0, 2.0, 3.0), Vec3::Y);
+        let t =
+            LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(DVec3::new(1.0, 2.0, 3.0), Vec3::Y);
         assert!(t.rotation.is_finite());
         let t = LocalTransform::IDENTITY.looking_to(Vec3::Y, Vec3::Y);
         assert!(t.rotation.is_finite());
@@ -838,21 +957,18 @@ mod tests {
 
     #[test]
     fn global_transform_constructors_match_local() {
-        let eye = Vec3::new(0.0, 10.0, 5.0);
-        let target = Vec3::ZERO;
+        let eye = DVec3::new(0.0, 10.0, 5.0);
+        let target = DVec3::ZERO;
         let local = LocalTransform::from_translation(eye).looking_at(target, Vec3::Y);
         let global = GlobalTransform::looking_at(eye, target, Vec3::Y);
         let from_local: GlobalTransform = (&local).into();
-        // The matrices match (scale=1 in both paths).
-        let (sa, ra, ta) = global.0.to_scale_rotation_translation();
-        let (sb, rb, tb) = from_local.0.to_scale_rotation_translation();
-        assert!((sa - sb).length() < 1e-6);
-        assert!((ta - tb).length() < 1e-6);
-        assert!(ra.dot(rb).abs() > 1.0 - 1e-6);
-        assert_eq!(
-            GlobalTransform::from_xyz(1.0, 2.0, 3.0).0,
-            Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0))
-        );
+        // The transforms match (scale=1 in both paths).
+        assert!((global.translation - from_local.translation).length() < 1e-9);
+        let (da, db) = (global.forward(), from_local.forward());
+        assert!((da - db).length() < 1e-6);
+        let gt = GlobalTransform::from_xyz(1.0, 2.0, 3.0);
+        assert_eq!(gt.translation, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(gt.m3, Mat3::IDENTITY);
     }
 
     #[test]
@@ -867,7 +983,7 @@ mod tests {
 
     #[test]
     fn local_transform_to_matrix() {
-        let lt = LocalTransform::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        let lt = LocalTransform::from_translation(DVec3::new(1.0, 2.0, 3.0));
         let m = lt.to_matrix();
         // Verify that the 4x4 matrix maps the origin to the translation
         let origin = Vec3::ZERO;
@@ -878,7 +994,8 @@ mod tests {
     #[test]
     fn global_transform_default_is_identity() {
         let gt = GlobalTransform::default();
-        assert_eq!(*gt.to_matrix(), Mat4::IDENTITY);
+        assert_eq!(gt.to_mat4_lossy(), Mat4::IDENTITY);
+        assert_eq!(gt.rebased_mat4(DVec3::ZERO), Mat4::IDENTITY);
     }
 
     /// C6: `LocalTransform`/`GlobalTransform` auto-register on `World::new()`
@@ -909,7 +1026,7 @@ mod tests {
         let mut world = World::new();
 
         // Spawn with a SINGLE LocalTransform — no GlobalTransform, no TransformDirty.
-        let entity = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+        let entity = world.spawn((LocalTransform::from_translation(DVec3::new(10.0, 0.0, 0.0)),));
 
         // GlobalTransform does not exist yet.
         assert!(world.get::<GlobalTransform>(entity).is_none());
@@ -918,7 +1035,7 @@ mod tests {
 
         // propagate auto-initialized GlobalTransform = LocalTransform.
         let gt = world.get::<GlobalTransform>(entity).unwrap();
-        assert_eq!(gt.0.transform_point3(Vec3::ZERO), Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(gt.translation, DVec3::new(10.0, 0.0, 0.0));
     }
 
     #[test]
@@ -927,8 +1044,9 @@ mod tests {
         TransformPlugin::register_components(&mut world);
 
         // Hierarchy parent → child, both with a single LocalTransform (GlobalTransform auto).
-        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),));
-        let child = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+        let parent =
+            world.spawn((LocalTransform::from_translation(DVec3::new(100.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(DVec3::new(10.0, 0.0, 0.0)),));
         world.add_relation(child, ChildOf, parent);
 
         propagate_transforms(&mut world);
@@ -936,12 +1054,12 @@ mod tests {
         // child.Global = parent.Global * child.Local = (100 + 10) = 110 on X.
         let child_gt = world.get::<GlobalTransform>(child).unwrap();
         assert_eq!(
-            child_gt.0.transform_point3(Vec3::ZERO),
-            Vec3::new(110.0, 0.0, 0.0),
+            child_gt.translation,
+            DVec3::new(110.0, 0.0, 0.0),
             "Child must be at 110.0 on X (100 parent + 10 local)"
         );
         let parent_gt = world.get::<GlobalTransform>(parent).unwrap();
-        assert_eq!(parent_gt.0.transform_point3(Vec3::ZERO), Vec3::new(100.0, 0.0, 0.0));
+        assert_eq!(parent_gt.translation, DVec3::new(100.0, 0.0, 0.0));
     }
 
     #[test]
@@ -951,12 +1069,12 @@ mod tests {
 
         // grandparent → parent → child
         let grandparent = world.spawn((
-            LocalTransform::from_translation(Vec3::new(50.0, 0.0, 0.0)),
+            LocalTransform::from_translation(DVec3::new(50.0, 0.0, 0.0)),
             GlobalTransform::default(),
         ));
 
-        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(30.0, 0.0, 0.0)),));
-        let child = world.spawn((LocalTransform::from_translation(Vec3::new(20.0, 0.0, 0.0)),));
+        let parent = world.spawn((LocalTransform::from_translation(DVec3::new(30.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(DVec3::new(20.0, 0.0, 0.0)),));
 
         world.add_relation(parent, ChildOf, grandparent);
         world.add_relation(child, ChildOf, parent);
@@ -966,16 +1084,16 @@ mod tests {
         // parent = 50 + 30 = 80
         let parent_gt = world.get::<GlobalTransform>(parent).unwrap();
         assert_eq!(
-            parent_gt.0.transform_point3(Vec3::ZERO),
-            Vec3::new(80.0, 0.0, 0.0),
+            parent_gt.translation,
+            DVec3::new(80.0, 0.0, 0.0),
             "Parent must be at 80.0"
         );
 
         // child = 80 + 20 = 100
         let child_gt = world.get::<GlobalTransform>(child).unwrap();
         assert_eq!(
-            child_gt.0.transform_point3(Vec3::ZERO),
-            Vec3::new(100.0, 0.0, 0.0),
+            child_gt.translation,
+            DVec3::new(100.0, 0.0, 0.0),
             "Child must be at 100.0"
         );
     }
@@ -988,13 +1106,13 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        let e = world.spawn((LocalTransform::from_translation(Vec3::new(1.0, 0.0, 0.0)),));
+        let e = world.spawn((LocalTransform::from_translation(DVec3::new(1.0, 0.0, 0.0)),));
 
         // First pass: auto-init GlobalTransform = (1,0,0).
         propagate_transforms(&mut world);
         assert_eq!(
-            world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(1.0, 0.0, 0.0)
+            world.get::<GlobalTransform>(e).unwrap().translation,
+            DVec3::new(1.0, 0.0, 0.0)
         );
 
         // Advance the tick (as a frame does) and mutate via Query<Write> — without
@@ -1003,7 +1121,7 @@ mod tests {
         {
             let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|_, mut lt| {
-                lt.translation = Vec3::new(42.0, 0.0, 0.0);
+                lt.translation = DVec3::new(42.0, 0.0, 0.0);
             });
         }
 
@@ -1011,8 +1129,8 @@ mod tests {
 
         // GlobalTransform recomputed without TransformDirty.
         assert_eq!(
-            world.get::<GlobalTransform>(e).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(42.0, 0.0, 0.0),
+            world.get::<GlobalTransform>(e).unwrap().translation,
+            DVec3::new(42.0, 0.0, 0.0),
             "Changed<LocalTransform> via Query<Write> must trigger a recompute"
         );
     }
@@ -1026,34 +1144,34 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        let gp = world.spawn((LocalTransform::from_translation(Vec3::new(1.0, 0.0, 0.0)),));
-        let mid = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
-        let leaf = world.spawn((LocalTransform::from_translation(Vec3::new(100.0, 0.0, 0.0)),));
+        let gp = world.spawn((LocalTransform::from_translation(DVec3::new(1.0, 0.0, 0.0)),));
+        let mid = world.spawn((LocalTransform::from_translation(DVec3::new(10.0, 0.0, 0.0)),));
+        let leaf = world.spawn((LocalTransform::from_translation(DVec3::new(100.0, 0.0, 0.0)),));
         world.add_relation(mid, ChildOf, gp);
         world.add_relation(leaf, ChildOf, mid);
 
         propagate_transforms(&mut world);
         assert_eq!(
-            world.get::<GlobalTransform>(leaf).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(111.0, 0.0, 0.0)
+            world.get::<GlobalTransform>(leaf).unwrap().translation,
+            DVec3::new(111.0, 0.0, 0.0)
         );
 
         // Change the grandparent and the leaf; the intermediate node stays clean.
         world.tick();
-        world.get_mut::<LocalTransform>(gp).unwrap().translation = Vec3::new(2.0, 0.0, 0.0);
-        world.get_mut::<LocalTransform>(leaf).unwrap().translation = Vec3::new(200.0, 0.0, 0.0);
+        world.get_mut::<LocalTransform>(gp).unwrap().translation = DVec3::new(2.0, 0.0, 0.0);
+        world.get_mut::<LocalTransform>(leaf).unwrap().translation = DVec3::new(200.0, 0.0, 0.0);
         propagate_transforms(&mut world);
 
         // 2 (gp) + 10 (mid, clean) + 200 (leaf) = 212.
         assert_eq!(
-            world.get::<GlobalTransform>(leaf).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(212.0, 0.0, 0.0),
+            world.get::<GlobalTransform>(leaf).unwrap().translation,
+            DVec3::new(212.0, 0.0, 0.0),
             "the leaf must be computed from the FRESH grandparent matrix through the clean intermediate node"
         );
         // The clean intermediate node is also recomputed (it is in the dirty-root's subtree).
         assert_eq!(
-            world.get::<GlobalTransform>(mid).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(12.0, 0.0, 0.0)
+            world.get::<GlobalTransform>(mid).unwrap().translation,
+            DVec3::new(12.0, 0.0, 0.0)
         );
     }
 
@@ -1065,8 +1183,8 @@ mod tests {
         TransformPlugin::register_components(&mut world);
         let mut all = Vec::new();
         for i in 0..100 {
-            all.push(world.spawn((LocalTransform::from_translation(Vec3::new(
-                i as f32, 0.0, 0.0,
+            all.push(world.spawn((LocalTransform::from_translation(DVec3::new(
+                i as f64, 0.0, 0.0,
             )),)));
         }
         // Half of the entities — with a different composition (a different archetype in the scan).
@@ -1112,9 +1230,9 @@ mod tests {
         let mut pairs = Vec::new();
         for i in 0..n {
             let parent =
-                world.spawn((LocalTransform::from_translation(Vec3::new(i as f32, 0.0, 0.0)),));
+                world.spawn((LocalTransform::from_translation(DVec3::new(i as f64, 0.0, 0.0)),));
             let child =
-                world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 1.0, 0.0)),));
+                world.spawn((LocalTransform::from_translation(DVec3::new(0.0, 1.0, 0.0)),));
             world.add_relation(child, ChildOf, parent);
             pairs.push((parent, child));
         }
@@ -1134,12 +1252,12 @@ mod tests {
 
         for (i, (parent, child)) in pairs.iter().enumerate() {
             assert_eq!(
-                world.get::<GlobalTransform>(*parent).unwrap().0.transform_point3(Vec3::ZERO),
-                Vec3::new(1000.0 + i as f32, 0.0, 0.0)
+                world.get::<GlobalTransform>(*parent).unwrap().translation,
+                DVec3::new(1000.0 + i as f64, 0.0, 0.0)
             );
             assert_eq!(
-                world.get::<GlobalTransform>(*child).unwrap().0.transform_point3(Vec3::ZERO),
-                Vec3::new(1000.0 + i as f32, 1.0, 0.0),
+                world.get::<GlobalTransform>(*child).unwrap().translation,
+                DVec3::new(1000.0 + i as f64, 1.0, 0.0),
                 "child {i} must be recomputed from the fresh parent in the parallel branch"
             );
         }
@@ -1155,13 +1273,13 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        let root = world.spawn((LocalTransform::from_translation(Vec3::new(10.0, 0.0, 0.0)),));
+        let root = world.spawn((LocalTransform::from_translation(DVec3::new(10.0, 0.0, 0.0)),));
         let mut grandkids = Vec::new();
         for i in 0..300 {
             let child =
-                world.spawn((LocalTransform::from_translation(Vec3::new(0.0, i as f32, 0.0)),));
+                world.spawn((LocalTransform::from_translation(DVec3::new(0.0, i as f64, 0.0)),));
             world.add_relation(child, ChildOf, root);
-            let gk = world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 0.0, 1.0)),));
+            let gk = world.spawn((LocalTransform::from_translation(DVec3::new(0.0, 0.0, 1.0)),));
             world.add_relation(gk, ChildOf, child);
             grandkids.push((i, gk));
         }
@@ -1182,8 +1300,8 @@ mod tests {
         // Grandchild i: root(1000,0,0) + child(0,i,0) + gk(0,0,1) = (1000, i, 1).
         for (i, gk) in grandkids {
             assert_eq!(
-                world.get::<GlobalTransform>(gk).unwrap().0.transform_point3(Vec3::ZERO),
-                Vec3::new(1000.0, i as f32, 1.0),
+                world.get::<GlobalTransform>(gk).unwrap().translation,
+                DVec3::new(1000.0, i as f64, 1.0),
                 "grandchild {i} recomputed from the fresh root through the parallel level"
             );
         }
@@ -1196,14 +1314,14 @@ mod tests {
         let mut world = World::new();
         TransformPlugin::register_components(&mut world);
 
-        let parent = world.spawn((LocalTransform::from_translation(Vec3::new(0.0, 0.0, 0.0)),));
-        let child = world.spawn((LocalTransform::from_translation(Vec3::new(5.0, 0.0, 0.0)),));
+        let parent = world.spawn((LocalTransform::from_translation(DVec3::new(0.0, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(DVec3::new(5.0, 0.0, 0.0)),));
         world.add_relation(child, ChildOf, parent);
 
         propagate_transforms(&mut world);
         assert_eq!(
-            world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(5.0, 0.0, 0.0)
+            world.get::<GlobalTransform>(child).unwrap().translation,
+            DVec3::new(5.0, 0.0, 0.0)
         );
 
         // Move ONLY the parent.
@@ -1212,7 +1330,7 @@ mod tests {
             let mut q = Query::<&mut LocalTransform>::new_mut(&mut world);
             q.for_each_mut(|e, mut lt| {
                 if e == parent {
-                    lt.translation = Vec3::new(100.0, 0.0, 0.0);
+                    lt.translation = DVec3::new(100.0, 0.0, 0.0);
                 }
             });
         }
@@ -1220,8 +1338,8 @@ mod tests {
 
         // The child is recomputed by cascade: 100 (parent) + 5 (local) = 105.
         assert_eq!(
-            world.get::<GlobalTransform>(child).unwrap().0.transform_point3(Vec3::ZERO),
-            Vec3::new(105.0, 0.0, 0.0),
+            world.get::<GlobalTransform>(child).unwrap().translation,
+            DVec3::new(105.0, 0.0, 0.0),
             "changing the parent must cascade a recompute to the child"
         );
     }
@@ -1239,14 +1357,78 @@ mod tests {
         assert!((m.up() - Vec3::Y).length() < 1e-6);
         assert!((m.down() - Vec3::NEG_Y).length() < 1e-6);
 
-        // forward()/back() are exact opposites; `GlobalTransform` delegates to the same trait and
+        // forward()/back() are exact opposites; `GlobalTransform` mirrors the same convention and
         // agrees with `LocalTransform` (built from the same rotation) for an arbitrary orientation.
-        let lt = LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(Vec3::new(4.0, 0.0, -1.0), Vec3::Y);
-        let gt = GlobalTransform(lt.to_matrix());
+        let lt =
+            LocalTransform::from_xyz(1.0, 2.0, 3.0).looking_at(DVec3::new(4.0, 0.0, -1.0), Vec3::Y);
+        let gt = GlobalTransform::from_mat4(lt.to_matrix());
         assert!((gt.forward() - lt.forward()).length() < 1e-5, "GlobalTransform.forward == LocalTransform.forward");
         assert!((gt.back() - lt.back()).length() < 1e-5);
         assert!((gt.right() - lt.right()).length() < 1e-5);
         assert!((gt.up() - lt.up()).length() < 1e-5);
         assert!((gt.forward() + gt.back()).length() < 1e-5, "forward = -back");
+    }
+
+    /// The C2 authoring gate at the CORE level (engine ADR-056 / TD-203): a
+    /// 1 cm authored step a thousand km out survives the write, the
+    /// propagation (incl. a deep chain) and the window narrowing. In f32 the
+    /// step would be swallowed whole (ulp(10⁶) = 6.25 cm).
+    #[test]
+    fn f64_translation_survives_centimetre_steps_a_thousand_km_out() {
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let parent =
+            world.spawn((LocalTransform::from_translation(DVec3::new(1.0e6, 0.0, 0.0)),));
+        let child = world.spawn((LocalTransform::from_translation(DVec3::new(2.0, 0.0, 0.0)),));
+        world.add_relation(child, ChildOf, parent);
+        propagate_transforms(&mut world);
+
+        // The authored step: += 1 cm on the parent, a thousand km out.
+        world.tick();
+        world.get_mut::<LocalTransform>(parent).unwrap().translation.x += 0.01;
+        propagate_transforms(&mut world);
+
+        let pt = world.get::<GlobalTransform>(parent).unwrap().translation;
+        let ct = world.get::<GlobalTransform>(child).unwrap().translation;
+        assert_eq!(pt.x, 1.0e6 + 0.01, "the centimetre write must be stored exactly (f64)");
+        assert_eq!(ct.x, 1.0e6 + 0.01 + 2.0, "…and propagate exactly through the chain");
+
+        // The window narrowing keeps it: rebased against an anchor near the
+        // camera, the centimetre is far above the local f32 ulp.
+        let origin = DVec3::new(1.0e6, 0.0, 0.0);
+        let before = world.get::<GlobalTransform>(parent).unwrap().rebased_mat4(origin);
+        assert!((before.w_axis.x - 0.01).abs() < 1e-6, "1 cm survives the rebased narrowing");
+    }
+
+    /// The hybrid `{ Mat3, DVec3 }` composition must match the old Mat4×Mat4
+    /// reference bit-for-bit in the linear part (that is what keeps the
+    /// engine's goldens byte-identical) and to f32-ulp in the translation.
+    #[test]
+    fn hybrid_composition_matches_mat4_reference() {
+        let parent = LocalTransform {
+            translation: DVec3::new(3.5, -2.25, 7.125),
+            rotation: Quat::from_euler(glam::EulerRot::YXZ, 0.7, -0.3, 0.15),
+            scale: Vec3::new(2.0, 1.0, 0.5), // non-uniform — shear appears downstream
+        };
+        let child = LocalTransform {
+            translation: DVec3::new(-1.5, 4.0, 2.5),
+            rotation: Quat::from_euler(glam::EulerRot::YXZ, -0.2, 0.9, 0.4),
+            scale: Vec3::new(1.5, 3.0, 1.0),
+        };
+        let hybrid = GlobalTransform::from(&parent).mul_local(&child);
+        let reference = parent.to_matrix() * child.to_matrix();
+        assert_eq!(
+            hybrid.m3,
+            Mat3::from_mat4(reference),
+            "the linear part must be bit-identical to the Mat4 reference composition \
+             (incl. shear from the non-uniform parent scale)"
+        );
+        let rt = reference.w_axis.truncate();
+        let ht = hybrid.translation.as_vec3();
+        assert!(
+            (rt - ht).length() < 1e-5,
+            "the f64 translation must match the f32 reference within f32 rounding"
+        );
     }
 }
