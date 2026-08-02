@@ -572,6 +572,7 @@ impl World {
                     .map(|mf| (cid, mf))
             })
             .collect();
+        let this_run = self.current_tick;
         for (cid, map_fn) in mapped {
             let arch = &mut self.archetypes[arch_idx];
             if let Some(col_idx) = arch.column_index(cid) {
@@ -579,6 +580,15 @@ impl World {
                 // for the type stored in column `cid`.
                 let ptr = unsafe { arch.columns[col_idx].get_ptr(row) };
                 unsafe { map_fn(ptr, f) };
+                // This IS a write, so change detection has to see it. Writing through the raw
+                // pointer bypasses `Mut<T>`'s lazy stamp, and without this the remap was invisible:
+                // a `Changed<T>` filter never fired, and a consumer caching per-component ticks
+                // (the editor's inspector tree) kept serving the pre-remap value — the reference
+                // was repaired in the world and stale everywhere that looks at it.
+                let ticks = &mut arch.columns[col_idx].change_ticks;
+                if let Some(cell) = ticks.get_mut(row) {
+                    *cell.get_mut() = this_run;
+                }
             }
         }
     }
@@ -5596,5 +5606,63 @@ mod wave6_bundle {
         let mut remap = |old: Entity| if old == a { b } else { old };
         world.map_entity_refs(e, &mut remap);
         assert_eq!(world.get::<Link>(e).unwrap().0, b, "ref remapped a -> b");
+    }
+
+    /// E6: a remap is a WRITE, so change detection must see it.
+    ///
+    /// The raw `MapEntitiesFn` path bypasses `Mut<T>`'s lazy stamp, so without an explicit one the
+    /// component changes under every observer's nose: `Changed<T>` never fires and anything caching
+    /// per-component ticks keeps serving the pre-remap value. Found downstream, where an editor
+    /// repaired a reference in the world and every reader kept reporting the broken one.
+    #[test]
+    fn e6_map_entity_refs_marks_the_component_changed() {
+        #[derive(Debug, PartialEq)]
+        struct Link(Entity);
+        impl Component for Link {}
+        impl crate::component::MapEntities for Link {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        world.register_map_entities::<Link>();
+        let a = world.spawn(());
+        let b = world.spawn(());
+        let e = world.spawn((Link(a),));
+        // A settled world: everything is older than `since`.
+        world.advance_change_tick();
+        let since = world.current_tick();
+        world.advance_change_tick();
+        let changed = |world: &World| {
+            world.query_builder().build().unwrap().get(e).unwrap().changed_since(since)
+        };
+        assert!(!changed(&world), "nothing has touched it yet");
+
+        world.map_entity_refs(e, &mut |old| if old == a { b } else { old });
+        assert!(changed(&world), "the remap is visible to change detection");
+    }
+
+    /// The registry answers "does anything here hold entity references?" without a world walk — the
+    /// gate a consumer needs before sweeping every entity to repair references.
+    #[test]
+    fn any_map_entities_is_false_until_something_registers() {
+        struct Link(Entity);
+        impl Component for Link {}
+        impl crate::component::MapEntities for Link {
+            fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+                self.0 = f(self.0);
+            }
+        }
+
+        let mut world = World::new();
+        assert!(!world.registry().any_map_entities(), "a fresh world declares none");
+        world.registry_mut().register::<Link>();
+        assert!(
+            !world.registry().any_map_entities(),
+            "registering the TYPE is not declaring the references"
+        );
+        world.register_map_entities::<Link>();
+        assert!(world.registry().any_map_entities());
     }
 }

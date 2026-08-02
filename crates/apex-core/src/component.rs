@@ -377,6 +377,9 @@ pub struct ComponentRegistry {
     /// through the same queue).
     requires: FxHashMap<u32, Vec<RequiredInsertFn>>,
     any_flags: bool,
+    /// Any component carries a [`MapEntitiesFn`] (E6) — the cheap gate of
+    /// [`any_map_entities`](Self::any_map_entities).
+    any_map_entities: bool,
 }
 
 impl ComponentRegistry {
@@ -389,6 +392,7 @@ impl ComponentRegistry {
             hooks: FxHashMap::default(),
             requires: FxHashMap::default(),
             any_flags: false,
+            any_map_entities: false,
         }
     }
 
@@ -520,7 +524,21 @@ impl ComponentRegistry {
     pub(crate) fn set_map_entities(&mut self, id: ComponentId, f: MapEntitiesFn) {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.map_entities = Some(f);
+            self.any_map_entities = true;
         }
+    }
+
+    /// Does ANY registered component hold remappable `Entity` references (E6)?
+    ///
+    /// The cheap gate for a caller whose only alternative is sweeping every entity of the world to
+    /// repair references — the editor's structural undo, which brings a deleted object back under a
+    /// NEW handle and must point everything that referenced it at the new one. Most worlds register
+    /// nothing of the kind, and this lets them skip the sweep instead of walking the whole world to
+    /// discover there was nothing to do. The same shape as [`any_flags`](Self::any_flags): one bool
+    /// raised at registration.
+    #[inline]
+    pub fn any_map_entities(&self) -> bool {
+        self.any_map_entities
     }
 
     /// Register a component with serialization support (JSON format).
