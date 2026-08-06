@@ -45,8 +45,10 @@ impl Tick {
     /// Maximum "age" of a change tick relative to the world's current tick.
     ///
     /// `is_newer_than` is a wrapping comparison, correct when the difference < 2³¹.
-    /// A row unchanged for longer would "wrap around" into a false Changed
-    /// (~99 days of uptime @250Hz). A periodic clamp
+    /// A row unchanged for longer would "wrap around" into a false Changed after
+    /// `2³¹ / ticks-per-second` of uptime — the tick advances once per scheduler
+    /// STAGE plus the frame boundary, so e.g. a 7-stage schedule @60 FPS runs
+    /// ~480 ticks/s ⇒ ≈ 52 days (PE-C7). A periodic clamp
     /// ([`World::check_change_ticks`](crate::World::check_change_ticks))
     /// pulls old ticks up to this age, preserving the invariant (W2-3).
     pub const MAX_CHANGE_AGE: u32 = 1 << 30;

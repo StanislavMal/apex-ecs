@@ -3,6 +3,19 @@ use super::*;
 impl Scheduler {
     // ── Execution ─────────────────────────────────────────────
 
+    /// PE-C5: the identity archetype-index list `0..n` for whole-world
+    /// SubWorlds, cached across frames instead of materialized per stage.
+    /// Grows monotonically; call BEFORE building the SubWorld and do not touch
+    /// the scratch while it is live (reallocation would dangle the raw slice).
+    #[inline]
+    fn all_arch_indices(&mut self, n: usize) -> &[usize] {
+        let len = self.scratch_arch_indices.len();
+        if len < n {
+            self.scratch_arch_indices.extend(len..n);
+        }
+        &self.scratch_arch_indices[..n]
+    }
+
     /// Run one scheduler iteration.
     /// Uses Rayon for parallel execution.
     ///
@@ -233,9 +246,10 @@ impl Scheduler {
             // before the loop and went stale). MIRI-CD: built from the RAW `world_ptr`
             // (not a `&World` reborrow) so the interleaved `&mut *world_ptr` writes below
             // do not invalidate it.
-            let all_indices: Vec<usize> = (0..unsafe { &*world_ptr }.archetypes().len()).collect();
+            // PE-C5: cached identity list — no per-stage Vec.
+            let all_indices = self.all_arch_indices(unsafe { &*world_ptr }.archetypes().len());
             let sub_world =
-                unsafe { apex_core::SubWorld::from_raw(world_ptr as *const World, &all_indices) };
+                unsafe { apex_core::SubWorld::from_raw(world_ptr as *const World, all_indices) };
             {
                 // TD-52: per-execution-stage change-detection window (cross-stage `Changed<T>`).
                 self.open_stage_change_window(stage_idx, unsafe { &mut *world_ptr });
@@ -347,6 +361,9 @@ impl Scheduler {
     ) {
         let archetypes = world.archetypes();
         let num_workers = rayon::current_num_threads();
+        // PE-C5: grow the identity scratch once up front; the site below slices
+        // the FIELD directly (disjoint from the `&mut self.systems` borrow).
+        self.all_arch_indices(archetypes.len());
 
         // 0. Run conditions were already evaluated ONCE this frame by the caller
         //    (`enabled` set) — do NOT re-evaluate here, or a stateful condition
@@ -466,9 +483,10 @@ impl Scheduler {
                     let window = self.system_window(sys_id);
                     let system = &mut self.systems[sys_idx];
                     if let SystemKind::Parallel { system: sys, .. } = &mut system.kind {
-                        let all_indices: Vec<usize> = (0..archetypes.len()).collect();
+                        // PE-C5: identity scratch grown at fn entry — no Vec.
+                        let all_indices = &self.scratch_arch_indices[..archetypes.len()];
                         let sw = unsafe {
-                            apex_core::SubWorld::from_raw(world as *const World, &all_indices)
+                            apex_core::SubWorld::from_raw(world as *const World, all_indices)
                         };
                         let sws = [sw];
                         // SAFETY: this system's private per-system slot (D8b), run
@@ -855,8 +873,17 @@ impl Scheduler {
             // D8b: (re)build per-system command slots for this stage in rank order
             // (position in `stage_ids`). One slot per system; command-emitting
             // single-task systems write their slot, applied in rank order below.
-            stage_cmds.clear();
-            stage_cmds.resize_with(stage_ids.len(), Commands::new);
+            // PE-C4: REUSE the slots — `clear()` dropped every `Commands` (arena
+            // buffers deallocated) and recreated them per stage per frame;
+            // `reset_for_reuse` keeps queue/arena capacity and unbinds stale
+            // reservers. Extra slots from a wider earlier stage stay empty, so
+            // the apply loops below no-op over them.
+            if stage_cmds.len() < stage_ids.len() {
+                stage_cmds.resize_with(stage_ids.len(), Commands::new);
+            }
+            for cmds in &mut stage_cmds {
+                cmds.reset_for_reuse();
+            }
             slot_of.clear();
             seeded.clear();
             for (slot, &sys_id) in stage_ids.iter().enumerate() {
@@ -905,9 +932,10 @@ impl Scheduler {
                     // not a `&*const_ptr` reborrow — the interleaved `&mut *world_ptr`
                     // writes below are children of that same raw tag, so they never
                     // invalidate the SubWorld's read pointer.
-                    let all_indices: Vec<usize> =
-                        (0..unsafe { &*const_ptr }.archetypes().len()).collect();
-                    let sub_world = unsafe { apex_core::SubWorld::from_raw(const_ptr, &all_indices) };
+                    // PE-C5: cached identity list — no per-stage Vec.
+                    let n = unsafe { &*const_ptr }.archetypes().len();
+                    let sub_world =
+                        unsafe { apex_core::SubWorld::from_raw(const_ptr, self.all_arch_indices(n)) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             if !enabled.contains(&sys_id) {
@@ -964,7 +992,7 @@ impl Scheduler {
                         cmds.apply(w);
                     }
                 }
-                // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
+                // No reset needed here: `reset_for_reuse` runs at the top of each stage (PE-C4).
                 // D8b: adaptive block sizing + reclaim unused block tails (bounds
                 // id-space under churn). After apply (records grown by flush).
                 self.commit_spawn_history(&mut seeded, unsafe { &mut *world_ptr });
@@ -1015,9 +1043,10 @@ impl Scheduler {
                     // MIRI-CD: SubWorld from the raw `const_ptr` (see the `!all_parallel`
                     // branch) so the interleaved `&mut *world_ptr` writes do not
                     // invalidate it.
-                    let all_indices: Vec<usize> =
-                        (0..unsafe { &*const_ptr }.archetypes().len()).collect();
-                    let sub_world = unsafe { apex_core::SubWorld::from_raw(const_ptr, &all_indices) };
+                    // PE-C5: cached identity list — no per-stage Vec.
+                    let n = unsafe { &*const_ptr }.archetypes().len();
+                    let sub_world =
+                        unsafe { apex_core::SubWorld::from_raw(const_ptr, self.all_arch_indices(n)) };
                     for &sys_id in stage_ids {
                         if let Some(&sys_idx) = self.system_indices.get(&sys_id) {
                             if !enabled.contains(&sys_id) {
@@ -1073,7 +1102,7 @@ impl Scheduler {
                         cmds.apply(w);
                     }
                 }
-                // No reset needed: `stage_cmds` is cleared + rebuilt each stage.
+                // No reset needed here: `reset_for_reuse` runs at the top of each stage (PE-C4).
             } else {
                 self.run_stage_parallel(
                     stage_ids,

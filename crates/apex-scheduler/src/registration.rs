@@ -29,6 +29,7 @@ impl Scheduler {
             last_added_system_id: None,
             scope_condition: None,
             scratch_arch_lengths: Vec::new(),
+            scratch_arch_indices: Vec::new(),
             scratch_schedule: Vec::new(),
             scratch_sys_infos: Vec::new(),
             scratch_tasks: Vec::new(),

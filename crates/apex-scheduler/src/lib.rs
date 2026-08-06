@@ -907,6 +907,12 @@ pub struct Scheduler {
     // `ThreadPool::install`). Its outer-Vec alloc is negligible; it stays a local.
     /// Reused `arch_lengths` snapshot (cleared + refilled per frame).
     scratch_arch_lengths: Vec<usize>,
+    /// PE-C5: cached identity list `0..n` for whole-world SubWorlds (grows
+    /// monotonically with the archetype count; never rebuilt per stage).
+    /// While a `SubWorld` built over it is live the vec must not reallocate —
+    /// guaranteed because it is only extended via `all_arch_indices` BEFORE the
+    /// SubWorld is constructed and untouched while systems run.
+    scratch_arch_indices: Vec<usize>,
     /// Reused execution schedule (FixedUpdate expansion) index list.
     scratch_schedule: Vec<usize>,
     /// Reused per-parallel-stage system-info buffer.

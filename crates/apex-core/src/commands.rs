@@ -562,6 +562,10 @@ impl Commands {
         // (their spawn commands will fill in location/components). Idempotent and cheap if there are
         // no reservations.
         world.flush_reserved();
+        // PE-C4 note: `into_iter` deliberately — a measured attempt to keep the
+        // queue's capacity via `drain(..)` cost +5–8% on insert-heavy applies
+        // (commands_insert 555→599 µs); the arena (the actual per-frame churn)
+        // is reused via the scheduler's `reset_for_reuse` slots instead.
         let queue = std::mem::take(&mut self.queue);
         let mut it = queue.into_iter().peekable();
         // Reusable group buffers (outside the loop — no reallocations).
@@ -762,6 +766,15 @@ impl Commands {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// PE-C4: reset for SLOT REUSE across scheduler stages — [`clear`](Self::clear)
+    /// (drops any unapplied payloads, reclaims reservations; the queue and arena
+    /// keep their capacity) plus unbinding the reserver, so a stale id block
+    /// cannot leak into a stage that did not seed one (D8b determinism).
+    pub fn reset_for_reuse(&mut self) {
+        self.clear();
+        self.reserver = None;
     }
 
     /// Clear without applying — correctly drops the typed data in the arena

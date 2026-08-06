@@ -333,9 +333,13 @@ impl World {
     }
 
     /// Auto-run interval for [`check_change_ticks`](Self::check_change_ticks):
-    /// every 2²⁶ ticks (~3 days @250Hz). Must be much smaller than
-    /// `2³¹ − Tick::MAX_CHANGE_AGE`, so a tick cannot "wrap around" between clamp
-    /// passes.
+    /// every 2²⁶ ticks. Wall-clock time depends on the TICK RATE, not the frame
+    /// rate: the scheduler advances the tick once per stage window
+    /// (`open_stage_change_window`) plus once per frame boundary, so
+    /// `interval ≈ 2²⁶ / (fps · (stages + 1))` — e.g. ~39 hours for a 7-stage
+    /// schedule at 60 FPS (480 ticks/s), not "2²⁶ frames". Must stay much
+    /// smaller than `2³¹ − Tick::MAX_CHANGE_AGE`, so a tick cannot "wrap
+    /// around" between clamp passes (PE-C7).
     const TICK_CHECK_INTERVAL: u32 = 1 << 26;
 
     /// Advances the global tick. **Does not flush events** — that is the
@@ -368,8 +372,10 @@ impl World {
     /// analogous to Bevy's `check_change_ticks`).
     ///
     /// `Changed<T>` uses wrapping comparison, correct for a difference < 2³¹: a
-    /// row unchanged for longer would become falsely Changed (~99 days of uptime
-    /// @250Hz). The clamp pulls such ticks to the window boundary, keeping
+    /// row unchanged for longer would become falsely Changed after
+    /// `2³¹ / ticks-per-second` of uptime (≈ 52 days at the typical 480 ticks/s
+    /// of a 7-stage schedule @60 FPS — the tick advances per STAGE, not per
+    /// frame). The clamp pulls such ticks to the window boundary, keeping
     /// "unchanged for a long time" forever. Runs automatically from
     /// [`tick`](Self::tick)/[`advance_change_tick`](Self::advance_change_tick)
     /// once every `TICK_CHECK_INTERVAL`; public for prod servers / editors with

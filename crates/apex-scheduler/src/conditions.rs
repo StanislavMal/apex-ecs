@@ -82,7 +82,10 @@ impl<T> Clone for AnyWithComponent<T> {
 
 impl<T: Component> Condition for AnyWithComponent<T> {
     fn check(&self, w: &World) -> bool {
-        Query::<&T>::new(w).iter().count() > 0
+        // PE-C3: existence, not cardinality — `is_empty` stops at the first
+        // match (its archetype-level fast path is O(archetypes)); `count()`
+        // walked every row with `T` per check per frame.
+        !Query::<&T>::new(w).is_empty()
     }
     fn access(&self) -> AccessDescriptor {
         AccessDescriptor::new().read::<T>()
