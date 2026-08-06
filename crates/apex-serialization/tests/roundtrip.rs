@@ -479,3 +479,79 @@ fn corrupt_component_bytes_yield_deserialize_failed() {
         other => panic!("expected DeserializeFailed, got {other:?}"),
     }
 }
+
+/// `snapshot_entities` (the editor's subtree capture, engine PERF_ECONOMY PE.2) must be
+/// EQUIVALENT to `snapshot_with_filter` over the same entity set — same per-entity component
+/// bytes, the same deterministic relation list — while never touching the rest of the world.
+/// Divergence between the two paths would silently change what undo restores.
+#[test]
+fn snapshot_entities_matches_the_filter_path_over_the_same_set() {
+    let mut world = World::new();
+    register_vocabulary(&mut world);
+
+    // A subtree (root + two children in sibling order + a Follows edge inside it)…
+    let root = world.spawn((Name("root".into()), Position { x: 1.0, y: 2.0 }, Frozen));
+    let a = world.spawn((Name("a".into()), Health { hp: 10.0, max: 20.0 }));
+    let b = world.spawn((Name("b".into()), Velocity { dx: 3.0, dy: 4.0 }));
+    world.add_relation(a, ChildOf, root);
+    world.add_relation(b, ChildOf, root);
+    world.add_relation(b, Follows, a);
+
+    // …and unrelated world content that a subtree capture must not drag in.
+    let outsider = world.spawn((Name("outsider".into()), Position { x: 9.0, y: 9.0 }));
+    let out_child = world.spawn((Name("out_child".into()),));
+    world.add_relation(out_child, ChildOf, outsider);
+    // An edge CROSSING the boundary is dropped by both paths (it cannot restore).
+    world.add_relation(out_child, Follows, a);
+
+    let subtree = [root, a, b];
+    let set: HashSet<Entity> = subtree.iter().copied().collect();
+
+    let filtered = WorldSerializer::snapshot_with_filter(
+        &world,
+        &mut apex_core::NoContext,
+        &|e| set.contains(&e),
+    )
+    .unwrap();
+    let scoped =
+        WorldSerializer::snapshot_entities(&world, &mut apex_core::NoContext, &subtree).unwrap();
+
+    // Entities: same set, identical serialized components (order-independent compare — the
+    // filter path emits archetype order, the scoped path the caller's list order).
+    let by_index = |snap: &WorldSnapshot| {
+        let mut v: Vec<_> = snap
+            .entities
+            .iter()
+            .map(|e| (e.original_index, format!("{:?}", e.components)))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(by_index(&filtered), by_index(&scoped), "same entities, same component bytes");
+
+    // Relations: both paths emit the same DETERMINISTIC list (kinds ↑, targets ↑, sibling
+    // order), with the boundary-crossing edge dropped by both.
+    let rels = |snap: &WorldSnapshot| {
+        snap.relations
+            .iter()
+            .map(|r| (r.kind_name.clone(), r.target_index, r.subject_index))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rels(&filtered), rels(&scoped), "identical relation lists");
+    assert_eq!(
+        scoped.relations.len(),
+        3,
+        "exactly the subtree's edges (two ChildOf + one Follows), nothing from outside"
+    );
+
+    // And the scoped snapshot restores into an equivalent subtree.
+    let mut restored = World::new();
+    register_vocabulary(&mut restored);
+    let map = WorldSerializer::restore(&mut restored, &scoped).unwrap();
+    assert_eq!(map.len(), 3);
+    let ra = map[&a.index()];
+    let rroot = map[&root.index()];
+    assert_eq!(restored.get::<Health>(ra), Some(&Health { hp: 10.0, max: 20.0 }));
+    let children: Vec<Entity> = restored.targets_of(ChildOf, rroot).collect();
+    assert_eq!(children, vec![map[&a.index()], map[&b.index()]], "sibling order survives");
+}

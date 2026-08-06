@@ -2165,6 +2165,17 @@ impl World {
         self.entities.is_alive(entity)
     }
 
+    /// The entity's storage location (archetype + row), if it is alive.
+    ///
+    /// Random access for whole-entity readers: the serializer's subtree snapshot walks a GIVEN
+    /// entity list through this instead of scanning every archetype — an editor deleting N models
+    /// used to pay a full-world scan per despawn capture, O(N × world) for one gesture
+    /// (engine PERF_ECONOMY PE.2).
+    #[inline]
+    pub fn entity_location(&self, entity: Entity) -> Option<crate::entity::EntityLocation> {
+        self.entities.get_location(entity)
+    }
+
     /// Check whether the entity has component `T`.
     ///
     /// O(1) after the first call for the given archetype (column_index is cached).

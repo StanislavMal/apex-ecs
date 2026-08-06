@@ -1221,6 +1221,27 @@ impl World {
         }
         out
     }
+
+    /// [`iter_relations_target_major`](Self::iter_relations_target_major) scoped to the given
+    /// TARGET entity indices — same deterministic order (kinds ascending, the given targets by
+    /// index ascending, subjects in SIBLING ORDER), without touching the rest of the world's
+    /// relations. The subtree snapshot's half of the O(world)-per-capture cost: the full dump
+    /// collected and SORTED every relation in the world per captured subtree (engine
+    /// PERF_ECONOMY PE.2). Callers still filter subjects to their kept set.
+    pub fn iter_relations_target_major_among(&self, targets: &[u32]) -> Vec<(Entity, u32, u32)> {
+        let mut sorted: Vec<u32> = targets.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut out = Vec::new();
+        for kind_idx in 0..self.relations.kind_count() as u32 {
+            for &target_index in &sorted {
+                for &subject in self.target_index.subjects(kind_idx, target_index) {
+                    out.push((subject, kind_idx, target_index));
+                }
+            }
+        }
+        out
+    }
 }
 
 // ── RelationIter ───────────────────────────────────────────────

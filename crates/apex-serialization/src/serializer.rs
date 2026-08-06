@@ -22,6 +22,72 @@ use crate::snapshot::{
     WorldSnapshot,
 };
 
+/// One entity's serialized components — the SHARED body of
+/// [`WorldSerializer::snapshot_with_filter`] (archetype scan) and
+/// [`WorldSerializer::snapshot_entities`] (random access via `entity_location`): two copies of
+/// this loop would drift (§0.2a).
+fn entity_snapshot(
+    world: &World,
+    arch: &apex_core::archetype::Archetype,
+    row: usize,
+    entity: Entity,
+    ctx: &mut dyn apex_core::SerdeContext,
+) -> Result<EntitySnapshot, SerializationError> {
+    let mut entity_snap = EntitySnapshot {
+        original_index: entity.index(),
+        components:     Vec::new(),
+    };
+
+    for col in arch.columns() {
+        let cid  = col.id();
+        let info = match world.registry().get_info(cid) {
+            Some(i) => i,
+            None    => continue,
+        };
+
+        // Components without serde are skipped
+        let serde_fns = match &info.serde {
+            Some(s) => s,
+            None    => continue,
+        };
+
+        // ZST marker (Folder/Model/Hidden/…): no bytes, but its PRESENCE is the data —
+        // write an empty snapshot so that restore re-inserts the component. (Previously
+        // `continue` silently lost marker components on save/load.)
+        if info.size == 0 {
+            entity_snap
+                .components
+                .push(ComponentSnapshot::new_json(info.name.to_string(), Vec::new()));
+            continue;
+        }
+
+        let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row), ctx) }
+            .map_err(|e| SerializationError::SerializeFailed {
+                type_name: info.name.to_string(),
+                reason:    e.to_string(),
+            })?;
+
+        // Save depending on the serialization format
+        match serde_fns.format {
+            "json" => {
+                entity_snap.components.push(ComponentSnapshot::new_json(
+                    info.name.to_string(),
+                    raw_bytes,
+                ));
+            }
+            _ => {
+                // Binary format — save as-is
+                entity_snap.components.push(ComponentSnapshot::new_binary(
+                    info.name.to_string(),
+                    raw_bytes,
+                ));
+            }
+        }
+    }
+
+    Ok(entity_snap)
+}
+
 // ── Errors ────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -109,59 +175,7 @@ impl WorldSerializer {
                     continue;
                 }
                 kept.insert(entity.index());
-                let mut entity_snap = EntitySnapshot {
-                    original_index: entity.index(),
-                    components:     Vec::new(),
-                };
-
-                for col in arch.columns() {
-                    let cid  = col.id();
-                    let info = match world.registry().get_info(cid) {
-                        Some(i) => i,
-                        None    => continue,
-                    };
-
-                    // Components without serde are skipped
-                    let serde_fns = match &info.serde {
-                        Some(s) => s,
-                        None    => continue,
-                    };
-
-                    // ZST marker (Folder/Model/Hidden/…): no bytes, but its PRESENCE is the data —
-                    // write an empty snapshot so that restore re-inserts the component. (Previously
-                    // `continue` silently lost marker components on save/load.)
-                    if info.size == 0 {
-                        entity_snap
-                            .components
-                            .push(ComponentSnapshot::new_json(info.name.to_string(), Vec::new()));
-                        continue;
-                    }
-
-                    let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row), ctx) }
-                        .map_err(|e| SerializationError::SerializeFailed {
-                            type_name: info.name.to_string(),
-                            reason:    e.to_string(),
-                        })?;
-
-                    // Save depending on the serialization format
-                    match serde_fns.format {
-                        "json" => {
-                            entity_snap.components.push(ComponentSnapshot::new_json(
-                                info.name.to_string(),
-                                raw_bytes,
-                            ));
-                        }
-                        _ => {
-                            // Binary format — save as-is
-                            entity_snap.components.push(ComponentSnapshot::new_binary(
-                                info.name.to_string(),
-                                raw_bytes,
-                            ));
-                        }
-                    }
-                }
-
-                snap.entities.push(entity_snap);
+                snap.entities.push(entity_snapshot(world, arch, row, entity, ctx)?);
             }
         }
 
@@ -195,6 +209,57 @@ impl WorldSerializer {
         for (type_name, data) in world.snapshot_resources_serde() {
             snap.resources
                 .push(crate::snapshot::ResourceSnapshot { type_name, data });
+        }
+
+        Ok(snap)
+    }
+
+    /// Snapshot ONLY the given entities (plus the relations among them) — **O(|entities|), not
+    /// O(world)**. The editor's despawn capture is the consumer (engine PERF_ECONOMY PE.2): with
+    /// [`snapshot_with_filter`](Self::snapshot_with_filter) each captured subtree paid a full
+    /// archetype scan AND a sorted dump of every relation in the world, which made deleting N
+    /// models quadratic in practice.
+    ///
+    /// Semantics match the filter path exactly per entity (same component serialization — one
+    /// shared helper — and the same deterministic relation order: kinds ascending, targets by
+    /// index ascending, subjects in sibling order; relations whose subject or target is outside
+    /// the set are dropped). Differences, both deliberate: the entity ORDER in the snapshot is the
+    /// caller's list order (restore does not depend on it), and **resources are NOT included** —
+    /// an entity-scoped capture is not a world save (full saves go through `snapshot_with*`).
+    /// Dead entities in the list are skipped.
+    pub fn snapshot_entities(
+        world: &World,
+        ctx: &mut dyn apex_core::SerdeContext,
+        entities: &[Entity],
+    ) -> Result<WorldSnapshot, SerializationError> {
+        let tick = world.current_tick().0;
+        let mut snap = WorldSnapshot::new(tick);
+        let mut kept: HashSet<u32> = HashSet::new();
+        for &e in entities {
+            if world.is_alive(e) {
+                kept.insert(e.index());
+            }
+        }
+
+        for &entity in entities {
+            let Some(loc) = world.entity_location(entity) else { continue };
+            let arch = &world.archetypes()[loc.archetype_id.as_usize()];
+            snap.entities.push(entity_snapshot(world, arch, loc.row as usize, entity, ctx)?);
+        }
+
+        let targets: Vec<u32> = kept.iter().copied().collect();
+        for (subject, kind_idx, target_index) in
+            world.iter_relations_target_major_among(&targets)
+        {
+            if !kept.contains(&subject.index()) {
+                continue;
+            }
+            let kind_name = world
+                .relation_registry()
+                .get_name(kind_idx)
+                .unwrap_or("<unknown>")
+                .to_string();
+            snap.relations.push(RelationSnapshot { subject_index: subject.index(), target_index, kind_name });
         }
 
         Ok(snap)
