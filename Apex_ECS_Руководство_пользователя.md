@@ -895,15 +895,25 @@ world.insert_resource(FrameStats::default());
 let cfg = world.resource::<PhysicsConfig>();
 println!("gravity: {}", cfg.gravity);
 
-// Мутабельный доступ:
+// Мутабельный доступ — ЛЕНИВЫЙ `ResMut<T>` (ADR-012, Bevy-паритет):
+// взятие хэндла НЕ помечает ресурс изменённым, штамп ставит только запись
+// (deref_mut). Читать через него можно без следа в change-детекции.
 world.resource_mut::<PhysicsConfig>().gravity = 1.62;
+
+// Пер-кадровым писателям — set_if_neq: равное значение не пишет и не штампит,
+// Changed-гейты по ресурсу молчат (паритет компонентного Mut::set_if_neq).
+world.resource_mut::<PhysicsConfig>().set_if_neq(PhysicsConfig { gravity: 1.62, dt: 0.016 });
+
+// Сознательный выход в &mut T (например, вернуть его из функции) — into_inner():
+// это штамп «изменён» при взятии, ленивость дальше не отслеживается.
+let cfg: &mut PhysicsConfig = world.resource_mut::<PhysicsConfig>().into_inner();
 
 // Безопасное чтение (Option):
 if let Some(stats) = world.try_resource::<FrameStats>() {
     println!("frame: {}", stats.frame);
 }
 
-// Безопасный мутабельный доступ (Option):
+// Безопасный мутабельный доступ (Option<ResMut<T>>):
 if let Some(mut stats) = world.try_resource_mut::<FrameStats>() {
     stats.frame += 1;
 }
@@ -4355,9 +4365,9 @@ fn main() {
 | `get_mut_by_id::<T>(entity, cid)` | `get_mut` по ComponentId (стампит change-tick) |
 | `insert_resource(value)` | Вставить ресурс |
 | `resource::<T>()` | Прочитать ресурс (panic если нет) |
-| `resource_mut::<T>()` | Изменить ресурс |
+| `resource_mut::<T>()` | Изменить ресурс → ленивый `ResMut<T>` (штамп на записи, не на взятии; ADR-012) |
 | `try_resource::<T>()` | Безопасное чтение ресурса → `Option<Res<T>>` |
-| `try_resource_mut::<T>()` | Безопасное мутабельное чтение → `Option<ResMut<T>>` |
+| `try_resource_mut::<T>()` | Безопасное мутабельное чтение → `Option<ResMut<T>>` (та же ленивость) |
 | `has_resource::<T>()` | Проверить наличие ресурса → `bool` |
 | `remove_resource::<T>()` | Удалить ресурс → `Option<T>` |
 | `add_event::<T>()` | Зарегистрировать тип события (опционально — `send_event` регистрирует сам) |
