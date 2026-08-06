@@ -496,14 +496,27 @@ impl EntityAllocator {
         // Read the current lease from the cell (a clone — the read-lock is released immediately, before
         // the write-lock in refresh_lease, otherwise self-deadlock).
         let lease = read_lease(&self.lease);
-        // Fast path (typical: spawns only, no despawns): nothing to return/re-lease.
-        // A non-empty `free_list` here (e.g. just-drained abandoned indices) skips it.
-        if self.free_list.is_empty() && lease.free.is_empty() {
+        let cursor = lease.cursor.load(Ordering::Relaxed).max(0) as usize;
+        let unconsumed = cursor.min(lease.free.len());
+        // Fast path — nothing to reconcile: no new frees, nothing abandoned, AND the lease
+        // is untouched (every slot still unconsumed). The return + re-lease below would
+        // then rebuild a byte-identical lease (same indices, same order, same generations
+        // — `free` is the only path that changes a generation, and it always pushes to
+        // `free_list`), so skipping it is observationally a no-op.
+        //
+        // The check used to be `free_list.is_empty() && lease.free.is_empty()`, which
+        // stopped firing once ANY entity had been despawned: the freed indices live in the
+        // lease from then on, so every later flush walked the whole pool and allocated a
+        // fresh Vec + Arc. `Commands::apply` calls `World::flush_reserved` for every command
+        // buffer of every stage of every frame, so the steady-state per-frame cost became
+        // proportional to the number of DELETED entities — the app got SLOWER after a mass
+        // delete, with FEWER entities alive. Found by the user in the editor after deleting
+        // several hundred models; measured 87 µs per idle flush at 20k freed, tens of calls
+        // per frame. Regression test: `idle_flush_does_not_rebuild_the_lease`.
+        if self.free_list.is_empty() && unconsumed == lease.free.len() {
             return;
         }
         // (1) Un-consumed lease slots (free[0..cursor]) are still free — return them to free_list.
-        let cursor = lease.cursor.load(Ordering::Relaxed).max(0) as usize;
-        let unconsumed = cursor.min(lease.free.len());
         for k in 0..unconsumed {
             self.free_list.push(lease.free[k].0);
         }
@@ -735,6 +748,52 @@ mod tests {
         assert_ne!(e3.generation, e1.generation);
         alloc.set_location(e3, make_loc());
         assert!(alloc.is_alive(e3));
+    }
+
+    /// An IDLE `flush` (nothing spawned, freed or abandoned since the last one) must
+    /// be a no-op — it must NOT return the lease's untouched slots to `free_list` only
+    /// to re-publish an identical lease.
+    ///
+    /// Found on a live editor: after mass-deleting several hundred models the app kept
+    /// getting slower with FEWER entities alive. `Commands::apply` calls
+    /// `World::flush_reserved` on every command buffer, every stage, every frame; with a
+    /// non-empty lease the old fast-path check (`free_list.is_empty() && lease.free
+    /// .is_empty()`) never fired, so each of those calls walked the whole free pool and
+    /// allocated a fresh `Vec` + `Arc` of thousands of entries. The per-frame cost was
+    /// proportional to the number of DELETED entities, which is why deleting made it
+    /// slower. `Arc::ptr_eq` is the structural witness: an idle flush keeps the lease.
+    #[test]
+    fn idle_flush_does_not_rebuild_the_lease() {
+        let mut alloc = EntityAllocator::new();
+        let entities = alloc.allocate_batch(4096);
+        for e in &entities {
+            alloc.set_location(*e, make_loc());
+        }
+        // Mass delete: every index lands in the reuse pool, then the lease.
+        for e in &entities {
+            alloc.free(*e);
+        }
+        alloc.flush();
+        let leased = read_lease(&alloc.lease);
+        assert_eq!(leased.free.len(), 4096, "the freed indices are leased for reuse");
+
+        // Idle frames: no spawn, no despawn, nothing abandoned.
+        for _ in 0..8 {
+            alloc.flush();
+            let now = read_lease(&alloc.lease);
+            assert!(
+                Arc::ptr_eq(&leased, &now),
+                "an idle flush must not re-publish the lease — that is O(free pool) \
+                 plus an allocation on every Commands::apply of every stage"
+            );
+        }
+
+        // …and the pool is still fully usable afterwards (the skip is not a leak).
+        let reused = alloc.allocate_batch(4096);
+        assert_eq!(reused.len(), 4096);
+        let fresh_indices: Vec<u32> =
+            reused.iter().map(|e| e.index).filter(|i| *i >= 4096).collect();
+        assert!(fresh_indices.is_empty(), "every id came from the reuse pool: {fresh_indices:?}");
     }
 
     #[test]

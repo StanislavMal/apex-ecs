@@ -881,7 +881,7 @@ impl Scheduler {
             if stage_cmds.len() < stage_ids.len() {
                 stage_cmds.resize_with(stage_ids.len(), Commands::new);
             }
-            for cmds in &mut stage_cmds {
+            for cmds in &mut stage_cmds[..stage_ids.len()] {
                 cmds.reset_for_reuse();
             }
             slot_of.clear();
@@ -988,7 +988,12 @@ impl Scheduler {
                     let w = unsafe { &mut *world_ptr };
                     // D8b: apply per-system command buffers in rank order (slot =
                     // position in stage_ids) — deterministic command application.
-                    for cmds in &mut stage_cmds {
+                    // PE-C4: only this stage's LIVE slots — the pool keeps the widest
+                    // stage's slots, and applying the stale tail would call
+                    // `World::flush_reserved` for buffers no system could have written.
+                    // Empty live slots are still applied: `apply` is what flushes the
+                    // reserved-id records that D8b's `reclaim_block_tail` requires.
+                    for cmds in &mut stage_cmds[..stage_ids.len()] {
                         cmds.apply(w);
                     }
                 }
@@ -1098,7 +1103,12 @@ impl Scheduler {
                     let w = unsafe { &mut *world_ptr };
                     // D8b: apply per-system command buffers in rank order (slot =
                     // position in stage_ids) — deterministic command application.
-                    for cmds in &mut stage_cmds {
+                    // PE-C4: only this stage's LIVE slots — the pool keeps the widest
+                    // stage's slots, and applying the stale tail would call
+                    // `World::flush_reserved` for buffers no system could have written.
+                    // Empty live slots are still applied: `apply` is what flushes the
+                    // reserved-id records that D8b's `reclaim_block_tail` requires.
+                    for cmds in &mut stage_cmds[..stage_ids.len()] {
                         cmds.apply(w);
                     }
                 }
@@ -1116,7 +1126,12 @@ impl Scheduler {
                     let w = unsafe { &mut *world_ptr };
                     // D8b: apply per-system command buffers in rank order (slot =
                     // position in stage_ids) — deterministic command application.
-                    for cmds in &mut stage_cmds {
+                    // PE-C4: only this stage's LIVE slots — the pool keeps the widest
+                    // stage's slots, and applying the stale tail would call
+                    // `World::flush_reserved` for buffers no system could have written.
+                    // Empty live slots are still applied: `apply` is what flushes the
+                    // reserved-id records that D8b's `reclaim_block_tail` requires.
+                    for cmds in &mut stage_cmds[..stage_ids.len()] {
                         cmds.apply(w);
                     }
                 }
