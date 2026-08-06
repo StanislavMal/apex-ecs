@@ -1,7 +1,7 @@
 //! `changed_iter` fairness guard: apex and bevy MUST yield the same number of changed
 //! entities each frame (otherwise the bench compares different work). We run several frames.
 
-#[cfg(all(feature = "bevy"))]
+#[cfg(feature = "bevy")]
 #[test]
 fn changed_iter_apex_and_bevy_yield_same_count() {
     use apex_bench::apex::changed_iter::ChangedIter;
@@ -23,7 +23,7 @@ fn changed_iter_apex_and_bevy_yield_same_count() {
     }
 }
 
-#[cfg(all(feature = "bevy"))]
+#[cfg(feature = "bevy")]
 #[test]
 fn changed_iter_static_apex_and_bevy_yield_zero() {
     use apex_bench::apex::changed_iter::ChangedIterStatic;
@@ -43,7 +43,7 @@ fn changed_iter_static_apex_and_bevy_yield_zero() {
     }
 }
 
-#[cfg(all(feature = "bevy"))]
+#[cfg(feature = "bevy")]
 #[test]
 fn changed_iter_frag_apex_and_bevy_yield_same_count() {
     use apex_bench::apex::changed_iter::ChangedIterFrag;

@@ -980,23 +980,35 @@ impl World {
         self.resources.get::<T>()
     }
 
-    /// Exclusive resource access. Stamps the change tick on ACQUISITION (RT-1:
-    /// `&mut T` through the exclusive world is presumed a write; the precise
-    /// lazy path is a `ResMut<T>` system parameter).
+    /// Exclusive resource access with LAZY change detection (PE-C6, Bevy
+    /// `World::resource_mut` parity): the returned [`ResMut`] stamps the change
+    /// tick on `deref_mut` — merely acquiring it is not a change, so a
+    /// read-or-skip pattern through the exclusive world no longer trips
+    /// `Changed`-gated consumers. The eager low-level path remains on
+    /// [`Resources::get_mut`] (explicitly documented stamping).
     #[track_caller]
-    pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> &mut T {
-        let tick = self.current_tick;
-        self.resources.get_mut::<T>(tick)
+    pub fn resource_mut<T: Send + Sync + 'static>(&mut self) -> crate::system_param::ResMut<'_, T> {
+        self.try_resource_mut::<T>().unwrap_or_else(|| {
+            panic!(
+                "resource_mut: resource {} not found",
+                std::any::type_name::<T>()
+            )
+        })
     }
 
     pub fn try_resource<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.resources.try_get::<T>()
     }
 
-    /// See [`resource_mut`](Self::resource_mut) for the stamping contract.
-    pub fn try_resource_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
-        let tick = self.current_tick;
-        self.resources.try_get_mut::<T>(tick)
+    /// See [`resource_mut`](Self::resource_mut) — the same lazy RT-1 contract.
+    pub fn try_resource_mut<T: Send + Sync + 'static>(
+        &mut self,
+    ) -> Option<crate::system_param::ResMut<'_, T>> {
+        let this_run = self.current_tick;
+        let (ptr, tick) = self.resources.get_raw_parts::<T>()?;
+        // SAFETY: `&mut self` guarantees exclusive access to the resource for
+        // the borrow; ptr/tick come from `get_raw_parts` and live in the slot.
+        Some(unsafe { crate::system_param::ResMut::from_raw_parts(ptr, tick, this_run) })
     }
 
     pub fn remove_resource<T: Send + Sync + 'static>(&mut self) -> Option<T> {
@@ -3987,12 +3999,40 @@ mod tests {
             "no mutation this frame — not 'changed'"
         );
 
-        // `&mut` acquisition through the exclusive world stamps.
+        // A write through the exclusive world stamps (lazily, on deref_mut).
         world.resource_mut::<Score>().0 = 2;
         assert!(
             world.resource_changed_tick::<Score>().expect("present").is_newer_than(last_run),
             "mutation this frame — 'changed'"
         );
+    }
+
+    /// PE-C6: `World::resource_mut` is LAZY — acquisition alone stamps nothing,
+    /// `set_if_neq` with an equal value stays quiet, a real write stamps.
+    #[test]
+    fn resource_mut_acquisition_is_not_a_change() {
+        let mut world = World::new();
+        world.insert_resource(Score(1));
+        world.tick();
+        let base = world.resource_changed_tick::<Score>().unwrap();
+
+        // Acquisition + shared read: no stamp.
+        {
+            let r = world.resource_mut::<Score>();
+            assert_eq!(r.0, 1);
+        }
+        assert_eq!(world.resource_changed_tick::<Score>(), Some(base));
+
+        // set_if_neq with the same value: no stamp.
+        world.tick();
+        assert!(!world.resource_mut::<Score>().set_if_neq(Score(1)));
+        assert_eq!(world.resource_changed_tick::<Score>(), Some(base));
+
+        // A differing value writes and stamps.
+        assert!(world.resource_mut::<Score>().set_if_neq(Score(2)));
+        let stamped = world.resource_changed_tick::<Score>().unwrap();
+        assert!(stamped.is_newer_than(base));
+        assert_eq!(world.resource::<Score>().0, 2);
     }
 
     #[test]
@@ -5052,7 +5092,7 @@ mod hooks_and_added_tests {
         let mut world = log_world();
         world.on_remove::<Hp>(|w, e| {
             let alive = w.is_alive(e);
-            let log = w.resource_mut::<HookLog>();
+            let mut log = w.resource_mut::<HookLog>();
             log.removed.push(e);
             log.removed_alive.push(alive);
         });

@@ -149,7 +149,7 @@ system! {
         world: &mut World,
     ) {
         let entities = world.entity_count();
-        let stats = world.resource_mut::<FrameStats>();
+        let mut stats = world.resource_mut::<FrameStats>();
         stats.frame += 1;
         stats.total_entities_processed += entities;
         println!("  [stats_update] frame={} entities={}", stats.frame, stats.total_entities_processed);

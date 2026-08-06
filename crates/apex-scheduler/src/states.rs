@@ -105,13 +105,20 @@ fn apply_state_transition<S: States>(world: &mut World) {
     // survive the whole first frame so on_enter(initial) is visible to Update and
     // later stages, not just Startup (D7).
     {
-        let tr = world.resource_mut::<StateTransitions<S>>();
+        let mut tr = world.resource_mut::<StateTransitions<S>>();
         if tr.first_apply {
             tr.first_apply = false;
-        } else {
+        } else if tr.entered.is_some() || tr.exited.is_some() {
+            // PE-C6: only write when there is something to clear — an idle
+            // frame must not stamp the transitions resource "changed".
             tr.entered = None;
             tr.exited = None;
         }
+    }
+    // PE-C6: probe read-only first — `take()` writes `None` even when there is
+    // no pending state, which would stamp NextState "changed" every frame.
+    if world.resource::<NextState<S>>().0.is_none() {
+        return;
     }
     let Some(next) = world.resource_mut::<NextState<S>>().0.take() else {
         return;
@@ -121,7 +128,7 @@ fn apply_state_transition<S: States>(world: &mut World) {
         return;
     }
     world.resource_mut::<State<S>>().0 = next;
-    let tr = world.resource_mut::<StateTransitions<S>>();
+    let mut tr = world.resource_mut::<StateTransitions<S>>();
     tr.exited = Some(current);
     tr.entered = Some(next);
 }

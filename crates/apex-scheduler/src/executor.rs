@@ -1129,7 +1129,16 @@ impl Scheduler {
         }
         world
             .try_resource_mut::<crate::fixed::FixedTime>()
-            .map(|ft| ft.drain_steps())
+            .map(|mut ft| {
+                // PE-C6: `ResMut` stamps lazily on mutable deref — do not touch
+                // the accumulator when no step is due, or FixedTime reads as
+                // "changed" every frame forever.
+                if ft.dt <= 0.0 || ft.overstep() < ft.dt {
+                    0
+                } else {
+                    ft.drain_steps()
+                }
+            })
             .unwrap_or(1)
     }
 

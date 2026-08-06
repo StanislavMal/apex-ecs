@@ -131,6 +131,41 @@ impl<'w, T: Send + Sync + 'static> ResMut<'w, T> {
         }
     }
 
+    /// Assign `value` ONLY if it differs (PE-C6, parity with the component
+    /// `Mut::set_if_neq`): an equal value stamps nothing and `Changed`-gated
+    /// consumers of the resource stay quiet; a differing value writes and
+    /// stamps. The compare reads through `Deref` (no stamp).
+    #[inline]
+    pub fn set_if_neq(&mut self, value: T) -> bool
+    where
+        T: PartialEq,
+    {
+        // Compare through the raw pointer (a plain read — no stamp).
+        if unsafe { &*self.ptr } == &value {
+            return false;
+        }
+        // SAFETY: exclusive access for `'w` is the constructor's contract.
+        unsafe { *self.ptr = value };
+        if let Some(tick) = self.tick {
+            // SAFETY: the cell lives in the resource slot and outlives `'w`.
+            unsafe { (*tick).set(self.this_run) };
+        }
+        true
+    }
+
+    /// Consume the wrapper and return the raw `&'w mut T`, stamping the change
+    /// tick (Bevy `Mut::into_inner` parity): the caller escapes lazy tracking,
+    /// so the acquisition is presumed a write.
+    #[inline]
+    pub fn into_inner(self) -> &'w mut T {
+        if let Some(tick) = self.tick {
+            // SAFETY: the cell lives in the resource slot and outlives `'w`.
+            unsafe { (*tick).set(self.this_run) };
+        }
+        // SAFETY: exclusive access for `'w` is the constructor's contract.
+        unsafe { &mut *self.ptr }
+    }
+
     /// # Safety
     /// `ptr` and `tick` come from `Resources::get_raw_parts` and are valid for
     /// `'w`; the scheduler guarantees exclusive access to the resource.

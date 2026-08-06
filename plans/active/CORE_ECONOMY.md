@@ -123,6 +123,22 @@ set_changed, set_if_neq; `Mut` несёт указатель агрегата, �
 Гейты: ядро 296 + воркспейс зелёные; clippy чистый; Miri точечно 7/7 (тик-пути);
 движок `cargo build --workspace` против HEAD ядра; goldens **753/753 байт-идентичны**.
 
+**Волна 3 ✅ (PE-C6, 2026-08-06)** — тики ресурсов стали ленивыми на золотом пути:
+`World::resource_mut`/`try_resource_mut` теперь отдают `ResMut<'_, T>` (Bevy-паритет;
+взятие ≠ изменение, штамп на `deref_mut`); низкоуровневый `Resources::get_mut(tick)`
+остаётся ЯВНЫМ eager-API (задокументирован). `ResMut` получил `set_if_neq` (равное
+значение — тихо) и `into_inner` (сознательный выход в `&mut T` = штамп, Bevy-паритет).
+Вечная «изменённость» служебных ресурсов устранена: `stage_steps` не трогает
+аккумулятор `FixedTime` без шага; `apply_state_transition` не пишет `NextState`/
+`StateTransitions` на холостом кадре; движковый `App::update` не аккумулирует dt=0.
+Тип-миграция: движок мигрирован свипом (109 файлов, механически `let mut`/`into_inner`;
+rustc-саджесты применены скриптом по JSON-диагностике). Тест
+`resource_mut_acquisition_is_not_a_change` (+ уточнён lifecycle-тест). Гейты: ядро
+зелёное + clippy net-neutral (хвост: `cfg(all())`-стиль и `Default` в бенчах волны 0
+зачищены), Miri точечно по ResMut-путям чист, движок
+`cargo check --workspace --all-targets --all-features` зелёный, apex-render clippy
+держит свои 8 pre-existing, goldens **753/753 байт-идентичны**.
+
 **Волна 2 ✅ (PE-C1, 2026-08-06)** — changed-фаза `propagate_transforms` пропускает
 архетип по агрегату колонки `LocalTransform` ДО построчного тик-скана (одна проверка
 O(1) на архетип). Добавлен бенч `propagate_static` (та же иерархия 10k узлов, ничего

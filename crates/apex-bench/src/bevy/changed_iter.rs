@@ -48,6 +48,12 @@ pub struct BenchmarkStatic {
     query: QueryState<&'static Data, Changed<Data>>,
 }
 
+impl Default for BenchmarkStatic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BenchmarkStatic {
     pub fn new() -> Self {
         let mut world = World::new();
@@ -88,6 +94,12 @@ pub struct BenchmarkFrag {
     world: World,
     hot: Vec<Entity>,
     query: QueryState<&'static Data, Changed<Data>>,
+}
+
+impl Default for BenchmarkFrag {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BenchmarkFrag {
