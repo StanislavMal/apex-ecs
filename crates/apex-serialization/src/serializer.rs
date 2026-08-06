@@ -222,11 +222,23 @@ impl WorldSerializer {
     ///
     /// Semantics match the filter path exactly per entity (same component serialization — one
     /// shared helper — and the same deterministic relation order: kinds ascending, targets by
-    /// index ascending, subjects in sibling order; relations whose subject or target is outside
-    /// the set are dropped). Differences, both deliberate: the entity ORDER in the snapshot is the
-    /// caller's list order (restore does not depend on it), and **resources are NOT included** —
-    /// an entity-scoped capture is not a world save (full saves go through `snapshot_with*`).
-    /// Dead entities in the list are skipped.
+    /// index ascending, subjects in sibling order). Differences, both deliberate: the entity ORDER
+    /// in the snapshot is the caller's list order (restore does not depend on it), and
+    /// **resources are NOT included** — an entity-scoped capture is not a world save (full saves
+    /// go through `snapshot_with*`). Dead entities in the list are skipped.
+    ///
+    /// # A snapshot owns only what it captured
+    ///
+    /// **Relations with an end OUTSIDE `entities` are NOT captured** — a snapshot is
+    /// self-contained, and an edge to an entity it does not own has nothing to restore against
+    /// (the stored target is an index, which the allocator may have handed to a stranger by
+    /// restore time). This is not a filtering detail: it means a captured entity's link to a
+    /// SURVIVING parent is the CALLER's to preserve. The engine editor's structural undo learned
+    /// this the hard way — deleting a nested object and undoing brought it back detached at the
+    /// scene root, and with a nested transform that made it visibly the wrong size; it now records
+    /// the parent by its own stable identity alongside the snapshot (`apex-editor`
+    /// `SubtreeCapture::parent`). A caller that restores into a world where those outside ends
+    /// still live must do the same.
     pub fn snapshot_entities(
         world: &World,
         ctx: &mut dyn apex_core::SerdeContext,
