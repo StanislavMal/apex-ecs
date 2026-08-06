@@ -56,3 +56,30 @@ impl Propagate {
         propagate_transforms(&mut self.world);
     }
 }
+
+// PropagateStatic — the PE-C1 target case: the same 10k-node hierarchy, but NOTHING moves.
+// Measures the pure per-frame cost of propagate proving there is no work: pre PE-C1/C2 a
+// linear tick scan of every LocalTransform row, post — an O(archetypes) aggregate check.
+pub struct PropagateStatic {
+    world: World,
+}
+
+impl Default for PropagateStatic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PropagateStatic {
+    pub fn new() -> Self {
+        let mut inner = Propagate::new();
+        // Settle: one propagated frame, then the graph goes quiet.
+        inner.run();
+        Self { world: inner.world }
+    }
+
+    pub fn run(&mut self) {
+        self.world.tick();
+        propagate_transforms(&mut self.world);
+    }
+}

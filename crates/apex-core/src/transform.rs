@@ -607,6 +607,12 @@ pub fn propagate_transforms(world: &mut World) {
                     continue;
                 };
                 let col = &arch.columns[col_idx];
+                // PE-C1: the column tick aggregate (PE-C2) rules out untouched
+                // archetypes in O(1) — a static scene skips the row scan
+                // entirely instead of reading every transform's tick per frame.
+                if !col.max_change_tick().is_newer_than(last_run) {
+                    continue;
+                }
                 for (tick, &entity) in col.change_ticks.iter().zip(arch.entities.iter()) {
                     if tick.get().is_newer_than(last_run) {
                         dirty_entities.push(entity);

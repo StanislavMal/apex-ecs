@@ -336,6 +336,15 @@ fn bench_wide_iter(c: &mut Criterion) {
     });
 }
 
+// PE-C1 target case (CORE_ECONOMY): the cost of propagate proving nothing moved.
+fn bench_propagate_static(c: &mut Criterion) {
+    let mut group = c.benchmark_group("propagate_static");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::propagate::PropagateStatic::new();
+        b.iter(move || bench.run());
+    });
+}
+
 fn bench_propagate(c: &mut Criterion) {
     // Apex-focused (our differentiator; bevy propagate is a separate crate/schedule). Regression guard.
     let mut group = c.benchmark_group("propagate");
@@ -378,6 +387,7 @@ criterion_group!(
     bench_events_frame_loop,
     bench_relations,
     bench_propagate,
+    bench_propagate_static,
     bench_despawn_recursive,
     bench_wide_iter,
     bench_commands_insert,
