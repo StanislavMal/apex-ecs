@@ -2,6 +2,7 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::alloc::{alloc, dealloc, realloc, Layout};
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
     component::{ComponentId, ComponentInfo, Tick},
@@ -63,6 +64,56 @@ impl TickCell {
     }
 }
 
+/// Per-column upper bound of the row ticks (PE-C2, the CORE_ECONOMY aggregate).
+///
+/// Invariant: the aggregate is never OLDER (in the wrapping window sense of
+/// [`Tick::is_newer_than`]) than any row tick of its column. It only ever
+/// rises ([`raise`](Self::raise)); a `swap_remove` does not lower it — a stale
+/// too-new aggregate merely costs a scan, never a missed change. With the
+/// invariant, `!aggregate.is_newer_than(last_run)` proves NO row can pass a
+/// `Changed<T>`/`Added<T>` filter, so a whole archetype is skipped in O(1).
+///
+/// Atomic because row-split chunks of one system share the column: row ticks
+/// are distinct cells, but the aggregate is one location written by every
+/// chunk. All concurrent writers stamp the same `this_run` (writers of
+/// DIFFERENT ticks are serialized by the scheduler's `AccessDescriptor`
+/// discipline), so a relaxed load/compare/store suffices — no CAS.
+#[repr(transparent)]
+pub(crate) struct TickAggregate(AtomicU32);
+
+impl TickAggregate {
+    #[inline]
+    pub(crate) fn new(tick: Tick) -> Self {
+        Self(AtomicU32::new(tick.0))
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Tick {
+        Tick(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Raise the aggregate to `tick` if `tick` is newer. Safe for ticks that
+    /// may be OLDER than the aggregate (archetype moves, restore paths): an
+    /// older tick leaves the upper bound untouched. On hot paths the common
+    /// case is "already at `this_run`" — one relaxed load and a predicted
+    /// branch, no store (and no cross-core store ping-pong between chunks).
+    #[inline]
+    pub(crate) fn raise(&self, tick: Tick) {
+        if tick.is_newer_than(self.get()) {
+            self.0.store(tick.0, Ordering::Relaxed);
+        }
+    }
+
+    /// Clamp into the `MAX_CHANGE_AGE` window (the same W2-3 pass as row ticks).
+    #[inline]
+    pub(crate) fn check_against(&mut self, current: Tick) {
+        let mut t = Tick(*self.0.get_mut());
+        if t.check_against(current) {
+            *self.0.get_mut() = t.0;
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct ArchetypeId(pub(crate) u32);
 
@@ -96,6 +147,11 @@ pub struct Column {
     /// via `insert` over an existing component updates ONLY the change-tick (like
     /// Bevy: a re-insert does not restart `Added<T>`).
     pub(crate) added_ticks: Vec<TickCell>,
+    /// Upper bound of `change_ticks` (PE-C2) — lets `Changed<T>` consumers skip
+    /// the whole column in O(1) when nothing in it changed since their last run.
+    pub(crate) max_change_tick: TickAggregate,
+    /// Upper bound of `added_ticks` (PE-C2) — the same skip for `Added<T>`.
+    pub(crate) max_added_tick: TickAggregate,
 }
 
 unsafe impl Send for Column {}
@@ -131,7 +187,23 @@ impl Column {
             capacity: 0,
             change_ticks: Vec::new(),
             added_ticks: Vec::new(),
+            max_change_tick: TickAggregate::new(Tick::ZERO),
+            max_added_tick: TickAggregate::new(Tick::ZERO),
         }
+    }
+
+    /// Upper bound of this column's per-row change ticks (PE-C2): if it is not
+    /// newer than a consumer's `last_run`, NO row of the column passes
+    /// `Changed<T>` — the archetype may be skipped without a row scan.
+    #[inline]
+    pub fn max_change_tick(&self) -> Tick {
+        self.max_change_tick.get()
+    }
+
+    /// Upper bound of this column's per-row added ticks (PE-C2, `Added<T>`).
+    #[inline]
+    pub fn max_added_tick(&self) -> Tick {
+        self.max_added_tick.get()
     }
 
     /// Public accessor for the column's component_id.
@@ -162,6 +234,7 @@ impl Column {
         // from the buffer base carries cell provenance — writing is legal (A2).
         let ptr = self.change_ticks.as_ptr() as *mut Tick;
         *ptr.add(row) = tick;
+        self.max_change_tick.raise(tick);
     }
 
     /// Stamp the change-tick over a RANGE of rows `[start, end)` (W2-0.5).
@@ -180,6 +253,9 @@ impl Column {
         let ptr = self.change_ticks.as_ptr() as *mut Tick;
         for row in start..end {
             *ptr.add(row) = tick;
+        }
+        if start < end {
+            self.max_change_tick.raise(tick);
         }
     }
 
@@ -238,6 +314,8 @@ impl Column {
         }
         self.change_ticks.push(TickCell::new(tick));
         self.added_ticks.push(TickCell::new(tick));
+        self.max_change_tick.raise(tick);
+        self.max_added_tick.raise(tick);
         self.len += 1;
     }
 
@@ -252,6 +330,12 @@ impl Column {
     pub(crate) unsafe fn push_moved_ticks(&mut self, changed: Tick, added: Tick) {
         self.change_ticks.push(TickCell::new(changed));
         self.added_ticks.push(TickCell::new(added));
+        // A moved row carries its ORIGINAL ticks, which may be newer than
+        // anything this column has seen — the destination aggregate must rise,
+        // or a freshly-changed row would vanish from `Changed<T>` behind an
+        // archetype skip (the PE-C2 false-negative case).
+        self.max_change_tick.raise(changed);
+        self.max_added_tick.raise(added);
         self.len += 1;
     }
 
@@ -292,6 +376,7 @@ impl Column {
         }
         if row < self.change_ticks.len() {
             self.change_ticks[row] = TickCell::new(tick);
+            self.max_change_tick.raise(tick);
         }
     }
 
@@ -318,6 +403,8 @@ impl Column {
         for t in &mut self.added_ticks {
             t.get_mut().check_against(current);
         }
+        self.max_change_tick.check_against(current);
+        self.max_added_tick.check_against(current);
     }
 
     /// # Safety
@@ -834,6 +921,59 @@ mod tests {
             }
             assert_eq!(col.get_tick(i).0, i as u32);
         }
+    }
+
+    /// PE-C2: the per-column aggregates are an upper bound of the row ticks on
+    /// every write path, only ever rise, and clamp with the W2-3 window pass.
+    #[test]
+    fn tick_aggregates_follow_writes_and_clamp() {
+        let info = make_info(0);
+        let mut col = Column::new(&info);
+        assert_eq!(col.max_change_tick(), Tick::ZERO);
+        assert_eq!(col.max_added_tick(), Tick::ZERO);
+
+        // push (fresh value): both aggregates rise to the spawn tick.
+        let val: f32 = 1.0;
+        unsafe { col.push(&val as *const f32 as *const u8, Tick(5)) };
+        assert_eq!(col.max_change_tick(), Tick(5));
+        assert_eq!(col.max_added_tick(), Tick(5));
+
+        // Interior stamp (the Mut/set_change_tick path): change aggregate rises.
+        unsafe { col.set_change_tick(0, Tick(9)) };
+        assert_eq!(col.max_change_tick(), Tick(9));
+        assert_eq!(col.max_added_tick(), Tick(5), "added is untouched by mutation");
+
+        // An OLDER stamp must not lower the upper bound.
+        unsafe { col.set_change_tick(0, Tick(7)) };
+        assert_eq!(col.max_change_tick(), Tick(9));
+
+        // A moved row with fresher ticks raises the destination aggregates —
+        // the PE-C2 false-negative case.
+        let val2: f32 = 2.0;
+        unsafe {
+            if col.len >= col.capacity {
+                col.grow();
+            }
+            let dst = col.get_ptr(1);
+            std::ptr::copy_nonoverlapping(&val2 as *const f32 as *const u8, dst, col.item_size);
+            col.push_moved_ticks(Tick(12), Tick(11));
+        }
+        assert_eq!(col.max_change_tick(), Tick(12));
+        assert_eq!(col.max_added_tick(), Tick(11));
+
+        // stamp_range (dense write slice): one raise for the whole range.
+        unsafe { col.stamp_range(0, 2, Tick(20)) };
+        assert_eq!(col.max_change_tick(), Tick(20));
+
+        // swap_remove does NOT lower the aggregate (conservative upper bound).
+        unsafe { col.swap_remove_and_drop(1) };
+        assert_eq!(col.max_change_tick(), Tick(20));
+
+        // The W2-3 clamp pulls a stale aggregate into the window like row ticks.
+        let current = Tick(Tick::MAX_CHANGE_AGE.wrapping_mul(2));
+        col.check_change_ticks(current);
+        assert_eq!(col.max_change_tick(), Tick(current.0 - Tick::MAX_CHANGE_AGE));
+        assert_eq!(col.max_added_tick(), Tick(current.0 - Tick::MAX_CHANGE_AGE));
     }
 
     /// A8 regression: if a component's `Drop` panics during

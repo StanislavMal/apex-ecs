@@ -146,6 +146,24 @@ pub unsafe trait WorldQuery: Sized {
         false
     }
 
+    /// Archetype-level early-out by the per-column tick aggregates (PE-C2,
+    /// CORE_ECONOMY): `true` ⇒ NO row of this MATCHED archetype can pass this
+    /// shape's row filter for the given `last_run`, so iteration may skip the
+    /// whole archetype without fetching state or scanning rows.
+    ///
+    /// Purely a perf hook: `false` is always correct; `true` while some row
+    /// could still match would LOSE changes, so overrides must rest on the
+    /// aggregate's upper-bound invariant
+    /// ([`Column::max_change_tick`](crate::archetype::Column::max_change_tick)).
+    /// `Changed<T>`/`Added<T>` compare their column aggregate against
+    /// `last_run`; a tuple skips when ANY conjunct skips; `Or` — only when
+    /// EVERY matching branch skips. Default: never skip (data shapes and
+    /// archetype-level filters carry no tick semantics).
+    #[inline(always)]
+    fn skip_archetype(_arch: &Archetype, _ids: &[ComponentId], _last_run: Tick) -> bool {
+        false
+    }
+
     /// Infallible variant of [`fetch_item`](Self::fetch_item) for
     /// archetype-level shapes. Call ONLY when [`has_row_filter`](Self::has_row_filter)
     /// is false — otherwise UB (`unwrap_unchecked` on a per-row-filtered row).
@@ -185,15 +203,33 @@ pub struct Mut<'w, T: 'static> {
     pub(crate) value: &'w mut T,
     /// Pointer to this row's change-tick (inside `Column::change_ticks`).
     pub(crate) change_tick: *mut Tick,
+    /// Pointer to the column's tick aggregate (PE-C2): every row stamp also
+    /// raises the column upper bound, so `Changed<T>` consumers can skip
+    /// untouched archetypes wholesale. Lives in `Column`, valid for `'w`.
+    pub(crate) max_change_tick: *const crate::archetype::TickAggregate,
     /// Current world tick — stamped on `DerefMut`.
     pub(crate) this_run: Tick,
 }
 
 impl<T: 'static> Mut<'_, T> {
+    /// Stamp the row tick AND raise the column aggregate (PE-C2). The common
+    /// repeat case (aggregate already at `this_run`) is a relaxed load + a
+    /// predicted branch — no store, no cross-core ping-pong between chunks.
+    #[inline(always)]
+    fn stamp(&mut self) {
+        // SAFETY: both cells live in the `Column` and outlive `'w`; exclusive
+        // access to the row is the scheduler's guarantee for this `Mut`, and
+        // the aggregate is interior-mutable (atomic) by design.
+        unsafe {
+            *self.change_tick = self.this_run;
+            (*self.max_change_tick).raise(self.this_run);
+        }
+    }
+
     /// Explicitly mark the component changed without mutating the value.
     #[inline]
     pub fn set_changed(&mut self) {
-        unsafe { *self.change_tick = self.this_run };
+        self.stamp();
     }
 
     /// Get `&mut T` without marking a change (escape-hatch).
@@ -218,7 +254,7 @@ impl<T: 'static> Mut<'_, T> {
             return false;
         }
         *self.value = value;
-        unsafe { *self.change_tick = self.this_run };
+        self.stamp();
         true
     }
 }
@@ -234,7 +270,7 @@ impl<T: 'static> std::ops::Deref for Mut<'_, T> {
 impl<T: 'static> std::ops::DerefMut for Mut<'_, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { *self.change_tick = self.this_run };
+        self.stamp();
         self.value
     }
 }
@@ -250,6 +286,7 @@ impl<T: std::fmt::Debug + 'static> std::fmt::Debug for Mut<'_, T> {
 pub struct WriteState<T> {
     data: *mut T,
     ticks: *mut Tick,
+    agg: *const crate::archetype::TickAggregate,
     this_run: Tick,
 }
 
@@ -383,6 +420,7 @@ unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
         WriteState {
             data: col.get_ptr(0) as *mut T,
             ticks: col.ticks_ptr() as *mut Tick,
+            agg: &col.max_change_tick,
             this_run,
         }
     }
@@ -392,6 +430,7 @@ unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
         Some(Mut {
             value: &mut *state.data.add(row),
             change_tick: state.ticks.add(row),
+            max_change_tick: state.agg,
             this_run: state.this_run,
         })
     }
@@ -670,6 +709,7 @@ pub struct MaybeWrite<T: Component>(std::marker::PhantomData<T>);
 pub struct MaybeMutState {
     data: *mut u8,
     ticks: *mut Tick,
+    agg: *const crate::archetype::TickAggregate,
     item_size: usize,
     present: bool,
     this_run: Tick,
@@ -683,6 +723,7 @@ impl MaybeMutState {
         MaybeMutState {
             data: std::ptr::null_mut(),
             ticks: std::ptr::null_mut(),
+            agg: std::ptr::null(),
             item_size: 0,
             present: false,
             this_run: Tick::ZERO,
@@ -740,6 +781,7 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
         MaybeMutState {
             data: col.data,
             ticks: col.ticks_ptr() as *mut Tick,
+            agg: &col.max_change_tick,
             item_size: col.item_size,
             present: true,
             this_run,
@@ -757,6 +799,7 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
             Some(Some(Mut {
                 value,
                 change_tick: state.ticks.add(row),
+                max_change_tick: state.agg,
                 this_run: state.this_run,
             }))
         } else {
@@ -813,6 +856,16 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         !ids.is_empty() && arch.has_component(ids[0])
+    }
+
+    /// PE-C2: the column aggregate is an upper bound of the row ticks — if it
+    /// is not newer than `last_run`, no row of this archetype passes.
+    #[inline]
+    fn skip_archetype(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> bool {
+        match ids.first().and_then(|&id| arch.column_index(id)) {
+            Some(col_idx) => !arch.columns[col_idx].max_change_tick().is_newer_than(last_run),
+            None => false,
+        }
     }
 
     unsafe fn fetch_state(
@@ -897,6 +950,15 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
 
     fn matches_archetype(arch: &Archetype, ids: &[ComponentId]) -> bool {
         !ids.is_empty() && arch.has_component(ids[0])
+    }
+
+    /// PE-C2: same skip as `Changed<T>`, against the added-tick aggregate.
+    #[inline]
+    fn skip_archetype(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> bool {
+        match ids.first().and_then(|&id| arch.column_index(id)) {
+            Some(col_idx) => !arch.columns[col_idx].max_added_tick().is_newer_than(last_run),
+            None => false,
+        }
     }
 
     unsafe fn fetch_state(
@@ -1003,6 +1065,25 @@ macro_rules! impl_or_query {
                     #[allow(unused_assignments)] { offset += n; }
                 )+
                 false
+            }
+
+            /// PE-C2: a row passes `Or` via ANY branch, so the archetype may be
+            /// skipped only when EVERY branch is ruled out — either it does not
+            /// match the archetype at all, or its own skip proves no row passes.
+            /// A matching non-tick branch (`With` etc.) never skips ⇒ `Or` does
+            /// not skip. Conservatively correct.
+            #[inline]
+            fn skip_archetype(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> bool {
+                let mut offset = 0;
+                $(
+                    let n = $F::component_count();
+                    let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                    if $F::matches_archetype(arch, slice) && !$F::skip_archetype(arch, slice, last_run) {
+                        return false;
+                    }
+                    #[allow(unused_assignments)] { offset += n; }
+                )+
+                true
             }
 
             unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick, this_run: Tick) -> Self::State {
@@ -1114,6 +1195,20 @@ macro_rules! impl_world_query_tuple {
                     #[allow(unused_assignments)] { offset += n; }
                 )+
                 true
+            }
+
+            /// PE-C2: elements are conjunctive — if ANY element proves no row
+            /// can pass, the whole tuple passes nowhere in this archetype.
+            #[inline]
+            fn skip_archetype(arch: &Archetype, ids: &[ComponentId], last_run: Tick) -> bool {
+                let mut offset = 0;
+                $(
+                    let n = $Q::component_count();
+                    let slice = if offset + n <= ids.len() { &ids[offset..offset + n] } else { &[] };
+                    if $Q::skip_archetype(arch, slice, last_run) { return true; }
+                    #[allow(unused_assignments)] { offset += n; }
+                )+
+                false
             }
 
             unsafe fn fetch_state(arch: &Archetype, ids: &[ComponentId], last_run: Tick, this_run: Tick) -> Self::State {
@@ -1702,6 +1797,10 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
             if arch.is_empty() || (!self.match_verified && !<(D, F)>::matches_archetype(arch, ids)) {
                 continue;
             }
+            // PE-C2: the tick aggregates prove no row can pass — skip wholesale.
+            if <(D, F)>::has_row_filter() && <(D, F)>::skip_archetype(arch, ids, self.last_run) {
+                continue;
+            }
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
             if end <= row_start {
@@ -1736,6 +1835,10 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
                 continue;
             }
             if !self.match_verified && !<(D, F)>::matches_archetype(arch, ids) {
+                continue;
+            }
+            // PE-C2: the tick aggregates prove no row can pass — skip wholesale.
+            if <(D, F)>::has_row_filter() && <(D, F)>::skip_archetype(arch, ids, self.last_run) {
                 continue;
             }
             let state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
@@ -1810,6 +1913,11 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
             .copied()
             .filter(|&a| !world.archetypes[a].is_empty())
             .filter(|&a| match_verified || <(D, F)>::matches_archetype(&world.archetypes[a], &ids))
+            // PE-C2: the tick aggregates prove no row can pass — skip wholesale.
+            .filter(|&a| {
+                !<(D, F)>::has_row_filter()
+                    || !<(D, F)>::skip_archetype(&world.archetypes[a], &ids, last_run)
+            })
             .filter_map(|a| {
                 let (s, e) = rr(a);
                 let start = s;
@@ -2093,6 +2201,10 @@ impl<'q, D: WorldQuery, F: WorldQuery> QueryIter<'q, D, F> {
             if !self.match_verified && !<(D, F)>::matches_archetype(arch, self.ids) {
                 continue;
             }
+            // PE-C2: the tick aggregates prove no row can pass — skip wholesale.
+            if <(D, F)>::has_row_filter() && <(D, F)>::skip_archetype(arch, self.ids, self.last_run) {
+                continue;
+            }
 
             let (r_start, r_end) = self
                 .row_ranges
@@ -2359,6 +2471,23 @@ impl DynTerms {
             let col = &arch.columns[col_idx];
             let tick = if t.added { col.get_added_tick(row) } else { col.get_tick(row) };
             tick.is_newer_than(last_run)
+        })
+    }
+
+    /// PE-C2 archetype-level pre-filter for the change terms: `false` ⇒ the
+    /// column tick aggregates prove NO row of `arch` can pass EVERY term, so
+    /// the archetype may be skipped without a row scan. Terms are conjunctive:
+    /// one term whose aggregate is not newer than `last_run` rules out the
+    /// whole archetype. Empty term list ⇒ trivially passes (no cost).
+    #[inline]
+    fn arch_may_pass_change(terms: &[ChangeTerm], last_run: Tick, arch: &Archetype) -> bool {
+        terms.iter().all(|t| match arch.column_index(t.id) {
+            Some(col_idx) => {
+                let col = &arch.columns[col_idx];
+                let agg = if t.added { col.max_added_tick() } else { col.max_change_tick() };
+                agg.is_newer_than(last_run)
+            }
+            None => false,
         })
     }
 
@@ -2967,6 +3096,15 @@ impl<'q, 'w> Iterator for DynIter<'q, 'w> {
         loop {
             let &arch_idx = self.arch_ids.get(self.arch_cursor)?;
             let arch = &self.world.archetypes()[arch_idx];
+            // PE-C2: on entering an archetype, the tick aggregates may prove no
+            // row passes the change terms — skip the whole archetype.
+            if self.row == 0
+                && !self.change_terms.is_empty()
+                && !DynTerms::arch_may_pass_change(self.change_terms, self.change_since, arch)
+            {
+                self.arch_cursor += 1;
+                continue;
+            }
             if self.row < arch.len() {
                 let row = self.row;
                 self.row += 1;
@@ -3145,6 +3283,12 @@ impl<'w> DynQueryMut<'w> {
         let mut n = 0;
         for &i in &self.arch_ids {
             let arch = &archs[i];
+            // PE-C2: skip archetypes the tick aggregates already rule out.
+            if !self.change_terms.is_empty()
+                && !DynTerms::arch_may_pass_change(&self.change_terms, self.change_since, arch)
+            {
+                continue;
+            }
             for row in 0..arch.len() {
                 let e = arch.entities()[row];
                 if DynTerms::entity_passes_relations(&self.relations, world, e)
@@ -3173,6 +3317,12 @@ impl<'w> DynQueryMut<'w> {
         let writes: &[ComponentId] = &self.writes;
         for &arch_idx in &self.arch_ids {
             let arch = &world.archetypes()[arch_idx];
+            // PE-C2: skip archetypes the tick aggregates already rule out.
+            if !self.change_terms.is_empty()
+                && !DynTerms::arch_may_pass_change(&self.change_terms, self.change_since, arch)
+            {
+                continue;
+            }
             for row in 0..arch.len() {
                 let entity = arch.entities()[row];
                 // Relation post-filter (S8): skip entities that fail a term.
@@ -3761,6 +3911,121 @@ mod tests {
             vec![target],
             "mutation through Query<&mut T> must mark Changed<T>"
         );
+    }
+
+    // ── PE-C2: per-column tick aggregates + archetype skip (CORE_ECONOMY) ──
+
+    #[derive(Debug, PartialEq)]
+    struct Val(i32);
+    impl Component for Val {}
+    #[derive(Debug)]
+    struct Aux(i32);
+    impl Component for Aux {}
+
+    /// The skip must be invisible to semantics: the hot archetype still yields
+    /// its changed rows while a static sibling archetype is ruled out by its
+    /// aggregate (white-box assert on the upper bound).
+    #[test]
+    fn changed_skips_static_archetypes_but_finds_hot_rows() {
+        let mut world = World::new();
+        let hot = world.spawn((Val(0),));
+        let cold = world.spawn((Val(1), Aux(0)));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        world.get_mut::<Val>(hot).unwrap().0 += 1;
+
+        let changed: Vec<_> =
+            Query::<(Entity, Changed<Val>, &Val)>::new_with_tick(&world, last_run)
+                .iter()
+                .map(|(e, _, _)| e)
+                .collect();
+        assert_eq!(changed, vec![hot], "only the mutated row is Changed");
+
+        // White-box: the static archetype's aggregate proves the skip fired.
+        let loc = world.entity_location(cold).unwrap();
+        let arch = &world.archetypes()[loc.archetype_id.as_usize()];
+        let val_id = world.component_id_by_name(std::any::type_name::<Val>()).unwrap();
+        let col = &arch.columns[arch.column_index(val_id).unwrap()];
+        assert!(
+            !col.max_change_tick().is_newer_than(last_run),
+            "the static column's aggregate must not be newer than last_run"
+        );
+    }
+
+    /// PE-C2 false-negative regress: a mutated row MOVED into another archetype
+    /// (insert of a neighboring component) carries its fresh tick — the
+    /// destination column aggregate must rise with it, or the change would
+    /// vanish behind the archetype skip.
+    #[test]
+    fn archetype_move_keeps_changed_visible_through_skip() {
+        let mut world = World::new();
+        let e = world.spawn((Val(0),));
+        // Season the DESTINATION archetype {Val, Aux} before the baseline, so
+        // its aggregate is old news by the time the row moves in.
+        let _seed = world.spawn((Val(9), Aux(9)));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        // Mutate, then move the row into {Val, Aux} the same frame.
+        world.get_mut::<Val>(e).unwrap().0 = 42;
+        world.insert(e, Aux(1));
+
+        let changed: Vec<_> =
+            Query::<(Entity, Changed<Val>, &Val)>::new_with_tick(&world, last_run)
+                .iter()
+                .map(|(e, _, _)| e)
+                .collect();
+        assert_eq!(
+            changed,
+            vec![e],
+            "a moved fresh-ticked row must survive the archetype skip"
+        );
+    }
+
+    /// `Added<T>` uses its own aggregate: an old archetype is skipped, a fresh
+    /// spawn is found.
+    #[test]
+    fn added_aggregate_skips_old_finds_fresh() {
+        let mut world = World::new();
+        let _old = world.spawn((Val(0),));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        let fresh = world.spawn((Val(1), Aux(0)));
+
+        let added: Vec<_> = Query::<(Entity, Added<Val>)>::new_with_tick(&world, last_run)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(added, vec![fresh]);
+    }
+
+    /// `Or` skips only when EVERY matching branch skips: with only `Aux` hot,
+    /// the `Changed<Val>` branch alone must not rule the archetype out.
+    #[test]
+    fn or_changed_does_not_skip_when_one_branch_is_hot() {
+        let mut world = World::new();
+        let e = world.spawn((Val(0), Aux(0)));
+        let _static_sibling = world.spawn((Val(5),));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        world.get_mut::<Aux>(e).unwrap().0 += 1;
+
+        let hits: Vec<_> = Query::<(
+            Entity,
+            &Val,
+            Or<(Changed<Val>, Changed<Aux>)>,
+        )>::new_with_tick(&world, last_run)
+            .iter()
+            .map(|(e, _, _)| e)
+            .collect();
+        assert_eq!(hits, vec![e], "the hot Aux branch must keep the archetype");
     }
 
     /// C3: Bevy-like `&T` / `&mut T` syntax in queries.

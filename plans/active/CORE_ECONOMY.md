@@ -98,3 +98,27 @@
 
 ⚠ `propagate`-бенч мутирует трансформы каждый кадр — цель PE-C1 (статичный кейс) он не
 изолирует; волна 2 добавит static-вариант либо замерит фазу тик-скана точечно.
+
+**Волна 1 ✅ (PE-C2, 2026-08-06)** — агрегаты `Column::max_change_tick`/`max_added_tick`
+(`TickAggregate` = AtomicU32 relaxed, только `raise`) на всех путях записи: `push` /
+`write_at`(replace) / `push_moved_ticks` (подъём до переносимых тиков — анти-false-negative) /
+`set_change_tick` / `stamp_range` (один raise на диапазон) / `Mut::stamp` (deref_mut,
+set_changed, set_if_neq; `Mut` несёт указатель агрегата, Д-1) / четыре обходных пути world.rs
+(batch-спавны, E6-remap) — плюс клампинг в `check_change_ticks`. Потребители:
+`WorldQuery::skip_archetype` (default false; `Changed`/`Added` — по агрегату; кортеж — скип
+при ЛЮБОМ конъюнкте; `Or` — только если ВСЕ совпавшие ветки скипают) в четырёх петлях
+(`for_each_raw`, `single_inner`, `par_for_each_raw`, `QueryIter::advance_archetype`) +
+дин-путь `DynTerms::arch_may_pass_change` (DynIter / count / for_each_mut).
+Тесты: +5 поведенческих (в т.ч. archetype-move false-negative регресс) + юнит агрегатов
+(включая кламп и «swap_remove не понижает»). **Замер:**
+
+| Бенч | до | после |
+|---|---|---|
+| `changed_iter_static` | 2.84 µs | **15.6 нс (×182; bevy 3.8 µs = ×244)** |
+| `changed_iter_frag` | 3.66 µs | **487 нс (×7.5; bevy 4.6 µs = ×9.4)** |
+| `changed_iter` (10%) | 8.63 µs | 9.0 µs (+4% первый прогон; повтор — «No change») |
+| `simple_iter` / chunked | 9.55 / 6.88 µs | 9.39 (−1.8%) / 6.82 («No change») |
+| `heavy_compute`, `propagate` | 575.7 / 318.5 µs | остаток ≤2% = полоса шума сессии (bevy без правок дрейфует так же; повтор — «No change» оба) |
+
+Гейты: ядро 296 + воркспейс зелёные; clippy чистый; Miri точечно 7/7 (тик-пути);
+движок `cargo build --workspace` против HEAD ядра; goldens **753/753 байт-идентичны**.

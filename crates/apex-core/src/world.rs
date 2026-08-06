@@ -585,9 +585,10 @@ impl World {
                 // a `Changed<T>` filter never fired, and a consumer caching per-component ticks
                 // (the editor's inspector tree) kept serving the pre-remap value — the reference
                 // was repaired in the world and stale everywhere that looks at it.
-                let ticks = &mut arch.columns[col_idx].change_ticks;
-                if let Some(cell) = ticks.get_mut(row) {
+                let col = &mut arch.columns[col_idx];
+                if let Some(cell) = col.change_ticks.get_mut(row) {
                     *cell.get_mut() = this_run;
+                    col.max_change_tick.raise(this_run);
                 }
             }
         }
@@ -1336,6 +1337,10 @@ impl World {
                 col.added_ticks
                     .resize_with(target_len, || TickCell::new(tick));
                 col.len = target_len;
+                // Direct tick writes bypass `Column::push` — the PE-C2
+                // aggregates must still see the spawn tick.
+                col.max_change_tick.raise(tick);
+                col.max_added_tick.raise(tick);
             }
         }
 
@@ -1481,6 +1486,10 @@ impl World {
             col.added_ticks
                 .resize_with(target_len, || TickCell::new(tick));
             col.len = target_len;
+            // Direct tick writes bypass `Column::push` — the PE-C2 aggregates
+            // must still see the spawn tick.
+            col.max_change_tick.raise(tick);
+            col.max_added_tick.raise(tick);
         }
         self.entities
             .set_locations_batch(&entities, archetype_id, start_row as u32);
@@ -2152,10 +2161,12 @@ impl World {
         // disjoint buffers (ticks vs data), so they do not alias.
         debug_assert!(row < col.change_ticks.len());
         let change_tick = unsafe { (col.change_ticks.as_ptr() as *mut Tick).add(row) };
+        let max_change_tick = &col.max_change_tick as *const crate::archetype::TickAggregate;
         let value = unsafe { col.get_mut::<T>(row) };
         Some(crate::query::Mut {
             value,
             change_tick,
+            max_change_tick,
             this_run,
         })
     }
@@ -3420,6 +3431,8 @@ impl<T: Component> Bundle for T {
                 }
                 col.change_ticks.push(TickCell::new(tick));
                 col.added_ticks.push(TickCell::new(tick));
+                col.max_change_tick.raise(tick);
+                col.max_added_tick.raise(tick);
                 col.len += 1;
             }
         }
@@ -3447,6 +3460,8 @@ impl<T: Component> Bundle for T {
             }
             col.change_ticks.push(TickCell::new(tick));
             col.added_ticks.push(TickCell::new(tick));
+            col.max_change_tick.raise(tick);
+            col.max_added_tick.raise(tick);
             col.len += 1;
         }
         std::mem::forget(self);
