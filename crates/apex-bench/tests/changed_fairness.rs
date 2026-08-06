@@ -22,3 +22,43 @@ fn changed_iter_apex_and_bevy_yield_same_count() {
         assert_eq!(cb, 1000, "bevy frame {frame}: expected 1000 changed, got {cb}");
     }
 }
+
+#[cfg(all(feature = "bevy"))]
+#[test]
+fn changed_iter_static_apex_and_bevy_yield_zero() {
+    use apex_bench::apex::changed_iter::ChangedIterStatic;
+    use apex_bench::bevy::changed_iter::BenchmarkStatic;
+
+    let mut a = ChangedIterStatic::new();
+    let mut b = BenchmarkStatic::new();
+
+    let _ = a.run();
+    let _ = b.run();
+
+    for frame in 0..5 {
+        let ca = a.run();
+        let cb = b.run();
+        assert_eq!(ca, 0, "apex frame {frame}: expected 0 changed, got {ca}");
+        assert_eq!(cb, 0, "bevy frame {frame}: expected 0 changed, got {cb}");
+    }
+}
+
+#[cfg(all(feature = "bevy"))]
+#[test]
+fn changed_iter_frag_apex_and_bevy_yield_same_count() {
+    use apex_bench::apex::changed_iter::ChangedIterFrag;
+    use apex_bench::bevy::changed_iter::BenchmarkFrag;
+
+    let mut a = ChangedIterFrag::new();
+    let mut b = BenchmarkFrag::new();
+
+    let _ = a.run();
+    let _ = b.run();
+
+    for frame in 0..5 {
+        let ca = a.run();
+        let cb = b.run();
+        assert_eq!(ca, 40, "apex frame {frame}: expected 40 changed, got {ca}");
+        assert_eq!(cb, 40, "bevy frame {frame}: expected 40 changed, got {cb}");
+    }
+}

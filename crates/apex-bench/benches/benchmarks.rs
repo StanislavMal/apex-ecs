@@ -211,6 +211,34 @@ fn bench_changed_iter(c: &mut Criterion) {
     });
 }
 
+// PE-C2 target cases (CORE_ECONOMY): the cost of PROVING nothing (or almost nothing)
+// changed. `static` — 10k rows, zero mutations; `frag` — 26 archetypes, one hot.
+fn bench_changed_iter_static(c: &mut Criterion) {
+    let mut group = c.benchmark_group("changed_iter_static");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::changed_iter::ChangedIterStatic::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::changed_iter::BenchmarkStatic::new();
+        b.iter(move || bench.run());
+    });
+}
+
+fn bench_changed_iter_frag(c: &mut Criterion) {
+    let mut group = c.benchmark_group("changed_iter_frag");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::changed_iter::ChangedIterFrag::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::changed_iter::BenchmarkFrag::new();
+        b.iter(move || bench.run());
+    });
+}
+
 fn bench_events(c: &mut Criterion) {
     let mut group = c.benchmark_group("events");
     group.bench_function("apex", |b| {
@@ -344,6 +372,8 @@ criterion_group!(
     bench_despawn,
     bench_get_component,
     bench_changed_iter,
+    bench_changed_iter_static,
+    bench_changed_iter_frag,
     bench_events,
     bench_events_frame_loop,
     bench_relations,
