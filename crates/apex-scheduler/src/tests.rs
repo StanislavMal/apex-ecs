@@ -1292,6 +1292,90 @@
         );
     }
 
+    /// ONE scheduler, TWO worlds — the archetype cache must not carry across.
+    ///
+    /// The incremental cache rests on "archetypes are append-only", which is true within a world
+    /// and false between two. A host that drives several worlds with one scheduler (the editor runs
+    /// its document world and, in Play, a separate play world through the same one; any
+    /// `IsolatedWorld` host can do likewise) got either silently wrong query sets, when the two
+    /// worlds happened to have the same archetype count, or an out-of-bounds archetype index when
+    /// the second world had fewer — which is how it surfaced: a parallel query panicking with
+    /// "index out of bounds: the len is 20 but the index is 20" on the first Play frame of the
+    /// editor (found by the user, 2026-08-07).
+    ///
+    /// The rich world runs FIRST so the cache is fat, then the poor one: the failing direction.
+    #[test]
+    fn one_scheduler_over_two_worlds_does_not_reuse_the_others_archetypes() {
+        struct CountPos(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl AutoSystem for CountPos {
+            type Query = &'static Pos;
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, ctx: SystemContext<'_>) {
+                let mut n = 0usize;
+                ctx.query_unchecked::<Self::Query>().for_each(|_, _| n += 1);
+                self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // A second, non-conflicting system so the stage is a PARALLEL one: the failing path is the
+        // per-system rayon task, which copies the cached archetype slice verbatim (the ASD-split
+        // path happens to bound-check it; this one never did).
+        struct TouchHp;
+        impl AutoSystem for TouchHp {
+            type Query = &'static mut Hp;
+            type Resources = ();
+            type Events = ();
+            fn run(&mut self, ctx: SystemContext<'_>) {
+                ctx.query_unchecked::<Self::Query>().for_each_mut(|_, mut hp| hp.0 += 1.0);
+            }
+        }
+
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sched = Scheduler::new();
+        sched.add_auto_system("count_pos", CountPos(std::sync::Arc::clone(&seen)));
+        sched.add_auto_system("touch_hp", TouchHp);
+
+        // Populated enough that the dispatcher chooses the PARALLEL path (the cost model runs a
+        // handful of entities sequentially, and the sequential path resolves archetypes afresh).
+        const N: usize = 4000;
+        let mut rich = World::new();
+        for i in 0..N {
+            rich.spawn((Pos { x: i as f32, y: 0.0 },));
+            rich.spawn((Pos { x: i as f32, y: 1.0 }, Vel { x: 0.0, y: 0.0 }));
+            rich.spawn((Pos { x: i as f32, y: 2.0 }, Hp(1.0)));
+            rich.spawn((Vel { x: 0.0, y: 0.0 },));
+            rich.spawn((Hp(2.0),));
+        }
+        sched.run(&mut rich);
+        assert_eq!(
+            seen.swap(0, std::sync::atomic::Ordering::Relaxed),
+            3 * N,
+            "the rich world's Pos"
+        );
+
+        // A DIFFERENT, poorer world: ONE archetype. Reusing the fat cache here is the bug — at best
+        // it reads someone else's archetypes, at worst it indexes past the end.
+        let mut poor = World::new();
+        for i in 0..N {
+            poor.spawn((Pos { x: i as f32, y: 9.0 },));
+        }
+        sched.run(&mut poor);
+        assert_eq!(
+            seen.swap(0, std::sync::atomic::Ordering::Relaxed),
+            N,
+            "the poor world's own Pos — the cache was rebuilt for THIS world"
+        );
+
+        // And back: the first world must still be seen whole (the swap works both ways).
+        sched.run(&mut rich);
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            3 * N,
+            "back to the rich world"
+        );
+    }
+
     #[test]
     fn archetype_indices_for_subworld_uses_any_criterion() {
         // Two systems with cross Write/Read over Pos and Vel

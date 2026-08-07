@@ -865,6 +865,15 @@ pub struct Scheduler {
     /// The World's archetype count as of the last compute_archetype_indices().
     /// Used for caching — recompute only on change.
     cached_archetype_count: usize,
+    /// WHICH world that cache describes ([`World::id`]).
+    ///
+    /// The archetype cache is incremental because archetypes are append-only — WITHIN ONE WORLD.
+    /// A scheduler may legitimately run over more than one (the editor drives its document world
+    /// and, in Play, a separate play world with the same scheduler; any `IsolatedWorld` host can do
+    /// the same), and there the assumption is simply false: a different world's archetype indices
+    /// mean silently wrong query sets when the counts happen to match, and an out-of-bounds index
+    /// when the new world has fewer archetypes. `0` = nothing cached yet (ids start at 1).
+    cached_world_id: u64,
 
     /// Flag: whether the Startup stage has already run.
     startup_completed: bool,

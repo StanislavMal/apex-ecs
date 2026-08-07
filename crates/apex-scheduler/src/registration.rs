@@ -21,6 +21,7 @@ impl Scheduler {
             par_system_indices: Vec::new(),
             system_archetype_indices: FxHashMap::default(),
             cached_archetype_count: 0,
+            cached_world_id: 0,
             startup_completed: false,
             stage_order: None,
             default_stage_label: StageLabel::Update,

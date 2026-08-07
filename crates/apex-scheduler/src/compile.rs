@@ -193,6 +193,18 @@ impl Scheduler {
         let archetypes = world.archetypes();
         let arch_count = archetypes.len();
 
+        // A DIFFERENT world invalidates everything: the incremental scheme below rests on
+        // "archetypes are append-only", which holds within one world and says nothing across two.
+        // A host may run one scheduler over several (the editor's document world and its separate
+        // play world are the same scheduler's guests) — and there a kept cache is either silently
+        // wrong (equal counts, different archetypes) or fatal (fewer archetypes ⇒ an index past the
+        // end, which is how this was found: a play frame panicked inside a parallel query).
+        if world.id() != self.cached_world_id {
+            self.system_archetype_indices.clear();
+            self.cached_archetype_count = 0;
+            self.cached_world_id = world.id();
+        }
+
         // Cache: if the archetype count is unchanged, skip the recompute
         if arch_count == self.cached_archetype_count && !self.system_archetype_indices.is_empty() {
             return;
