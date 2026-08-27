@@ -1278,9 +1278,11 @@ impl<'w, Q: WorldQuery> Iterator for RelationIter<'w, Q> {
         loop {
             let &(group_idx, row) = self.rows.get(self.cursor)?;
             self.cursor += 1;
-            let group = &self.groups[group_idx as usize];
-            if let Some(item) = unsafe { Q::fetch_item(group.state, row as usize) } {
-                let entity = self.world.archetypes[group.arch_idx].entities[row as usize];
+            let group = &mut self.groups[group_idx as usize];
+            let arch_idx = group.arch_idx;
+            // Iterator: the item outlives this call, so no raise-once memo.
+            if let Some(item) = unsafe { Q::fetch_item::<false>(&mut group.state, row as usize) } {
+                let entity = self.world.archetypes[arch_idx].entities[row as usize];
                 return Some((entity, item));
             }
         }

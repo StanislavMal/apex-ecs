@@ -2185,6 +2185,9 @@ impl World {
             value,
             change_tick,
             max_change_tick,
+            // One-shot access: this `Mut` outlives no iteration state, so the
+            // aggregate is raised on the stamp itself (BENCH-REGRESS-0824).
+            defer_agg: false,
             this_run,
         })
     }

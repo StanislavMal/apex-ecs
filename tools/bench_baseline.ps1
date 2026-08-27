@@ -50,11 +50,11 @@ $commit = (git -C $repo rev-parse HEAD).Trim()
 # Which implementations are OURS and which are the reference the machine is judged by.
 $OURS = @('apex', 'apex_chunked')
 
-# The numbers this core ONCE MEASURED and lost (sh_final 2026-07-04, BENCH-REGRESS-0824). A baseline
-# recorded today freezes the REGRESSED state, and a gate that only says "no worse than yesterday"
-# would quietly make that state the standard -- which is the exact shape of the defect it exists to
-# prevent ("No change" compared against an already-regressed baseline). So the target travels WITH
-# the baseline and is printed beside it: the gate blocks a slide, the target says where home is.
+# The numbers this core ONCE MEASURED, lost, and won back (sh_final 2026-07-04; regression found and
+# fixed 2026-08-27, BENCH-REGRESS-0824). The targets travel WITH the baseline and are printed beside
+# it, because a baseline recorded while a regression is live would quietly make that state the
+# standard -- the exact shape of the defect this tool exists to prevent ("No change" compared against
+# an already-regressed baseline). The gate blocks a slide; the target says where home is.
 $TARGETS = @{
     'schedule/apex'        = 26600.0
     'wide_iter/apex'       = 3490.0
@@ -113,7 +113,7 @@ if ($Record) {
         # Recorded victories this core has LOST and is expected to win back (PS.5). Present so a
         # reader of the baseline cannot mistake "what it costs now" for "what it should cost".
         targets_ns = $TARGETS
-        targets_note = 'sh_final 2026-07-04; the baseline below is the REGRESSED state (BENCH-REGRESS-0824)'
+        targets_note = 'sh_final 2026-07-04; RECOVERED 2026-08-27 (BENCH-REGRESS-0824 closed): the baseline below is the state AFTER the fix, so a slide back to the regression is a regression again'
         groups = $now
     }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $BaselinePath) | Out-Null

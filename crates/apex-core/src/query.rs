@@ -125,7 +125,27 @@ pub unsafe trait WorldQuery: Sized {
     /// `state` must come from [`fetch_state`](Self::fetch_state) on the same
     /// archetype and `row` must be a valid row of it. For write-forms the row
     /// must be accessed exclusively (no aliasing across parallel chunks).
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>>;
+    /// `SCOPED` — the CALLER's promise that every item fetched from this state
+    /// is consumed before the state is touched again. True for the closure
+    /// drivers, whose item lifetime is late-bound (`FnMut(Entity, D::Item<'_>)`),
+    /// so an item cannot be stored past its call; false for `iter_mut`/
+    /// `get_mut`/`single_mut`, whose items outlive the state. Write shapes use
+    /// it to raise the PE-C2 column aggregate ONCE per archetype instead of once
+    /// per row (see `Mut::stamp`, BENCH-REGRESS-0824). A const parameter, not a
+    /// state field, so the choice folds at monomorphisation and the row loop
+    /// carries neither branch. `false` is always correct — only slower.
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>>;
+
+    /// Settle whatever a `SCOPED` fetch deferred out of the row loop — for write
+    /// shapes, raise the PE-C2 column aggregate if any row of this archetype was
+    /// actually stamped (see [`settle_column_aggregate`]). MUST run once per
+    /// state fetched with `SCOPED = true`, including on unwind; `ScopedState` is
+    /// the only thing that calls it, so a driver cannot forget. A no-op for
+    /// every shape that defers nothing.
+    #[inline(always)]
+    fn flush_scoped(state: &mut Self::State) {
+        let _ = state;
+    }
 
     /// `true` if `fetch_item` may return `None` on SOME rows of an
     /// already-matched archetype — i.e. the shape carries a **per-row** filter
@@ -176,8 +196,8 @@ pub unsafe trait WorldQuery: Sized {
     /// [`has_row_filter`](Self::has_row_filter) must be `false` for this shape —
     /// otherwise the internal `unwrap_unchecked` hits a `None` (UB).
     #[inline(always)]
-    unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
-        Self::fetch_item(state, row).unwrap_unchecked()
+    unsafe fn fetch_item_unchecked<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Self::Item<'w> {
+        Self::fetch_item::<SCOPED>(state, row).unwrap_unchecked()
     }
 
     fn is_filter() -> bool {
@@ -187,6 +207,77 @@ pub unsafe trait WorldQuery: Sized {
     /// For Without<T> returns false.
     fn is_positive() -> bool {
         true
+    }
+}
+
+/// Settle a write column's PE-C2 tick aggregate after a `SCOPED` iteration of it
+/// (see [`WorldQuery::flush_scoped`] and `Mut::stamp`).
+///
+/// The row loop deliberately records NOTHING: a per-row memo of "somebody
+/// stamped" is a store to a loop-invariant address, and that alone cost 15-18 %
+/// of the write path (measured, BENCH-REGRESS-0824) because it forbids
+/// vectorising the loop. So the question is answered here instead, and answered
+/// EXACTLY - a stamp writes `this_run` into its row tick, so "was anything
+/// stamped" is "does any row tick equal `this_run`".
+///
+/// Cost is O(1) in every case that matters: if anything at all stamped this
+/// column this run - this query or an earlier system - the aggregate is already
+/// current and the first line returns. The scan runs only when the column is
+/// untouched this run, and then it is a vectorisable `u32` compare that stops at
+/// the first stamped row. That is the precise trade PE-C2 was written to buy:
+/// an iteration that writes nothing (`set_if_neq`, a guard that rejects every
+/// row) still leaves `Changed<T>` consumers able to skip the archetype.
+///
+/// # Safety
+/// `agg` and `ticks` must point into the same live column, and `len` must be its
+/// row count.
+#[inline]
+unsafe fn settle_column_aggregate(
+    agg: *const crate::archetype::TickAggregate,
+    ticks: *const Tick,
+    len: usize,
+    this_run: Tick,
+) {
+    let agg = &*agg;
+    if !this_run.is_newer_than(agg.get()) {
+        return;
+    }
+    for i in 0..len {
+        if *ticks.add(i) == this_run {
+            agg.raise(this_run);
+            return;
+        }
+    }
+}
+
+/// RAII owner of an iteration state fetched with `SCOPED = true`.
+///
+/// A scoped fetch defers work out of the row loop (the PE-C2 aggregate raise —
+/// see `Mut::stamp`), and that work MUST still happen: on the normal exit, on an
+/// early `continue`, and on unwind, because a closure that panics halfway
+/// through an archetype has already stamped rows whose column aggregate would
+/// otherwise never rise — a `Changed<T>` consumer would then skip them forever.
+/// Hence a destructor rather than a call at the end of the driver: the
+/// obligation cannot be forgotten and cannot be jumped over.
+struct ScopedState<Q: WorldQuery> {
+    state: Q::State,
+}
+
+impl<Q: WorldQuery> ScopedState<Q> {
+    /// # Safety
+    /// `state` must come from [`WorldQuery::fetch_state`], and the caller must
+    /// honour the `SCOPED` contract of [`WorldQuery::fetch_item`]: every item
+    /// fetched from it is consumed before the state is next touched.
+    #[inline(always)]
+    unsafe fn new(state: Q::State) -> Self {
+        Self { state }
+    }
+}
+
+impl<Q: WorldQuery> Drop for ScopedState<Q> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        Q::flush_scoped(&mut self.state);
     }
 }
 
@@ -203,18 +294,42 @@ pub struct Mut<'w, T: 'static> {
     pub(crate) value: &'w mut T,
     /// Pointer to this row's change-tick (inside `Column::change_ticks`).
     pub(crate) change_tick: *mut Tick,
-    /// Pointer to the column's tick aggregate (PE-C2): every row stamp also
-    /// raises the column upper bound, so `Changed<T>` consumers can skip
-    /// untouched archetypes wholesale. Lives in `Column`, valid for `'w`.
+    /// Pointer to the column's tick aggregate (PE-C2): a row stamp also raises
+    /// the column upper bound, so `Changed<T>` consumers can skip untouched
+    /// archetypes wholesale. Lives in `Column`, valid for `'w`.
     pub(crate) max_change_tick: *const crate::archetype::TickAggregate,
+    /// `true` — the column aggregate is settled by
+    /// [`WorldQuery::flush_scoped`] once this archetype is done, so a row stamp
+    /// touches nothing but its own tick (BENCH-REGRESS-0824). `false` — this
+    /// item may outlive its state, so the stamp raises the aggregate itself.
+    pub(crate) defer_agg: bool,
     /// Current world tick — stamped on `DerefMut`.
     pub(crate) this_run: Tick,
 }
 
 impl<T: 'static> Mut<'_, T> {
-    /// Stamp the row tick AND raise the column aggregate (PE-C2). The common
-    /// repeat case (aggregate already at `this_run`) is a relaxed load + a
-    /// predicted branch — no store, no cross-core ping-pong between chunks.
+    /// Stamp the row tick AND raise the column aggregate (PE-C2).
+    ///
+    /// The aggregate is an ATOMIC, and an atomic in a row loop is not hoistable:
+    /// PE-C2 shipped the raise here per row and cost the core 2.3x on
+    /// `schedule`, 2.2x on `wide_iter`, 1.9x on `fragmented_iter` — not for the
+    /// instruction (a relaxed load is a `mov` on x86) but because an opaque
+    /// memory op forbids vectorising the whole write loop (BENCH-REGRESS-0824).
+    /// A CONDITIONAL atomic is no better, and neither is a plain per-row memo
+    /// byte: any store to a loop-invariant address blocks the same optimisation
+    /// (all three were measured). So where the handed-out item provably cannot
+    /// outlive its state (`fetch_item::<true>` — the closure drivers, whose item
+    /// lifetime is late-bound) the row loop records NOTHING beyond its own tick,
+    /// and [`settle_column_aggregate`] reconstructs the answer exactly once the
+    /// archetype is done — run by `ScopedState` on the normal exit AND on
+    /// unwind, so a panicking closure cannot swallow a change stamp. `defer_agg`
+    /// is `SCOPED`, a const, so this branch folds away in both
+    /// monomorphisations: the write loop is byte-for-byte the pre-PE-C2 loop.
+    ///
+    /// Where the item CAN escape its state (`iter_mut`, `get_mut`, `single_mut`,
+    /// one-shot `Mut`s) there is no later moment guaranteed to run while the
+    /// column is still identified, so the aggregate is raised on every stamp,
+    /// exactly as PE-C2 wrote it.
     #[inline(always)]
     fn stamp(&mut self) {
         // SAFETY: both cells live in the `Column` and outlive `'w`; exclusive
@@ -222,7 +337,9 @@ impl<T: 'static> Mut<'_, T> {
         // the aggregate is interior-mutable (atomic) by design.
         unsafe {
             *self.change_tick = self.this_run;
-            (*self.max_change_tick).raise(self.this_run);
+            if !self.defer_agg {
+                (*self.max_change_tick).raise(self.this_run);
+            }
         }
     }
 
@@ -287,6 +404,9 @@ pub struct WriteState<T> {
     data: *mut T,
     ticks: *mut Tick,
     agg: *const crate::archetype::TickAggregate,
+    /// Rows of the column — the range [`WorldQuery::flush_scoped`] proves its
+    /// answer over. See `Mut::stamp`.
+    len: usize,
     this_run: Tick,
 }
 
@@ -365,7 +485,7 @@ unsafe impl<'a, T: Component> WorldQuery for &'a T {
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         Some(&*state.add(row))
     }
 }
@@ -421,16 +541,25 @@ unsafe impl<'a, T: Component> WorldQuery for &'a mut T {
             data: col.get_ptr(0) as *mut T,
             ticks: col.ticks_ptr() as *mut Tick,
             agg: &col.max_change_tick,
+            len: col.len,
             this_run,
         }
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    fn flush_scoped(state: &mut Self::State) {
+        // SAFETY: `agg`/`ticks` point into the column this state was fetched
+        // from, alive for the whole world borrow; `len` is its row count.
+        unsafe { settle_column_aggregate(state.agg, state.ticks, state.len, state.this_run) };
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         Some(Mut {
             value: &mut *state.data.add(row),
             change_tick: state.ticks.add(row),
             max_change_tick: state.agg,
+            defer_agg: SCOPED,
             this_run: state.this_run,
         })
     }
@@ -474,7 +603,7 @@ unsafe impl WorldQuery for Entity {
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         Some(*state.add(row))
     }
 }
@@ -519,7 +648,7 @@ unsafe impl<T: Component> WorldQuery for With<T> {
     unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick, _: Tick) -> Self::State {}
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(_: &mut Self::State, _: usize) -> Option<Self::Item<'w>> {
         Some(())
     }
 }
@@ -571,7 +700,7 @@ unsafe impl<T: Component> WorldQuery for Without<T> {
     unsafe fn fetch_state(_: &Archetype, _: &[ComponentId], _: Tick, _: Tick) -> Self::State {}
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(_: Self::State, _: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(_: &mut Self::State, _: usize) -> Option<Self::Item<'w>> {
         Some(())
     }
 }
@@ -678,7 +807,7 @@ unsafe impl<T: Component> WorldQuery for Maybe<T> {
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         if state.present {
             if state.item_size == 0 {
                 // ZST — the column allocates no memory, use a dangling pointer
@@ -712,6 +841,8 @@ pub struct MaybeMutState {
     agg: *const crate::archetype::TickAggregate,
     item_size: usize,
     present: bool,
+    /// See [`WriteState`] — the range the flush proves its answer over.
+    len: usize,
     this_run: Tick,
 }
 
@@ -726,6 +857,7 @@ impl MaybeMutState {
             agg: std::ptr::null(),
             item_size: 0,
             present: false,
+            len: 0,
             this_run: Tick::ZERO,
         }
     }
@@ -784,12 +916,22 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
             agg: &col.max_change_tick,
             item_size: col.item_size,
             present: true,
+            len: col.len,
             this_run,
         }
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    fn flush_scoped(state: &mut Self::State) {
+        if !state.present {
+            return;
+        }
+        // SAFETY: `present` implies `agg`/`ticks` point into a live column.
+        unsafe { settle_column_aggregate(state.agg, state.ticks, state.len, state.this_run) };
+    }
+
+    #[inline(always)]
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         if state.present {
             let value = if state.item_size == 0 {
                 &mut *std::ptr::NonNull::<T>::dangling().as_ptr()
@@ -800,6 +942,7 @@ unsafe impl<T: Component> WorldQuery for MaybeWrite<T> {
                 value,
                 change_tick: state.ticks.add(row),
                 max_change_tick: state.agg,
+                defer_agg: SCOPED,
                 this_run: state.this_run,
             }))
         } else {
@@ -883,7 +1026,7 @@ unsafe impl<T: Component> WorldQuery for Changed<T> {
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         let tick = *state.ticks.add(row);
         if tick.is_newer_than(state.last_run) {
             Some(())
@@ -976,7 +1119,7 @@ unsafe impl<T: Component> WorldQuery for Added<T> {
     }
 
     #[inline(always)]
-    unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
         let tick = *state.added.add(row);
         if tick.is_newer_than(state.last_run) {
             Some(())
@@ -1104,10 +1247,15 @@ macro_rules! impl_or_query {
             }
 
             #[inline(always)]
-            unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+            fn flush_scoped(state: &mut Self::State) {
+                $( if let Some(s) = state.$idx.as_mut() { $F::flush_scoped(s); } )+
+            }
+
+            #[inline(always)]
+            unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
                 $(
-                    if let Some(s) = state.$idx {
-                        if $F::fetch_item(s, row).is_some() {
+                    if let Some(s) = state.$idx.as_mut() {
+                        if $F::fetch_item::<SCOPED>(s, row).is_some() {
                             return Some(());
                         }
                     }
@@ -1226,9 +1374,14 @@ macro_rules! impl_world_query_tuple {
 
 
             #[inline(always)]
-            unsafe fn fetch_item<'w>(state: Self::State, row: usize) -> Option<Self::Item<'w>> {
+            fn flush_scoped(state: &mut Self::State) {
+                $( $Q::flush_scoped(&mut state.$idx); )+
+            }
+
+            #[inline(always)]
+            unsafe fn fetch_item<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Option<Self::Item<'w>> {
                 Some(( $( {
-                    let item = $Q::fetch_item(state.$idx, row);
+                    let item = $Q::fetch_item::<SCOPED>(&mut state.$idx, row);
                     if item.is_none() { return None; }
                     item.unwrap_unchecked()
                 }, )+ ))
@@ -1239,8 +1392,8 @@ macro_rules! impl_world_query_tuple {
             /// the elements' `fetch_item_unchecked` — not a single per-element
             /// Option check.
             #[inline(always)]
-            unsafe fn fetch_item_unchecked<'w>(state: Self::State, row: usize) -> Self::Item<'w> {
-                ( $( $Q::fetch_item_unchecked(state.$idx, row), )+ )
+            unsafe fn fetch_item_unchecked<'w, const SCOPED: bool>(state: &mut Self::State, row: usize) -> Self::Item<'w> {
+                ( $( $Q::fetch_item_unchecked::<SCOPED>(&mut state.$idx, row), )+ )
             }
         }
 
@@ -1286,7 +1439,7 @@ unsafe impl WorldQuery for () {
     ) -> Self::State {
     }
 
-    unsafe fn fetch_item<'w>(_state: Self::State, _row: usize) -> Option<Self::Item<'w>> {
+    unsafe fn fetch_item<'w, const SCOPED: bool>(_state: &mut Self::State, _row: usize) -> Option<Self::Item<'w>> {
         Some(())
     }
 }
@@ -1731,9 +1884,9 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
         if row < r_start || row >= r_end.min(arch.len()) {
             return None;
         }
-        let state =
+        let mut state =
             unsafe { <(D, F)>::fetch_state(arch, &self.ids, self.last_run, self.world.current_tick()) };
-        unsafe { <(D, F)>::fetch_item(state, row) }.map(|(item, _)| item)
+        unsafe { <(D, F)>::fetch_item::<false>(&mut state, row) }.map(|(item, _)| item)
     }
 
     /// Item of a specific entity, if it matches the query (Bevy parity
@@ -1809,11 +1962,11 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
             // SAFETY: the state holds column pointers valid for the whole world
             // borrow 'w; `self` is consumed, so no further access through this
             // Query is possible (the same aliasing discipline as iter()).
-            let state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
+            let mut state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
             let entities = &arch.entities[row_start..end];
             for (offset, &entity) in entities.iter().enumerate() {
                 let row = row_start + offset;
-                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
+                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item::<false>(&mut state, row) } {
                     if found.is_some() {
                         return Err(QuerySingleError::MultipleEntities);
                     }
@@ -1841,7 +1994,13 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
             if <(D, F)>::has_row_filter() && <(D, F)>::skip_archetype(arch, ids, self.last_run) {
                 continue;
             }
-            let state = unsafe { <(D, F)>::fetch_state(arch, ids, self.last_run, this_run) };
+            // SCOPED: the closure takes `D::Item<'_>` (late-bound), so no item
+            // outlives its call — the PE-C2 aggregate is raised once, by the
+            // guard's destructor, instead of on every row.
+            let mut guard = unsafe {
+                ScopedState::<(D, F)>::new(<(D, F)>::fetch_state(arch, ids, self.last_run, this_run))
+            };
+            let state = &mut guard.state;
             let (row_start, row_end) = self.row_range(arch_idx);
             let end = row_end.min(arch.len());
             let len = end.saturating_sub(row_start);
@@ -1853,7 +2012,7 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
                 // Row-level filter: load the entity LAZILY — only for passing rows.
                 for offset in 0..len {
                     let row = row_start + offset;
-                    if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
+                    if let Some((item, _)) = unsafe { <(D, F)>::fetch_item::<true>(state, row) } {
                         f(entities[offset], item);
                     }
                 }
@@ -1861,7 +2020,7 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
                 // Archetype-level shape: dense loop without the Option branch (§3.1A).
                 for offset in 0..len {
                     let (item, _) =
-                        unsafe { <(D, F)>::fetch_item_unchecked(state, row_start + offset) };
+                        unsafe { <(D, F)>::fetch_item_unchecked::<true>(state, row_start + offset) };
                     f(entities[offset], item);
                 }
             }
@@ -1936,18 +2095,25 @@ impl<'w, 's, D: WorldQuery, F: WorldQuery> Query<'w, 's, D, F> {
         // query id list.
         let process = |arch_idx: usize, start: usize, end: usize| {
             let arch = &world.archetypes[arch_idx];
-            let state = unsafe { <(D, F)>::fetch_state(arch, &ids, last_run, this_run) };
+            // SCOPED, per leaf: the memo lives in this thread's own state, so
+            // the parallel split shares nothing (see `Mut::stamp`).
+            let mut guard = unsafe {
+                ScopedState::<(D, F)>::new(<(D, F)>::fetch_state(arch, &ids, last_run, this_run))
+            };
+            let state = &mut guard.state;
             let entities = &arch.entities[start..end];
             if <(D, F)>::has_row_filter() {
                 for (offset, &entity) in entities.iter().enumerate() {
-                    if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, start + offset) } {
+                    if let Some((item, _)) =
+                        unsafe { <(D, F)>::fetch_item::<true>(state, start + offset) }
+                    {
                         f(entity, item);
                     }
                 }
             } else {
                 for (offset, &entity) in entities.iter().enumerate() {
                     let (item, _) =
-                        unsafe { <(D, F)>::fetch_item_unchecked(state, start + offset) };
+                        unsafe { <(D, F)>::fetch_item_unchecked::<true>(state, start + offset) };
                     f(entity, item);
                 }
             }
@@ -2174,13 +2340,13 @@ impl<'q, D: WorldQuery, F: WorldQuery> Iterator for QueryIter<'q, D, F> {
             let row = self.row;
             self.row += 1;
 
-            let state = *self.state.as_ref().unwrap();
+            let state = self.state.as_mut().unwrap();
             if <(D, F)>::has_row_filter() {
-                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item(state, row) } {
+                if let Some((item, _)) = unsafe { <(D, F)>::fetch_item::<false>(state, row) } {
                     return Some(item);
                 }
             } else {
-                let (item, _) = unsafe { <(D, F)>::fetch_item_unchecked(state, row) };
+                let (item, _) = unsafe { <(D, F)>::fetch_item_unchecked::<false>(state, row) };
                 return Some(item);
             }
         }
@@ -4026,6 +4192,137 @@ mod tests {
             .map(|(e, _, _)| e)
             .collect();
         assert_eq!(hits, vec![e], "the hot Aux branch must keep the archetype");
+    }
+
+    // ── BENCH-REGRESS-0824: the aggregate is settled by the flush, not per row ──
+
+    /// Column aggregate of `Val` in the archetype `e` lives in, as an upper
+    /// bound the PE-C2 skip reads.
+    fn val_aggregate(world: &World, e: Entity) -> Tick {
+        let loc = world.entity_location(e).unwrap();
+        let arch = &world.archetypes()[loc.archetype_id.as_usize()];
+        let val_id = world.component_id_by_name(std::any::type_name::<Val>()).unwrap();
+        arch.columns[arch.column_index(val_id).unwrap()].max_change_tick()
+    }
+
+    /// The PRECISION half of the trade. A write-shaped iteration that stamps
+    /// nothing (`set_if_neq` with equal values) must leave the archetype
+    /// skippable: settling the aggregate at the end of the archetype must ask
+    /// whether a row was stamped, not whether the column was handed out. A
+    /// conservative "raise when a write query touches the archetype" passes
+    /// every other test in this file and fails exactly here.
+    #[test]
+    fn a_write_iteration_that_stamps_nothing_leaves_the_archetype_skippable() {
+        let mut world = World::new();
+        let e = world.spawn((Val(7),));
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        {
+            let mut q: Query<'_, '_, &mut Val> = Query::new_mut(&mut world);
+            q.for_each_mut(|_, mut v| {
+                // Same value → no stamp, by set_if_neq's contract.
+                v.set_if_neq(Val(7));
+            });
+        }
+
+        assert!(
+            !val_aggregate(&world, e).is_newer_than(last_run),
+            "an iteration that stamped no row must not raise the column aggregate"
+        );
+        let changed: Vec<Entity> = Query::<(Entity, Changed<Val>)>::new_with_tick(&world, last_run)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert!(changed.is_empty(), "nothing was written, nothing is Changed");
+    }
+
+    /// The other half: one stamped row out of many, through the closure driver,
+    /// must raise the aggregate — otherwise the skip swallows it forever.
+    #[test]
+    fn one_stamped_row_among_many_survives_the_deferred_settle() {
+        let mut world = World::new();
+        let ids: Vec<Entity> = (0..64).map(|i| world.spawn((Val(i),))).collect();
+        let hot = ids[63];
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        {
+            let mut q: Query<'_, '_, &mut Val> = Query::new_mut(&mut world);
+            q.for_each_mut(|e, mut v| {
+                if e == hot {
+                    v.0 += 1;
+                }
+            });
+        }
+
+        assert!(
+            val_aggregate(&world, hot).is_newer_than(last_run),
+            "a stamped row must leave the aggregate above last_run"
+        );
+        let changed: Vec<Entity> = Query::<(Entity, Changed<Val>)>::new_with_tick(&world, last_run)
+            .iter()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(changed, vec![hot]);
+    }
+
+    /// The parallel driver settles per LEAF, and the leaves share nothing: every
+    /// stamped row must still be visible after the split.
+    #[test]
+    fn par_iteration_settles_the_aggregate_for_every_leaf() {
+        let mut world = World::new();
+        let ids: Vec<Entity> = (0..4096).map(|i| world.spawn((Val(i),))).collect();
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        {
+            let mut q: Query<'_, '_, &mut Val> = Query::new_mut(&mut world);
+            q.par_for_each_mut(|_, mut v| {
+                v.0 += 1;
+            });
+        }
+
+        assert!(val_aggregate(&world, ids[0]).is_newer_than(last_run));
+        let changed = Query::<(Entity, Changed<Val>)>::new_with_tick(&world, last_run)
+            .iter()
+            .count();
+        assert_eq!(changed, ids.len(), "every parallel-written row stays Changed");
+    }
+
+    /// The settle is a DESTRUCTOR because a closure can leave the loop by
+    /// unwinding: rows stamped before the panic are already changed, and an
+    /// aggregate that never rose would hide them behind the skip for good.
+    #[test]
+    fn a_panic_mid_archetype_still_settles_the_aggregate() {
+        let mut world = World::new();
+        let ids: Vec<Entity> = (0..8).map(|i| world.spawn((Val(i),))).collect();
+        world.tick();
+        let last_run = world.current_tick();
+        world.tick();
+
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut q: Query<'_, '_, (Entity, &mut Val)> = Query::new_mut(&mut world);
+            q.for_each_mut(|e, (_, mut v)| {
+                if e == ids[4] {
+                    panic!("closure gives up mid-archetype");
+                }
+                v.0 += 1;
+            });
+        }));
+        assert!(caught.is_err(), "the closure was supposed to panic");
+
+        assert!(
+            val_aggregate(&world, ids[0]).is_newer_than(last_run),
+            "rows stamped before the unwind must leave the aggregate raised"
+        );
+        let changed = Query::<(Entity, Changed<Val>)>::new_with_tick(&world, last_run)
+            .iter()
+            .count();
+        assert_eq!(changed, 4, "exactly the rows stamped before the panic");
     }
 
     /// C3: Bevy-like `&T` / `&mut T` syntax in queries.
