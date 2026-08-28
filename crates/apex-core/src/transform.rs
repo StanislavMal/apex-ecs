@@ -270,7 +270,20 @@ impl LocalTransform {
 /// right = up × back, up' = back × right. Degenerate inputs (zero/NaN
 /// direction, up ∥ direction) fall back safely as in Bevy
 /// (`any_orthonormal_vector`).
-fn look_to_rotation(direction: Vec3, up: Vec3) -> Quat {
+///
+/// **Public because a hand-rolled copy of these five lines is a trap, not a
+/// convenience.** The naive form (`right = up.cross(back).normalize()`) is
+/// DEGENERATE for an aim along `up` — and looking straight down with an up of
+/// +Y is the everyday case: an overhead sun, a spot pointed at the floor, a top
+/// view. There the cross product is zero, `normalize` divides by it, and the
+/// NaN basis rides silently into every matrix derived from the rotation.
+/// Callers that need only the rotation (a light, a camera basis, a test
+/// fixture) call THIS instead of writing the basis out again;
+/// [`LocalTransform::looking_to`] and [`GlobalTransform::looking_at`] are the
+/// same function wearing a transform.
+#[inline]
+#[must_use]
+pub fn look_to_rotation(direction: Vec3, up: Vec3) -> Quat {
     let back = -direction.try_normalize().unwrap_or(Vec3::NEG_Z);
     let up = up.try_normalize().unwrap_or(Vec3::Y);
     let right = up
@@ -959,6 +972,20 @@ mod tests {
         let t = LocalTransform::IDENTITY.looking_to(Vec3::Y, Vec3::Y);
         assert!(t.rotation.is_finite());
         assert!((t.forward() - Vec3::Y).length() < 1e-6);
+        // Straight DOWN with an up of +Y — the everyday aim (overhead sun, spot
+        // on the floor, top view), and the one a hand-rolled `up × back` copy
+        // turns into NaN. Finiteness alone is too weak a claim here: a basis
+        // whose right axis collapsed to zero is finite too, and it destroys
+        // every matrix built from it just as thoroughly. Demand the BASIS.
+        let down = LocalTransform::from_xyz(0.0, 10.0, 0.0).looking_at(DVec3::ZERO, Vec3::Y);
+        assert!(down.rotation.is_finite());
+        assert!((down.rotation.length() - 1.0).abs() < 1e-6, "unit quaternion");
+        assert!((down.forward() - Vec3::NEG_Y).length() < 1e-6, "aims down");
+        let (r, u, f) = (down.right(), down.up(), down.forward());
+        for (name, v) in [("right", r), ("up", u), ("forward", f)] {
+            assert!((v.length() - 1.0).abs() < 1e-6, "{name} axis is unit, got {v:?}");
+        }
+        assert!(r.dot(u).abs() < 1e-6 && r.dot(f).abs() < 1e-6 && u.dot(f).abs() < 1e-6);
     }
 
     #[test]
