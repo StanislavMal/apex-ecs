@@ -644,10 +644,40 @@ pub fn propagate_transforms(world: &mut World) {
         return;
     }
 
-    // 2. Seed the stack with dirty-roots: dirty entities without a dirty ancestor. The walk-up over
-    //    ancestors stops at the first dirty one (then the entity is inside its subtree and will be
-    //    recomputed by the descent — it must not be seeded separately, otherwise double-process).
-    //    This phase only reads the world → it parallelizes for a large dirty-set.
+    let mut visits = 0usize;
+    let gt_id = world.registry.get_id::<GlobalTransform>();
+    // Pre-taken lookups for every per-entity step below: `World::get::<T>` re-derives the
+    // `ComponentId` by `TypeId` hash on each call, and the generic relation accessors do the same
+    // for the kind index. Both answers are constant for the whole run.
+    let lt_id = world.component_id::<LocalTransform>();
+    let child_of_idx = world.relations.get_idx::<ChildOf>();
+    // Auto-creation of GlobalTransform (entity with a single LocalTransform): empty on the hot path
+    // (required components); the structural insert happens at the end, not during the parallel descent.
+    let mut missing: Vec<(Entity, GlobalTransform)> = Vec::new();
+    let dirty_total = scratch.dirty_entities.len();
+
+    // 2. ONE pass over the dirty set that classifies and resolves each entity at once:
+    //    - no parent and no children  -> **simple**: its world matrix IS its local one, written
+    //      right here, and it never reaches the seed/descent machinery at all;
+    //    - a dirty ancestor exists    -> skipped (that ancestor's descent recomputes it);
+    //    - otherwise                  -> a seed for the descent, carrying its (clean) parent matrix.
+    //
+    //    **The simple road, checked against the reference BEFORE choosing the form.** Bevy splits
+    //    the same population off into `sync_simple_transforms` (`Without<ChildOf>, Without<Children>`
+    //    -> `*global = GlobalTransform::from(*transform)`, a parallel query, no frontier at all) and
+    //    only the rest goes through `propagate_parent_transforms`. Ours was a dirty-list + a seed
+    //    vector + a DFS for everybody, and on a moving mass EVERY entity is simple: 100k roots were
+    //    materialised into a `Vec<(Entity, GlobalTransform)>` (72 B per row, ~7 MB written per
+    //    frame), drained into a second such vector, then walked as 100k one-node "subtrees". The
+    //    bookkeeping cost an order of magnitude more than the transforms themselves.
+    //
+    //    **Why the classification is fused into the seed and is not a pass of its own.** It WAS a
+    //    separate pass first, and the probe (`apex-bench --bin propagate_shapes`) priced that
+    //    immediately: the flat mass went 7.10 -> 0.62 ms, but a 10k-node chain went 0.255 -> 0.408 ms
+    //    (+60 %), because every node paid a parent lookup for the classification and then paid it
+    //    AGAIN in the seed. One walk of the relation index answers both questions, so the hierarchy
+    //    pays nothing for the mass's road.
+    const PAR_MIN_DIRTY: usize = 4096;
     {
         let TransformScratch {
             dirty_entities,
@@ -656,20 +686,61 @@ pub fn propagate_transforms(world: &mut World) {
             ..
         } = &mut scratch;
         let dirty: &IndexStamp = dirty;
-        let seed = |world: &World, entity: Entity| -> Option<(Entity, GlobalTransform)> {
-            let parent = world.target_of(entity, ChildOf);
+        // The `ChildOf` kind index is the one hoisted above (`World::target_of` is generic over the
+        // relation kind and would re-derive it by `TypeId` hash on every call - twice per entity
+        // here: its own parent, then the walk-up). `None` means no `ChildOf` was ever registered in
+        // this world, so nothing has a parent and every dirty entity is its own root.
+        let parent_of = |world: &World, entity: Entity| -> Option<Entity> {
+            let kind_idx = child_of_idx?;
+            if !world.is_alive(entity) {
+                return None;
+            }
+            world
+                .subject_index
+                .first_with_kind(entity.index, kind_idx)
+                .map(|p| p.target)
+        };
+        // One dirty entity: writes its own result (simple) or returns a seed for the descent.
+        // Takes `&World` and writes through `write_global_parallel` on BOTH the parallel and the
+        // sequential road - one road, one semantics: a row is written by exactly one thread and
+        // there are no structural changes in this phase (`missing` is deferred to the end).
+        let resolve = |world: &World,
+                       entity: Entity,
+                       visits: &mut usize,
+                       missing: &mut Vec<(Entity, GlobalTransform)>|
+         -> Option<(Entity, GlobalTransform)> {
+            if !world.is_alive(entity) {
+                return None;
+            }
+            let parent = parent_of(world, entity);
+            if parent.is_none() {
+                let has_children = child_of_idx
+                    .is_some_and(|k| !world.target_index.subjects(k, entity.index).is_empty());
+                if !has_children {
+                    let local = lt_id.and_then(|id| world.get_by_id::<LocalTransform>(entity, id))?;
+                    // A parentless node's parent matrix is identity - the very expression the
+                    // descent would evaluate for it, so the result is bit-identical to the old path.
+                    let global = GlobalTransform::IDENTITY.mul_local(local);
+                    *visits += 1;
+                    if !write_global_parallel(world, gt_id, entity, global, this_run) {
+                        missing.push((entity, global));
+                    }
+                    return None;
+                }
+                return Some((entity, GlobalTransform::IDENTITY));
+            }
             let mut ancestor = parent;
             let mut depth = 0usize;
             while let Some(p) = ancestor {
                 if dirty.contains(p.index) {
-                    return None; // covered by a dirty ancestor — recomputed by its descent
+                    return None; // covered by a dirty ancestor - recomputed by its descent
                 }
-                ancestor = world.target_of(p, ChildOf);
+                ancestor = parent_of(world, p);
                 depth += 1;
                 if depth > MAX_PROPAGATE_DEPTH {
                     // Defensive: a ChildOf cycle would loop here forever.
                     // `add_relation` now rejects cycle-forming edges, so this is
-                    // unreachable in practice — treat the chain as a clean root
+                    // unreachable in practice - treat the chain as a clean root
                     // rather than hanging the frame.
                     log::error!(
                         "propagate_transforms: ChildOf ancestor chain for {entity} exceeds depth limit — possible cycle"
@@ -677,31 +748,74 @@ pub fn propagate_transforms(world: &mut World) {
                     break;
                 }
             }
-            // The parent is clean (or absent) — its world matrix is valid from previous
-            // frames; a missing GlobalTransform is treated as identity (previous semantics).
+            // The parent is clean - its world matrix is valid from previous frames; a missing
+            // `GlobalTransform` is treated as identity (previous semantics).
             let parent_global = parent
                 .and_then(|p| world.get::<GlobalTransform>(p))
                 .copied()
                 .unwrap_or(GlobalTransform::IDENTITY);
             Some((entity, parent_global))
         };
-        const PAR_MIN_DIRTY: usize = 4096;
         if dirty_entities.len() >= PAR_MIN_DIRTY {
             use rayon::prelude::*;
             let world_ref: &World = world;
-            stack.par_extend(
-                dirty_entities
-                    .par_iter()
-                    .filter_map(|&e| seed(world_ref, e)),
-            );
+            let (par_visits, mut seeds, mut par_missing) = dirty_entities
+                .par_iter()
+                .fold(
+                    || {
+                        (
+                            0usize,
+                            Vec::<(Entity, GlobalTransform)>::new(),
+                            Vec::<(Entity, GlobalTransform)>::new(),
+                        )
+                    },
+                    |(mut n, mut seeds, mut miss), &entity| {
+                        if let Some(seed) = resolve(world_ref, entity, &mut n, &mut miss) {
+                            seeds.push(seed);
+                        }
+                        (n, seeds, miss)
+                    },
+                )
+                .reduce(
+                    || (0usize, Vec::new(), Vec::new()),
+                    |mut a, mut b| {
+                        a.0 += b.0;
+                        a.1.append(&mut b.1);
+                        a.2.append(&mut b.2);
+                        a
+                    },
+                );
+            visits += par_visits;
+            stack.append(&mut seeds);
+            missing.append(&mut par_missing);
         } else {
+            let world_ref: &World = world;
             for &entity in dirty_entities.iter() {
-                if let Some(s) = seed(world, entity) {
-                    stack.push(s);
+                if let Some(seed) = resolve(world_ref, entity, &mut visits, &mut missing) {
+                    stack.push(seed);
                 }
             }
         }
     }
+
+    if scratch.stack.is_empty() {
+        // Everything dirty was simple - no hierarchy work at all this frame.
+        for (entity, global) in missing {
+            world.insert(entity, global);
+        }
+        if trace {
+            log::info!(
+                "PROP_TRACE: total {:.2}ms | changed-query {:.2} | simple-only | dirty {dirty_total} \
+                 simple {visits}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                (t1 - t0).as_secs_f64() * 1000.0,
+            );
+        }
+        scratch.last_run = this_run;
+        world.insert_resource(scratch);
+        return;
+    }
+
     let seeds = scratch.stack.len();
     let t2 = std::time::Instant::now();
 
@@ -721,11 +835,6 @@ pub fn propagate_transforms(world: &mut World) {
     //    56 nodes), THEN — a parallel descent over the independent subtrees of the wide frontier. If
     //    the frontier is already wide (10000 animated character-roots) — the widening is skipped; if
     //    the tree is narrow and does not widen (a chain) — we bail out and descend as is.
-    let mut visits = 0usize;
-    let gt_id = world.registry.get_id::<GlobalTransform>();
-    // Auto-creation of GlobalTransform (entity with a single LocalTransform): empty on the hot path
-    // (required components); the structural insert happens at the end, not during the parallel descent.
-    let mut missing: Vec<(Entity, GlobalTransform)> = Vec::new();
     let mut frontier: Vec<(Entity, GlobalTransform)> = scratch.stack.drain(..).collect();
 
     // ── Widen phase: sequentially process the top (narrow) levels until the frontier becomes
@@ -765,49 +874,192 @@ pub fn propagate_transforms(world: &mut World) {
         }
     }
 
+    // ── Attribution ladder (`APEX_PROP_LADDER=1`, diagnostic) ──────────────────────────────────
+    // The descent is a single lap over several per-node steps, and a lap says only "how much", never
+    // "of what". This pre-pass re-walks the SAME root frontier in the SAME parallel form, each pass
+    // adding one more of the steps the real descent performs, so the cost lands on a named step
+    // instead of on a guess. It pays by its OWN clock (the lesson of the extract ladder): the passes
+    // run BEFORE the descent and print separately — the descent's lap never contains them, and a
+    // ladder run is diagnostic, not comparable with a clean frame.
+    {
+        static LADDER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let ladder = *LADDER.get_or_init(|| std::env::var("APEX_PROP_LADDER").is_ok_and(|v| v == "1"));
+        if ladder && frontier.len() >= 64 {
+            use rayon::prelude::*;
+            use std::hint::black_box;
+            let world_ref: &World = world;
+            let n = frontier.len();
+            let lap = |f: &dyn Fn() -> usize| -> (f64, usize) {
+                let t = std::time::Instant::now();
+                let sink = f();
+                (t.elapsed().as_secs_f64() * 1000.0, sink)
+            };
+            let (t_iter, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .map(|&(e, _)| black_box(e.index as usize))
+                    .sum()
+            });
+            let (t_alive, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .filter(|&&(e, _)| black_box(world_ref.is_alive(e)))
+                    .count()
+            });
+            let (t_local, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .filter(|&&(e, _)| {
+                        world_ref.is_alive(e) && black_box(world_ref.get::<LocalTransform>(e)).is_some()
+                    })
+                    .count()
+            });
+            // The real descent allocates a fresh DFS stack per root (`Vec::with_capacity(64)`) —
+            // priced here as its own step, because on a flat frontier that is one allocation per
+            // entity and nothing in the lap above shows it.
+            let (t_stack, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .map(|&(e, pg)| {
+                        if !world_ref.is_alive(e) {
+                            return 0;
+                        }
+                        let Some(local) = world_ref.get::<LocalTransform>(e) else {
+                            return 0;
+                        };
+                        let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
+                        stack.push((e, pg.mul_local(local)));
+                        black_box(stack.len())
+                    })
+                    .sum()
+            });
+            let (t_write, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .map(|&(e, pg)| {
+                        if !world_ref.is_alive(e) {
+                            return 0;
+                        }
+                        let Some(local) = world_ref.get::<LocalTransform>(e) else {
+                            return 0;
+                        };
+                        let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
+                        let global = pg.mul_local(local);
+                        stack.push((e, global));
+                        black_box(write_global_parallel(world_ref, gt_id, e, global, this_run)) as usize
+                    })
+                    .sum()
+            });
+            let (t_children, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .map(|&(e, pg)| {
+                        if !world_ref.is_alive(e) {
+                            return 0;
+                        }
+                        let Some(local) = world_ref.get::<LocalTransform>(e) else {
+                            return 0;
+                        };
+                        let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
+                        let global = pg.mul_local(local);
+                        write_global_parallel(world_ref, gt_id, e, global, this_run);
+                        for child in world_ref.targets_of(ChildOf, e) {
+                            stack.push((child, global));
+                        }
+                        black_box(stack.len())
+                    })
+                    .sum()
+            });
+            // The real closure reports its visit count into ONE shared atomic, once per root — on a
+            // flat frontier that is one read-modify-write per entity on a single cache line, and no
+            // per-node step above can show it.
+            let counter = std::sync::atomic::AtomicUsize::new(0);
+            let (t_atomic, _) = lap(&|| {
+                frontier
+                    .par_iter()
+                    .map(|&(e, pg)| {
+                        if !world_ref.is_alive(e) {
+                            return 0;
+                        }
+                        let Some(local) = world_ref.get::<LocalTransform>(e) else {
+                            return 0;
+                        };
+                        let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
+                        let global = pg.mul_local(local);
+                        write_global_parallel(world_ref, gt_id, e, global, this_run);
+                        for child in world_ref.targets_of(ChildOf, e) {
+                            stack.push((child, global));
+                        }
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        black_box(stack.len())
+                    })
+                    .sum()
+            });
+            // Printed to stderr, not through `log`: a probe binary has no logger installed, and a
+            // ladder that can only be read where a logger happens to exist is not an instrument.
+            eprintln!(
+                "PROP_LADDER (roots={n}, cumulative ms): iterate {t_iter:.3} | +is_alive {t_alive:.3} \
+                 | +local {t_local:.3} | +stack_alloc {t_stack:.3} | +write {t_write:.3} \
+                 | +children {t_children:.3} | +atomic {t_atomic:.3}"
+            );
+        }
+    }
+
     // ── Descend phase: parallel descent over the independent subtrees of the wide frontier. ──
     const PAR_MIN_ROOTS: usize = 64;
     if frontier.len() >= PAR_MIN_ROOTS {
         use rayon::prelude::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         // Writes go DIRECTLY from the parallel descent via (archetype, row) pointers — the same
         // contract as parallel Write-queries (a row is written by exactly one thread): subtrees are
         // disjoint, an entity is visited once; there are no structural changes in this phase (missing is deferred).
         let roots = frontier;
         let missing_par: std::sync::Mutex<Vec<(Entity, GlobalTransform)>> =
             std::sync::Mutex::new(Vec::new());
-        let visited = AtomicUsize::new(0);
         let world_ref: &World = world;
-        roots.par_iter().for_each(|&(root, parent_global)| {
-            let mut stack: Vec<(Entity, GlobalTransform)> = Vec::with_capacity(64);
-            stack.push((root, parent_global));
-            let mut local_missing: Vec<(Entity, GlobalTransform)> = Vec::new();
-            let mut n = 0usize;
-            while let Some((entity, pg)) = stack.pop() {
-                if !world_ref.is_alive(entity) {
-                    continue;
-                }
-                let local = match world_ref.get::<LocalTransform>(entity) {
-                    Some(l) => *l,
-                    None => continue,
-                };
-                let global = pg.mul_local(&local);
-                n += 1;
-                if !write_global_parallel(world_ref, gt_id, entity, global, this_run) {
-                    local_missing.push((entity, global));
-                }
-                for child in world_ref.targets_of(ChildOf, entity) {
-                    stack.push((child, global));
-                }
-            }
-            if n > 0 {
-                visited.fetch_add(n, Ordering::Relaxed);
-            }
-            if !local_missing.is_empty() {
-                missing_par.lock().unwrap().extend(local_missing);
-            }
-        });
-        visits += visited.load(Ordering::Relaxed);
+        // The visit count is reduced PER TASK and summed at the end — not written into one shared
+        // atomic per root. On a wide flat frontier the per-root `fetch_add` was ~2 ms/frame at 100k
+        // roots (measured by the `APEX_PROP_LADDER` ladder): a read-modify-write on a single cache
+        // line, contended by every worker thread, for a number nobody reads until the descent ends.
+        // The DFS stack is likewise per TASK (`map_init`), not per root: a childless root needs no
+        // heap at all, and a deep subtree still gets one buffer that grows once and is reused.
+        let visits_par: usize = roots
+            .par_iter()
+            .map_init(
+                || Vec::<(Entity, GlobalTransform)>::with_capacity(64),
+                |stack, &(root, parent_global)| {
+                    stack.clear();
+                    stack.push((root, parent_global));
+                    let mut local_missing: Vec<(Entity, GlobalTransform)> = Vec::new();
+                    let mut n = 0usize;
+                    while let Some((entity, pg)) = stack.pop() {
+                        if !world_ref.is_alive(entity) {
+                            continue;
+                        }
+                        let local = match lt_id
+                            .and_then(|id| world_ref.get_by_id::<LocalTransform>(entity, id))
+                        {
+                            Some(l) => *l,
+                            None => continue,
+                        };
+                        let global = pg.mul_local(&local);
+                        n += 1;
+                        if !write_global_parallel(world_ref, gt_id, entity, global, this_run) {
+                            local_missing.push((entity, global));
+                        }
+                        if let Some(kind_idx) = child_of_idx {
+                            for &child in world_ref.target_index.subjects(kind_idx, entity.index) {
+                                stack.push((child, global));
+                            }
+                        }
+                    }
+                    if !local_missing.is_empty() {
+                        missing_par.lock().unwrap().extend(local_missing);
+                    }
+                    n
+                },
+            )
+            .sum();
+        visits += visits_par;
         missing.extend(missing_par.into_inner().unwrap());
     } else {
         // Sequential DFS of the remainder (narrow frontier): each node exactly once, after its parent.
@@ -1294,6 +1546,73 @@ mod tests {
                 "child {i} must be recomputed from the fresh parent in the parallel branch"
             );
         }
+    }
+
+    /// A moving mass of parentless, childless entities takes the "simple" road (no seed vector, no
+    /// DFS) — and a hierarchy dirty in the SAME frame still goes through seed + descent. The mix is
+    /// the whole point: the simple pass rewrites the dirty list the seed phase then consumes, so an
+    /// entity landing on the wrong road would either lose its update or be processed twice.
+    ///
+    /// Sized above `PAR_MIN_DIRTY` (4096) deliberately — below it the split is not taken at all.
+    /// Half the mass is spawned WITHOUT `GlobalTransform`, so the deferred auto-insert (`missing`)
+    /// is exercised on the simple road too.
+    #[test]
+    fn a_mass_of_simple_movers_and_a_hierarchy_are_both_correct_in_one_frame() {
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+
+        let mass = 5000; // > PAR_MIN_DIRTY
+        let mut movers = Vec::with_capacity(mass);
+        for i in 0..mass {
+            let lt = LocalTransform::from_translation(DVec3::new(i as f64, 0.0, 0.0));
+            // Half with a GlobalTransform (the write road), half without (the auto-insert road).
+            let e = if i % 2 == 0 {
+                world.spawn((lt, GlobalTransform::IDENTITY))
+            } else {
+                world.spawn((lt,))
+            };
+            movers.push(e);
+        }
+        let parent = world.spawn((
+            LocalTransform::from_translation(DVec3::new(0.0, 10.0, 0.0)),
+            GlobalTransform::IDENTITY,
+        ));
+        let child = world.spawn((
+            LocalTransform::from_translation(DVec3::new(0.0, 1.0, 0.0)),
+            GlobalTransform::IDENTITY,
+        ));
+        world.add_relation(child, ChildOf, parent);
+        propagate_transforms(&mut world);
+
+        // One frame in which EVERYTHING is dirty: the mass (simple) and the hierarchy root.
+        world.tick();
+        for &e in &movers {
+            if let Some(mut l) = world.get_mut::<LocalTransform>(e) {
+                l.translation.z += 5.0;
+            }
+        }
+        if let Some(mut l) = world.get_mut::<LocalTransform>(parent) {
+            l.translation.y += 100.0;
+        }
+        propagate_transforms(&mut world);
+
+        for (i, &e) in movers.iter().enumerate() {
+            assert_eq!(
+                world.get::<GlobalTransform>(e).unwrap().translation,
+                DVec3::new(i as f64, 0.0, 5.0),
+                "mover {i} must be propagated by the simple road"
+            );
+        }
+        assert_eq!(
+            world.get::<GlobalTransform>(parent).unwrap().translation,
+            DVec3::new(0.0, 110.0, 0.0),
+            "the hierarchy root must still be propagated in the same frame as the mass"
+        );
+        assert_eq!(
+            world.get::<GlobalTransform>(child).unwrap().translation,
+            DVec3::new(0.0, 111.0, 0.0),
+            "the child must be recomputed from its fresh parent — the mass must not starve the descent"
+        );
     }
 
     /// A deep/wide hierarchy with FEW roots (the ring-parent many_foxes case): parallelism
