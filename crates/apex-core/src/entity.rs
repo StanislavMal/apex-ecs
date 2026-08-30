@@ -344,6 +344,22 @@ pub struct EntityAllocator {
     /// Shared with ALL [`EntityReserver`]s — publishing a new lease through it
     /// rules out a stale snapshot (B2).
     lease: LeaseCell,
+    /// The allocator's OWN handle on the current lease — the same `Arc` the cell holds, not a
+    /// snapshot of it.
+    ///
+    /// [`allocate`](Self::allocate) used to reach the lease the way a RESERVER has to: read-lock
+    /// the cell, clone the `Arc` out of it, use it, drop it. That is four atomic
+    /// read-modify-writes per entity spent looking up a value THIS struct publishes and is the
+    /// only writer of. The ladder measured the whole of `allocate` at 30 ns — 46 % of a
+    /// four-component `World::spawn` and more than bevy's entire spawn (probe `spawn_ladder`,
+    /// 2026-08-30). The cell stays exactly as it was: reservers read it, and reading it is what
+    /// makes a stale snapshot impossible for them (B2). What is removed is the allocator asking a
+    /// lock for something it is holding.
+    ///
+    /// INVARIANT this rests on: it is `ptr_eq` to the cell's content at all times.
+    /// [`refresh_lease`](Self::refresh_lease) is the ONLY writer of the cell and it sets both
+    /// from one value. Gated by `the_allocators_lease_handle_is_the_shared_one`.
+    owned_lease: Arc<ReserveLease>,
     records: Vec<EntityRecord>,
     free_list: Vec<u32>,
     /// Count of **live** (located) records — maintained in O(1) on location transitions (like `Entities::len`
@@ -364,12 +380,14 @@ pub struct EntityAllocator {
 
 impl EntityAllocator {
     pub fn new() -> Self {
+        let lease = Arc::new(ReserveLease {
+            cursor: AtomicI64::new(0),
+            free: Box::new([]),
+        });
         Self {
             high_water: Arc::new(AtomicU32::new(0)),
-            lease: Arc::new(RwLock::new(Arc::new(ReserveLease {
-                cursor: AtomicI64::new(0),
-                free: Box::new([]),
-            }))),
+            owned_lease: Arc::clone(&lease),
+            lease: Arc::new(RwLock::new(lease)),
             records: Vec::new(),
             free_list: Vec::new(),
             live: 0,
@@ -449,12 +467,23 @@ impl EntityAllocator {
             .map(|i| (i, self.records[i as usize].generation))
             .collect();
         let cursor = free.len() as i64;
-        // Publish the new lease into the SHARED cell — all reservers will see it
-        // on the next `reserve` (B2: the old snapshot is no longer handed out).
-        *self.lease.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ReserveLease {
+        let lease = Arc::new(ReserveLease {
             cursor: AtomicI64::new(cursor),
             free: free.into_boxed_slice(),
         });
+        // ONE place sets BOTH: the shared cell every reserver reads (B2: the old snapshot is no
+        // longer handed out) and the allocator's own handle on the same `Arc`. Writing them from
+        // one value is what makes them incapable of disagreeing — see `owned_lease`.
+        self.owned_lease = Arc::clone(&lease);
+        *self.lease.write().unwrap_or_else(|e| e.into_inner()) = lease;
+        // The invariant, asserted where it is established rather than only where it is used: a
+        // handle that stopped being the cell's content hands out slots that were already
+        // re-leased (the B2 defect, from the allocator's side this time). Every debug and test
+        // build of every caller of `flush` is a witness.
+        debug_assert!(
+            self.lease_handle_is_the_shared_one(),
+            "refresh_lease published a lease the allocator's own handle does not point at"
+        );
     }
 
     /// Reconciliation at the apply boundary (`&mut World`): (1) return UN-consumed lease slots to free_list;
@@ -547,11 +576,45 @@ impl EntityAllocator {
             let generation = self.records[index as usize].generation;
             Entity { index, generation }
         } else {
-            let lease = read_lease(&self.lease);
-            let e = reserve_from(&lease, &self.high_water);
+            let e = self.take_reused_or_fresh();
             self.ensure_record(e.index);
             e
         }
+    }
+
+    /// One id from the current lease, or a fresh one from high-water: [`reserve_from`] without
+    /// the lock and the `Arc` traffic a `&self` reserver has to pay (see
+    /// [`owned_lease`](Self::owned_lease)).
+    ///
+    /// The cursor is LOADED before it is decremented. An exhausted lease (`<= 0`) is the steady
+    /// state of any world that spawns more than it despawns, and the unconditional decrement was
+    /// an atomic read-modify-write per entity that could never hand anything back. The load is
+    /// safe against a concurrent reserver: only `refresh_lease` raises the cursor and it needs
+    /// `&mut self`, so a reserver can move it down but never back above zero — a lease this call
+    /// saw as exhausted cannot become non-exhausted under it.
+    #[inline]
+    fn take_reused_or_fresh(&self) -> Entity {
+        let lease = &self.owned_lease;
+        if lease.cursor.load(Ordering::Relaxed) > 0 {
+            let n = lease.cursor.fetch_sub(1, Ordering::Relaxed);
+            if n > 0 {
+                let (index, generation) = lease.free[(n - 1) as usize];
+                return Entity { index, generation };
+            }
+            // Lost the race to a reserver between the load and the decrement — fall through to a
+            // fresh index, exactly as `reserve_from` does.
+        }
+        Entity {
+            index: self.high_water.fetch_add(1, Ordering::Relaxed),
+            generation: 0,
+        }
+    }
+
+    /// The invariant [`owned_lease`](Self::owned_lease) rests on, as a value a test can assert:
+    /// the allocator's handle IS the lease the reservers read, not a copy that once matched.
+    pub(crate) fn lease_handle_is_the_shared_one(&self) -> bool {
+        let guard = self.lease.read().unwrap_or_else(|e| e.into_inner());
+        Arc::ptr_eq(&self.owned_lease, &guard)
     }
 
     /// Allocate N entities in a single pass — batch API.
@@ -576,13 +639,18 @@ impl EntityAllocator {
             return entities;
         }
         // 2. Remainder from the lease — ONE fetch_sub (like reserve_n): consume free[old-1..old-reuse].
-        let lease = read_lease(&self.lease);
-        let old = lease.cursor.fetch_sub(remaining as i64, Ordering::Relaxed);
-        let reuse = old.max(0).min(remaining as i64) as usize;
-        for k in 0..reuse {
-            let (index, generation) = lease.free[old as usize - 1 - k];
-            entities.push(Entity { index, generation });
-        }
+        //    Through the allocator's own handle: the batch path pays the lock only once, but
+        //    there is no reason for it to pay it at all (see `owned_lease`).
+        let reuse = {
+            let lease = &self.owned_lease;
+            let old = lease.cursor.fetch_sub(remaining as i64, Ordering::Relaxed);
+            let reuse = old.max(0).min(remaining as i64) as usize;
+            for k in 0..reuse {
+                let (index, generation) = lease.free[old as usize - 1 - k];
+                entities.push(Entity { index, generation });
+            }
+            reuse
+        };
         // 3. Fresh indices — ONE high-water fetch_add + ONE records resize.
         let fresh = remaining - reuse;
         if fresh > 0 {
@@ -1019,6 +1087,55 @@ mod tests {
     /// B2: a reserver that SURVIVED a flush must hand out from the CURRENT lease, not
     /// from a stale snapshot. Previously it held a captured `Arc<ReserveLease>`; after
     /// flush its unconsumed slots returned to free_list and were re-leased,
+    /// The allocator holds its OWN handle on the lease so `allocate` does not read-lock a cell
+    /// and clone an `Arc` per entity (see `owned_lease`). That handle is only ever safe while it
+    /// IS the cell's content — a handle that merely matched once would hand out slots that have
+    /// already been re-leased, which is exactly the B2 defect from the reserver side.
+    ///
+    /// So the invariant is asserted after every operation that can publish a new lease, and the
+    /// reuse is checked to actually come THROUGH the handle: a stale handle with a live cursor
+    /// would still hand ids back, so `ptr_eq` alone would not notice it had gone quiet.
+    #[test]
+    fn the_allocators_lease_handle_is_the_shared_one() {
+        let mut a = EntityAllocator::new();
+        assert!(a.lease_handle_is_the_shared_one(), "fresh allocator");
+
+        let first: Vec<Entity> = (0..8).map(|_| a.allocate()).collect();
+        assert!(a.lease_handle_is_the_shared_one(), "after fresh allocations");
+
+        // Free half of them, then flush: `refresh_lease` drains free_list INTO a new lease, so
+        // the next allocate must reach those slots through the handle and not through free_list.
+        for e in &first[..4] {
+            a.free(*e);
+        }
+        a.flush();
+        assert!(a.lease_handle_is_the_shared_one(), "after flush");
+
+        let reused = a.allocate();
+        assert!(
+            first[..4].iter().any(|e| e.index == reused.index),
+            "reuse did not come from the leased slots — the handle is not the lease being read"
+        );
+        assert_eq!(
+            reused.generation, 1,
+            "a reused slot must carry the bumped generation from the lease"
+        );
+        assert!(a.lease_handle_is_the_shared_one(), "after a leased allocation");
+
+        // A reserver taken out, then another flush: the cell is republished while a handle to the
+        // old lease is alive elsewhere.
+        let reserver = a.reserver();
+        a.flush();
+        assert!(a.lease_handle_is_the_shared_one(), "after a flush with a reserver alive");
+        let from_reserver = reserver.reserve();
+        assert!(
+            first.iter().all(|e| e.index != from_reserver.index)
+                || from_reserver.generation != 0,
+            "reserver and allocator handed out the same live index"
+        );
+        assert!(a.lease_handle_is_the_shared_one(), "after the reserver drew");
+    }
+
     /// while the old reserver still handed them out — the same indices also went out via
     /// direct `allocate` (double issue of one slot).
     #[test]

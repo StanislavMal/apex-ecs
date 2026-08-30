@@ -19,6 +19,12 @@ use crate::{
     template::TemplateRegistry,
 };
 
+/// Attribution ladder for the spawn path -- a probe, not a road (see the module header).
+/// A child module so it reaches the private stages of `spawn_at` WITHOUT widening their
+/// visibility for the sake of an instrument.
+#[doc(hidden)]
+pub mod spawn_ladder;
+
 // ── QueryCache ─────────────────────────────────────────────────
 
 struct CacheEntry {

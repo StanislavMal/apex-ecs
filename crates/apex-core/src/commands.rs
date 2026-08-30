@@ -9,6 +9,12 @@ use crate::{
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem;
 
+/// Attribution ladder for the deferred insert path -- a probe, not a road (see the module
+/// header). A child module so it reaches the private queue/arena WITHOUT widening their
+/// visibility for the sake of an instrument.
+#[doc(hidden)]
+pub mod insert_ladder;
+
 // ── Chunk-based bump arena for command payloads ──────────────────
 //
 // Instead of N separate Box<dyn Trait> allocations for Spawn/Insert,
