@@ -35,21 +35,32 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 #[derive(Component, Clone, Copy)]
 struct A(f32);
+// The four-component bundle mirrors the criterion cell `spawn_wide` EXACTLY -- 64-byte matrix
+// plus three 12-byte vectors, 100 bytes a row. Four f32 markers would have measured per-call
+// overhead only, and a spawn of a real bundle is mostly memory.
 #[allow(dead_code)]
 #[derive(Component, Clone, Copy)]
-struct B2(f32);
+struct B2(cgmath::Matrix4<f32>);
 #[allow(dead_code)]
 #[derive(Component, Clone, Copy)]
-struct C2(f32);
+struct C2(cgmath::Vector3<f32>);
 #[allow(dead_code)]
 #[derive(Component, Clone, Copy)]
-struct D2(f32);
+struct D2(cgmath::Vector3<f32>);
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn m4(seed: f32) -> cgmath::Matrix4<f32> {
+    cgmath::Matrix4::from_scale(1.0 + seed * 1e-6)
+}
+
+fn v3(seed: f32) -> cgmath::Vector3<f32> {
+    cgmath::Vector3::new(seed, 0.0, 0.0)
 }
 
 fn us(d: Duration) -> f64 {
@@ -97,6 +108,11 @@ struct Shape {
     /// The same with a FOUR-component bundle. `spawn4 - spawn1` is what three extra
     /// components cost per spawn — the price of resolving the bundle, if it is not cached.
     spawn4: f64,
+    /// The same four-component spawns into an archetype that ALREADY holds a large
+    /// population, so its columns never grow during the measurement. `spawn4 - spawn4_warm`
+    /// is what the growth costs: apex grows every column and every tick vector on its own,
+    /// bevy allocates the row.
+    spawn4_warm: f64,
 }
 
 impl Shape {
@@ -207,13 +223,42 @@ fn apex_shape(n: usize, samples: usize) -> Shape {
             let mut world = World::new();
             for i in 0..n {
                 let f = i as f32;
-                world.spawn((A(f), B2(f), C2(f), D2(f)));
+                world.spawn((A(f), B2(m4(f)), C2(v3(f)), D2(v3(f))));
             }
             world.entity_count()
         },
     );
 
-    Shape { bulk_spawn, bulk_link, inter_spawn, inter_linked, walk, inter_linked_hoisted, spawn1, spawn4 }
+    let spawn4_warm = median(
+        samples,
+        || {
+            let mut world = World::new();
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((A(f), B2(m4(f)), C2(v3(f)), D2(v3(f))));
+            }
+            world
+        },
+        |world| {
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((A(f), B2(m4(f)), C2(v3(f)), D2(v3(f))));
+            }
+            world.entity_count()
+        },
+    );
+
+    Shape {
+        bulk_spawn,
+        bulk_link,
+        inter_spawn,
+        inter_linked,
+        walk,
+        inter_linked_hoisted,
+        spawn1,
+        spawn4,
+        spawn4_warm,
+    }
 }
 
 #[cfg(feature = "bevy")]
@@ -226,13 +271,13 @@ fn bevy_shape(n: usize, samples: usize) -> Shape {
     struct B(f32);
     #[allow(dead_code)]
     #[derive(bevy_ecs::component::Component)]
-    struct B3(f32);
+    struct B3(cgmath::Matrix4<f32>);
     #[allow(dead_code)]
     #[derive(bevy_ecs::component::Component)]
-    struct B4(f32);
+    struct B4(cgmath::Vector3<f32>);
     #[allow(dead_code)]
     #[derive(bevy_ecs::component::Component)]
-    struct B5(f32);
+    struct B5(cgmath::Vector3<f32>);
 
     let bulk_spawn = median(samples, BWorld::new, |world: &mut BWorld| {
         let mut last = None;
@@ -328,7 +373,26 @@ fn bevy_shape(n: usize, samples: usize) -> Shape {
             let mut world = BWorld::new();
             for i in 0..n {
                 let f = i as f32;
-                world.spawn((B(f), B3(f), B4(f), B5(f)));
+                world.spawn((B(f), B3(m4(f)), B4(v3(f)), B5(v3(f))));
+            }
+            world.entities().len()
+        },
+    );
+
+    let spawn4_warm = median(
+        samples,
+        || {
+            let mut world = BWorld::new();
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((B(f), B3(m4(f)), B4(v3(f)), B5(v3(f))));
+            }
+            world
+        },
+        |world: &mut BWorld| {
+            for i in 0..n {
+                let f = i as f32;
+                world.spawn((B(f), B3(m4(f)), B4(v3(f)), B5(v3(f))));
             }
             world.entities().len()
         },
@@ -343,6 +407,7 @@ fn bevy_shape(n: usize, samples: usize) -> Shape {
         inter_linked_hoisted: inter_linked,
         spawn1,
         spawn4,
+        spawn4_warm,
     }
 }
 
@@ -390,6 +455,12 @@ fn main() {
         row("INTER link, kind hoisted", n, a.inter_linked_hoisted, pick(|s| s.inter_linked_hoisted));
         row("spawn 1 component", n, a.spawn1, pick(|s| s.spawn1));
         row("spawn 4 components", n, a.spawn4, pick(|s| s.spawn4));
+        row("spawn 4, warm archetype", n, a.spawn4_warm, pick(|s| s.spawn4_warm));
+        println!(
+            "  note: column growth costs apex {:.1} us, bevy {:.1} us (spawn4 minus the warm run)",
+            a.spawn4 - a.spawn4_warm,
+            b.as_ref().map(|s| s.spawn4 - s.spawn4_warm).unwrap_or(f64::NAN)
+        );
         println!(
             "  note: the 3 extra components cost apex {:.1} us, bevy {:.1} us — a per-spawn bundle 
                      resolution that is NOT cached shows up here and nowhere else",
