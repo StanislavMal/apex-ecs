@@ -61,6 +61,15 @@ $TARGETS = @{
     'fragmented_iter/apex' = 175.0
 }
 
+# WHEN this invocation started measuring. Criterion writes into a directory it never prunes, so
+# every reading older than this was left behind by an EARLIER run: a benchmark deleted from the
+# source goes on answering, and a filtered run leaves every other group's stale number in place.
+# Read as "unchanged", those rows made the table say `0.0%` about work that did not happen -- a
+# verdict about something nobody observed (found 2026-08-30 by the user: `or_iter` and
+# `query_relation` had been gone from `apex-bench` for a long time and were still judged every run,
+# and a `-Run heavy_compute` invocation would have announced "no regression" over all 25 groups
+# while measuring three).
+$runStart = Get-Date
 if ($Run) {
     Write-Host "[bench] cargo bench -p apex-bench --bench benchmarks --features `"bevy legion`" -- $Run"
     Push-Location $repo
@@ -79,7 +88,9 @@ if (-not (Test-Path -LiteralPath $criterion)) {
 # `new/estimates.json` is the LAST run; `base/` is what criterion itself compared against, and that
 # is precisely the number this tool exists not to trust.
 function Read-Estimates {
+    param([datetime]$Since)
     $out = [ordered]@{}
+    $script:StaleSkipped = @()
     foreach ($g in (Get-ChildItem -LiteralPath $criterion -Directory | Sort-Object Name)) {
         if ($g.Name -eq 'report') { continue }
         if ($Groups.Count -gt 0 -and $Groups -notcontains $g.Name) { continue }
@@ -88,6 +99,13 @@ function Read-Estimates {
             if ($i.Name -eq 'report') { continue }
             $est = Join-Path $i.FullName 'new\estimates.json'
             if (-not (Test-Path -LiteralPath $est)) { continue }
+            # The file's own timestamp against this run's start is the only fact on disk that
+            # separates "measured" from "left over". Absent is what a stale reading MEANS, and the
+            # gate already reports absence by name (`was not measured this run`).
+            if ($null -ne $Since -and (Get-Item -LiteralPath $est).LastWriteTime -lt $Since) {
+                $script:StaleSkipped += "$($g.Name)/$($i.Name)"
+                continue
+            }
             $e = [System.IO.File]::ReadAllText($est) | ConvertFrom-Json
             $impls[$i.Name] = [Math]::Round([double]$e.median.point_estimate, 3)
         }
@@ -96,10 +114,33 @@ function Read-Estimates {
     return $out
 }
 
-$now = Read-Estimates
+# `-Run` omitted is the documented "compare what is on disk" mode: then NOTHING was measured now,
+# and saying so once is the honest form -- not marking every row as unmeasured.
+$now = if ($Run) { Read-Estimates -Since $runStart } else { Read-Estimates }
 if ($now.Count -eq 0) { Write-Warning "criterion has no estimates to read"; exit 3 }
+if (-not $Run) {
+    Write-Warning "no -Run given: every number below is CARRIED from an earlier run, not measured now"
+} elseif ($script:StaleSkipped.Count -gt 0) {
+    Write-Host ("[bench] {0} reading(s) left over from earlier runs are NOT counted: {1}" -f `
+        $script:StaleSkipped.Count, ($script:StaleSkipped -join ', '))
+}
 
 if ($Record) {
+    # **The stamp must not outrun the tree.** The baseline in force on 2026-08-30 said `97a58f9`
+    # while holding numbers measured with the NEXT commit's code in the working tree: it was
+    # recorded before committing, and `git rev-parse HEAD` answered honestly about the wrong thing.
+    # A baseline that names a commit it did not measure is worse than none -- every later run
+    # compares against a lie with a plausible provenance.
+    $dirty = @(git -C $repo status --porcelain --untracked-files=no)
+    if ($dirty.Count -gt 0) {
+        Write-Warning ("the working tree is NOT clean ({0} changed file(s)) -- these numbers do not belong to commit {1}. Commit first, then record." -f $dirty.Count, $commit.Substring(0, 8))
+        Write-Warning "refusing to write a baseline that would name a commit it did not measure"
+        exit 4
+    }
+    if (-not $Run) {
+        Write-Warning "refusing to record from criterion output this run did not produce -- pass -Run"
+        exit 4
+    }
     $snapshot = [ordered]@{
         schema = 'apex-core-bench-baseline-v1'
         recorded = (Get-Date).ToUniversalTime().ToString('o')
