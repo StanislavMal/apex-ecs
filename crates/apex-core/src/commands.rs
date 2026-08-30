@@ -148,6 +148,97 @@ type RemoveRelationApply = fn(&mut World, Entity, Entity);
 /// application of insert bursts (W2-1): the id is needed BEFORE calling typed-apply.
 type ComponentIdFn = fn(&mut crate::component::ComponentRegistry) -> ComponentId;
 
+/// Everything a queued `Insert` needs that belongs to its component TYPE and not to the
+/// individual command: how to move the payload into the world, how to drop it if the command is
+/// never applied, and how to resolve its `ComponentId` for the grouped-burst road.
+///
+/// Held ONCE per type behind a `&'static`, not once per command. Three function pointers on every
+/// queued command are 24 bytes of the same answer written ten thousand times a frame, and the
+/// queue's width is the record half's whole cost: `commands_ladder` measured the 48-byte record at
+/// 19.9 ns per insert against 5.7 ns for a 12-byte one, with the reference's record half at 7.4
+/// (CMD-RECORD-0830). Same lesson as `BundleCache` in `World` — an answer that belongs to the type
+/// is not re-stated per call (CONVENTIONS §2, lesson 25).
+pub(crate) struct InsertVtable {
+    apply: InsertApply,
+    drop: DropFn,
+    cid: ComponentIdFn,
+}
+
+/// The `Spawn` counterpart. `apply_batch` is also the GROUPING key: consecutive spawns of one
+/// type share one vtable, so the burst is recognised by comparing `&'static` addresses instead of
+/// function pointers. Distinct `B` cannot share a vtable — `spawn_apply_batch::<B>` bulk-inserts
+/// through `B`'s own `spawn_bundles_bulk`, so the constants differ by content and the linker has
+/// nothing to merge.
+pub(crate) struct SpawnVtable {
+    apply: SpawnApply,
+    apply_batch: SpawnApplyBatch,
+    drop: DropFn,
+}
+
+/// Per-type constant, monomorphised into a `&'static` at each call site.
+trait InsertMeta {
+    const VTABLE: InsertVtable;
+}
+
+impl<T: Component + Send + 'static> InsertMeta for T {
+    const VTABLE: InsertVtable = InsertVtable {
+        apply: apply_insert::<T>,
+        drop: drop_typed::<T>,
+        cid: cid_of::<T>,
+    };
+}
+
+/// Per-type constant for the spawn road (see [`InsertMeta`]).
+trait SpawnMeta {
+    const VTABLE: SpawnVtable;
+}
+
+impl<B: Bundle + Send + 'static> SpawnMeta for B {
+    const VTABLE: SpawnVtable = SpawnVtable {
+        apply: spawn_apply::<B>,
+        apply_batch: spawn_apply_batch::<B>,
+        drop: spawn_drop::<B>,
+    };
+}
+
+/// Move a queued payload into the world as a component of `entity`.
+///
+/// # Safety
+/// `ptr` must point at a live, owned `T` written by [`Commands::insert`]; it is read (moved) out.
+unsafe fn apply_insert<T: Component>(ptr: *mut u8, world: &mut World, entity: Entity) {
+    let component = std::ptr::read(ptr as *const T);
+    world.insert(entity, component);
+}
+
+/// Drop a queued payload in place — the un-applied path (`clear`, `Drop`, dead entity).
+///
+/// # Safety
+/// `ptr` must point at a live, owned `T` that no one else will drop.
+unsafe fn drop_typed<T>(ptr: *mut u8) {
+    std::ptr::drop_in_place(ptr as *mut T);
+}
+
+fn cid_of<T: Component>(registry: &mut crate::component::ComponentRegistry) -> ComponentId {
+    registry.get_or_register::<T>()
+}
+
+/// The rare, wide payloads live behind a `Box` so the queue's width is set by the COMMON commands.
+/// A `Vec<u8>` inline made every queued spawn and insert 16 bytes wider for the sake of a variant
+/// that appears when a `ComponentId` is only known dynamically.
+struct InsertRawCmd {
+    entity: Entity,
+    component_id: ComponentId,
+    data: Vec<u8>,
+    tick: Tick,
+}
+
+/// Same reason as [`InsertRawCmd`]: a `String` plus a `Box` is 32 bytes for a variant that spawns
+/// from a named template.
+struct SpawnFromTemplateCmd {
+    name: String,
+    params: TemplateParams,
+}
+
 // ── Typed command enum ───────────────────────────────────────────
 //
 // Spawn / Insert store the typed payload in the bump arena instead of Box<dyn Trait>.
@@ -160,20 +251,16 @@ enum Command {
     Spawn {
         entity: Entity,
         offset: u32,
-        apply: SpawnApply,
-        /// Batch applier (the same for all spawns of one type `B`) — grouping consecutive
-        /// `Spawn` commands by equality of this pointer yields a bulk-apply with one archetype resolve.
-        apply_batch: SpawnApplyBatch,
-        drop: DropFn,
+        /// The bundle TYPE's constant (see [`SpawnVtable`]) — one `&'static` where three function
+        /// pointers used to sit. Also the grouping key: consecutive spawns of one type share it.
+        vtable: &'static SpawnVtable,
     },
-    /// Insert with data in the bump arena (offset + apply fn)
+    /// Insert with data in the bump arena (offset + the component TYPE's constant)
     Insert {
         entity: Entity,
         offset: u32,
-        apply: InsertApply,
-        drop: DropFn,
-        /// For grouped application of an insert burst on one entity (W2-1).
-        cid_fn: ComponentIdFn,
+        /// The component TYPE's constant (see [`InsertVtable`]).
+        vtable: &'static InsertVtable,
     },
     /// Remove — inline
     Remove {
@@ -186,23 +273,14 @@ enum Command {
         /// function pointer to call world.remove::<T>()
         remove_fn: RemoveApply,
     },
-    /// InsertRaw — insert by ComponentId with raw data (Vec<u8>)
-    InsertRaw {
-        entity: Entity,
-        component_id: ComponentId,
-        data: Vec<u8>,
-        tick: Tick,
-    },
+    /// InsertRaw — insert by ComponentId with raw data. Boxed: see [`InsertRawCmd`].
+    InsertRaw(Box<InsertRawCmd>),
     /// Despawn — inline, without allocation
     Despawn(Entity),
-    /// SpawnFromTemplate — a rare variant; `TemplateParams` (3×HashMap ≈ 144 bytes) is MOVED into a
-    /// `Box` so as not to bloat the size of the WHOLE `Command` enum (paid by every `queue.push`,
-    /// including bulk Spawn/Insert). Without Box a single Command would weigh ~168 bytes instead of
-    /// ~40 ⇒ +300µs of pure queue-write memory traffic for 10k spawns.
-    SpawnFromTemplate {
-        name: String,
-        params: Box<TemplateParams>,
-    },
+    /// SpawnFromTemplate — a rare variant, boxed WHOLE (name and params both): see
+    /// [`SpawnFromTemplateCmd`]. `TemplateParams` alone is 3×HashMap ≈ 144 bytes, and the `String`
+    /// beside it was another 24 — every `queue.push` in the process paid for them.
+    SpawnFromTemplate(Box<SpawnFromTemplateCmd>),
     /// Arbitrary command — Box<dyn FnOnce>
     Apply(Box<dyn FnOnce(&mut World) + Send>),
     /// AddRelation — typed, via a function pointer
@@ -220,13 +298,21 @@ enum Command {
 }
 
 // Size guard: `Command` is written into the queue by the millions on bulk spawns/inserts, so its
-// size = a direct write tax (Vec<Command> is uniform at the size of the largest variant). Keep it
-// ≤48 bytes: large/rare payloads (TemplateParams) are moved into a `Box`. If the assert fails — a
-// new variant bloated the enum; move its data into a `Box` rather than growing the queue for all
-// commands.
+// size IS the record half's cost (Vec<Command> is uniform at the size of the largest variant, and
+// the probe `commands_ladder` reads 19.9 ns per insert at 48 bytes against 5.7 at 12).
+//
+// The bound is 32 and it is deliberately TIGHT — it is what holds the two rules that got it here:
+// per-TYPE answers live behind a `&'static` vtable, not on the command, and a rare variant's wide
+// payload lives behind a `Box`. A new variant that does not follow both breaks this line rather
+// than quietly taxing every queued spawn and insert in the engine.
+//
+// What sets it now: `AddRelation`/`RemoveRelation` at 24 bytes of payload (subject, target, apply).
+// Going below 32 means moving that pair into the arena too — measured as worth ~4 ns per insert,
+// not taken yet (CMD-RECORD-0830).
 const _: () = assert!(
-    std::mem::size_of::<Command>() <= 48,
-    "Command is bloated — move a new variant's large payload into a Box (see SpawnFromTemplate)"
+    std::mem::size_of::<Command>() <= 32,
+    "Command is bloated — a per-TYPE answer belongs in a &'static vtable and a rare wide payload \
+     in a Box; growing this bound taxes every queued command in the engine (CMD-RECORD-0830)"
 );
 
 /// Apply of a single spawn command: fill the reserved `entity` (or allocate a new one on
@@ -269,7 +355,8 @@ unsafe fn spawn_apply_batch<B: Bundle>(
 /// The entity target of an insert-like command — the grouping criterion for bursts (W2-1).
 fn insert_target(cmd: &Command) -> Option<Entity> {
     match cmd {
-        Command::Insert { entity, .. } | Command::InsertRaw { entity, .. } => Some(*entity),
+        Command::Insert { entity, .. } => Some(*entity),
+        Command::InsertRaw(raw) => Some(raw.entity),
         _ => None,
     }
 }
@@ -291,6 +378,21 @@ fn insert_target(cmd: &Command) -> Option<Entity> {
 /// ```
 pub struct Commands {
     queue: Vec<Command>,
+    /// The buffer [`apply`](Self::apply) swaps in while it drains the live one, so the queue's
+    /// allocation is REUSED instead of being rebuilt from capacity zero every time.
+    ///
+    /// `apply` used to consume the queue with `into_iter`, which hands the allocation to the
+    /// iterator and drops it: ten thousand pushes then regrew it through ~19 reallocations on the
+    /// next frame, and `commands_ladder` measured that at 6.7 ns per insert of the record half's
+    /// 19.9 (CMD-RECORD-0830). Keeping it with `drain(..)` was tried before and was WORSE
+    /// (+5–8 %, PE-C4): `vec::Drain` carries a drop guard and its `next` does not optimise to a
+    /// pointer bump. This does — it reads the commands out by raw pointer.
+    ///
+    /// A spare rather than draining in place, because an applied command can reach arbitrary code
+    /// (`Command::Apply` holds a closure with `&mut World`): a re-entrant `push` must land in a
+    /// queue that this pass is not walking. It lands in the spare, which is live for the duration,
+    /// and stays queued for the next `apply` — exactly what `mem::take` used to guarantee.
+    spare: Vec<Command>,
     arena: CommandArena,
     /// Entity reserver — lets `spawn().id()` hand back a real `Entity` immediately (see
     /// [`EntityReserver`](crate::entity::EntityReserver)). Injected when Commands is accessed from a
@@ -303,6 +405,7 @@ impl Commands {
     pub fn new() -> Self {
         Self {
             queue: Vec::new(),
+            spare: Vec::new(),
             arena: CommandArena::new(),
             reserver: None,
         }
@@ -311,6 +414,8 @@ impl Commands {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             queue: Vec::with_capacity(cap),
+            // The spare grows on the first `apply`, which hands it the drained buffer.
+            spare: Vec::new(),
             arena: CommandArena::new(),
             reserver: None,
         }
@@ -349,9 +454,7 @@ impl Commands {
         self.queue.push(Command::Spawn {
             entity,
             offset,
-            apply: spawn_apply::<B>,
-            apply_batch: spawn_apply_batch::<B>,
-            drop: spawn_drop::<B>,
+            vtable: &<B as SpawnMeta>::VTABLE,
         });
         EntityCommands {
             commands: self,
@@ -384,9 +487,7 @@ impl Commands {
             self.queue.push(Command::Spawn {
                 entity,
                 offset,
-                apply: spawn_apply::<B>,
-                apply_batch: spawn_apply_batch::<B>,
-                drop: spawn_drop::<B>,
+                vtable: &<B as SpawnMeta>::VTABLE,
             });
         }
         entities
@@ -404,23 +505,11 @@ impl Commands {
 
     /// Add a component to an entity — typed payload in the bump arena
     pub fn insert<T: Component + Send + 'static>(&mut self, entity: Entity, component: T) {
-        unsafe fn apply_insert<T: Component>(ptr: *mut u8, world: &mut World, entity: Entity) {
-            let component = std::ptr::read(ptr as *const T);
-            world.insert(entity, component);
-        }
-        unsafe fn drop_typed<T>(ptr: *mut u8) {
-            std::ptr::drop_in_place(ptr as *mut T);
-        }
-        fn cid<T: Component>(registry: &mut crate::component::ComponentRegistry) -> ComponentId {
-            registry.get_or_register::<T>()
-        }
         let offset = self.arena.alloc(component);
         self.queue.push(Command::Insert {
             entity,
             offset,
-            apply: apply_insert::<T>,
-            drop: drop_typed::<T>,
-            cid_fn: cid::<T>,
+            vtable: &<T as InsertMeta>::VTABLE,
         });
     }
 
@@ -433,12 +522,12 @@ impl Commands {
         data: Vec<u8>,
         tick: Tick,
     ) {
-        self.queue.push(Command::InsertRaw {
+        self.queue.push(Command::InsertRaw(Box::new(InsertRawCmd {
             entity,
             component_id,
             data,
             tick,
-        });
+        })));
     }
 
     /// Remove a component by ComponentId (raw).
@@ -538,10 +627,11 @@ impl Commands {
     ///     .set::<MonsterSpeed>(10.0f32));
     /// ```
     pub fn spawn_template_with(&mut self, name: &str, params: TemplateParams) {
-        self.queue.push(Command::SpawnFromTemplate {
-            name: name.to_string(),
-            params: Box::new(params),
-        });
+        self.queue
+            .push(Command::SpawnFromTemplate(Box::new(SpawnFromTemplateCmd {
+                name: name.to_string(),
+                params,
+            })));
     }
 
     /// Create an entity from a template with default parameters.
@@ -551,10 +641,11 @@ impl Commands {
     /// cmds.spawn_template("Monster");
     /// ```
     pub fn spawn_template(&mut self, name: &str) {
-        self.queue.push(Command::SpawnFromTemplate {
-            name: name.to_string(),
-            params: Box::new(TemplateParams::new()),
-        });
+        self.queue
+            .push(Command::SpawnFromTemplate(Box::new(SpawnFromTemplateCmd {
+                name: name.to_string(),
+                params: TemplateParams::new(),
+            })));
     }
 
     /// Apply all accumulated commands to the world.
@@ -568,72 +659,102 @@ impl Commands {
         // (their spawn commands will fill in location/components). Idempotent and cheap if there are
         // no reservations.
         world.flush_reserved();
-        // PE-C4 note: `into_iter` deliberately — a measured attempt to keep the
-        // queue's capacity via `drain(..)` cost +5–8% on insert-heavy applies
-        // (commands_insert 555→599 µs); the arena (the actual per-frame churn)
-        // is reused via the scheduler's `reset_for_reuse` slots instead.
-        let queue = std::mem::take(&mut self.queue);
-        let mut it = queue.into_iter().peekable();
+        // The live queue is swapped for the spare (see `spare`), so its allocation comes back to
+        // us at the end instead of being dropped with an `into_iter`, and a re-entrant push during
+        // an applied closure lands in a queue this pass is not walking.
+        let mut queue = std::mem::replace(&mut self.queue, std::mem::take(&mut self.spare));
+        let len = queue.len();
+        // Ownership of the `len` commands passes to this loop by raw pointer. The length is
+        // zeroed FIRST: if an apply panics, the commands still ahead of us are leaked rather than
+        // dropped a second time by the Vec. That is what `into_iter` did too — dropping a
+        // `Command` never frees its arena payload, only its explicit `drop` pointer does — so
+        // panic behaviour is unchanged in substance.
+        unsafe { queue.set_len(0) };
+        let base = queue.as_ptr();
         // Reusable group buffers (outside the loop — no reallocations).
         let mut group: smallvec::SmallVec<[Command; 8]> = smallvec::SmallVec::new();
         let mut parts: smallvec::SmallVec<[(ComponentId, *const u8, Tick); 8]> =
             smallvec::SmallVec::new();
 
-        while let Some(cmd) = it.next() {
-            if let Some(entity) = insert_target(&cmd) {
-                if it.peek().and_then(insert_target) == Some(entity) {
+        // SAFETY of every `base.add(i)` below: `i < len`, and the buffer still holds the `len`
+        // initialised commands (nothing writes to `queue` while this loop runs — pushes go to the
+        // spare, which is the live queue).
+        let mut i = 0usize;
+        while i < len {
+            let peek_target = |k: usize| -> Option<Entity> {
+                if k < len {
+                    insert_target(unsafe { &*base.add(k) })
+                } else {
+                    None
+                }
+            };
+            if let Some(entity) = insert_target(unsafe { &*base.add(i) }) {
+                if peek_target(i + 1) == Some(entity) {
                     group.clear();
-                    group.push(cmd);
-                    while it.peek().and_then(insert_target) == Some(entity) {
-                        group.push(it.next().unwrap());
+                    group.push(unsafe { std::ptr::read(base.add(i)) });
+                    i += 1;
+                    while peek_target(i) == Some(entity) {
+                        group.push(unsafe { std::ptr::read(base.add(i)) });
+                        i += 1;
                     }
                     self.apply_insert_group(world, entity, &mut group, &mut parts);
                     continue;
                 }
             }
-            // A batch of consecutive spawns of the SAME type `B` (equal `apply_batch` pointer) — one
-            // bulk-apply with a single archetype resolve instead of a per-spawn `spawn_at`. Spawns of
-            // different types, or interleaved with other commands (e.g. `with_children` →
-            // Spawn+AddRelation), are not grouped (`items.len()==1` ⇒ single path, no regression).
-            // Closes the `commands_spawn` gap vs Bevy.
+            let cmd = unsafe { std::ptr::read(base.add(i)) };
+            i += 1;
+            // A batch of consecutive spawns of the SAME type `B` (the same `&'static SpawnVtable`)
+            // — one bulk-apply with a single archetype resolve instead of a per-spawn `spawn_at`.
+            // Spawns of different types, or interleaved with other commands (e.g. `with_children`
+            // → Spawn+AddRelation), are not grouped (`items.len()==1` ⇒ single path, no
+            // regression). Closes the `commands_spawn` gap vs Bevy.
             if let Command::Spawn {
                 entity,
                 offset,
-                apply,
-                apply_batch,
-                ..
+                vtable,
             } = cmd
             {
-                let batch_ptr = apply_batch as usize;
                 let mut items: smallvec::SmallVec<[(Entity, u32); 16]> = smallvec::SmallVec::new();
                 items.push((entity, offset));
-                loop {
-                    // `matches!` releases the `peek` borrow BEFORE `next` (no borrow conflict).
+                while i < len {
                     let same = matches!(
-                        it.peek(),
-                        Some(Command::Spawn { apply_batch: ab, .. }) if *ab as usize == batch_ptr
+                        unsafe { &*base.add(i) },
+                        Command::Spawn { vtable: v, .. } if std::ptr::eq(*v, vtable)
                     );
                     if !same {
                         break;
                     }
-                    if let Some(Command::Spawn { entity, offset, .. }) = it.next() {
+                    if let Command::Spawn { entity, offset, .. } =
+                        unsafe { std::ptr::read(base.add(i)) }
+                    {
                         items.push((entity, offset));
                     }
+                    i += 1;
                 }
                 if items.len() == 1 {
                     // A single spawn — the single path without the bulk's Vec allocations.
-                    unsafe { apply(self.arena.get_ptr(offset), world, entity) };
+                    unsafe { (vtable.apply)(self.arena.get_ptr(offset), world, entity) };
                 } else {
-                    // SAFETY: all items are one type `B` (equal `apply_batch` pointer; per-type
-                    // `component_ids` rules out ICF-merging distinct `B`); their bundles are valid in
-                    // the arena.
-                    unsafe { apply_batch(world, &items, &self.arena) };
+                    // SAFETY: all items are one type `B` (the same vtable address; the constants
+                    // differ by content per `B`, so the linker cannot merge two of them); their
+                    // bundles are valid in the arena.
+                    unsafe { (vtable.apply_batch)(world, &items, &self.arena) };
                 }
                 continue;
             }
             self.apply_one(cmd, world);
         }
         self.arena.reset();
+        // The drained buffer goes back to whichever slot is empty: normally it becomes the live
+        // queue again (the spare stayed empty), and only if the pass queued something re-entrantly
+        // does it become the spare. Either way both buffers keep their capacity, so the steady
+        // state allocates nothing.
+        queue.clear();
+        if self.queue.is_empty() {
+            self.spare = std::mem::replace(&mut self.queue, queue);
+        } else {
+            self.spare = queue;
+        }
     }
 
     /// Apply a group of insert/insert_raw on one entity with a single archetype move.
@@ -648,17 +769,12 @@ impl Commands {
         parts.clear();
         for cmd in group.iter() {
             match cmd {
-                Command::Insert { offset, cid_fn, .. } => {
-                    let cid = cid_fn(&mut world.registry);
+                Command::Insert { offset, vtable, .. } => {
+                    let cid = (vtable.cid)(&mut world.registry);
                     parts.push((cid, self.arena.get_ptr(*offset) as *const u8, tick));
                 }
-                Command::InsertRaw {
-                    component_id,
-                    data,
-                    tick,
-                    ..
-                } => {
-                    parts.push((*component_id, data.as_ptr(), *tick));
+                Command::InsertRaw(raw) => {
+                    parts.push((raw.component_id, raw.data.as_ptr(), raw.tick));
                 }
                 _ => unreachable!("an insert group contains only Insert/InsertRaw"),
             }
@@ -672,8 +788,8 @@ impl Commands {
             // Entity is dead — we free the typed payloads, as world.insert
             // would have dropped the value on an early return.
             for cmd in group.drain(..) {
-                if let Command::Insert { offset, drop, .. } = cmd {
-                    unsafe { drop(self.arena.get_ptr(offset)) };
+                if let Command::Insert { offset, vtable, .. } = cmd {
+                    unsafe { (vtable.drop)(self.arena.get_ptr(offset)) };
                 }
             }
         }
@@ -686,18 +802,16 @@ impl Commands {
                 Command::Spawn {
                     entity,
                     offset,
-                    apply,
-                    ..
+                    vtable,
                 } => unsafe {
-                    apply(self.arena.get_ptr(offset), world, entity);
+                    (vtable.apply)(self.arena.get_ptr(offset), world, entity);
                 },
                 Command::Insert {
                     entity,
                     offset,
-                    apply,
-                    ..
+                    vtable,
                 } => unsafe {
-                    apply(self.arena.get_ptr(offset), world, entity);
+                    (vtable.apply)(self.arena.get_ptr(offset), world, entity);
                 },
                 Command::Remove {
                     entity,
@@ -711,12 +825,13 @@ impl Commands {
                 Command::RemoveTyped { entity, remove_fn } => unsafe {
                     remove_fn(entity, world);
                 },
-                Command::InsertRaw {
-                    entity,
-                    component_id,
-                    data,
-                    tick,
-                } => {
+                Command::InsertRaw(raw) => {
+                    let InsertRawCmd {
+                        entity,
+                        component_id,
+                        data,
+                        tick,
+                    } = *raw;
                     world.insert_raw(entity, component_id, data, tick);
                 }
                 Command::Despawn(entity) => {
@@ -732,7 +847,8 @@ impl Commands {
                         );
                     }
                 }
-                Command::SpawnFromTemplate { name, params } => {
+                Command::SpawnFromTemplate(tpl) => {
+                    let SpawnFromTemplateCmd { name, params } = *tpl;
                     // §0.2a (B10): a queued spawn of an unregistered template name
                     // (typo, or the template was never registered) silently spawns
                     // nothing. Surface it.
@@ -789,16 +905,16 @@ impl Commands {
         self.abandon_queued_reservations();
         for cmd in self.queue.drain(..) {
             match cmd {
-                Command::Spawn { offset, drop, .. } => unsafe {
-                    drop(self.arena.get_ptr(offset));
+                Command::Spawn { offset, vtable, .. } => unsafe {
+                    (vtable.drop)(self.arena.get_ptr(offset));
                 },
-                Command::Insert { offset, drop, .. } => unsafe {
-                    drop(self.arena.get_ptr(offset));
+                Command::Insert { offset, vtable, .. } => unsafe {
+                    (vtable.drop)(self.arena.get_ptr(offset));
                 },
                 // RemoveTyped / Remove / InsertRaw store no data in the bump arena — nothing to drop
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
-                Command::InsertRaw { .. } => {}
+                Command::InsertRaw(_) => {}
                 Command::AddRelation { .. } => {}
                 Command::RemoveRelation { .. } => {}
                 _ => {}
@@ -1029,16 +1145,16 @@ impl Drop for Commands {
         // Drop the typed data in the arena before deallocating the buffer
         for cmd in self.queue.drain(..) {
             match cmd {
-                Command::Spawn { offset, drop, .. } => unsafe {
-                    drop(self.arena.get_ptr(offset));
+                Command::Spawn { offset, vtable, .. } => unsafe {
+                    (vtable.drop)(self.arena.get_ptr(offset));
                 },
-                Command::Insert { offset, drop, .. } => unsafe {
-                    drop(self.arena.get_ptr(offset));
+                Command::Insert { offset, vtable, .. } => unsafe {
+                    (vtable.drop)(self.arena.get_ptr(offset));
                 },
                 // RemoveTyped / Remove / InsertRaw store no data in the bump arena — nothing to drop
                 Command::RemoveTyped { .. } => {}
                 Command::Remove { .. } => {}
-                Command::InsertRaw { .. } => {}
+                Command::InsertRaw(_) => {}
                 Command::AddRelation { .. } => {}
                 Command::RemoveRelation { .. } => {}
                 _ => {}
@@ -1506,6 +1622,66 @@ mod tests {
         let query = crate::query::Query::<&Pos>::new(&world);
         let count = query.iter().count();
         assert_eq!(count, 20);
+    }
+
+    /// What CMD-RECORD-0830 actually buys, as a value a test can assert: a `Commands` that has
+    /// applied once keeps its queue's room, so the second frame's ten thousand pushes reallocate
+    /// nothing. `apply` used to consume the queue with `into_iter` and hand the allocation to the
+    /// iterator; the probe measured the regrowth at 6.7 ns per insert, and the cell cannot see it
+    /// at all (`commands_insert` builds a fresh `Commands` per pass).
+    ///
+    /// Asserted on CAPACITY and not on a timing, because a timing gate on a few nanoseconds is a
+    /// gate whose own spread is its verdict.
+    #[test]
+    fn a_commands_that_applied_once_keeps_its_queues_room() {
+        #[derive(Clone, Copy)]
+        struct C(u32);
+        impl Component for C {}
+
+        let mut world = World::new();
+        let entities: Vec<Entity> = (0..256).map(|i| world.spawn((C(i),))).collect();
+
+        let mut cmds = Commands::new();
+        for (i, &e) in entities.iter().enumerate() {
+            cmds.insert(e, C(i as u32 + 1000));
+        }
+        let held = cmds.queue.len();
+        assert_eq!(held, entities.len(), "the queue did not hold what was recorded");
+        cmds.apply(&mut world);
+
+        assert!(cmds.queue.is_empty(), "apply left commands behind");
+        assert!(
+            cmds.queue.capacity() >= held,
+            "apply threw the queue's allocation away: capacity {} after holding {held} commands \
+             — the next frame regrows it from scratch",
+            cmds.queue.capacity()
+        );
+
+        // And the second round still applies correctly through the reused buffer.
+        for (i, &e) in entities.iter().enumerate() {
+            cmds.insert(e, C(i as u32 + 2000));
+        }
+        cmds.apply(&mut world);
+        for (i, &e) in entities.iter().enumerate() {
+            assert_eq!(
+                world.get::<C>(e).map(|c| c.0),
+                Some(i as u32 + 2000),
+                "entity {i} did not receive the second round"
+            );
+        }
+    }
+
+    /// The queue's width is the record half's cost, so the bound is a fact worth stating in a
+    /// test as well as in a `const` assert: a reader who widens a variant should meet the number,
+    /// not just a compile error in a file they were not editing.
+    #[test]
+    fn a_queued_command_is_no_wider_than_the_bound() {
+        assert!(
+            std::mem::size_of::<Command>() <= 32,
+            "Command grew to {} bytes: a per-TYPE answer belongs in a &'static vtable and a rare \
+             wide payload in a Box (CMD-RECORD-0830)",
+            std::mem::size_of::<Command>()
+        );
     }
 
     // ── W2-1: grouping of insert bursts ────────────────────────

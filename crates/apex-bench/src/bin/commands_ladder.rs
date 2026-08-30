@@ -263,6 +263,41 @@ into a {}-byte record instead of {} {:.1} (+-{:.1}%)",
         insert_ladder::APPLY_COPY_COMPLETE as usize,
     );
 
+    // ── The SECOND frame ── a `Commands` that has already applied once, which is the only kind
+    // the scheduler ever runs. The cell cannot see this: `commands_insert` builds a fresh
+    // `Commands` per pass, so a queue that keeps its allocation looks free AND useless there.
+    // The world is fresh either way — only the Commands is warm.
+    let second = ladder(2, repeats, |half| {
+        let (mut throwaway, warm_entities) = setup(count);
+        let mut cmds =
+            insert_ladder::warmed_commands::<B, _>(&mut throwaway, &warm_entities, |i| B(i as f32));
+        drop(throwaway);
+        let (mut world, entities) = setup(count);
+        if half == 0 {
+            let t = Instant::now();
+            insert_ladder::record_rung::<B, _>(&mut cmds, &entities, insert_ladder::RECORD_REAL, |i| {
+                B(i as f32)
+            });
+            let ns = t.elapsed().as_secs_f64() * 1e9 / count as f64;
+            std::hint::black_box(insert_ladder::queue_len(&cmds));
+            ns
+        } else {
+            insert_ladder::record_rung::<B, _>(&mut cmds, &entities, insert_ladder::RECORD_REAL, |i| {
+                B(i as f32)
+            });
+            let t = Instant::now();
+            insert_ladder::apply_rung::<B>(&mut cmds, &mut world, insert_ladder::APPLY_REAL);
+            let ns = t.elapsed().as_secs_f64() * 1e9 / count as f64;
+            std::hint::black_box(&world);
+            ns
+        }
+    });
+    println!(
+        "
+second frame (a `Commands` that already applied once — what the scheduler runs): record {:.1} (+-{:.1}%) + apply {:.1} (+-{:.1}%) = {:.1}",
+        second[0].0, second[0].1, second[1].0, second[1].1, second[0].0 + second[1].0
+    );
+
     // ── The control arm: the same inserts with no Commands in the way ──
     let (direct, direct_sp) = timed(repeats, || {
         let (mut world, entities) = setup(count);
@@ -276,35 +311,44 @@ into a {}-byte record instead of {} {:.1} (+-{:.1}%)",
     let rec_real = record[insert_ladder::RECORD_REAL as usize].0;
     let app_real = apply[insert_ladder::APPLY_REAL as usize].0;
     println!(
-        "\napex   : direct {direct:.1} (+-{direct_sp:.1}%) | deferred {:.1} \
-         (record {rec_real:.1} + apply {app_real:.1}) => deferring costs {:+.1} ns/insert \
-         ({:+.0}%)",
+        "\napex   : direct {direct:.1} (+-{direct_sp:.1}%) | deferred cold {:.1} \
+(record {rec_real:.1} + apply {app_real:.1}) | deferred warm {:.1} \
+(record {:.1} + apply {:.1})",
         rec_real + app_real,
-        rec_real + app_real - direct,
-        (rec_real + app_real - direct) / direct * 100.0
+        second[0].0 + second[1].0,
+        second[0].0,
+        second[1].0,
     );
 
     #[cfg(feature = "bevy")]
     {
         let (b_direct, b_direct_sp) = reference::direct(count, repeats);
-        let ((b_rec, _), (b_app, _)) = reference::deferred(count, repeats);
+        let ((b_rec, b_rec_sp), (b_app, b_app_sp)) = reference::deferred(count, repeats);
         println!(
             "bevy   : direct {b_direct:.1} (+-{b_direct_sp:.1}%) | deferred {:.1} \
-             (record {b_rec:.1} + apply {b_app:.1}) => deferring costs {:+.1} ns/insert ({:+.0}%)",
+(record {b_rec:.1} +-{b_rec_sp:.1}% + apply {b_app:.1} +-{b_app_sp:.1}%)",
             b_rec + b_app,
-            b_rec + b_app - b_direct,
-            (b_rec + b_app - b_direct) / b_direct * 100.0
         );
-        let ours = rec_real + app_real - direct;
-        let theirs = b_rec + b_app - b_direct;
+        // The HALVES, not the difference of differences. "What the machinery costs" is
+        // (deferred − direct) on each side, and a difference of two noisy medians divided by
+        // another difference of two noisy medians is a number whose own spread swamps its signal
+        // — this probe printed 1.83x, 2.12x, 3.26x and 4.26x for it across four runs of the same
+        // binary while every half below moved by a few percent. A quantity whose spread reaches
+        // its verdict cannot be the judge (CONVENTIONS §2, lesson 25.4).
         println!(
-            "\nverdict: the archetype move is ours to keep (direct {:.2}x bevy, >1 = we are \
-             faster); the machinery around it costs us {ours:.1} ns against their {theirs:.1} \
-             ({:.2}x, >1 = ours is dearer). Record: {:.2}x. Apply: {:.2}x.",
+            "\nby halves (>1 = we are faster): direct {:.2}x | record cold {:.2}x | \
+record warm {:.2}x | apply {:.2}x | deferred total cold {:.2}x / warm {:.2}x",
             b_direct / direct.max(f64::MIN_POSITIVE),
-            ours / theirs.max(f64::MIN_POSITIVE),
-            rec_real / b_rec.max(f64::MIN_POSITIVE),
-            app_real / b_app.max(f64::MIN_POSITIVE),
+            b_rec / rec_real.max(f64::MIN_POSITIVE),
+            b_rec / second[0].0.max(f64::MIN_POSITIVE),
+            b_app / app_real.max(f64::MIN_POSITIVE),
+            (b_rec + b_app) / (rec_real + app_real).max(f64::MIN_POSITIVE),
+            (b_rec + b_app) / (second[0].0 + second[1].0).max(f64::MIN_POSITIVE),
+        );
+        println!(
+            "the WARM record is the one the scheduler runs: a `Commands` that has applied once \
+keeps its queue's allocation, and the cell (`commands_insert`) cannot see that because it builds \
+a fresh `Commands` per pass."
         );
     }
 }

@@ -22,7 +22,14 @@
 //! record: `arena.alloc` 3.2, `queue.push` 16.1. The two variants below split that 16.1 in half
 //! and name both halves: into a RESERVED queue 13.2 (so 6.7 ns is regrowing an allocation `apply`
 //! throws away every time), into a 12-byte record instead of the 48-byte `Command` 5.7 (so ~7.5 ns
-//! is the width of the record itself). Written up as CMD-RECORD-0830.
+//! is the width of the record itself).
+//!
+//! Both halves were then closed (CMD-RECORD-0830): `size_of::<Command>()` 48 -> 32, and `apply`
+//! hands the queue's allocation back instead of giving it to an iterator. The record half on the
+//! SECOND frame — the only kind the scheduler runs — went 21.2 -> 7.5 against the reference's 7.4,
+//! the apply half's queue walk 12.4 -> 2.8, and the deferred path as a whole is 1.20x ahead. The
+//! third arm below ("second frame") exists because the cell cannot see any of that: it builds a
+//! fresh `Commands` per pass, so it measures the COLD path and nothing else.
 //!
 //! # Shape
 //!
@@ -38,8 +45,8 @@
 //! a burst on ONE entity takes the grouped road (`apply_insert_group`, one archetype move for the
 //! whole burst), which is a different subject with different costs.
 
-use super::{Command, Commands, insert_target};
-use crate::component::{Component, ComponentId};
+use super::{Command, Commands, InsertMeta, insert_target};
+use crate::component::Component;
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -94,18 +101,6 @@ where
         std::any::type_name::<T>()
     );
 
-    // The same three function items `Commands::insert` writes into the command.
-    unsafe fn apply_insert<T: Component>(ptr: *mut u8, world: &mut World, entity: Entity) {
-        let component = std::ptr::read(ptr as *const T);
-        world.insert(entity, component);
-    }
-    unsafe fn drop_typed<T>(ptr: *mut u8) {
-        std::ptr::drop_in_place(ptr as *mut T);
-    }
-    fn cid<T: Component>(registry: &mut crate::component::ComponentRegistry) -> ComponentId {
-        registry.get_or_register::<T>()
-    }
-
     for (i, &entity) in entities.iter().enumerate() {
         let component = make(i);
 
@@ -128,9 +123,7 @@ where
         cmds.queue.push(Command::Insert {
             entity,
             offset,
-            apply: apply_insert::<T>,
-            drop: drop_typed::<T>,
-            cid_fn: cid::<T>,
+            vtable: &<T as InsertMeta>::VTABLE,
         });
     }
 }
@@ -156,31 +149,47 @@ pub fn apply_rung<T: Component>(cmds: &mut Commands, world: &mut World, rung: u8
     }
 
     world.flush_reserved();
-    let queue = std::mem::take(&mut cmds.queue);
-    let mut it = queue.into_iter().peekable();
+    // The same swap production does (see `Commands::spare`): the buffer comes back at the end, so
+    // the copy does not quietly measure a different walk from the road it describes. Before this
+    // followed along, the copy read 5.9 ns per insert DEARER than the real `apply` — the
+    // `copy drift` line is what said so.
+    let mut queue = std::mem::take(&mut cmds.queue);
+    let len = queue.len();
+    // SAFETY: ownership of the `len` commands passes to this loop by raw pointer; the length is
+    // zeroed first so a panic leaks rather than double-drops (exactly as production does).
+    unsafe { queue.set_len(0) };
+    let base = queue.as_ptr();
     // One scalar sink for every rung that stops short, folded once after the loop. A per-rung
     // `black_box` of a tuple was the first shape and it cost the bottom rung ~9 ns of stack
     // traffic that no rung above it paid — enough to print rung 0 as DEARER than rung 1, which
     // does strictly more. A sink that every rung pays identically cannot invert an order.
     let mut sink = 0u64;
 
-    while let Some(cmd) = it.next() {
+    let mut i = 0usize;
+    while i < len {
+        // SAFETY: `i < len`, and nothing writes to the buffer while this loop walks it.
+        let cmd = unsafe { std::ptr::read(base.add(i)) };
+        let next_target = if i + 1 < len {
+            insert_target(unsafe { &*base.add(i + 1) })
+        } else {
+            None
+        };
+        i += 1;
         // The grouping probe production pays on EVERY command, whether or not a burst follows.
         let target = insert_target(&cmd);
         assert!(target.is_some(), "commands ladder: non-insert command in the queue");
         assert!(
-            it.peek().and_then(insert_target) != target,
+            next_target != target,
             "commands ladder: two consecutive inserts on one entity take the GROUPED road, which \
              this ladder does not describe"
         );
 
-        let (entity, offset, apply) = match cmd {
+        let (entity, offset, vtable) = match cmd {
             Command::Insert {
                 entity,
                 offset,
-                apply,
-                ..
-            } => (entity, offset, apply),
+                vtable,
+            } => (entity, offset, vtable),
             _ => unreachable!("guarded by insert_target above"),
         };
         sink ^= (entity.index() as u64) << 32 | offset as u64;
@@ -212,10 +221,14 @@ pub fn apply_rung<T: Component>(cmds: &mut Commands, world: &mut World, rung: u8
         // direct monomorphic call: the indirect call is part of what deferring costs, and a copy
         // that inlined it would hand that cost to the `copy drift` line as a mystery.
         // SAFETY: the pointer was written by `Commands::insert` for this exact `T` and offset.
-        unsafe { apply(cmds.arena.get_ptr(offset), world, entity) };
+        unsafe { (vtable.apply)(cmds.arena.get_ptr(offset), world, entity) };
     }
     std::hint::black_box(sink);
     cmds.arena.reset();
+    // Hand the buffer back, as production does — a copy that dropped it would make the NEXT pass
+    // pay for regrowth the road does not pay.
+    queue.clear();
+    cmds.queue = queue;
 }
 
 /// Give the command queue room for `additional` commands BEFORE a timed pass.
@@ -266,6 +279,25 @@ pub fn queue_len(cmds: &Commands) -> usize {
 /// see what the variant traded away.
 pub fn command_bytes() -> usize {
     std::mem::size_of::<Command>()
+}
+
+/// Hand a `Commands` back its allocations without applying anything — the probe's way of asking
+/// "what does the SECOND frame cost", which is the frame the scheduler actually runs.
+///
+/// The record half's cheapest form is a queue that already has room, and `Commands::apply` now
+/// leaves it that way; a probe that builds a fresh `Commands` per pass can never see it, and the
+/// cell (`commands_insert`) does exactly that. So the probe warms one and reuses it.
+pub fn warmed_commands<T, F>(world: &mut World, entities: &[Entity], mut make: F) -> Commands
+where
+    T: Component + Send + 'static,
+    F: FnMut(usize) -> T,
+{
+    let mut cmds = Commands::new();
+    for (i, &entity) in entities.iter().enumerate() {
+        cmds.insert(entity, make(i));
+    }
+    cmds.apply(world);
+    cmds
 }
 
 /// The control arm: the SAME inserts, straight into the world, with no Commands in the way. The
