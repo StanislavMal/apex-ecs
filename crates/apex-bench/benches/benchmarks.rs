@@ -252,8 +252,9 @@ fn bench_events(c: &mut Criterion) {
     });
 }
 
-// Steady-state frame profile: 10k frames × (8 send + read with persistent cursor + rotate).
-// A different profile than the one-shot batch (bench_events): it amortizes the per-frame rotate.
+// Steady-state frame profile, PER-EVENT rung: 1k frames × (512 send + read with a persistent
+// cursor + rotate). The batch size is deliberately large — see `apex::events::FrameLoopBench`:
+// at a small batch this cell reported the harness binary's code layout instead of the engines.
 fn bench_events_frame_loop(c: &mut Criterion) {
     let mut group = c.benchmark_group("events_frame_loop");
     group.bench_function("apex", |b| {
@@ -263,6 +264,38 @@ fn bench_events_frame_loop(c: &mut Criterion) {
     #[cfg(feature = "bevy")]
     group.bench_function("bevy", |b| {
         let mut bench = bevy::events::FrameLoopBenchmark::new();
+        b.iter(move || bench.run());
+    });
+}
+
+// The same loop at the PER-FRAME rung: 10k frames × (1 send + read + rotate). Here the rotation
+// and the cursor bookkeeping are most of the frame, so this is the cell that would catch a
+// regression in `Events::update` — which the per-event rung above would dilute 50-fold.
+fn bench_events_frame_idle(c: &mut Criterion) {
+    let mut group = c.benchmark_group("events_frame_idle");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::events::FrameLoopBench::idle();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::events::FrameLoopBenchmark::idle();
+        b.iter(move || bench.run());
+    });
+}
+
+// 10k INDIVIDUAL spawns of a four-component bundle. The other spawn cells all measure the
+// BATCH path, which resolves the bundle once per batch; this one measures the per-CALL path,
+// where the cost of resolving a bundle grows with its width. See `apex::spawn_wide`.
+fn bench_spawn_wide(c: &mut Criterion) {
+    let mut group = c.benchmark_group("spawn_wide");
+    group.bench_function("apex", |b| {
+        let mut bench = apex::spawn_wide::SpawnWide::new();
+        b.iter(move || bench.run());
+    });
+    #[cfg(feature = "bevy")]
+    group.bench_function("bevy", |b| {
+        let mut bench = bevy::spawn_wide::Benchmark::new();
         b.iter(move || bench.run());
     });
 }
@@ -372,6 +405,7 @@ criterion_group!(
     benches,
     bench_par_split,
     bench_simple_insert,
+    bench_spawn_wide,
     bench_simple_iter,
     bench_frag_iter,
     bench_schedule,
@@ -385,6 +419,7 @@ criterion_group!(
     bench_changed_iter_frag,
     bench_events,
     bench_events_frame_loop,
+    bench_events_frame_idle,
     bench_relations,
     bench_propagate,
     bench_propagate_static,

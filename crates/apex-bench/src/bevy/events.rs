@@ -36,7 +36,20 @@ pub struct FrameLoopBenchmark {
 
 impl FrameLoopBenchmark {
     pub fn new() -> Self {
-        Self { frames: 10_000, per_frame: 8 }
+        Self { frames: 1_000, per_frame: 512 }
+    }
+
+
+    /// How many events one `run()` sends. The honesty guard derives the expected sum from THIS,
+    /// so moving the rung cannot leave a stale constant asserting the old shape.
+    pub fn event_count(&self) -> u64 {
+        self.frames * self.per_frame
+    }
+
+    /// Counterpart of apex `FrameLoopBench::idle` — one message per frame, so the cell is
+    /// dominated by the rotation and the cursor, not by the payload.
+    pub fn idle() -> Self {
+        Self { frames: 10_000, per_frame: 1 }
     }
 
     pub fn run(&mut self) -> u64 {

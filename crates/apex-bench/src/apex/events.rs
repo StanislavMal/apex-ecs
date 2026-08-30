@@ -39,6 +39,18 @@ impl EventsBench {
 // rotate the buffer. Unlike a one-off batch (EventsBench) it amortizes the per-frame cost of
 // send+read+rotate (rotation is called EVERY frame) — closer to a real engine frame.
 // A persistent cursor — like a system reader. Both implementations read all events.
+//
+// ⚠ THE RUNG IS PART OF THE INSTRUMENT (2026-08-30, BENCH-EVENTS-0830). This cell used to run
+// 10 000 frames x 8 events, and at that rung the fixed per-frame cost and the per-event cost are
+// the same order, so the number was decided by how the loop happened to be laid out in the
+// harness binary rather than by `Events<T>`: three builds of the SAME event code gave 134.0,
+// 160.7 and 198.5 us while bevy sat still at 104, and the very same `run()` called from another
+// binary (`--bin events_shapes`) cost 10.4 ns/frame against criterion's 19.9. A batch of 512
+// puts the per-event work 50x above the per-frame term, so what the cell reports is the quantity
+// that actually differs between the two engines — and that one IS stable: apex 1.75-1.79x ahead
+// across independent runs, because we push 8 bytes per event where bevy pushes a 16-byte
+// `MessageInstance`. The per-frame term keeps its own cell (`events_frame_idle`), at the rung
+// where IT dominates.
 pub struct FrameLoopBench {
     frames: u64,
     per_frame: u64,
@@ -52,7 +64,20 @@ impl Default for FrameLoopBench {
 
 impl FrameLoopBench {
     pub fn new() -> Self {
-        Self { frames: 10_000, per_frame: 8 }
+        Self { frames: 1_000, per_frame: 512 }
+    }
+
+
+    /// How many events one `run()` sends. The honesty guard derives the expected sum from THIS,
+    /// so moving the rung cannot leave a stale constant asserting the old shape.
+    pub fn event_count(&self) -> u64 {
+        self.frames * self.per_frame
+    }
+
+    /// The same loop at ONE event per frame: the rotate + cursor bookkeeping is then ~80 % of
+    /// the frame, so a regression in `Events::update` shows here and nowhere else.
+    pub fn idle() -> Self {
+        Self { frames: 10_000, per_frame: 1 }
     }
 
     pub fn run(&mut self) -> u64 {

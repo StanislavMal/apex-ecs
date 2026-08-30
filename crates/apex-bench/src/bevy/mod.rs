@@ -12,4 +12,5 @@ pub mod wide_iter;
 pub mod heavy_compute;
 pub mod schedule;
 pub mod simple_insert;
+pub mod spawn_wide;
 pub mod simple_iter;

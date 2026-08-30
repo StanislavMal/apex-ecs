@@ -46,10 +46,24 @@ fn events_frame_loop_apex_and_bevy_read_all() {
     use apex_bench::apex::events::FrameLoopBench;
     use apex_bench::bevy::events::FrameLoopBenchmark as BevyFrameLoop;
 
-    // 10_000 frames × 8 = 80_000 events; sum(0..80000) = 80000*79999/2 = 3_199_960_000.
-    const EXPECTED: u64 = 3_199_960_000;
-    assert_eq!(FrameLoopBench::new().run(), EXPECTED, "apex frame-loop did not read all events");
-    assert_eq!(BevyFrameLoop::new().run(), EXPECTED, "bevy frame-loop did not read all events");
+    // The expected sum is DERIVED from each bench's own shape, never written out as a
+    // constant: the rung moved once already (BENCH-EVENTS-0830) and a hardcoded total would have
+    // gone on asserting the shape the cell no longer runs.
+    // Both rungs are checked — the per-event one and the per-frame (idle) one.
+    for (mut apex, mut bevy, rung) in [
+        (FrameLoopBench::new(), BevyFrameLoop::new(), "per-event rung"),
+        (FrameLoopBench::idle(), BevyFrameLoop::idle(), "per-frame (idle) rung"),
+    ] {
+        let n = apex.event_count();
+        assert_eq!(
+            n,
+            bevy.event_count(),
+            "{rung}: the two engines must be given the SAME amount of work"
+        );
+        let expected = n * (n - 1) / 2; // sum of 0..n
+        assert_eq!(apex.run(), expected, "{rung}: apex frame-loop did not read all events");
+        assert_eq!(bevy.run(), expected, "{rung}: bevy frame-loop did not read all events");
+    }
 }
 
 #[cfg(feature = "bevy")]

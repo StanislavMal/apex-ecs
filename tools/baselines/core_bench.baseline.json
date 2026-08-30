@@ -1,134 +1,141 @@
-{
-    "schema": "apex-core-bench-baseline-v1",
-    "recorded": "2026-08-27T09:10:01.1392013Z",
-    "git_commit": "b1d5fea4cc168d20a807e43128197045e9cd69e1",
-    "host": {
-        "os": "Microsoft Windows NT 10.0.26200.0",
-        "cpu_logical": 12
-    },
-    "unit": "nanoseconds (criterion median point estimate)",
-    "reference_impls": [
-        "bevy",
-        "legion"
-    ],
-    "targets_ns": {
-        "schedule/apex": 26600,
-        "fragmented_iter/apex": 175,
-        "wide_iter/apex": 3490
-    },
-    "targets_note": "sh_final 2026-07-04; RECOVERED 2026-08-27 (BENCH-REGRESS-0824 closed): the baseline below is the state AFTER the fix, so a slide back to the regression is a regression again",
-    "groups": {
-        "add_remove_component": {
-            "apex": 520484.393,
-            "bevy": 831926.364,
-            "legion": 2627220
-        },
-        "changed_iter": {
-            "apex": 8472.388,
-            "bevy": 7555.061
-        },
-        "changed_iter_frag": {
-            "apex": 472.599,
-            "bevy": 4290.827
-        },
-        "changed_iter_static": {
-            "apex": 14.645,
-            "bevy": 3535.651
-        },
-        "commands_insert": {
-            "apex": 509850.144,
-            "bevy": 466906.037
-        },
-        "commands_spawn": {
-            "apex": 398454.953,
-            "bevy": 456815.697
-        },
-        "despawn": {
-            "apex": 280181.061,
-            "bevy": 294790.53,
-            "legion": 474122.579
-        },
-        "despawn_recursive": {
-            "apex": 22442.79,
-            "bevy": 52384.109
-        },
-        "events": {
-            "apex": 13411.718,
-            "bevy": 29197.374
-        },
-        "events_frame_loop": {
-            "apex": 134015.431,
-            "bevy": 106951.572
-        },
-        "fragmented_iter": {
-            "apex": 175.351,
-            "bevy": 126.439,
-            "legion": 174.454
-        },
-        "get_component": {
-            "apex": 34885.804,
-            "bevy": 37871.061,
-            "legion": 50594.068
-        },
-        "heavy_compute": {
-            "apex": 548363.782,
-            "apex_chunked": 741759.836,
-            "apex_ftz": 3219245,
-            "apex_plain": 579501.546,
-            "apex_serial": 14214366.667,
-            "bevy": 506300.263,
-            "legion": 409872.538
-        },
-        "or_iter": {
-            "apex": 5013.098,
-            "bevy": 5159.644
-        },
-        "par_split": {
-            "skew": 1193093.652,
-            "uniform": 1201278.999
-        },
-        "par_split_ab": {
-            "fixed": 1331283.605,
-            "split": 1334551.56
-        },
-        "par_uniform_ab": {
-            "fixed": 1455783.78,
-            "split": 1328574.722
-        },
-        "propagate": {
-            "apex": 280798.397
-        },
-        "propagate_static": {
-            "apex": 102.773
-        },
-        "query_relation": {
-            "apex": 43887.007
-        },
-        "relations": {
-            "apex": 854524.084,
-            "bevy": 621557.591
-        },
-        "schedule": {
-            "apex": 26336.307,
-            "bevy": 39509.996,
-            "legion": 30667.817
-        },
-        "simple_insert": {
-            "apex": 370657.712,
-            "bevy": 329161.449,
-            "legion": 227299.502
-        },
-        "simple_iter": {
-            "apex": 8743.095,
-            "apex_chunked": 6381.851,
-            "bevy": 8673.52,
-            "legion": 5756.265
-        },
-        "wide_iter": {
-            "apex": 3686.325,
-            "bevy": 3660.396,
-            "legion": 2132.695
-        }
-    },
-    "recorded_note": "snapshot of the WITH-FIX arm of the two-arm experiment that closed BENCH-REGRESS-0824 (control arm = the same tree with the fix stashed, run back to back on this machine). The machine drifted ~4% between the arms, so absolute numbers here are the pessimistic arm; the reference impls in this file were measured in the SAME arm, so the file is internally consistent and the machine check still works."
+﻿{
+    "schema":  "apex-core-bench-baseline-v1",
+    "recorded":  "2026-08-30T00:31:17.9914799Z",
+    "git_commit":  "f0a6ea2cd48a0f71d48d604f70a101df2dfc9ad4",
+    "host":  {
+                 "os":  "Microsoft Windows NT 10.0.26200.0",
+                 "cpu_logical":  12
+             },
+    "unit":  "nanoseconds (criterion median point estimate)",
+    "reference_impls":  [
+                            "bevy",
+                            "legion"
+                        ],
+    "targets_ns":  {
+                       "schedule/apex":  26600,
+                       "fragmented_iter/apex":  175,
+                       "wide_iter/apex":  3490
+                   },
+    "targets_note":  "sh_final 2026-07-04; RECOVERED 2026-08-27 (BENCH-REGRESS-0824 closed): the baseline below is the state AFTER the fix, so a slide back to the regression is a regression again",
+    "groups":  {
+                   "add_remove_component":  {
+                                                "apex":  524884.864,
+                                                "bevy":  827649.265,
+                                                "legion":  2492909.524
+                                            },
+                   "changed_iter":  {
+                                        "apex":  8265.72,
+                                        "bevy":  7138.762
+                                    },
+                   "changed_iter_frag":  {
+                                             "apex":  444.016,
+                                             "bevy":  4171.402
+                                         },
+                   "changed_iter_static":  {
+                                               "apex":  14.106,
+                                               "bevy":  3400.115
+                                           },
+                   "commands_insert":  {
+                                           "apex":  502513.766,
+                                           "bevy":  447780.857
+                                       },
+                   "commands_spawn":  {
+                                          "apex":  386486.806,
+                                          "bevy":  441538.627
+                                      },
+                   "despawn":  {
+                                   "apex":  272661.55,
+                                   "bevy":  279962.605,
+                                   "legion":  447414.872
+                               },
+                   "despawn_recursive":  {
+                                             "apex":  21805.712,
+                                             "bevy":  51375.051
+                                         },
+                   "events":  {
+                                  "apex":  12425.542,
+                                  "bevy":  23737.522
+                              },
+                   "events_frame_idle":  {
+                                             "apex":  47888.004,
+                                             "bevy":  34771.529
+                                         },
+                   "events_frame_loop":  {
+                                             "apex":  288569.289,
+                                             "bevy":  510117.089
+                                         },
+                   "fragmented_iter":  {
+                                           "apex":  171.628,
+                                           "bevy":  122.202,
+                                           "legion":  169.817
+                                       },
+                   "get_component":  {
+                                         "apex":  33160.838,
+                                         "bevy":  34450.563,
+                                         "legion":  47767.697
+                                     },
+                   "heavy_compute":  {
+                                         "apex":  538065.812,
+                                         "apex_chunked":  741759.836,
+                                         "apex_ftz":  3219245,
+                                         "apex_plain":  579501.546,
+                                         "apex_serial":  14214366.667,
+                                         "bevy":  481566.396,
+                                         "legion":  402380.235
+                                     },
+                   "or_iter":  {
+                                   "apex":  5013.098,
+                                   "bevy":  5159.644
+                               },
+                   "par_split":  {
+                                     "skew":  1179821.176,
+                                     "uniform":  1194882.143
+                                 },
+                   "par_split_ab":  {
+                                        "fixed":  1331283.605,
+                                        "split":  1334551.56
+                                    },
+                   "par_uniform_ab":  {
+                                          "fixed":  1455783.78,
+                                          "split":  1328574.722
+                                      },
+                   "propagate":  {
+                                     "apex":  261895.308
+                                 },
+                   "propagate_static":  {
+                                            "apex":  101.452
+                                        },
+                   "query_relation":  {
+                                          "apex":  43887.007
+                                      },
+                   "relations":  {
+                                     "apex":  779845.967,
+                                     "bevy":  612151.429
+                                 },
+                   "schedule":  {
+                                    "apex":  28241.743,
+                                    "bevy":  38119.048,
+                                    "legion":  29806.95
+                                },
+                   "simple_insert":  {
+                                         "apex":  338019.515,
+                                         "bevy":  311631.922,
+                                         "legion":  209218.14
+                                     },
+                   "simple_iter":  {
+                                       "apex":  8586.71,
+                                       "apex_chunked":  6125.007,
+                                       "bevy":  8477.753,
+                                       "legion":  5608.194
+                                   },
+                   "spawn_wide":  {
+                                      "apex":  788005.333,
+                                      "bevy":  598229.779
+                                  },
+                   "wide_iter":  {
+                                     "apex":  3537.515,
+                                     "bevy":  3550.308,
+                                     "legion":  2099.156
+                                 }
+               }
 }

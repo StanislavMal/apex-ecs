@@ -235,6 +235,12 @@ pub struct World {
     /// The hook dispatcher is already running higher up the stack (re-entrancy
     /// guard).
     pub(crate) hook_dispatch_active: bool,
+    /// Bundle TYPE -> its resolved composition in this world (see [`BundleCache`]).
+    pub(crate) bundles: BundleCache,
+    /// Scratch for the column indices a single `spawn` hands to `write_into_batch`.
+    /// Lives on the world so the steady state allocates nothing: the cached indices are
+    /// copied into it, the borrow of the cache ends, and `&mut World` can be handed on.
+    pub(crate) bundle_cols_scratch: Vec<usize>,
 }
 
 /// A deferred composition event for the hook dispatcher (W3-1).
@@ -316,6 +322,8 @@ impl World {
             error_handler: ErrorHandler::default(),
             hook_queue: Vec::new(),
             hook_dispatch_active: false,
+            bundles: BundleCache::default(),
+            bundle_cols_scratch: Vec::new(),
         };
         world
             .archetypes
@@ -1232,8 +1240,11 @@ impl World {
             }
         }
         self.entities.ensure_record(entity.index());
-        let ids = bundle.component_ids(&mut self.registry);
-        if ids.is_empty() {
+        // The bundle's composition, archetype and column layout are a property of the TYPE —
+        // resolved once per type per world, not per spawn (see [`BundleCache`]).
+        let slot = self.bundle_slot::<B>();
+        let archetype_id = self.bundles.infos[slot].archetype;
+        if self.bundles.infos[slot].decl_ids.is_empty() {
             // Fast path for an empty entity (spawn(()))
             let row = unsafe { self.archetypes[0].allocate_row(entity) } as u32;
             self.entities.set_location(
@@ -1245,14 +1256,21 @@ impl World {
             );
             return;
         }
-        // Normal path
-        let archetype_id = self.get_or_create_archetype(&ids);
+        // Normal path. The column indices are copied into the world's scratch so the borrow of
+        // the cache ends before `write_into_batch` takes `&mut World`; the scratch keeps its
+        // capacity across spawns, so the steady state allocates nothing.
+        let mut cols = std::mem::take(&mut self.bundle_cols_scratch);
+        cols.clear();
+        cols.extend_from_slice(&self.bundles.infos[slot].cols);
         let row = self.archetypes[archetype_id.0 as usize].entities.len();
         let tick = self.current_tick;
         self.archetypes[archetype_id.0 as usize]
             .entities
             .push(entity);
-        bundle.write_into(self, archetype_id, row, tick);
+        // `write_into_batch` is the SAME write as `write_into` (data + ticks + `col.len`), only
+        // with the column index already known instead of re-derived per component.
+        bundle.write_into_batch(self, archetype_id, row, tick, &cols);
+        self.bundle_cols_scratch = cols;
         self.entities.set_location(
             entity,
             EntityLocation {
@@ -1261,6 +1279,7 @@ impl World {
             },
         );
         if self.registry.any_flags() {
+            let ids = self.bundles.infos[slot].sorted_ids.clone();
             self.queue_added_hooks(entity, &ids);
             self.flush_hooks();
         }
@@ -1278,19 +1297,19 @@ impl World {
             return Vec::new();
         }
 
-        // `decl_ids` — the bundle's DECLARATION order (= `write_into_batch`
-        // traversal order); `ids` — SORTED (for the archetype). Their SEPARATION
-        // is critical: col_indices MUST be in traversal order, otherwise a
-        // component is written to the wrong column (UB). §10.10: the composition
-        // is taken STATICALLY (by the type `B`), without a `make_bundle(0)` probe
-        // — the closure is no longer called an extra time for composition and need
-        // not be pure.
-        let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        B::static_component_ids(&mut self.registry, &mut decl_ids);
-        let mut ids = decl_ids.clone();
-        ids.sort_unstable();
+        // Composition, archetype and column layout come from the shared [`BundleCache`] —
+        // one derivation per bundle TYPE, the same one `spawn` uses. `sorted_ids` is the
+        // archetype key and the hook order; `cols` is in DECLARATION order, which is what
+        // `write_data_into_batch` traverses (traversal order matters: a mismatch writes a
+        // component into another component's column — UB). §10.10: the composition is taken
+        // STATICALLY (by the type `B`), without a `make_bundle(0)` probe — the closure is not
+        // called an extra time for composition and need not be pure.
+        let slot = self.bundle_slot::<B>();
+        let ids = self.bundles.infos[slot].sorted_ids.clone();
+        let col_indices: SmallVec<[usize; 8]> =
+            self.bundles.infos[slot].cols.iter().copied().collect();
 
-        let archetype_id = self.get_or_create_archetype(&ids);
+        let archetype_id = self.bundles.infos[slot].archetype;
         let arch_idx = archetype_id.0 as usize;
         let start_row = self.archetypes[arch_idx].entities.len();
         let tick = self.current_tick;
@@ -1301,17 +1320,6 @@ impl World {
         }
 
         let entities = self.entities.allocate_batch(count);
-
-        // Precompute column indices in DECLARATION order (`decl_ids`) — EXACTLY as
-        // `write_into_batch` consumes them. Avoids repeated
-        // get_or_register/column_index in write_into for each entity (~40k HashMap
-        // lookups at 10k). CRITICALLY from `decl_ids`, NOT from the sorted `ids`
-        // (otherwise, when "declaration order ≠ id order", a write goes to the
-        // wrong column).
-        let col_indices: SmallVec<[usize; 8]> = decl_ids
-            .iter()
-            .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
-            .collect();
 
         // ALWAYS per-entity: `make_bundle(i)` is called for EACH entity (the
         // closure contract is per-index data). The former bulk-copy "copy row 0 to
@@ -1433,15 +1441,11 @@ impl World {
             entities
         };
 
-        // Resolve archetype/ids/columns — ONCE per batch (instead of per-spawn in
-        // spawn_at). `decl_ids` (declaration order = write_into_batch traversal
-        // order) SEPARATE from `ids` (sorted for the archetype) — col_indices is
-        // built from decl_ids, otherwise a component is written to the wrong column
-        // (UB).
-        let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
-        B::static_component_ids(&mut self.registry, &mut decl_ids);
-        let mut ids = decl_ids.clone();
-        ids.sort_unstable();
+        // Archetype/ids/columns come from the shared [`BundleCache`] — derived once per bundle
+        // TYPE, not per batch and certainly not per spawn. `cols` is in DECLARATION order
+        // (= `write_data_into_batch` traversal order), `sorted_ids` is the archetype key.
+        let slot = self.bundle_slot::<B>();
+        let ids = self.bundles.infos[slot].sorted_ids.clone();
         if ids.is_empty() {
             // Empty bundle (`spawn(())`) — into the EMPTY archetype.
             for (i, _bundle) in bundles.into_iter().enumerate() {
@@ -1457,7 +1461,7 @@ impl World {
             }
             return;
         }
-        let archetype_id = self.get_or_create_archetype(&ids);
+        let archetype_id = self.bundles.infos[slot].archetype;
         let arch_idx = archetype_id.0 as usize;
         let start_row = self.archetypes[arch_idx].entities.len();
         let tick = self.current_tick;
@@ -1465,10 +1469,8 @@ impl World {
         for col in &mut self.archetypes[arch_idx].columns {
             col.reserve(count);
         }
-        let col_indices: SmallVec<[usize; 8]> = decl_ids
-            .iter()
-            .filter_map(|&id| self.archetypes[arch_idx].column_index(id))
-            .collect();
+        let col_indices: SmallVec<[usize; 8]> =
+            self.bundles.infos[slot].cols.iter().copied().collect();
 
         // Bundles are DIFFERENT per item ⇒ write the DATA of each via
         // write_data_into_batch (with precomputed col_indices in traversal order —
@@ -3330,9 +3332,118 @@ impl<D: WorldQuery, F: WorldQuery> QueryState<D, F> {
     }
 }
 
+// ── Bundle resolution cache ────────────────────────────────────
+
+/// A bundle TYPE resolved against THIS world: which components it contributes, which
+/// archetype a spawn of it lands in, and where each of its components sits inside that
+/// archetype.
+///
+/// # Why it exists
+///
+/// The answer belongs to the bundle TYPE, not to the call — and `spawn` used to re-derive it
+/// every time. A four-component spawn paid: four `TypeId` -> `ComponentId` hash lookups
+/// (`static_component_ids`), a sort, a hash of the sorted id list (`get_or_create_archetype`),
+/// then inside `write_into` FOUR more `TypeId` lookups and four `column_index` scans. Nine hash
+/// lookups per spawn to learn something that never changes.
+///
+/// Measured 2026-08-30 (`--bin relations_shapes`, 100k individual spawns): three extra
+/// components cost apex 5313 us against bevy's 1252 us — 4.2x — because bevy resolves a bundle
+/// ONCE into a `BundleInfo` and keys it by `TypeId::of::<B>()`. This is the same shape, in our
+/// storage model.
+///
+/// It also removes a real hazard: the same derivation was written out THREE times
+/// (`spawn_at`, `spawn_many_inner`, `spawn_bundles_bulk`), each ending in a `filter_map` that
+/// would SILENTLY shorten `col_indices` if a column were ever missing — and a short
+/// `col_indices` makes the tuple `write_into_batch` slice the wrong sub-range, i.e. write a
+/// component into another component's column. One derivation, one place, and a missing column
+/// now refuses loudly at registration instead (§0.2a).
+///
+/// # Why the cached archetype cannot go stale
+///
+/// A bundle's composition is static (it comes from the TYPE), `ComponentId`s are stable for the
+/// life of a world, and archetypes are append-only — `get_or_create_archetype` never removes or
+/// renumbers one. So the mapping bundle -> archetype -> columns is fixed from its first use.
+pub(crate) struct BundleInfo {
+    /// Component ids in the bundle's DECLARATION order — the order every `write_*_into_batch`
+    /// traverses. NOT sorted: `cols` must be in traversal order, or a component is written
+    /// into the wrong column (UB).
+    decl_ids: SmallVec<[ComponentId; 8]>,
+    /// The same ids SORTED — the archetype key, and the order added-hooks are queued in.
+    sorted_ids: SmallVec<[ComponentId; 8]>,
+    /// The archetype a spawn of this bundle lands in (`ArchetypeId::EMPTY` for an empty bundle).
+    archetype: ArchetypeId,
+    /// Column index inside `archetype` of each id of `decl_ids`, in that same order.
+    cols: Vec<usize>,
+}
+
+/// Per-world registry of [`BundleInfo`], keyed by the bundle type.
+#[derive(Default)]
+pub(crate) struct BundleCache {
+    by_type: FxHashMap<TypeId, u32>,
+    infos: Vec<BundleInfo>,
+}
+
+impl World {
+    /// Slot of `B` in the bundle cache, resolving it on first use.
+    #[inline]
+    fn bundle_slot<B: Bundle>(&mut self) -> usize {
+        match self.bundles.by_type.get(&TypeId::of::<B>()) {
+            Some(&slot) => slot as usize,
+            None => self.register_bundle::<B>(),
+        }
+    }
+
+    /// First-use resolution of a bundle type (cold: once per type per world).
+    #[cold]
+    fn register_bundle<B: Bundle>(&mut self) -> usize {
+        let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
+        B::static_component_ids(&mut self.registry, &mut decl_ids);
+        let mut sorted_ids = decl_ids.clone();
+        sorted_ids.sort_unstable();
+
+        let (archetype, cols) = if sorted_ids.is_empty() {
+            (ArchetypeId::EMPTY, Vec::new())
+        } else {
+            let archetype = self.get_or_create_archetype(&sorted_ids);
+            let arch = &self.archetypes[archetype.0 as usize];
+            let cols = decl_ids
+                .iter()
+                .map(|&id| {
+                    // Cannot fail: the archetype was just built from exactly these ids, and
+                    // `get_or_create_archetype` already rejected duplicates. If it ever did,
+                    // silently dropping the entry would misalign every later component's
+                    // column — refuse loudly instead (§0.2a).
+                    arch.column_index(id).unwrap_or_else(|| {
+                        panic!(
+                            "bundle `{}` declares component {:?}, absent from the archetype built \
+                             from its own composition",
+                            std::any::type_name::<B>(),
+                            id
+                        )
+                    })
+                })
+                .collect();
+            (archetype, cols)
+        };
+
+        let slot = self.bundles.infos.len();
+        self.bundles.infos.push(BundleInfo {
+            decl_ids,
+            sorted_ids,
+            archetype,
+            cols,
+        });
+        self.bundles.by_type.insert(TypeId::of::<B>(), slot as u32);
+        slot
+    }
+}
+
 // ── Bundle ─────────────────────────────────────────────────────
 
-pub trait Bundle: Sized {
+/// `'static` is what lets a bundle be cached by its own type ([`BundleCache`]); it costs
+/// nothing, since `Component: Send + Sync + 'static` already, and it matches the reference
+/// (bevy's `Bundle: DynamicBundle + Send + Sync + 'static`).
+pub trait Bundle: Sized + 'static {
     /// The bundle composition in DECLARATION order WITHOUT constructing a value
     /// (§10.10): derive/tuples know it statically from the types. This removes the
     /// `make_bundle(0)` probe footgun in `spawn_many` (the closure no longer has
@@ -3348,21 +3459,16 @@ pub trait Bundle: Sized {
 
     /// The composition as a SORTED owned `SmallVec` — the archetype key. Delegates
     /// to [`static_component_ids`](Bundle::static_component_ids) + `sort_unstable`.
+    ///
+    /// ⚠ This DERIVES the composition on every call (one hash lookup per component plus a sort).
+    /// No spawn path uses it any more — they read the world's cached resolution instead (see
+    /// `BundleCache`). Kept as a public convenience for one-off introspection; never call it in
+    /// a loop.
     fn component_ids(&self, registry: &mut ComponentRegistry) -> SmallVec<[ComponentId; 8]> {
         let mut out = SmallVec::new();
         Self::static_component_ids(registry, &mut out);
         out.sort_unstable();
         out
-    }
-
-    /// Write the ComponentIds in DECLARATION order into `out` (without an
-    /// intermediate SmallVec) — for the `write_into_batch` traversal.
-    fn push_component_ids(
-        &self,
-        registry: &mut ComponentRegistry,
-        out: &mut SmallVec<[ComponentId; 8]>,
-    ) {
-        Self::static_component_ids(registry, out);
     }
 
     fn write_into(self, world: &mut World, archetype_id: ArchetypeId, row: usize, tick: Tick);
@@ -3988,6 +4094,93 @@ mod tests {
 
     #[derive(Debug, PartialEq)]
     struct Score(u32);
+
+    // ── BundleCache: the resolved layout belongs to ONE world ──
+
+    // Declared WITHOUT `#[derive(Component)]` on purpose: a derived component is pre-registered
+    // in every world by the distributed-slice registrar, in slice order, so two worlds would
+    // always agree on its id and the divergence this test needs could not happen. A manual impl
+    // is registered lazily, on first use — which is also the wasm behaviour for every component
+    // (TD-25), so this is not an artificial shape.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Narrow(u32);
+    impl Component for Narrow {}
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct Widest(u64);
+    impl Component for Widest {}
+
+    /// A bundle's resolved column layout is a fact about a bundle type IN A WORLD, never about
+    /// the type alone: two worlds can assign different `ComponentId`s to the same components and
+    /// therefore order the archetype's columns differently. Here the two worlds are made to
+    /// disagree (each registers a different component first) and then spawn the SAME bundle
+    /// type. A layout cached across worlds — or one that assumed columns follow DECLARATION
+    /// order rather than id order — would write each field into the other's column, and the
+    /// read-backs below would come apart.
+    #[test]
+    fn bundle_layout_is_resolved_per_world_not_per_type() {
+        let mut narrow_first = World::new();
+        narrow_first.spawn((Narrow(1),)); // Narrow takes the lower id here
+        let a = narrow_first.spawn((Narrow(7), Widest(9)));
+
+        let mut widest_first = World::new();
+        widest_first.spawn((Widest(1),)); // ... and the higher id there
+        let b = widest_first.spawn((Narrow(7), Widest(9)));
+
+        // The premise of the test: the two worlds really did diverge. If this ever stops
+        // holding, the assertions below pass for a reason that has nothing to do with the cache.
+        let (n1, w1) = (
+            narrow_first.registry.register::<Narrow>(),
+            narrow_first.registry.register::<Widest>(),
+        );
+        let (n2, w2) = (
+            widest_first.registry.register::<Narrow>(),
+            widest_first.registry.register::<Widest>(),
+        );
+        assert!(
+            (n1 < w1) != (n2 < w2),
+            "the two worlds must order these components differently for this test to mean \
+             anything (got {n1:?}/{w1:?} and {n2:?}/{w2:?})"
+        );
+
+        for (world, entity, label) in [
+            (&narrow_first, a, "narrow registered first"),
+            (&widest_first, b, "widest registered first"),
+        ] {
+            assert_eq!(
+                world.get::<Narrow>(entity).copied(),
+                Some(Narrow(7)),
+                "{label}: narrow field read back from the wrong column"
+            );
+            assert_eq!(
+                world.get::<Widest>(entity).copied(),
+                Some(Widest(9)),
+                "{label}: wide field read back from the wrong column"
+            );
+        }
+    }
+
+    /// `spawn` and `spawn_many` now read the SAME cached layout instead of each deriving its
+    /// own. They must land in one archetype and write the same fields to the same columns —
+    /// otherwise one of the two paths is quietly writing into the other's columns.
+    #[test]
+    fn spawn_and_spawn_many_share_one_layout() {
+        let mut world = World::new();
+        let single = world.spawn((Narrow(3), Widest(4)));
+        let batch = world.spawn_many(2, |i| (Narrow(10 + i as u32), Widest(20 + i as u64)));
+
+        let arch = |w: &World, e: Entity| w.entities.get_location(e).map(|l| l.archetype_id);
+        assert_eq!(
+            arch(&world, single),
+            arch(&world, batch[0]),
+            "one bundle type must resolve to one archetype on both spawn paths"
+        );
+        assert_eq!(world.get::<Narrow>(single).copied(), Some(Narrow(3)));
+        assert_eq!(world.get::<Widest>(single).copied(), Some(Widest(4)));
+        for (i, &e) in batch.iter().enumerate() {
+            assert_eq!(world.get::<Narrow>(e).copied(), Some(Narrow(10 + i as u32)));
+            assert_eq!(world.get::<Widest>(e).copied(), Some(Widest(20 + i as u64)));
+        }
+    }
 
     // ── RT-1: resource change ticks ────────────────────────────
 

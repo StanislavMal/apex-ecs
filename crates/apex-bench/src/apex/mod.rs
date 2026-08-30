@@ -1,4 +1,5 @@
 pub mod simple_insert;
+pub mod spawn_wide;
 pub mod simple_iter;
 pub mod frag_iter;
 pub mod schedule;
