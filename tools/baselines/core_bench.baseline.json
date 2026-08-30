@@ -1,7 +1,7 @@
 ﻿{
     "schema":  "apex-core-bench-baseline-v1",
-    "recorded":  "2026-08-30T09:03:25.5349548Z",
-    "git_commit":  "97a58f9e0fa10bad1c9a4c5f97681283722d7e61",
+    "recorded":  "2026-08-30T18:10:04.5269533Z",
+    "git_commit":  "274b09bb728014ba412d1568dfce577bff25bc4d",
     "host":  {
                  "os":  "Microsoft Windows NT 10.0.26200.0",
                  "cpu_logical":  12
@@ -19,123 +19,104 @@
     "targets_note":  "sh_final 2026-07-04; RECOVERED 2026-08-27 (BENCH-REGRESS-0824 closed): the baseline below is the state AFTER the fix, so a slide back to the regression is a regression again",
     "groups":  {
                    "add_remove_component":  {
-                                                "apex":  495952.73,
-                                                "bevy":  808219.545,
-                                                "legion":  2460509.524
+                                                "apex":  514637.989,
+                                                "bevy":  795391.486,
+                                                "legion":  2447276.19
                                             },
                    "changed_iter":  {
-                                        "apex":  8029.394,
-                                        "bevy":  7092.489
+                                        "apex":  8030.526,
+                                        "bevy":  6854.963
                                     },
                    "changed_iter_frag":  {
-                                             "apex":  434.781,
-                                             "bevy":  4125.853
+                                             "apex":  432.164,
+                                             "bevy":  4137.168
                                          },
                    "changed_iter_static":  {
-                                               "apex":  14.571,
-                                               "bevy":  3374.21
+                                               "apex":  14.11,
+                                               "bevy":  3391.675
                                            },
                    "commands_insert":  {
-                                           "apex":  448314.667,
-                                           "bevy":  474070.276
+                                           "apex":  437980.313,
+                                           "bevy":  459601.371
                                        },
                    "commands_spawn":  {
-                                          "apex":  224690.308,
-                                          "bevy":  436103.593
+                                          "apex":  223204.058,
+                                          "bevy":  447408.205
                                       },
                    "despawn":  {
-                                   "apex":  271554.67,
-                                   "bevy":  274051.29,
-                                   "legion":  435848.106
+                                   "apex":  270822.358,
+                                   "bevy":  272913.219,
+                                   "legion":  443200.34
                                },
                    "despawn_recursive":  {
-                                             "apex":  22057.684,
-                                             "bevy":  50086.183
+                                             "apex":  21704.974,
+                                             "bevy":  49834.876
                                          },
                    "events":  {
-                                  "apex":  12167.275,
-                                  "bevy":  25346.437
+                                  "apex":  12492.407,
+                                  "bevy":  26503.395
                               },
                    "events_frame_idle":  {
-                                             "apex":  47102.414,
-                                             "bevy":  34556.696
+                                             "apex":  46540.103,
+                                             "bevy":  34775.158
                                          },
                    "events_frame_loop":  {
-                                             "apex":  299536.471,
-                                             "bevy":  527835.131
+                                             "apex":  283814.281,
+                                             "bevy":  618817.662
                                          },
                    "fragmented_iter":  {
-                                           "apex":  166.255,
-                                           "bevy":  123.965,
-                                           "legion":  168.542
+                                           "apex":  177.009,
+                                           "bevy":  126.757,
+                                           "legion":  168.013
                                        },
                    "get_component":  {
-                                         "apex":  32829.64,
-                                         "bevy":  34274.514,
-                                         "legion":  47326.688
+                                         "apex":  32300.788,
+                                         "bevy":  34379.778,
+                                         "legion":  47505.517
                                      },
                    "heavy_compute":  {
-                                         "apex":  541186.366,
-                                         "apex_chunked":  741759.836,
-                                         "apex_ftz":  3219245,
-                                         "apex_plain":  579501.546,
-                                         "apex_serial":  14214366.667,
-                                         "bevy":  465288.864,
-                                         "legion":  398203.309
+                                         "apex":  545389.68,
+                                         "bevy":  492272.056,
+                                         "legion":  406204.493
                                      },
-                   "or_iter":  {
-                                   "apex":  5013.098,
-                                   "bevy":  5159.644
-                               },
                    "par_split":  {
-                                     "skew":  1180833.405,
-                                     "uniform":  1181827.33
+                                     "skew":  1194984.979,
+                                     "uniform":  1191463.043
                                  },
-                   "par_split_ab":  {
-                                        "fixed":  1331283.605,
-                                        "split":  1334551.56
-                                    },
-                   "par_uniform_ab":  {
-                                          "fixed":  1455783.78,
-                                          "split":  1328574.722
-                                      },
                    "propagate":  {
-                                     "apex":  256628.359
+                                     "apex":  256504.315
                                  },
                    "propagate_static":  {
-                                            "apex":  100.781
+                                            "apex":  99.624
                                         },
-                   "query_relation":  {
-                                          "apex":  43887.007
-                                      },
                    "relations":  {
-                                     "apex":  558234.677,
-                                     "bevy":  617023.232
+                                     "apex":  565686.25,
+                                     "bevy":  607894.978
                                  },
                    "schedule":  {
-                                    "apex":  28999.711,
-                                    "bevy":  38043.942,
-                                    "legion":  29626.805
+                                    "apex":  30655.727,
+                                    "bevy":  39301.169,
+                                    "legion":  30371.614
                                 },
                    "simple_insert":  {
-                                         "apex":  358716.378,
-                                         "bevy":  295800.014,
-                                         "legion":  206973.887
+                                         "apex":  385569.165,
+                                         "bevy":  306096.416,
+                                         "legion":  211168.64
                                      },
                    "simple_iter":  {
-                                       "apex":  8459.52,
-                                       "apex_chunked":  6068.527,
-                                       "bevy":  8430.705,
-                                       "legion":  5727.722
+                                       "apex":  8483.131,
+                                       "apex_chunked":  6093.107,
+                                       "bevy":  8509.643,
+                                       "legion":  5572.814
                                    },
                    "spawn_wide":  {
-                                      "apex":  591765.95,
-                                      "bevy":  645397.803
+                                      "apex":  621181.91,
+                                      "bevy":  628684.398
                                   },
                    "wide_iter":  {
-                                     "apex":  3457.924,
-                                     "bevy":  3477.791,
-                                     "legion":  2136.562
+                                     "apex":  3443.6,
+                                     "bevy":  3352.291,
+                                     "legion":  2122.713
                                  }
                }
 }
