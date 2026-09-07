@@ -116,6 +116,31 @@ impl std::fmt::Display for ComponentSerdeError {
 pub trait SerdeContext: std::any::Any {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
+    /// **Is this (de)serialization a shape PROBE rather than a read of a document?** (ADR-014)
+    ///
+    /// A reflective inspector learns what a value node IS by substituting a candidate and pushing
+    /// the tree through the type's own serde: nothing else can tell a `u8` from an `f32` or an enum
+    /// from a `String`. That makes the deserializer answer a question the AUTHOR never asked — and a
+    /// component that resolves an external reference (an asset handle) would go to the project, and
+    /// complain to the author, once per candidate. The core owns the bit because the core owns the
+    /// call: it says what this round-trip is FOR, and knows nothing about what a consumer resolves.
+    ///
+    /// A context that resolves external references must, while this is true, answer "nothing" —
+    /// **without looking, and without saying anything**. The verdicts do not change: a probe asks
+    /// whether the value comes BACK unchanged, and a reference that resolved to nothing never does.
+    #[inline]
+    fn probing(&self) -> bool {
+        false
+    }
+
+    /// Turn [`probing`](Self::probing) on or off, returning what it was — so a probe can restore
+    /// the caller's mode instead of assuming it. Default: a context with nothing to resolve has
+    /// nothing to suppress, and stays not-probing however it is asked.
+    #[inline]
+    fn set_probing(&mut self, _on: bool) -> bool {
+        false
+    }
 }
 
 /// The default empty context — for ordinary (de)serialization without resolving external references. The old
@@ -662,5 +687,47 @@ mod tests {
         // Idempotent: re-registering Host does NOT duplicate the require closure.
         reg.register::<Host>();
         assert_eq!(reg.requires(host_id).map(|r| r.len()), Some(1), "no duplicate require on re-register");
+    }
+
+    /// **The probe bit travels through the trait object** (ADR-014) — the only thing the core
+    /// promises about it. A context that resolves nothing stays not-probing however it is asked
+    /// (that is what makes the default safe for every component that ignores the context), and a
+    /// context that DOES resolve is both readable and restorable through `&mut dyn SerdeContext`,
+    /// which is the only form a probe ever holds one in.
+    #[test]
+    fn the_probe_bit_is_readable_and_restorable_through_the_trait_object() {
+        #[derive(Default)]
+        struct Resolving {
+            probing: bool,
+        }
+        impl SerdeContext for Resolving {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+            fn probing(&self) -> bool {
+                self.probing
+            }
+            fn set_probing(&mut self, on: bool) -> bool {
+                std::mem::replace(&mut self.probing, on)
+            }
+        }
+
+        let mut plain = NoContext;
+        let plain: &mut dyn SerdeContext = &mut plain;
+        assert!(!plain.probing(), "a context with nothing to resolve is never probing");
+        assert!(!plain.set_probing(true), "…and says so when asked to become one");
+        assert!(!plain.probing(), "…and does not become one");
+
+        let mut ctx = Resolving::default();
+        let ctx: &mut dyn SerdeContext = &mut ctx;
+        assert!(!ctx.probing(), "a fresh resolving context reads the document");
+        let was = ctx.set_probing(true);
+        assert!(!was, "set_probing hands back what it replaced");
+        assert!(ctx.probing(), "the probe is visible to the resolver through the trait object");
+        assert!(ctx.set_probing(was), "…and restoring returns the probe's own mode");
+        assert!(!ctx.probing(), "the caller's mode is what is left behind");
     }
 }
