@@ -2030,6 +2030,30 @@ impl World {
         entity: Entity,
         name: &str,
     ) -> Result<Option<serde_json::Value>, String> {
+        self.component_json_with(entity, name, &mut crate::component::NoContext)
+    }
+
+    /// The same read, through a caller's [`SerdeContext`].
+    ///
+    /// **A component may need one to be readable at all.** A type whose document form is a
+    /// reference — an asset PATH where the live component holds a handle — can only name that
+    /// reference through a context that knows the project; handed [`NoContext`] it has nothing to
+    /// write and must say so. Before this pair existed, the context-free door was the ONLY door,
+    /// so every such component was read through a context that could not name its references, and
+    /// what came back looked like a component whose reference was EMPTY.
+    ///
+    /// That is not a hypothetical: an editor user lost a texture off a fog volume that way
+    /// (apex-engine TD-467) — the value was read blind, the emptied slot was merged with an edit,
+    /// and the merged tree was written back over the real one.
+    ///
+    /// The context-free [`component_json`](Self::component_json) stays, and stays correct, for
+    /// every type that references nothing.
+    pub fn component_json_with(
+        &self,
+        entity: Entity,
+        name: &str,
+        ctx: &mut dyn crate::component::SerdeContext,
+    ) -> Result<Option<serde_json::Value>, String> {
         let info = self.registry.find_by_name(name)?;
         let component_id = info.id;
         let serde_fns = info.serde.as_ref().ok_or_else(|| {
@@ -2049,7 +2073,7 @@ impl World {
         // registered component's; serialize_fn reads it as the registered `T`.
         let bytes = unsafe {
             let ptr = arch.columns_raw()[col_idx].get_raw_ptr(location.row as usize);
-            (serde_fns.serialize_fn)(ptr, &mut crate::component::NoContext)
+            (serde_fns.serialize_fn)(ptr, ctx)
         }
         .map_err(|e| format!("serialize of '{}' failed: {e:?}", info.name))?;
         let value = serde_json::from_slice(&bytes).map_err(|e| {
@@ -2073,6 +2097,22 @@ impl World {
         name: &str,
         value: &serde_json::Value,
     ) -> Result<(), String> {
+        self.set_component_json_with(entity, name, value, &mut crate::component::NoContext)
+    }
+
+    /// The same write, through a caller's [`SerdeContext`] — see
+    /// [`component_json_with`](Self::component_json_with) for why a component may need one.
+    ///
+    /// This is the half that can DESTROY authored work rather than merely misreport it: a
+    /// reference the document carries, resolved through a context that cannot resolve anything,
+    /// becomes an empty slot in the live component, and the next save writes the emptiness back.
+    pub fn set_component_json_with(
+        &mut self,
+        entity: Entity,
+        name: &str,
+        value: &serde_json::Value,
+        ctx: &mut dyn crate::component::SerdeContext,
+    ) -> Result<(), String> {
         let info = self.registry.find_by_name(name)?;
         let component_id = info.id;
         let serde_fns = info.serde.as_ref().ok_or_else(|| {
@@ -2085,7 +2125,7 @@ impl World {
             return Err(format!("entity {entity:?} is not alive"));
         }
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-        let raw = (serde_fns.deserialize_fn)(&bytes, &mut crate::component::NoContext)
+        let raw = (serde_fns.deserialize_fn)(&bytes, ctx)
             .map_err(|e| format!("deserialize into '{}' failed: {e:?}", info.name))?;
         let tick = self.current_tick;
         self.insert_dyn(entity, component_id, raw, tick);
@@ -2102,14 +2142,33 @@ impl World {
         name: &str,
         partial: &serde_json::Value,
     ) -> Result<(), String> {
-        let merged = match self.component_json(entity, name)? {
+        let mut none = crate::component::NoContext;
+        self.apply_component_json_with(entity, name, partial, &mut none)
+    }
+
+    /// The same partial edit, through a caller's [`SerdeContext`].
+    ///
+    /// **The most dangerous of the three doors**, because it is the only one that READS and WRITES
+    /// in one gesture: the base tree is read, the partial is merged into it, and the result is
+    /// written back WHOLE. Read blind, every reference the component held comes back empty, the
+    /// merge leaves it empty (a partial says nothing about fields it does not name), and the write
+    /// stores that emptiness — so a caller who edited one number silently cleared an asset it never
+    /// touched. The context flows through both halves here for exactly that reason.
+    pub fn apply_component_json_with(
+        &mut self,
+        entity: Entity,
+        name: &str,
+        partial: &serde_json::Value,
+        ctx: &mut dyn crate::component::SerdeContext,
+    ) -> Result<(), String> {
+        let merged = match self.component_json_with(entity, name, ctx)? {
             Some(mut base) => {
                 crate::component::json_merge(&mut base, partial);
                 base
             }
             None => partial.clone(),
         };
-        self.set_component_json(entity, name, &merged).map_err(|e| {
+        self.set_component_json_with(entity, name, &merged, ctx).map_err(|e| {
             format!("{e} (a partial write on an absent component must carry ALL fields)")
         })
     }
@@ -4097,6 +4156,107 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A reflective door hands the caller's context to the component's serde** (apex-engine
+    /// TD-467; the defect was found by an editor user, who lost a texture off a fog volume).
+    ///
+    /// A component whose document form is a REFERENCE — an asset path where the live value holds a
+    /// handle — can only be read and written through a context that knows how to name and resolve
+    /// it. `component_json` / `set_component_json` / `apply_component_json` used to hard-code
+    /// `NoContext`, so such a component could not survive them: it read back with an emptied
+    /// reference, and the write stored that emptiness into the live world.
+    ///
+    /// `apply_component_json` is the one that destroys work, because it is the only door that
+    /// READS and WRITES in one gesture: a partial says nothing about the fields it does not name,
+    /// so an emptied reference in the base survives the merge and lands in the world. This test
+    /// walks that gesture, which is the gesture the editor user actually made.
+    #[test]
+    fn a_reflective_door_carries_the_callers_serde_context() {
+        use crate::component::{ComponentSerdeFns, NoContext, SerdeContext};
+        use std::any::Any;
+
+        // A context that can name references; without it the component has nothing to write.
+        struct Names;
+        impl SerdeContext for Names {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
+            }
+        }
+
+        // The shape of every asset-holding component: a live id that MEANS something only through
+        // the context. Serialised without one there is no honest answer, so it writes `null`
+        // exactly as the engine's own bridges did before they learned to refuse — this test is
+        // about the DOOR, so the component keeps the lenient behaviour and the door is what must
+        // stop losing the value.
+        // A manual `impl Component` (the derive macro is not in scope inside the core's own
+        // tests, and a lazily-registered component is the wasm shape anyway — TD-25).
+        #[derive(Debug, PartialEq)]
+        struct Ref {
+            id: Option<u64>,
+            other: i32,
+        }
+        impl Component for Ref {}
+
+        let fns = ComponentSerdeFns {
+            serialize_fn: |ptr, ctx| {
+                let r = unsafe { &*(ptr as *const Ref) };
+                let named = ctx.as_any().downcast_ref::<Names>().is_some();
+                let id = if named { r.id } else { None };
+                serde_json::to_vec(&serde_json::json!({ "id": id, "other": r.other }))
+                    .map_err(|e| crate::component::ComponentSerdeError::SerializationFailed(e.to_string()))
+            },
+            deserialize_fn: |bytes, ctx| {
+                let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
+                    crate::component::ComponentSerdeError::DeserializationFailed(e.to_string())
+                })?;
+                let named = ctx.as_any().downcast_ref::<Names>().is_some();
+                let r = Ref {
+                    id: if named { v["id"].as_u64() } else { None },
+                    other: v["other"].as_i64().unwrap_or(0) as i32,
+                };
+                let size = std::mem::size_of::<Ref>();
+                let mut buf = vec![0u8; size];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(&r as *const Ref as *const u8, buf.as_mut_ptr(), size);
+                }
+                std::mem::forget(r);
+                Ok(buf)
+            },
+            format: "json",
+        };
+
+        let mut w = World::default();
+        w.register_component_serde_with::<Ref>(fns);
+        let e = w.spawn((Ref { id: Some(7), other: 1 },));
+
+        // 1. THE CONTROL — through a context that can name it, the reference is there.
+        let mut names = Names;
+        let read = w.component_json_with(e, "Ref", &mut names).unwrap().unwrap();
+        assert_eq!(read["id"], 7, "the control: with a context the reference reads");
+
+        // 2. THE DEFECT — a partial edit that says nothing about the reference must not eat it.
+        //    Before the door carried the context this wrote `id: null` into the live world: read
+        //    blind (id → null), merged (a partial does not mention id), written back (id → None).
+        w.apply_component_json_with(e, "Ref", &serde_json::json!({ "other": 42 }), &mut names)
+            .unwrap();
+        assert_eq!(
+            w.get::<Ref>(e).unwrap(),
+            &Ref { id: Some(7), other: 42 },
+            "a partial edit must change what it names and nothing else"
+        );
+
+        // 3. …AND THE CONTEXT-FREE DOOR IS STILL THERE, still correct for what it is for: a type
+        //    that references nothing loses nothing through it. Shown on this same component to
+        //    make the boundary explicit — blind, the reference is what does not survive, and that
+        //    is precisely why a caller holding assets must pass its context.
+        let mut none = NoContext;
+        let blind = w.component_json_with(e, "Ref", &mut none).unwrap().unwrap();
+        assert_eq!(blind["other"], 42, "the fields that need no context read blind");
+        assert!(blind["id"].is_null(), "and the reference is the part a blind read cannot answer");
+    }
 
     #[derive(Debug, PartialEq)]
     struct Score(u32);
