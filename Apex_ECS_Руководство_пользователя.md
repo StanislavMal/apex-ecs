@@ -927,6 +927,16 @@ world.has_resource::<PhysicsConfig>() // -> bool
 
 // Удаление:
 let old_cfg = world.remove_resource::<PhysicsConfig>();
+
+// ЗАЁМ: забрать ресурс из мира на время вызова и вернуть ТО ЖЕ значение обратно.
+// Обычный insert_resource штампует текущий тик — «значение пришло», — и читатель,
+// который пропускает работу, пока значение стоит, перестраивается оттого, что на
+// мир посмотрели. Заём возвращает ресурс с тем тиком, с которым его забрали:
+let taken_at = world.resource_changed_tick::<PhysicsConfig>().unwrap();
+let borrowed = world.remove_resource::<PhysicsConfig>().unwrap();
+// ... вызов, внутри которого &mut World не должен алиасить этот ресурс ...
+world.insert_resource_with_tick(borrowed, taken_at);   // заём невидим change-детекции
+// Если заёмщик ПИСАЛ — класть обычным insert_resource, иначе запись не увидит никто.
 ```
 
 ### 5.2 Events

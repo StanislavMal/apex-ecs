@@ -938,6 +938,28 @@ impl World {
         self.resources.insert(value, tick);
     }
 
+    /// Put a resource back **as it was**, stamping `tick` as its change tick instead of the
+    /// world's current one -- the closing half of a LOAN.
+    ///
+    /// [`insert_resource`](Self::insert_resource) is right for a value that ARRIVED: a new value
+    /// is a change, and every reader gated on the tick owes itself a re-read. A loan is the other
+    /// case, and it has no expression without this. A caller that takes a resource OUT of the
+    /// world for the length of a call -- so a `&mut World` inside that call cannot alias it --
+    /// and puts the same value back has changed nothing; the plain insert says it has, and a
+    /// reader whose whole job is to skip work while the value stands still (an asset table's
+    /// prepare pass, a cache keyed on the tick) then rebuilds every time anyone so much as LOOKS
+    /// at the world through such a bracket.
+    ///
+    /// Read the tick before the take ([`resource_changed_tick`](Self::resource_changed_tick)) and
+    /// hand it back here, and the loan becomes invisible -- which is what a loan is.
+    ///
+    /// **The judgement stays with the caller**, and it is a real one: if the borrower WROTE
+    /// through the loan, put the value back the ordinary way, or the change it made is one no
+    /// reader will ever see.
+    pub fn insert_resource_with_tick<T: Send + Sync + 'static>(&mut self, value: T, tick: Tick) {
+        self.resources.insert(value, tick);
+    }
+
     /// E7: include resource `R` in the snapshot (opt-in, bincode). After this,
     /// `WorldSerializer::snapshot` saves the present resource `R`, and `restore`
     /// restores it. Without registration, resources do NOT go into the snapshot
@@ -4401,6 +4423,44 @@ mod tests {
         let stamped = world.resource_changed_tick::<Score>().unwrap();
         assert!(stamped.is_newer_than(base));
         assert_eq!(world.resource::<Score>().0, 2);
+    }
+
+    /// **A loan is not a change** (`insert_resource_with_tick`): a bracket that takes a resource
+    /// out of the world and puts the same value back must leave the tick where it found it, or
+    /// every reader gated on that tick rebuilds because somebody LOOKED.
+    ///
+    /// The second half is what keeps the door honest: put the value back at the current tick --
+    /// what a borrower that actually wrote owes its readers -- and the change is seen.
+    #[test]
+    fn a_resource_put_back_as_a_loan_does_not_look_changed() {
+        let mut world = World::new();
+        world.insert_resource(Score(1));
+        world.tick();
+        world.tick();
+        let taken_at = world.resource_changed_tick::<Score>().expect("stamped on insert");
+        assert!(
+            taken_at != world.current_tick(),
+            "the frames above must move the clock away from the insert, or this stand cannot tell a preserved tick from a fresh one"
+        );
+
+        let borrowed = world.remove_resource::<Score>().expect("taken out");
+        assert_eq!(world.resource_changed_tick::<Score>(), None, "out of the world while lent");
+        world.insert_resource_with_tick(borrowed, taken_at);
+        assert_eq!(
+            world.resource_changed_tick::<Score>(),
+            Some(taken_at),
+            "the loan came back as it left -- nobody wrote, so nothing changed"
+        );
+
+        // And a borrower that DID write puts it back at the current tick, where it is seen.
+        let mut written = world.remove_resource::<Score>().expect("taken out");
+        written.0 = 2;
+        world.insert_resource(written);
+        assert_eq!(
+            world.resource_changed_tick::<Score>(),
+            Some(world.current_tick()),
+            "a write through the loan is a change like any other"
+        );
     }
 
     #[test]
