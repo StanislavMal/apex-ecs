@@ -425,8 +425,20 @@ impl WorldSerializer {
                         }
                     };
 
-                    // Data is already in the right format — use as-is
-                    let raw = &comp_snap.data;
+                    // **Bare presence reads as `null`** (ADR-015). A snapshot written while this
+                    // type was a zero-sized marker holds NO bytes (the ZST branch of `snapshot`),
+                    // and the prefab form of the same presence is already `null`. The day a marker
+                    // grows a field, those documents are still on disk: handing their empty bytes
+                    // to serde is `EOF at column 0` and the WHOLE document fails to open (found by
+                    // the user on `UiWidgetRoot`, 2026-08-13, and answered then by forbidding the
+                    // marker ever to grow). Here the type decides what bare presence means — a
+                    // marker that grew reads it as its defaults — and a type that cannot read
+                    // `null` still fails loudly, naming itself.
+                    let raw: &[u8] = if comp_snap.data.is_empty() && serde_fns.format == "json" {
+                        b"null"
+                    } else {
+                        &comp_snap.data
+                    };
 
                     (serde_fns.deserialize_fn)(raw, ctx)
                         .map_err(|e| SerializationError::DeserializeFailed {
@@ -943,6 +955,70 @@ mod tests {
     /// Zero-sized marker (like the editor's `Folder`/`Model`/`Hidden`): presence is the only state.
     #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct Marker;
+
+    /// The same marker after it GREW a field: bare presence means its defaults.
+    #[derive(Component, Clone, Copy, Debug, Serialize, PartialEq)]
+    struct GrownMarker {
+        strength: f32,
+    }
+
+    impl<'de> Deserialize<'de> for GrownMarker {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            #[derive(Deserialize)]
+            struct Fields {
+                strength: f32,
+            }
+            Ok(Option::<Fields>::deserialize(d)?
+                .map_or(GrownMarker { strength: 1.0 }, |f| GrownMarker { strength: f.strength }))
+        }
+    }
+
+    /// **A document that stored a marker by PRESENCE still opens after the marker grows a field**
+    /// (ADR-015). The artifact is the real one: a snapshot taken while the type was zero-sized,
+    /// restored into a world where the same name is a sized type that reads `null` as its defaults.
+    /// The control restores a written value, so the gate cannot pass by defaulting everything.
+    #[test]
+    fn a_marker_that_grew_a_field_reads_its_presence_only_documents() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Marker>();
+        let e = world.spawn((Marker,));
+        let mut snap = WorldSerializer::snapshot(&world).unwrap();
+        let grown = std::any::type_name::<GrownMarker>().to_string();
+        let mut renamed = 0;
+        for es in &mut snap.entities {
+            for c in &mut es.components {
+                if c.type_name == std::any::type_name::<Marker>() {
+                    assert!(c.data.is_empty(), "a zero-sized marker is written as presence only");
+                    c.type_name = grown.clone();
+                    renamed += 1;
+                }
+            }
+        }
+        assert_eq!(renamed, 1, "the snapshot must hold the marker to rename");
+
+        let mut w2 = World::new();
+        w2.register_component_serde_json::<GrownMarker>();
+        let map = WorldSerializer::restore(&mut w2, &snap)
+            .unwrap_or_else(|err| panic!("a presence-only document must open: {err}"));
+        assert_eq!(
+            w2.get::<GrownMarker>(map[&e.index()]).copied(),
+            Some(GrownMarker { strength: 1.0 }),
+            "bare presence reads as the grown marker's defaults"
+        );
+
+        // Control: a value that was written is the value that comes back.
+        let mut w3 = World::new();
+        w3.register_component_serde_json::<GrownMarker>();
+        let written = w3.spawn((GrownMarker { strength: 0.25 },));
+        let snap3 = WorldSerializer::snapshot(&w3).unwrap();
+        let mut w4 = World::new();
+        w4.register_component_serde_json::<GrownMarker>();
+        let map4 = WorldSerializer::restore(&mut w4, &snap3).unwrap();
+        assert_eq!(
+            w4.get::<GrownMarker>(map4[&written.index()]).map(|m| m.strength),
+            Some(0.25)
+        );
+    }
 
     #[test]
     fn zst_marker_survives_snapshot_restore() {
