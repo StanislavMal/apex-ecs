@@ -591,7 +591,10 @@ pub fn propagate_transforms(world: &mut World) {
         .unwrap_or_default();
 
     let last_run = scratch.last_run;
-    let this_run = world.current_tick();
+    // The window this run reads is closed as it is read (ADR-016): a transform written after this
+    // pass - by an editor edit between frames, by a later system of the same stage - is stamped
+    // strictly newer than `this_run` and is seen by the next pass instead of never.
+    let this_run = world.increment_change_tick();
 
     // Clear all buffers (capacity is preserved — allocations are reused)
     scratch.dirty_entities.clear();
@@ -1457,6 +1460,41 @@ mod tests {
         assert_eq!(
             world.get::<GlobalTransform>(mid).unwrap().translation,
             DVec3::new(12.0, 0.0, 0.0)
+        );
+    }
+
+    /// **A transform written right after a direct pass reaches its `GlobalTransform`** (ADR-016,
+    /// engine TD-565).
+    ///
+    /// The pass records the tick it read as its base. Before the fix it left the world standing on
+    /// that tick, so a spawn made before anyone advanced the clock was stamped with the base itself,
+    /// `is_newer_than` compares strictly greater, and the entity never received a world transform -
+    /// not on the next pass, not on any: measured in the editor as three driven frames with no
+    /// `GlobalTransform`, the picking ray then cast from the origin. The stand ticks nothing of its
+    /// own, because what it checks is that nobody has to.
+    #[test]
+    fn a_transform_written_right_after_a_pass_is_propagated_by_the_next() {
+        let mut world = World::new();
+        TransformPlugin::register_components(&mut world);
+        world.spawn((LocalTransform::from_translation(DVec3::new(1.0, 0.0, 0.0)),));
+        propagate_transforms(&mut world);
+
+        // No tick between the pass and the writes: exactly an edit applied between two frames.
+        let spawned = world.spawn((LocalTransform::from_translation(DVec3::new(0.0, 2.0, 0.0)),));
+        let first = world.spawn((LocalTransform::from_translation(DVec3::new(0.0, 0.0, 3.0)),));
+        propagate_transforms(&mut world);
+        world.get_mut::<LocalTransform>(first).unwrap().translation.z = 4.0;
+        propagate_transforms(&mut world);
+
+        assert_eq!(
+            world.get::<GlobalTransform>(spawned).map(|g| g.translation),
+            Some(DVec3::new(0.0, 2.0, 0.0)),
+            "a spawn on the tick the pass read must still get its world transform"
+        );
+        assert_eq!(
+            world.get::<GlobalTransform>(first).map(|g| g.translation),
+            Some(DVec3::new(0.0, 0.0, 4.0)),
+            "and a move on the tick the pass read must reach it too"
         );
     }
 

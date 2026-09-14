@@ -366,6 +366,26 @@ impl World {
         }
     }
 
+    /// **The tick a change-driven reader reads at, with its window closed behind it** (ADR-016).
+    ///
+    /// Returns the current tick and advances the clock (Bevy's `World::increment_change_tick`,
+    /// 1:1). A reader that records "I have seen everything up to tick `T`" must not leave the world
+    /// standing on `T`: a write made after the reader on that same tick is stamped `T`, the next
+    /// run compares `is_newer_than(T)` - strictly greater - and the write is invisible FOREVER, not
+    /// late. Inside a schedule the stage windows advance the clock between systems, which is why
+    /// the hole only shows for readers called directly (an editor maintenance pass, an extract
+    /// between frames) - and why it hid: engine TD-565, a transform spawned right after a direct
+    /// `propagate_transforms` never received its `GlobalTransform`.
+    ///
+    /// Use it wherever a reader stamps its own base (`last_run = world.current_tick()`): one call,
+    /// and every later write is strictly newer than the mark.
+    #[inline]
+    pub fn increment_change_tick(&mut self) -> Tick {
+        let read_at = self.current_tick;
+        self.tick();
+        read_at
+    }
+
     /// Advance the change-tick at the frame boundary: remember the current tick
     /// as the `Changed<T>` base for the next frame and increment `current_tick`.
     ///

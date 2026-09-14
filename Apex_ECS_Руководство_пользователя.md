@@ -630,8 +630,11 @@ Query::<(&Health, With<Player>)>::new(&world)
 Query::<(&Position, Without<Enemy>)>::new(&world)
     .for_each(|_, pos| { /* только не-Enemy */ });
 
-// Change detection (фильтр — Changed<T> не возвращает данные, только фильтрует):
-let last_tick = world.current_tick();
+// Change detection (фильтр — Changed<T> не возвращает данные, только фильтрует).
+// Базу берите increment_change_tick(), а не current_tick(): он возвращает текущий тик и продвигает
+// часы, так что запись, сделанная после отметки, строго новее её. С current_tick() запись на том же
+// тике не видна ни следующему запросу, ни какому-либо ещё (ADR-016).
+let last_tick = world.increment_change_tick();
 // ... (следующий тик) ...
 // Changed<Position> в составе кортежа — выбирает только изменённые entity:
 Query::<(&Position, &Velocity, Changed<Position>)>::new_with_tick(&world, last_tick)
