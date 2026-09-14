@@ -449,8 +449,7 @@ mod tests {
         let mut registry = AssetRegistry::new();
 
         // Write the prefab file and register it.
-        let dir = std::env::temp_dir().join("apex_prefab_e4_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = apex_test_dir::TestDir::new("apex_prefab_e4");
         let file_path = dir.join("goblin.prefab.json");
         std::fs::write(&file_path, tag_prefab_json("Goblin", 0)).unwrap();
         let id = plugin.load_file(&file_path, &mut registry).unwrap();
@@ -523,8 +522,7 @@ mod tests {
         let mut registry = AssetRegistry::new();
 
         // Create a temporary .prefab.json file
-        let dir = std::env::temp_dir().join("apex_prefab_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = apex_test_dir::TestDir::new("apex_prefab");
         let file_path = dir.join("test_entity.prefab.json");
 
         let json = r#"{
@@ -539,10 +537,6 @@ mod tests {
         let id = plugin.load_file(&file_path, &mut registry).unwrap();
         assert!(plugin.loader().has("TestEntity"));
         assert_eq!(plugin.prefab_name(id), Some("TestEntity"));
-
-        // Cleanup
-        let _ = std::fs::remove_file(&file_path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -550,8 +544,7 @@ mod tests {
         let mut plugin = PrefabPlugin::new();
         let mut registry = AssetRegistry::new();
 
-        let dir = std::env::temp_dir().join("apex_prefab_reload_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = apex_test_dir::TestDir::new("apex_prefab_reload");
         let file_path = dir.join("reload_test.prefab.json");
 
         // First version
@@ -580,10 +573,6 @@ mod tests {
         // After reload — the name must update
         assert!(plugin.loader().has("V2"));
         assert_eq!(plugin.prefab_name(id), Some("V2"));
-
-        // Cleanup
-        let _ = std::fs::remove_file(&file_path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -591,8 +580,7 @@ mod tests {
         let mut plugin = PrefabPlugin::new();
         let mut registry = AssetRegistry::new();
 
-        let dir = std::env::temp_dir().join("apex_prefab_dir_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = apex_test_dir::TestDir::new("apex_prefab_dir");
 
         // Create several prefab files
         std::fs::write(
@@ -613,11 +601,5 @@ mod tests {
         assert_eq!(plugin.len(), 2);
         assert!(plugin.loader().has("A"));
         assert!(plugin.loader().has("B"));
-
-        // Cleanup
-        let _ = std::fs::remove_file(dir.join("a.prefab.json"));
-        let _ = std::fs::remove_file(dir.join("b.prefab.json"));
-        let _ = std::fs::remove_file(dir.join("not_prefab.json"));
-        let _ = std::fs::remove_dir(&dir);
     }
 }

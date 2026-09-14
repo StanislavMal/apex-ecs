@@ -12,3 +12,7 @@ bincode.workspace   = true
 rustc-hash.workspace = true
 thiserror.workspace  = true
 log.workspace        = true
+
+[dev-dependencies]
+# Tests write to disk only through a directory their Drop removes (engine TD-564).
+apex-test-dir = { path = "../apex-test-dir" }

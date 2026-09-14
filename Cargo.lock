@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "apex-core",
  "apex-serialization",
+ "apex-test-dir",
  "log",
  "notify",
  "rustc-hash",
@@ -208,6 +209,7 @@ name = "apex-serialization"
 version = "0.1.0"
 dependencies = [
  "apex-core",
+ "apex-test-dir",
  "bincode",
  "log",
  "rustc-hash",
@@ -215,6 +217,10 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "apex-test-dir"
+version = "0.1.0"
 
 [[package]]
 name = "approx"

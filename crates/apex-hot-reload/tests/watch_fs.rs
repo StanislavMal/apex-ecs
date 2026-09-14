@@ -7,7 +7,7 @@
 //! (and that editor temp files are filtered out). They tolerate OS event
 //! latency with a bounded retry loop rather than a single fixed sleep.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use apex_hot_reload::FileWatcher;
@@ -20,11 +20,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A unique, clean temp directory for one test (tests share a process, so the
 /// name is disambiguated per-test to avoid cross-talk).
-fn fresh_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("apex_watch_fs_{}_{}", std::process::id(), tag));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp watch dir");
-    dir
+fn fresh_dir(tag: &str) -> apex_test_dir::TestDir {
+    apex_test_dir::TestDir::new(format!("apex_watch_fs_{tag}"))
 }
 
 /// Poll until a file whose name matches `wanted` surfaces, or the timeout hits.
@@ -65,7 +62,6 @@ fn real_watch_detects_a_written_file() {
         "a real file write must surface through poll() (saw: {seen:?})"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -85,5 +81,4 @@ fn real_watch_filters_editor_temp_files() {
         "editor temp files must never surface (saw: {seen:?})"
     );
 
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -11,6 +11,7 @@ members = [
     "crates/apex-bench",
     "crates/apex-macros",
     "crates/apex-scripting",
+    "crates/apex-test-dir",
 ]
 
 [workspace.package]

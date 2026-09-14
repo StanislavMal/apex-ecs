@@ -1206,8 +1206,7 @@ mod tests {
         let world = setup_world();
         let snap = WorldSerializer::snapshot(&world).unwrap();
 
-        let dir = std::env::temp_dir().join("apex_serialization_test");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = apex_test_dir::TestDir::new("apex_serialization");
 
         // JSON
         let json_path = dir.join("test_save.json");
@@ -1226,9 +1225,6 @@ mod tests {
         let bin_meta = std::fs::metadata(&bin_path).unwrap();
         assert!(bin_meta.len() < json_meta.len(),
             "bin={} should be < json={}", bin_meta.len(), json_meta.len());
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Atomic save: replacing an existing file works and leaves no `.tmp`
@@ -1238,9 +1234,7 @@ mod tests {
         let world = setup_world();
         let snap = WorldSerializer::snapshot(&world).unwrap();
 
-        let dir = std::env::temp_dir().join("apex_serialization_atomic_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = apex_test_dir::TestDir::new("apex_serialization_atomic");
         let path = dir.join("save.json");
 
         // Pre-existing content that must be atomically replaced.
@@ -1253,8 +1247,6 @@ mod tests {
             !dir.join("save.json.tmp").exists(),
             "atomic write must not leave a .tmp file behind on success"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// §0.2a (E7): versioning is centralised on the load path — read_from_file
@@ -1263,9 +1255,7 @@ mod tests {
     /// snapshot kept its stale version, only to be rejected later by restore.
     #[test]
     fn read_from_file_runs_migrate_on_load() {
-        let dir = std::env::temp_dir().join("apex_serialization_migrate_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = apex_test_dir::TestDir::new("apex_serialization_migrate");
         let path = dir.join("old.json");
 
         let mut snap = WorldSnapshot::new(0);
@@ -1278,8 +1268,6 @@ mod tests {
             WorldSnapshot::CURRENT_VERSION,
             "read_from_file must migrate an older snapshot to the current version on load"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

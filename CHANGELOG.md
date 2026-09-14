@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added — `apex-test-dir`: каталог теста удаляет его значение (2026-09-14, ADR-017)
+
+- **`TestDir::new(label)`** — свежий каталог под `<temp>/apex_test_dirs/`, удаляемый `Drop`, в том
+  числе при панике; неудавшееся удаление валит тест с путём (эталон `tempfile` молчит).
+  `APEX_KEEP_TEST_DIRS=1` оставляет каталоги. **`audit::offenders`** — правило исходника на оба
+  репозитория: сырой `std::env::temp_dir()` вне списка разрешений и `TestDir`, умирающий в своём
+  операторе, отвергаются (гейт ядра `workspace_hygiene`, движковый `source_hygiene`). Тесты
+  `apex-hot-reload` и `apex-serialization` переведены; `watch_fs` копил каталоги с pid (apex-engine
+  TD-564 нашёл 25,5 ГБ таких в `%TEMP%` у движка).
+
 ### Added — ЗАЁМ РЕСУРСА перестал читаться как его изменение (2026-09-11)
 
 - **`World::insert_resource_with_tick(value, tick)`** — вернуть ресурс в мир с ТЕМ тиком, с

@@ -149,12 +149,10 @@ mod tests {
     /// OS backend. Only the debounce logic (`poll_at`) is exercised here.
     ///
     /// SAFETY/scope: we still need a real `RecommendedWatcher` to fill the
-    /// `_watcher` field, so we create one over a temp dir. The events we test
-    /// with are injected through the returned `Sender`, not the OS.
+    /// `_watcher` field; it watches nothing (a directory made for it here was
+    /// never handed to it). The events we test with are injected through the
+    /// returned `Sender`, not the OS.
     fn test_watcher(debounce: Duration) -> (FileWatcher, mpsc::Sender<FileChange>) {
-        let dir = std::env::temp_dir().join("apex_watcher_debounce_test");
-        let _ = std::fs::create_dir_all(&dir);
-
         let (tx, rx) = mpsc::channel::<FileChange>();
         // A real watcher just to own the backend thread; it won't feed `rx`.
         let watcher = RecommendedWatcher::new(

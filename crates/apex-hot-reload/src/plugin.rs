@@ -279,8 +279,7 @@ mod tests {
     /// registered despite the failed initial load.
     #[test]
     fn watch_config_keeps_loader_after_initial_load_failure() {
-        let dir = std::env::temp_dir().join("apex_watch_e9a_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = apex_test_dir::TestDir::new("apex_watch_e9a");
         let path = dir.join("config.json");
 
         // Start with a BROKEN file (invalid JSON).
@@ -316,8 +315,5 @@ mod tests {
             Some(&DummyConfig { value: 42 }),
             "fixed config was not applied"
         );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 }
