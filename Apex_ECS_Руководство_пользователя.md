@@ -48,7 +48,7 @@
 - **Change Detection** — каждая строка данных хранит тик последнего изменения, запросы `Changed<T>`/`Added<T>` работают без overhead
 - **Композиция Bundle** — вложенные `#[derive(Bundle)]`, кортежи Bundle до 12 элементов, одиночные компоненты напрямую в `spawn()`
 - **Relations (связи между entity)** — иерархии, ownership и произвольные связи в выделенных индексах мира (O(1) добавление, без влияния на архетипы; cascade delete при despawn target)
-- **Сериализация мира** — снэпшот/восстановление состояния через JSON или bincode; инкрементальный diff; префабы
+- **Сериализация мира** — снэпшот/восстановление состояния: читаемый текстовый документ (JSON, значения по имени типа) или компактная бинарная форма (`postcard`); инкрементальный diff (с ресурсами); префабы
 - **Hot Reload** — файловый watcher перезагружает JSON-конфиги, Lua-скрипты и префабы без перезапуска
 - **Lua-скриптинг** — игровая логика на Lua 5.4 с хот-релоадом `.lua`-файлов, sandbox-изоляцией и доступом к ECS через query/spawn/resource/event API
 - **Детерминированный спавн** — опциональный record/replay-детерминизм присвоения entity-id run-to-run
@@ -3060,32 +3060,68 @@ println!("entities: {}", snapshot.entities.len());
 println!("relations: {}", snapshot.relations.len());
 ```
 
-#### 10.2.1 Бинарный формат (bincode)
+#### 10.2.1 Текстовый документ
 
-Помимо JSON, снэпшоты поддерживают бинарную сериализацию через `bincode`. Бинарный формат компактнее и быстрее — используйте его для production save/load:
+`to_json()` пишет документ, который читают и диффают люди (wire-версия 4, ядро ADR-018):
 
-```rust
-// Сериализовать в bincode:
-let binary = snapshot.to_bincode().expect("bincode failed");
-std::fs::write("savegame.bin", &binary).unwrap();
-
-// Загрузить из bincode:
-let data = std::fs::read("savegame.bin").unwrap();
-let restored = WorldSnapshot::from_bincode(&data).expect("invalid binary save");
+```json
+{
+  "format": "apex-world",
+  "version": 4,
+  "tick": 17,
+  "entities": [
+    { "id": 3, "components": { "game::Name": "Door", "game::Health": {"hp":50.0}, "game::Frozen": null } }
+  ],
+  "relations": [ { "subject": 3, "target": 1, "kind": "apex_core::relations::ChildOf" } ],
+  "resources": { "game::Settings": {"volume":0.5} }
+}
 ```
 
-Также доступен универсальный метод `WorldSerializer::write_to_file()`, который определяет формат по расширению:
+- Компонент или ресурс с JSON-регистрацией записан своим значением **байт в байт**, как его выдали
+  serde-функции: загрузка и повторное сохранение не меняют ни одного числа.
+- Маркер без данных (голое присутствие) — `null`.
+- Компонент или ресурс с бинарной регистрацией у документа нет JSON-написания — он лежит в
+  `binary_components` / `binary_resources` массивом байт. Для документов, которые читает человек,
+  регистрируйте типы через `register_component_serde_json` / `register_resource_serde_json`.
+- Неизвестное поле и тип, названный у сущности дважды, — ошибка чтения, а не молча выброшенные данные.
+
+#### 10.2.2 Бинарная форма (postcard)
+
+Бинарная форма компактнее и быстрее на разборе — для сохранений, которые не читает человек:
+
+```rust
+let binary = snapshot.to_binary().expect("binary failed");
+std::fs::write("savegame.bin", &binary).unwrap();
+
+let data = std::fs::read("savegame.bin").unwrap();
+let restored = WorldSnapshot::from_binary(&data).expect("invalid binary save");
+```
+
+Файл начинается магией `APXW` (дифф — `APXD`), затем `postcard` 1.x, первым полем — версия. Более
+новая версия — `SerializationError::VersionMismatch`, а не мусорный разбор.
+
+Также доступен универсальный метод `WorldSerializer::write_to_file()`:
 
 ```rust
 // Сохранение — явное указание формата:
-WorldSerializer::write_to_file("savegame.json", &snapshot, apex_serialization::snapshot::SaveFormat::Json).unwrap();
-WorldSerializer::write_to_file("savegame.bin", &snapshot, apex_serialization::snapshot::SaveFormat::Bincode).unwrap();
+WorldSerializer::write_to_file("savegame.json", &snapshot, SaveFormat::Json).unwrap();
+WorldSerializer::write_to_file("savegame.bin", &snapshot, SaveFormat::Binary).unwrap();
 
 // Загрузка — авто-определение по расширению:
 let loaded = WorldSerializer::read_from_file("savegame.json").unwrap();
 ```
 
-> **Сравнение размеров** (на тестовом датасете): JSON ~1.8 MB, bincode ~1.2 MB. Разница особенно заметна при большом количестве entity.
+> **Размеры и цена** — стенд `cargo run --release -p apex-bench --bin serialization_load`
+> (20 000 entity: текст и бинарная форма, restore, дифф, события мостов).
+
+#### 10.2.3 Документы старых версий
+
+Документы wire-версий 0–3 читаются (`from_json` / `from_binary` различают версию сами). В них
+ресурсы и бинарные компоненты записаны устаревшим `bincode`: restore декодирует их читателем типа,
+как бы тип ни был зарегистрирован сегодня. **Чтение `bincode` удаляется 2026-12-17** — документ,
+последний раз сохранённый до версии 4, нужно до этой даты открыть и сохранить. Записать снимок, в
+котором ещё лежат `bincode`-байты, нельзя (`SerializationError::LegacyPayload`): сначала restore в
+мир, затем новый снимок.
 
 ### 10.3 Загрузка
 
@@ -3094,9 +3130,9 @@ let loaded = WorldSerializer::read_from_file("savegame.json").unwrap();
 let json = std::fs::read("savegame.json").unwrap();
 let snapshot = WorldSnapshot::from_json(&json).unwrap();
 
-// Или из bincode:
+// Или из бинарной формы:
 let binary = std::fs::read("savegame.bin").unwrap();
-let snapshot = WorldSnapshot::from_bincode(&binary).unwrap();
+let snapshot = WorldSnapshot::from_binary(&binary).unwrap();
 
 // Подготовить новый мир (зарегистрировать те же типы):
 let mut world = World::new();
@@ -3164,7 +3200,7 @@ world.register_component_serde_with::<MyRef>(ComponentSerdeFns {
         Ok(bytes)
     },
     deserialize_fn: |bytes, ctx| { /* резолвим обратно через ctx */ Ok(buf) },
-    format: "bincode",
+    format: apex_core::SERDE_FORMAT_JSON, // или любое другое имя — тогда байты считаются бинарными
 });
 
 // Снэпшот/восстановление С контекстом:
@@ -3233,14 +3269,14 @@ Prefabs — это JSON-формат для описания и переиспо
 
 #### 10.4.1 Формат `PrefabManifest` и регистрация компонентов
 
-Для инстанциирования префаба компоненты должны быть зарегистрированы через `register_component_serde_json<T>()` — PrefabLoader читает JSON и использует `serde_json::from_slice` для десериализации. `register_component_serde<T>()` (bincode) НЕ подходит — bincode не может разобрать JSON.
+Для инстанциирования префаба компоненты должны быть зарегистрированы через `register_component_serde_json<T>()` — PrefabLoader читает JSON и использует `serde_json::from_slice` для десериализации. `register_component_serde<T>()` (бинарный `postcard`) НЕ подходит — он не разбирает JSON.
 
 ```rust
 // ✅ ПРАВИЛЬНО: для префабов
 world.register_component_serde_json::<Position>();
 world.register_component_serde_json::<Health>();
 
-// ❌ НЕПРАВИЛЬНО: bincode не читает JSON
+// ❌ НЕПРАВИЛЬНО: бинарная регистрация не читает JSON
 // world.register_component_serde::<Position>();
 ```
 
@@ -3532,7 +3568,7 @@ render_scheduler.run_extract(&mut render_world);
 | Метод | Сериализация | Требуется `register_event`? | Тип данных |
 |---|---|---|---|
 | `send_action_event(event)` | Нет (closure) | Нет | `Send + Sync + 'static` |
-| `send_event(event)` | Да (bincode) | Да | `Serialize + Send + Sync + 'static` |
+| `send_event(event)` | Да (`postcard`) | Да | `Serialize + Send + Sync + 'static` |
 
 #### 12.2.1 `send_action_event` (без сериализации)
 
@@ -3553,9 +3589,9 @@ bridge_b.apply_incoming(&mut world);
 
 #### 12.2.2 `send_event` + `register_event` (с сериализацией)
 
-Сериализует событие через bincode и десериализует на принимающей стороне. Перед отправкой нужно вызвать `register_event`, который:
+Сериализует событие через `postcard` и десериализует на принимающей стороне. Перед отправкой нужно вызвать `register_event`, который:
 1. Регистрирует тип в `EventQueue` принимающего мира (`world.add_event::<T>()`)
-2. Сохраняет bincode-десериализатор в реестре моста
+2. Сохраняет десериализатор в реестре моста
 
 ```rust
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4491,7 +4527,7 @@ fn main() {
 | `iter_relations()` | Все связи мира `(subject_index, kind_idx, target)` — сериализация |
 | `add_relation_by_kind_idx(s, kind_idx, t)` | Низкоуровневое добавление по kind_idx (restore/горячие циклы) |
 | `register_component::<T>()` | Зарегистрировать компонент |
-| `register_component_serde::<T>()` | Зарегистрировать + bincode-сериализация |
+| `register_component_serde::<T>()` | Зарегистрировать + бинарная сериализация (`postcard`) |
 | `register_component_serde_json::<T>()` | Зарегистрировать + JSON-сериализация (для префабов) |
 | `require_component::<C, R>()` | Объявить: C требует R — спавн дотягивает `R::default()` (§2.2.1; derive-атрибут `#[require(…)]`) |
 | `on_add::<T>(fn)` | Хук «компонент T появился у entity» (§5.2.10); один хук на компонент, fn-pointer без захватов |

@@ -26,6 +26,8 @@ apex-macros = { path = "../apex-macros" }
 # Serialization — needed for the Serializable trait and make_serde_fns
 serde      = { workspace = true }
 serde_json = { workspace = true }
+postcard   = { workspace = true }
+# Legacy reader only (payloads of wire v3 and older), removed with engine TD-608.
 bincode    = { workspace = true }
 
 # Math for transforms

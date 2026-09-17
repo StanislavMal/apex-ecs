@@ -76,7 +76,7 @@ pub enum PrefabChild {
 /// migrated up to [`Self::CURRENT_VERSION`] on load ([`PrefabManifest::from_json_str`] /
 /// [`PrefabLoader::load_json`]). The field is meaningful at the **file root**; on a nested
 /// [`PrefabChild::Inline`] sub-tree it is inert (the whole file shares one version). Prefabs are
-/// JSON-only, so this is an additive, backward-compatible change (unlike positional bincode).
+/// JSON-only, so this is an additive, backward-compatible change (unlike a positional binary format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefabManifest {
     /// Prefab wire-format version (see type docs). Defaults to 0 for old, field-less files.

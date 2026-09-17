@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::cell::UnsafeCell;
 
 use crate::archetype::TickCell;
-use crate::component::Tick;
+use crate::component::{Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD};
 
 /// A resource slot: the value behind `UnsafeCell` so `get_raw_parts` can hand
 /// out a `*mut T` whose provenance is the cell's interior — writing through it
@@ -31,11 +31,26 @@ unsafe impl Sync for ResourceCell {}
 #[derive(Clone)]
 pub struct ResourceSerdeFns {
     pub type_name: &'static str,
+    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`] — what `serialize` writes and
+    /// `deserialize` reads.
+    pub format: &'static str,
     /// Serialize the resource if it is currently present.
-    pub serialize: fn(&Resources) -> Option<Vec<u8>>,
+    pub serialize: fn(&Resources) -> Option<Result<Vec<u8>, String>>,
     /// Deserialize bytes and insert the resource (stamping `tick` — a restore
     /// IS a change for change-detection consumers, RT-1).
     pub deserialize: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
+    /// Reader of the retired `bincode` payload: every resource of wire v3 and older was written
+    /// so, whatever the type's registration today. Removed with engine TD-608 (2026-12-17).
+    pub legacy_bincode: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
+}
+
+/// One registered, present resource as the snapshot takes it.
+#[derive(Clone, Debug)]
+pub struct SerializedResource {
+    pub type_name: String,
+    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`].
+    pub format: &'static str,
+    pub data: Vec<u8>,
 }
 
 /// RT-2: name-addressed JSON view of a resource for dynamic consumers (the
@@ -50,15 +65,40 @@ pub struct ResourceReflectFns {
     pub to_json: fn(&Resources) -> Option<Result<serde_json::Value, String>>,
 }
 
-fn ser_resource<R: serde::Serialize + Send + Sync + 'static>(res: &Resources) -> Option<Vec<u8>> {
-    res.try_get::<R>().and_then(|r| bincode::serialize(r).ok())
+fn ser_resource<R: serde::Serialize + Send + Sync + 'static>(
+    res: &Resources,
+) -> Option<Result<Vec<u8>, String>> {
+    res.try_get::<R>().map(|r| crate::binary::to_vec(r).map_err(|e| e.to_string()))
 }
 fn de_resource<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
     res: &mut Resources,
     bytes: &[u8],
     tick: Tick,
 ) -> Result<(), String> {
-    let r: R = bincode::deserialize(bytes).map_err(|e| e.to_string())?;
+    let r: R = crate::binary::from_bytes(bytes).map_err(|e| e.to_string())?;
+    res.insert(r, tick);
+    Ok(())
+}
+fn ser_resource_json<R: serde::Serialize + Send + Sync + 'static>(
+    res: &Resources,
+) -> Option<Result<Vec<u8>, String>> {
+    res.try_get::<R>().map(|r| serde_json::to_vec(r).map_err(|e| e.to_string()))
+}
+fn de_resource_json<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    res: &mut Resources,
+    bytes: &[u8],
+    tick: Tick,
+) -> Result<(), String> {
+    let r: R = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    res.insert(r, tick);
+    Ok(())
+}
+fn de_resource_legacy_bincode<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    res: &mut Resources,
+    bytes: &[u8],
+    tick: Tick,
+) -> Result<(), String> {
+    let r: R = bincode::deserialize(bytes).map_err(|e| format!("legacy bincode payload: {e}"))?;
     res.insert(r, tick);
     Ok(())
 }
@@ -86,9 +126,10 @@ impl Resources {
         }
     }
 
-    /// E7: opt a resource type into snapshots (bincode). Present resources of
-    /// this type are then included by [`snapshot_serde`](Self::snapshot_serde)
-    /// and restored by [`restore_serde`](Self::restore_serde).
+    /// E7: opt a resource type into snapshots in the binary format (`postcard`). Present resources
+    /// of this type are then included by [`snapshot_serde`](Self::snapshot_serde) and restored by
+    /// [`restore_serde`](Self::restore_serde). A resource that rides a text document a person
+    /// reads (a scene) registers with [`register_serde_json`](Self::register_serde_json) instead.
     pub fn register_serde<R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static>(
         &mut self,
     ) {
@@ -96,8 +137,29 @@ impl Resources {
             TypeId::of::<R>(),
             ResourceSerdeFns {
                 type_name: std::any::type_name::<R>(),
+                format: SERDE_FORMAT_POSTCARD,
                 serialize: ser_resource::<R>,
                 deserialize: de_resource::<R>,
+                legacy_bincode: de_resource_legacy_bincode::<R>,
+            },
+        );
+    }
+
+    /// E7: opt a resource type into snapshots as a JSON value — the resource counterpart of
+    /// `register_component_serde_json`, for resources that live in text documents.
+    pub fn register_serde_json<
+        R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    >(
+        &mut self,
+    ) {
+        self.serde.insert(
+            TypeId::of::<R>(),
+            ResourceSerdeFns {
+                type_name: std::any::type_name::<R>(),
+                format: SERDE_FORMAT_JSON,
+                serialize: ser_resource_json::<R>,
+                deserialize: de_resource_json::<R>,
+                legacy_bincode: de_resource_legacy_bincode::<R>,
             },
         );
     }
@@ -136,25 +198,63 @@ impl Resources {
         found
     }
 
-    /// E7: `(type_name, bytes)` for every registered resource that is present.
-    pub fn snapshot_serde(&self) -> Vec<(String, Vec<u8>)> {
+    /// E7: every registered resource that is present, serialized. A resource whose serializer
+    /// fails is an error naming it, not a silent absence from the document (§0.2a).
+    pub fn snapshot_serde(&self) -> Result<Vec<SerializedResource>, String> {
         let mut out = Vec::new();
         for fns in self.serde.values() {
             if let Some(bytes) = (fns.serialize)(self) {
-                out.push((fns.type_name.to_string(), bytes));
+                let data = bytes.map_err(|e| format!("resource `{}` serialize failed: {e}", fns.type_name))?;
+                out.push(SerializedResource {
+                    type_name: fns.type_name.to_string(),
+                    format: fns.format,
+                    data,
+                });
             }
         }
-        out
+        // Registration lives in a hash map: sort so a document's bytes do not depend on hash order.
+        out.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+        Ok(out)
     }
 
     /// E7: deserialize+insert a resource by `type_name`, stamping `tick` as its
-    /// change tick (a restore is a change, RT-1). `Ok(false)` if that type_name
-    /// was never registered (unknown resource — caller may warn).
-    pub fn restore_serde(&mut self, type_name: &str, bytes: &[u8], tick: Tick) -> Result<bool, String> {
+    /// change tick (a restore is a change, RT-1). `format` is what the bytes were written as; a
+    /// payload in another format than the type's registration is an error naming both, not a
+    /// parse failure of the wrong reader. `Ok(false)` if that type_name was never registered
+    /// (unknown resource — caller may warn).
+    pub fn restore_serde(
+        &mut self,
+        type_name: &str,
+        format: &str,
+        bytes: &[u8],
+        tick: Tick,
+    ) -> Result<bool, String> {
+        let fns = self.serde.values().find(|f| f.type_name == type_name).cloned();
+        match fns {
+            Some(f) if f.format != format => Err(format!(
+                "the payload is {format}, the type is registered as {}",
+                f.format
+            )),
+            Some(f) => {
+                (f.deserialize)(self, bytes, tick)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// E7: [`restore_serde`](Self::restore_serde) for a payload in the retired `bincode` encoding
+    /// (every resource of wire v3 and older), whatever the type's registration today.
+    pub fn restore_serde_legacy_bincode(
+        &mut self,
+        type_name: &str,
+        bytes: &[u8],
+        tick: Tick,
+    ) -> Result<bool, String> {
         let fns = self.serde.values().find(|f| f.type_name == type_name).cloned();
         match fns {
             Some(f) => {
-                (f.deserialize)(self, bytes, tick)?;
+                (f.legacy_bincode)(self, bytes, tick)?;
                 Ok(true)
             }
             None => Ok(false),

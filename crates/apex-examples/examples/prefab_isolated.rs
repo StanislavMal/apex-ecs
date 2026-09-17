@@ -240,9 +240,9 @@ fn main() {
     );
 
     // ── 6a. register_event + send_event (main → sub) ──────────────
-    // send_event serializes the event via bincode. On the receiving
+    // send_event serializes the event via postcard. On the receiving
     // side register_event is required — it registers the type in the
-    // world's EventQueue and stores the bincode deserializer in the bridge.
+    // world's EventQueue and stores the postcard deserializer in the bridge.
     {
         println!("\n  --- send_event: serialized event main → sub ---");
         // Fetch the bridge from resources
@@ -250,7 +250,7 @@ fn main() {
         // Register the String type in IsolatedWorld
         bridge.register_event::<String>(iso.world_mut());
         // Send the serialized event
-        bridge.send_event(&"Hello via bincode from main world!".to_string());
+        bridge.send_event(&"Hello via postcard from main world!".to_string());
         println!("  ✓ register_event + send_event: event sent to IsolatedWorld");
     }
 

@@ -103,7 +103,7 @@ impl std::fmt::Display for ComponentSerdeError {
 ///
 /// # Safety
 /// Both functions operate on the component's raw bytes:
-/// - `serialize_fn(src_ptr)` — reads T from `src_ptr`, returns bytes (JSON/bincode/RON)
+/// - `serialize_fn(src_ptr)` — reads T from `src_ptr`, returns bytes (JSON or postcard)
 /// - `deserialize_fn(bytes)`  — takes bytes, returns aligned bytes of T
 ///   suitable for writing into a Column via `write_component`.
 ///
@@ -164,7 +164,8 @@ pub struct ComponentSerdeFns {
     pub serialize_fn: unsafe fn(*const u8, &mut dyn SerdeContext) -> SerializeResult,
     /// Deserialize bytes back into an aligned buffer holding T's data (with the same `ctx`).
     pub deserialize_fn: fn(&[u8], &mut dyn SerdeContext) -> DeserializeResult,
-    /// Human-readable format name: "json", "bincode", "ron".
+    /// Format name: [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`]. A snapshot stores JSON bytes
+    /// as a readable value and anything else as bytes.
     pub format: &'static str,
 }
 
@@ -249,6 +250,10 @@ pub struct ComponentInfo {
     /// Remap of Entity references on restore (E6) — `None` if the component does not
     /// hold any. Populated by `register_map_entities::<T>()`.
     pub map_entities: Option<MapEntitiesFn>,
+    /// Reader of this type's payloads in the retired `bincode` encoding (wire v3 and older) — set
+    /// by the plain serde registrations, `None` for context-dependent fns, whose bytes were never
+    /// plain bincode. Removed with the dependency (engine TD-608, 2026-12-17).
+    pub legacy_bincode: Option<LegacyBincodeDeserializeFn>,
 }
 
 // ── Component trait ────────────────────────────────────────────
@@ -290,46 +295,59 @@ pub(crate) unsafe fn drop_ptr<T>(ptr: *mut u8) {
 
 // ── serde fn implementation for a concrete T ──────────────────
 
-/// Creates `ComponentSerdeFns` for a type T implementing `Serializable`.
-///
-/// Internally uses `bincode` as a compact binary format.
-/// The format can be changed — it is enough to swap the implementation of the two closures.
+/// The `format` name of text component and resource fns ([`make_serde_fns_json`]). A snapshot
+/// stores such bytes as a JSON value a person can read.
+pub const SERDE_FORMAT_JSON: &str = "json";
+/// The `format` name of binary component and resource fns ([`make_serde_fns`]): `postcard` 1.x,
+/// whose wire format is stable across the 1.x line by its specification.
+pub const SERDE_FORMAT_POSTCARD: &str = "postcard";
+
+/// Reads a component payload written by the retired binary encoding (`bincode` 1.x): the format
+/// of `Binary` component bytes in snapshots of wire version 3 and older. Kept only so such
+/// documents still open; removed together with the dependency (engine TD-608, 2026-12-17).
+pub type LegacyBincodeDeserializeFn = fn(&[u8]) -> DeserializeResult;
+
+/// Move a deserialized `T` into an aligned byte buffer for writing into a Column. The value is
+/// forgotten, not dropped: its heap parts are owned by the buffer's eventual column.
+fn pack_component<T>(val: T) -> Vec<u8> {
+    let size = std::mem::size_of::<T>();
+    let mut buf = vec![0u8; size];
+    if size > 0 {
+        // SAFETY: `buf` holds exactly `size_of::<T>()` bytes; the value is moved bitwise and then
+        // forgotten, so it is owned once.
+        unsafe {
+            std::ptr::copy_nonoverlapping(&val as *const T as *const u8, buf.as_mut_ptr(), size);
+        }
+    }
+    std::mem::forget(val);
+    buf
+}
+
+/// Creates `ComponentSerdeFns` for a type T implementing `Serializable`, in the compact binary
+/// format (`postcard`).
 pub fn make_serde_fns<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
         serialize_fn: |ptr, _ctx| {
             // SAFETY: the caller guarantees the validity of ptr as *const T
             let val = unsafe { &*(ptr as *const T) };
-            bincode::serialize(val)
+            crate::binary::to_vec(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
         },
         deserialize_fn: |bytes, _ctx| {
-            let val: T = bincode::deserialize(bytes)
+            let val: T = crate::binary::from_bytes(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
-            // Pack T into an aligned byte buffer for writing into a Column.
-            let size = std::mem::size_of::<T>();
-            let mut buf = vec![0u8; size];
-            if size > 0 {
-                // SAFETY: buf is large enough, T: Copy-compatible via serde
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &val as *const T as *const u8,
-                        buf.as_mut_ptr(),
-                        size,
-                    );
-                }
-            }
-            std::mem::forget(val);
-            Ok(buf)
+            Ok(pack_component(val))
         },
-        format: "bincode",
+        format: SERDE_FORMAT_POSTCARD,
     }
 }
 
 /// Creates `ComponentSerdeFns` for a type T implementing `Serializable`
-/// using `serde_json` (a text format for debugging/logs).
+/// using `serde_json` (the text format of scene documents).
 pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
     ComponentSerdeFns {
         serialize_fn: |ptr, _ctx| {
+            // SAFETY: the caller guarantees the validity of ptr as *const T
             let val = unsafe { &*(ptr as *const T) };
             serde_json::to_vec(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
@@ -337,22 +355,18 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
         deserialize_fn: |bytes, _ctx| {
             let val: T = serde_json::from_slice(bytes)
                 .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
-            let size = std::mem::size_of::<T>();
-            let mut buf = vec![0u8; size];
-            if size > 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        &val as *const T as *const u8,
-                        buf.as_mut_ptr(),
-                        size,
-                    );
-                }
-            }
-            std::mem::forget(val);
-            Ok(buf)
+            Ok(pack_component(val))
         },
-        format: "json",
+        format: SERDE_FORMAT_JSON,
     }
+}
+
+/// The legacy reader of a `Serializable` type: its value as the retired `bincode` 1.x wrote it.
+fn legacy_bincode_deserialize<T: Serializable>(bytes: &[u8]) -> DeserializeResult {
+    let val: T = bincode::deserialize(bytes).map_err(|e| {
+        ComponentSerdeError::DeserializationFailed(format!("legacy bincode payload: {e}"))
+    })?;
+    Ok(pack_component(val))
 }
 
 // ── JSON deep merge (RT-2) ─────────────────────────────────────
@@ -510,6 +524,7 @@ impl ComponentRegistry {
             drop_fn: drop_ptr::<T>,
             serde: None,
             map_entities: None,
+            legacy_bincode: None,
         });
         self.type_to_id.insert(type_id, id);
         // Register the required components (`#[require]`) EXACTLY ONCE — here, on the type's first
@@ -528,6 +543,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
+                info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }
         id
@@ -536,12 +552,13 @@ impl ComponentRegistry {
     /// Register a component with **context-dependent** serde functions (TD-44): a component with
     /// an external reference (an asset Handle, an Entity reference) is (de)serialized via [`SerdeContext`],
     /// which is provided by `WorldSerializer::*_with` / `PrefabLoader`. Unlike [`register_serde`], it **always
-    /// replaces** the serde functions (context-dependent ones take priority over the default bincode/json). The resolver itself lives in
+    /// replaces** the serde functions (context-dependent ones take priority over the default postcard/json). The resolver itself lives in
     /// the engine/editor — the core stays asset-agnostic.
     pub fn register_serde_with<T: Component>(&mut self, fns: ComponentSerdeFns) -> ComponentId {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.serde = Some(fns);
+            info.legacy_bincode = None;
         }
         id
     }
@@ -577,6 +594,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns_json::<T>());
+                info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }
         id

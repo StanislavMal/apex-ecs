@@ -8,7 +8,9 @@ edition.workspace = true
 apex-core  = { path = "../apex-core" }
 
 serde         = { version = "1.0", features = ["derive"] }
-serde_json    = "1.0"
+# `raw_value`: a JSON payload is carried into the text document verbatim.
+serde_json    = { workspace = true, features = ["raw_value"] }
+# Legacy reader only (documents of wire v3 and older), removed with engine TD-608.
 bincode.workspace   = true
 rustc-hash.workspace = true
 thiserror.workspace  = true

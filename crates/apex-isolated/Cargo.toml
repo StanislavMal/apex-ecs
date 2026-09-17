@@ -11,5 +11,4 @@ apex-serialization = { path = "../apex-serialization" }
 
 crossbeam-channel = { workspace = true }
 serde             = { workspace = true }
-bincode           = { workspace = true }
 log               = { workspace = true }

@@ -2,9 +2,9 @@
 //!
 //! Demonstrates:
 //! - register_component_serde::<T>() — registering a serializable component
-//! - WorldSerializer::snapshot()     — world snapshot to JSON and Bincode
+//! - WorldSerializer::snapshot()     — world snapshot to JSON and the binary form
 //! - WorldSerializer::restore()      — restoring a world from a snapshot
-//! - SaveFormat::Bincode             — binary format (~2.5x more compact than JSON)
+//! - SaveFormat::Binary              — binary format (postcard, several times more compact than JSON)
 //! - WorldDiff                       — incremental saves (changes only)
 //! - HotReloadPlugin::watch_config() — hot reload of JSON configs
 //! - Entity remapping after restore
@@ -95,14 +95,14 @@ fn main() {
         json.len()
     );
 
-    // ── 4. Serialization: snapshot (Bincode) ───────────────────
+    // ── 4. Serialization: snapshot (binary) ────────────────────
 
-    let bincode = snapshot.to_bincode().expect("to_bincode failed");
+    let binary = snapshot.to_binary().expect("to_binary failed");
 
     println!(
-        "  Bincode snapshot: same data, {} bytes ({}x smaller)",
-        bincode.len(),
-        json.len() as f64 / bincode.len() as f64
+        "  Binary snapshot: same data, {} bytes ({}x smaller)",
+        binary.len(),
+        json.len() as f64 / binary.len() as f64
     );
 
     // ── 5. File I/O: save/load ─────────────────────────────────
@@ -115,13 +115,13 @@ fn main() {
     WorldSerializer::write_to_file(&json_path, &snapshot, SaveFormat::Json)
         .expect("write_to_file (JSON) failed");
 
-    // Save as Bincode — several times smaller
+    // Save in the binary form — several times smaller
     let bin_path = dir.join("save.bin");
-    WorldSerializer::write_to_file(&bin_path, &snapshot, SaveFormat::Bincode)
-        .expect("write_to_file (Bincode) failed");
+    WorldSerializer::write_to_file(&bin_path, &snapshot, SaveFormat::Binary)
+        .expect("write_to_file (binary) failed");
 
     println!(
-        "  File sizes: JSON={} bytes, Bincode={} bytes",
+        "  File sizes: JSON={} bytes, binary={} bytes",
         std::fs::metadata(&json_path).unwrap().len(),
         std::fs::metadata(&bin_path).unwrap().len(),
     );
@@ -130,7 +130,7 @@ fn main() {
     let loaded_json = WorldSerializer::read_from_file(&json_path)
         .expect("read_from_file (JSON) failed");
     let loaded_bin  = WorldSerializer::read_from_file(&bin_path)
-        .expect("read_from_file (Bincode) failed");
+        .expect("read_from_file (binary) failed");
 
     assert_eq!(loaded_json.entities.len(), snapshot.entities.len());
     assert_eq!(loaded_bin.entities.len(),  snapshot.entities.len());
@@ -158,12 +158,12 @@ fn main() {
         diff.removed_components.len(),
     );
 
-    // The diff can be serialized to bincode
-    let diff_bytes = diff.to_bincode().expect("diff.to_bincode failed");
-    let loaded_diff = WorldDiff::from_bincode(&diff_bytes)
-        .expect("WorldDiff::from_bincode failed");
+    // The diff can be serialized to the binary form
+    let diff_bytes = diff.to_binary().expect("diff.to_binary failed");
+    let loaded_diff = WorldDiff::from_binary(&diff_bytes)
+        .expect("WorldDiff::from_binary failed");
     assert_eq!(loaded_diff.added_entities.len(), 1);
-    println!("  ✓ WorldDiff bincode roundtrip OK ({} bytes)", diff_bytes.len());
+    println!("  ✓ WorldDiff binary roundtrip OK ({} bytes)", diff_bytes.len());
 
     // ── 7. Serialization: restore ──────────────────────────────
 

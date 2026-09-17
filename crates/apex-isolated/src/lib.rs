@@ -30,7 +30,7 @@ pub use apex_core::WorldRegistrar;
 pub enum BridgeEvent {
     /// An arbitrary callable action.
     Action(Box<dyn FnOnce(&mut World) + Send>),
-    /// A typed event (serialized via bincode).
+    /// A typed event (serialized with `postcard`: both worlds live in one process and one build).
     Event { type_name: String, data: Vec<u8> },
 }
 
@@ -240,7 +240,7 @@ impl WorldBridge {
         self.event_handlers.write().unwrap().insert(
             type_name,
             Box::new(|data: &[u8], world: &mut World| {
-                if let Ok(event) = bincode::deserialize::<T>(data) {
+                if let Ok(event) = apex_core::binary::from_bytes::<T>(data) {
                     world.send_event(event);
                 } else {
                     log::warn!(
@@ -268,17 +268,17 @@ impl WorldBridge {
 
     /// Send a typed event to the target world.
     ///
-    /// The event is serialized with `bincode` before sending.
+    /// The event is serialized with `postcard` before sending.
     /// [`register_event::<T>`](Self::register_event) must be called on the receiving side.
     pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
         let type_name = std::any::type_name::<T>().to_string();
-        let data = match bincode::serialize(event) {
+        let data = match apex_core::binary::to_vec(event) {
             Ok(bytes) => bytes,
             // §0.2a (E12): a serialize failure silently discarded the event.
             Err(e) => {
                 self.stats.record_dropped();
                 apex_core::warn_once!(
-                    "WorldBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
+                    "WorldBridge::send_event: serialize of `{type_name}` failed ({e}) — event dropped"
                 );
                 return;
             }
@@ -522,7 +522,7 @@ impl CloneableBridge {
         self.event_handlers.write().unwrap().insert(
             type_name,
             Box::new(|data: &[u8], world: &mut World| {
-                if let Ok(event) = bincode::deserialize::<T>(data) {
+                if let Ok(event) = apex_core::binary::from_bytes::<T>(data) {
                     world.send_event(event);
                 } else {
                     log::warn!(
@@ -548,18 +548,18 @@ impl CloneableBridge {
         );
     }
 
-    /// Send a typed event to the target world (serialized via bincode).
+    /// Send a typed event to the target world (serialized with `postcard`).
     ///
     /// [`register_event::<T>`](Self::register_event) must be called on the receiving side.
     pub fn send_event<T: serde::Serialize + Send + Sync + 'static>(&self, event: &T) {
         let type_name = std::any::type_name::<T>().to_string();
-        let data = match bincode::serialize(event) {
+        let data = match apex_core::binary::to_vec(event) {
             Ok(bytes) => bytes,
             // §0.2a (E12): a serialize failure silently discarded the event.
             Err(e) => {
                 self.stats.record_dropped();
                 apex_core::warn_once!(
-                    "CloneableBridge::send_event: bincode serialize of `{type_name}` failed ({e}) — event dropped"
+                    "CloneableBridge::send_event: serialize of `{type_name}` failed ({e}) — event dropped"
                 );
                 return;
             }
@@ -747,7 +747,7 @@ mod tests {
             }
         }
         let (main, _sub) = WorldBridge::new();
-        // bincode::serialize fails before the channel is touched — event dropped.
+        // Serialization fails before the channel is touched — event dropped.
         main.send_event(&FailSer);
     }
 

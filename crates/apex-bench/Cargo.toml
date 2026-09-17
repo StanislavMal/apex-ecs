@@ -21,6 +21,9 @@ log = { workspace = true }
 apex-core = { path = "../apex-core" }
 apex-scheduler = { path = "../apex-scheduler" }
 apex-macros = { path = "../apex-macros" }
+apex-serialization = { path = "../apex-serialization" }
+apex-isolated = { path = "../apex-isolated" }
+serde = { workspace = true }
 
 # ECS under test (current released versions — fair comparison vs modern engines)
 bevy_ecs = { version = "0.18", optional = true, features = ["multi_threaded"] }

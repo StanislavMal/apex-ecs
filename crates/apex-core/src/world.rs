@@ -980,7 +980,7 @@ impl World {
         self.resources.insert(value, tick);
     }
 
-    /// E7: include resource `R` in the snapshot (opt-in, bincode). After this,
+    /// E7: include resource `R` in the snapshot (opt-in, binary `postcard`). After this,
     /// `WorldSerializer::snapshot` saves the present resource `R`, and `restore`
     /// restores it. Without registration, resources do NOT go into the snapshot
     /// (the world may contain non-serializable resources — GPU handles, etc.).
@@ -992,19 +992,46 @@ impl World {
         self.resources.register_serde::<R>();
     }
 
+    /// E7: include resource `R` in the snapshot as a JSON value — for resources that ride a
+    /// text document a person reads (a scene), the counterpart of `register_component_serde_json`.
+    pub fn register_resource_serde_json<
+        R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    >(
+        &mut self,
+    ) {
+        self.resources.register_serde_json::<R>();
+    }
+
     /// Snapshot every resource registered via
-    /// [`register_resource_serde`](Self::register_resource_serde) as
-    /// `(type_name, bytes)` pairs. Consumed by `WorldSerializer`.
-    pub fn snapshot_resources_serde(&self) -> Vec<(String, Vec<u8>)> {
+    /// [`register_resource_serde`](Self::register_resource_serde) or
+    /// [`register_resource_serde_json`](Self::register_resource_serde_json), sorted by type name.
+    /// Consumed by `WorldSerializer`.
+    pub fn snapshot_resources_serde(&self) -> Result<Vec<crate::resources::SerializedResource>, String> {
         self.resources.snapshot_serde()
     }
 
-    /// Restore one resource from its serde bytes. `Ok(true)` = applied,
+    /// Restore one resource from its serde bytes written as `format`. `Ok(true)` = applied,
     /// `Ok(false)` = type not registered for serde on this world (caller warns,
     /// §0.2a). Consumed by `WorldSerializer`.
-    pub fn restore_resource_serde(&mut self, type_name: &str, bytes: &[u8]) -> Result<bool, String> {
+    pub fn restore_resource_serde(
+        &mut self,
+        type_name: &str,
+        format: &str,
+        bytes: &[u8],
+    ) -> Result<bool, String> {
         let tick = self.current_tick;
-        self.resources.restore_serde(type_name, bytes, tick)
+        self.resources.restore_serde(type_name, format, bytes, tick)
+    }
+
+    /// Restore one resource from a payload in the retired `bincode` encoding (wire v3 and older).
+    /// Removed with engine TD-608 (2026-12-17).
+    pub fn restore_resource_serde_legacy_bincode(
+        &mut self,
+        type_name: &str,
+        bytes: &[u8],
+    ) -> Result<bool, String> {
+        let tick = self.current_tick;
+        self.resources.restore_serde_legacy_bincode(type_name, bytes, tick)
     }
 
     /// RT-2: opt resource `R` into the name-addressed read-only JSON view

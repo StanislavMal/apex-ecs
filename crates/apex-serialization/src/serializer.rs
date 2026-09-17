@@ -1,7 +1,7 @@
 //! WorldSerializer — world snapshot and restore logic.
 //!
 //! Supports:
-//! - JSON and Bincode formats
+//! - The text document and the binary form (`crate::wire`), older versions read (`crate::legacy`)
 //! - Versioning with automatic migration
 //! - Incremental diff-saves
 //! - File I/O with arbitrary format
@@ -18,9 +18,10 @@ use apex_core::{
 
 use crate::prefab::{PrefabChild, PrefabComponent, PrefabManifest};
 use crate::snapshot::{
-    ComponentSnapshot, EntitySnapshot, RelationSnapshot, SaveFormat, WorldDiff,
-    WorldSnapshot,
+    ComponentSnapshot, DataFormat, EntitySnapshot, RelationSnapshot, ResourceSnapshot, SaveFormat,
+    WorldDiff, WorldSnapshot,
 };
+use apex_core::{SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD};
 
 /// One entity's serialized components — the SHARED body of
 /// [`WorldSerializer::snapshot_with_filter`] (archetype scan) and
@@ -69,7 +70,7 @@ fn entity_snapshot(
 
         // Save depending on the serialization format
         match serde_fns.format {
-            "json" => {
+            SERDE_FORMAT_JSON => {
                 entity_snap.components.push(ComponentSnapshot::new_json(
                     info.name.to_string(),
                     raw_bytes,
@@ -107,8 +108,23 @@ pub enum SerializationError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] Box<bincode::ErrorKind>),
+    #[error("binary format error: {0}")]
+    Binary(#[from] apex_core::binary::Error),
+
+    #[error("legacy bincode document: {0}")]
+    LegacyBincode(#[from] Box<bincode::ErrorKind>),
+
+    #[error("not an apex world document: {reason}")]
+    NotADocument { reason: String },
+
+    #[error("{what} `{type_name}` holds a payload in the retired bincode encoding; restore the document into a world and snapshot it again before writing it")]
+    LegacyPayload { what: &'static str, type_name: String },
+
+    #[error("{what} `{type_name}` cannot be written: {reason}")]
+    Encode { what: &'static str, type_name: String, reason: String },
+
+    #[error("resource snapshot failed: {0}")]
+    ResourceSerializeFailed(String),
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -206,9 +222,12 @@ impl WorldSerializer {
         // ── Resources (E7) ─────────────────────────────────────
         // Only resources opted in via `register_resource_serde` (a world may
         // hold non-serializable resources — GPU handles etc.).
-        for (type_name, data) in world.snapshot_resources_serde() {
-            snap.resources
-                .push(crate::snapshot::ResourceSnapshot { type_name, data });
+        for r in world.snapshot_resources_serde().map_err(SerializationError::ResourceSerializeFailed)? {
+            snap.resources.push(ResourceSnapshot {
+                type_name: r.type_name,
+                format:    if r.format == SERDE_FORMAT_JSON { DataFormat::Json } else { DataFormat::Binary },
+                data:      r.data,
+            });
         }
 
         Ok(snap)
@@ -434,17 +453,44 @@ impl WorldSerializer {
                     // marker ever to grow). Here the type decides what bare presence means — a
                     // marker that grew reads it as its defaults — and a type that cannot read
                     // `null` still fails loudly, naming itself.
-                    let raw: &[u8] = if comp_snap.data.is_empty() && serde_fns.format == "json" {
-                        b"null"
-                    } else {
-                        &comp_snap.data
-                    };
+                    let registered_json = serde_fns.format == SERDE_FORMAT_JSON;
+                    match comp_snap.format {
+                        // A document of wire v3 or older: decode through the type's legacy reader.
+                        DataFormat::LegacyBincode => {
+                            let legacy = info.legacy_bincode.ok_or_else(|| SerializationError::DeserializeFailed {
+                                type_name: comp_snap.type_name.clone(),
+                                reason:    "the payload is in the retired bincode encoding, and the type is registered with context-dependent serde fns, which never wrote it".into(),
+                            })?;
+                            legacy(&comp_snap.data).map_err(|e| SerializationError::DeserializeFailed {
+                                type_name: comp_snap.type_name.clone(),
+                                reason:    e.to_string(),
+                            })?
+                        }
+                        // A payload of the other format than the registration: name both, rather
+                        // than let the wrong reader report a parse error at column 1.
+                        format if (format == DataFormat::Json) != registered_json => {
+                            return Err(SerializationError::DeserializeFailed {
+                                type_name: comp_snap.type_name.clone(),
+                                reason:    format!(
+                                    "the payload is {format:?}, the type is registered as {}",
+                                    serde_fns.format
+                                ),
+                            });
+                        }
+                        _ => {
+                            let raw: &[u8] = if comp_snap.data.is_empty() && registered_json {
+                                b"null"
+                            } else {
+                                &comp_snap.data
+                            };
 
-                    (serde_fns.deserialize_fn)(raw, ctx)
-                        .map_err(|e| SerializationError::DeserializeFailed {
-                            type_name: comp_snap.type_name.clone(),
-                            reason:    e.to_string(),
-                        })?
+                            (serde_fns.deserialize_fn)(raw, ctx)
+                                .map_err(|e| SerializationError::DeserializeFailed {
+                                    type_name: comp_snap.type_name.clone(),
+                                    reason:    e.to_string(),
+                                })?
+                        }
+                    }
                 };
 
                 world.insert_dyn(new_entity, component_id, component_bytes, tick);
@@ -501,7 +547,12 @@ impl WorldSerializer {
 
         // ── Step 3: Resources (E7) ─────────────────────────────
         for res in &snapshot.resources {
-            match world.restore_resource_serde(&res.type_name, &res.data) {
+            let restored = match res.format {
+                DataFormat::Json => world.restore_resource_serde(&res.type_name, SERDE_FORMAT_JSON, &res.data),
+                DataFormat::Binary => world.restore_resource_serde(&res.type_name, SERDE_FORMAT_POSTCARD, &res.data),
+                DataFormat::LegacyBincode => world.restore_resource_serde_legacy_bincode(&res.type_name, &res.data),
+            };
+            match restored {
                 Ok(true) => {}
                 // §0.2a: a resource in the snapshot whose type is not registered
                 // for serde on this world is silently lost otherwise.
@@ -646,6 +697,20 @@ impl WorldSerializer {
             }
         }
 
+        // Resources — by type name, the same byte-level delta as components.
+        let old_resources: HashMap<&str, &ResourceSnapshot> =
+            old.resources.iter().map(|r| (r.type_name.as_str(), r)).collect();
+        for res in &new.resources {
+            if old_resources.get(res.type_name.as_str()).is_none_or(|o| o.data != res.data || o.format != res.format) {
+                diff.changed_resources.push(res.clone());
+            }
+        }
+        for res in &old.resources {
+            if !new.resources.iter().any(|r| r.type_name == res.type_name) {
+                diff.removed_resources.push(res.type_name.clone());
+            }
+        }
+
         Ok(diff)
     }
 
@@ -728,6 +793,16 @@ impl WorldSerializer {
         // Add relations
         result.relations.extend(diff.added_relations.clone());
 
+        // Resources
+        result.resources.retain(|r| !diff.removed_resources.contains(&r.type_name));
+        for res in &diff.changed_resources {
+            match result.resources.iter_mut().find(|r| r.type_name == res.type_name) {
+                Some(old) => *old = res.clone(),
+                None => result.resources.push(res.clone()),
+            }
+        }
+        result.resources.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+
         Ok(result)
     }
 
@@ -766,7 +841,7 @@ impl WorldSerializer {
     ) -> Result<(), SerializationError> {
         let data = match format {
             SaveFormat::Json => snap.to_json()?,
-            SaveFormat::Bincode => snap.to_bincode()?,
+            SaveFormat::Binary => snap.to_binary()?,
         };
         Self::atomic_write(path, &data)?;
         Ok(())
@@ -775,8 +850,8 @@ impl WorldSerializer {
     /// Read a snapshot from a file, auto-detecting the format by extension.
     ///
     /// Supported extensions:
-    /// - `.json` → JSON
-    /// - `.bin` → Bincode
+    /// - `.json` → the text document
+    /// - `.bin` → the binary form
     pub fn read_from_file(path: &Path) -> Result<WorldSnapshot, SerializationError> {
         let data = std::fs::read(path)?;
         let ext = path.extension()
@@ -785,12 +860,12 @@ impl WorldSerializer {
 
         let mut snap = match ext {
             "json" => WorldSnapshot::from_json(&data)?,
-            "bin" => WorldSnapshot::from_bincode(&data)?,
+            "bin" => WorldSnapshot::from_binary(&data)?,
             _ => {
-                // Try JSON, then Bincode
+                // Try the text document, then the binary form
                 if let Ok(snap) = WorldSnapshot::from_json(&data) {
                     snap
-                } else if let Ok(snap) = WorldSnapshot::from_bincode(&data) {
+                } else if let Ok(snap) = WorldSnapshot::from_binary(&data) {
                     snap
                 } else {
                     return Err(SerializationError::Migration(format!(
@@ -810,7 +885,7 @@ impl WorldSerializer {
 
     /// Save a diff to a file (always in binary format).
     pub fn write_diff_to_file(path: &Path, diff: &WorldDiff) -> Result<(), SerializationError> {
-        let data = diff.to_bincode()?;
+        let data = diff.to_binary()?;
         Self::atomic_write(path, &data)?;
         Ok(())
     }
@@ -818,7 +893,7 @@ impl WorldSerializer {
     /// Read a diff from a file.
     pub fn read_diff_from_file(path: &Path) -> Result<WorldDiff, SerializationError> {
         let data = std::fs::read(path)?;
-        let diff = WorldDiff::from_bincode(&data)?;
+        let diff = WorldDiff::from_binary(&data)?;
         Ok(diff)
     }
 
@@ -1127,10 +1202,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_bincode_roundtrip() {
+    fn snapshot_binary_roundtrip() {
         let world = setup_world();
         let snap = WorldSerializer::snapshot(&world).unwrap();
-        let binary = snap.to_bincode().unwrap();
+        let binary = snap.to_binary().unwrap();
 
         let mut restored_world = World::new();
         restored_world.register_component::<RenderHandle>();
@@ -1141,7 +1216,7 @@ mod tests {
         let c = restored_world.spawn((Position { x: 0.0, y: 0.0 },));
         restored_world.add_relation(c, apex_core::relations::ChildOf, p);
 
-        let restored_snap = WorldSnapshot::from_bincode(&binary).unwrap();
+        let restored_snap = WorldSnapshot::from_binary(&binary).unwrap();
         let entity_map = WorldSerializer::restore(&mut restored_world, &restored_snap).unwrap();
 
         assert!(!entity_map.is_empty());
@@ -1151,14 +1226,14 @@ mod tests {
     }
 
     #[test]
-    fn bincode_smaller_than_json() {
+    fn binary_smaller_than_json() {
         let world = setup_world();
         let snap = WorldSerializer::snapshot(&world).unwrap();
         let json_size = snap.to_json().unwrap().len();
-        let bincode_size = snap.to_bincode().unwrap().len();
+        let binary_size = snap.to_binary().unwrap().len();
 
-        assert!(bincode_size < json_size,
-            "bincode={} should be < json={}", bincode_size, json_size);
+        assert!(binary_size < json_size,
+            "binary={} should be < json={}", binary_size, json_size);
     }
 
     #[test]
@@ -1214,13 +1289,13 @@ mod tests {
         let loaded = WorldSerializer::read_from_file(&json_path).unwrap();
         assert_eq!(loaded.entities.len(), snap.entities.len());
 
-        // Bincode
+        // Binary
         let bin_path = dir.join("test_save.bin");
-        WorldSerializer::write_to_file(&bin_path, &snap, SaveFormat::Bincode).unwrap();
+        WorldSerializer::write_to_file(&bin_path, &snap, SaveFormat::Binary).unwrap();
         let loaded_bin = WorldSerializer::read_from_file(&bin_path).unwrap();
         assert_eq!(loaded_bin.entities.len(), snap.entities.len());
 
-        // The Bincode file must be smaller
+        // The binary file must be smaller
         let json_meta = std::fs::metadata(&json_path).unwrap();
         let bin_meta = std::fs::metadata(&bin_path).unwrap();
         assert!(bin_meta.len() < json_meta.len(),
@@ -1258,9 +1333,8 @@ mod tests {
         let dir = apex_test_dir::TestDir::new("apex_serialization_migrate");
         let path = dir.join("old.json");
 
-        let mut snap = WorldSnapshot::new(0);
-        snap.version = 0; // older format; a v0 -> v1 migration is registered
-        std::fs::write(&path, snap.to_json().unwrap()).unwrap();
+        // A v0 document (the inline form, written before versions existed in any other shape).
+        std::fs::write(&path, br#"{"version":0,"tick":0,"entities":[],"relations":[]}"#).unwrap();
 
         let loaded = WorldSerializer::read_from_file(&path).unwrap();
         assert_eq!(
@@ -1285,8 +1359,8 @@ mod tests {
         assert_eq!(diff.added_entities.len(), 1);
 
         // Save the diff and load it back
-        let diff_bytes = diff.to_bincode().unwrap();
-        let loaded_diff = WorldDiff::from_bincode(&diff_bytes).unwrap();
+        let diff_bytes = diff.to_binary().unwrap();
+        let loaded_diff = WorldDiff::from_binary(&diff_bytes).unwrap();
         assert_eq!(loaded_diff.added_entities.len(), 1);
     }
 
@@ -1367,6 +1441,51 @@ mod tests {
         assert!(world.get::<Wrapper<u32>>(e2).is_none());
     }
 
+    /// A float read from a text document is the float that was written — to the last bit, however
+    /// many saves and loads it goes through. Found re-saving a real scene (TD-608): a transform
+    /// coordinate stored as `5.5955240441107883e-14` (`0x1.f7fffffffffffp-45`, the correct shortest
+    /// spelling) was read one ulp lower, because `serde_json` parses floats approximately unless its
+    /// `float_roundtrip` feature is on, and the next save wrote the drifted value. The values are
+    /// the drifting one and extremes of both widths.
+    #[test]
+    fn a_float_survives_the_text_document_to_the_last_bit() {
+        #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize)]
+        struct Precise {
+            wide: [f64; 6],
+            narrow: [f32; 3],
+        }
+        let written = Precise {
+            wide: [
+                f64::from_bits(0x3d2f_7fff_ffff_ffff), // 5.5955240441107883e-14
+                0.1,
+                1.0 / 3.0,
+                f64::MIN_POSITIVE,
+                f64::MAX,
+                -2.2250738585072014e-308,
+            ],
+            narrow: [0.1, f32::MIN_POSITIVE, 16_777_217.0],
+        };
+        assert_eq!(written.wide[0].to_string(), "0.000000000000055955240441107883");
+
+        let mut world = World::new();
+        world.register_component_serde_json::<Precise>();
+        world.spawn((written,));
+        let mut bytes = WorldSerializer::snapshot(&world).unwrap().to_json().unwrap();
+        for _ in 0..3 {
+            let mut w2 = World::new();
+            w2.register_component_serde_json::<Precise>();
+            let map = WorldSerializer::restore(&mut w2, &WorldSnapshot::from_json(&bytes).unwrap()).unwrap();
+            let read = *w2.get::<Precise>(*map.values().next().unwrap()).unwrap();
+            for (a, b) in written.wide.iter().zip(read.wide) {
+                assert_eq!(a.to_bits(), b.to_bits(), "f64 {a:e} came back as {b:e}");
+            }
+            for (a, b) in written.narrow.iter().zip(read.narrow) {
+                assert_eq!(a.to_bits(), b.to_bits(), "f32 {a:e} came back as {b:e}");
+            }
+            bytes = WorldSerializer::snapshot(&w2).unwrap().to_json().unwrap();
+        }
+    }
+
     /// E7: a resource opted into serde survives snapshot/restore into a fresh
     /// world; a non-registered resource is simply absent (no panic).
     #[test]
@@ -1396,6 +1515,122 @@ mod tests {
                 name: "prod".into()
             })
         );
+    }
+
+    /// A resource that changed between two snapshots rides the diff, and applying the diff yields
+    /// the new value. Before wire v4 a diff carried no resources: the incremental save kept the
+    /// OLD value of every changed resource, and a removed one came back.
+    #[test]
+    fn a_changed_or_removed_resource_rides_the_diff() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Config {
+            level: u32,
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Session(u64);
+
+        let mut world = World::new();
+        world.register_resource_serde_json::<Config>();
+        world.register_resource_serde::<Session>();
+        world.insert_resource(Config { level: 1 });
+        world.insert_resource(Session(9));
+        let old = WorldSerializer::snapshot(&world).unwrap();
+
+        world.insert_resource(Config { level: 2 });
+        world.remove_resource::<Session>();
+        let diff = WorldSerializer::diff(&old, &world).unwrap();
+        assert_eq!(diff.changed_resources.len(), 1, "{diff:?}");
+        assert_eq!(diff.removed_resources.len(), 1, "{diff:?}");
+
+        let diff = WorldDiff::from_binary(&diff.to_binary().unwrap()).unwrap();
+        let patched = WorldSerializer::apply_diff_to_snapshot(&old, &diff).unwrap();
+        let mut w2 = World::new();
+        w2.register_resource_serde_json::<Config>();
+        w2.register_resource_serde::<Session>();
+        WorldSerializer::restore(&mut w2, &patched).unwrap();
+        assert_eq!(w2.try_resource::<Config>(), Some(&Config { level: 2 }));
+        assert_eq!(w2.try_resource::<Session>(), None, "the removed resource stays removed");
+
+        // An unchanged world diffs to nothing, resources included.
+        let still = WorldSerializer::snapshot(&w2).unwrap();
+        assert!(WorldSerializer::diff(&still, &w2).unwrap().is_empty());
+    }
+
+    /// A document written before wire v4 — `bincode` resource and binary component payloads —
+    /// restores through each type's legacy reader, whatever the type is registered as today, and
+    /// the next save writes the current format.
+    #[test]
+    fn a_v3_document_with_bincode_payloads_restores_and_saves_as_v4() {
+        #[derive(Component, Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+        struct Packed {
+            a: u32,
+            b: f32,
+        }
+        #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+        struct Materials {
+            by_name: std::collections::BTreeMap<String, String>,
+        }
+        let materials = Materials { by_name: [("m1".to_string(), "{}".to_string())].into() };
+        let packed = Packed { a: 7, b: 0.5 };
+
+        let v3 = crate::legacy::InternedSnapshot {
+            version:      3,
+            tick:         1,
+            string_table: vec![std::any::type_name::<Packed>().into(), std::any::type_name::<Materials>().into()],
+            entities:     vec![crate::legacy::InternedEntity {
+                original_index: 0,
+                components:     vec![crate::legacy::InternedComponent {
+                    name_idx: 0,
+                    data:     bincode::serialize(&packed).unwrap(),
+                    format:   crate::legacy::LegacyDataFormat::Binary,
+                }],
+            }],
+            relations:    Vec::new(),
+            resources:    vec![crate::legacy::InternedResource { name_idx: 1, data: bincode::serialize(&materials).unwrap() }],
+        };
+
+        for bytes in [serde_json::to_vec_pretty(&v3).unwrap(), bincode::serialize(&v3).unwrap()] {
+            let snap = WorldSnapshot::from_json(&bytes).or_else(|_| WorldSnapshot::from_binary(&bytes)).unwrap();
+            let mut world = World::new();
+            world.register_component_serde::<Packed>();
+            world.register_resource_serde_json::<Materials>();
+            let map = WorldSerializer::restore(&mut world, &snap).unwrap();
+            assert_eq!(world.get::<Packed>(map[&0]), Some(&packed));
+            assert_eq!(world.try_resource::<Materials>(), Some(&materials));
+            // The pre-pass reader of a resource gets the same value without a world.
+            assert_eq!(snap.resources[0].decode::<Materials>().unwrap(), materials);
+
+            let saved = WorldSerializer::snapshot(&world).unwrap();
+            let text = String::from_utf8(saved.to_json().unwrap()).unwrap();
+            assert!(text.contains(r#""version": 4"#), "{text}");
+            assert!(text.contains(r#"{"by_name":{"m1":"{}"}}"#), "the resource is a readable value now: {text}");
+        }
+    }
+
+    /// A payload in another format than its type's registration is named as such.
+    #[test]
+    fn a_payload_of_the_other_format_names_both_formats() {
+        let mut world = World::new();
+        world.register_component_serde_json::<Position>();
+        let e = world.spawn((Position { x: 1.0, y: 2.0 },));
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+
+        let mut w2 = World::new();
+        w2.register_component_serde::<Position>();
+        let err = WorldSerializer::restore(&mut w2, &snap).unwrap_err().to_string();
+        assert!(err.contains("Json") && err.contains("postcard"), "{err}");
+
+        #[derive(Serialize, Deserialize)]
+        struct Level(u32);
+        let mut world = World::new();
+        world.register_resource_serde_json::<Level>();
+        world.insert_resource(Level(3));
+        let snap = WorldSerializer::snapshot(&world).unwrap();
+        let mut w2 = World::new();
+        w2.register_resource_serde::<Level>();
+        WorldSerializer::restore(&mut w2, &snap).unwrap();
+        assert!(w2.try_resource::<Level>().is_none(), "a mismatched resource is dropped loudly, not misread");
+        let _ = e;
     }
 
     /// E6: a component holding an `Entity` ref is remapped on restore — the ref
@@ -1561,7 +1796,7 @@ mod tests {
                 std::mem::forget(r);
                 Ok(buf)
             },
-            format: "bincode",
+            format: "raw-le-u64",
         };
 
         let mut world = World::new();

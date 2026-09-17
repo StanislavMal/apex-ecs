@@ -872,6 +872,7 @@ mod tests {
             drop_fn: noop_drop,
             serde: None,
             map_entities: None,
+            legacy_bincode: None,
         }
     }
 
@@ -1009,6 +1010,7 @@ mod tests {
             drop_fn: counting_panic_drop,
             serde: None,
             map_entities: None,
+            legacy_bincode: None,
         };
         let mut col = Column::new(&info);
         for v in [10u32, 20, 30] {
@@ -1058,6 +1060,7 @@ mod tests {
             drop_fn: noop_drop,
             serde: None,
             map_entities: None,
+            legacy_bincode: None,
         };
         let mut col = Column::new(&info);
         // new_cap == 4 → item_size * 4 overflows usize → checked_mul panics.
@@ -1165,6 +1168,7 @@ mod tests {
             drop_fn: noop_drop,
             serde: None,
             map_entities: None,
+            legacy_bincode: None,
         };
         let mut col = Column::new(&info);
         unsafe {

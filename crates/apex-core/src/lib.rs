@@ -74,6 +74,7 @@ macro_rules! anomaly {
 
 pub mod access;
 pub mod archetype;
+pub mod binary;
 pub mod commands;
 pub mod component;
 pub mod dense;
@@ -103,7 +104,7 @@ pub use commands::Commands;
 pub use component::{
     json_merge, make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentHookFn,
     ComponentId, ComponentRegistry, ComponentSerdeFns, MapEntities, MapEntitiesFn, NoContext,
-    Serializable, SerdeContext, Tick,
+    Serializable, SerdeContext, Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD,
 };
 pub use entity::Entity;
 pub use error::{Anomaly, AnomalyCounts, ErrorHandler, ErrorMode, Severity};
@@ -121,7 +122,7 @@ pub use query::{
 };
 pub use registrar::WorldRegistrar;
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
-pub use resources::Resources;
+pub use resources::{Resources, SerializedResource};
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
 pub use system_param::{

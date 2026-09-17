@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Changed — сцену можно прочитать; бинарный формат — postcard (2026-09-17, ADR-018)
+
+- **Wire-версия 4.** Текстовый документ (`to_json`) хранит компонент и ресурс ЗНАЧЕНИЕМ по полному
+  имени типа (`"game::Health": {"hp":50.0}`), байт в байт как их выдал serde; до v4 полезная нагрузка
+  лежала массивом чисел по байту (сцена движка — 640 КБ нечитаемого). Неизвестное поле и дважды
+  названный тип — ошибка.
+- **`bincode` → `postcard`** (RUSTSEC-2025-0141: `bincode` без сопровождения, вся линейка): бинарный
+  снимок и дифф (магия `APXW`/`APXD`, версия первым полем), `register_component_serde`,
+  `register_resource_serde`, события `WorldBridge`/`CloneableBridge`.
+- **API:** `to_bincode`/`from_bincode` → `to_binary`/`from_binary`; `SaveFormat::Bincode` → `Binary`;
+  методы формата возвращают `SerializationError`; новые `register_resource_serde_json`,
+  `ResourceSnapshot { format }` и `ResourceSnapshot::decode::<R>()`, `SERDE_FORMAT_JSON` /
+  `SERDE_FORMAT_POSTCARD`; `snapshot_resources_serde` → `Result<Vec<SerializedResource>, String>`
+  (отсортировано по имени), `restore_resource_serde(name, format, bytes)`. In-memory типы снимка
+  больше не `Serialize`/`Deserialize` — байтовые формы только в `wire`/`legacy`.
+- **Дифф несёт ресурсы** (`changed_resources`, `removed_resources`): раньше инкрементальное
+  сохранение молча оставляло старое значение изменённого ресурса.
+- **Старые документы (v0–v3) читаются** до 2026-12-17: `bincode`-байты ресурсов и бинарных
+  компонентов помечаются `DataFormat::LegacyBincode` и декодируются читателем типа при restore.
+- **`apex_core::binary::to_vec`** — единственная дорога бинарной записи (размер заранее; `to_allocvec` был
+  вдвое медленнее на мелких значениях).
+- **Fixed — float из текстового документа читается до последнего бита:** `serde_json` с `float_roundtrip`.
+  Без него загрузка+сохранение сдвигали f64 на ulp (гейт `a_float_survives_the_text_document_to_the_last_bit`).
+
 ### Fixed — запись сразу после прямого прохода трансформов терялась навсегда (2026-09-14, ADR-016)
 
 - **`World::increment_change_tick() -> Tick`** (Bevy 1:1) — текущий тик с закрытым за ним окном.

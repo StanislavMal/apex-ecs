@@ -174,9 +174,9 @@ fn full_world_json_roundtrip_preserves_every_component_and_relation() {
     );
 }
 
-/// Bincode is the other supported wire format — the same equivalence must hold.
+/// The binary form is the other supported wire format — the same equivalence must hold.
 #[test]
-fn full_world_bincode_roundtrip_preserves_relations() {
+fn full_world_binary_roundtrip_preserves_relations() {
     let mut world = World::new();
     register_vocabulary(&mut world);
     let a = world.spawn((Position { x: 7.0, y: 8.0 }, Frozen));
@@ -184,8 +184,8 @@ fn full_world_bincode_roundtrip_preserves_relations() {
     world.add_relation(a, ChildOf, b);
 
     let snap = WorldSerializer::snapshot(&world).unwrap();
-    let bytes = snap.to_bincode().unwrap();
-    let parsed = WorldSnapshot::from_bincode(&bytes).unwrap();
+    let bytes = snap.to_binary().unwrap();
+    let parsed = WorldSnapshot::from_binary(&bytes).unwrap();
 
     let mut restored = World::new();
     register_vocabulary(&mut restored);
@@ -195,10 +195,10 @@ fn full_world_bincode_roundtrip_preserves_relations() {
     let a2 = map[&a.index()];
     let b2 = map[&b.index()];
     assert_eq!(restored.get::<Position>(a2), Some(&Position { x: 7.0, y: 8.0 }));
-    assert!(restored.get::<Frozen>(a2).is_some(), "ZST marker survives bincode");
+    assert!(restored.get::<Frozen>(a2).is_some(), "ZST marker survives the binary form");
     assert!(
         restored.has_relation(a2, ChildOf, b2),
-        "ChildOf(a -> b) must survive a bincode round-trip and remap"
+        "ChildOf(a -> b) must survive a binary round-trip and remap"
     );
 }
 

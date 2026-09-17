@@ -113,7 +113,7 @@ fn worker_loop_processes_stream_and_echoes_result_back() {
 
 // ── Typed events deserialize on the far side of the boundary ──────
 
-/// `send_event` serializes with bincode; the worker registers the type and
+/// `send_event` serializes with postcard; the worker registers the type and
 /// deserializes it during drain. Proves the serialized wire path works across a
 /// real thread, not just in-process.
 #[test]

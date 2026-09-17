@@ -21,6 +21,16 @@
 
 ---
 
+## 🟢 LEGACY-BINCODE — чтение документов wire v0–v3 до 2026-12-17 (ADR-018, движковый TD-608)
+
+`bincode` 1.x без сопровождения (RUSTSEC-2025-0141). Запись переведена на `postcard` и текстовые
+значения (wire v4); чтение старого держат `apex-serialization/src/legacy.rs`,
+`ComponentInfo::legacy_bincode`, `ResourceSerdeFns::legacy_bincode` и зависимость `bincode` в
+`apex-core`/`apex-serialization`. **2026-12-17** — удалить их вместе с игнором RUSTSEC-2025-0141 в
+`apex-engine/deny.toml`; движковые документы к этой дате пересохранены (TD-608).
+
+---
+
 ## 🟡 §0.2a-громкость — снапшот молчит о том, что выбросил
 
 - **SNAP-REL 🟡 — `snapshot_with_filter` МОЛЧА выбрасывает связь, чей subject или target не прошёл

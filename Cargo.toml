@@ -44,8 +44,17 @@ thiserror = "2.0"
 
 # Serialization
 serde      = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip`: a float read from a text document is the float that was written, to the last
+# bit. Without it the parser rounds approximately, and a load followed by a save moves a coordinate
+# by an ulp (gate `a_float_survives_the_text_document_to_the_last_bit`, engine TD-608). Cargo
+# unifies features, so this holds for every crate of a build that includes the core.
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+# Retired binary format: read-only, for documents written before wire v4 (engine TD-608,
+# removed 2026-12-17). New binary data is `postcard`.
 bincode    = "1.3"
+# Binary format of snapshots, diffs, binary components and events between worlds. The wire
+# format is stable across 1.x by its specification.
+postcard   = { version = "1.1", default-features = false, features = ["use-std"] }
 
 # Math for transforms
 glam = { version = "0.32", features = ["serde"] }
