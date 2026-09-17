@@ -1,5 +1,6 @@
 [package]
 name = "apex-core"
+publish = false
 version.workspace = true
 edition.workspace = true
 

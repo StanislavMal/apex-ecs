@@ -1,5 +1,6 @@
 [package]
 name = "apex-test-dir"
+publish = false
 version.workspace = true
 edition.workspace = true
 description = "A scratch directory for a test that is removed when the value is dropped - including when the test panics (engine TD-564). Dev-dependency only; depends on nothing."

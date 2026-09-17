@@ -1,5 +1,6 @@
 [package]
 name = "apex-isolated"
+publish = false
 version.workspace = true
 edition.workspace = true
 
