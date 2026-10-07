@@ -787,20 +787,8 @@ impl World {
             i += 1;
             match ev {
                 HookEvent::Added(entity, cid) => {
-                    // Required components (D2-4) — BEFORE the user's on_add: the
-                    // hook sees the entity already with its full composition.
-                    // Transitive requires go through this same queue (inserting R
-                    // queues its own Added event).
-                    if world.registry.flags(cid) & crate::component::FLAG_REQUIRES != 0 {
-                        let fns: SmallVec<[crate::component::RequiredInsertFn; 4]> = world
-                            .registry
-                            .requires(cid)
-                            .map(|s| s.iter().copied().collect())
-                            .unwrap_or_default();
-                        for f in fns {
-                            f(world, entity);
-                        }
-                    }
+                    // Required components (D2-4) arrived with the structural operation itself (ADR-019): the hook
+                    // sees the entity with its full composition.
                     let hook = world.registry.hooks(cid).and_then(|h| h.on_add);
                     if let Some(f) = hook {
                         f(world, entity);
@@ -1346,6 +1334,7 @@ impl World {
         // with the column index already known instead of re-derived per component.
         bundle.write_into_batch(self, archetype_id, row, tick, &cols);
         self.bundle_cols_scratch = cols;
+        self.write_required_defaults(slot, archetype_id, row, tick, true);
         self.entities.set_location(
             entity,
             EntityLocation {
@@ -1421,6 +1410,7 @@ impl World {
                     let bundle = make_bundle(i);
                     world.archetypes[arch_idx].entities.push(entity);
                     bundle.write_data_into_batch(world, archetype_id, row, tick, &col_indices);
+                    world.write_required_defaults(slot, archetype_id, row, tick, false);
                 }
             }
             guard.armed = false;
@@ -1430,8 +1420,10 @@ impl World {
             // (leaf/tuple/derive) it fills count new slots; for the default (manual
             // impl → write_into_batch already set ticks/len) it is a no-op.
             let target_len = start_row + count;
+            let required_cols: SmallVec<[usize; 2]> =
+                self.bundles.infos[slot].required.iter().map(|(c, _)| *c).collect();
             let arch = &mut self.archetypes[arch_idx];
-            for &col_idx in &col_indices {
+            for &col_idx in col_indices.iter().chain(required_cols.iter()) {
                 let col = &mut arch.columns[col_idx];
                 col.change_ticks
                     .resize_with(target_len, || TickCell::new(tick));
@@ -1568,13 +1560,15 @@ impl World {
                     let row = start_row + i;
                     world.archetypes[arch_idx].entities.push(entity);
                     bundle.write_data_into_batch(world, archetype_id, row, tick, &col_indices);
+                    world.write_required_defaults(slot, archetype_id, row, tick, false);
                 }
             }
             guard.armed = false;
             drop(guard);
         }
         let target_len = start_row + count;
-        for &col_idx in &col_indices {
+        let required_cols: SmallVec<[usize; 2]> = self.bundles.infos[slot].required.iter().map(|(c, _)| *c).collect();
+        for &col_idx in col_indices.iter().chain(required_cols.iter()) {
             let col = &mut self.archetypes[arch_idx].columns[col_idx];
             col.change_ticks
                 .resize_with(target_len, || TickCell::new(tick));
@@ -1675,7 +1669,7 @@ impl World {
             return;
         }
 
-        let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
+        let (new_arch_id, required) = self.insert_target(location.archetype_id, component_id);
         let new_row = self.move_entity(entity, location, new_arch_id);
         let tick = self.current_tick;
         unsafe {
@@ -1687,6 +1681,7 @@ impl World {
             );
         }
         std::mem::forget(component);
+        self.write_inserted_requirements(new_arch_id, new_row as usize, &required, tick);
         self.entities.set_location(
             entity,
             EntityLocation {
@@ -1694,11 +1689,18 @@ impl World {
                 row: new_row,
             },
         );
-        if self.registry.any_flags()
-            && self.registry.flags(component_id) & crate::component::ADDED_NOTIFY_MASK != 0
-        {
-            self.hook_queue.push(HookEvent::Added(entity, component_id));
-            self.flush_hooks();
+        // The folded requirements appeared too: their own `on_add` and requirements run as if inserted one by one.
+        if self.registry.any_flags() {
+            let mut queued = false;
+            for cid in std::iter::once(component_id).chain(required.iter().map(|(id, _)| *id)) {
+                if self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
+                    self.hook_queue.push(HookEvent::Added(entity, cid));
+                    queued = true;
+                }
+            }
+            if queued {
+                self.flush_hooks();
+            }
         }
     }
 
@@ -1777,7 +1779,7 @@ impl World {
             return;
         }
 
-        let new_arch_id = self.find_or_create_archetype_with(location.archetype_id, component_id);
+        let (new_arch_id, required) = self.insert_target(location.archetype_id, component_id);
         let new_row = self.move_entity(entity, location, new_arch_id);
         unsafe {
             self.archetypes[new_arch_id.0 as usize].write_component(
@@ -1787,6 +1789,7 @@ impl World {
                 tick,
             );
         }
+        self.write_inserted_requirements(new_arch_id, new_row as usize, &required, tick);
         self.entities.set_location(
             entity,
             EntityLocation {
@@ -1794,11 +1797,18 @@ impl World {
                 row: new_row,
             },
         );
-        if self.registry.any_flags()
-            && self.registry.flags(component_id) & crate::component::ADDED_NOTIFY_MASK != 0
-        {
-            self.hook_queue.push(HookEvent::Added(entity, component_id));
-            self.flush_hooks();
+        // The folded requirements appeared too: their own `on_add` and requirements run as if inserted one by one.
+        if self.registry.any_flags() {
+            let mut queued = false;
+            for cid in std::iter::once(component_id).chain(required.iter().map(|(id, _)| *id)) {
+                if self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
+                    self.hook_queue.push(HookEvent::Added(entity, cid));
+                    queued = true;
+                }
+            }
+            if queued {
+                self.flush_hooks();
+            }
         }
     }
 
@@ -1841,12 +1851,39 @@ impl World {
         // component is already in the target composition).
         let any_flags = self.registry.any_flags();
         let mut added_hooked: SmallVec<[ComponentId; 8]> = SmallVec::new();
+        let mut fresh: SmallVec<[ComponentId; 8]> = SmallVec::new();
         let mut target = location.archetype_id;
         for &(cid, _, _) in parts {
             if !self.archetypes[target.0 as usize].has_component(cid) {
                 target = self.find_or_create_archetype_with(target, cid);
+                fresh.push(cid);
                 if any_flags && self.registry.flags(cid) & crate::component::ADDED_NOTIFY_MASK != 0 {
                     added_hooked.push(cid);
+                }
+            }
+        }
+        // ADR-019: the requirements of what arrived that the entity still lacks, transitively - in the same move.
+        let mut required: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 2]> = SmallVec::new();
+        let mut k = 0;
+        while k < fresh.len() {
+            let cid = fresh[k];
+            k += 1;
+            if self.registry.flags(cid) & crate::component::FLAG_REQUIRES == 0 {
+                continue;
+            }
+            let reqs: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 4]> = self
+                .registry
+                .required_defaults(cid)
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            for (rid, write) in reqs {
+                if !self.archetypes[target.0 as usize].has_component(rid) {
+                    target = self.find_or_create_archetype_with(target, rid);
+                    required.push((rid, write));
+                    fresh.push(rid);
+                    if any_flags && self.registry.flags(rid) & crate::component::ADDED_NOTIFY_MASK != 0 {
+                        added_hooked.push(rid);
+                    }
                 }
             }
         }
@@ -1870,6 +1907,10 @@ impl World {
             // New column (len == row) — push; existing — replace with a drop of
             // the old value.
             unsafe { arch.write_or_replace_component(row, cid, ptr, tick) };
+        }
+        if !required.is_empty() {
+            let tick = parts.first().map_or(self.current_tick, |p| p.2);
+            self.write_inserted_requirements(target, row, &required, tick);
         }
         for &cid in &added_hooked {
             self.hook_queue.push(HookEvent::Added(entity, cid));
@@ -2426,6 +2467,64 @@ impl World {
     }
 
     // ── Internal methods ───────────────────────────────────────
+
+    /// **Where an entity in `current` lands when it gains `add`** (ADR-019): the archetype with `add` AND every
+    /// requirement of it (transitively) `current` lacks - one move instead of one per requirement - and those
+    /// requirements, to be written into the moved row by [`write_inserted_requirements`](Self::write_inserted_requirements).
+    pub(crate) fn insert_target(
+        &mut self,
+        current: ArchetypeId,
+        add: ComponentId,
+    ) -> (ArchetypeId, SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 2]>) {
+        let mut target = self.find_or_create_archetype_with(current, add);
+        let mut required: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 2]> = SmallVec::new();
+        if self.registry.flags(add) & crate::component::FLAG_REQUIRES == 0 {
+            return (target, required);
+        }
+        let mut walk: SmallVec<[ComponentId; 4]> = SmallVec::new();
+        walk.push(add);
+        let mut k = 0;
+        while k < walk.len() {
+            let reqs: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 4]> = self
+                .registry
+                .required_defaults(walk[k])
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            k += 1;
+            for (rid, write) in reqs {
+                if !self.archetypes[target.0 as usize].has_component(rid) {
+                    target = self.find_or_create_archetype_with(target, rid);
+                    required.push((rid, write));
+                    walk.push(rid);
+                }
+            }
+        }
+        (target, required)
+    }
+
+    /// The defaults of the requirements [`insert_target`](Self::insert_target) folded, written into the moved `row`
+    /// with the insert's tick (as the spawn writes them).
+    fn write_inserted_requirements(
+        &mut self,
+        archetype: ArchetypeId,
+        row: usize,
+        required: &[(ComponentId, crate::component::RequiredDefaultFn)],
+        tick: Tick,
+    ) {
+        for &(rid, write) in required {
+            let arch = &mut self.archetypes[archetype.0 as usize];
+            let Some(col_idx) = arch.column_index(rid) else { continue };
+            let col = &mut arch.columns[col_idx];
+            // SAFETY: the requirement's own column in the archetype the row was moved into; the move pushed every
+            // column the source had, so this new column's next row is `row`.
+            unsafe { write(col, row) };
+            col.change_ticks.push(TickCell::new(tick));
+            col.added_ticks.push(TickCell::new(tick));
+            col.max_change_tick.raise(tick);
+            col.max_added_tick.raise(tick);
+            col.len += 1;
+        }
+    }
 
     pub(crate) fn find_or_create_archetype_with(
         &mut self,
@@ -3508,6 +3607,10 @@ pub(crate) struct BundleInfo {
     archetype: ArchetypeId,
     /// Column index inside `archetype` of each id of `decl_ids`, in that same order.
     cols: Vec<usize>,
+    /// The bundle's requirements it does not carry itself, transitively (ADR-019): their column in
+    /// `archetype` and the write of their default. A spawn writes them into the same row, so a required
+    /// component costs no archetype move after the spawn.
+    required: SmallVec<[(usize, crate::component::RequiredDefaultFn); 2]>,
 }
 
 /// Per-world registry of [`BundleInfo`], keyed by the bundle type.
@@ -3515,12 +3618,43 @@ pub(crate) struct BundleInfo {
 pub(crate) struct BundleCache {
     by_type: FxHashMap<TypeId, u32>,
     infos: Vec<BundleInfo>,
+    /// The registry's requirement generation the bundles were resolved under: a requirement declared later
+    /// changes an archetype a bundle lands in, so the cache is resolved again from scratch.
+    requires_generation: u64,
 }
 
 impl World {
+    /// **The folded requirements of a spawned row** (ADR-019): each requirement the bundle at `slot` does not carry
+    /// gets its default written into `row`. `bookkeep` - the single spawn - also pushes the row's ticks and `len`, as
+    /// `write_into_batch` does for the bundle's own columns; the bulk spawns set those per column after the loop.
+    #[inline]
+    pub(crate) fn write_required_defaults(&mut self, slot: usize, archetype_id: ArchetypeId, row: usize, tick: Tick, bookkeep: bool) {
+        let n = self.bundles.infos[slot].required.len();
+        for i in 0..n {
+            let (col_idx, write) = self.bundles.infos[slot].required[i];
+            let col = &mut self.archetypes[archetype_id.0 as usize].columns[col_idx];
+            // SAFETY: `col_idx` is the requirement's own column in this archetype (resolved with it in
+            // `register_bundle`), and `row` is the row being spawned - the column's next.
+            unsafe { write(col, row) };
+            if bookkeep {
+                col.change_ticks.push(TickCell::new(tick));
+                col.added_ticks.push(TickCell::new(tick));
+                col.max_change_tick.raise(tick);
+                col.max_added_tick.raise(tick);
+                col.len += 1;
+            }
+        }
+    }
+
     /// Slot of `B` in the bundle cache, resolving it on first use.
     #[inline]
     fn bundle_slot<B: Bundle>(&mut self) -> usize {
+        if self.bundles.requires_generation != self.registry.requires_generation() {
+            self.bundles = BundleCache {
+                requires_generation: self.registry.requires_generation(),
+                ..BundleCache::default()
+            };
+        }
         match self.bundles.by_type.get(&TypeId::of::<B>()) {
             Some(&slot) => slot as usize,
             None => self.register_bundle::<B>(),
@@ -3532,7 +3666,26 @@ impl World {
     fn register_bundle<B: Bundle>(&mut self) -> usize {
         let mut decl_ids: SmallVec<[ComponentId; 8]> = SmallVec::new();
         B::static_component_ids(&mut self.registry, &mut decl_ids);
+        // ADR-019: the requirements the bundle does not carry, transitively - folded into its archetype.
+        let mut required_ids: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 2]> = SmallVec::new();
+        let mut walk: SmallVec<[ComponentId; 8]> = decl_ids.clone();
+        let mut k = 0;
+        while k < walk.len() {
+            let reqs: SmallVec<[(ComponentId, crate::component::RequiredDefaultFn); 4]> = self
+                .registry
+                .required_defaults(walk[k])
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default();
+            k += 1;
+            for (rid, write) in reqs {
+                if !decl_ids.contains(&rid) && !required_ids.iter().any(|(id, _)| *id == rid) {
+                    required_ids.push((rid, write));
+                    walk.push(rid);
+                }
+            }
+        }
         let mut sorted_ids = decl_ids.clone();
+        sorted_ids.extend(required_ids.iter().map(|(id, _)| *id));
         sorted_ids.sort_unstable();
 
         let (archetype, cols) = if sorted_ids.is_empty() {
@@ -3560,12 +3713,26 @@ impl World {
             (archetype, cols)
         };
 
+        let required = required_ids
+            .iter()
+            .map(|&(id, write)| {
+                let col = self.archetypes[archetype.0 as usize].column_index(id).unwrap_or_else(|| {
+                    panic!(
+                        "bundle `{}`: required component {:?} absent from the archetype built with it",
+                        std::any::type_name::<B>(),
+                        id
+                    )
+                });
+                (col, write)
+            })
+            .collect();
         let slot = self.bundles.infos.len();
         self.bundles.infos.push(BundleInfo {
             decl_ids,
             sorted_ids,
             archetype,
             cols,
+            required,
         });
         self.bundles.by_type.insert(TypeId::of::<B>(), slot as u32);
         slot
@@ -5788,6 +5955,119 @@ mod hooks_and_added_tests {
         });
         let e = world.spawn((C,));
         assert_eq!(world.resource::<HookLog>().added, vec![e]);
+    }
+
+    /// **A required component lands with the spawn, not after it** (ADR-019).
+    ///
+    /// The requirement used to be an `insert` queued after the spawn: every spawn of a bundle lacking it built the
+    /// bundle's own archetype, moved the row into the archetype with the requirement, and paid the move again for
+    /// each requirement. Measured by the engine (`diag_drawn_mesh_cost`, 100 000 renderers): one requirement doubled
+    /// the spawn, 10.3 -> 20.9 ms. Now the bundle's archetype already holds its requirements, transitively, and their
+    /// defaults are written into the same row, on every spawn road - one at a time, `spawn_many`, and the batched
+    /// commands. The witness of "no move" is that the archetype of the bare bundle is never built. An explicit value
+    /// still wins (the bundle then carries it), a requirement declared after the bundle was first spawned reaches the
+    /// next spawn, the added tick is the spawn's, and a requirement that owns heap memory is written and dropped once.
+    #[test]
+    fn a_required_component_lands_with_the_spawn_not_after_it() {
+        #[derive(Debug, PartialEq)]
+        struct Named(String);
+        impl Default for Named {
+            fn default() -> Self {
+                Named("default".to_string())
+            }
+        }
+        impl Component for Named {}
+        #[derive(Default, Debug, PartialEq)]
+        struct Leaf(u32);
+        impl Component for Leaf {}
+        #[derive(Debug, PartialEq)]
+        struct Host(u32);
+        impl Component for Host {}
+
+        let mut world = World::new();
+        world.require_component::<Host, Named>();
+        world.require_component::<Named, Leaf>();
+        let host = world.registry.get_id::<Host>().unwrap();
+        let bare_archetype_built = |world: &World| world.archetypes.iter().any(|a| a.columns.len() == 1 && a.has_component(host));
+
+        let e = world.spawn((Host(1),));
+        assert_eq!(world.get::<Named>(e), Some(&Named("default".into())), "the direct requirement");
+        assert_eq!(world.get::<Leaf>(e), Some(&Leaf(0)), "the transitive one");
+        assert!(!bare_archetype_built(&world), "the bundle's own archetype was built: the requirement moved the row");
+        let explicit = world.spawn((Host(2), Named("mine".into())));
+        assert_eq!(world.get::<Named>(explicit), Some(&Named("mine".into())), "an explicit value wins");
+        assert_eq!(world.get::<Leaf>(explicit), Some(&Leaf(0)), "and its own requirement still comes");
+
+        let mark = world.increment_change_tick();
+        world.spawn_many(3, |i| (Host(10 + i as u32),));
+        let mut cmds = crate::commands::Commands::new();
+        for i in 0..3 {
+            cmds.spawn((Host(20 + i),));
+        }
+        cmds.apply(&mut world);
+        let mut hosts = 0;
+        crate::query::Query::<(&Host, &Named, &Leaf)>::new(&world).for_each(|_, (_, n, _)| {
+            hosts += 1;
+            assert!(n.0 == "default" || n.0 == "mine");
+        });
+        assert_eq!(hosts, 2 + 3 + 3, "every road: one at a time, spawn_many, the batched commands");
+        assert!(!bare_archetype_built(&world), "no road built the bare archetype");
+        let added = crate::query::Query::<&Named, crate::query::Added<Named>>::new_with_tick(&world, mark).iter().count();
+        assert_eq!(added, 6, "the bulk roads stamp the requirement's added tick, as the bundle's own columns");
+
+        // Declared after the bundle was resolved: the next spawn folds it too.
+        #[derive(Default, Debug, PartialEq)]
+        struct Late(u8);
+        impl Component for Late {}
+        world.require_component::<Host, Late>();
+        let late = world.spawn((Host(3),));
+        assert_eq!(world.get::<Late>(late), Some(&Late(0)), "a requirement declared after the bundle was cached");
+        // Declared twice: one closure, one default (the registry is idempotent).
+        world.require_component::<Host, Late>();
+        assert_eq!(world.registry.required_defaults(host).map(|r| r.len()), Some(2), "Named and Late, each once");
+    }
+
+    /// **A component inserted onto an existing entity brings its requirements in the same move** (ADR-019) - the
+    /// `insert` road and the batched `insert_parts` road of the commands. The witness of "one move" is that no row
+    /// ever lived in an archetype holding the component without its requirement (the edge chain may name one, empty;
+    /// a row that passed through leaves its vector's capacity behind); the requirement's own `on_add` still
+    /// runs (it used to run from the requirement's separate insert), and a requirement the entity already carries
+    /// keeps its value.
+    #[test]
+    fn an_inserted_component_brings_its_requirements_in_the_same_move() {
+        #[derive(Default, Debug, PartialEq)]
+        struct Req(u8);
+        impl Component for Req {}
+        #[derive(Default, Debug, PartialEq)]
+        struct Deep(u8);
+        impl Component for Deep {}
+        struct Owner;
+        impl Component for Owner {}
+        #[derive(Debug, PartialEq)]
+        struct Other(u8);
+        impl Component for Other {}
+
+        let mut world = log_world();
+        world.require_component::<Owner, Req>();
+        world.require_component::<Req, Deep>();
+        world.on_add::<Req>(|w, e| w.resource_mut::<HookLog>().added.push(e));
+        let (owner, req) = (world.registry.get_id::<Owner>().unwrap(), world.registry.get_id::<Req>().unwrap());
+        let half_built =
+            |world: &World| world.archetypes.iter().any(|a| a.has_component(owner) && !a.has_component(req) && a.entities.capacity() > 0);
+
+        let a = world.spawn((Other(1),));
+        world.insert(a, Owner);
+        assert_eq!((world.get::<Req>(a), world.get::<Deep>(a)), (Some(&Req(0)), Some(&Deep(0))), "insert: both, transitively");
+        let b = world.spawn((Other(2), Req(7)));
+        world.insert(b, Owner);
+        assert_eq!(world.get::<Req>(b), Some(&Req(7)), "a requirement already carried keeps its value");
+        let c = world.spawn((Other(3),));
+        let mut cmds = crate::commands::Commands::new();
+        cmds.insert(c, Owner);
+        cmds.apply(&mut world);
+        assert_eq!(world.get::<Deep>(c), Some(&Deep(0)), "the batched commands road");
+        assert!(!half_built(&world), "a row lived in an archetype with the owner and without its requirement: a second move");
+        assert_eq!(world.resource::<HookLog>().added, vec![a, b, c], "the requirement's on_add ran where it was added: a's insert, b's spawn, c's commands");
     }
 
     // ── W3-5: memory in archetype_stats ────────────────────────

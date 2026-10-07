@@ -219,14 +219,36 @@ pub(crate) type EmitRemovedFn = fn(&mut crate::events::EventRegistry, crate::Ent
 pub(crate) const FLAG_ON_ADD: u8 = 1;
 pub(crate) const FLAG_ON_REMOVE: u8 = 2;
 pub(crate) const FLAG_TRACK_REMOVED: u8 = 4;
-/// The component has required components (D2-4, `#[require(...)]`).
+/// The component has required components (D2-4, `#[require(...)]`). Read by the roads that fold them into the
+/// archetype (ADR-019); it is not a subscription - it does not raise [`any_flags`](ComponentRegistry::any_flags).
 pub(crate) const FLAG_REQUIRES: u8 = 8;
-/// Mask "the appearance of the component is of interest to someone" (requires + on_add).
-pub(crate) const ADDED_NOTIFY_MASK: u8 = FLAG_ON_ADD | FLAG_REQUIRES;
+/// Mask "the appearance of the component is of interest to someone": an `on_add` hook. Requirements used to be
+/// here - an insert run from the hook queue after the spawn; every road that adds a component now folds them into
+/// the same move (ADR-019), and nothing is left for a queue to do.
+pub(crate) const ADDED_NOTIFY_MASK: u8 = FLAG_ON_ADD;
 
-/// Insertion of a missing required component (D2-4): a no-op if `R` is already on
-/// the entity (an explicit value from spawn/bundle ALWAYS wins over the default).
-pub(crate) type RequiredInsertFn = fn(&mut crate::World, crate::Entity);
+/// The spawn fold of a requirement (ADR-019): writes `R::default()` into `row` of `R`'s column, growing
+/// it if needed - DATA only; the ticks and `len` are the caller's, as for a bundle's own columns.
+///
+/// # Safety
+/// `column` is `R`'s column, and `row` is the row being spawned (the column's next one).
+pub(crate) type RequiredDefaultFn = unsafe fn(&mut crate::archetype::Column, usize);
+
+/// The [`RequiredDefaultFn`] of `R`.
+unsafe fn write_required_default<R: Component + Default>(column: &mut crate::archetype::Column, row: usize) {
+    if column.item_size == 0 {
+        return;
+    }
+    while row >= column.capacity {
+        column.grow();
+    }
+    let value = std::mem::ManuallyDrop::new(R::default());
+    // SAFETY: the caller's contract - `column` stores `R`, `row` is within capacity (grown above); the value's
+    // ownership moves into the column (`ManuallyDrop` keeps the source from being dropped).
+    unsafe {
+        std::ptr::copy_nonoverlapping(&*value as *const R as *const u8, column.get_ptr(row), column.item_size);
+    }
+}
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct ComponentHooks {
@@ -412,11 +434,11 @@ pub struct ComponentRegistry {
     flags: Vec<u8>,
     /// The hooks themselves — only for components with non-zero flags.
     hooks: FxHashMap<u32, ComponentHooks>,
-    /// Required components per cid (D2-4): inserted by default if
-    /// absent, AFTER the owning component appears (via the hook
-    /// queue, before the user's on_add; transitivity comes naturally
-    /// through the same queue).
-    requires: FxHashMap<u32, Vec<RequiredInsertFn>>,
+    /// Required components per cid (D2-4), as `(R's id, the write of its default)` - what every road that adds a
+    /// component folds into the same archetype move (ADR-019).
+    required_defaults: FxHashMap<u32, Vec<(ComponentId, RequiredDefaultFn)>>,
+    /// Moves on every new requirement: a bundle resolved before it is resolved again (`BundleCache`).
+    requires_generation: u64,
     any_flags: bool,
     /// Any component carries a [`MapEntitiesFn`] (E6) — the cheap gate of
     /// [`any_map_entities`](Self::any_map_entities).
@@ -431,7 +453,8 @@ impl ComponentRegistry {
             next_id: 0,
             flags: Vec::new(),
             hooks: FxHashMap::default(),
-            requires: FxHashMap::default(),
+            required_defaults: FxHashMap::default(),
+            requires_generation: 0,
             any_flags: false,
             any_map_entities: false,
         }
@@ -442,25 +465,38 @@ impl ComponentRegistry {
     /// is inserted as `R::default()` (an explicitly set value always wins).
     /// Called by the derive-macro registrar or manually
     /// ([`World::require_component`](crate::World::require_component)).
+    ///
+    /// Idempotent: declaring the same pair again changes nothing. A spawn whose bundle lacks `R` lands in the
+    /// archetype WITH `R` and writes its default in the same row; an insert of `C` moves the row straight into the
+    /// archetype with `R` (ADR-019).
     pub fn register_required<C: Component, R: Component + Default>(&mut self) {
         let cid = self.register::<C>();
-        self.register::<R>();
-        self.requires
-            .entry(cid.0)
-            .or_default()
-            .push(|world, entity| {
-                if !world.has_component::<R>(entity) {
-                    world.insert(entity, R::default());
-                }
-            });
-        self.set_flag(cid, FLAG_REQUIRES);
+        let rid = self.register::<R>();
+        let defaults = self.required_defaults.entry(cid.0).or_default();
+        if defaults.iter().any(|(id, _)| *id == rid) {
+            return;
+        }
+        defaults.push((rid, write_required_default::<R>));
+        self.requires_generation += 1;
+        let idx = cid.0 as usize;
+        if self.flags.len() <= idx {
+            self.flags.resize(idx + 1, 0);
+        }
+        self.flags[idx] |= FLAG_REQUIRES;
     }
 
-    /// The component's required inserts (D2-4); `None` — no requirements.
+    /// The requirements of `cid` as the spawn folds them (ADR-019); `None` - it requires nothing.
     #[inline]
-    pub(crate) fn requires(&self, cid: ComponentId) -> Option<&[RequiredInsertFn]> {
-        self.requires.get(&cid.0).map(|v| v.as_slice())
+    pub(crate) fn required_defaults(&self, cid: ComponentId) -> Option<&[(ComponentId, RequiredDefaultFn)]> {
+        self.required_defaults.get(&cid.0).map(|v| v.as_slice())
     }
+
+    /// Moves on every new requirement - the staleness mark of a resolved bundle.
+    #[inline]
+    pub(crate) fn requires_generation(&self) -> u64 {
+        self.requires_generation
+    }
+
 
     // ── Hooks (W3-1) ───────────────────────────────────────────
 
@@ -692,9 +728,9 @@ mod tests {
         let mut reg = ComponentRegistry::new();
         let host_id = reg.register::<Host>(); // lazy first-use registration
 
-        // The require fired from inside `register`: Host has a required-insert closure, and Req is registered.
+        // The require fired from inside `register`: Host has its requirement, and Req is registered.
         assert!(
-            reg.requires(host_id).is_some_and(|r| r.len() == 1),
+            reg.required_defaults(host_id).is_some_and(|r| r.len() == 1),
             "register::<Host> must register its #[require] (Req) via Component::register_requires"
         );
         assert!(
@@ -702,9 +738,9 @@ mod tests {
             "the required component Req must be registered transitively"
         );
 
-        // Idempotent: re-registering Host does NOT duplicate the require closure.
+        // Idempotent: re-registering Host does NOT duplicate the requirement.
         reg.register::<Host>();
-        assert_eq!(reg.requires(host_id).map(|r| r.len()), Some(1), "no duplicate require on re-register");
+        assert_eq!(reg.required_defaults(host_id).map(|r| r.len()), Some(1), "no duplicate require on re-register");
     }
 
     /// **The probe bit travels through the trait object** (ADR-014) — the only thing the core

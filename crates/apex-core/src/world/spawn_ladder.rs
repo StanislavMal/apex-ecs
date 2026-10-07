@@ -181,9 +181,11 @@ where
         // switched INSIDE the one bookkeeping pass rather than each taking a pass of its own —
         // otherwise every added rung would charge its own walk of the columns to itself, and at
         // width 8 that walk is the thing being measured.
+        // ADR-019: the requirements the bundle does not carry are columns of the same row.
+        let required: Vec<usize> = world.bundles.infos[slot].required.iter().map(|(c, _)| *c).collect();
         {
             let arch = &mut world.archetypes[arch_idx];
-            for &c in cols.iter() {
+            for &c in cols.iter().chain(required.iter()) {
                 let col = &mut arch.columns[c];
                 if col.len >= col.capacity {
                     col.grow();
@@ -194,9 +196,10 @@ where
         // without it the next row would compute its pointer past the allocation, so a rung that
         // "only writes data" cannot exist.
         bundle.write_data_into_batch(world, archetype_id, row, tick, &cols);
+        world.write_required_defaults(slot, archetype_id, row, tick, false);
         {
             let arch = &mut world.archetypes[arch_idx];
-            for &c in cols.iter() {
+            for &c in cols.iter().chain(required.iter()) {
                 let col = &mut arch.columns[c];
                 // Rung 7 — the per-row tick cells: TWO pushes per component, each with its own
                 // capacity check, against a reference that writes into a pre-sized row.
