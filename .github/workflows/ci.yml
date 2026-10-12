@@ -1,4 +1,4 @@
-# CI ядра: build + test + clippy(-D warnings) + frag_world-страж + wasm32-check.
+# CI ядра: build + test + clippy(-D warnings) + frag_world-страж + wasm32-check + wasm-запуск (ADR-020).
 # Голдены/GPU-тесты живут в apex-engine и остаются локальными (нет GPU в раннерах).
 # Таймерные пороги здесь НЕ проверяются (шумные раннеры) — frag_world падает только
 # на структурном регрессе (assert числа архетипов, класс CR-M1); тайминги — в лог.
@@ -30,7 +30,7 @@ jobs:
         run: cargo run --release -p apex-bench --bin frag_world
 
   wasm:
-    name: wasm32 check (core crates)
+    name: wasm32 check + run (core crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,3 +42,12 @@ jobs:
       # ⚠ Авторегистрация компонентов (linkme) на wasm отключена — TD-25 в apex-engine/plans/TECH_DEBT.md.
       - name: cargo check (wasm32-unknown-unknown)
         run: cargo check --target wasm32-unknown-unknown -p apex-core -p apex-scheduler -p apex-graph -p apex-isolated -p apex-serialization
+      # Проверка сборки не видит API, который паникует только при исполнении (std::time::Instant —
+      # ADR-020). Свидетель исполняется под Node и сверяет хеш с нативным.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: wasm smoke run (apex-wasm-smoke под Node, хеш = нативный)
+        run: |
+          cargo build --release --target wasm32-unknown-unknown -p apex-wasm-smoke
+          node crates/apex-wasm-smoke/run.mjs

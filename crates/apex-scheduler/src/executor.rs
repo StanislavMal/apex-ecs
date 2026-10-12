@@ -263,7 +263,7 @@ impl Scheduler {
                         // D6: per-system baseline (Copy — ends before `&mut systems`).
                         let window = self.system_window(sys_id);
                         let system = &mut self.systems[index];
-                        let prof_t = main_prof_enabled().then(std::time::Instant::now);
+                        let prof_t = main_prof_enabled().then(apex_core::clock::Instant::now);
                         match &mut system.kind {
                             SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                             SystemKind::Parallel { system, .. } => {
@@ -945,7 +945,7 @@ impl Scheduler {
                             // (Copy, so the immutable borrow ends before `&mut systems`).
                             let window = self.system_window(sys_id);
                             let system = &mut self.systems[sys_idx];
-                            let prof_t = main_prof_enabled().then(std::time::Instant::now);
+                            let prof_t = main_prof_enabled().then(apex_core::clock::Instant::now);
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {
@@ -1041,7 +1041,7 @@ impl Scheduler {
                 stage_par_min,
                 auto_disable_stage,
             );
-            let stage_t0 = std::time::Instant::now();
+            let stage_t0 = apex_core::clock::Instant::now();
 
             if should_fallback {
                 {
@@ -1060,7 +1060,7 @@ impl Scheduler {
                             // D6: per-system change-detection baseline (see branch above).
                             let window = self.system_window(sys_id);
                             let system = &mut self.systems[sys_idx];
-                            let prof_t = main_prof_enabled().then(std::time::Instant::now);
+                            let prof_t = main_prof_enabled().then(apex_core::clock::Instant::now);
                             match &mut system.kind {
                                 SystemKind::Sequential(f) => f(unsafe { &mut *world_ptr }),
                                 SystemKind::Parallel { system, .. } => {

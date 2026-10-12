@@ -603,7 +603,7 @@ pub fn propagate_transforms(world: &mut World) {
 
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let trace = *TRACE.get_or_init(|| std::env::var("APEX_PROP_TRACE").is_ok_and(|v| v == "1"));
-    let t0 = std::time::Instant::now();
+    let t0 = crate::clock::Instant::now();
 
     // 1. Collect entities with a changed LocalTransform (since the previous run) and mark them in
     //    the stamp map. The semantics are exactly `Query<Changed<LocalTransform>>` (the same
@@ -638,7 +638,7 @@ pub fn propagate_transforms(world: &mut World) {
             }
         }
     }
-    let t1 = std::time::Instant::now();
+    let t1 = crate::clock::Instant::now();
 
     if scratch.dirty_entities.is_empty() {
         // Nothing changed — commit the tick and return.
@@ -820,7 +820,7 @@ pub fn propagate_transforms(world: &mut World) {
     }
 
     let seeds = scratch.stack.len();
-    let t2 = std::time::Instant::now();
+    let t2 = crate::clock::Instant::now();
 
     // 3. Descent. Two modes with identical semantics:
     //    — few roots / small subtrees → sequential in-place DFS;
@@ -893,7 +893,7 @@ pub fn propagate_transforms(world: &mut World) {
             let world_ref: &World = world;
             let n = frontier.len();
             let lap = |f: &dyn Fn() -> usize| -> (f64, usize) {
-                let t = std::time::Instant::now();
+                let t = crate::clock::Instant::now();
                 let sink = f();
                 (t.elapsed().as_secs_f64() * 1000.0, sink)
             };

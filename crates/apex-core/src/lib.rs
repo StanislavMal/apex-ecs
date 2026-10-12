@@ -75,6 +75,7 @@ macro_rules! anomaly {
 pub mod access;
 pub mod archetype;
 pub mod binary;
+pub mod clock;
 pub mod commands;
 pub mod component;
 pub mod dense;

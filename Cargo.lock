@@ -226,6 +226,15 @@ name = "apex-test-dir"
 version = "0.1.0"
 
 [[package]]
+name = "apex-wasm-smoke"
+version = "0.1.0"
+dependencies = [
+ "apex-core",
+ "apex-macros",
+ "apex-scheduler",
+]
+
+[[package]]
 name = "approx"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

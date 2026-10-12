@@ -129,7 +129,7 @@ fn main_prof_enabled() -> bool {
 
 fn main_prof_record(name: &str, elapsed: std::time::Duration) {
     use std::sync::Mutex;
-    use std::time::Instant;
+    use apex_core::clock::Instant;
     static ACC: Mutex<Vec<(String, f64, u32)>> = Mutex::new(Vec::new());
     static LAST_LOG: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -167,7 +167,7 @@ fn main_prof_record(name: &str, elapsed: std::time::Duration) {
 /// `APEX_MAIN_PROF` report; growth in empty/archetypes signals fragmentation).
 fn main_prof_world_stats(world: &apex_core::World) {
     use std::sync::Mutex;
-    use std::time::Instant;
+    use apex_core::clock::Instant;
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap();
     if last.map(|t| t.elapsed().as_secs_f32() > 2.0).unwrap_or(true) {

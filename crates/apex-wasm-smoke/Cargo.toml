@@ -1,0 +1,14 @@
+[package]
+name = "apex-wasm-smoke"
+publish = false
+version.workspace = true
+edition.workspace = true
+description = "A world and a schedule that run in the browser's target, not only compile for it (ADR-020). Built as wasm and run by Node in CI; the same function pins its hash natively."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+apex-core      = { path = "../apex-core" }
+apex-scheduler = { path = "../apex-scheduler" }
+apex-macros    = { path = "../apex-macros" }

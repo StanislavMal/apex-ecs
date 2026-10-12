@@ -12,6 +12,7 @@ members = [
     "crates/apex-macros",
     "crates/apex-scripting",
     "crates/apex-test-dir",
+    "crates/apex-wasm-smoke",
 ]
 
 [workspace.package]
