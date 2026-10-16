@@ -14,7 +14,8 @@
 
 use crate::{AccessDescriptor, Condition, ConditionTree, ParSystem, SystemFn};
 use apex_core::system_param::{
-    AutoSystem, EventAccessList, ExclusiveSystem, ResourceAccessList, WorldQuerySystemAccess,
+    AutoSystem, EventAccessList, ExclusiveSystem, IntoAutoSystem, IntoExclusiveSystem,
+    ResourceAccessList, WorldQuerySystemAccess,
 };
 use apex_core::world::SystemContext;
 
@@ -127,8 +128,12 @@ impl SystemConfig {
 // ── Constructors ───────────────────────────────────────────
 
 impl SystemConfig {
-    /// AutoSystem (includes `system!` struct).
-    pub(crate) fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
+    /// AutoSystem — the value itself or the function a stateless `system!` declares (ADR-022).
+    pub(crate) fn sys<M, T: IntoAutoSystem<M>>(name: impl Into<String>, s: T) -> Self {
+        Self::sys_value(name, s.into_auto_system())
+    }
+
+    fn sys_value<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> Self {
         let mut access = S::Query::system_access()
             .merge(&S::Resources::resource_accesses())
             .merge(&S::Events::event_accesses());
@@ -192,8 +197,10 @@ impl SystemConfig {
     /// Exclusive system (`system!` with `world: &mut World`).
     ///
     /// Declares FULL access and is registered as Sequential — the scheduler
-    /// runs it alone. The name is taken from the system itself.
-    pub fn exclusive<S: ExclusiveSystem>(mut system: S) -> Self {
+    /// runs it alone. The name is taken from the system itself. Takes the system value or the
+    /// function a stateless exclusive `system!` declares (ADR-022).
+    pub fn exclusive<M, T: IntoExclusiveSystem<M>>(system: T) -> Self {
+        let mut system = system.into_exclusive_system();
         let name = system.name().to_string();
         Self {
             name,
@@ -296,8 +303,9 @@ impl SystemConfig {
 
 // ── Free function aliases — short API ───────────────────────
 
-/// AutoSystem (includes `system!` struct). Alias for `SystemConfig::sys()`.
-pub fn sys<S: AutoSystem + 'static>(name: impl Into<String>, s: S) -> SystemConfig {
+/// AutoSystem (a struct, a stateful `system!`, or the function a stateless `system!` declares).
+/// Alias for `SystemConfig::sys()`.
+pub fn sys<M, T: IntoAutoSystem<M>>(name: impl Into<String>, s: T) -> SystemConfig {
     SystemConfig::sys(name, s)
 }
 
@@ -326,20 +334,20 @@ where F: FnMut(SystemContext<'_>) + Send + Sync + 'static
 //
 // The marker parameter `M` distinguishes sources (Bevy-style disambiguation),
 // which allows passing HETEROGENEOUS elements into `add_systems` as one tuple:
-//   - bare `AutoSystem` marker (parallel system from `system!`) — name from fn;
-//   - bare `ExclusiveSystem` marker (`system!` with `world: &mut World`) — name from fn;
+//   - an `AutoSystem` — a value, or the function a stateless `system!` declares (ADR-022);
+//   - an `ExclusiveSystem` — a value/closure, or the function of an exclusive `system!`;
 //   - ready-made `SystemConfig` (`sys()`/`seq()`/`.run_if()`…).
 // Different markers → different trait instantiations → no coherence conflict.
 
 /// Marker: element is a ready-made `SystemConfig`.
 #[doc(hidden)]
 pub struct ConfigMarker;
-/// Marker: element is a bare `AutoSystem` (parallel system).
+/// Marker: element names an `AutoSystem` (parallel system); `M` is its `IntoAutoSystem` marker.
 #[doc(hidden)]
-pub struct AutoMarker;
-/// Marker: element is a bare `ExclusiveSystem`.
+pub struct AutoMarker<M>(std::marker::PhantomData<M>);
+/// Marker: element names an `ExclusiveSystem`; `M` is its `IntoExclusiveSystem` marker.
 #[doc(hidden)]
-pub struct ExclusiveMarker;
+pub struct ExclusiveMarker<M>(std::marker::PhantomData<M>);
 /// Marker: element is a plain-fn system (D2-1, `SystemParamFunction`).
 /// Not a tuple — otherwise it would overlap with the tuple impl of `IntoScheduleConfigs`.
 #[doc(hidden)]
@@ -389,6 +397,8 @@ pub struct NameTarget;
 pub struct FnTarget;
 #[doc(hidden)]
 pub struct AutoTarget;
+#[doc(hidden)]
+pub struct ExclusiveTarget;
 
 impl OrderTarget<NameTarget> for String {
     fn order_target_name(self) -> String {
@@ -407,11 +417,19 @@ impl<Marker, F: apex_core::SystemParamFunction<Marker>> OrderTarget<(FnTarget, M
         apex_core::short_system_name::<F>().to_string()
     }
 }
-/// Typed: an [`AutoSystem`](apex_core::AutoSystem) (struct / `system!`-macro
-/// systems) — `AutoSystem::name()`, the registered name.
-impl<S: apex_core::AutoSystem> OrderTarget<AutoTarget> for S {
+/// Typed: an [`AutoSystem`](apex_core::AutoSystem) — a struct, a stateful `system!`, or the
+/// function a stateless `system!` declares (ADR-022) — `AutoSystem::name()`, the registered name.
+impl<M, T: IntoAutoSystem<M>> OrderTarget<(AutoTarget, M)> for T {
     fn order_target_name(self) -> String {
-        S::name().to_string()
+        <T::System as AutoSystem>::name().to_string()
+    }
+}
+/// Typed: an [`ExclusiveSystem`](apex_core::ExclusiveSystem) — a struct, a stateful exclusive
+/// `system!`, or the function a stateless one declares (ADR-022) — `ExclusiveSystem::name()`,
+/// the name [`SystemConfig::exclusive`] registers it under.
+impl<M, T: IntoExclusiveSystem<M>> OrderTarget<(ExclusiveTarget, M)> for T {
+    fn order_target_name(self) -> String {
+        self.into_exclusive_system().name().to_string()
     }
 }
 
@@ -477,13 +495,17 @@ impl IntoScheduleConfigs<ConfigMarker> for SystemConfig {
     }
 }
 
-impl<S: AutoSystem + 'static> IntoScheduleConfigs<AutoMarker> for S {
+impl<M, T: IntoAutoSystem<M>> IntoScheduleConfigs<AutoMarker<M>> for T {
     fn into_configs(self) -> ScheduleConfigs {
-        ScheduleConfigs::single(SystemConfig::sys(S::name(), self))
+        let system = self.into_auto_system();
+        ScheduleConfigs::single(SystemConfig::sys_value(
+            <T::System as AutoSystem>::name(),
+            system,
+        ))
     }
 }
 
-impl<S: ExclusiveSystem> IntoScheduleConfigs<ExclusiveMarker> for S {
+impl<M, T: IntoExclusiveSystem<M>> IntoScheduleConfigs<ExclusiveMarker<M>> for T {
     fn into_configs(self) -> ScheduleConfigs {
         ScheduleConfigs::single(SystemConfig::exclusive(self))
     }

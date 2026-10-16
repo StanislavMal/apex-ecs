@@ -19,6 +19,17 @@
 /// // Registration: app.add_system(Update, movement_system);
 /// ```
 ///
+/// The stateless form declares a FUNCTION, `fn movement_system() -> impl AutoSystem` (the
+/// exclusive one, `impl ExclusiveSystem`), not a unit struct: a function name never captures a
+/// pattern, so a binding spelled like a system (`|_, (pilot,)|` next to a system `pilot`) still
+/// compiles (ADR-022). It is passed by name as before — `add_systems`, `sys("name", f)`,
+/// `.before(f)`/`.after(f)` — and registers under the function's name.
+///
+/// Every form takes outer attributes (doc comments, `#[cfg]`) and a visibility, carried to the
+/// generated function or struct: `system! { /// Moves. pub fn movement(…) { … } }`. A `pub`
+/// stateful struct can be no more visible than the components its `AutoSystem` impl names
+/// (E0446); the function form hides them behind `impl AutoSystem`.
+///
 /// # Variant B — stateful
 ///
 /// ```ignore
@@ -85,27 +96,38 @@
 /// ```
 #[macro_export]
 macro_rules! system {
+    // Every form takes outer attributes (doc comments included) and a visibility, carried to
+    // the generated item: `system! { /// Moves. pub fn movement(…) { … } }` (ADR-022).
+
     // ═══════════════════════════════════════════════════════════════
     //  Exclusive systems: `world: &mut World` ⇒ FULL access ⇒ alone
     // ═══════════════════════════════════════════════════════════════
 
     // ── Exclusive A: stateless `fn name(world: &mut World) { … }` ──
+    // A FUNCTION returning the system, not a unit struct named `name`: a unit struct sits in the
+    // pattern namespace and broke every binding spelled like the system (ADR-022).
     {
-        fn $fn_name:ident( $world:ident : &mut World $(,)? ) {
+        $(#[$attr:meta])*
+        $vis:vis fn $fn_name:ident( $world:ident : &mut World $(,)? ) {
             $($body:tt)*
         }
     } => {
-        #[allow(non_camel_case_types, dead_code)]
-        struct $fn_name;
-        impl $crate::ExclusiveSystem for $fn_name {
-            fn run(&mut self, $world: &mut $crate::World) { $($body)* }
-            fn name(&self) -> &'static str { stringify!($fn_name) }
+        $(#[$attr])*
+        #[allow(dead_code)]
+        $vis fn $fn_name() -> impl $crate::ExclusiveSystem {
+            struct __ApexSystemFn;
+            impl $crate::ExclusiveSystem for __ApexSystemFn {
+                fn run(&mut self, $world: &mut $crate::World) { $($body)* }
+                fn name(&self) -> &'static str { stringify!($fn_name) }
+            }
+            __ApexSystemFn
         }
     };
 
     // ── Guard: `world` + other parameters → clear error (U.1) ──
     {
-        fn $fn_name:ident( $world:ident : &mut World , $($rest:tt)+ ) {
+        $(#[$attr:meta])*
+        $vis:vis fn $fn_name:ident( $world:ident : &mut World , $($rest:tt)+ ) {
             $($body:tt)*
         }
     } => {
@@ -118,14 +140,16 @@ macro_rules! system {
 
     // ── Exclusive B: stateful with defaults ──
     {
-        struct $struct_name:ident {
+        $(#[$attr:meta])*
+        $vis:vis struct $struct_name:ident {
             $( $field:ident : $fty:ty = $default:expr ),+ $(,)?
         }
         fn run( $slf:ident : &mut Self , $world:ident : &mut World $(,)? ) {
             $($body:tt)*
         }
     } => {
-        struct $struct_name { $( $field: $fty ),+ }
+        $(#[$attr])*
+        $vis struct $struct_name { $( $field: $fty ),+ }
         impl Default for $struct_name {
             fn default() -> Self { Self { $( $field: $default ),+ } }
         }
@@ -140,14 +164,16 @@ macro_rules! system {
 
     // ── Exclusive B': stateful without defaults (U.5 — fields pub, no Default) ──
     {
-        struct $struct_name:ident {
+        $(#[$attr:meta])*
+        $vis:vis struct $struct_name:ident {
             $( $field:ident : $fty:ty ),+ $(,)?
         }
         fn run( $slf:ident : &mut Self , $world:ident : &mut World $(,)? ) {
             $($body:tt)*
         }
     } => {
-        struct $struct_name { $( pub $field: $fty ),+ }
+        $(#[$attr])*
+        $vis struct $struct_name { $( pub $field: $fty ),+ }
         impl $crate::ExclusiveSystem for $struct_name {
             fn run(&mut self, $world: &mut $crate::World) {
                 let $slf = &mut *self;
@@ -161,29 +187,30 @@ macro_rules! system {
     //  Parallel systems: access inferred from parameters
     // ═══════════════════════════════════════════════════════════════
 
-    // ── Parallel A: stateless ──
+    // ── Parallel A: stateless — a function returning the system (ADR-022) ──
     {
-        fn $fn_name:ident(
+        $(#[$attr:meta])*
+        $vis:vis fn $fn_name:ident(
             $($params:tt)*
         ) {
             $($body:tt)*
         }
     } => {
         $crate::__system_impl! {
-            @fn_name: $fn_name,
+            @head: [ fn [ $(#[$attr])* ] $vis $fn_name ],
             @ctx: ctx,
             @q: [], @r: [], @e: [],
             @before: [], @after: [],
             @params: [ $($params)* ],
             @body: { $($body)* },
-            @struct_body: [],
             @slf: [], @whole: [], @cmd: [],
         }
     };
 
     // ── Parallel B: with state (with defaults — Default is generated) ──
     {
-        struct $struct_name:ident {
+        $(#[$attr:meta])*
+        $vis:vis struct $struct_name:ident {
             $( $field:ident : $fty:ty = $default:expr ),+ $(,)?
         }
         fn run(
@@ -193,27 +220,28 @@ macro_rules! system {
             $($body:tt)*
         }
     } => {
-        struct $struct_name { $( $field: $fty ),+ }
+        $(#[$attr])*
+        $vis struct $struct_name { $( $field: $fty ),+ }
 
         impl Default for $struct_name {
             fn default() -> Self { Self { $( $field: $default ),+ } }
         }
 
         $crate::__system_impl! {
-            @fn_name: $struct_name,
+            @head: [ struct $struct_name ],
             @ctx: ctx,
             @q: [], @r: [], @e: [],
             @before: [], @after: [],
             @params: [ $($params)* ],
             @body: { $($body)* },
-            @struct_body: [ struct $struct_name { $( $field: $fty ),+ } ],
             @slf: [ $slf ], @whole: [], @cmd: [],
         }
     };
 
     // ── Parallel B': with state without defaults (U.5 — fields pub, no Default) ──
     {
-        struct $struct_name:ident {
+        $(#[$attr:meta])*
+        $vis:vis struct $struct_name:ident {
             $( $field:ident : $fty:ty ),+ $(,)?
         }
         fn run(
@@ -223,29 +251,22 @@ macro_rules! system {
             $($body:tt)*
         }
     } => {
-        struct $struct_name { $( pub $field: $fty ),+ }
+        $(#[$attr])*
+        $vis struct $struct_name { $( pub $field: $fty ),+ }
 
         $crate::__system_impl! {
-            @fn_name: $struct_name,
+            @head: [ struct $struct_name ],
             @ctx: ctx,
             @q: [], @r: [], @e: [],
             @before: [], @after: [],
             @params: [ $($params)* ],
             @body: { $($body)* },
-            @struct_body: [ struct $struct_name { $( $field: $fty ),+ } ],
             @slf: [ $slf ], @whole: [], @cmd: [],
         }
     };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __emit_struct {
-    { [] $fn_name:ident } => { #[allow(non_camel_case_types, dead_code)] struct $fn_name; };
-    { [ $($t:tt)+ ] $fn_name:ident } => {};
-}
 
 #[doc(hidden)]
 #[macro_export]
@@ -319,20 +340,18 @@ macro_rules! __sys_compile_error {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __system_impl {
-    // Base case
+    // Base case — a stateful system: the struct was emitted by the entry arm.
     {
-        @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+        @head: [ struct $name:ident ], @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ],
         @r: [ $( ( $($r:tt)+ ) )* ],
         @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [], @body: { $( $body:tt )* },
-        @struct_body: [ $( $struct_tokens:tt )* ],
         @slf: [ $( $slf_name:ident )* ],
         @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => {
-        $crate::__emit_struct! { [ $( $struct_tokens )* ] $fn_name }
-        impl $crate::AutoSystem for $fn_name {
+        impl $crate::AutoSystem for $name {
             type Query = $crate::__q_static!( $( $($q)+ ),* );
             type Resources = ( $( $($r)+ ),* );
             type Events = ( $( $($e)+ ),* );
@@ -342,38 +361,69 @@ macro_rules! __system_impl {
                 $( let $slf_name = &mut *self; )*
                 $( $before )* $( $body )* $( $after )*
             }
-            fn name() -> &'static str { stringify!($fn_name) }
+            fn name() -> &'static str { stringify!($name) }
+        }
+    };
+
+    // Base case — a stateless system: a function returning a zero-sized system local to it
+    // (ADR-022). The name the scheduler registers and orders by stays the function's.
+    {
+        @head: [ fn [ $( $attr:tt )* ] $vis:vis $name:ident ], @ctx: $ctx:ident,
+        @q: [ $( ( $($q:tt)+ ) )* ],
+        @r: [ $( ( $($r:tt)+ ) )* ],
+        @e: [ $( ( $($e:tt)+ ) )* ],
+        @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
+        @params: [], @body: { $( $body:tt )* },
+        @slf: [],
+        @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+    } => {
+        $( $attr )*
+        #[allow(dead_code)]
+        $vis fn $name() -> impl $crate::AutoSystem {
+            struct __ApexSystemFn;
+            impl $crate::AutoSystem for __ApexSystemFn {
+                type Query = $crate::__q_static!( $( $($q)+ ),* );
+                type Resources = ( $( $($r)+ ),* );
+                type Events = ( $( $($e)+ ),* );
+                $crate::__sys_whole_world!([ $( $whole )* ]);
+                $crate::__sys_has_deferred!([ $( $cmd )* ]);
+                fn run(&mut self, $ctx: $crate::SystemContext<'_>) {
+                    $( $before )* $( $body )* $( $after )*
+                }
+                fn name() -> &'static str { stringify!($name) }
+            }
+            __ApexSystemFn
         }
     };
 
     // ═══ With trailing comma ═══
 
     // Ctx
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Ctx , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$crate::SystemContext<'_> = &$ctx; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // WholeWorld
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : WholeWorld , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* ], @after: [ $( $after )* ],
         @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // F6: a SECOND Query parameter is rejected. All query params accumulate into
@@ -382,11 +432,11 @@ macro_rules! __system_impl {
     // query, not two independent queries. Matches when `@q` already holds one
     // query and another arrives (trailing comma optional). Tried before the
     // general query arms below, so the FIRST query (empty `@q`) falls through.
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ ( $($q0:tt)+ ) $( ( $($qn:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ( $( $qty:tt )* ) $( , $( $rest:tt )* )? ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => {
         compile_error!(
@@ -395,113 +445,113 @@ macro_rules! __system_impl {
     };
 
     // Query tuple
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ( $( $qty:tt )* ) , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event reader
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & [ $ev:ty ] , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let $pname = $ctx.event_reader_persistent_auto::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event writer (generates EventWriter, user calls .send())
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut Vec < $ev:ty > , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource write — Res/ResMut semantics (P2): same grammar as in
     // plain-fn systems. Bare `&T`/`&mut T` as a resource is NO LONGER accepted
     // (compile error below) — in Bevy `&T` denotes a query component,
     // the dual semantics was a migrant trap.
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ResMut < $ty:ty > , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut_unchecked::<$ty>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource read — Res<T>
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Res < $ty:ty > , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: $crate::system_param::Res<'_, $ty> = $ctx.resource::<$ty>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // EventReader<E> — Bevy name for reading events (equivalent to `&[E]`)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : EventReader < $ev:ty > , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_reader_persistent_auto::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // EventWriter<E> — Bevy name for writing events (equivalent to `&mut Vec<E>`)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : EventWriter < $ev:ty > , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // ── P2: bare `&T`/`&mut T` as a resource — NO LONGER SUPPORTED ──
     // (the dual semantics with Bevy components was the migrant's trap #1)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
@@ -511,11 +561,11 @@ macro_rules! __system_impl {
          a single-component query — a 1-tuple: `q: (&mut ", stringify!($ty), ",)`."
     )); };
 
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &", stringify!($ty),
@@ -526,167 +576,167 @@ macro_rules! __system_impl {
     )); };
 
     // Commands
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Cmd , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &mut apex_core::Commands = $ctx.commands(); ],
+        @before: [ $( $before )* let $pname: &mut $crate::Commands = $ctx.commands(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
     }};
 
     // Single component query (bare type)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : $qty:ty , $( $rest:tt )* ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [ $( $rest )* ], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // ═══ Without trailing comma (last param) ═══
 
     // Ctx (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Ctx ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: &$crate::SystemContext<'_> = &$ctx; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // WholeWorld (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : WholeWorld ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* ], @after: [ $( $after )* ],
         @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ X ], @cmd: [ $( $cmd )* ],
     }};
 
     // Query tuple (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ( $( $qty:tt )* ) ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $( $qty )* ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event reader (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & [ $ev:ty ] ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let $pname = $ctx.event_reader_persistent_auto::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Event writer (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut Vec < $ev:ty > ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource write (last) — ResMut<T> (P2)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : ResMut < $ty:ty > ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResWrite<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let mut $pname: $crate::system_param::ResMut<'_, $ty> = $ctx.resource_mut_unchecked::<$ty>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Resource read (last) — Res<T> (P2)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Res < $ty:ty > ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ( ResRead<$ty> ) ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* let $pname: $crate::system_param::Res<'_, $ty> = $ctx.resource::<$ty>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // EventReader<E> (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : EventReader < $ev:ty > ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Listen<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_reader_persistent_auto::<$ev>(); let _ = &mut $pname; ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // EventWriter<E> (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : EventWriter < $ev:ty > ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ( Emit<$ev> ) ],
         @before: [ $( $before )* let mut $pname = $ctx.event_writer_unchecked::<$ev>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // ── P2: bare `&T`/`&mut T` as a resource (last) — compile error ──
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & mut $ty:ty ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &mut ", stringify!($ty),
@@ -696,11 +746,11 @@ macro_rules! __system_impl {
          a single-component query — a 1-tuple: `q: (&mut ", stringify!($ty), ",)`."
     )); };
 
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : & $ty:ty ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { compile_error!(concat!(
         "system!: `", stringify!($pname), ": &", stringify!($ty),
@@ -711,38 +761,38 @@ macro_rules! __system_impl {
     )); };
 
     // Commands (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : Cmd ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
-        @before: [ $( $before )* let $pname: &mut apex_core::Commands = $ctx.commands(); ],
+        @before: [ $( $before )* let $pname: &mut $crate::Commands = $ctx.commands(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [X],
     }};
 
     // Bare type query (last)
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $pname:ident : $qty:ty ],
-        @body: { $( $body:tt )* }, @struct_body: [ $( $struct_tokens:tt )* ],
+        @body: { $( $body:tt )* }, 
         @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
-    } => { $crate::__system_impl! { @fn_name: $fn_name, @ctx: $ctx,
+    } => { $crate::__system_impl! { @head: $head, @ctx: $ctx,
         @q: [ $( ( $($q)+ ) )* ( $qty ) ], @r: [ $( ( $($r)+ ) )* ], @e: [ $( ( $($e)+ ) )* ],
         @before: [ $( $before )* #[allow(unused_mut)] let mut $pname = $ctx.query_unchecked::<Self::Query>(); ],
         @after: [ $( $after )* ], @params: [], @body: { $( $body )* },
-        @struct_body: [ $( $struct_tokens )* ], @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
+        @slf: [ $( $slf_name )* ], @whole: [ $( $whole )* ], @cmd: [ $( $cmd )* ],
     }};
 
     // Catch-all
-    { @fn_name: $fn_name:ident, @ctx: $ctx:ident,
+    { @head: $head:tt, @ctx: $ctx:ident,
         @q: [ $( ( $($q:tt)+ ) )* ], @r: [ $( ( $($r:tt)+ ) )* ], @e: [ $( ( $($e:tt)+ ) )* ],
         @before: [ $( $before:tt )* ], @after: [ $( $after:tt )* ],
         @params: [ $($rest:tt)+ ], @body: { $( $body:tt )* },
-        @struct_body: [ $( $struct_tokens:tt )* ], @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
+        @slf: [ $( $slf_name:ident )* ], @whole: [ $( $whole:tt )* ], @cmd: [ $( $cmd:tt )* ],
     } => { $crate::__sys_compile_error! { $($rest)* } };
 }

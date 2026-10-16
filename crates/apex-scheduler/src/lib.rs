@@ -272,6 +272,16 @@ pub enum SchedulerError {
     CircularDependency { cycle_info: String },
     #[error("System '{0}' not found")]
     SystemNotFound(String),
+    /// An explicit ordering (`before`/`after`/`chain`/`add_dependency`/a pipeline) asks
+    /// `earlier` to run before `later`, but `earlier`'s stage runs after `later`'s in the stage
+    /// order (`configure_stages`, or the stage priority) — no plan can honour both (ADR-021).
+    #[error("'{earlier}' is ordered before '{later}', but its stage {earlier_stage} runs after {later_stage}: move one of the systems to another stage, reorder the stages (configure_stages), or drop the ordering")]
+    OrderingAgainstStages {
+        earlier: String,
+        later: String,
+        earlier_stage: String,
+        later_stage: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -845,6 +855,13 @@ pub struct Scheduler {
     /// Pairs of systems with an explicit order (from add_dependency / .before / .after).
     /// The edge points from "earlier" to "later": (a, b) means a before b.
     explicit_orderings: FxHashSet<(SystemId, SystemId)>,
+    /// The subset of `explicit_orderings` laid down by `independent()` — a deterministic order
+    /// for a pair that asked for none. Across two ranked stages the stage order satisfies such a
+    /// pair whichever way it points, so it is never an `OrderingAgainstStages` (ADR-021).
+    order_free_pairs: FxHashSet<(SystemId, SystemId)>,
+    /// Node ids of the sequential barriers of the last graph build, one per barrier group
+    /// (ADR-021) — removed and rebuilt with the graph's edges.
+    barrier_ids: Vec<SystemId>,
     /// Config-declared ordering edges awaiting name resolution, drained at the
     /// start of `compile()`. Each pair is `(before, after)`: `before` runs
     /// before `after`. Populated by `add_systems` from `.before()`/`.after()`/

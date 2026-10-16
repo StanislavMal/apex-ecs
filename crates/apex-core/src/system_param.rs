@@ -1047,6 +1047,74 @@ where
     }
 }
 
+// ── IntoAutoSystem / IntoExclusiveSystem — what names a system (ADR-022) ──
+
+/// Marker of the identity impls of [`IntoAutoSystem`] / [`IntoExclusiveSystem`].
+#[doc(hidden)]
+pub struct IsSystemValue;
+
+/// Anything that names an [`AutoSystem`]: the system value itself (a struct, a stateful
+/// `system!`), or the function the stateless `system!` form declares —
+/// `fn name() -> impl AutoSystem` (ADR-022).
+///
+/// The function form exists because a stateless system used to be a unit struct named like the
+/// function, and a unit struct occupies the PATTERN namespace of its module: every closure or
+/// `let` binding spelled like a system (`|_, (body, pilot)|` next to a system `pilot`) stopped
+/// compiling. A function name never captures a binding. The marker only disambiguates the two
+/// impls; call sites never name it.
+pub trait IntoAutoSystem<Marker> {
+    type System: AutoSystem + 'static;
+    fn into_auto_system(self) -> Self::System;
+}
+
+impl<S: AutoSystem + 'static> IntoAutoSystem<IsSystemValue> for S {
+    type System = S;
+    #[inline]
+    fn into_auto_system(self) -> S {
+        self
+    }
+}
+
+impl<F, S> IntoAutoSystem<fn() -> S> for F
+where
+    F: Fn() -> S,
+    S: AutoSystem + 'static,
+{
+    type System = S;
+    #[inline]
+    fn into_auto_system(self) -> S {
+        self()
+    }
+}
+
+/// Anything that names an [`ExclusiveSystem`]: the system value itself (a struct, a closure
+/// `FnMut(&mut World)`), or the function the stateless exclusive `system!` form declares —
+/// `fn name() -> impl ExclusiveSystem` (ADR-022; see [`IntoAutoSystem`] for why a function).
+pub trait IntoExclusiveSystem<Marker> {
+    type System: ExclusiveSystem;
+    fn into_exclusive_system(self) -> Self::System;
+}
+
+impl<S: ExclusiveSystem> IntoExclusiveSystem<IsSystemValue> for S {
+    type System = S;
+    #[inline]
+    fn into_exclusive_system(self) -> S {
+        self
+    }
+}
+
+impl<F, S> IntoExclusiveSystem<fn() -> S> for F
+where
+    F: Fn() -> S,
+    S: ExclusiveSystem,
+{
+    type System = S;
+    #[inline]
+    fn into_exclusive_system(self) -> S {
+        self()
+    }
+}
+
 // ── Extract<P> — a Bevy-compatible SystemParam for extract systems ──
 
 /// A Bevy-compatible parameter of extract systems — reads from [`MainWorld`].

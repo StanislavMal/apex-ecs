@@ -159,3 +159,107 @@ fn changed_in_system_parallel_path() {
     sched.run(&mut world);
     assert_eq!(world.resource::<ChangedCount>().0, 1, "frame 2: only the changed one (parallel)");
 }
+
+// ── ADR-022: visibility, attributes, and the function form ──────────────────
+
+/// Systems declared in one module and scheduled from another — the field report (HEAD 213f303):
+/// `system!` took no visibility, so systems and their schedule had to share a module.
+mod systems_elsewhere {
+    use super::Counter;
+    use apex_core::system;
+
+    system! {
+        /// A documented public parallel system.
+        pub fn public_inc(q: (&mut Counter,)) {
+            q.for_each_mut(|_, (mut c,)| {
+                c.0 += 10;
+            });
+        }
+    }
+
+    system! {
+        pub(crate) fn public_spawn(world: &mut World) {
+            world.spawn((Counter(1000),));
+        }
+    }
+
+    system! {
+        /// A stateful system visible outside its module; its fields are public (no-default
+        /// form). A struct's `AutoSystem` impl names its components, so the struct can be no
+        /// more visible than they are (E0446) — the function form hides them behind `impl`.
+        pub(crate) struct PublicAccumulator { step: u32 }
+        fn run(s: &mut Self, q: (&mut Counter,)) {
+            q.for_each_mut(|_, (mut c,)| {
+                c.0 += s.step;
+            });
+        }
+    }
+}
+
+#[test]
+fn pub_systems_from_another_module_register_and_order_from_here() {
+    use apex_scheduler::IntoScheduleConfigs;
+    use systems_elsewhere::{public_inc, public_spawn, PublicAccumulator};
+
+    let mut world = World::new();
+    world.spawn((Counter(0),));
+
+    let mut sched = Scheduler::new();
+    // Typed ordering targets resolve to the function's name — the registered one.
+    sched.add_systems(
+        StageLabel::Update,
+        (
+            public_spawn,
+            public_inc.after(public_spawn),
+            PublicAccumulator { step: 1 }.after(public_inc),
+        ),
+    );
+    sched.compile_with_world(&world).unwrap();
+    sched.run_sequential(&mut world);
+
+    let mut values: Vec<u32> = Query::<&Counter>::new(&world).iter().map(|c| c.0).collect();
+    values.sort_unstable();
+    // spawn (1000) → +10 both → +1 both.
+    assert_eq!(values, vec![11, 1011]);
+
+    let plan = sched.debug_plan();
+    assert!(plan.contains("public_inc") && plan.contains("public_spawn"), "{plan}");
+    // The string API resolves the function name too.
+    sched.before("public_spawn", "public_inc").unwrap();
+}
+
+#[test]
+fn a_renamed_registration_takes_the_function_form() {
+    let mut world = World::new();
+    world.spawn((Counter(0),));
+    let mut sched = Scheduler::new();
+    sched.add_systems(
+        StageLabel::Update,
+        apex_scheduler::sys("renamed_inc", systems_elsewhere::public_inc),
+    );
+    sched.compile_with_world(&world).unwrap();
+    sched.run_sequential(&mut world);
+    assert!(sched.debug_plan().contains("renamed_inc"));
+    assert_eq!(Query::<&Counter>::new(&world).iter().next().map(|c| c.0), Some(10));
+}
+
+/// Outer attributes reach the generated item: this system names a type that does not exist, so
+/// the test crate compiles only while `#[cfg(any())]` removes it — a dropped attribute is a build
+/// error, not a silent loss of documentation.
+mod attributes_reach_the_system {
+    use apex_core::system;
+
+    system! {
+        #[cfg(any())]
+        fn never_compiled(q: (&ThereIsNoSuchComponent,)) {
+            let _ = q;
+        }
+    }
+
+    system! {
+        #[cfg(any())]
+        fn never_compiled_either(world: &mut World) {
+            let _: ThereIsNoSuchType = world;
+        }
+    }
+}

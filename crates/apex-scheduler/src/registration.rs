@@ -16,6 +16,8 @@ impl Scheduler {
             edge_info: Vec::new(),
             graph_dirty: false,
             explicit_orderings: FxHashSet::default(),
+            order_free_pairs: FxHashSet::default(),
+            barrier_ids: Vec::new(),
             pending_orderings: Vec::new(),
             seq_system_indices: Vec::new(),
             par_system_indices: Vec::new(),
@@ -259,16 +261,29 @@ impl Scheduler {
     /// Register an AutoSystem.
     /// Stage is `default_stage_label` (`Update` by default).
     #[cfg(test)]
-    pub(crate) fn add_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
+    pub(crate) fn add_auto_system<M, T>(&mut self, name: impl Into<String>, system: T) -> SystemBuilder<'_>
     where
-        S: AutoSystem + 'static,
+        T: apex_core::IntoAutoSystem<M>,
     {
         self.add_auto_system_to_stage(name, system, self.default_stage_label.clone())
     }
 
     /// Register an AutoSystem in the given stage.
     #[cfg(test)]
-    pub(crate) fn add_auto_system_to_stage<S>(
+    pub(crate) fn add_auto_system_to_stage<M, T>(
+        &mut self,
+        name: impl Into<String>,
+        system: T,
+        stage_label: StageLabel,
+    ) -> SystemBuilder<'_>
+    where
+        T: apex_core::IntoAutoSystem<M>,
+    {
+        self.add_auto_system_value_to_stage(name, system.into_auto_system(), stage_label)
+    }
+
+    #[cfg(test)]
+    fn add_auto_system_value_to_stage<S>(
         &mut self,
         name: impl Into<String>,
         system: S,
@@ -326,9 +341,9 @@ impl Scheduler {
 
     /// Register an AutoSystem in the Startup stage.
     #[cfg(test)]
-    pub(crate) fn add_startup_auto_system<S>(&mut self, name: impl Into<String>, system: S) -> SystemBuilder<'_>
+    pub(crate) fn add_startup_auto_system<M, T>(&mut self, name: impl Into<String>, system: T) -> SystemBuilder<'_>
     where
-        S: AutoSystem + 'static,
+        T: apex_core::IntoAutoSystem<M>,
     {
         let name_str = name.into();
         if self.startup_completed {
@@ -664,6 +679,7 @@ impl Scheduler {
 
         // 4. Prune ordering references to the removed id.
         self.explicit_orderings.retain(|(a, b)| *a != id && *b != id);
+        self.order_free_pairs.retain(|(a, b)| *a != id && *b != id);
         self.pending_orderings.retain(|(a, b)| {
             !matches!(a, OrderEndpoint::Id(x) if *x == id)
                 && !matches!(b, OrderEndpoint::Id(x) if *x == id)
@@ -678,13 +694,22 @@ impl Scheduler {
 
         // 5. Reset the incremental dependency graph — the next compile rebuilds it
         //    from the surviving systems (all "new" to an empty graph).
+        self.reset_graph();
+
+        self.invalidate_plan();
+        true
+    }
+
+    /// Drop the incremental dependency graph: the next compile rebuilds it from every
+    /// registered system (all "new" to an empty graph). Needed whenever edges laid down earlier
+    /// may no longer hold — a removed system, or a new stage order (its edges depend on which
+    /// stages the order ranks, ADR-021); the incremental path only ever ADDS edges.
+    fn reset_graph(&mut self) {
         self.dependency_graph = Graph::new();
         self.graph_nodes.clear();
         self.edge_set.clear();
         self.edge_info.clear();
-
-        self.invalidate_plan();
-        true
+        self.barrier_ids.clear();
     }
 
     // Stage-parallelism gating is configured on the World, not the scheduler
@@ -962,6 +987,7 @@ impl Scheduler {
         for (first, second) in ordered {
             // `first` → `second`: explicit ordering suppresses the opposing BidirectionalWriteRead edge.
             self.add_dependency(second, first);
+            self.order_free_pairs.insert((first, second));
         }
         Ok(())
     }
@@ -969,7 +995,9 @@ impl Scheduler {
     /// Set a custom StageLabel order for compile().
     ///
     /// By default stages are ordered by priority:
-    /// `Startup(0) → First(1) → PreUpdate(2) → Update(3) → PostUpdate(4) → Last(5) → Custom(6)`.
+    /// `Startup(0) → First(1) → PreUpdate(2) → FixedUpdate(3) → Update(4) → PostUpdate(5) → Last(6)
+    /// → Custom(7)`; `Custom` labels share a priority, so without this method the graph interleaves
+    /// their stages.
     ///
     /// To change the order (e.g. `First` after `Update`), use this method:
     ///
@@ -979,8 +1007,17 @@ impl Scheduler {
     /// scheduler.configure_stages(vec![Startup, Update, First, PreUpdate, PostUpdate, Last]);
     /// ```
     ///
-    /// Stages not listed in `order` are appended at the end in ascending priority order.
+    /// Stages not listed in `order` are appended at the end in ascending priority order (`Custom`
+    /// ones by name).
+    ///
+    /// The stage order is an ordering in its own right (ADR-021): two systems in stages it ranks
+    /// run in stage order and need no `before`/`after`/`chain` between them, whatever data they
+    /// share; an explicit ordering against it is `SchedulerError::OrderingAgainstStages`.
     pub fn configure_stages(&mut self, order: Vec<StageLabel>) {
+        if self.stage_order.as_ref() != Some(&order) {
+            // The graph's cross-stage edges depend on which stages the order ranks (ADR-021).
+            self.reset_graph();
+        }
         self.stage_order = Some(order);
         self.invalidate_plan();
     }

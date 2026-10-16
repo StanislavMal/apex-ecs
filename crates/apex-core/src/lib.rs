@@ -128,8 +128,8 @@ pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
 pub use system_param::{
     AutoSystem, CommandsParam, Emit, EventAccessList, EventReader, EventWriter, ExclusiveSystem,
-    Listen, QueryParam, RemovedComponents, Res, ResMut, ResRead, ResWrite, ResourceAccessList,
-    SystemParam, WorldQuerySystemAccess,
+    IntoAutoSystem, IntoExclusiveSystem, Listen, QueryParam, RemovedComponents, Res, ResMut,
+    ResRead, ResWrite, ResourceAccessList, SystemParam, WorldQuerySystemAccess,
 };
 pub use transform::IndexStamp;
 pub use visibility::Visibility;

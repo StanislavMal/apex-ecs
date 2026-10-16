@@ -3612,3 +3612,222 @@
         assert_eq!(drive(|s, w| s.run_sequential(w)), 5, "run_sequential: run_until(5) → 5");
         assert_eq!(drive(|s, w| s.run(w)), 5, "run(): run_until(5) → 5");
     }
+
+    // ── ADR-021: the stage order is an ordering ──────────────────────────────
+
+    /// `integrate` writes Pos reading Vel, `steer` writes Vel reading Pos — a true
+    /// BidirectionalWriteRead (a cycle inside one stage).
+    struct Integrate;
+    impl ParSystem for Integrate {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Vel>().write::<Pos>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+    struct Steer;
+    impl ParSystem for Steer {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Pos>().write::<Vel>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+    /// Reads what `Integrate` writes.
+    struct ReadPos;
+    impl ParSystem for ReadPos {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().read::<Pos>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+    /// Shares no data with anyone above.
+    struct WriteHp;
+    impl ParSystem for WriteHp {
+        fn access() -> AccessDescriptor {
+            AccessDescriptor::new().write::<Hp>()
+        }
+        fn run(&mut self, _: SystemContext<'_>) {}
+    }
+
+    /// The field report (HEAD 213f303): two systems with a BidirectionalWriteRead in two stages
+    /// `configure_stages` orders were a CircularDependency. The stage boundary serializes them.
+    #[test]
+    fn bidirectional_across_configured_stages_runs_in_stage_order() {
+        for registration_reversed in [false, true] {
+            let mut sched = Scheduler::new();
+            if registration_reversed {
+                sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+                sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+            } else {
+                sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+                sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+            }
+            sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+            sched.compile().unwrap_or_else(|e| {
+                panic!("ranked stages serialize the pair (reversed={registration_reversed}): {e}")
+            });
+            assert!(stage_of(&sched, "integrate") < stage_of(&sched, "steer"));
+        }
+    }
+
+    /// The same without `configure_stages`: built-in stages are ranked by priority.
+    #[test]
+    fn bidirectional_across_builtin_stages_runs_in_priority_order() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::Update);
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::PreUpdate);
+        sched.compile().expect("PreUpdate runs strictly before Update");
+        assert!(stage_of(&sched, "integrate") < stage_of(&sched, "steer"));
+    }
+
+    /// Inside one stage nothing orders the pair — the strictness stays.
+    #[test]
+    fn bidirectional_inside_one_stage_is_still_a_cycle() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("a"));
+        sched.configure_stages(vec![StageLabel::tag("a")]);
+        assert!(matches!(sched.compile(), Err(SchedulerError::CircularDependency { .. })));
+    }
+
+    /// Two `Custom` stages without `configure_stages` share a priority and `compile()`
+    /// interleaves them by graph level: the graph is their order, so the pair still needs one.
+    #[test]
+    fn bidirectional_across_unordered_custom_stages_is_still_a_cycle() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+        assert!(matches!(sched.compile(), Err(SchedulerError::CircularDependency { .. })));
+    }
+
+    /// An explicit ordering against the stage order used to be dropped silently (the plan
+    /// concatenated stages regardless). Now it is an error — also when the stage order changes
+    /// AFTER a compile (the graph's cross-stage edges are rebuilt, not kept).
+    #[test]
+    fn explicit_ordering_against_the_stage_order_is_an_error() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.before("steer", "integrate").unwrap();
+        match sched.compile() {
+            Err(SchedulerError::OrderingAgainstStages { earlier, later, .. }) => {
+                assert_eq!((earlier.as_str(), later.as_str()), ("steer", "integrate"));
+            }
+            other => panic!("expected OrderingAgainstStages, got {:?}", other.map(|_| ())),
+        }
+
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.before("integrate", "steer").unwrap();
+        sched.compile().expect("an ordering that agrees with the stage order is satisfied by it");
+        sched.configure_stages(vec![StageLabel::tag("b"), StageLabel::tag("a")]);
+        assert!(matches!(
+            sched.compile(),
+            Err(SchedulerError::OrderingAgainstStages { .. })
+        ));
+    }
+
+    /// `independent()` asks for no particular order, so a pair the stage order ranks against
+    /// registration order is satisfied, not an error.
+    #[test]
+    fn independent_pair_across_stages_follows_the_stage_order() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.independent(&["steer", "integrate"]).unwrap();
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.compile().expect("the stage order satisfies an order-free pair");
+        assert!(stage_of(&sched, "integrate") < stage_of(&sched, "steer"));
+    }
+
+    /// A conflict with an earlier stage pushed the reader to a deeper graph level, and the plan
+    /// cut the later stage into sequential sub-stages per level: `read_pos` and `write_hp`
+    /// share nothing yet ran one after the other.
+    #[test]
+    fn a_conflict_with_an_earlier_stage_does_not_split_the_later_stage() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("read_pos", ReadPos, StageLabel::tag("b"));
+        sched.add_par_system_to_stage("write_hp", WriteHp, StageLabel::tag("b"));
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.compile().unwrap();
+        assert_eq!(stage_of(&sched, "read_pos"), stage_of(&sched, "write_hp"));
+        assert_eq!(sched.stages().unwrap().len(), 2, "one plan stage per label");
+    }
+
+    /// The same split came from an explicit ordering that agrees with the stage order: as a graph
+    /// edge it pushed `write_hp` a level deeper than `read_pos`.
+    #[test]
+    fn an_ordering_with_an_earlier_stage_does_not_split_the_later_stage() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("read_pos", ReadPos, StageLabel::tag("b"));
+        sched.add_par_system_to_stage("write_hp", WriteHp, StageLabel::tag("b"));
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.before("integrate", "write_hp").unwrap();
+        sched.compile().unwrap();
+        assert_eq!(stage_of(&sched, "read_pos"), stage_of(&sched, "write_hp"));
+        assert_eq!(sched.stages().unwrap().len(), 2, "one plan stage per label");
+    }
+
+    /// ADR-021's invariant, checked on the graph itself: no edge joins two systems of stages the
+    /// stage order ranks — not a conflict edge, not an explicit one, not a sequential barrier
+    /// (each barrier serves one stage). Stages: `a` = {integrate, exclusive}, `b` = {steer,
+    /// read_pos, exclusive}, plus an explicit cross-stage ordering that agrees with the order.
+    #[test]
+    fn no_graph_edge_crosses_ranked_stages() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_system_to_stage("excl_a", |_| {}, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("steer", Steer, StageLabel::tag("b"));
+        sched.add_par_system_to_stage("read_pos", ReadPos, StageLabel::tag("b"));
+        sched.add_system_to_stage("excl_b", |_| {}, StageLabel::tag("b"));
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.before("integrate", "read_pos").unwrap();
+        sched.compile().unwrap();
+
+        let label = |id: SystemId| sched.label_of(id).cloned();
+        let mut barrier_labels: FxHashMap<SystemId, FxHashSet<StageLabel>> = FxHashMap::default();
+        for e in &sched.edge_info {
+            match (label(e.from_id), label(e.to_id)) {
+                (Some(a), Some(b)) => assert!(
+                    sched.stage_precedence(&a, &b).is_none(),
+                    "edge {:?} joins ranked stages {a} and {b}",
+                    e.kind
+                ),
+                (Some(a), None) => {
+                    barrier_labels.entry(e.to_id).or_default().insert(a);
+                }
+                (None, Some(b)) => {
+                    barrier_labels.entry(e.from_id).or_default().insert(b);
+                }
+                (None, None) => panic!("an edge between two non-systems"),
+            }
+        }
+        assert_eq!(barrier_labels.len(), 2, "one sequential barrier per stage");
+        for labels in barrier_labels.values() {
+            assert_eq!(labels.len(), 1, "a barrier serves one stage: {labels:?}");
+        }
+    }
+
+    /// Without `configure_stages` two `Custom` stages are unranked and their conflict edges are
+    /// real graph edges. Ranking them afterwards must DROP those edges — the incremental graph only
+    /// ever adds, so a kept edge would keep splitting the later stage.
+    #[test]
+    fn a_new_stage_order_drops_the_edges_of_the_old_one() {
+        let mut sched = Scheduler::new();
+        sched.add_par_system_to_stage("integrate", Integrate, StageLabel::tag("a"));
+        sched.add_par_system_to_stage("read_pos", ReadPos, StageLabel::tag("b"));
+        sched.add_par_system_to_stage("write_hp", WriteHp, StageLabel::tag("b"));
+        sched.compile().unwrap();
+        assert_ne!(
+            stage_of(&sched, "read_pos"),
+            stage_of(&sched, "write_hp"),
+            "unranked: the graph interleaves the custom stages"
+        );
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.compile().unwrap();
+        assert_eq!(stage_of(&sched, "read_pos"), stage_of(&sched, "write_hp"));
+    }

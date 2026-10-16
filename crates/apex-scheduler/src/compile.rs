@@ -287,6 +287,76 @@ impl Scheduler {
         self.cached_archetype_count = arch_count;
     }
 
+    /// How the stage order relates two stage labels (ADR-021).
+    ///
+    /// `Some(Less)` — every stage of `a` runs strictly before every stage of `b` (and `Greater`
+    /// the other way): the execution plan concatenates stages in this order and the executor
+    /// never overlaps two stages, so a pair of systems from `a` and `b` is serialized by the
+    /// stage boundary alone. `None` — the graph decides: the same label, or two `Custom` labels
+    /// without `configure_stages` (they share priority 7, and `compile()` interleaves their stages
+    /// level by level).
+    ///
+    /// Mirrors the stage concatenation in `compile()`: listed labels in `configure_stages` order,
+    /// unlisted ones after them ordered by label; without an order — by `StageLabel::priority`.
+    pub(crate) fn stage_precedence(&self, a: &StageLabel, b: &StageLabel) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        if a == b {
+            return None;
+        }
+        match &self.stage_order {
+            Some(order) => {
+                let pa = order.iter().position(|l| l == a);
+                let pb = order.iter().position(|l| l == b);
+                Some(match (pa, pb) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => a.cmp(b),
+                })
+            }
+            None => {
+                let (pa, pb) = (a.priority(), b.priority());
+                if pa == pb { None } else { Some(pa.cmp(&pb)) }
+            }
+        }
+    }
+
+    /// The group a system's sequential barrier belongs to (ADR-021): its own stage when the stage
+    /// order ranks that stage against every other, and one shared group for the `Custom` labels
+    /// that the graph interleaves (no `configure_stages`). A barrier spanning ranked stages tied
+    /// them together in the graph for nothing — the plan orders them by stage anyway — and was the
+    /// last kind of edge to cross ranked stages.
+    fn barrier_group(&self, label: &StageLabel) -> Option<StageLabel> {
+        match label {
+            StageLabel::Custom(_) if self.stage_order.is_none() => None,
+            other => Some(other.clone()),
+        }
+    }
+
+    pub(crate) fn label_of(&self, id: SystemId) -> Option<&StageLabel> {
+        self.system_indices
+            .get(&id)
+            .and_then(|&i| self.systems.get(i))
+            .map(|s| &s.stage_label)
+    }
+
+    fn name_of(&self, id: SystemId) -> &str {
+        self.system_indices
+            .get(&id)
+            .and_then(|&i| self.systems.get(i))
+            .map(|s| s.name.as_str())
+            .unwrap_or("?")
+    }
+
+    /// True when the stage order alone serializes the two systems (ADR-021) — their pair needs no
+    /// graph edge, neither from an access conflict nor from an explicit ordering.
+    fn ranked_across_stages(&self, a: SystemId, b: SystemId) -> bool {
+        match (self.label_of(a), self.label_of(b)) {
+            (Some(la), Some(lb)) => self.stage_precedence(la, lb).is_some(),
+            _ => false,
+        }
+    }
+
     /// Checks whether an edge exists between two nodes.
     fn has_edge_between(&self, from: Index, to: Index) -> bool {
         // O(1) check via edge_set instead of O(N) successors()
@@ -327,11 +397,43 @@ impl Scheduler {
         };
 
         // ── 2. Explicit dependencies for new/changed systems ──
+        // An explicit edge between two systems of stages the stage order ranks (ADR-021) never
+        // enters the graph: agreeing with the stage order it is already satisfied by the stage
+        // boundary (and as a graph edge it only pushed the later system to a deeper level,
+        // splitting its stage into sequential sub-stages); contradicting it, no plan can honour
+        // it — that is an error naming both systems and stages, not a silently dropped request.
+        // An `independent()` pair asked for no particular order, so the stage order satisfies it.
+        for &idx in &systems_to_process {
+            let system = &self.systems[idx];
+            for (earlier, later) in system
+                .after
+                .iter()
+                .map(|&a| (a, system.id))
+                .chain(system.before.iter().map(|&b| (system.id, b)))
+            {
+                let (Some(le), Some(ll)) = (self.label_of(earlier), self.label_of(later)) else {
+                    continue;
+                };
+                if self.stage_precedence(le, ll) == Some(std::cmp::Ordering::Greater)
+                    && !self.order_free_pairs.contains(&(earlier, later))
+                {
+                    return Err(SchedulerError::OrderingAgainstStages {
+                        earlier: self.name_of(earlier).to_string(),
+                        later: self.name_of(later).to_string(),
+                        earlier_stage: le.to_string(),
+                        later_stage: ll.to_string(),
+                    });
+                }
+            }
+        }
         for &idx in &systems_to_process {
             let system = &self.systems[idx];
 
             // Runs after
             for &after_id in &system.after {
+                if self.ranked_across_stages(after_id, system.id) {
+                    continue;
+                }
                 if let (Some(&from), Some(&to)) = (
                     self.graph_nodes.get(&after_id),
                     self.graph_nodes.get(&system.id),
@@ -352,6 +454,9 @@ impl Scheduler {
 
             // Runs before
             for &before_id in &system.before {
+                if self.ranked_across_stages(system.id, before_id) {
+                    continue;
+                }
                 if let (Some(&from), Some(&to)) = (
                     self.graph_nodes.get(&system.id),
                     self.graph_nodes.get(&before_id),
@@ -379,69 +484,84 @@ impl Scheduler {
         let has_existing_edges = !self.edge_set.is_empty();
 
         // ── 3. Sequential barriers ──
-        // Use one dummy barrier node instead of O(N×M) edges:
-        //   all parallel → barrier → all sequential
-        // Result: N+M edges instead of N×M.
-        const BARRIER_ID: u32 = u32::MAX;
-        let barrier_sys_id = SystemId(BARRIER_ID);
-
-        if !self.seq_system_indices.is_empty() && !self.par_system_indices.is_empty() {
-            // Remove the old barrier node, if any
-            if let Some(old_barrier) = self.graph_nodes.remove(&barrier_sys_id) {
+        // One dummy barrier node per barrier group instead of O(N×M) edges:
+        //   the group's parallel systems → barrier → the group's sequential systems
+        // Result: N+M edges instead of N×M. A group is a stage the stage order ranks, or the
+        // shared group of graph-interleaved `Custom` stages (ADR-021, `barrier_group`).
+        for old_id in std::mem::take(&mut self.barrier_ids) {
+            if let Some(old_barrier) = self.graph_nodes.remove(&old_id) {
                 self.dependency_graph.remove_node(old_barrier);
                 self.edge_set
                     .retain(|&(a, b)| a != old_barrier && b != old_barrier);
                 self.edge_info
-                    .retain(|e| e.from_id != barrier_sys_id && e.to_id != barrier_sys_id);
+                    .retain(|e| e.from_id != old_id && e.to_id != old_id);
             }
-            // Add a new barrier node
-            let barrier_node = self.dependency_graph.add_node(barrier_sys_id);
-            self.graph_nodes.insert(barrier_sys_id, barrier_node);
-
-            // All parallel → barrier
+        }
+        {
+            use std::collections::BTreeMap;
+            // Group → (parallel ids, sequential ids); a BTreeMap so barrier ids are deterministic.
+            let mut groups: BTreeMap<Option<StageLabel>, (Vec<SystemId>, Vec<SystemId>)> =
+                BTreeMap::new();
             for &par_idx in &self.par_system_indices {
-                let par_id = self.systems[par_idx].id;
-                if let Some(&par_node) = self.graph_nodes.get(&par_id) {
-                    if !self.has_edge_between(par_node, barrier_node)
-                        && (has_existing_edges
-                            && !self.dependency_graph.has_path(barrier_node, par_node)
-                            || !has_existing_edges)
-                    {
-                        self.dependency_graph.add_edge(
-                            par_node,
-                            barrier_node,
-                            ConflictKind::SequentialBarrier,
-                        );
-                        self.edge_set.insert((par_node, barrier_node));
-                        self.edge_info.push(GraphEdgeInfo {
-                            from_id: par_id,
-                            to_id: barrier_sys_id,
-                            kind: ConflictKind::SequentialBarrier,
-                        });
+                let s = &self.systems[par_idx];
+                groups.entry(self.barrier_group(&s.stage_label)).or_default().0.push(s.id);
+            }
+            for &seq_idx in &self.seq_system_indices {
+                let s = &self.systems[seq_idx];
+                groups.entry(self.barrier_group(&s.stage_label)).or_default().1.push(s.id);
+            }
+            for (par_ids, seq_ids) in groups.into_values() {
+                if par_ids.is_empty() || seq_ids.is_empty() {
+                    continue;
+                }
+                let barrier_sys_id = SystemId(u32::MAX - self.barrier_ids.len() as u32);
+                self.barrier_ids.push(barrier_sys_id);
+                let barrier_node = self.dependency_graph.add_node(barrier_sys_id);
+                self.graph_nodes.insert(barrier_sys_id, barrier_node);
+
+                // Parallel → barrier
+                for par_id in par_ids {
+                    if let Some(&par_node) = self.graph_nodes.get(&par_id) {
+                        if !self.has_edge_between(par_node, barrier_node)
+                            && (has_existing_edges
+                                && !self.dependency_graph.has_path(barrier_node, par_node)
+                                || !has_existing_edges)
+                        {
+                            self.dependency_graph.add_edge(
+                                par_node,
+                                barrier_node,
+                                ConflictKind::SequentialBarrier,
+                            );
+                            self.edge_set.insert((par_node, barrier_node));
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: par_id,
+                                to_id: barrier_sys_id,
+                                kind: ConflictKind::SequentialBarrier,
+                            });
+                        }
                     }
                 }
-            }
 
-            // Barrier → all sequential
-            for &seq_idx in &self.seq_system_indices {
-                let seq_id = self.systems[seq_idx].id;
-                if let Some(&seq_node) = self.graph_nodes.get(&seq_id) {
-                    if !self.has_edge_between(barrier_node, seq_node)
-                        && (has_existing_edges
-                            && !self.dependency_graph.has_path(seq_node, barrier_node)
-                            || !has_existing_edges)
-                    {
-                        self.dependency_graph.add_edge(
-                            barrier_node,
-                            seq_node,
-                            ConflictKind::SequentialBarrier,
-                        );
-                        self.edge_set.insert((barrier_node, seq_node));
-                        self.edge_info.push(GraphEdgeInfo {
-                            from_id: barrier_sys_id,
-                            to_id: seq_id,
-                            kind: ConflictKind::SequentialBarrier,
-                        });
+                // Barrier → sequential
+                for seq_id in seq_ids {
+                    if let Some(&seq_node) = self.graph_nodes.get(&seq_id) {
+                        if !self.has_edge_between(barrier_node, seq_node)
+                            && (has_existing_edges
+                                && !self.dependency_graph.has_path(seq_node, barrier_node)
+                                || !has_existing_edges)
+                        {
+                            self.dependency_graph.add_edge(
+                                barrier_node,
+                                seq_node,
+                                ConflictKind::SequentialBarrier,
+                            );
+                            self.edge_set.insert((barrier_node, seq_node));
+                            self.edge_info.push(GraphEdgeInfo {
+                                from_id: barrier_sys_id,
+                                to_id: seq_id,
+                                kind: ConflictKind::SequentialBarrier,
+                            });
+                        }
                     }
                 }
             }
@@ -464,6 +584,15 @@ impl Scheduler {
                 }
 
                 let system_j = &self.systems[j];
+                // ADR-021: the stage order already serializes a pair from two ranked stages — a
+                // conflict edge there is redundant at best, and at worst fabricates a cycle
+                // (BidirectionalWriteRead adds both directions) or splits the later stage.
+                if self
+                    .stage_precedence(&system_i.stage_label, &system_j.stage_label)
+                    .is_some()
+                {
+                    continue;
+                }
                 let aj = match system_j.kind.access() {
                     Some(a) => a,
                     None => continue,

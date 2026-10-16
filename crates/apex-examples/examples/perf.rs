@@ -1341,18 +1341,18 @@ fn bench_parallel_scheduler(n: usize) {
         };
     }
 
-    make_solo_sys!(SoloSys0, C0);
-    make_solo_sys!(SoloSys1, C1);
-    make_solo_sys!(SoloSys2, C2);
-    make_solo_sys!(SoloSys3, C3);
-    make_solo_sys!(SoloSys4, C4);
-    make_solo_sys!(SoloSys5, C5);
-    make_solo_sys!(SoloSys6, C6);
-    make_solo_sys!(SoloSys7, C7);
-    make_solo_sys!(SoloSys8, C8);
-    make_solo_sys!(SoloSys9, C9);
-    make_solo_sys!(SoloSys10, C10);
-    make_solo_sys!(SoloSys11, C11);
+    make_solo_sys!(solo_sys_0, C0);
+    make_solo_sys!(solo_sys_1, C1);
+    make_solo_sys!(solo_sys_2, C2);
+    make_solo_sys!(solo_sys_3, C3);
+    make_solo_sys!(solo_sys_4, C4);
+    make_solo_sys!(solo_sys_5, C5);
+    make_solo_sys!(solo_sys_6, C6);
+    make_solo_sys!(solo_sys_7, C7);
+    make_solo_sys!(solo_sys_8, C8);
+    make_solo_sys!(solo_sys_9, C9);
+    make_solo_sys!(solo_sys_10, C10);
+    make_solo_sys!(solo_sys_11, C11);
 
     // ── World with 12 archetypes, one component in each ────
     let make_12arch_world = |n: usize| {
@@ -1388,8 +1388,8 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Test 1: 2 systems ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", solo_sys_0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", solo_sys_1)); }
         );
         bench_seq_par(
             &format!("2 solo systems, 2 archetypes ({n}k each)"),
@@ -1402,10 +1402,10 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Test 2: 4 systems ─────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", solo_sys_0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", solo_sys_1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", solo_sys_2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", solo_sys_3)); }
         );
         bench_seq_par(
             &format!("4 solo systems, 4 archetypes ({n}k each)"),
@@ -1418,14 +1418,14 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Test 3: 8 systems ────────────────────────────────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", SoloSys4)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", SoloSys5)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", SoloSys6)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", SoloSys7)); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", solo_sys_0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", solo_sys_1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", solo_sys_2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", solo_sys_3)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", solo_sys_4)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", solo_sys_5)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", solo_sys_6)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", solo_sys_7)); }
         );
         bench_seq_par(
             &format!("8 solo systems, 8 archetypes ({n}k each)"),
@@ -1438,18 +1438,18 @@ fn bench_parallel_scheduler(n: usize) {
     // ── Test 4: 12 systems (full load on all cores) ──────────
     {
         let (seq, par) = make_scheds!(
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", SoloSys0)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", SoloSys1)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", SoloSys2)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", SoloSys3)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", SoloSys4)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", SoloSys5)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", SoloSys6)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", SoloSys7)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s8", SoloSys8)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s9", SoloSys9)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s10", SoloSys10)); },
-            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s11", SoloSys11)); }
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s0", solo_sys_0)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s1", solo_sys_1)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s2", solo_sys_2)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s3", solo_sys_3)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s4", solo_sys_4)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s5", solo_sys_5)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s6", solo_sys_6)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s7", solo_sys_7)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s8", solo_sys_8)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s9", solo_sys_9)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s10", solo_sys_10)); },
+            |s: &mut Scheduler| { s.add_systems(StageLabel::Update, sys("s11", solo_sys_11)); }
         );
         bench_seq_par(
             &format!("12 solo systems, 12 archetypes ({n}k each)"),
