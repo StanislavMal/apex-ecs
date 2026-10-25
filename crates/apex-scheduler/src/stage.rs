@@ -101,6 +101,9 @@ pub struct Stage {
     /// TypeIds of events the systems of this Stage may emit.
     /// After the Stage runs, a per-Stage flush of exactly these types is invoked.
     pub(crate) emit_event_types: Vec<TypeId>,
+    /// The Stage holds an exclusive system (`&mut World`, no access descriptor): it may
+    /// emit any event type, so after the Stage ALL event queues are flushed (ADR-023).
+    pub(crate) flush_all_events: bool,
 }
 
 impl Stage {
@@ -110,6 +113,7 @@ impl Stage {
             system_ids,
             all_parallel,
             emit_event_types: Vec::new(),
+            flush_all_events: false,
         }
     }
 

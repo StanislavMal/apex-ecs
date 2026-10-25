@@ -188,10 +188,10 @@ impl Scheduler {
 
         // (clone the stage metadata — the plan borrows self, while stage_steps
         // and the systems below need &mut)
-        let stages_meta: Vec<(StageLabel, Vec<SystemId>, Vec<TypeId>)> = plan
+        let stages_meta: Vec<(StageLabel, Vec<SystemId>, Vec<TypeId>, bool)> = plan
             .stages
             .iter()
-            .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone()))
+            .map(|s| (s.label.clone(), s.system_ids.clone(), s.emit_event_types.clone(), s.flush_all_events))
             .collect();
 
         // Same FixedUpdate grouping as run_hybrid_parallel (D1): the contiguous
@@ -218,7 +218,7 @@ impl Scheduler {
         }
 
         for &stage_idx in &schedule {
-            let (label, system_ids, emit_event_types) = &stages_meta[stage_idx];
+            let (label, system_ids, emit_event_types, flush_all_events) = &stages_meta[stage_idx];
             if *label == StageLabel::Startup && self.startup_completed {
                 continue;
             }
@@ -303,9 +303,7 @@ impl Scheduler {
                 stage_cmds.apply(unsafe { &mut *world_ptr });
 
                 // Per-stage flush — makes events available to the next stage
-                if !emit_event_types.is_empty() {
-                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
-                }
+                flush_stage_events(unsafe { &mut *world_ptr }, emit_event_types, *flush_all_events);
                 // D6: advance each enabled system's baseline to this stage's tick.
                 self.advance_system_windows(&enabled, this_run);
             }
@@ -839,6 +837,7 @@ impl Scheduler {
             let stage_ids = &stage.system_ids;
             let all_parallel = stage.all_parallel;
             let emit_event_types = &stage.emit_event_types;
+            let flush_all_events = stage.flush_all_events;
             // Evaluate each system's run_condition EXACTLY ONCE this frame into
             // `enabled`, then reuse it in every branch below (SEQ-fallback, per-stage
             // sequential, and `run_stage_parallel`). A stateful condition
@@ -1001,9 +1000,7 @@ impl Scheduler {
                 // D8b: adaptive block sizing + reclaim unused block tails (bounds
                 // id-space under churn). After apply (records grown by flush).
                 self.commit_spawn_history(&mut seeded, unsafe { &mut *world_ptr });
-                if !emit_event_types.is_empty() {
-                    unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
-                }
+                flush_stage_events(unsafe { &mut *world_ptr }, emit_event_types, flush_all_events);
                 // D6: advance each enabled system's baseline to this stage's tick.
                 self.advance_system_windows(&enabled, this_run);
                 continue;
@@ -1147,9 +1144,7 @@ impl Scheduler {
             // D8b: adaptive block sizing + reclaim unused block tails (covers both the
             // SEQ-fallback and PAR branches). After apply (records grown by flush).
             self.commit_spawn_history(&mut seeded, unsafe { &mut *world_ptr });
-            if !emit_event_types.is_empty() {
-                unsafe { &mut *world_ptr }.flush_events_by_type(emit_event_types);
-            }
+            flush_stage_events(unsafe { &mut *world_ptr }, emit_event_types, flush_all_events);
             // D6: advance each enabled system's baseline to this stage's tick (covers the
             // SEQ-fallback and PAR branches).
             self.advance_system_windows(&enabled, this_run);
@@ -1186,4 +1181,16 @@ impl Scheduler {
             .unwrap_or(1)
     }
 
+}
+
+/// Per-stage event flush: makes the events sent on this stage readable from the next one.
+/// A stage with an exclusive system flushes every queue — such a system declares no event
+/// writes but may send any event through `&mut World` (ADR-023); otherwise only the
+/// declared `writes_event` types are flushed.
+fn flush_stage_events(world: &mut World, emit_event_types: &[TypeId], flush_all: bool) {
+    if flush_all {
+        world.flush_all_events();
+    } else if !emit_event_types.is_empty() {
+        world.flush_events_by_type(emit_event_types);
+    }
 }

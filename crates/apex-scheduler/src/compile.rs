@@ -147,20 +147,27 @@ impl Scheduler {
         // Collect event_writes for the per-stage flush
         for stage in &mut stages {
             let mut emit_types: FxHashSet<TypeId> = FxHashSet::default();
+            let mut flush_all = false;
             for &sys_id in &stage.system_ids {
                 if let Some(system) = self
                     .system_indices
                     .get(&sys_id)
                     .and_then(|&idx| self.systems.get(idx))
                 {
-                    if let Some(access) = system.kind.access() {
-                        for &(tid, _) in &access.writes_event {
-                            emit_types.insert(tid);
+                    match system.kind.access() {
+                        Some(access) => {
+                            for &(tid, _) in &access.writes_event {
+                                emit_types.insert(tid);
+                            }
                         }
+                        // An exclusive system declares no event writes but may send any
+                        // event through `&mut World` (ADR-023).
+                        None => flush_all = true,
                     }
                 }
             }
             stage.emit_event_types = emit_types.into_iter().collect();
+            stage.flush_all_events = flush_all;
         }
 
         self.execution_plan = Some(ExecutionPlan { stages, flat_order });

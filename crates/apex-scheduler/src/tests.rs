@@ -3831,3 +3831,61 @@
         sched.compile().unwrap();
         assert_eq!(stage_of(&sched, "read_pos"), stage_of(&sched, "write_hp"));
     }
+
+    // ── ADR-023: события эксклюзивной системы флашатся после её стадии ──────
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Blast(u32);
+
+    /// Эксклюзивная система стадии `a` шлёт событие — эксклюзивная система стадии `b` того же
+    /// кадра его читает (руководство §5.2: «события Stage N видны на Stage N+1»). До ADR-023
+    /// событие навсегда оставалось в `pending`: у эксклюзивной системы нет объявленных
+    /// `writes_event`, и флаш стадии его тип пропускал.
+    #[test]
+    fn exclusive_system_events_reach_the_next_stage() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        SEEN.store(0, Ordering::SeqCst);
+        let mut world = World::new();
+        world.add_event::<Blast>();
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::tag("a"), seq("send", |w: &mut World| w.send_event(Blast(7))));
+        sched.add_systems(
+            StageLabel::tag("b"),
+            seq("recv", |w: &mut World| {
+                let n = w.event_reader::<Blast>().read().iter().filter(|b| b.0 == 7).count();
+                SEEN.fetch_add(n as u32, Ordering::SeqCst);
+            }),
+        );
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.compile().unwrap();
+        for frame in 1..=3u32 {
+            world.tick();
+            sched.run(&mut world);
+            // Каждое событие прочитано ровно один раз, в том же кадре.
+            assert_eq!(SEEN.load(Ordering::SeqCst), frame, "кадр {frame}");
+        }
+    }
+
+    /// Эксклюзивная система, шлющая событие, и параллельная система, объявившая его чтение в
+    /// следующей стадии: событие доходит и до объявленного читателя.
+    #[test]
+    fn exclusive_event_reaches_a_declared_reader() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static READ: AtomicU32 = AtomicU32::new(0);
+        READ.store(0, Ordering::SeqCst);
+        system! {
+            fn listen_blast(r: EventReader<Blast>) {
+                READ.fetch_add(r.len() as u32, Ordering::SeqCst);
+            }
+        }
+        let mut world = World::new();
+        world.add_event::<Blast>();
+        let mut sched = Scheduler::new();
+        sched.add_systems(StageLabel::tag("a"), seq("send", |w: &mut World| w.send_event(Blast(1))));
+        sched.add_systems(StageLabel::tag("b"), listen_blast);
+        sched.configure_stages(vec![StageLabel::tag("a"), StageLabel::tag("b")]);
+        sched.compile().unwrap();
+        world.tick();
+        sched.run(&mut world);
+        assert_eq!(READ.load(Ordering::SeqCst), 1);
+    }
