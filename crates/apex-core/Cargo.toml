@@ -37,3 +37,6 @@ cgmath = { workspace = true, optional = true }
 [dev-dependencies]
 # Compile-fail tests for derive/`system!` migrant traps
 trybuild = { workspace = true }
+# `RawValue` in the fixture of `text::to_vec`: a value a document carries verbatim must pass the
+# wrapper untouched. A test-only feature - the library itself never names it.
+serde_json = { workspace = true, features = ["raw_value"] }

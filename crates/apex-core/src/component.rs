@@ -269,6 +269,12 @@ pub struct ComponentInfo {
     /// Serialization functions — `None` if the component is not marked as Serializable.
     /// Populated by a call to `register_component_serde::<T>()`.
     pub serde: Option<ComponentSerdeFns>,
+    /// The same type's fns in the OTHER format (ADR-024): a plain registration
+    /// (`register_component_serde`, `register_component_serde_json`) has both, because both come
+    /// from the type's one `serde` implementation — `serde` is the format the registration named,
+    /// this is the other. `None` for context-dependent fns, which exist in one format only.
+    /// Read through [`serde_as`](Self::serde_as).
+    pub serde_alt: Option<ComponentSerdeFns>,
     /// Remap of Entity references on restore (E6) — `None` if the component does not
     /// hold any. Populated by `register_map_entities::<T>()`.
     pub map_entities: Option<MapEntitiesFn>,
@@ -276,6 +282,19 @@ pub struct ComponentInfo {
     /// by the plain serde registrations, `None` for context-dependent fns, whose bytes were never
     /// plain bincode. Removed with the dependency (engine TD-608, 2026-12-17).
     pub legacy_bincode: Option<LegacyBincodeDeserializeFn>,
+}
+
+impl ComponentInfo {
+    /// The fns that write and read this type as a text payload (`text == true`: a JSON value) or
+    /// as a binary one — the registration's own format, or the other one when the registration
+    /// can give it ([`serde_alt`](Self::serde_alt)). `None`: the type has no serde, or only in
+    /// the other kind.
+    pub fn serde_as(&self, text: bool) -> Option<&ComponentSerdeFns> {
+        [self.serde.as_ref(), self.serde_alt.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|fns| (fns.format == SERDE_FORMAT_JSON) == text)
+    }
 }
 
 // ── Component trait ────────────────────────────────────────────
@@ -371,7 +390,7 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
         serialize_fn: |ptr, _ctx| {
             // SAFETY: the caller guarantees the validity of ptr as *const T
             let val = unsafe { &*(ptr as *const T) };
-            serde_json::to_vec(val)
+            crate::text::to_vec(val)
                 .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
         },
         deserialize_fn: |bytes, _ctx| {
@@ -559,6 +578,7 @@ impl ComponentRegistry {
             align: std::mem::align_of::<T>(),
             drop_fn: drop_ptr::<T>,
             serde: None,
+            serde_alt: None,
             map_entities: None,
             legacy_bincode: None,
         });
@@ -579,6 +599,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
+                info.serde_alt = Some(make_serde_fns_json::<T>());
                 info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }
@@ -594,6 +615,7 @@ impl ComponentRegistry {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.serde = Some(fns);
+            info.serde_alt = None;
             info.legacy_bincode = None;
         }
         id
@@ -630,6 +652,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns_json::<T>());
+                info.serde_alt = Some(make_serde_fns::<T>());
                 info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }

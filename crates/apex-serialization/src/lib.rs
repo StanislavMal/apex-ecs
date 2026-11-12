@@ -37,4 +37,6 @@ pub use snapshot::{
     ComponentSnapshot, DataFormat, EntitySnapshot, RelationSnapshot, ResourceSnapshot, SaveFormat,
     WorldDiff, WorldSnapshot,
 };
-pub use serializer::{WorldSerializer, RestoreEntityMap, SerializationError};
+pub use serializer::{
+    Payloads, RestoreEntityMap, SerializationError, SnapshotOptions, WorldSerializer,
+};

@@ -75,6 +75,7 @@ macro_rules! anomaly {
 pub mod access;
 pub mod archetype;
 pub mod binary;
+pub mod text;
 pub mod clock;
 pub mod commands;
 pub mod component;
@@ -123,7 +124,7 @@ pub use query::{
 };
 pub use registrar::WorldRegistrar;
 pub use relations::{ChildOf, Owns, RelationHookFn, RelationKind};
-pub use resources::{Resources, SerializedResource};
+pub use resources::{ResourceCodec, Resources, SerializedResource};
 pub use smallvec; // re-exported for #[derive(Bundle)] macro
 pub use sub_world::SubWorld;
 pub use system_param::{

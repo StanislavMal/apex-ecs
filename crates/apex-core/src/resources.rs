@@ -42,6 +42,29 @@ pub struct ResourceSerdeFns {
     /// Reader of the retired `bincode` payload: every resource of wire v3 and older was written
     /// so, whatever the type's registration today. Removed with engine TD-608 (2026-12-17).
     pub legacy_bincode: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
+    /// The same resource in the OTHER format (ADR-024): both registrations fill it, because both
+    /// formats come from the type's one `serde` implementation.
+    pub other: Option<ResourceCodec>,
+}
+
+/// One format's pair of resource fns — see [`ResourceSerdeFns::other`].
+#[derive(Clone, Copy)]
+pub struct ResourceCodec {
+    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`].
+    pub format: &'static str,
+    pub serialize: fn(&Resources) -> Option<Result<Vec<u8>, String>>,
+    pub deserialize: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
+}
+
+impl ResourceSerdeFns {
+    /// The pair that writes and reads `format`: the registration's own or the other one.
+    fn codec(&self, format: &str) -> Option<ResourceCodec> {
+        if self.format == format {
+            Some(ResourceCodec { format: self.format, serialize: self.serialize, deserialize: self.deserialize })
+        } else {
+            self.other.filter(|c| c.format == format)
+        }
+    }
 }
 
 /// One registered, present resource as the snapshot takes it.
@@ -82,7 +105,7 @@ fn de_resource<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
 fn ser_resource_json<R: serde::Serialize + Send + Sync + 'static>(
     res: &Resources,
 ) -> Option<Result<Vec<u8>, String>> {
-    res.try_get::<R>().map(|r| serde_json::to_vec(r).map_err(|e| e.to_string()))
+    res.try_get::<R>().map(|r| crate::text::to_vec(r).map_err(|e| e.to_string()))
 }
 fn de_resource_json<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
     res: &mut Resources,
@@ -141,6 +164,11 @@ impl Resources {
                 serialize: ser_resource::<R>,
                 deserialize: de_resource::<R>,
                 legacy_bincode: de_resource_legacy_bincode::<R>,
+                other: Some(ResourceCodec {
+                    format: SERDE_FORMAT_JSON,
+                    serialize: ser_resource_json::<R>,
+                    deserialize: de_resource_json::<R>,
+                }),
             },
         );
     }
@@ -160,6 +188,11 @@ impl Resources {
                 serialize: ser_resource_json::<R>,
                 deserialize: de_resource_json::<R>,
                 legacy_bincode: de_resource_legacy_bincode::<R>,
+                other: Some(ResourceCodec {
+                    format: SERDE_FORMAT_POSTCARD,
+                    serialize: ser_resource::<R>,
+                    deserialize: de_resource::<R>,
+                }),
             },
         );
     }
@@ -201,13 +234,28 @@ impl Resources {
     /// E7: every registered resource that is present, serialized. A resource whose serializer
     /// fails is an error naming it, not a silent absence from the document (§0.2a).
     pub fn snapshot_serde(&self) -> Result<Vec<SerializedResource>, String> {
+        self.snapshot_serde_as(None)
+    }
+
+    /// [`snapshot_serde`](Self::snapshot_serde) with the format chosen by the caller (ADR-024):
+    /// `None` — each resource as registered; `Some(format)` — every resource in that format. A
+    /// resource whose registration cannot write it is an error naming it.
+    pub fn snapshot_serde_as(&self, format: Option<&str>) -> Result<Vec<SerializedResource>, String> {
         let mut out = Vec::new();
         for fns in self.serde.values() {
-            if let Some(bytes) = (fns.serialize)(self) {
+            let codec = fns.codec(format.unwrap_or(fns.format)).ok_or_else(|| {
+                format!(
+                    "resource `{}` cannot be written as {}: its registration gives only {}",
+                    fns.type_name,
+                    format.unwrap_or(fns.format),
+                    fns.format
+                )
+            })?;
+            if let Some(bytes) = (codec.serialize)(self) {
                 let data = bytes.map_err(|e| format!("resource `{}` serialize failed: {e}", fns.type_name))?;
                 out.push(SerializedResource {
                     type_name: fns.type_name.to_string(),
-                    format: fns.format,
+                    format: codec.format,
                     data,
                 });
             }
@@ -218,8 +266,9 @@ impl Resources {
     }
 
     /// E7: deserialize+insert a resource by `type_name`, stamping `tick` as its
-    /// change tick (a restore is a change, RT-1). `format` is what the bytes were written as; a
-    /// payload in another format than the type's registration is an error naming both, not a
+    /// change tick (a restore is a change, RT-1). `format` is what the bytes were written as: it
+    /// is read by the registration's fns of that format, whichever format the registration named
+    /// (ADR-024). A payload in a format the type has no reader for is an error naming both, not a
     /// parse failure of the wrong reader. `Ok(false)` if that type_name was never registered
     /// (unknown resource — caller may warn).
     pub fn restore_serde(
@@ -231,12 +280,11 @@ impl Resources {
     ) -> Result<bool, String> {
         let fns = self.serde.values().find(|f| f.type_name == type_name).cloned();
         match fns {
-            Some(f) if f.format != format => Err(format!(
-                "the payload is {format}, the type is registered as {}",
-                f.format
-            )),
             Some(f) => {
-                (f.deserialize)(self, bytes, tick)?;
+                let codec = f.codec(format).ok_or_else(|| {
+                    format!("the payload is {format}, the type is registered as {}", f.format)
+                })?;
+                (codec.deserialize)(self, bytes, tick)?;
                 Ok(true)
             }
             None => Ok(false),

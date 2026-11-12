@@ -23,16 +23,74 @@ use crate::snapshot::{
 };
 use apex_core::{SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD};
 
+/// How the payloads of a snapshot are written (ADR-024). The format belongs to the WRITE, not to
+/// the type: a plain registration gives a type both formats, and the caller picks one per
+/// snapshot — a document a person reads now, a compact in-memory copy of the same world a moment
+/// later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Payloads {
+    /// Each type in the format its registration named.
+    #[default]
+    AsRegistered,
+    /// Every payload as a JSON value.
+    Text,
+    /// Every payload as binary bytes (`postcard` for a plain registration). `postcard` stores no
+    /// field names: such a payload is read back only by the build that wrote it, so this is the
+    /// format of a snapshot that lives inside one run, not of a save file (see ADR-024).
+    Binary,
+}
+
+impl Payloads {
+    /// The resource format name of the choice; `None` — as registered.
+    fn resource_format(self) -> Option<&'static str> {
+        match self {
+            Payloads::AsRegistered => None,
+            Payloads::Text => Some(SERDE_FORMAT_JSON),
+            Payloads::Binary => Some(SERDE_FORMAT_POSTCARD),
+        }
+    }
+}
+
+/// What [`WorldSerializer::snapshot_opts`] takes into a snapshot and how it writes it. `Default`
+/// is the plain full snapshot of [`WorldSerializer::snapshot_with`].
+#[derive(Default)]
+pub struct SnapshotOptions<'a> {
+    /// Entities to keep; `None` — every entity (see
+    /// [`snapshot_with_filter`](WorldSerializer::snapshot_with_filter)).
+    pub keep: Option<&'a dyn Fn(Entity) -> bool>,
+    /// The payload format.
+    pub payloads: Payloads,
+    /// `Some(key)` — a **canonical** snapshot (ADR-024): equal worlds give equal bytes, whatever
+    /// order their entities were spawned in and however many were despawned on the way. `key`
+    /// names an entity by something the HOST keeps stable (a unit id, an editor id) and must be
+    /// unique among the kept entities. Then:
+    /// - entities are written in key order and numbered 0, 1, 2… in that order;
+    /// - an `Entity` inside a component that registered `MapEntities`, and both ends of a
+    ///   relation, are written as those numbers;
+    /// - an entity's components are ordered by type name, relations by kind name, then target;
+    /// - the tick is 0.
+    ///
+    /// A reference to an entity outside the snapshot has no history-independent spelling and is
+    /// an error ([`SerializationError::CanonicalOutsideRef`]); `Entity::PLACEHOLDER` is a
+    /// constant and is kept.
+    pub canonical: Option<&'a dyn Fn(Entity) -> u64>,
+}
+
 /// One entity's serialized components — the SHARED body of
-/// [`WorldSerializer::snapshot_with_filter`] (archetype scan) and
+/// [`WorldSerializer::snapshot_opts`] (archetype scan) and
 /// [`WorldSerializer::snapshot_entities`] (random access via `entity_location`): two copies of
 /// this loop would drift (§0.2a).
+///
+/// `numbers` is the canonical numbering (old entity index → number in the snapshot), when the
+/// snapshot is canonical.
 fn entity_snapshot(
     world: &World,
     arch: &apex_core::archetype::Archetype,
     row: usize,
     entity: Entity,
     ctx: &mut dyn apex_core::SerdeContext,
+    payloads: Payloads,
+    numbers: Option<&HashMap<u32, u32>>,
 ) -> Result<EntitySnapshot, SerializationError> {
     let mut entity_snap = EntitySnapshot {
         original_index: entity.index(),
@@ -47,7 +105,7 @@ fn entity_snapshot(
         };
 
         // Components without serde are skipped
-        let serde_fns = match &info.serde {
+        let registered = match &info.serde {
             Some(s) => s,
             None    => continue,
         };
@@ -62,11 +120,37 @@ fn entity_snapshot(
             continue;
         }
 
-        let raw_bytes = unsafe { (serde_fns.serialize_fn)(col.get_raw_ptr(row), ctx) }
-            .map_err(|e| SerializationError::SerializeFailed {
-                type_name: info.name.to_string(),
-                reason:    e.to_string(),
-            })?;
+        // The fns of the format this snapshot is written in (ADR-024).
+        let serde_fns = match payloads {
+            Payloads::AsRegistered => registered,
+            Payloads::Text | Payloads::Binary => {
+                let text = payloads == Payloads::Text;
+                info.serde_as(text).ok_or_else(|| SerializationError::PayloadFormat {
+                    what:       "component",
+                    type_name:  info.name.to_string(),
+                    wanted:     if text { SERDE_FORMAT_JSON } else { "binary" },
+                    registered: registered.format,
+                })?
+            }
+        };
+
+        // SAFETY: `row` is a live row of this archetype (the caller took it from the archetype's
+        // entity list or from the entity's location).
+        let live = unsafe { col.get_raw_ptr(row) };
+        let raw_bytes = match (numbers, info.map_entities) {
+            // Canonical: the entity references of this component are written as snapshot numbers.
+            (Some(numbers), Some(map_fn)) => {
+                // SAFETY: `live` is the live value of the type `info` describes; `map_fn` and
+                // `serde_fns` were registered for that type.
+                unsafe { renumbered_payload(info, serde_fns, map_fn, live, ctx, numbers) }?
+            }
+            _ => unsafe { (serde_fns.serialize_fn)(live, ctx) }.map_err(|e| {
+                SerializationError::SerializeFailed {
+                    type_name: info.name.to_string(),
+                    reason:    e.to_string(),
+                }
+            })?,
+        };
 
         // Save depending on the serialization format
         match serde_fns.format {
@@ -87,6 +171,80 @@ fn entity_snapshot(
     }
 
     Ok(entity_snap)
+}
+
+/// The payload of a component whose `Entity` references are rewritten to canonical numbers.
+///
+/// The world is not touched (a snapshot reads it), and a component cannot be cloned in general,
+/// so the value takes a trip through its own serde: it is written, read back into a private
+/// copy, the copy's references are mapped, and the copy is written. This is the trip every
+/// restore makes anyway, and only a type that registered `MapEntities` pays for it.
+///
+/// # Safety
+/// `live` points at a live value of the type `info` describes; `serde_fns` and `map_fn` were
+/// registered for that type.
+unsafe fn renumbered_payload(
+    info: &apex_core::component::ComponentInfo,
+    serde_fns: &apex_core::ComponentSerdeFns,
+    map_fn: apex_core::MapEntitiesFn,
+    live: *const u8,
+    ctx: &mut dyn apex_core::SerdeContext,
+    numbers: &HashMap<u32, u32>,
+) -> Result<Vec<u8>, SerializationError> {
+    let failed = |reason: String| SerializationError::SerializeFailed {
+        type_name: info.name.to_string(),
+        reason,
+    };
+    let bytes = (serde_fns.serialize_fn)(live, ctx).map_err(|e| failed(e.to_string()))?;
+    let packed = (serde_fns.deserialize_fn)(&bytes, ctx)
+        .map_err(|e| failed(format!("the value does not read back for renumbering: {e}")))?;
+    debug_assert_eq!(packed.len(), info.size);
+
+    /// The private copy in an allocation of the type's own alignment (`deserialize_fn` hands the
+    /// value over in a byte vector, which promises none); dropped as the type on the way out.
+    struct Copy {
+        ptr:     *mut u8,
+        layout:  std::alloc::Layout,
+        drop_fn: unsafe fn(*mut u8),
+    }
+    impl Drop for Copy {
+        fn drop(&mut self) {
+            // SAFETY: `ptr` holds one live value of the type `drop_fn` belongs to, in an
+            // allocation of `layout`.
+            unsafe {
+                (self.drop_fn)(self.ptr);
+                std::alloc::dealloc(self.ptr, self.layout);
+            }
+        }
+    }
+    // The ZST branch of `entity_snapshot` returned earlier, so the size is not zero.
+    let layout = std::alloc::Layout::from_size_align(info.size, info.align)
+        .map_err(|e| failed(e.to_string()))?;
+    let ptr = std::alloc::alloc(layout);
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    // The value moves bitwise out of `packed` (plain bytes, dropped as such) into the copy.
+    std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, info.size);
+    let copy = Copy { ptr, layout, drop_fn: info.drop_fn };
+
+    let mut outside = None;
+    map_fn(copy.ptr, &mut |old: Entity| {
+        if old == Entity::PLACEHOLDER {
+            return old;
+        }
+        match numbers.get(&old.index()) {
+            Some(&number) => Entity::from_raw_parts(number, 0),
+            None => {
+                outside.get_or_insert(old.index());
+                old
+            }
+        }
+    });
+    if let Some(index) = outside {
+        return Err(SerializationError::CanonicalOutsideRef { type_name: info.name.to_string(), index });
+    }
+    (serde_fns.serialize_fn)(copy.ptr, ctx).map_err(|e| failed(e.to_string()))
 }
 
 // ── Errors ────────────────────────────────────────────────────
@@ -137,6 +295,15 @@ pub enum SerializationError {
 
     #[error("entity with index {index} not found in world")]
     EntityNotFound { index: u32 },
+
+    #[error("{what} `{type_name}` cannot be written as {wanted}: its registration gives only {registered}")]
+    PayloadFormat { what: &'static str, type_name: String, wanted: &'static str, registered: &'static str },
+
+    #[error("canonical snapshot: entities {first} and {second} share the key {key} — the key must name one entity")]
+    CanonicalKeyTwice { key: u64, first: u32, second: u32 },
+
+    #[error("canonical snapshot: component `{type_name}` refers to entity {index}, which is not in the snapshot — such a reference has no history-independent spelling")]
+    CanonicalOutsideRef { type_name: String, index: u32 },
 }
 
 // ── RestoreEntityMap ───────────────────────────────────────────
@@ -176,23 +343,65 @@ impl WorldSerializer {
         ctx: &mut dyn apex_core::SerdeContext,
         keep: &dyn Fn(apex_core::Entity) -> bool,
     ) -> Result<WorldSnapshot, SerializationError> {
-        let tick = world.current_tick().0;
-        let mut snap = WorldSnapshot::new(tick);
-        // Entity indices that made it into the snapshot — used to drop relations whose subject/target was
-        // filtered out (e.g. a scene instance's inner nodes), which would otherwise warn + skip on restore.
-        let mut kept: HashSet<u32> = HashSet::new();
+        Self::snapshot_opts(world, ctx, &SnapshotOptions { keep: Some(keep), ..Default::default() })
+    }
 
-        // ── Entities + Components ──────────────────────────────
+    /// The full snapshot with every choice the caller has (ADR-024): which entities
+    /// ([`SnapshotOptions::keep`]), which payload format ([`SnapshotOptions::payloads`]), and
+    /// whether the snapshot is canonical ([`SnapshotOptions::canonical`]). With
+    /// `SnapshotOptions::default()` this is [`snapshot_with`](Self::snapshot_with).
+    pub fn snapshot_opts(
+        world: &World,
+        ctx: &mut dyn apex_core::SerdeContext,
+        opts: &SnapshotOptions<'_>,
+    ) -> Result<WorldSnapshot, SerializationError> {
+        let tick = if opts.canonical.is_some() { 0 } else { world.current_tick().0 };
+        let mut snap = WorldSnapshot::new(tick);
+
+        // ── Which entities, in which order ─────────────────────
+        let mut picked: Vec<(&apex_core::archetype::Archetype, usize, Entity)> = Vec::new();
         for arch in world.archetypes() {
             if arch.is_empty() { continue; }
 
             for (row, &entity) in arch.entities().iter().enumerate() {
-                if !keep(entity) {
-                    continue;
+                if opts.keep.is_none_or(|keep| keep(entity)) {
+                    picked.push((arch, row, entity));
                 }
-                kept.insert(entity.index());
-                snap.entities.push(entity_snapshot(world, arch, row, entity, ctx)?);
             }
+        }
+        // Canonical: key order, and the numbering every reference is rewritten to.
+        let numbers: Option<HashMap<u32, u32>> = match opts.canonical {
+            None => None,
+            Some(key) => {
+                let mut keyed: Vec<(u64, (&apex_core::archetype::Archetype, usize, Entity))> =
+                    picked.drain(..).map(|p| (key(p.2), p)).collect();
+                keyed.sort_by_key(|(k, _)| *k);
+                if let Some(pair) = keyed.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+                    return Err(SerializationError::CanonicalKeyTwice {
+                        key:    pair[0].0,
+                        first:  pair[0].1 .2.index(),
+                        second: pair[1].1 .2.index(),
+                    });
+                }
+                picked.extend(keyed.into_iter().map(|(_, p)| p));
+                Some(picked.iter().enumerate().map(|(i, p)| (p.2.index(), i as u32)).collect())
+            }
+        };
+        // Entity indices that made it into the snapshot — used to drop relations whose subject/target was
+        // filtered out (e.g. a scene instance's inner nodes), which would otherwise warn + skip on restore.
+        let kept: HashSet<u32> = picked.iter().map(|p| p.2.index()).collect();
+
+        // ── Entities + Components ──────────────────────────────
+        snap.entities.reserve(picked.len());
+        for &(arch, row, entity) in &picked {
+            let mut entity_snap =
+                entity_snapshot(world, arch, row, entity, ctx, opts.payloads, numbers.as_ref())?;
+            if let Some(numbers) = &numbers {
+                entity_snap.original_index = numbers[&entity.index()];
+                // Column order follows component ids, which follow registration order.
+                entity_snap.components.sort_by(|a, b| a.type_name.cmp(&b.type_name));
+            }
+            snap.entities.push(entity_snap);
         }
 
         // ── Relations ──────────────────────────────────────────
@@ -218,11 +427,25 @@ impl WorldSerializer {
                 kind_name,
             });
         }
+        if let Some(numbers) = &numbers {
+            for rel in &mut snap.relations {
+                rel.subject_index = numbers[&rel.subject_index];
+                rel.target_index = numbers[&rel.target_index];
+            }
+            // Kinds by NAME (their index is registration order), targets by number; the sort is
+            // stable, so the subjects of one target keep their sibling order (ADR-008).
+            snap.relations.sort_by(|a, b| {
+                (a.kind_name.as_str(), a.target_index).cmp(&(b.kind_name.as_str(), b.target_index))
+            });
+        }
 
         // ── Resources (E7) ─────────────────────────────────────
         // Only resources opted in via `register_resource_serde` (a world may
         // hold non-serializable resources — GPU handles etc.).
-        for r in world.snapshot_resources_serde().map_err(SerializationError::ResourceSerializeFailed)? {
+        for r in world
+            .snapshot_resources_serde_as(opts.payloads.resource_format())
+            .map_err(SerializationError::ResourceSerializeFailed)?
+        {
             snap.resources.push(ResourceSnapshot {
                 type_name: r.type_name,
                 format:    if r.format == SERDE_FORMAT_JSON { DataFormat::Json } else { DataFormat::Binary },
@@ -275,7 +498,9 @@ impl WorldSerializer {
         for &entity in entities {
             let Some(loc) = world.entity_location(entity) else { continue };
             let arch = &world.archetypes()[loc.archetype_id.as_usize()];
-            snap.entities.push(entity_snapshot(world, arch, loc.row as usize, entity, ctx)?);
+            snap.entities.push(entity_snapshot(
+                world, arch, loc.row as usize, entity, ctx, Payloads::AsRegistered, None,
+            )?);
         }
 
         let targets: Vec<u32> = kept.iter().copied().collect();
@@ -453,7 +678,6 @@ impl WorldSerializer {
                     // marker ever to grow). Here the type decides what bare presence means — a
                     // marker that grew reads it as its defaults — and a type that cannot read
                     // `null` still fails loudly, naming itself.
-                    let registered_json = serde_fns.format == SERDE_FORMAT_JSON;
                     match comp_snap.format {
                         // A document of wire v3 or older: decode through the type's legacy reader.
                         DataFormat::LegacyBincode => {
@@ -466,25 +690,26 @@ impl WorldSerializer {
                                 reason:    e.to_string(),
                             })?
                         }
-                        // A payload of the other format than the registration: name both, rather
-                        // than let the wrong reader report a parse error at column 1.
-                        format if (format == DataFormat::Json) != registered_json => {
-                            return Err(SerializationError::DeserializeFailed {
+                        // The payload is read by the type's fns of the payload's own format,
+                        // whichever format the registration named (ADR-024). A type that has no
+                        // reader for it (context-dependent fns exist in one format): name both,
+                        // rather than let the wrong reader report a parse error at column 1.
+                        format => {
+                            let text = format == DataFormat::Json;
+                            let reader = info.serde_as(text).ok_or_else(|| SerializationError::DeserializeFailed {
                                 type_name: comp_snap.type_name.clone(),
                                 reason:    format!(
                                     "the payload is {format:?}, the type is registered as {}",
                                     serde_fns.format
                                 ),
-                            });
-                        }
-                        _ => {
-                            let raw: &[u8] = if comp_snap.data.is_empty() && registered_json {
+                            })?;
+                            let raw: &[u8] = if comp_snap.data.is_empty() && text {
                                 b"null"
                             } else {
                                 &comp_snap.data
                             };
 
-                            (serde_fns.deserialize_fn)(raw, ctx)
+                            (reader.deserialize_fn)(raw, ctx)
                                 .map_err(|e| SerializationError::DeserializeFailed {
                                     type_name: comp_snap.type_name.clone(),
                                     reason:    e.to_string(),
@@ -560,10 +785,16 @@ impl WorldSerializer {
                     "restore: resource '{}' not registered for serde — dropped",
                     res.type_name
                 ),
-                Err(e) => log::warn!(
-                    "restore: resource '{}' failed to deserialize ({e}) — dropped",
-                    res.type_name
-                ),
+                // A resource that does not read is the same failure as a component that does not
+                // read: the document is not this world (ADR-024). It used to be a line in the log,
+                // and the world loaded with the resource at whatever it held before — a save that
+                // "loaded" with an empty journal.
+                Err(e) => {
+                    return Err(SerializationError::DeserializeFailed {
+                        type_name: res.type_name.clone(),
+                        reason:    e,
+                    })
+                }
             }
         }
 
@@ -1607,30 +1838,374 @@ mod tests {
         }
     }
 
-    /// A payload in another format than its type's registration is named as such.
+    /// A JSON-only type: context-dependent fns exist in the one format their author wrote.
+    #[derive(Component, Debug, PartialEq)]
+    struct JsonOnly(u64);
+
+    fn json_only_fns() -> apex_core::ComponentSerdeFns {
+        apex_core::ComponentSerdeFns {
+            serialize_fn: |ptr, _ctx| {
+                let v = unsafe { &*(ptr as *const JsonOnly) };
+                Ok(serde_json::to_vec(&v.0).unwrap())
+            },
+            deserialize_fn: |bytes, _ctx| {
+                let id: u64 = serde_json::from_slice(bytes).map_err(|e| {
+                    apex_core::component::ComponentSerdeError::DeserializationFailed(e.to_string())
+                })?;
+                Ok(id.to_le_bytes().to_vec())
+            },
+            format: SERDE_FORMAT_JSON,
+        }
+    }
+
+    /// A payload in a format its type has NO reader for is named as such (ADR-018). Since ADR-024
+    /// a plain registration reads both formats, so the mismatch is left to the types that exist in
+    /// one: context-dependent fns.
     #[test]
     fn a_payload_of_the_other_format_names_both_formats() {
         let mut world = World::new();
-        world.register_component_serde_json::<Position>();
-        let e = world.spawn((Position { x: 1.0, y: 2.0 },));
-        let snap = WorldSerializer::snapshot(&world).unwrap();
+        world.register_component_serde_with::<JsonOnly>(json_only_fns());
+        world.spawn((JsonOnly(7),));
+        let mut snap = WorldSerializer::snapshot(&world).unwrap();
+        assert_eq!(snap.entities[0].components[0].format, DataFormat::Json);
+        // The same bytes claimed to be binary: the type cannot read binary.
+        snap.entities[0].components[0].format = DataFormat::Binary;
 
         let mut w2 = World::new();
-        w2.register_component_serde::<Position>();
+        w2.register_component_serde_with::<JsonOnly>(json_only_fns());
         let err = WorldSerializer::restore(&mut w2, &snap).unwrap_err().to_string();
-        assert!(err.contains("Json") && err.contains("postcard"), "{err}");
+        assert!(err.contains("Binary") && err.contains("json") && err.contains("JsonOnly"), "{err}");
+    }
 
-        #[derive(Serialize, Deserialize)]
+    /// The same type cannot be WRITTEN in the format it does not have either: the snapshot names
+    /// it instead of putting the registered format into a snapshot that was asked for the other.
+    #[test]
+    fn a_type_with_one_format_is_refused_in_the_other() {
+        let mut world = World::new();
+        world.register_component_serde_with::<JsonOnly>(json_only_fns());
+        world.register_component_serde::<Position>();
+        world.spawn((JsonOnly(7), Position { x: 1.0, y: 2.0 }));
+
+        let binary = SnapshotOptions { payloads: Payloads::Binary, ..Default::default() };
+        let err = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &binary)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JsonOnly") && err.contains("binary") && err.contains("json"), "{err}");
+
+        // In its own format the snapshot is written, the plain type following the request.
+        let text = SnapshotOptions { payloads: Payloads::Text, ..Default::default() };
+        let snap = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &text).unwrap();
+        assert!(snap.entities[0].components.iter().all(|c| c.format == DataFormat::Json));
+    }
+
+    /// ADR-024: the payload format is chosen when the snapshot is written, not when the type is
+    /// registered — and a world registered either way reads either payload, through both container
+    /// forms.
+    #[test]
+    fn a_snapshot_is_written_in_the_format_the_caller_names() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Level(u32);
+
+        fn build(json: bool) -> World {
+            let mut world = World::new();
+            if json {
+                world.register_component_serde_json::<Position>();
+                world.register_component_serde_json::<Marker>();
+                world.register_resource_serde_json::<Level>();
+            } else {
+                world.register_component_serde::<Position>();
+                world.register_component_serde::<Marker>();
+                world.register_resource_serde::<Level>();
+            }
+            world
+        }
+        let position = Position { x: 1.5, y: -2.0 };
+
+        for registered_json in [true, false] {
+            let mut world = build(registered_json);
+            let e = world.spawn((position, Marker));
+            world.insert_resource(Level(3));
+            let as_registered = WorldSerializer::snapshot(&world).unwrap();
+
+            for (payloads, format) in
+                [(Payloads::Text, DataFormat::Json), (Payloads::Binary, DataFormat::Binary)]
+            {
+                let opts = SnapshotOptions { payloads, ..Default::default() };
+                let snap = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap();
+                let payload = snap.entities[0]
+                    .components
+                    .iter()
+                    .find(|c| c.type_name.ends_with("Position"))
+                    .unwrap();
+                assert_eq!(payload.format, format);
+                assert_eq!(snap.resources[0].format, format);
+                // The bytes are the bytes of that format's one road.
+                let expected = if format == DataFormat::Json {
+                    apex_core::text::to_vec(&position).unwrap()
+                } else {
+                    apex_core::binary::to_vec(&position).unwrap()
+                };
+                assert_eq!(payload.data, expected);
+                // Asking for the registered format is the plain snapshot.
+                if (format == DataFormat::Json) == registered_json {
+                    assert_eq!(snap, as_registered);
+                }
+
+                let forms = [
+                    WorldSnapshot::from_json(&snap.to_json().unwrap()).unwrap(),
+                    WorldSnapshot::from_binary(&snap.to_binary().unwrap()).unwrap(),
+                ];
+                for form in &forms {
+                    for reader_json in [true, false] {
+                        let mut w2 = build(reader_json);
+                        let map = WorldSerializer::restore(&mut w2, form).unwrap();
+                        let restored = map[&e.index()];
+                        assert_eq!(w2.get::<Position>(restored), Some(&position));
+                        assert!(w2.get::<Marker>(restored).is_some(), "a marker is its presence");
+                        assert_eq!(w2.try_resource::<Level>().map(|l| l.0), Some(3));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A resource whose payload does not read fails the restore, as a component's does — it is
+    /// not dropped with a line in the log, leaving the world with whatever the resource held.
+    #[test]
+    fn a_resource_that_does_not_read_fails_the_restore() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct Level(u32);
         let mut world = World::new();
         world.register_resource_serde_json::<Level>();
         world.insert_resource(Level(3));
-        let snap = WorldSerializer::snapshot(&world).unwrap();
+        let mut snap = WorldSerializer::snapshot(&world).unwrap();
+        snap.resources[0].data = br#""three""#.to_vec();
+
         let mut w2 = World::new();
-        w2.register_resource_serde::<Level>();
-        WorldSerializer::restore(&mut w2, &snap).unwrap();
-        assert!(w2.try_resource::<Level>().is_none(), "a mismatched resource is dropped loudly, not misread");
-        let _ = e;
+        w2.register_resource_serde_json::<Level>();
+        w2.insert_resource(Level(1));
+        let err = WorldSerializer::restore(&mut w2, &snap).unwrap_err();
+        match &err {
+            SerializationError::DeserializeFailed { type_name, .. } => {
+                assert!(type_name.ends_with("Level"), "{type_name}")
+            }
+            other => panic!("{other}"),
+        }
+        // A resource the world does not know is still skipped: a type removed by a newer build
+        // must not make its old documents unreadable.
+        let mut w3 = World::new();
+        snap.resources[0].data = b"3".to_vec();
+        WorldSerializer::restore(&mut w3, &snap).unwrap();
+        assert!(w3.try_resource::<Level>().is_none());
+    }
+
+    // ── Canonical snapshot (ADR-024) ─────────────────────────────
+
+    /// The host's stable name of an entity.
+    #[derive(Component, Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+    struct Id(u64);
+
+    /// Entity references of every shape, next to heap data: the renumbering works on a private
+    /// copy of the value, which has to be dropped as the type it is.
+    #[derive(Component, Clone, Debug, Serialize, Deserialize, PartialEq)]
+    struct Squad {
+        leader:  Entity,
+        members: Vec<Entity>,
+        name:    String,
+        reserve: Entity,
+    }
+
+    impl apex_core::MapEntities for Squad {
+        fn map_entities(&mut self, f: &mut dyn FnMut(Entity) -> Entity) {
+            self.leader = f(self.leader);
+            for m in &mut self.members {
+                *m = f(*m);
+            }
+            self.reserve = f(self.reserve);
+        }
+    }
+
+    fn register_squads(world: &mut World, reversed: bool) {
+        // Registration order decides component ids, and with them the column order of an archetype.
+        if reversed {
+            world.register_component_serde_json::<Squad>();
+            world.register_component_serde_json::<Position>();
+            world.register_component_serde_json::<Id>();
+        } else {
+            world.register_component_serde_json::<Id>();
+            world.register_component_serde_json::<Position>();
+            world.register_component_serde_json::<Squad>();
+        }
+        world.register_map_entities::<Squad>();
+    }
+
+    /// The same five units and the same links between them, reached by a different history:
+    /// `order` is the spawn order, `junk` entities are spawned first and half of them despawned.
+    fn squads(order: &[u64], junk: usize, reversed: bool) -> (World, HashMap<u64, Entity>) {
+        let mut world = World::new();
+        register_squads(&mut world, reversed);
+        let scrap: Vec<Entity> = (0..junk).map(|_| world.spawn((Position { x: 0.0, y: 0.0 },))).collect();
+        for e in scrap.iter().step_by(2) {
+            world.despawn(*e);
+        }
+        let mut by_id = HashMap::new();
+        for &id in order {
+            let e = world.spawn((Id(id), Position { x: id as f32 * 0.1, y: -(id as f32) }));
+            by_id.insert(id, e);
+        }
+        for e in scrap.iter().skip(1).step_by(2) {
+            world.despawn(*e);
+        }
+        world.insert(
+            by_id[&1],
+            Squad {
+                leader:  by_id[&2],
+                members: vec![by_id[&3], by_id[&5], by_id[&1]],
+                name:    "first".into(),
+                reserve: Entity::PLACEHOLDER,
+            },
+        );
+        world.insert(
+            by_id[&4],
+            Squad { leader: by_id[&1], members: Vec::new(), name: "fourth".into(), reserve: by_id[&5] },
+        );
+        for (child, parent) in [(2, 1), (3, 1), (5, 1), (4, 2)] {
+            world.add_relation(by_id[&child], apex_core::relations::ChildOf, by_id[&parent]);
+        }
+        (world, by_id)
+    }
+
+    fn canonical(world: &World, payloads: Payloads) -> Result<WorldSnapshot, SerializationError> {
+        let key = |e: Entity| world.get::<Id>(e).map_or(u64::MAX, |id| id.0);
+        let opts = SnapshotOptions { canonical: Some(&key), payloads, ..Default::default() };
+        WorldSerializer::snapshot_opts(world, &mut apex_core::NoContext, &opts)
+    }
+
+    /// ADR-024: a canonical snapshot is a function of the world's state, not of its history.
+    #[test]
+    fn equal_worlds_of_different_history_give_equal_canonical_bytes() {
+        let (a, a_ids) = squads(&[1, 2, 3, 4, 5], 0, false);
+        let (b, _) = squads(&[5, 3, 1, 4, 2], 7, true);
+
+        // The control: the plain snapshots of the two worlds differ.
+        assert_ne!(
+            WorldSerializer::snapshot(&a).unwrap().to_json().unwrap(),
+            WorldSerializer::snapshot(&b).unwrap().to_json().unwrap()
+        );
+
+        for payloads in [Payloads::AsRegistered, Payloads::Binary] {
+            let (sa, sb) = (canonical(&a, payloads).unwrap(), canonical(&b, payloads).unwrap());
+            assert_eq!(
+                String::from_utf8(sa.to_json().unwrap()).unwrap(),
+                String::from_utf8(sb.to_json().unwrap()).unwrap()
+            );
+            assert_eq!(sa.to_binary().unwrap(), sb.to_binary().unwrap());
+        }
+
+        // What "canonical" means, read off the snapshot.
+        let snap = canonical(&b, Payloads::AsRegistered).unwrap();
+        assert_eq!(snap.tick, 0);
+        assert_eq!(snap.entities.iter().map(|e| e.original_index).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        let payload = |entity: usize, ty: &str| -> serde_json::Value {
+            let c = snap.entities[entity].components.iter().find(|c| c.type_name.ends_with(ty)).unwrap();
+            serde_json::from_slice(&c.data).unwrap()
+        };
+        assert_eq!(payload(0, "::Id"), serde_json::json!(1));
+        assert_eq!(payload(4, "::Id"), serde_json::json!(5));
+        // Unit 1's squad: leader 2 → number 1, members 3, 5, 1 → numbers 2, 4, 0, the placeholder kept.
+        let squad = payload(0, "::Squad");
+        assert_eq!(squad["leader"], serde_json::json!({ "index": 1, "generation": 0 }));
+        assert_eq!(
+            squad["members"],
+            serde_json::json!([
+                { "index": 2, "generation": 0 },
+                { "index": 4, "generation": 0 },
+                { "index": 0, "generation": 0 }
+            ])
+        );
+        assert_eq!(squad["reserve"], serde_json::to_value(Entity::PLACEHOLDER).unwrap());
+        let names: Vec<&str> = snap.entities[0].components.iter().map(|c| c.type_name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "components by type name");
+        // Relations: by target, the children of one parent in the order they were attached.
+        assert_eq!(
+            snap.relations.iter().map(|r| (r.subject_index, r.target_index)).collect::<Vec<_>>(),
+            [(1, 0), (2, 0), (4, 0), (3, 1)]
+        );
+
+        // The snapshot read the world and left it alone: the live references are the live entities.
+        let live = a.get::<Squad>(a_ids[&1]).unwrap();
+        assert_eq!((live.leader, live.members[1]), (a_ids[&2], a_ids[&5]));
+
+        // Save → load → save: the restored world gives the same bytes, with its references
+        // pointing at its own entities.
+        let mut loaded = World::new();
+        register_squads(&mut loaded, false);
+        // A relation kind is part of the schema: restore finds it by name.
+        loaded.relation_registry_mut().get_or_register::<apex_core::relations::ChildOf>();
+        loaded.spawn((Position { x: 9.0, y: 9.0 },)); // a different allocator state again
+        let map = WorldSerializer::restore(&mut loaded, &snap).unwrap();
+        let (unit1, unit2) = (map[&0], map[&1]);
+        assert_eq!(loaded.get::<Id>(unit2), Some(&Id(2)));
+        assert_eq!(loaded.get::<Squad>(unit1).unwrap().leader, unit2);
+        let keep = |e: Entity| loaded.get::<Id>(e).is_some();
+        let key = |e: Entity| loaded.get::<Id>(e).unwrap().0;
+        let opts = SnapshotOptions { keep: Some(&keep), canonical: Some(&key), ..Default::default() };
+        let again = WorldSerializer::snapshot_opts(&loaded, &mut apex_core::NoContext, &opts).unwrap();
+        assert_eq!(
+            String::from_utf8(again.to_json().unwrap()).unwrap(),
+            String::from_utf8(snap.to_json().unwrap()).unwrap()
+        );
+    }
+
+    /// A key that names two entities cannot order them: an error, not an order that depends on
+    /// which archetype came first.
+    #[test]
+    fn a_canonical_key_shared_by_two_entities_is_an_error() {
+        let (world, ids) = squads(&[1, 2, 3, 4, 5], 0, false);
+        let key = |e: Entity| if e == ids[&3] || e == ids[&5] { 77 } else { world.get::<Id>(e).unwrap().0 };
+        let opts = SnapshotOptions { canonical: Some(&key), ..Default::default() };
+        let err = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap_err();
+        match err {
+            SerializationError::CanonicalKeyTwice { key: 77, first, second } => {
+                let mut pair = [first, second];
+                pair.sort();
+                let mut expected = [ids[&3].index(), ids[&5].index()];
+                expected.sort();
+                assert_eq!(pair, expected);
+            }
+            other => panic!("{other}"),
+        }
+    }
+
+    /// A reference to an entity the snapshot does not hold — filtered out, or despawned and left
+    /// dangling — has no canonical spelling: an error naming the component, not a raw index that
+    /// differs between two equal worlds.
+    #[test]
+    fn a_canonical_reference_to_an_entity_outside_the_snapshot_is_an_error() {
+        // Filtered out: unit 2 is the leader of unit 1's squad.
+        let (world, ids) = squads(&[1, 2, 3, 4, 5], 0, false);
+        let keep = |e: Entity| e != ids[&2];
+        let key = |e: Entity| world.get::<Id>(e).unwrap().0;
+        let opts = SnapshotOptions { keep: Some(&keep), canonical: Some(&key), ..Default::default() };
+        let err = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap_err();
+        match &err {
+            SerializationError::CanonicalOutsideRef { type_name, index } => {
+                assert!(type_name.ends_with("::Squad"), "{type_name}");
+                assert_eq!(*index, ids[&2].index());
+            }
+            other => panic!("{other}"),
+        }
+        // The same world without the canonical option is written as before: the reference stays raw.
+        let plain = SnapshotOptions { keep: Some(&keep), ..Default::default() };
+        assert!(WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &plain).is_ok());
+
+        // Dangling: the referenced entity is gone.
+        let (mut world, ids) = squads(&[1, 2, 3, 4, 5], 0, false);
+        world.despawn(ids[&5]);
+        let err = canonical(&world, Payloads::AsRegistered).unwrap_err();
+        assert!(matches!(err, SerializationError::CanonicalOutsideRef { .. }), "{err}");
     }
 
     /// E6: a component holding an `Entity` ref is remapped on restore — the ref

@@ -998,6 +998,15 @@ impl World {
         self.resources.snapshot_serde()
     }
 
+    /// [`snapshot_resources_serde`](Self::snapshot_resources_serde) with the format chosen by the
+    /// caller (ADR-024): `None` — as registered, `Some(format)` — every resource in that format.
+    pub fn snapshot_resources_serde_as(
+        &self,
+        format: Option<&str>,
+    ) -> Result<Vec<crate::resources::SerializedResource>, String> {
+        self.resources.snapshot_serde_as(format)
+    }
+
     /// Restore one resource from its serde bytes written as `format`. `Ok(true)` = applied,
     /// `Ok(false)` = type not registered for serde on this world (caller warns,
     /// §0.2a). Consumed by `WorldSerializer`.
