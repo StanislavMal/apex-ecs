@@ -11,8 +11,11 @@
 //! - **Binary** ([`WorldSnapshot::to_binary`]) — `postcard`, behind a magic word, for compact
 //!   saves.
 //!
-//! A component's bytes are whatever its registered serde fns write ([`DataFormat`]); the
-//! container format only decides how those bytes are carried.
+//! A component's bytes are whatever its serde fns of the snapshot's payload format write
+//! ([`DataFormat`], chosen by [`Payloads`](crate::Payloads)); the container format only decides
+//! how those bytes are carried. A binary SAVE is the binary container with
+//! [`DataFormat::Named`] payloads (core ADR-025): the container's own layout is versioned by the
+//! core, and the payloads carry their field names.
 
 use serde::de::DeserializeOwned;
 
@@ -36,13 +39,39 @@ use crate::serializer::SerializationError;
 pub enum DataFormat {
     /// JSON text — written into a text document as a readable value.
     Json,
-    /// Bytes of a binary registration (`postcard` for the core's own fns).
+    /// Bytes of a binary registration (`postcard` for the core's own fns): no field names, read
+    /// only by the build that wrote them.
     Binary,
+    /// Self-describing binary bytes (`apex_core::named`: MessagePack, struct fields by name) —
+    /// the binary payload a later build still reads (core ADR-025).
+    Named,
     /// Bytes in the retired `bincode` encoding, read from a document of wire version 3 or older.
     /// Restore decodes them through the type's legacy reader; writing them into a new document is
     /// refused, because no reader of the new format could decode them. Removed with the
     /// dependency (engine TD-608, 2026-12-17).
     LegacyBincode,
+}
+
+impl DataFormat {
+    /// The format of the bytes a pair of serde fns with this `format` name writes.
+    pub(crate) fn of(format: &str) -> Self {
+        match apex_core::PayloadKind::of(format) {
+            apex_core::PayloadKind::Text => DataFormat::Json,
+            apex_core::PayloadKind::Binary => DataFormat::Binary,
+            apex_core::PayloadKind::Named => DataFormat::Named,
+        }
+    }
+
+    /// The kind of serde fns that read these bytes; `None` for the retired encoding, which has
+    /// its own reader.
+    pub(crate) fn kind(self) -> Option<apex_core::PayloadKind> {
+        match self {
+            DataFormat::Json => Some(apex_core::PayloadKind::Text),
+            DataFormat::Binary => Some(apex_core::PayloadKind::Binary),
+            DataFormat::Named => Some(apex_core::PayloadKind::Named),
+            DataFormat::LegacyBincode => None,
+        }
+    }
 }
 
 // ── WorldSnapshot ────────────────────────────────────────────────
@@ -64,6 +93,7 @@ impl ResourceSnapshot {
         match self.format {
             DataFormat::Json => serde_json::from_slice(&self.data).map_err(|e| e.to_string()),
             DataFormat::Binary => apex_core::binary::from_bytes(&self.data).map_err(|e| e.to_string()),
+            DataFormat::Named => apex_core::named::from_slice(&self.data).map_err(|e| e.to_string()),
             DataFormat::LegacyBincode => bincode::deserialize(&self.data)
                 .map_err(|e| format!("legacy bincode payload: {e}")),
         }
@@ -211,6 +241,15 @@ impl ComponentSnapshot {
             type_name: type_name.into(),
             data: bytes,
             format: DataFormat::Binary,
+        }
+    }
+
+    /// Create a snapshot from self-describing binary bytes (`apex_core::named`).
+    pub fn new_named(type_name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            type_name: type_name.into(),
+            data: bytes,
+            format: DataFormat::Named,
         }
     }
 
@@ -430,6 +469,11 @@ mod tests {
             format: DataFormat::Binary,
             data: apex_core::binary::to_vec(&value).unwrap(),
         };
+        let named = ResourceSnapshot {
+            type_name: "Config".into(),
+            format: DataFormat::Named,
+            data: apex_core::named::to_vec(&value).unwrap(),
+        };
         let legacy = ResourceSnapshot {
             type_name: "Config".into(),
             format: DataFormat::LegacyBincode,
@@ -437,6 +481,11 @@ mod tests {
         };
         assert_eq!(json.decode::<Config>().unwrap(), value);
         assert_eq!(binary.decode::<Config>().unwrap(), value);
+        assert_eq!(named.decode::<Config>().unwrap(), value);
+        // A named payload read as the compact one is an error too: the two binary kinds are
+        // not each other's bytes.
+        let wrong = ResourceSnapshot { format: DataFormat::Binary, ..named };
+        assert!(wrong.decode::<Config>().is_err());
         assert_eq!(legacy.decode::<Config>().unwrap(), value);
         // The same bytes read as another format are an error, not a value.
         let wrong = ResourceSnapshot { format: DataFormat::Json, ..binary };

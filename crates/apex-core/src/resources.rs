@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::cell::UnsafeCell;
 
 use crate::archetype::TickCell;
-use crate::component::{Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD};
+use crate::component::{Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_MSGPACK, SERDE_FORMAT_POSTCARD};
 
 /// A resource slot: the value behind `UnsafeCell` so `get_raw_parts` can hand
 /// out a `*mut T` whose provenance is the cell's interior — writing through it
@@ -31,8 +31,8 @@ unsafe impl Sync for ResourceCell {}
 #[derive(Clone)]
 pub struct ResourceSerdeFns {
     pub type_name: &'static str,
-    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`] — what `serialize` writes and
-    /// `deserialize` reads.
+    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`] — the format the registration named:
+    /// what `serialize` writes and `deserialize` reads.
     pub format: &'static str,
     /// Serialize the resource if it is currently present.
     pub serialize: fn(&Resources) -> Option<Result<Vec<u8>, String>>,
@@ -42,27 +42,56 @@ pub struct ResourceSerdeFns {
     /// Reader of the retired `bincode` payload: every resource of wire v3 and older was written
     /// so, whatever the type's registration today. Removed with engine TD-608 (2026-12-17).
     pub legacy_bincode: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
-    /// The same resource in the OTHER format (ADR-024): both registrations fill it, because both
-    /// formats come from the type's one `serde` implementation.
-    pub other: Option<ResourceCodec>,
+    /// The same resource in the OTHER formats (ADR-024, ADR-025): both registrations fill both,
+    /// because every format comes from the type's one `serde` implementation.
+    pub others: [Option<ResourceCodec>; 2],
 }
 
-/// One format's pair of resource fns — see [`ResourceSerdeFns::other`].
+/// One format's pair of resource fns — see [`ResourceSerdeFns::others`].
 #[derive(Clone, Copy)]
 pub struct ResourceCodec {
-    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`].
+    /// [`SERDE_FORMAT_JSON`], [`SERDE_FORMAT_POSTCARD`] or [`SERDE_FORMAT_MSGPACK`].
     pub format: &'static str,
     pub serialize: fn(&Resources) -> Option<Result<Vec<u8>, String>>,
     pub deserialize: fn(&mut Resources, &[u8], Tick) -> Result<(), String>,
 }
 
 impl ResourceSerdeFns {
-    /// The pair that writes and reads `format`: the registration's own or the other one.
+    /// The pair that writes and reads `format`: the registration's own or one of the others.
     fn codec(&self, format: &str) -> Option<ResourceCodec> {
         if self.format == format {
             Some(ResourceCodec { format: self.format, serialize: self.serialize, deserialize: self.deserialize })
         } else {
-            self.other.filter(|c| c.format == format)
+            self.others.iter().flatten().find(|c| c.format == format).copied()
+        }
+    }
+
+    /// The fns of a plain registration: `json` names the registered format, the other two formats
+    /// of the type's `serde` implementation ride along.
+    fn plain<R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static>(json: bool) -> Self {
+        let text = ResourceCodec {
+            format: SERDE_FORMAT_JSON,
+            serialize: ser_resource_json::<R>,
+            deserialize: de_resource_json::<R>,
+        };
+        let binary = ResourceCodec {
+            format: SERDE_FORMAT_POSTCARD,
+            serialize: ser_resource::<R>,
+            deserialize: de_resource::<R>,
+        };
+        let named = ResourceCodec {
+            format: SERDE_FORMAT_MSGPACK,
+            serialize: ser_resource_named::<R>,
+            deserialize: de_resource_named::<R>,
+        };
+        let (own, other) = if json { (text, binary) } else { (binary, text) };
+        ResourceSerdeFns {
+            type_name: std::any::type_name::<R>(),
+            format: own.format,
+            serialize: own.serialize,
+            deserialize: own.deserialize,
+            legacy_bincode: de_resource_legacy_bincode::<R>,
+            others: [Some(other), Some(named)],
         }
     }
 }
@@ -71,7 +100,7 @@ impl ResourceSerdeFns {
 #[derive(Clone, Debug)]
 pub struct SerializedResource {
     pub type_name: String,
-    /// [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`].
+    /// [`SERDE_FORMAT_JSON`], [`SERDE_FORMAT_POSTCARD`] or [`SERDE_FORMAT_MSGPACK`].
     pub format: &'static str,
     pub data: Vec<u8>,
 }
@@ -116,6 +145,20 @@ fn de_resource_json<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
     res.insert(r, tick);
     Ok(())
 }
+fn ser_resource_named<R: serde::Serialize + Send + Sync + 'static>(
+    res: &Resources,
+) -> Option<Result<Vec<u8>, String>> {
+    res.try_get::<R>().map(|r| crate::named::to_vec(r).map_err(|e| e.to_string()))
+}
+fn de_resource_named<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
+    res: &mut Resources,
+    bytes: &[u8],
+    tick: Tick,
+) -> Result<(), String> {
+    let r: R = crate::named::from_slice(bytes).map_err(|e| e.to_string())?;
+    res.insert(r, tick);
+    Ok(())
+}
 fn de_resource_legacy_bincode<R: serde::de::DeserializeOwned + Send + Sync + 'static>(
     res: &mut Resources,
     bytes: &[u8],
@@ -156,21 +199,7 @@ impl Resources {
     pub fn register_serde<R: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static>(
         &mut self,
     ) {
-        self.serde.insert(
-            TypeId::of::<R>(),
-            ResourceSerdeFns {
-                type_name: std::any::type_name::<R>(),
-                format: SERDE_FORMAT_POSTCARD,
-                serialize: ser_resource::<R>,
-                deserialize: de_resource::<R>,
-                legacy_bincode: de_resource_legacy_bincode::<R>,
-                other: Some(ResourceCodec {
-                    format: SERDE_FORMAT_JSON,
-                    serialize: ser_resource_json::<R>,
-                    deserialize: de_resource_json::<R>,
-                }),
-            },
-        );
+        self.serde.insert(TypeId::of::<R>(), ResourceSerdeFns::plain::<R>(false));
     }
 
     /// E7: opt a resource type into snapshots as a JSON value — the resource counterpart of
@@ -180,21 +209,7 @@ impl Resources {
     >(
         &mut self,
     ) {
-        self.serde.insert(
-            TypeId::of::<R>(),
-            ResourceSerdeFns {
-                type_name: std::any::type_name::<R>(),
-                format: SERDE_FORMAT_JSON,
-                serialize: ser_resource_json::<R>,
-                deserialize: de_resource_json::<R>,
-                legacy_bincode: de_resource_legacy_bincode::<R>,
-                other: Some(ResourceCodec {
-                    format: SERDE_FORMAT_POSTCARD,
-                    serialize: ser_resource::<R>,
-                    deserialize: de_resource::<R>,
-                }),
-            },
-        );
+        self.serde.insert(TypeId::of::<R>(), ResourceSerdeFns::plain::<R>(true));
     }
 
     /// RT-2: opt a resource type into the name-addressed JSON view (read-only

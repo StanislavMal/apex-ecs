@@ -13,7 +13,7 @@
 
 use apex_core::prelude::*;
 use apex_isolated::WorldBridge;
-use apex_serialization::{WorldSerializer, WorldSnapshot};
+use apex_serialization::{Payloads, SnapshotOptions, WorldSerializer, WorldSnapshot};
 use serde::{Deserialize, Serialize};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -136,6 +136,32 @@ fn main() {
             w.entity_count()
         }),
     );
+
+    // The whole save in each payload format (ADR-024, ADR-025): the text document a person reads,
+    // the binary save a later build still reads (named), the compact copy of one run (binary).
+    println!("
+[a save: every payload in one format]");
+    for (name, payloads) in [("text", Payloads::Text), ("named", Payloads::Named), ("binary", Payloads::Binary)] {
+        let opts = SnapshotOptions { payloads, ..Default::default() };
+        let take = || WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap();
+        let write = |s: &WorldSnapshot| if payloads == Payloads::Text { s.to_json() } else { s.to_binary() }.unwrap();
+        let bytes = write(&take());
+        row(&format!("{name}: snapshot + write"), median_of(|| write(&take()).len()));
+        row(
+            &format!("{name}: read + restore"),
+            median_of(|| {
+                let s = if payloads == Payloads::Text {
+                    WorldSnapshot::from_json(&bytes)
+                } else {
+                    WorldSnapshot::from_binary(&bytes)
+                }
+                .unwrap();
+                let mut w = registered_world();
+                WorldSerializer::restore(&mut w, &s).unwrap();
+                w.entity_count()
+            }),
+        );
+    }
 
     // A tenth of the entities moved: the incremental save.
     let (mut moved, ids) = populated_world();

@@ -20,8 +20,9 @@
 //! A JSON component or resource is written as its JSON value, **byte for byte** as its serde fns
 //! produced it (`RawValue`): a load followed by a save does not re-print a single float. Bare
 //! presence (no bytes) is `null`. A payload of a binary registration has no JSON spelling and goes
-//! into `binary_components` / `binary_resources` as bytes. Unknown fields and a type named twice on
-//! one entity are errors, not silently dropped data.
+//! into `binary_components` / `binary_resources` as bytes; a self-describing binary payload
+//! (`apex_core::named`, core ADR-025) — into `msgpack_components` / `msgpack_resources`. Unknown
+//! fields and a type named twice on one entity are errors, not silently dropped data.
 //!
 //! Up to version 3 the document stored every payload as an array of byte values (a 640 KB scene
 //! of which a person could read nothing), and resources as `bincode` bytes.
@@ -131,6 +132,8 @@ struct TextSnapshot {
     resources: Named<Box<RawValue>>,
     #[serde(default, skip_serializing_if = "Named::is_empty")]
     binary_resources: Named<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Named::is_empty")]
+    msgpack_resources: Named<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,6 +144,8 @@ struct TextEntity {
     components: Named<Box<RawValue>>,
     #[serde(default, skip_serializing_if = "Named::is_empty")]
     binary_components: Named<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Named::is_empty")]
+    msgpack_components: Named<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,12 +183,14 @@ pub(crate) fn snapshot_to_text(snap: &WorldSnapshot) -> Result<Vec<u8>, Serializ
     for e in &snap.entities {
         let mut components = Vec::new();
         let mut binary_components = Vec::new();
+        let mut msgpack_components = Vec::new();
         for c in &e.components {
             match c.format {
                 DataFormat::Json => {
                     components.push((c.type_name.clone(), raw_json("component", &c.type_name, &c.data)?))
                 }
                 DataFormat::Binary => binary_components.push((c.type_name.clone(), c.data.clone())),
+                DataFormat::Named => msgpack_components.push((c.type_name.clone(), c.data.clone())),
                 DataFormat::LegacyBincode => return Err(legacy_payload("component", &c.type_name)),
             }
         }
@@ -191,14 +198,17 @@ pub(crate) fn snapshot_to_text(snap: &WorldSnapshot) -> Result<Vec<u8>, Serializ
             id: e.original_index,
             components: Named(components),
             binary_components: Named(binary_components),
+            msgpack_components: Named(msgpack_components),
         });
     }
     let mut resources = Vec::new();
     let mut binary_resources = Vec::new();
+    let mut msgpack_resources = Vec::new();
     for r in &snap.resources {
         match r.format {
             DataFormat::Json => resources.push((r.type_name.clone(), raw_json("resource", &r.type_name, &r.data)?)),
             DataFormat::Binary => binary_resources.push((r.type_name.clone(), r.data.clone())),
+            DataFormat::Named => msgpack_resources.push((r.type_name.clone(), r.data.clone())),
             DataFormat::LegacyBincode => return Err(legacy_payload("resource", &r.type_name)),
         }
     }
@@ -214,6 +224,7 @@ pub(crate) fn snapshot_to_text(snap: &WorldSnapshot) -> Result<Vec<u8>, Serializ
             .collect(),
         resources: Named(resources),
         binary_resources: Named(binary_resources),
+        msgpack_resources: Named(msgpack_resources),
     };
     Ok(serde_json::to_vec_pretty(&doc)?)
 }
@@ -238,6 +249,9 @@ fn text_v4_into_snapshot(data: &[u8]) -> Result<WorldSnapshot, SerializationErro
             components.extend(
                 e.binary_components.0.into_iter().map(|(name, bytes)| ComponentSnapshot::new_binary(name, bytes)),
             );
+            components.extend(
+                e.msgpack_components.0.into_iter().map(|(name, bytes)| ComponentSnapshot::new_named(name, bytes)),
+            );
             EntitySnapshot { original_index: e.id, components }
         })
         .collect();
@@ -259,6 +273,11 @@ fn text_v4_into_snapshot(data: &[u8]) -> Result<WorldSnapshot, SerializationErro
     resources.extend(doc.binary_resources.0.into_iter().map(|(type_name, data)| ResourceSnapshot {
         type_name,
         format: DataFormat::Binary,
+        data,
+    }));
+    resources.extend(doc.msgpack_resources.0.into_iter().map(|(type_name, data)| ResourceSnapshot {
+        type_name,
+        format: DataFormat::Named,
         data,
     }));
     resources.sort_by(|a, b| a.type_name.cmp(&b.type_name));
@@ -290,10 +309,13 @@ pub(crate) fn snapshot_from_text(data: &[u8]) -> Result<WorldSnapshot, Serializa
 // encoding it — TD-608 stand), and reading borrows payload bytes out of the input until the
 // in-memory record takes its one copy.
 
+/// The variants are numbered by `postcard` in declaration order: a new one goes LAST, so every
+/// document written before it reads as it did (`Named` joined in core ADR-025).
 #[derive(Serialize, Deserialize, Clone, Copy)]
 enum WireFormat {
     Json,
     Binary,
+    Named,
 }
 
 /// A payload as ONE block of bytes (`serialize_bytes`), not a sequence of `u8` elements: the same
@@ -418,6 +440,7 @@ impl<'a> Interner<'a> {
         let format = match format {
             DataFormat::Json => WireFormat::Json,
             DataFormat::Binary => WireFormat::Binary,
+            DataFormat::Named => WireFormat::Named,
             DataFormat::LegacyBincode => return Err(legacy_payload(what, name)),
         };
         Ok(BinaryPayload { name: self.intern(name), format, data: Cow::Borrowed(data) })
@@ -455,6 +478,7 @@ impl Names<'_> {
         Ok(match p.format {
             WireFormat::Json => ComponentSnapshot::new_json(name, p.data.into_owned()),
             WireFormat::Binary => ComponentSnapshot::new_binary(name, p.data.into_owned()),
+            WireFormat::Named => ComponentSnapshot::new_named(name, p.data.into_owned()),
         })
     }
 
@@ -468,6 +492,7 @@ impl Names<'_> {
             format:    match p.format {
                 WireFormat::Json => DataFormat::Json,
                 WireFormat::Binary => DataFormat::Binary,
+                WireFormat::Named => DataFormat::Named,
             },
             data:      p.data.into_owned(),
         })
@@ -616,6 +641,7 @@ mod tests {
                 ComponentSnapshot::new_json("game::Name", br#""Door \"A\"""#.to_vec()),
                 ComponentSnapshot::new_json("game::Frozen", Vec::new()),
                 ComponentSnapshot::new_binary("game::Packed", vec![0, 255, 7, 1]),
+                ComponentSnapshot::new_named("game::Saved", vec![0x81, 0xa2, b'h', b'p', 5]),
             ],
         });
         snap.entities.push(EntitySnapshot { original_index: 9, components: Vec::new() });
@@ -634,7 +660,33 @@ mod tests {
             format:    DataFormat::Json,
             data:      br#"{"volume":0.1}"#.to_vec(),
         });
+        snap.resources.push(ResourceSnapshot {
+            type_name: "game::World".into(),
+            format:    DataFormat::Named,
+            data:      vec![0x81, 0xa3, b'd', b'a', b'y', 12],
+        });
         snap
+    }
+
+    /// `postcard` numbers an enum's variants in declaration order, so the tag of a payload format
+    /// is part of every binary document ever written: a format joins at the end.
+    #[test]
+    fn the_payload_format_tags_are_pinned() {
+        for (format, tag) in [(WireFormat::Json, 0u8), (WireFormat::Binary, 1), (WireFormat::Named, 2)] {
+            assert_eq!(apex_core::binary::to_vec(&format).unwrap(), [tag]);
+        }
+    }
+
+    /// A document that holds no self-describing payload is the document it was before they
+    /// existed (ADR-025): a build that does not know them still reads it.
+    #[test]
+    fn a_document_without_named_payloads_does_not_mention_them() {
+        let mut snap = full_snapshot();
+        snap.entities[0].components.retain(|c| c.format != DataFormat::Named);
+        snap.resources.retain(|r| r.format != DataFormat::Named);
+        let text = String::from_utf8(snap.to_json().unwrap()).unwrap();
+        assert!(!text.contains("msgpack"), "{text}");
+        assert_eq!(WorldSnapshot::from_json(text.as_bytes()).unwrap(), snap);
     }
 
     #[test]
@@ -657,6 +709,8 @@ mod tests {
         assert_eq!(comps["game::Name"], "Door \"A\"");
         assert!(comps["game::Frozen"].is_null(), "bare presence is null");
         assert_eq!(v["entities"][0]["binary_components"]["game::Packed"], serde_json::json!([0, 255, 7, 1]));
+        assert_eq!(v["entities"][0]["msgpack_components"]["game::Saved"], serde_json::json!([0x81, 0xa2, 104, 112, 5]));
+        assert_eq!(v["msgpack_resources"]["game::World"], serde_json::json!([0x81, 0xa3, 100, 97, 121, 12]));
         assert_eq!(v["resources"]["game::Settings"]["volume"], 0.1);
         assert_eq!(v["relations"][0]["kind"], "apex_core::relations::ChildOf");
         assert!(!text.contains("\"data\""), "no payload is spelled as bytes: {text}");

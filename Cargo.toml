@@ -56,6 +56,9 @@ bincode    = "1.3"
 # Binary format of snapshots, diffs, binary components and events between worlds. The wire
 # format is stable across 1.x by its specification.
 postcard   = { version = "1.1", default-features = false, features = ["use-std"] }
+# Self-describing binary format (MessagePack, struct fields by name) of binary SAVES: payloads a
+# later build still reads (core ADR-025). The mapping is pinned by `named::the_encoding_is_pinned`.
+rmp-serde  = "1.3"
 
 # Math for transforms
 glam = { version = "0.32", features = ["serde"] }

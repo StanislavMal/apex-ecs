@@ -164,8 +164,9 @@ pub struct ComponentSerdeFns {
     pub serialize_fn: unsafe fn(*const u8, &mut dyn SerdeContext) -> SerializeResult,
     /// Deserialize bytes back into an aligned buffer holding T's data (with the same `ctx`).
     pub deserialize_fn: fn(&[u8], &mut dyn SerdeContext) -> DeserializeResult,
-    /// Format name: [`SERDE_FORMAT_JSON`] or [`SERDE_FORMAT_POSTCARD`]. A snapshot stores JSON bytes
-    /// as a readable value and anything else as bytes.
+    /// Format name: [`SERDE_FORMAT_JSON`], [`SERDE_FORMAT_POSTCARD`], [`SERDE_FORMAT_MSGPACK`] or
+    /// the name a context-dependent pair gives its own bytes. A snapshot stores JSON bytes as a
+    /// readable value and anything else as bytes ([`PayloadKind::of`]).
     pub format: &'static str,
 }
 
@@ -269,12 +270,12 @@ pub struct ComponentInfo {
     /// Serialization functions — `None` if the component is not marked as Serializable.
     /// Populated by a call to `register_component_serde::<T>()`.
     pub serde: Option<ComponentSerdeFns>,
-    /// The same type's fns in the OTHER format (ADR-024): a plain registration
-    /// (`register_component_serde`, `register_component_serde_json`) has both, because both come
-    /// from the type's one `serde` implementation — `serde` is the format the registration named,
-    /// this is the other. `None` for context-dependent fns, which exist in one format only.
-    /// Read through [`serde_as`](Self::serde_as).
-    pub serde_alt: Option<ComponentSerdeFns>,
+    /// The same type's fns in the OTHER formats (ADR-024, ADR-025): a plain registration
+    /// (`register_component_serde`, `register_component_serde_json`) has all three, because all
+    /// come from the type's one `serde` implementation — `serde` is the format the registration
+    /// named, these are the other two. `[None, None]` for context-dependent fns, which exist in
+    /// one format only. Read through [`serde_as`](Self::serde_as).
+    pub serde_alt: [Option<ComponentSerdeFns>; 2],
     /// Remap of Entity references on restore (E6) — `None` if the component does not
     /// hold any. Populated by `register_map_entities::<T>()`.
     pub map_entities: Option<MapEntitiesFn>,
@@ -285,15 +286,14 @@ pub struct ComponentInfo {
 }
 
 impl ComponentInfo {
-    /// The fns that write and read this type as a text payload (`text == true`: a JSON value) or
-    /// as a binary one — the registration's own format, or the other one when the registration
-    /// can give it ([`serde_alt`](Self::serde_alt)). `None`: the type has no serde, or only in
-    /// the other kind.
-    pub fn serde_as(&self, text: bool) -> Option<&ComponentSerdeFns> {
-        [self.serde.as_ref(), self.serde_alt.as_ref()]
-            .into_iter()
+    /// The fns that write and read this type as a payload of `kind` — the registration's own
+    /// format, or another one when the registration can give it
+    /// ([`serde_alt`](Self::serde_alt)). `None`: the type has no serde, or not in that kind.
+    pub fn serde_as(&self, kind: PayloadKind) -> Option<&ComponentSerdeFns> {
+        std::iter::once(&self.serde)
+            .chain(&self.serde_alt)
             .flatten()
-            .find(|fns| (fns.format == SERDE_FORMAT_JSON) == text)
+            .find(|fns| PayloadKind::of(fns.format) == kind)
     }
 }
 
@@ -342,6 +342,45 @@ pub const SERDE_FORMAT_JSON: &str = "json";
 /// The `format` name of binary component and resource fns ([`make_serde_fns`]): `postcard` 1.x,
 /// whose wire format is stable across the 1.x line by its specification.
 pub const SERDE_FORMAT_POSTCARD: &str = "postcard";
+/// The `format` name of self-describing binary component and resource fns
+/// ([`make_serde_fns_named`]): MessagePack with struct fields by name ([`crate::named`]) — the
+/// binary bytes a later build still reads (ADR-025).
+pub const SERDE_FORMAT_MSGPACK: &str = "msgpack";
+
+/// What a payload's bytes are to the one who carries or reads them (ADR-025). A type with a plain
+/// registration has fns of every kind ([`ComponentInfo::serde_as`]); a snapshot is written in the
+/// kind its caller names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadKind {
+    /// A JSON value: a text document carries it as a value a person reads.
+    Text,
+    /// Compact bytes without field names (`postcard`, or what a context-dependent pair writes):
+    /// read only by the build that wrote them.
+    Binary,
+    /// Self-describing binary bytes ([`crate::named`]): the binary payload of a save.
+    Named,
+}
+
+impl PayloadKind {
+    /// The kind of the bytes a pair of fns with this `format` name writes. A name the core does
+    /// not know is a context-dependent pair's own binary format.
+    pub fn of(format: &str) -> Self {
+        match format {
+            SERDE_FORMAT_JSON => PayloadKind::Text,
+            SERDE_FORMAT_MSGPACK => PayloadKind::Named,
+            _ => PayloadKind::Binary,
+        }
+    }
+
+    /// The name of the kind in an error message.
+    pub fn name(self) -> &'static str {
+        match self {
+            PayloadKind::Text => SERDE_FORMAT_JSON,
+            PayloadKind::Binary => "binary",
+            PayloadKind::Named => SERDE_FORMAT_MSGPACK,
+        }
+    }
+}
 
 /// Reads a component payload written by the retired binary encoding (`bincode` 1.x): the format
 /// of `Binary` component bytes in snapshots of wire version 3 and older. Kept only so such
@@ -399,6 +438,25 @@ pub fn make_serde_fns_json<T: Serializable>() -> ComponentSerdeFns {
             Ok(pack_component(val))
         },
         format: SERDE_FORMAT_JSON,
+    }
+}
+
+/// Creates `ComponentSerdeFns` for a type T implementing `Serializable` in the self-describing
+/// binary format ([`crate::named`]): the binary payload of a save (ADR-025).
+pub fn make_serde_fns_named<T: Serializable>() -> ComponentSerdeFns {
+    ComponentSerdeFns {
+        serialize_fn: |ptr, _ctx| {
+            // SAFETY: the caller guarantees the validity of ptr as *const T
+            let val = unsafe { &*(ptr as *const T) };
+            crate::named::to_vec(val)
+                .map_err(|e| ComponentSerdeError::SerializationFailed(e.to_string()))
+        },
+        deserialize_fn: |bytes, _ctx| {
+            let val: T = crate::named::from_slice(bytes)
+                .map_err(|e| ComponentSerdeError::DeserializationFailed(e.to_string()))?;
+            Ok(pack_component(val))
+        },
+        format: SERDE_FORMAT_MSGPACK,
     }
 }
 
@@ -578,7 +636,7 @@ impl ComponentRegistry {
             align: std::mem::align_of::<T>(),
             drop_fn: drop_ptr::<T>,
             serde: None,
-            serde_alt: None,
+            serde_alt: [None, None],
             map_entities: None,
             legacy_bincode: None,
         });
@@ -599,7 +657,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns::<T>());
-                info.serde_alt = Some(make_serde_fns_json::<T>());
+                info.serde_alt = [Some(make_serde_fns_json::<T>()), Some(make_serde_fns_named::<T>())];
                 info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }
@@ -615,7 +673,7 @@ impl ComponentRegistry {
         let id = self.register::<T>();
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             info.serde = Some(fns);
-            info.serde_alt = None;
+            info.serde_alt = [None, None];
             info.legacy_bincode = None;
         }
         id
@@ -652,7 +710,7 @@ impl ComponentRegistry {
         if let Some(info) = self.by_id.get_mut(id.0 as usize) {
             if info.serde.is_none() {
                 info.serde = Some(make_serde_fns_json::<T>());
-                info.serde_alt = Some(make_serde_fns::<T>());
+                info.serde_alt = [Some(make_serde_fns::<T>()), Some(make_serde_fns_named::<T>())];
                 info.legacy_bincode = Some(legacy_bincode_deserialize::<T>);
             }
         }

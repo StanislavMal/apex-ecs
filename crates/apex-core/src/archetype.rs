@@ -871,7 +871,7 @@ mod tests {
             align: std::mem::align_of::<f32>(),
             drop_fn: noop_drop,
             serde: None,
-            serde_alt: None,
+            serde_alt: [None, None],
             map_entities: None,
             legacy_bincode: None,
         }
@@ -1010,7 +1010,7 @@ mod tests {
             align: std::mem::align_of::<u32>(),
             drop_fn: counting_panic_drop,
             serde: None,
-            serde_alt: None,
+            serde_alt: [None, None],
             map_entities: None,
             legacy_bincode: None,
         };
@@ -1061,7 +1061,7 @@ mod tests {
             align: 1,
             drop_fn: noop_drop,
             serde: None,
-            serde_alt: None,
+            serde_alt: [None, None],
             map_entities: None,
             legacy_bincode: None,
         };
@@ -1170,7 +1170,7 @@ mod tests {
             align: 1,
             drop_fn: noop_drop,
             serde: None,
-            serde_alt: None,
+            serde_alt: [None, None],
             map_entities: None,
             legacy_bincode: None,
         };

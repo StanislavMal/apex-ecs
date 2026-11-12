@@ -21,11 +21,11 @@ use crate::snapshot::{
     ComponentSnapshot, DataFormat, EntitySnapshot, RelationSnapshot, ResourceSnapshot, SaveFormat,
     WorldDiff, WorldSnapshot,
 };
-use apex_core::{SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD};
+use apex_core::{PayloadKind, SERDE_FORMAT_JSON, SERDE_FORMAT_MSGPACK, SERDE_FORMAT_POSTCARD};
 
-/// How the payloads of a snapshot are written (ADR-024). The format belongs to the WRITE, not to
-/// the type: a plain registration gives a type both formats, and the caller picks one per
-/// snapshot — a document a person reads now, a compact in-memory copy of the same world a moment
+/// How the payloads of a snapshot are written (ADR-024, ADR-025). The format belongs to the
+/// WRITE, not to the type: a plain registration gives a type every format, and the caller picks
+/// one per snapshot — a document a person reads now, a binary save of the same world a moment
 /// later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Payloads {
@@ -38,6 +38,11 @@ pub enum Payloads {
     /// field names: such a payload is read back only by the build that wrote it, so this is the
     /// format of a snapshot that lives inside one run, not of a save file (see ADR-024).
     Binary,
+    /// Every payload as self-describing binary bytes (`apex_core::named`: MessagePack with struct
+    /// fields by name). A later build still reads them — a field added with `#[serde(default)]`,
+    /// a field removed, a variant added — so this, in the binary container
+    /// ([`WorldSnapshot::to_binary`]), is the format of a binary SAVE (ADR-025).
+    Named,
 }
 
 impl Payloads {
@@ -47,6 +52,17 @@ impl Payloads {
             Payloads::AsRegistered => None,
             Payloads::Text => Some(SERDE_FORMAT_JSON),
             Payloads::Binary => Some(SERDE_FORMAT_POSTCARD),
+            Payloads::Named => Some(SERDE_FORMAT_MSGPACK),
+        }
+    }
+
+    /// The payload kind of the choice; `None` — as registered.
+    fn kind(self) -> Option<PayloadKind> {
+        match self {
+            Payloads::AsRegistered => None,
+            Payloads::Text => Some(PayloadKind::Text),
+            Payloads::Binary => Some(PayloadKind::Binary),
+            Payloads::Named => Some(PayloadKind::Named),
         }
     }
 }
@@ -121,17 +137,14 @@ fn entity_snapshot(
         }
 
         // The fns of the format this snapshot is written in (ADR-024).
-        let serde_fns = match payloads {
-            Payloads::AsRegistered => registered,
-            Payloads::Text | Payloads::Binary => {
-                let text = payloads == Payloads::Text;
-                info.serde_as(text).ok_or_else(|| SerializationError::PayloadFormat {
-                    what:       "component",
-                    type_name:  info.name.to_string(),
-                    wanted:     if text { SERDE_FORMAT_JSON } else { "binary" },
-                    registered: registered.format,
-                })?
-            }
+        let serde_fns = match payloads.kind() {
+            None => registered,
+            Some(kind) => info.serde_as(kind).ok_or_else(|| SerializationError::PayloadFormat {
+                what:       "component",
+                type_name:  info.name.to_string(),
+                wanted:     kind.name(),
+                registered: registered.format,
+            })?,
         };
 
         // SAFETY: `row` is a live row of this archetype (the caller took it from the archetype's
@@ -152,22 +165,13 @@ fn entity_snapshot(
             })?,
         };
 
-        // Save depending on the serialization format
-        match serde_fns.format {
-            SERDE_FORMAT_JSON => {
-                entity_snap.components.push(ComponentSnapshot::new_json(
-                    info.name.to_string(),
-                    raw_bytes,
-                ));
-            }
-            _ => {
-                // Binary format — save as-is
-                entity_snap.components.push(ComponentSnapshot::new_binary(
-                    info.name.to_string(),
-                    raw_bytes,
-                ));
-            }
-        }
+        // The payload is carried as what its fns wrote.
+        let name = info.name.to_string();
+        entity_snap.components.push(match PayloadKind::of(serde_fns.format) {
+            PayloadKind::Text => ComponentSnapshot::new_json(name, raw_bytes),
+            PayloadKind::Binary => ComponentSnapshot::new_binary(name, raw_bytes),
+            PayloadKind::Named => ComponentSnapshot::new_named(name, raw_bytes),
+        });
     }
 
     Ok(entity_snap)
@@ -448,7 +452,7 @@ impl WorldSerializer {
         {
             snap.resources.push(ResourceSnapshot {
                 type_name: r.type_name,
-                format:    if r.format == SERDE_FORMAT_JSON { DataFormat::Json } else { DataFormat::Binary },
+                format:    DataFormat::of(r.format),
                 data:      r.data,
             });
         }
@@ -696,7 +700,7 @@ impl WorldSerializer {
                         // rather than let the wrong reader report a parse error at column 1.
                         format => {
                             let text = format == DataFormat::Json;
-                            let reader = info.serde_as(text).ok_or_else(|| SerializationError::DeserializeFailed {
+                            let reader = format.kind().and_then(|kind| info.serde_as(kind)).ok_or_else(|| SerializationError::DeserializeFailed {
                                 type_name: comp_snap.type_name.clone(),
                                 reason:    format!(
                                     "the payload is {format:?}, the type is registered as {}",
@@ -775,6 +779,7 @@ impl WorldSerializer {
             let restored = match res.format {
                 DataFormat::Json => world.restore_resource_serde(&res.type_name, SERDE_FORMAT_JSON, &res.data),
                 DataFormat::Binary => world.restore_resource_serde(&res.type_name, SERDE_FORMAT_POSTCARD, &res.data),
+                DataFormat::Named => world.restore_resource_serde(&res.type_name, SERDE_FORMAT_MSGPACK, &res.data),
                 DataFormat::LegacyBincode => world.restore_resource_serde_legacy_bincode(&res.type_name, &res.data),
             };
             match restored {
@@ -1868,13 +1873,15 @@ mod tests {
         world.spawn((JsonOnly(7),));
         let mut snap = WorldSerializer::snapshot(&world).unwrap();
         assert_eq!(snap.entities[0].components[0].format, DataFormat::Json);
-        // The same bytes claimed to be binary: the type cannot read binary.
-        snap.entities[0].components[0].format = DataFormat::Binary;
+        // The same bytes claimed to be binary, of either binary kind: the type reads neither.
+        for (claimed, named_as) in [(DataFormat::Binary, "Binary"), (DataFormat::Named, "Named")] {
+            snap.entities[0].components[0].format = claimed;
 
-        let mut w2 = World::new();
-        w2.register_component_serde_with::<JsonOnly>(json_only_fns());
-        let err = WorldSerializer::restore(&mut w2, &snap).unwrap_err().to_string();
-        assert!(err.contains("Binary") && err.contains("json") && err.contains("JsonOnly"), "{err}");
+            let mut w2 = World::new();
+            w2.register_component_serde_with::<JsonOnly>(json_only_fns());
+            let err = WorldSerializer::restore(&mut w2, &snap).unwrap_err().to_string();
+            assert!(err.contains(named_as) && err.contains("json") && err.contains("JsonOnly"), "{err}");
+        }
     }
 
     /// The same type cannot be WRITTEN in the format it does not have either: the snapshot names
@@ -1886,11 +1893,13 @@ mod tests {
         world.register_component_serde::<Position>();
         world.spawn((JsonOnly(7), Position { x: 1.0, y: 2.0 }));
 
-        let binary = SnapshotOptions { payloads: Payloads::Binary, ..Default::default() };
-        let err = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &binary)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("JsonOnly") && err.contains("binary") && err.contains("json"), "{err}");
+        for (payloads, wanted) in [(Payloads::Binary, "binary"), (Payloads::Named, "msgpack")] {
+            let opts = SnapshotOptions { payloads, ..Default::default() };
+            let err = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("JsonOnly") && err.contains(wanted) && err.contains("json"), "{err}");
+        }
 
         // In its own format the snapshot is written, the plain type following the request.
         let text = SnapshotOptions { payloads: Payloads::Text, ..Default::default() };
@@ -1898,9 +1907,9 @@ mod tests {
         assert!(snap.entities[0].components.iter().all(|c| c.format == DataFormat::Json));
     }
 
-    /// ADR-024: the payload format is chosen when the snapshot is written, not when the type is
-    /// registered — and a world registered either way reads either payload, through both container
-    /// forms.
+    /// ADR-024, ADR-025: the payload format is chosen when the snapshot is written, not when the
+    /// type is registered — and a world registered either way reads a payload of any of the three
+    /// formats, through both container forms.
     #[test]
     fn a_snapshot_is_written_in_the_format_the_caller_names() {
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -1927,9 +1936,12 @@ mod tests {
             world.insert_resource(Level(3));
             let as_registered = WorldSerializer::snapshot(&world).unwrap();
 
-            for (payloads, format) in
-                [(Payloads::Text, DataFormat::Json), (Payloads::Binary, DataFormat::Binary)]
-            {
+            let registered = if registered_json { DataFormat::Json } else { DataFormat::Binary };
+            for (payloads, format) in [
+                (Payloads::Text, DataFormat::Json),
+                (Payloads::Binary, DataFormat::Binary),
+                (Payloads::Named, DataFormat::Named),
+            ] {
                 let opts = SnapshotOptions { payloads, ..Default::default() };
                 let snap = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap();
                 let payload = snap.entities[0]
@@ -1940,15 +1952,17 @@ mod tests {
                 assert_eq!(payload.format, format);
                 assert_eq!(snap.resources[0].format, format);
                 // The bytes are the bytes of that format's one road.
-                let expected = if format == DataFormat::Json {
-                    apex_core::text::to_vec(&position).unwrap()
-                } else {
-                    apex_core::binary::to_vec(&position).unwrap()
+                let expected = match format {
+                    DataFormat::Json => apex_core::text::to_vec(&position).unwrap(),
+                    DataFormat::Named => apex_core::named::to_vec(&position).unwrap(),
+                    _ => apex_core::binary::to_vec(&position).unwrap(),
                 };
                 assert_eq!(payload.data, expected);
                 // Asking for the registered format is the plain snapshot.
-                if (format == DataFormat::Json) == registered_json {
+                if format == registered {
                     assert_eq!(snap, as_registered);
+                } else {
+                    assert_ne!(snap, as_registered);
                 }
 
                 let forms = [
@@ -1997,6 +2011,94 @@ mod tests {
         snap.resources[0].data = b"3".to_vec();
         WorldSerializer::restore(&mut w3, &snap).unwrap();
         assert!(w3.try_resource::<Level>().is_none());
+    }
+
+    // ── A binary save (ADR-025) ──────────────────────────────────
+
+    /// One type as two releases know it. `then` wrote the save; `now` reads it — with a field
+    /// added, a field removed, the rest moved, and a variant put in front of the others.
+    mod then {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub enum Order {
+            Idle,
+            Go(u32),
+        }
+        #[derive(Component, Serialize, Deserialize, Debug, PartialEq)]
+        pub struct Fleet {
+            pub id: u32,
+            pub gone: String,
+            pub order: Order,
+            pub t: f64,
+        }
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub struct Clock {
+            pub day: u32,
+        }
+    }
+    mod now {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub enum Order {
+            Wait { s: f64 },
+            Idle,
+            Go(u32),
+        }
+        #[derive(Component, Serialize, Deserialize, Debug, PartialEq)]
+        pub struct Fleet {
+            #[serde(default)]
+            pub added: Vec<u8>,
+            pub t: f64,
+            pub order: Order,
+            pub id: u32,
+        }
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        pub struct Clock {
+            #[serde(default)]
+            pub hour: u8,
+            pub day: u32,
+        }
+    }
+
+    /// The save of `then` as `now` finds it on disk. A type keeps its name across releases; the
+    /// test needs two Rust types for one, so it writes the name the reader knows.
+    fn saved_then(payloads: Payloads) -> Vec<u8> {
+        let mut world = World::new();
+        world.register_component_serde::<then::Fleet>();
+        world.register_resource_serde::<then::Clock>();
+        world.spawn((then::Fleet { id: 7, gone: "x".into(), order: then::Order::Go(3), t: f64::INFINITY },));
+        world.insert_resource(then::Clock { day: 12 });
+        let opts = SnapshotOptions { payloads, ..Default::default() };
+        let mut snap = WorldSerializer::snapshot_opts(&world, &mut apex_core::NoContext, &opts).unwrap();
+        snap.entities[0].components[0].type_name = std::any::type_name::<now::Fleet>().to_string();
+        snap.resources[0].type_name = std::any::type_name::<now::Clock>().to_string();
+        snap.to_binary().unwrap()
+    }
+
+    /// ADR-025: a binary save whose payloads carry field names opens after its types changed —
+    /// the property a save file needs and the compact payloads do not have.
+    #[test]
+    fn a_binary_save_with_named_payloads_is_read_after_its_types_changed() {
+        let read = |payloads: Payloads| {
+            let mut world = World::new();
+            world.register_component_serde::<now::Fleet>();
+            world.register_resource_serde::<now::Clock>();
+            let snap = WorldSnapshot::from_binary(&saved_then(payloads)).unwrap();
+            WorldSerializer::restore(&mut world, &snap).map(|map| (world, map))
+        };
+        let (world, map) = read(Payloads::Named).unwrap();
+        let fleet = world.get::<now::Fleet>(*map.values().next().unwrap()).unwrap();
+        assert_eq!(
+            fleet,
+            &now::Fleet { added: Vec::new(), t: f64::INFINITY, order: now::Order::Go(3), id: 7 }
+        );
+        assert_eq!(world.try_resource::<now::Clock>().map(|c| (c.hour, c.day)), Some((0, 12)));
+
+        // The compact payloads of the same world hold positions, not names: the newer types do
+        // not read them — which is why `Payloads::Binary` is not the format of a save.
+        assert!(matches!(read(Payloads::Binary), Err(SerializationError::DeserializeFailed { .. })));
     }
 
     // ── Canonical snapshot (ADR-024) ─────────────────────────────
@@ -2093,7 +2195,7 @@ mod tests {
             WorldSerializer::snapshot(&b).unwrap().to_json().unwrap()
         );
 
-        for payloads in [Payloads::AsRegistered, Payloads::Binary] {
+        for payloads in [Payloads::AsRegistered, Payloads::Binary, Payloads::Named] {
             let (sa, sb) = (canonical(&a, payloads).unwrap(), canonical(&b, payloads).unwrap());
             assert_eq!(
                 String::from_utf8(sa.to_json().unwrap()).unwrap(),

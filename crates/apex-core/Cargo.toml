@@ -27,6 +27,7 @@ apex-macros = { path = "../apex-macros" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 postcard   = { workspace = true }
+rmp-serde  = { workspace = true }
 # Legacy reader only (payloads of wire v3 and older), removed with engine TD-608.
 bincode    = { workspace = true }
 

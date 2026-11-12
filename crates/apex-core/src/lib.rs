@@ -75,6 +75,7 @@ macro_rules! anomaly {
 pub mod access;
 pub mod archetype;
 pub mod binary;
+pub mod named;
 pub mod text;
 pub mod clock;
 pub mod commands;
@@ -104,9 +105,10 @@ pub use apex_macros::Component;
 pub use archetype::ArchetypeId;
 pub use commands::Commands;
 pub use component::{
-    json_merge, make_serde_fns, make_serde_fns_json, Component as ComponentTrait, ComponentHookFn,
-    ComponentId, ComponentRegistry, ComponentSerdeFns, MapEntities, MapEntitiesFn, NoContext,
-    Serializable, SerdeContext, Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_POSTCARD,
+    json_merge, make_serde_fns, make_serde_fns_json, make_serde_fns_named,
+    Component as ComponentTrait, ComponentHookFn, ComponentId, ComponentRegistry,
+    ComponentSerdeFns, MapEntities, MapEntitiesFn, NoContext, PayloadKind, Serializable,
+    SerdeContext, Tick, SERDE_FORMAT_JSON, SERDE_FORMAT_MSGPACK, SERDE_FORMAT_POSTCARD,
 };
 pub use entity::Entity;
 pub use error::{Anomaly, AnomalyCounts, ErrorHandler, ErrorMode, Severity};
